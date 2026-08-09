@@ -1,9 +1,15 @@
 use crate::plugins::TranslationMode;
 use crate::settings::{AppliedSettings, ReaderSettingsChange};
 use rebook_formats::BookFormat;
+use rebook_publication::BookSource;
 use rebook_publication::RenditionLayout;
+use std::sync::Arc;
 
-use super::{DesktopReader, FollowUp, SnapshotEffects};
+use super::{
+    DesktopReader, FollowUp, NEXT_SEMANTIC_TASK_GENERATION, SearchMode, SemanticIndexTask,
+    SnapshotEffects,
+};
+use std::sync::atomic::Ordering;
 
 impl DesktopReader {
     pub(in crate::reader) fn request_settings(&mut self) {
@@ -30,6 +36,10 @@ impl DesktopReader {
         self.error = Some(error);
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "settings application coordinates reader, translation, and semantic follow-ups"
+    )]
     pub(crate) fn apply_global_settings(&mut self, settings: &AppliedSettings) {
         let mut plugin_settings = settings.plugin_settings.clone();
         if self.format == BookFormat::Pdf
@@ -47,6 +57,21 @@ impl DesktopReader {
                 && plugin_settings.target_language == crate::plugins::TARGET_LANGUAGE_INTERFACE);
         let toc_translation_setting_changed =
             self.plugin_settings.translate_toc != plugin_settings.translate_toc;
+        let old_embedding_provider = self
+            .plugin_settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == self.plugin_settings.embedding_provider);
+        let new_embedding_provider = plugin_settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == plugin_settings.embedding_provider);
+        let semantic_backend_changed = self.plugin_settings.embedding_provider
+            != plugin_settings.embedding_provider
+            || self.plugin_settings.embedding_model != plugin_settings.embedding_model
+            || old_embedding_provider != new_embedding_provider;
+        let semantic_enable_changed =
+            self.plugin_settings.semantic_search_enabled != plugin_settings.semantic_search_enabled;
 
         if let Err(error) = self
             .translation_source
@@ -84,6 +109,23 @@ impl DesktopReader {
                     self.translation.toc_labels.clear();
                 } else if toc_translation_setting_changed && !self.plugin_settings.translate_toc {
                     self.translation.toc_task.cancel();
+                }
+                if !self.plugin_settings.semantic_search_enabled {
+                    self.semantic_index.task.cancel();
+                    self.semantic_index.progress.clear();
+                    self.search.mode = SearchMode::Text;
+                } else if semantic_enable_changed || semantic_backend_changed {
+                    self.semantic_index.task.cancel();
+                    let semantic_source: Arc<dyn BookSource> = self.rewrite_source.clone();
+                    self.semantic_index.task.begin(SemanticIndexTask {
+                        source: semantic_source,
+                        settings: self.plugin_settings.clone(),
+                        generation: NEXT_SEMANTIC_TASK_GENERATION.fetch_add(1, Ordering::Relaxed),
+                    });
+                    self.semantic_index.progress = language.text("索引中 0%", "Indexing 0%").into();
+                    if semantic_enable_changed {
+                        self.search.mode = SearchMode::Semantic;
+                    }
                 }
                 self.apply_snapshot(
                     snapshot,

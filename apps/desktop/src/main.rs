@@ -14,6 +14,7 @@ mod platform;
 mod plugins;
 mod preferences;
 mod reader;
+mod semantic;
 mod settings;
 mod shelf;
 mod sync;

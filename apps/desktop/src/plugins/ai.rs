@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
 use crate::highlights::StoredHighlight;
+use crate::semantic::{self, SemanticSearchResult, SemanticSearchScope};
 
 use super::commands::ChatRequestKind;
 use super::pdf_vision::{
@@ -272,7 +273,7 @@ pub async fn chat_with_book(
             annotation_actions: Vec::new(),
         });
     }
-    let tools = book_tools();
+    let tools = book_tools(settings.semantic_search_enabled);
     let mut rewrites = Vec::new();
     let mut rewrite_transactions = Vec::new();
     let mut annotation_actions = Vec::new();
@@ -330,6 +331,9 @@ pub async fn chat_with_book(
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
             let result = match serde_json::from_str::<Value>(arguments) {
+                Ok(arguments) if arguments.is_object() && name == "semanticSearch" => {
+                    semantic_search_tool(&book_id, &settings, &arguments).await
+                }
                 Ok(arguments) if arguments.is_object() && name == "getVisualContent" => {
                     if format == BookFormat::Pdf {
                         get_visual_content(
@@ -1478,6 +1482,56 @@ fn execute_book_tool(
     }
 }
 
+async fn semantic_search_tool(
+    book_id: &str,
+    settings: &PluginSettings,
+    arguments: &Value,
+) -> Value {
+    if !settings.semantic_search_enabled {
+        return json!({ "error": "语义搜索尚未启用。" });
+    }
+    let query = arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if query.is_empty() {
+        return json!({ "error": "语义搜索词不能为空。" });
+    }
+    let max_results = read_usize(arguments, "maxResults", 8).clamp(1, 12);
+    match semantic::search(
+        query,
+        book_id,
+        SemanticSearchScope::CurrentBook,
+        settings,
+        Some(max_results),
+        false,
+    )
+    .await
+    {
+        Ok(results) => semantic_search_result_value(results),
+        Err(error) => json!({ "error": error }),
+    }
+}
+
+fn semantic_search_result_value(results: Vec<SemanticSearchResult>) -> Value {
+    json!({
+        "results": results.into_iter().map(|result| {
+            json!({
+                "unit": result.section_index,
+                "title": result.section_title,
+                "id": result.range.start.node,
+                "type": result.block_kind,
+                "text": clip_content_text(&result.text, 800),
+                "href": chat_citation_link(
+                    result.section_index,
+                    Some(&result.range.start.node),
+                ),
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
 fn build_system_prompt(
     source: &dyn BookSource,
     current: &ChatReadingContext,
@@ -1555,8 +1609,8 @@ fn round_context_number(value: f64) -> f64 {
 }
 
 #[allow(clippy::too_many_lines)]
-fn book_tools() -> Value {
-    json!([
+fn book_tools(semantic_search_enabled: bool) -> Value {
+    let mut tools = json!([
         {
             "type": "function",
             "function": {
@@ -1775,7 +1829,29 @@ fn book_tools() -> Value {
                 }
             }
         }
-    ])
+    ]);
+    if semantic_search_enabled {
+        tools
+            .as_array_mut()
+            .expect("book tools are an array")
+            .push(json!({
+                "type": "function",
+                "function": {
+                    "name": "semanticSearch",
+                    "description": "按含义搜索当前书籍，返回相关正文及 citation。概念问答或用户措辞可能与原文不一致时优先使用；查找精确词句时使用 searchBook。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" },
+                            "maxResults": { "type": "integer", "minimum": 1, "maximum": 12, "default": 8 }
+                        },
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }
+                }
+            }));
+    }
+    tools
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2488,7 +2564,7 @@ mod tests {
 
     #[test]
     fn chat_tools_include_controlled_content_rewrites_without_story_memory() {
-        let tools = book_tools();
+        let tools = book_tools(false);
         let tools = tools.as_array().unwrap();
         let names = tools
             .iter()
@@ -2592,8 +2668,36 @@ mod tests {
     }
 
     #[test]
+    fn semantic_search_tool_is_only_exposed_when_enabled() {
+        let disabled = book_tools(false);
+        assert!(!disabled.as_array().unwrap().iter().any(|tool| {
+            tool.pointer("/function/name").and_then(Value::as_str) == Some("semanticSearch")
+        }));
+
+        let enabled = book_tools(true);
+        let tool = enabled
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some("semanticSearch")
+            })
+            .unwrap();
+        assert_eq!(
+            tool.pointer("/function/parameters/properties/maxResults/default")
+                .and_then(Value::as_u64),
+            Some(8)
+        );
+        assert_eq!(
+            tool.pointer("/function/parameters/properties/maxResults/maximum")
+                .and_then(Value::as_u64),
+            Some(12)
+        );
+    }
+
+    #[test]
     fn visual_content_tool_uses_bounded_compact_page_arguments() {
-        let tools = book_tools();
+        let tools = book_tools(false);
         assert!(tools.as_array().unwrap().iter().any(|tool| {
             tool.pointer("/function/name").and_then(Value::as_str) == Some("getVisualContent")
         }));

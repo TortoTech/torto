@@ -21,6 +21,7 @@ pub(crate) struct DesktopApp {
     settings: SettingsFeature,
     applied_settings_revision: u64,
     pending_reader_notice: Option<String>,
+    pending_search_navigation: Option<crate::plugins::BookSearchResult>,
     #[cfg(target_os = "windows")]
     updater: crate::updater::WindowsUpdater,
 }
@@ -34,6 +35,7 @@ impl DesktopApp {
             settings,
             applied_settings_revision: 0,
             pending_reader_notice: None,
+            pending_search_navigation: None,
             #[cfg(target_os = "windows")]
             updater: crate::updater::WindowsUpdater::new(),
         }
@@ -41,6 +43,7 @@ impl DesktopApp {
 
     pub(crate) fn open_book(&mut self, path: &Path) {
         self.pending_reader_notice = None;
+        self.pending_search_navigation = None;
         self.shelf.open_book(path);
         if let Some(next_reader) = self.shelf.take_opened_reader() {
             if let Some(current_reader) = self.reader.as_ref() {
@@ -150,6 +153,15 @@ impl DesktopApp {
         }
     }
 
+    pub(crate) fn complete_reader_semantic_index(
+        &mut self,
+        message: crate::reader::SemanticIndexTaskMessage,
+    ) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.complete_semantic_index(message);
+        }
+    }
+
     pub(crate) fn complete_reader_chat(&mut self, message: ChatTaskMessage) {
         if let Some(reader) = self.reader.as_mut() {
             reader.complete_chat(message);
@@ -208,6 +220,31 @@ impl DesktopApp {
     }
 
     fn reconcile_state(&mut self, ctx: &egui::Context) {
+        let search_navigation = self
+            .reader
+            .as_mut()
+            .and_then(DesktopReader::take_search_navigation_request);
+        if let Some(result) = search_navigation {
+            if let Some(path) = self.shelf.book_path(&result.book_id) {
+                if let Some(reader) = self.reader.as_ref() {
+                    reader.prepare_for_shutdown();
+                }
+                self.pending_search_navigation = Some(result);
+                self.reader = None;
+                self.shelf.open_book(&path);
+            } else if let Some(reader) = self.reader.as_mut() {
+                reader.report_search_navigation_error(
+                    self.settings
+                        .applied()
+                        .language
+                        .text(
+                            "这本书已不在本地书架中，无法打开搜索结果",
+                            "This book is no longer in the local library",
+                        )
+                        .into(),
+                );
+            }
+        }
         let reopen = self.reader.as_mut().and_then(|reader| {
             reader
                 .take_reopen_request()
@@ -235,6 +272,9 @@ impl DesktopApp {
             self.reader = self.shelf.take_opened_reader().map(|mut reader| {
                 if let Some(notice) = self.pending_reader_notice.take() {
                     reader.show_notice(notice);
+                }
+                if let Some(result) = self.pending_search_navigation.take() {
+                    reader.go_to_search_result(&result);
                 }
                 reader
             });

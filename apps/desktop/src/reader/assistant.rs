@@ -12,6 +12,7 @@ use crate::plugins::{
     resolve_chat_command, search_book, section_title, set_pdf_ocr_view_mode, translate_blocks,
     translate_blocks_incremental,
 };
+use crate::semantic;
 
 use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, build_chat_prompt_with_references,
@@ -20,27 +21,93 @@ use super::chat_autocomplete::{
 use super::{
     AssistantPanel, ChatStreamMessage, ChatStreamingState, ChatTask, ChatTaskMessage,
     DesktopReader, FocusedMark, MarkRetention, PdfOcrTask, PdfOcrTaskMessage, PdfTocTask,
-    PdfTocTaskMessage, SearchTask, SearchTaskMessage, SidebarTab, SnapshotEffects,
-    TocTranslationTask, TocTranslationTaskMessage, TranslationTask, TranslationTaskMessage,
+    PdfTocTaskMessage, SearchMode, SearchTask, SearchTaskMessage, SemanticIndexTaskMessage,
+    SidebarTab, SnapshotEffects, TocTranslationTask, TocTranslationTaskMessage, TranslationTask,
+    TranslationTaskMessage,
 };
 
 impl DesktopReader {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "reader background work is dispatched from one event-loop integration point"
+    )]
     pub(crate) fn spawn_pending_tasks(
         &mut self,
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     ) {
+        if let Some(request) = self.semantic_index.task.take_pending() {
+            let proxy = proxy.clone();
+            runtime.spawn(async move {
+                let id = request.id;
+                let payload = request.payload;
+                let generation = payload.generation;
+                let progress_proxy = proxy.clone();
+                let result = semantic::index_book(
+                    payload.source,
+                    payload.settings,
+                    move |completed, total| {
+                        let _ = progress_proxy.send_event(UserEvent::ReaderSemanticIndex(
+                            SemanticIndexTaskMessage::Progress {
+                                id,
+                                generation,
+                                completed,
+                                total,
+                            },
+                        ));
+                    },
+                )
+                .await;
+                let _ = proxy.send_event(UserEvent::ReaderSemanticIndex(
+                    SemanticIndexTaskMessage::Complete {
+                        generation,
+                        message: crate::async_task::TaskResult { id, result },
+                    },
+                ));
+            });
+        }
         if let Some(request) = self.search.task.take_pending() {
             let proxy = proxy.clone();
             runtime.spawn(async move {
                 let id = request.id;
                 let payload = request.payload;
-                let result = tokio::task::spawn_blocking(move || {
-                    search_book(payload.source.as_ref(), &payload.query, 200)
-                })
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
+                let result = match payload.mode {
+                    SearchMode::Text => tokio::task::spawn_blocking(move || {
+                        search_book(payload.source.as_ref(), &payload.query, 200)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result),
+                    SearchMode::Semantic => semantic::search(
+                        &payload.query,
+                        &payload.book_id,
+                        payload.scope,
+                        &payload.settings,
+                        Some(50),
+                        false,
+                    )
+                    .await
+                    .map(|results| {
+                        results
+                            .into_iter()
+                            .map(|result| BookSearchResult {
+                                book_id: result.book_id,
+                                book_title: result.book_title,
+                                section_index: result.section_index,
+                                section_title: result.section_title,
+                                excerpt: semantic_result_excerpt(&result.text),
+                                matched_text: result.text,
+                                block_kind: result.block_kind,
+                                range: result.range,
+                                similarity: Some(result.similarity),
+                                is_image: result.modality
+                                    == crate::semantic::SemanticModality::Image,
+                                image_href: result.image_href,
+                                image_preview: result.image_preview,
+                            })
+                            .collect()
+                    }),
+                };
                 let _ = proxy.send_event(UserEvent::ReaderSearch(SearchTaskMessage { id, result }));
             });
         }
@@ -369,33 +436,64 @@ impl DesktopReader {
                 .into();
             return;
         }
+        if self.search.mode == SearchMode::Semantic
+            && self.search.scope == crate::semantic::SemanticSearchScope::CurrentBook
+            && self.semantic_index.task.is_pending()
+        {
+            self.search.status = self
+                .language
+                .text(
+                    "当前书仍在建立语义索引，请稍后再试",
+                    "The current book is still being indexed. Try again shortly.",
+                )
+                .into();
+            return;
+        }
         self.search.status = self.language.text("正在搜索…", "Searching…").into();
         self.search.results.clear();
         self.focused_mark = None;
         self.search.task.begin(SearchTask {
             source: Arc::clone(&self.source),
             query,
+            mode: self.search.mode,
+            scope: self.search.scope,
+            book_id: self.book_id.clone(),
+            settings: self.plugin_settings.clone(),
         });
         self.bump_scene_revision();
     }
 
     pub(crate) fn complete_search(&mut self, message: SearchTaskMessage) {
-        if self.search.task.complete(message.id).is_none() {
+        let Some(request) = self.search.task.complete(message.id) else {
             return;
-        }
+        };
         match message.result {
             Ok(results) => {
                 self.search.status = if results.is_empty() {
-                    self.language
-                        .text("没有找到匹配内容", "No matches found")
-                        .into()
+                    if request.mode == SearchMode::Semantic {
+                        self.language
+                            .text("没有找到相关内容", "No related passages found")
+                            .into()
+                    } else {
+                        self.language
+                            .text("没有找到匹配内容", "No matches found")
+                            .into()
+                    }
                 } else {
                     match self.language {
                         crate::preferences::AppLanguage::SimplifiedChinese => {
-                            format!("找到 {} 处结果", results.len())
+                            if request.mode == SearchMode::Semantic {
+                                format!("找到 {} 条相关内容", results.len())
+                            } else {
+                                format!("找到 {} 处结果", results.len())
+                            }
                         }
                         crate::preferences::AppLanguage::English => {
-                            format!("Found {} matches", results.len())
+                            if request.mode == SearchMode::Semantic {
+                                format!("Found {} related passages", results.len())
+                            } else {
+                                format!("Found {} matches", results.len())
+                            }
                         }
                     }
                 };
@@ -403,15 +501,111 @@ impl DesktopReader {
             }
             Err(error) => {
                 self.search.results.clear();
-                self.search.status = error;
+                if request.mode == SearchMode::Semantic {
+                    self.search.status.clear();
+                    self.error_timer.show(
+                        &mut self.error,
+                        format!(
+                            "{}: {error}",
+                            self.language.text("语义搜索失败", "Semantic search failed")
+                        ),
+                        Instant::now(),
+                    );
+                } else {
+                    self.search.status = error;
+                }
             }
         }
     }
 
-    pub(super) fn go_to_search_result(&mut self, result: &BookSearchResult) {
-        match self.reader.go_to_source(&result.range.start) {
+    pub(crate) fn complete_semantic_index(&mut self, message: SemanticIndexTaskMessage) {
+        match message {
+            SemanticIndexTaskMessage::Progress {
+                id,
+                generation,
+                completed,
+                total,
+            } => {
+                if self
+                    .semantic_index
+                    .task
+                    .in_flight(id)
+                    .is_some_and(|task| task.generation == generation)
+                {
+                    let percentage = semantic_index_percentage(completed, total);
+                    self.semantic_index.progress = match self.language {
+                        crate::preferences::AppLanguage::SimplifiedChinese => {
+                            format!("索引中 {percentage}%")
+                        }
+                        crate::preferences::AppLanguage::English => {
+                            format!("Indexing {percentage}%")
+                        }
+                    };
+                }
+            }
+            SemanticIndexTaskMessage::Complete {
+                generation,
+                message,
+            } => {
+                if self
+                    .semantic_index
+                    .task
+                    .in_flight(message.id)
+                    .is_none_or(|task| task.generation != generation)
+                {
+                    return;
+                }
+                if self.semantic_index.task.complete(message.id).is_none() {
+                    return;
+                }
+                match message.result {
+                    Ok(summary) => {
+                        tracing::debug!(
+                            already_indexed = summary.already_indexed,
+                            total_chunks = summary.total_chunks,
+                            "semantic index ready"
+                        );
+                        self.semantic_index.progress.clear();
+                    }
+                    Err(error) => {
+                        self.semantic_index.progress.clear();
+                        self.error_timer.show(
+                            &mut self.error,
+                            format!(
+                                "{}: {error}",
+                                self.language
+                                    .text("语义索引失败", "Semantic indexing failed")
+                            ),
+                            Instant::now(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn take_search_navigation_request(&mut self) -> Option<BookSearchResult> {
+        self.search_navigation_requested.take()
+    }
+
+    pub(crate) fn report_search_navigation_error(&mut self, message: String) {
+        self.search.status = message;
+    }
+
+    pub(crate) fn go_to_search_result(&mut self, result: &BookSearchResult) {
+        if result.book_id != self.book_id {
+            self.search_navigation_requested = Some(result.clone());
+            return;
+        }
+        let navigation = if result.is_image {
+            self.reader.go_to_section(result.section_index)
+        } else {
+            self.reader.go_to_source(&result.range.start)
+        };
+        match navigation {
             Ok(navigation) => {
-                self.focused_mark = Some(FocusedMark::search(result.range.clone()));
+                self.focused_mark =
+                    (!result.is_image).then(|| FocusedMark::search(result.range.clone()));
                 self.apply_snapshot(navigation.snapshot, SnapshotEffects::navigation());
             }
             Err(error) => {
@@ -1453,6 +1647,24 @@ fn clip_chat_reference_text(value: &str, max_chars: usize) -> String {
     clipped
 }
 
+fn semantic_result_excerpt(value: &str) -> String {
+    const MAX_CHARS: usize = 140;
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+    let mut excerpt = normalized.chars().take(MAX_CHARS).collect::<String>();
+    excerpt.push('…');
+    excerpt
+}
+
+fn semantic_index_percentage(completed: usize, total: usize) -> usize {
+    if total == 0 {
+        return 100;
+    }
+    completed.min(total).saturating_mul(100) / total
+}
+
 fn translated_toc_labels(
     toc_ids: &[String],
     translations: &[crate::plugins::BlockTranslation],
@@ -1492,5 +1704,25 @@ mod tests {
 
         assert_eq!(labels.len(), 1);
         assert_eq!(labels.get("chapter-1").map(String::as_str), Some("第一章"));
+    }
+
+    #[test]
+    fn semantic_results_use_a_compact_whitespace_normalized_excerpt() {
+        let source = format!("  first\n\n{}  ", "内容".repeat(80));
+
+        let excerpt = semantic_result_excerpt(&source);
+
+        assert_eq!(excerpt.chars().count(), 141);
+        assert!(excerpt.starts_with("first 内容"));
+        assert!(excerpt.ends_with('…'));
+    }
+
+    #[test]
+    fn semantic_index_progress_is_a_bounded_percentage() {
+        assert_eq!(semantic_index_percentage(0, 10), 0);
+        assert_eq!(semantic_index_percentage(3, 10), 30);
+        assert_eq!(semantic_index_percentage(10, 10), 100);
+        assert_eq!(semantic_index_percentage(12, 10), 100);
+        assert_eq!(semantic_index_percentage(0, 0), 100);
     }
 }

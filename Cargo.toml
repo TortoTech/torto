@@ -10,6 +10,7 @@ members = [
     "crates/publication",
     "crates/reader",
     "crates/renderer",
+    "crates/sqlite-vec-extension",
 ]
 exclude = [
     "third_party/egui",
@@ -32,6 +33,7 @@ authors = ["TortoTech"]
 anyrender = "0.11.1"
 atomicwrites = "0.4.4"
 base64 = "0.22.1"
+bytemuck = "1.25.2"
 bytes = "1.12.1"
 crc32fast = "1.5.0"
 directories = "6.0.0"
@@ -64,6 +66,8 @@ resvg = "0.47.0"
 rfd = "0.17.2"
 roxmltree = "0.21.1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+sqlite-vec = "=0.1.9"
+rebook-sqlite-vec-extension = { path = "crates/sqlite-vec-extension" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"

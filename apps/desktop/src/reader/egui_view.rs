@@ -13,7 +13,9 @@ use super::{
     AnnotationDraft, AssistantPanel, DesktopReader, GeneratedTocDraft, ImagePointerState,
     ImagePressCandidate, ReaderOverlay, ScrollSectionLayout, SelectedImage, SidebarTab,
 };
-use crate::plugins::{ChatCommand, ChatRole, PdfOcrViewMode, chat_command_suggestions};
+use crate::plugins::{
+    BookSearchResult, ChatCommand, ChatRole, PdfOcrViewMode, chat_command_suggestions,
+};
 use crate::preferences::{AppLanguage, AppTheme};
 use crate::settings::ReaderSettingsChange;
 use crate::ui::{
@@ -1355,36 +1357,110 @@ impl DesktopReader {
             });
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the search panel keeps mode, query, status, and result interactions together"
+    )]
     fn search(&mut self, ui: &mut egui::Ui) {
+        let semantic_available = self.plugin_settings.semantic_search_enabled;
+        let previous_mode = self.search.mode;
+        let previous_scope = self.search.scope;
         let width = ui.available_width();
-        let (response, clicked) = compact_input_frame()
+        let response = compact_input_frame()
             .show(ui, |ui| {
                 ui.set_min_width((width - 16.0).max(1.0));
                 ui.horizontal(|ui| {
-                    let input_width = (ui.available_width() - 40.0).max(48.0);
+                    let actions_width = if semantic_available { 80.0 } else { 0.0 };
+                    let input_width = (ui.available_width() - actions_width).max(48.0);
                     let response = ui.add_sized(
                         [input_width, 32.0],
                         egui::TextEdit::singleline(&mut self.search.query)
-                            .hint_text(self.language.text("搜索正文", "Search book"))
+                            .hint_text(if self.search.mode == super::SearchMode::Semantic {
+                                self.language.text("用自然语言搜索", "Search by meaning")
+                            } else {
+                                self.language.text("搜索正文", "Search book")
+                            })
                             .frame(egui::Frame::NONE)
                             .vertical_align(egui::Align::Center)
                             .margin(egui::Margin::symmetric(2, 0)),
                     );
-                    let clicked = icon_button(ui, Icon::Search)
-                        .on_hover_text(self.language.text("搜索", "Search"))
-                        .clicked();
-                    (response, clicked)
+                    if semantic_available {
+                        let semantic_active = self.search.mode == super::SearchMode::Semantic;
+                        let mode_toggle =
+                            selectable_icon_button(ui, Icon::BrainCircuit, semantic_active)
+                                .on_hover_text(if semantic_active {
+                                    self.language
+                                        .text("切换到关键词搜索", "Switch to keyword search")
+                                } else {
+                                    self.language
+                                        .text("切换到语义搜索", "Switch to semantic search")
+                                });
+                        if mode_toggle.clicked() {
+                            self.search.mode = if semantic_active {
+                                super::SearchMode::Text
+                            } else {
+                                super::SearchMode::Semantic
+                            };
+                        }
+
+                        let all_books =
+                            self.search.scope == crate::semantic::SemanticSearchScope::IndexedBooks;
+                        let scope_icon = if all_books {
+                            Icon::Library
+                        } else {
+                            Icon::BookOpen
+                        };
+                        let scope_toggle = ui
+                            .add_enabled_ui(semantic_active, |ui| {
+                                selectable_icon_button(ui, scope_icon, all_books)
+                            })
+                            .inner
+                            .on_hover_text(if all_books {
+                                self.language.text(
+                                    "全部已索引书籍；点击切换到当前书",
+                                    "All indexed books; switch to this book",
+                                )
+                            } else {
+                                self.language.text(
+                                    "当前书；点击切换到全部已索引书籍",
+                                    "This book; switch to all indexed books",
+                                )
+                            });
+                        if scope_toggle.clicked() {
+                            self.search.scope = if all_books {
+                                crate::semantic::SemanticSearchScope::CurrentBook
+                            } else {
+                                crate::semantic::SemanticSearchScope::IndexedBooks
+                            };
+                        }
+                    }
+                    response
                 })
                 .inner
             })
             .inner;
+        if previous_mode != self.search.mode || previous_scope != self.search.scope {
+            self.search.task.cancel();
+            self.search.results.clear();
+            self.search.status.clear();
+            self.focused_mark = None;
+            self.bump_scene_revision();
+        }
         if std::mem::take(&mut self.search.focus_input) {
             response.request_focus();
         }
-        if (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-            || clicked
-        {
+        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
             self.start_search();
+        }
+        if self.search.mode == super::SearchMode::Semantic
+            && !self.semantic_index.progress.is_empty()
+        {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(&self.semantic_index.progress)
+                    .size(crate::ui::scaled_font_size(11.0))
+                    .color(palette().muted),
+            );
         }
         if !self.search.status.is_empty() {
             ui.add_space(8.0);
@@ -1395,16 +1471,19 @@ impl DesktopReader {
             );
         }
         let results = self.search.results.clone();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for result in results {
-                if ui
-                    .button(RichText::new(&result.excerpt).size(crate::ui::scaled_font_size(12.0)))
-                    .clicked()
-                {
-                    self.go_to_search_result(&result);
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for result in results {
+                    let show_book = self.search.mode == super::SearchMode::Semantic
+                        && self.search.scope == crate::semantic::SemanticSearchScope::IndexedBooks;
+                    if search_result_card(ui, &result, show_book, self.language).clicked() {
+                        self.go_to_search_result(&result);
+                    }
+                    ui.add_space(6.0);
                 }
-            }
-        });
+            });
     }
 
     fn assistant(&mut self, ui: &mut egui::Ui) {
@@ -2825,6 +2904,113 @@ fn compact_input_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(1.0, palette().border))
         .corner_radius(9)
         .inner_margin(egui::Margin::symmetric(8, 4))
+}
+
+fn search_result_card(
+    ui: &mut egui::Ui,
+    result: &BookSearchResult,
+    show_book: bool,
+    language: AppLanguage,
+) -> egui::Response {
+    let width = ui.available_width().max(1.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 76.0), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let fill = if response.is_pointer_button_down_on() || response.hovered() {
+        palette().surface_muted
+    } else {
+        palette().surface
+    };
+    let stroke = if response.hovered() {
+        egui::Stroke::new(1.0, palette().accent.gamma_multiply(0.4))
+    } else {
+        egui::Stroke::new(1.0, palette().border)
+    };
+    ui.painter()
+        .rect(rect, 7.0, fill, stroke, egui::StrokeKind::Inside);
+
+    let heading = search_result_heading(result, show_book, language);
+    let content_rect = rect.shrink2(Vec2::new(10.0, 8.0));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            if let Some(preview) = &result.image_preview {
+                let uri = format!(
+                    "bytes://semantic/{}/{}/{}",
+                    result.book_id, result.section_index, result.range.start.node
+                );
+                ui.add(
+                    egui::Image::from_bytes(uri, preview.clone())
+                        .fit_to_exact_size(Vec2::splat(56.0))
+                        .corner_radius(4.0),
+                );
+                ui.add_space(6.0);
+            }
+            ui.vertical(|ui| {
+                ui.set_max_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.horizontal(|ui| {
+                    if let Some(similarity) = result.similarity {
+                        ui.label(
+                            RichText::new(format!("{:.0}%", similarity.clamp(0.0, 1.0) * 100.0))
+                                .size(crate::ui::scaled_font_size(11.0))
+                                .strong()
+                                .color(palette().accent),
+                        );
+                    }
+                    if result.is_image {
+                        ui.label(
+                            RichText::new(language.text("图片", "Image"))
+                                .size(crate::ui::scaled_font_size(10.5))
+                                .color(palette().accent),
+                        );
+                    }
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(heading)
+                                .size(crate::ui::scaled_font_size(11.0))
+                                .strong()
+                                .color(palette().muted),
+                        )
+                        .truncate(),
+                    );
+                });
+                let mut excerpt_job = egui::text::LayoutJob::default();
+                RichText::new(&result.excerpt)
+                    .size(crate::ui::scaled_font_size(12.0))
+                    .color(palette().text)
+                    .append_to(
+                        &mut excerpt_job,
+                        ui.style(),
+                        egui::FontSelection::Default,
+                        egui::Align::Center,
+                    );
+                excerpt_job.wrap.max_width = ui.available_width();
+                excerpt_job.wrap.max_rows = 2;
+                ui.add(egui::Label::new(excerpt_job).wrap());
+            });
+        },
+    );
+    response
+}
+
+fn search_result_heading(
+    result: &BookSearchResult,
+    show_book: bool,
+    language: AppLanguage,
+) -> String {
+    let section = result.section_title.trim();
+    let section = if section.is_empty() {
+        language.text("正文", "Text")
+    } else {
+        section
+    };
+    if show_book && !result.book_title.trim().is_empty() {
+        format!("{} · {section}", result.book_title.trim())
+    } else {
+        section.to_owned()
+    }
 }
 
 fn selection_popover_frame(inner_margin: i8) -> egui::Frame {

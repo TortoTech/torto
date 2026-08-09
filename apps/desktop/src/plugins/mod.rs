@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use directories::ProjectDirs;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::persistence::write_json_atomic;
 
@@ -39,8 +40,8 @@ pub(crate) use pdf_ocr::{
 };
 pub(crate) use pdf_toc::generate_pdf_toc;
 pub use rewrite::RewriteBookSource;
-pub(crate) use search::section_title;
 pub use search::{BookSearchResult, search_book};
+pub(crate) use search::{section_title, text_block_kind, text_block_text};
 pub use translation::{BlockTranslation, TranslationBlockInput, TranslationBookSource};
 
 const SETTINGS_FILE: &str = "plugins.json";
@@ -129,11 +130,52 @@ pub struct AiProvider {
     pub(crate) kind: AiProviderKind,
     pub name: String,
     pub base_url: String,
-    pub models: Vec<String>,
+    pub models: Vec<AiModelConfig>,
     /// Secrets are excluded from JSON and stored in Windows Credential Manager.
     /// `REBOOK_AI_API_KEY` can override the default provider at runtime.
     #[serde(skip)]
     pub api_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiModelKind {
+    #[default]
+    Language,
+    Embedding,
+}
+
+impl AiModelKind {
+    pub(crate) const ALL: [Self; 2] = [Self::Language, Self::Embedding];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Language => "LM",
+            Self::Embedding => "Embedding",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiModelConfig {
+    pub id: String,
+    pub kind: AiModelKind,
+}
+
+impl Default for AiModelConfig {
+    fn default() -> Self {
+        Self::language(DEFAULT_MODEL)
+    }
+}
+
+impl AiModelConfig {
+    pub(crate) fn language(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            kind: AiModelKind::Language,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,7 +193,7 @@ impl Default for AiProvider {
             kind: AiProviderKind::Custom,
             name: AiProviderKind::Custom.label().into(),
             base_url: String::new(),
-            models: vec![DEFAULT_MODEL.into()],
+            models: vec![AiModelConfig::language(DEFAULT_MODEL)],
             api_key: String::new(),
         }
     }
@@ -172,6 +214,10 @@ impl AiProvider {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "plugin settings persist independent user-facing feature toggles"
+)]
 pub struct PluginSettings {
     pub providers: Vec<AiProvider>,
     pub chat_provider: String,
@@ -181,6 +227,9 @@ pub struct PluginSettings {
     pub ocr_enabled: bool,
     pub ocr_provider: String,
     pub ocr_model: String,
+    pub semantic_search_enabled: bool,
+    pub embedding_provider: String,
+    pub embedding_model: String,
     pub pdf_ocr_enabled: bool,
     pub pdf_ocr_provider: PdfOcrProviderKind,
     pub paddle_ocr_model: String,
@@ -215,6 +264,9 @@ impl Default for PluginSettings {
             ocr_enabled: true,
             ocr_provider: DEFAULT_PROVIDER_ID.into(),
             ocr_model: DEFAULT_MODEL.into(),
+            semantic_search_enabled: false,
+            embedding_provider: DEFAULT_PROVIDER_ID.into(),
+            embedding_model: String::new(),
             pdf_ocr_enabled: false,
             pdf_ocr_provider: PdfOcrProviderKind::PaddleOcr,
             paddle_ocr_model: "PaddleOCR-VL-1.6".into(),
@@ -238,8 +290,7 @@ impl PluginSettings {
     pub fn load_default() -> io::Result<Self> {
         let path = settings_path()?;
         let mut settings = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            Ok(bytes) => deserialize_settings(&bytes)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Self::default(),
             Err(error) => return Err(error),
         };
@@ -258,13 +309,14 @@ impl PluginSettings {
             && !value.trim().is_empty()
         {
             if let Some(provider) = settings.providers.first_mut()
-                && !provider.models.iter().any(|model| model == &value)
+                && !provider.models.iter().any(|model| model.id == value)
             {
-                provider.models.push(value.clone());
+                provider.models.push(AiModelConfig::language(value.clone()));
             }
             if let Some(provider) = settings.providers.first() {
                 settings.chat_provider.clone_from(&provider.id);
                 settings.ocr_provider.clone_from(&provider.id);
+                settings.embedding_provider.clone_from(&provider.id);
                 settings.translation_provider.clone_from(&provider.id);
             }
             settings.chat_model.clone_from(&value);
@@ -332,12 +384,25 @@ impl PluginSettings {
             &self.providers,
             &mut self.chat_provider,
             &mut self.chat_model,
+            AiModelKind::Language,
         );
-        normalize_selection(&self.providers, &mut self.ocr_provider, &mut self.ocr_model);
+        normalize_selection(
+            &self.providers,
+            &mut self.ocr_provider,
+            &mut self.ocr_model,
+            AiModelKind::Language,
+        );
+        normalize_selection(
+            &self.providers,
+            &mut self.embedding_provider,
+            &mut self.embedding_model,
+            AiModelKind::Embedding,
+        );
         normalize_selection(
             &self.providers,
             &mut self.translation_provider,
             &mut self.translation_model,
+            AiModelKind::Language,
         );
         self.chat_max_tool_steps = self
             .chat_max_tool_steps
@@ -373,7 +438,7 @@ impl PluginSettings {
             kind: AiProviderKind::Custom,
             name: format!("Custom {suffix}"),
             base_url: String::new(),
-            models: vec![DEFAULT_MODEL.into()],
+            models: vec![AiModelConfig::language(DEFAULT_MODEL)],
             api_key: String::new(),
         });
     }
@@ -387,12 +452,25 @@ impl PluginSettings {
             &self.providers,
             &mut self.chat_provider,
             &mut self.chat_model,
+            AiModelKind::Language,
         );
-        normalize_selection(&self.providers, &mut self.ocr_provider, &mut self.ocr_model);
+        normalize_selection(
+            &self.providers,
+            &mut self.ocr_provider,
+            &mut self.ocr_model,
+            AiModelKind::Language,
+        );
+        normalize_selection(
+            &self.providers,
+            &mut self.embedding_provider,
+            &mut self.embedding_model,
+            AiModelKind::Embedding,
+        );
         normalize_selection(
             &self.providers,
             &mut self.translation_provider,
             &mut self.translation_model,
+            AiModelKind::Language,
         );
     }
 
@@ -408,25 +486,68 @@ impl PluginSettings {
             &self.providers,
             &mut self.chat_provider,
             &mut self.chat_model,
+            AiModelKind::Language,
         );
-        normalize_selection(&self.providers, &mut self.ocr_provider, &mut self.ocr_model);
+        normalize_selection(
+            &self.providers,
+            &mut self.ocr_provider,
+            &mut self.ocr_model,
+            AiModelKind::Language,
+        );
+        normalize_selection(
+            &self.providers,
+            &mut self.embedding_provider,
+            &mut self.embedding_model,
+            AiModelKind::Embedding,
+        );
         normalize_selection(
             &self.providers,
             &mut self.translation_provider,
             &mut self.translation_model,
+            AiModelKind::Language,
         );
     }
 
     pub fn chat_endpoint(&self) -> Result<(&AiProvider, &str), String> {
-        self.endpoint(&self.chat_provider, &self.chat_model, "AI Chat")
+        self.endpoint(
+            &self.chat_provider,
+            &self.chat_model,
+            AiModelKind::Language,
+            "AI Chat",
+        )
     }
 
     pub fn ocr_endpoint(&self) -> Result<(&AiProvider, &str), String> {
-        self.endpoint(&self.ocr_provider, &self.ocr_model, "OCR")
+        self.endpoint(
+            &self.ocr_provider,
+            &self.ocr_model,
+            AiModelKind::Language,
+            "OCR",
+        )
+    }
+
+    pub fn embedding_endpoint(&self) -> Result<(&AiProvider, &AiModelConfig), String> {
+        let (provider, _) = self.endpoint(
+            &self.embedding_provider,
+            &self.embedding_model,
+            AiModelKind::Embedding,
+            "语义搜索",
+        )?;
+        let model = provider
+            .models
+            .iter()
+            .find(|model| model.kind == AiModelKind::Embedding && model.id == self.embedding_model)
+            .ok_or_else(|| "请选择 Embedding 模型".to_owned())?;
+        Ok((provider, model))
     }
 
     pub fn translation_endpoint(&self) -> Result<(&AiProvider, &str), String> {
-        self.endpoint(&self.translation_provider, &self.translation_model, "翻译")
+        self.endpoint(
+            &self.translation_provider,
+            &self.translation_model,
+            AiModelKind::Language,
+            "翻译",
+        )
     }
 
     pub(crate) fn resolved_target_language(&self, interface_language: &str) -> String {
@@ -442,6 +563,7 @@ impl PluginSettings {
         &'a self,
         provider_id: &str,
         model: &'a str,
+        expected_kind: AiModelKind,
         feature: &str,
     ) -> Result<(&'a AiProvider, &'a str), String> {
         let provider = self
@@ -466,7 +588,11 @@ impl PluginSettings {
             ));
         }
         let model = model.trim();
-        if model.is_empty() || !provider.models.iter().any(|candidate| candidate == model) {
+        if model.is_empty()
+            || !provider.models.iter().any(|candidate| {
+                model_supports_feature(candidate, expected_kind) && candidate.id == model
+            })
+        {
             return Err(format!(
                 "请先在“设置 → {feature}”中选择 {} 下的模型",
                 provider.name
@@ -490,12 +616,18 @@ impl PluginSettings {
                 provider.api_key = api_key;
             }
             for model in [&self.chat_model, &self.ocr_model, &self.translation_model] {
-                if !model.trim().is_empty() && !provider.models.contains(model) {
-                    provider.models.push(model.clone());
+                if !model.trim().is_empty()
+                    && !provider
+                        .models
+                        .iter()
+                        .any(|candidate| candidate.id == *model)
+                {
+                    provider.models.push(AiModelConfig::language(model.clone()));
                 }
             }
             self.chat_provider.clone_from(&provider.id);
             self.ocr_provider.clone_from(&provider.id);
+            self.embedding_provider.clone_from(&provider.id);
             self.translation_provider.clone_from(&provider.id);
         }
     }
@@ -565,19 +697,74 @@ impl PluginSettings {
     }
 }
 
+fn deserialize_settings(bytes: &[u8]) -> io::Result<PluginSettings> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let embedding_provider = value
+        .get("embedding_provider")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let embedding_model = value
+        .get("embedding_model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if let Some(providers) = value
+        .get_mut("providers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for provider in providers {
+            let provider_id = provider
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let Some(models) = provider
+                .get_mut("models")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            if !models.iter().all(serde_json::Value::is_string) {
+                continue;
+            }
+            *models = models
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|id| {
+                    let kind = if provider_id == embedding_provider && id == embedding_model {
+                        "embedding"
+                    } else {
+                        "language"
+                    };
+                    json!({
+                        "id": id,
+                        "kind": kind,
+                    })
+                })
+                .collect();
+        }
+    }
+    serde_json::from_value(value).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 fn ai_credential_entry(provider_id: &str) -> io::Result<Entry> {
     Entry::new(AI_CREDENTIAL_SERVICE, provider_id).map_err(io::Error::other)
 }
 
-fn normalized_models(models: Vec<String>) -> Vec<String> {
+fn normalized_models(models: Vec<AiModelConfig>) -> Vec<AiModelConfig> {
     let mut seen = std::collections::HashSet::new();
     let mut models = models
         .into_iter()
-        .map(|model| model.trim().to_owned())
-        .filter(|model| !model.is_empty() && seen.insert(model.clone()))
+        .map(|mut model| {
+            model.id = model.id.trim().to_owned();
+            model
+        })
+        .filter(|model| !model.id.is_empty() && seen.insert((model.kind, model.id.clone())))
         .collect::<Vec<_>>();
     if models.is_empty() {
-        models.push(DEFAULT_MODEL.into());
+        models.push(AiModelConfig::language(DEFAULT_MODEL));
     }
     models
 }
@@ -593,15 +780,39 @@ fn normalize_target_language(value: &str) -> String {
     }
 }
 
-fn normalize_selection(providers: &[AiProvider], provider_id: &mut String, model: &mut String) {
-    let provider = providers
+fn normalize_selection(
+    providers: &[AiProvider],
+    provider_id: &mut String,
+    model: &mut String,
+    kind: AiModelKind,
+) {
+    if let Some(provider) = providers
         .iter()
         .find(|provider| provider.id == *provider_id)
-        .unwrap_or(&providers[0]);
-    provider_id.clone_from(&provider.id);
-    if !provider.models.iter().any(|candidate| candidate == model) {
-        model.clone_from(&provider.models[0]);
+        && provider
+            .models
+            .iter()
+            .any(|candidate| model_supports_feature(candidate, kind) && candidate.id == *model)
+    {
+        return;
     }
+    if let Some((provider, selected)) = providers.iter().find_map(|provider| {
+        provider
+            .models
+            .iter()
+            .find(|candidate| model_supports_feature(candidate, kind))
+            .map(|model| (provider, model))
+    }) {
+        provider_id.clone_from(&provider.id);
+        model.clone_from(&selected.id);
+    } else {
+        provider_id.clone_from(&providers[0].id);
+        model.clear();
+    }
+}
+
+fn model_supports_feature(model: &AiModelConfig, kind: AiModelKind) -> bool {
+    model.kind == kind
 }
 
 fn settings_path() -> io::Result<PathBuf> {
@@ -640,49 +851,25 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ai_provider_is_treated_as_custom() {
-        let json = r#"{
-            "id": "legacy",
-            "name": "Local model",
-            "base_url": "http://localhost:11434/v1",
-            "models": ["qwen"]
-        }"#;
-        let provider: AiProvider = serde_json::from_str(json).unwrap();
+    fn stored_model_names_are_upgraded_once_to_typed_models() {
+        let settings = deserialize_settings(
+            br#"{
+                "providers": [{
+                    "id": "provider",
+                    "name": "Provider",
+                    "base_url": "https://example.test/v1",
+                    "models": ["chat", "embed"]
+                }],
+                "chat_provider": "provider",
+                "chat_model": "chat",
+                "embedding_provider": "provider",
+                "embedding_model": "embed"
+            }"#,
+        )
+        .unwrap();
 
-        assert_eq!(provider.kind, AiProviderKind::Custom);
-        assert_eq!(provider.base_url, "http://localhost:11434/v1");
-    }
-
-    #[test]
-    fn legacy_single_provider_settings_migrate_without_losing_models() {
-        let json = r#"{
-            "base_url": "http://localhost:11434/v1",
-            "chat_model": "qwen-chat",
-            "translation_model": "qwen-translate",
-            "target_language": "English"
-        }"#;
-        let mut settings: PluginSettings = serde_json::from_str(json).unwrap();
-        settings.normalize();
-
-        assert_eq!(settings.providers.len(), 1);
-        assert_eq!(settings.providers[0].base_url, "http://localhost:11434/v1");
-        assert!(settings.providers[0].models.contains(&"qwen-chat".into()));
-        assert!(
-            settings.providers[0]
-                .models
-                .contains(&"qwen-translate".into())
-        );
-        assert_eq!(settings.chat_model, "qwen-chat");
-        assert_eq!(settings.ocr_provider, DEFAULT_PROVIDER_ID);
-        assert_eq!(settings.ocr_model, "qwen-chat");
-        assert_eq!(settings.translation_model, "qwen-translate");
-        assert_eq!(settings.target_language, TARGET_LANGUAGE_ENGLISH);
-        assert_eq!(settings.resolved_target_language("简体中文"), "English");
-        assert_eq!(settings.translation_mode, TranslationMode::Bilingual);
-        assert!(settings.translate_toc);
-        assert!(settings.ocr_enabled);
-        assert_eq!(settings.chat_max_tool_steps, DEFAULT_CHAT_MAX_TOOL_STEPS);
-        assert_eq!(settings.chat_history_turns, DEFAULT_CHAT_HISTORY_TURNS);
+        assert_eq!(settings.providers[0].models[0].kind, AiModelKind::Language);
+        assert_eq!(settings.providers[0].models[1].kind, AiModelKind::Embedding);
     }
 
     #[test]
@@ -743,16 +930,41 @@ mod tests {
         let second = settings.providers[1].id.clone();
         settings.chat_provider.clone_from(&second);
         settings.ocr_provider.clone_from(&second);
+        settings.embedding_provider.clone_from(&second);
         settings.translation_provider = second;
 
         settings.remove_provider(1);
 
         assert_eq!(settings.chat_provider, DEFAULT_PROVIDER_ID);
         assert_eq!(settings.ocr_provider, DEFAULT_PROVIDER_ID);
+        assert_eq!(settings.embedding_provider, DEFAULT_PROVIDER_ID);
         assert_eq!(settings.translation_provider, DEFAULT_PROVIDER_ID);
         assert_eq!(settings.chat_model, DEFAULT_MODEL);
         assert_eq!(settings.ocr_model, DEFAULT_MODEL);
+        assert!(settings.embedding_model.is_empty());
         assert_eq!(settings.translation_model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn semantic_search_defaults_off_and_embedding_selection_round_trips() {
+        let mut settings = PluginSettings::default();
+        assert!(!settings.semantic_search_enabled);
+        settings.providers[0].models.push(AiModelConfig {
+            id: "text-embedding-3-small".into(),
+            kind: AiModelKind::Embedding,
+        });
+        settings.providers[0].base_url = "https://api.example.test/v1".into();
+        settings.providers[0].api_key = "secret".into();
+        settings.semantic_search_enabled = true;
+        settings.embedding_model = "text-embedding-3-small".into();
+        settings.normalize();
+
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: PluginSettings = serde_json::from_str(&json).unwrap();
+        assert!(restored.semantic_search_enabled);
+        assert_eq!(restored.embedding_provider, DEFAULT_PROVIDER_ID);
+        assert_eq!(restored.embedding_model, "text-embedding-3-small");
+        assert!(!json.contains("secret"));
     }
 
     #[test]
@@ -761,7 +973,9 @@ mod tests {
             ocr_enabled: false,
             ..PluginSettings::default()
         };
-        settings.providers[0].models.push("qwen/base".into());
+        settings.providers[0]
+            .models
+            .push(AiModelConfig::language("qwen/base"));
         settings.providers[0].api_key = "secret-key".into();
         settings.providers[0].base_url = "https://example.com/v1".into();
         settings.ocr_model = "qwen/base".into();

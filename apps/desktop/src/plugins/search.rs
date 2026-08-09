@@ -6,14 +6,20 @@ use regex::RegexBuilder;
 
 const DEFAULT_CONTEXT_CHARS: usize = 72;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BookSearchResult {
+    pub book_id: String,
+    pub book_title: String,
     pub section_index: usize,
     pub section_title: String,
     pub excerpt: String,
     pub matched_text: String,
     pub block_kind: String,
     pub range: SourceRange,
+    pub similarity: Option<f32>,
+    pub is_image: bool,
+    pub image_href: Option<String>,
+    pub image_preview: Option<Vec<u8>>,
 }
 
 pub fn search_book(
@@ -52,6 +58,8 @@ fn search_sections(
         .build()
         .map_err(|error| format!("搜索表达式无效：{error}"))?;
     let mut results = Vec::new();
+    let book_id = source.book().id.to_string();
+    let book_title = source.book().metadata.title.clone();
 
     for section_index in sections {
         let section = source
@@ -69,6 +77,8 @@ fn search_sections(
                         let range =
                             source_range_for_match(source_range, &text, found.start(), found.end());
                         results.push(BookSearchResult {
+                            book_id: book_id.clone(),
+                            book_title: book_title.clone(),
                             section_index,
                             section_title: section_title.clone(),
                             excerpt: excerpt(
@@ -80,6 +90,10 @@ fn search_sections(
                             matched_text: found.as_str().to_owned(),
                             block_kind: "table-cell".into(),
                             range,
+                            similarity: None,
+                            is_image: false,
+                            image_href: None,
+                            image_preview: None,
                         });
                         if results.len() >= max_results {
                             return Ok(results);
@@ -111,12 +125,18 @@ fn search_sections(
             for found in matcher.find_iter(&text) {
                 let range = source_range_for_match(source_range, &text, found.start(), found.end());
                 results.push(BookSearchResult {
+                    book_id: book_id.clone(),
+                    book_title: book_title.clone(),
                     section_index,
                     section_title: section_title.clone(),
                     excerpt: excerpt(&text, found.start(), found.end(), DEFAULT_CONTEXT_CHARS),
                     matched_text: found.as_str().to_owned(),
                     block_kind: block_kind.clone(),
                     range,
+                    similarity: None,
+                    is_image: false,
+                    image_href: None,
+                    image_preview: None,
                 });
                 if results.len() >= max_results {
                     return Ok(results);

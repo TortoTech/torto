@@ -69,6 +69,15 @@ struct ShelfRemoveConfirmation {
 }
 
 impl ShelfFeature {
+    pub(crate) fn book_path(&self, book_id: &str) -> Option<PathBuf> {
+        self.shelf
+            .library
+            .books()
+            .iter()
+            .find(|book| book.id == book_id)
+            .map(|book| book.path.clone())
+    }
+
     pub(crate) fn new(library: LocalLibrary, reader_fonts: Arc<[Blob<u8>]>) -> Self {
         let (language, language_error) = preferences::load_app_language().map_or_else(
             |error| {

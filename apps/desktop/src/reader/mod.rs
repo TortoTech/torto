@@ -23,6 +23,7 @@ use crate::plugins::{
     TranslationBlockInput, TranslationBookSource, has_pending_pdf_ocr_task, load_pdf_ocr_source,
 };
 use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences};
+use crate::semantic::{SemanticIndexSummary, SemanticSearchScope};
 use crate::settings::ReaderSettingsChange;
 use crate::sync::{SyncSettings, SyncStore};
 
@@ -39,6 +40,7 @@ const SCROLL_PAGE_GAP: f32 = 24.0;
 const SCROLL_PREVIOUS_REGION_HEIGHT: f32 = 56.0;
 const SCROLL_NEXT_REGION_HEIGHT: f32 = 88.0;
 static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SEMANTIC_TASK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 mod assistant;
 mod chat_autocomplete;
@@ -311,6 +313,8 @@ pub(super) struct DesktopReader {
     sync_settings: SyncSettings,
     sync_password: String,
     search: SearchUiState,
+    search_navigation_requested: Option<BookSearchResult>,
+    semantic_index: SemanticIndexUiState,
     chat: ChatUiState,
     chat_markdown: chat_markdown::ChatMarkdownState,
     translation: TranslationUiState,
@@ -608,9 +612,46 @@ struct DesktopReaderResources {
 struct SearchTask {
     source: Arc<dyn BookSource>,
     query: String,
+    mode: SearchMode,
+    scope: SemanticSearchScope,
+    book_id: String,
+    settings: PluginSettings,
 }
 
 pub(crate) type SearchTaskMessage = TaskResult<Vec<BookSearchResult>>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SearchMode {
+    #[default]
+    Text,
+    Semantic,
+}
+
+#[derive(Clone)]
+struct SemanticIndexTask {
+    source: Arc<dyn BookSource>,
+    settings: PluginSettings,
+    generation: u64,
+}
+
+pub(crate) enum SemanticIndexTaskMessage {
+    Progress {
+        id: u64,
+        generation: u64,
+        completed: usize,
+        total: usize,
+    },
+    Complete {
+        generation: u64,
+        message: TaskResult<SemanticIndexSummary>,
+    },
+}
+
+#[derive(Default)]
+struct SemanticIndexUiState {
+    progress: String,
+    task: TaskSlot<SemanticIndexTask>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusedMarkKind {
@@ -653,6 +694,8 @@ struct SearchUiState {
     focus_input: bool,
     results: Vec<BookSearchResult>,
     status: String,
+    mode: SearchMode,
+    scope: SemanticSearchScope,
     task: TaskSlot<SearchTask>,
 }
 
@@ -1136,6 +1179,20 @@ impl DesktopReader {
                 settings: plugin_settings.clone(),
             });
         }
+        let mut semantic_index = SemanticIndexUiState::default();
+        if plugin_settings.semantic_search_enabled {
+            let semantic_source: Arc<dyn BookSource> = rewrite_source.clone();
+            semantic_index.task.begin(SemanticIndexTask {
+                source: semantic_source,
+                settings: plugin_settings.clone(),
+                generation: NEXT_SEMANTIC_TASK_GENERATION.fetch_add(1, Ordering::Relaxed),
+            });
+            semantic_index.progress = language.text("索引中 0%", "Indexing 0%").into();
+        }
+        let mut search = SearchUiState::default();
+        if plugin_settings.semantic_search_enabled {
+            search.mode = SearchMode::Semantic;
+        }
         Self {
             reader,
             source,
@@ -1161,7 +1218,9 @@ impl DesktopReader {
             annotation_note_draft: None,
             selected_highlight_id: None,
             focused_mark: None,
-            search: SearchUiState::default(),
+            search,
+            search_navigation_requested: None,
+            semantic_index,
             chat: ChatUiState::default(),
             chat_markdown: chat_markdown::ChatMarkdownState::default(),
             translation: TranslationUiState::default(),

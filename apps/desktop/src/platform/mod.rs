@@ -11,6 +11,7 @@ pub(crate) enum UserEvent {
     Update(crate::updater::UpdateTaskMessage),
     ShelfSync(crate::shelf::SyncTaskMessage),
     ReaderSearch(crate::reader::SearchTaskMessage),
+    ReaderSemanticIndex(crate::reader::SemanticIndexTaskMessage),
     ReaderChatStream(crate::reader::ChatStreamMessage),
     ReaderChat(crate::reader::ChatTaskMessage),
     ReaderTranslation(crate::reader::TranslationTaskMessage),

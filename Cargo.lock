@@ -3678,6 +3678,7 @@ dependencies = [
  "anyrender",
  "atomicwrites",
  "base64",
+ "bytemuck",
  "bytes",
  "directories",
  "egui",
@@ -3704,6 +3705,7 @@ dependencies = [
  "rebook-publication",
  "rebook-reader",
  "rebook-renderer",
+ "rebook-sqlite-vec-extension",
  "regex",
  "reqwest",
  "resvg",
@@ -3823,6 +3825,14 @@ dependencies = [
  "peniko",
  "rebook-layout",
  "rebook-publication",
+]
+
+[[package]]
+name = "rebook-sqlite-vec-extension"
+version = "0.2.18"
+dependencies = [
+ "rusqlite",
+ "sqlite-vec",
 ]
 
 [[package]]
@@ -4566,6 +4576,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
 dependencies = [
  "bitflags 2.13.1",
+]
+
+[[package]]
+name = "sqlite-vec"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ba424237a9a5db2f6071f193319e2b6a32f7f3961debb2fbbfe67067abce3f"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
