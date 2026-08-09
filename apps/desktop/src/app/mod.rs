@@ -20,6 +20,7 @@ pub(crate) struct DesktopApp {
     reader: Option<DesktopReader>,
     settings: SettingsFeature,
     applied_settings_revision: u64,
+    pending_reader_notice: Option<String>,
     #[cfg(target_os = "windows")]
     updater: crate::updater::WindowsUpdater,
 }
@@ -32,12 +33,14 @@ impl DesktopApp {
             reader: None,
             settings,
             applied_settings_revision: 0,
+            pending_reader_notice: None,
             #[cfg(target_os = "windows")]
             updater: crate::updater::WindowsUpdater::new(),
         }
     }
 
     pub(crate) fn open_book(&mut self, path: &Path) {
+        self.pending_reader_notice = None;
         self.shelf.open_book(path);
         if let Some(next_reader) = self.shelf.take_opened_reader() {
             if let Some(current_reader) = self.reader.as_ref() {
@@ -205,11 +208,13 @@ impl DesktopApp {
     }
 
     fn reconcile_state(&mut self, ctx: &egui::Context) {
-        if let Some(path) = self
-            .reader
-            .as_mut()
-            .and_then(DesktopReader::take_reopen_request)
-        {
+        let reopen = self.reader.as_mut().and_then(|reader| {
+            reader
+                .take_reopen_request()
+                .map(|path| (path, reader.take_reopen_notice()))
+        });
+        if let Some((path, notice)) = reopen {
+            self.pending_reader_notice = notice;
             self.reader = None;
             self.shelf.open_book(&path);
         }
@@ -227,7 +232,12 @@ impl DesktopApp {
 
     fn promote_opened_reader(&mut self) {
         if self.reader.is_none() {
-            self.reader = self.shelf.take_opened_reader();
+            self.reader = self.shelf.take_opened_reader().map(|mut reader| {
+                if let Some(notice) = self.pending_reader_notice.take() {
+                    reader.show_notice(notice);
+                }
+                reader
+            });
         }
     }
 

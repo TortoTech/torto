@@ -229,11 +229,24 @@ impl DesktopReader {
                         self.pdf_ocr.available = true;
                         self.pdf_ocr.mode = PdfOcrViewMode::Reflow;
                         self.persist_progress();
+                        self.reopen_notice = Some(
+                            self.language
+                                .text(
+                                    "PDF OCR 解析成功，已切换到 OCR 版式",
+                                    "PDF OCR completed; switched to OCR reflow",
+                                )
+                                .into(),
+                        );
                         self.reopen_requested = Some(self.source_path.clone());
                     }
-                    Err(error) => self
-                        .error_timer
-                        .show(&mut self.error, error, Instant::now()),
+                    Err(error) => {
+                        let prefix = self.language.text("PDF OCR 解析失败", "PDF OCR failed");
+                        self.error_timer.show(
+                            &mut self.error,
+                            format!("{prefix}：{error}"),
+                            Instant::now(),
+                        );
+                    }
                 }
             }
         }

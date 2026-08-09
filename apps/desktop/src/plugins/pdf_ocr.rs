@@ -4,10 +4,11 @@ use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::Engine;
+use bytes::Bytes;
 use directories::ProjectDirs;
 use pulldown_cmark::{CowStr, Event, Options, Parser, html};
 use rebook_publication::{
@@ -19,6 +20,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 use zip::ZipArchive;
 
 use super::{MINERU_API_URL, PADDLE_OCR_JOBS_URL, PdfOcrProviderKind, PluginSettings};
@@ -28,7 +30,15 @@ const PDF_OCR_VERSION: u8 = 1;
 const PDF_OCR_DIRECTORY: &str = "pdf-ocr";
 const DOCUMENT_FILE: &str = "document.json";
 const VIEW_MODE_FILE: &str = "view-mode.json";
+const PADDLE_JOB_FILE: &str = "paddle-job.json";
+const PADDLE_JOB_VERSION: u8 = 1;
+const PADDLE_PAGE_CHUNK_SIZE: usize = 100;
 const MAX_RESULT_BYTES: usize = 512 * 1024 * 1024;
+
+type SharedOcrResult = Result<(), String>;
+type SharedOcrSender = watch::Sender<Option<SharedOcrResult>>;
+
+static PDF_OCR_TASKS: OnceLock<Mutex<HashMap<String, SharedOcrSender>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -141,6 +151,22 @@ struct ParsedOcrDocument {
     resources: Vec<OcrResourceData>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredPaddleJob {
+    version: u8,
+    book_id: String,
+    model: String,
+    page_count: usize,
+    chunks: Vec<StoredPaddleChunk>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredPaddleChunk {
+    start_page: usize,
+    end_page: usize,
+    job_id: Option<String>,
+}
+
 enum ConfiguredPdfOcrProvider<'a> {
     PaddleOcr(&'a PluginSettings),
     MinerU(&'a PluginSettings),
@@ -159,6 +185,7 @@ impl<'a> ConfiguredPdfOcrProvider<'a> {
         client: &Client,
         path: &Path,
         book_id: &str,
+        page_count: usize,
         progress: &mut F,
     ) -> Result<ParsedOcrDocument, String>
     where
@@ -166,7 +193,7 @@ impl<'a> ConfiguredPdfOcrProvider<'a> {
     {
         match self {
             Self::PaddleOcr(settings) => {
-                recognize_with_paddle(client, path, settings, progress).await
+                recognize_with_paddle(client, path, book_id, page_count, settings, progress).await
             }
             Self::MinerU(settings) => {
                 recognize_with_mineru(client, path, book_id, settings, progress).await
@@ -219,12 +246,81 @@ pub(crate) fn set_pdf_ocr_view_mode(book_id: &str, mode: PdfOcrViewMode) -> io::
     write_json_atomic(&view_mode_path(book_id)?, &mode)
 }
 
+pub(crate) fn has_pending_pdf_ocr_task(
+    book_id: &str,
+    settings: &PluginSettings,
+) -> io::Result<bool> {
+    if settings.pdf_ocr_provider != PdfOcrProviderKind::PaddleOcr {
+        return Ok(false);
+    }
+    let job_path = paddle_job_path(book_id)?;
+    let document_path = document_path(book_id)?;
+    if document_path.try_exists()?
+        && job_path.try_exists()?
+        && fs::metadata(&document_path)?.modified()? >= fs::metadata(&job_path)?.modified()?
+    {
+        return Ok(false);
+    }
+    Ok(load_paddle_job(book_id)?.is_some_and(|job| {
+        job.version == PADDLE_JOB_VERSION
+            && job.book_id == book_id
+            && job.model == settings.paddle_ocr_model.trim()
+    }))
+}
+
 pub(crate) async fn recognize_pdf<F>(
     path: PathBuf,
     book_id: String,
     page_count: usize,
     settings: PluginSettings,
     mut progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(String) + Send,
+{
+    let follower = {
+        let tasks = PDF_OCR_TASKS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut tasks = tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sender) = tasks.get(&book_id) {
+            Some(sender.subscribe())
+        } else {
+            let (sender, _receiver) = watch::channel(None);
+            tasks.insert(book_id.clone(), sender);
+            None
+        }
+    };
+    if let Some(mut receiver) = follower {
+        progress("该 PDF 正在识别，正在等待现有任务…".into());
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result;
+            }
+            if receiver.changed().await.is_err() {
+                return Err("现有 PDF OCR 任务意外结束".into());
+            }
+        }
+    }
+
+    let result = recognize_pdf_inner(path, &book_id, page_count, settings, &mut progress).await;
+    let sender = PDF_OCR_TASKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&book_id);
+    if let Some(sender) = sender {
+        sender.send_replace(Some(result.clone()));
+    }
+    result
+}
+
+async fn recognize_pdf_inner<F>(
+    path: PathBuf,
+    book_id: &str,
+    page_count: usize,
+    settings: PluginSettings,
+    progress: &mut F,
 ) -> Result<(), String>
 where
     F: FnMut(String) + Send,
@@ -240,11 +336,16 @@ where
         .map_err(|error| format!("创建 OCR HTTP 客户端失败：{error}"))?;
     let provider = ConfiguredPdfOcrProvider::new(&settings);
     let mut parsed = provider
-        .recognize(&client, &path, &book_id, &mut progress)
+        .recognize(&client, &path, book_id, page_count, progress)
         .await?;
     normalize_page_count(&mut parsed.pages, page_count);
     progress("正在生成可重排正文…".into());
-    save_document(&book_id, parsed).map_err(|error| format!("保存 PDF OCR 结果失败：{error}"))?;
+    save_document(book_id, parsed).map_err(|error| format!("保存 PDF OCR 结果失败：{error}"))?;
+    if settings.pdf_ocr_provider == PdfOcrProviderKind::PaddleOcr
+        && let Err(error) = clear_paddle_job(book_id)
+    {
+        tracing::warn!(%error, %book_id, "failed to clear completed PaddleOCR task");
+    }
     Ok(())
 }
 
@@ -255,6 +356,8 @@ where
 async fn recognize_with_paddle<F>(
     client: &Client,
     path: &Path,
+    book_id: &str,
+    page_count: usize,
     settings: &PluginSettings,
     progress: &mut F,
 ) -> Result<ParsedOcrDocument, String>
@@ -271,15 +374,140 @@ where
         .and_then(|value| value.to_str())
         .unwrap_or("document.pdf")
         .to_owned();
-    let bytes = fs::read(path).map_err(|error| format!("读取 PDF 失败：{error}"))?;
-    let part = reqwest::multipart::Part::bytes(bytes)
-        .file_name(file_name)
+    let bytes = Bytes::from(fs::read(path).map_err(|error| format!("读取 PDF 失败：{error}"))?);
+    let optional_payload = paddle_optional_payload(settings.paddle_ocr_model.trim());
+    let model = settings.paddle_ocr_model.trim();
+    let mut stored_job = load_or_create_paddle_job(book_id, model, page_count)
+        .map_err(|error| format!("保存 PaddleOCR 任务状态失败：{error}"))?;
+    let mut pages = Vec::new();
+    let mut resources = Vec::new();
+    let chunk_count = stored_job.chunks.len();
+    for chunk_index in 0..chunk_count {
+        let chunk = stored_job.chunks[chunk_index].clone();
+        let result_urls = loop {
+            let job_id = if let Some(job_id) = stored_job.chunks[chunk_index].job_id.clone() {
+                progress(paddle_resume_message(chunk_index, chunk_count));
+                job_id
+            } else {
+                let job_id = submit_paddle_chunk(
+                    client,
+                    endpoint,
+                    token,
+                    model,
+                    &optional_payload,
+                    &file_name,
+                    bytes.clone(),
+                    &chunk,
+                    chunk_index,
+                    chunk_count,
+                )
+                .await?;
+                stored_job.chunks[chunk_index].job_id = Some(job_id.clone());
+                save_paddle_job(&stored_job)
+                    .map_err(|error| format!("保存 PaddleOCR jobId 失败：{error}"))?;
+                job_id
+            };
+            match poll_paddle_job(
+                client,
+                endpoint,
+                token,
+                &job_id,
+                &chunk,
+                page_count,
+                chunk_index,
+                chunk_count,
+                progress,
+            )
+            .await?
+            {
+                PaddlePollResult::Done(urls) => break urls,
+                PaddlePollResult::Resubmit => {
+                    stored_job.chunks[chunk_index].job_id = None;
+                    save_paddle_job(&stored_job)
+                        .map_err(|error| format!("更新 PaddleOCR 任务状态失败：{error}"))?;
+                }
+                PaddlePollResult::Failed(error) => {
+                    stored_job.chunks[chunk_index].job_id = None;
+                    save_paddle_job(&stored_job)
+                        .map_err(|save_error| format!("{error}；保存重试状态失败：{save_error}"))?;
+                    return Err(error);
+                }
+            }
+        };
+        progress(paddle_download_message(chunk_index, chunk_count));
+        let mut chunk_pages = Vec::new();
+        let mut chunk_resources = Vec::new();
+        let namespace = format!("pages-{}-{}", chunk.start_page, chunk.end_page);
+        if let Some(url) = result_urls.get("jsonUrl").and_then(Value::as_str) {
+            let text = download_text(client, url, "PaddleOCR JSON").await?;
+            parse_paddle_jsonl(
+                client,
+                &text,
+                &namespace,
+                &mut chunk_pages,
+                &mut chunk_resources,
+            )
+            .await?;
+        }
+        if chunk_pages.is_empty()
+            && let Some(url) = result_urls.get("markdownUrl").and_then(Value::as_str)
+        {
+            chunk_pages.push(StoredOcrPage {
+                markdown: download_text(client, url, "PaddleOCR Markdown").await?,
+            });
+        }
+        if chunk_pages.is_empty() {
+            return Err(format!(
+                "PaddleOCR 第 {}-{} 页没有返回可读正文",
+                chunk.start_page, chunk.end_page
+            ));
+        }
+        normalize_page_range(&mut chunk_pages, chunk.start_page, chunk.end_page);
+        pages.extend(chunk_pages);
+        resources.extend(chunk_resources);
+    }
+    if pages.is_empty() {
+        return Err("PaddleOCR 返回的结果中没有可读正文".into());
+    }
+    Ok(ParsedOcrDocument {
+        provider: PdfOcrProviderKind::PaddleOcr,
+        model: model.to_owned(),
+        pages,
+        resources,
+    })
+}
+
+enum PaddlePollResult {
+    Done(Value),
+    Resubmit,
+    Failed(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_paddle_chunk(
+    client: &Client,
+    endpoint: &str,
+    token: &str,
+    model: &str,
+    optional_payload: &Value,
+    file_name: &str,
+    bytes: Bytes,
+    chunk: &StoredPaddleChunk,
+    chunk_index: usize,
+    chunk_count: usize,
+) -> Result<String, String> {
+    let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let part = reqwest::multipart::Part::stream_with_length(bytes, byte_count)
+        .file_name(file_name.to_owned())
         .mime_str("application/pdf")
         .map_err(|error| format!("创建 PDF 上传内容失败：{error}"))?;
-    let optional_payload = paddle_optional_payload(settings.paddle_ocr_model.trim());
     let form = reqwest::multipart::Form::new()
-        .text("model", settings.paddle_ocr_model.trim().to_owned())
+        .text("model", model.to_owned())
         .text("optionalPayload", optional_payload.to_string())
+        .text(
+            "pageRanges",
+            format!("{}-{}", chunk.start_page, chunk.end_page),
+        )
         .part("file", part);
     let response = client
         .post(endpoint)
@@ -293,15 +521,37 @@ where
         .json()
         .await
         .map_err(|error| format!("解析 PaddleOCR 响应失败：{error}"))?;
-    if !status.is_success() || api_code(&body).is_some_and(|code| code != 0) {
-        return Err(api_error("PaddleOCR", status.as_u16(), &body));
+    if status.is_success() && api_code(&body).is_none_or(|code| code == 0) {
+        return body
+            .pointer("/data/jobId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "PaddleOCR 没有返回 jobId".to_owned());
     }
-    let job_id = body
-        .pointer("/data/jobId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "PaddleOCR 没有返回 jobId".to_owned())?;
+    if api_code(&body) == Some(10010) {
+        let chunk = paddle_chunk_label(chunk_index, chunk_count);
+        return Err(format!("PaddleOCR 服务队列已满{chunk}，请稍后手动重试"));
+    }
+    Err(api_error("PaddleOCR", status.as_u16(), &body))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn poll_paddle_job<F>(
+    client: &Client,
+    endpoint: &str,
+    token: &str,
+    job_id: &str,
+    chunk: &StoredPaddleChunk,
+    page_count: usize,
+    chunk_index: usize,
+    chunk_count: usize,
+    progress: &mut F,
+) -> Result<PaddlePollResult, String>
+where
+    F: FnMut(String),
+{
     let poll_url = format!("{}/{}", endpoint.trim_end_matches('/'), job_id);
-    let result_urls = loop {
+    loop {
         tokio::time::sleep(Duration::from_secs(3)).await;
         let response = client
             .get(&poll_url)
@@ -315,6 +565,9 @@ where
             .await
             .map_err(|error| format!("解析 PaddleOCR 任务状态失败：{error}"))?;
         if !status.is_success() || api_code(&body).is_some_and(|code| code != 0) {
+            if matches!(api_code(&body), Some(11001 | 11002)) {
+                return Ok(PaddlePollResult::Resubmit);
+            }
             return Err(api_error("PaddleOCR", status.as_u16(), &body));
         }
         let state = body
@@ -325,50 +578,128 @@ where
             .pointer("/data/extractProgress/extractedPages")
             .and_then(value_as_usize)
         {
-            let total = body
-                .pointer("/data/extractProgress/totalPages")
-                .and_then(value_as_usize)
-                .unwrap_or(extracted);
-            progress(format!("PaddleOCR 正在解析 {extracted}/{total} 页…"));
+            let completed = chunk.start_page.saturating_sub(1);
+            let overall = completed.saturating_add(extracted).min(page_count);
+            progress(format!("PaddleOCR 正在解析 {overall}/{page_count} 页…"));
         } else {
-            progress("PaddleOCR 正在排队解析…".into());
+            progress(paddle_pending_message(chunk_index, chunk_count));
         }
         match state {
-            "done" => break body["data"]["resultUrl"].clone(),
+            "done" => {
+                return Ok(PaddlePollResult::Done(body["data"]["resultUrl"].clone()));
+            }
             "failed" => {
-                return Err(body
-                    .pointer("/data/errorMsg")
-                    .and_then(Value::as_str)
-                    .unwrap_or("PaddleOCR 解析失败")
-                    .to_owned());
+                return Ok(PaddlePollResult::Failed(
+                    body.pointer("/data/errorMsg")
+                        .and_then(Value::as_str)
+                        .unwrap_or("PaddleOCR 解析失败")
+                        .to_owned(),
+                ));
             }
             _ => {}
         }
-    };
+    }
+}
 
-    progress("正在下载 PaddleOCR 结构化结果…".into());
-    let mut pages = Vec::new();
-    let mut resources = Vec::new();
-    if let Some(url) = result_urls.get("jsonUrl").and_then(Value::as_str) {
-        let text = download_text(client, url, "PaddleOCR JSON").await?;
-        parse_paddle_jsonl(client, &text, &mut pages, &mut resources).await?;
+fn paddle_resume_message(chunk_index: usize, chunk_count: usize) -> String {
+    let chunk = paddle_chunk_label(chunk_index, chunk_count);
+    format!("正在恢复 PaddleOCR{chunk}任务…")
+}
+
+fn paddle_pending_message(chunk_index: usize, chunk_count: usize) -> String {
+    let chunk = paddle_chunk_label(chunk_index, chunk_count);
+    format!("PaddleOCR{chunk}正在排队解析…")
+}
+
+fn paddle_download_message(chunk_index: usize, chunk_count: usize) -> String {
+    let chunk = paddle_chunk_label(chunk_index, chunk_count);
+    format!("正在下载 PaddleOCR{chunk}结构化结果…")
+}
+
+fn paddle_chunk_label(chunk_index: usize, chunk_count: usize) -> String {
+    if chunk_count > 1 {
+        format!("第 {}/{} 段", chunk_index + 1, chunk_count)
+    } else {
+        String::new()
     }
-    if pages.is_empty()
-        && let Some(url) = result_urls.get("markdownUrl").and_then(Value::as_str)
+}
+
+fn paddle_page_chunks(page_count: usize) -> Vec<StoredPaddleChunk> {
+    let page_count = page_count.max(1);
+    (1..=page_count)
+        .step_by(PADDLE_PAGE_CHUNK_SIZE)
+        .map(|start_page| StoredPaddleChunk {
+            start_page,
+            end_page: start_page
+                .saturating_add(PADDLE_PAGE_CHUNK_SIZE - 1)
+                .min(page_count),
+            job_id: None,
+        })
+        .collect()
+}
+
+fn load_or_create_paddle_job(
+    book_id: &str,
+    model: &str,
+    page_count: usize,
+) -> io::Result<StoredPaddleJob> {
+    let expected_chunks = paddle_page_chunks(page_count);
+    let stored = match load_paddle_job(book_id) {
+        Ok(job) => job,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            clear_paddle_job(book_id)?;
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(job) = stored
+        && job.version == PADDLE_JOB_VERSION
+        && job.book_id == book_id
+        && job.model == model
+        && job.page_count == page_count
+        && job.chunks.len() == expected_chunks.len()
+        && job
+            .chunks
+            .iter()
+            .zip(&expected_chunks)
+            .all(|(stored, expected)| {
+                stored.start_page == expected.start_page && stored.end_page == expected.end_page
+            })
     {
-        pages.push(StoredOcrPage {
-            markdown: download_text(client, url, "PaddleOCR Markdown").await?,
-        });
+        return Ok(job);
     }
-    if pages.is_empty() {
-        return Err("PaddleOCR 返回的结果中没有可读正文".into());
+    let job = StoredPaddleJob {
+        version: PADDLE_JOB_VERSION,
+        book_id: book_id.to_owned(),
+        model: model.to_owned(),
+        page_count,
+        chunks: expected_chunks,
+    };
+    save_paddle_job(&job)?;
+    Ok(job)
+}
+
+fn load_paddle_job(book_id: &str) -> io::Result<Option<StoredPaddleJob>> {
+    let bytes = match fs::read(paddle_job_path(book_id)?) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn save_paddle_job(job: &StoredPaddleJob) -> io::Result<()> {
+    write_json_atomic(&paddle_job_path(&job.book_id)?, job)
+}
+
+fn clear_paddle_job(book_id: &str) -> io::Result<()> {
+    match fs::remove_file(paddle_job_path(book_id)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
-    Ok(ParsedOcrDocument {
-        provider: PdfOcrProviderKind::PaddleOcr,
-        model: settings.paddle_ocr_model.trim().to_owned(),
-        pages,
-        resources,
-    })
 }
 
 fn paddle_optional_payload(model: &str) -> Value {
@@ -396,6 +727,7 @@ fn paddle_optional_payload(model: &str) -> Value {
 async fn parse_paddle_jsonl(
     client: &Client,
     text: &str,
+    resource_namespace: &str,
     pages: &mut Vec<StoredOcrPage>,
     resources: &mut Vec<OcrResourceData>,
 ) -> Result<(), String> {
@@ -416,7 +748,8 @@ async fn parse_paddle_jsonl(
                         let Some(data) = value.as_str() else {
                             continue;
                         };
-                        let resource = paddle_resource(client, source, data).await?;
+                        let resource =
+                            paddle_resource(client, source, data, resource_namespace).await?;
                         markdown = replace_resource_reference(&markdown, source, &resource.href);
                         resources.push(resource);
                     }
@@ -803,6 +1136,7 @@ async fn download_remote_resource(
     client: &Client,
     source: &str,
     url: &str,
+    namespace: &str,
 ) -> Result<OcrResourceData, String> {
     let response = client
         .get(url)
@@ -826,16 +1160,19 @@ async fn download_remote_resource(
         .await
         .map_err(|error| format!("读取 OCR 图片失败：{error}"))?
         .to_vec();
-    Ok(resource_data(source, bytes, media_type))
+    Ok(namespaced_resource_data(
+        source, namespace, bytes, media_type,
+    ))
 }
 
 async fn paddle_resource(
     client: &Client,
     source: &str,
     data: &str,
+    namespace: &str,
 ) -> Result<OcrResourceData, String> {
     if data.starts_with("https://") || data.starts_with("http://") {
-        return download_remote_resource(client, source, data).await;
+        return download_remote_resource(client, source, data, namespace).await;
     }
     let (encoded, declared_media_type) = data
         .strip_prefix("data:")
@@ -851,7 +1188,9 @@ async fn paddle_resource(
         .map(str::to_owned)
         .or_else(|| image_media_type(source).map(str::to_owned))
         .unwrap_or_else(|| "image/png".into());
-    Ok(resource_data(source, bytes, media_type))
+    Ok(namespaced_resource_data(
+        source, namespace, bytes, media_type,
+    ))
 }
 
 async fn download_text(client: &Client, url: &str, label: &str) -> Result<String, String> {
@@ -899,6 +1238,24 @@ fn resource_from_bytes(source: &str, bytes: Vec<u8>) -> OcrResourceData {
 }
 
 fn resource_data(source: &str, bytes: Vec<u8>, media_type: String) -> OcrResourceData {
+    resource_data_with_identity(source, source, bytes, media_type)
+}
+
+fn namespaced_resource_data(
+    source: &str,
+    namespace: &str,
+    bytes: Vec<u8>,
+    media_type: String,
+) -> OcrResourceData {
+    resource_data_with_identity(source, &format!("{namespace}/{source}"), bytes, media_type)
+}
+
+fn resource_data_with_identity(
+    source: &str,
+    identity: &str,
+    bytes: Vec<u8>,
+    media_type: String,
+) -> OcrResourceData {
     let extension = extension_for_media(&media_type)
         .or_else(|| {
             Path::new(source)
@@ -906,7 +1263,7 @@ fn resource_data(source: &str, bytes: Vec<u8>, media_type: String) -> OcrResourc
                 .and_then(|value| value.to_str())
         })
         .unwrap_or("bin");
-    let digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
     let file_name = format!("{digest}.{extension}");
     OcrResourceData {
         source: source.replace('\\', "/"),
@@ -930,6 +1287,19 @@ fn normalize_page_count(pages: &mut Vec<StoredOcrPage>, page_count: usize) {
     }
     while pages.len() < page_count {
         let page = pages.len() + 1;
+        pages.push(StoredOcrPage {
+            markdown: format!("## 第 {page} 页\n\n本页未识别到正文。"),
+        });
+    }
+}
+
+fn normalize_page_range(pages: &mut Vec<StoredOcrPage>, start_page: usize, end_page: usize) {
+    let page_count = end_page.saturating_sub(start_page) + 1;
+    if pages.len() > page_count {
+        pages.truncate(page_count);
+    }
+    while pages.len() < page_count {
+        let page = start_page.saturating_add(pages.len());
         pages.push(StoredOcrPage {
             markdown: format!("## 第 {page} 页\n\n本页未识别到正文。"),
         });
@@ -986,6 +1356,10 @@ fn document_path(book_id: &str) -> io::Result<PathBuf> {
 
 fn view_mode_path(book_id: &str) -> io::Result<PathBuf> {
     Ok(book_directory(book_id)?.join(VIEW_MODE_FILE))
+}
+
+fn paddle_job_path(book_id: &str) -> io::Result<PathBuf> {
+    Ok(book_directory(book_id)?.join(PADDLE_JOB_FILE))
 }
 
 fn load_pdf_ocr_view_mode(book_id: &str, fallback: PdfOcrViewMode) -> io::Result<PdfOcrViewMode> {
@@ -1690,6 +2064,44 @@ mod tests {
         assert_eq!(payload["useLayoutDetection"], true);
         assert_eq!(payload["prettifyMarkdown"], true);
         assert!(payload.get("useTableRecognition").is_none());
+    }
+
+    #[test]
+    fn paddle_jobs_split_long_pdfs_into_hundred_page_ranges() {
+        let chunks = paddle_page_chunks(250);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!((chunks[0].start_page, chunks[0].end_page), (1, 100));
+        assert_eq!((chunks[1].start_page, chunks[1].end_page), (101, 200));
+        assert_eq!((chunks[2].start_page, chunks[2].end_page), (201, 250));
+    }
+
+    #[test]
+    fn paddle_chunk_padding_keeps_physical_page_numbers() {
+        let mut pages = vec![StoredOcrPage {
+            markdown: "page 101".into(),
+        }];
+        normalize_page_range(&mut pages, 101, 103);
+        assert_eq!(pages.len(), 3);
+        assert!(pages[1].markdown.contains("第 102 页"));
+        assert!(pages[2].markdown.contains("第 103 页"));
+    }
+
+    #[test]
+    fn paddle_chunk_resources_do_not_overwrite_each_other() {
+        let first = namespaced_resource_data(
+            "images/figure.png",
+            "pages-1-100",
+            vec![1],
+            "image/png".into(),
+        );
+        let second = namespaced_resource_data(
+            "images/figure.png",
+            "pages-101-200",
+            vec![2],
+            "image/png".into(),
+        );
+        assert_ne!(first.file_name, second.file_name);
+        assert_ne!(first.href, second.href);
     }
 
     #[test]

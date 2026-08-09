@@ -812,20 +812,21 @@ impl DesktopReader {
             return;
         }
         if self.plugin_settings.pdf_ocr_enabled {
-            let label = if self.pdf_ocr.task.is_pending() {
-                self.pdf_ocr.progress.as_str()
-            } else if self.pdf_ocr.available {
+            let pending = self.pdf_ocr.task.is_pending();
+            let label = if self.pdf_ocr.available {
                 self.language
                     .text("重新识别 PDF 正文", "Recognize PDF text again")
             } else {
                 self.language.text("识别 PDF 正文", "Recognize PDF text")
             };
-            let recognize = ui
-                .add_enabled_ui(!self.pdf_ocr.task.is_pending(), |ui| {
-                    icon_button(ui, Icon::ScanText)
-                })
-                .inner
-                .on_hover_text(label);
+            let recognize = ui.add_enabled_ui(!pending, |ui| icon_button(ui, Icon::ScanText));
+            let recognize = if pending {
+                recognize
+                    .inner
+                    .on_disabled_hover_text(self.pdf_ocr.progress.as_str())
+            } else {
+                recognize.inner.on_hover_text(label)
+            };
             if recognize.clicked() {
                 self.start_pdf_ocr();
             }
@@ -2420,26 +2421,6 @@ impl DesktopReader {
                         .fill(palette().toast_error_fill)
                         .show(ui, |ui| {
                             ui.label(RichText::new(error).color(Color32::WHITE));
-                        });
-                });
-        } else if self.pdf_ocr.task.is_pending() {
-            egui::Area::new("pdf-ocr-progress".into())
-                .order(egui::Order::Tooltip)
-                .anchor(egui::Align2::RIGHT_TOP, [-18.0, 62.0])
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style())
-                        .fill(palette().accent_soft)
-                        .stroke(egui::Stroke::new(1.0, palette().accent_border))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::symmetric(14, 11))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 10.0;
-                                ui.add(egui::Spinner::new().size(15.0));
-                                ui.label(
-                                    RichText::new(&self.pdf_ocr.progress).color(palette().accent),
-                                );
-                            });
                         });
                 });
         } else if let Some(notice) = &self.notice {

@@ -34,8 +34,8 @@ pub use commands::{
     resolve_chat_command,
 };
 pub(crate) use pdf_ocr::{
-    PdfOcrSourceController, PdfOcrViewMode, load_pdf_ocr_source, recognize_pdf,
-    set_pdf_ocr_view_mode,
+    PdfOcrSourceController, PdfOcrViewMode, has_pending_pdf_ocr_task, load_pdf_ocr_source,
+    recognize_pdf, set_pdf_ocr_view_mode,
 };
 pub(crate) use pdf_toc::generate_pdf_toc;
 pub use rewrite::RewriteBookSource;

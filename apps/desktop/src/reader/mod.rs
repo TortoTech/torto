@@ -20,7 +20,7 @@ use crate::library::LibraryBook;
 use crate::plugins::{
     BlockTranslation, BookSearchResult, ChatReadingContext, ChatRequestKind, ChatResponse,
     ChatTurn, PdfOcrSourceController, PdfOcrViewMode, PluginSettings, RewriteBookSource,
-    TranslationBlockInput, TranslationBookSource, load_pdf_ocr_source,
+    TranslationBlockInput, TranslationBookSource, has_pending_pdf_ocr_task, load_pdf_ocr_source,
 };
 use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences};
 use crate::settings::ReaderSettingsChange;
@@ -334,6 +334,7 @@ pub(super) struct DesktopReader {
     error_timer: TransientMessageTimer,
     source_path: PathBuf,
     reopen_requested: Option<PathBuf>,
+    reopen_notice: Option<String>,
     pub(super) exit_requested: bool,
 }
 
@@ -536,6 +537,15 @@ impl DesktopReader {
 
     pub(crate) fn take_reopen_request(&mut self) -> Option<PathBuf> {
         self.reopen_requested.take()
+    }
+
+    pub(crate) fn take_reopen_notice(&mut self) -> Option<String> {
+        self.reopen_notice.take()
+    }
+
+    pub(crate) fn show_notice(&mut self, message: String) {
+        self.notice_timer
+            .show(&mut self.notice, message, Instant::now());
     }
 
     fn apply_generated_toc(&mut self) {
@@ -1108,6 +1118,24 @@ impl DesktopReader {
                 segment_index: snapshot.location.segment_index,
                 page_index: snapshot.location.page_index,
             });
+        let mut pdf_ocr = PdfOcrUiState::new(pdf_ocr_available, pdf_ocr_mode);
+        let resume_pdf_ocr = format == BookFormat::Pdf
+            && plugin_settings.pdf_ocr_enabled
+            && has_pending_pdf_ocr_task(&book_id, &plugin_settings).unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to inspect pending PDF OCR task");
+                false
+            });
+        if resume_pdf_ocr {
+            pdf_ocr.progress = language
+                .text("正在恢复 PDF OCR 任务…", "Resuming PDF OCR task…")
+                .into();
+            pdf_ocr.task.begin(PdfOcrTask {
+                path: source_path.clone(),
+                book_id: book_id.clone(),
+                page_count: source.book().sections.len(),
+                settings: plugin_settings.clone(),
+            });
+        }
         Self {
             reader,
             source,
@@ -1138,7 +1166,7 @@ impl DesktopReader {
             chat_markdown: chat_markdown::ChatMarkdownState::default(),
             translation: TranslationUiState::default(),
             pdf_toc: PdfTocUiState::default(),
-            pdf_ocr: PdfOcrUiState::new(pdf_ocr_available, pdf_ocr_mode),
+            pdf_ocr,
             ui: ReaderUiState {
                 sidebar_open: true,
                 sidebar_pinned: true,
@@ -1180,6 +1208,7 @@ impl DesktopReader {
             error_timer: TransientMessageTimer::default(),
             source_path,
             reopen_requested: None,
+            reopen_notice: None,
             exit_requested: false,
         }
     }
