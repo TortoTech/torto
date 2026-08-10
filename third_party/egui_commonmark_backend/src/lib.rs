@@ -24,7 +24,7 @@ pub use {
 };
 
 // The only struct that is allowed to use directly. (If one does not need egui_commonmark)
-pub use misc::CommonMarkCache;
+pub use misc::{CommonMarkCache, STRONG_FONT_FAMILY};
 
 #[cfg(feature = "better_syntax_highlighting")]
 pub use syntect;

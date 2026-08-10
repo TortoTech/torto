@@ -12,10 +12,12 @@ encoding_rs.workspace = true
 flate2.workspace = true
 hayro.workspace = true
 kurbo.workspace = true
+libchm.workspace = true
 quick-xml.workspace = true
 rebook-html = { path = "../html" }
 rebook-publication = { path = "../publication" }
 roxmltree.workspace = true
+scraper.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 zip.workspace = true

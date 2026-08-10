@@ -6,7 +6,7 @@ use image::imageops::FilterType;
 use image::{DynamicImage, Rgb, RgbImage};
 use rebook_publication::BookSource;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use tokio::task::JoinSet;
 
@@ -17,6 +17,7 @@ use super::pdf_vision::{
     render_page_image, request_vision_json,
 };
 use super::{AiProvider, PluginSettings};
+use crate::generated_metadata::GeneratedPdfMetadata;
 use crate::generated_toc::{GeneratedTocDraft, GeneratedTocEntry};
 
 const SCAN_BATCH_SIZE: usize = 8;
@@ -24,19 +25,22 @@ const SCAN_PAGE_LIMIT: usize = 20;
 const SCAN_IMAGE_MAX_DIMENSION: u32 = 560;
 const EXTRACTION_BATCH_SIZE: usize = 1;
 const VISION_REQUEST_CONCURRENCY: usize = 4;
+const METADATA_PAGE_LIMIT: usize = 6;
 
 #[derive(Debug, Deserialize)]
 struct ScanResponse {
     #[serde(default)]
     p: Vec<ScannedPage>,
+    #[serde(default)]
+    m: Option<MetadataResponse>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ScannedPage {
     i: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     k: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     n: String,
 }
 
@@ -47,15 +51,69 @@ struct ExtractionResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct MetadataResponse {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    t: String,
+    #[serde(default)]
+    a: MetadataAuthors,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(untagged)]
+enum MetadataAuthors {
+    Many(Vec<String>),
+    One(String),
+    #[default]
+    Missing,
+}
+
+impl MetadataAuthors {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::Many(authors) => authors,
+            Self::One(author) => vec![author],
+            Self::Missing => Vec::new(),
+        }
+    }
+}
+
+impl MetadataResponse {
+    fn into_generated(self, provider_name: &str, model: &str) -> Option<GeneratedPdfMetadata> {
+        let title = self.t.trim().to_owned();
+        let mut authors = self
+            .a
+            .into_vec()
+            .into_iter()
+            .map(|author| author.trim().to_owned())
+            .filter(|author| !author.is_empty())
+            .collect::<Vec<_>>();
+        authors.dedup();
+        (!title.is_empty() || !authors.is_empty()).then(|| GeneratedPdfMetadata {
+            title,
+            authors,
+            provider_name: provider_name.to_owned(),
+            model: model.to_owned(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct ExtractedEntry {
     #[serde(default)]
     d: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     t: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     n: String,
     #[serde(default)]
     c: Option<f32>,
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Clone)]
@@ -64,14 +122,88 @@ struct PageNumberAnchor {
     printed_page: String,
 }
 
+pub(crate) async fn generate_pdf_metadata(
+    source: Arc<dyn BookSource>,
+    settings: PluginSettings,
+) -> Result<GeneratedPdfMetadata, String> {
+    let (provider, model) = settings.ocr_endpoint()?;
+    let provider = provider.clone();
+    let model = model.to_owned();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(150))
+        .build()
+        .map_err(|error| format!("无法创建 AI 请求客户端：{error}"))?;
+    let page_count = source.book().sections.len();
+    if page_count == 0 {
+        return Err("PDF 没有可识别的页面".into());
+    }
+    let page_indices = (0..page_count.min(METADATA_PAGE_LIMIT)).collect::<Vec<_>>();
+    let content = vec![
+        json!({
+            "type": "text",
+            "text": "Identify the book's bibliographic metadata from these opening PDF pages. Prefer the title page over covers, running headers, advertisements, series names, subtitles presented as endorsements, and filenames. Preserve the original language and spelling. Return compact JSON only: {\"t\":\"full book title\",\"a\":[\"author name\"]}. Use an empty string or array only when the value is not visible."
+        }),
+        json!({
+            "type": "image_url",
+            "image_url": {
+                "url": render_contact_sheet(source.as_ref(), &page_indices, 900)?
+            }
+        }),
+    ];
+    let value = request_vision_json(&client, &provider, &model, content).await?;
+    let response: MetadataResponse = parse_json_value(&value)?;
+    response
+        .into_generated(&provider.name, &model)
+        .ok_or_else(|| "未能从 PDF 前置页面识别出标题或作者".into())
+}
+
+pub(crate) struct PdfMetadataExtraction {
+    pub(crate) toc: Option<GeneratedTocDraft>,
+    pub(crate) toc_error: Option<String>,
+    pub(crate) metadata: Option<GeneratedPdfMetadata>,
+}
+
+#[cfg(test)]
 pub(crate) async fn generate_pdf_toc<F>(
     source: Arc<dyn BookSource>,
     settings: PluginSettings,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<GeneratedTocDraft, String>
 where
     F: FnMut(String) + Send,
 {
+    let result = extract_pdf_metadata(source, settings, true, false, on_progress).await?;
+    result
+        .toc
+        .ok_or_else(|| result.toc_error.unwrap_or_else(|| "目录识别失败".into()))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "PDF metadata extraction keeps the shared scan result and TOC fallback together"
+)]
+pub(crate) async fn extract_pdf_metadata<F>(
+    source: Arc<dyn BookSource>,
+    settings: PluginSettings,
+    need_toc: bool,
+    need_book_metadata: bool,
+    mut on_progress: F,
+) -> Result<PdfMetadataExtraction, String>
+where
+    F: FnMut(String) + Send,
+{
+    if !need_toc {
+        let metadata = if need_book_metadata {
+            Some(generate_pdf_metadata(source, settings).await?)
+        } else {
+            None
+        };
+        return Ok(PdfMetadataExtraction {
+            toc: None,
+            toc_error: None,
+            metadata,
+        });
+    }
     let (provider, model) = settings.ocr_endpoint()?;
     let provider = provider.clone();
     let model = model.to_owned();
@@ -84,21 +216,26 @@ where
         return Err("PDF 没有可识别的页面".into());
     }
 
-    let (toc_pages, anchors) = locate_toc_pages(
+    let (toc_pages, anchors, metadata) = locate_toc_pages(
         &client,
         &provider,
         &model,
         Arc::clone(&source),
         page_count,
+        need_book_metadata,
         &mut on_progress,
     )
     .await?;
     if toc_pages.is_empty() {
-        return Err("未在 PDF 前部识别到印刷目录页".into());
+        return Ok(PdfMetadataExtraction {
+            toc: None,
+            toc_error: Some("未在 PDF 前部识别到印刷目录页".into()),
+            metadata,
+        });
     }
 
     on_progress(format!("正在提取 {} 页目录…", toc_pages.len()));
-    let extracted = extract_entries(
+    let extracted = match extract_entries(
         &client,
         &provider,
         &model,
@@ -106,10 +243,25 @@ where
         &toc_pages,
         &mut on_progress,
     )
-    .await?;
+    .await
+    {
+        Ok(extracted) => extracted,
+        Err(error) => {
+            return Ok(PdfMetadataExtraction {
+                toc: None,
+                toc_error: Some(error),
+                metadata,
+            });
+        }
+    };
     let last_toc_page = toc_pages.iter().copied().max().unwrap_or(0);
-    let (offset, offset_support) = infer_page_offset(&anchors, last_toc_page)
-        .ok_or_else(|| "已识别目录，但无法建立印刷页码与 PDF 页码的映射".to_owned())?;
+    let Some((offset, offset_support)) = infer_page_offset(&anchors, last_toc_page) else {
+        return Ok(PdfMetadataExtraction {
+            toc: None,
+            toc_error: Some("已识别目录，但无法建立印刷页码与 PDF 页码的映射".into()),
+            metadata,
+        });
+    };
     let confidence_factor = if offset_support >= 3 { 1.0 } else { 0.88 };
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
@@ -138,14 +290,22 @@ where
         });
     }
     if entries.len() < 2 {
-        return Err("目录条目过少，无法生成可靠的导航目录".into());
+        return Ok(PdfMetadataExtraction {
+            toc: None,
+            toc_error: Some("目录条目过少，无法生成可靠的导航目录".into()),
+            metadata,
+        });
     }
     on_progress(format!("已生成 {} 个目录条目", entries.len()));
-    Ok(GeneratedTocDraft {
-        provider_name: provider.name,
-        model,
-        source_pages: toc_pages,
-        entries,
+    Ok(PdfMetadataExtraction {
+        toc: Some(GeneratedTocDraft {
+            provider_name: provider.name,
+            model,
+            source_pages: toc_pages,
+            entries,
+        }),
+        toc_error: None,
+        metadata,
     })
 }
 
@@ -155,8 +315,16 @@ async fn locate_toc_pages<F>(
     model: &str,
     source: Arc<dyn BookSource>,
     page_count: usize,
+    extract_metadata: bool,
     on_progress: &mut F,
-) -> Result<(Vec<usize>, Vec<PageNumberAnchor>), String>
+) -> Result<
+    (
+        Vec<usize>,
+        Vec<PageNumberAnchor>,
+        Option<GeneratedPdfMetadata>,
+    ),
+    String,
+>
 where
     F: FnMut(String),
 {
@@ -171,10 +339,20 @@ where
             .map(|(slot, page)| format!("{slot}={}", page + 1))
             .collect::<Vec<_>>()
             .join(",");
+        let metadata_instruction = if extract_metadata && batch_start == 0 {
+            " Also identify the book title and authors from these opening pages, preferring the title page over covers, running headers, advertisements, series names, endorsements, and filenames. Preserve original language and spelling. Include m as {\"t\":\"full book title\",\"a\":[\"author name\"]}; use empty values only when not visible."
+        } else {
+            ""
+        };
+        let response_shape = if extract_metadata && batch_start == 0 {
+            "{\"p\":[{\"i\":0,\"k\":\"toc|other\",\"n\":\"visible printed page number or empty\"}],\"m\":{\"t\":\"title\",\"a\":[\"author\"]}}"
+        } else {
+            "{\"p\":[{\"i\":0,\"k\":\"toc|other\",\"n\":\"visible printed page number or empty\"}]}"
+        };
         let content = vec![
             json!({
                 "type": "text",
-                "text": format!("The image is a 2-column contact sheet in row-major slot order. Slot-to-PDF-page mapping: {page_mapping}. Inspect every slot. A toc page is a printed table-of-contents page listing multiple headings with page numbers; covers, copyright pages, prefaces and chapter opening pages are other. Return compact JSON only: {{\"p\":[{{\"i\":0,\"k\":\"toc|other\",\"n\":\"visible printed page number or empty\"}}]}}. Include exactly one item for every slot. Do not infer n when it is not visibly printed."),
+                "text": format!("The image is a 2-column contact sheet in row-major slot order. Slot-to-PDF-page mapping: {page_mapping}. Inspect every slot. A toc page is a printed table-of-contents page listing multiple headings with page numbers; covers, copyright pages, prefaces and chapter opening pages are other.{metadata_instruction} Return compact JSON only: {response_shape}. Include exactly one p item for every slot. Do not infer n when it is not visibly printed."),
             }),
             json!({
                 "type": "image_url",
@@ -203,6 +381,7 @@ where
 
     let mut toc_pages = Vec::new();
     let mut anchors = Vec::new();
+    let mut metadata = None;
     let mut completed_batches = 0;
     while let Some(result) = tasks.join_next().await {
         let (batch_start, batch_end, response) =
@@ -211,6 +390,11 @@ where
         on_progress(format!(
             "正在查找目录页：{completed_batches}/{total_batches} 批"
         ));
+        if batch_start == 0 {
+            metadata = response
+                .m
+                .and_then(|metadata| metadata.into_generated(&provider.name, model));
+        }
         for page in response.p {
             if page.i >= batch_end - batch_start {
                 continue;
@@ -240,7 +424,7 @@ where
     }
     toc_pages.sort_unstable();
     toc_pages.dedup();
-    Ok((toc_pages, anchors))
+    Ok((toc_pages, anchors, metadata))
 }
 
 async fn extract_entries<F>(
@@ -386,9 +570,37 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        PageNumberAnchor, generate_pdf_toc, infer_page_offset, is_retryable_vision_response_error,
-        parse_arabic_page_number, render_page_data_url, request_vision_json,
+        MetadataResponse, PageNumberAnchor, ScanResponse, generate_pdf_toc, infer_page_offset,
+        is_retryable_vision_response_error, parse_arabic_page_number, render_page_data_url,
+        request_vision_json,
     };
+
+    #[test]
+    fn combined_scan_response_keeps_book_metadata_beside_page_classification() {
+        let response: ScanResponse = serde_json::from_value(json!({
+            "p": [{"i": 0, "k": "other", "n": ""}],
+            "m": {"t": "  Book title  ", "a": [" Author "]}
+        }))
+        .unwrap();
+        let metadata = response
+            .m
+            .and_then(|value: MetadataResponse| value.into_generated("Provider", "model"))
+            .unwrap();
+        assert_eq!(metadata.title, "Book title");
+        assert_eq!(metadata.authors, ["Author"]);
+        assert_eq!(metadata.provider_name, "Provider");
+        assert_eq!(metadata.model, "model");
+    }
+
+    #[test]
+    fn nullable_toc_strings_are_treated_as_missing_values() {
+        let response: super::ExtractionResponse = serde_json::from_value(json!({
+            "e": [{"d": 0, "t": "Chapter", "n": null, "c": 0.5}]
+        }))
+        .unwrap();
+        assert_eq!(response.e[0].t, "Chapter");
+        assert!(response.e[0].n.is_empty());
+    }
 
     #[test]
     fn page_offset_uses_the_most_supported_mapping() {
@@ -510,5 +722,31 @@ mod tests {
                 .iter()
                 .all(|entry| entry.physical_page <= page_count)
         );
+    }
+
+    #[test]
+    #[ignore = "uses the configured AI provider and a local PDF"]
+    fn live_pdf_metadata_extraction() {
+        let path = std::env::var_os("REBOOK_PDF_TOC_TEST_FILE")
+            .expect("set REBOOK_PDF_TOC_TEST_FILE to a scanned PDF");
+        let opened = rebook_formats::open_file(std::path::PathBuf::from(path))
+            .expect("test PDF should open");
+        let source = opened.source();
+        let settings = super::PluginSettings::load_default().expect("AI settings should load");
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should start");
+        let result = runtime
+            .block_on(super::extract_pdf_metadata(
+                source,
+                settings,
+                true,
+                true,
+                |message| eprintln!("{message}"),
+            ))
+            .expect("metadata extraction request should succeed");
+        eprintln!("toc error: {:?}", result.toc_error);
+        let metadata = result.metadata.expect("book metadata should be recognized");
+        eprintln!("title: {}", metadata.title);
+        eprintln!("authors: {:?}", metadata.authors);
+        assert!(!metadata.title.is_empty() || !metadata.authors.is_empty());
     }
 }

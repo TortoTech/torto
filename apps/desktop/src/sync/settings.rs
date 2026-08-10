@@ -61,6 +61,17 @@ impl CloudProviderKind {
             Self::Custom => None,
         }
     }
+
+    pub(crate) const fn credential_url(self) -> &'static str {
+        match self {
+            Self::Jianguoyun => "https://www.jianguoyun.com/s/downloads",
+            Self::InfiniCloud => "https://infini-cloud.net/en/",
+            Self::Koofr => "https://app.koofr.net",
+            Self::HiDrive => "https://www.strato.de/",
+            Self::YandexDisk => "https://id.yandex.com/security/app-passwords",
+            Self::Custom => "https://tortotech.github.io/guides/cloud-storage/",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

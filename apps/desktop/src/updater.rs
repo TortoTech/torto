@@ -777,6 +777,10 @@ mod tests {
         }
 
         let ctx = egui::Context::default();
+        crate::ui::apply_interface_typography(
+            &ctx,
+            &crate::preferences::InterfaceTypography::default(),
+        );
         let mut cache = CommonMarkCache::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             show_release_notes(ui, &mut cache, "## Feature\n\n- Update support");

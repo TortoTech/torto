@@ -9,6 +9,7 @@ pub(crate) enum UserEvent {
     OpenBook(std::path::PathBuf),
     #[cfg(target_os = "windows")]
     Update(crate::updater::UpdateTaskMessage),
+    ShelfImport(crate::shelf::ShelfImportTaskMessage),
     ShelfSync(crate::shelf::SyncTaskMessage),
     ReaderSearch(crate::reader::SearchTaskMessage),
     ReaderSemanticIndex(crate::reader::SemanticIndexTaskMessage),

@@ -7,10 +7,10 @@ use rebook_reader::ReaderVisibleTextFragment;
 use crate::platform::UserEvent;
 use crate::plugins::{
     BookSearchResult, ChatAnnotationAction, ChatCommand, ChatCommandResolution, ChatReadingContext,
-    ChatRequestKind, ChatResponse, ChatRole, ChatSelection, ChatTurn, PdfOcrViewMode,
-    TranslationBlockInput, chat_citation_link, chat_with_book, generate_pdf_toc, recognize_pdf,
-    resolve_chat_command, search_book, section_title, set_pdf_ocr_view_mode, translate_blocks,
-    translate_blocks_incremental,
+    ChatRequestKind, ChatResponse, ChatRole, ChatSelection, ChatTurn, PDF_PAGE_ANCHOR_PREFIX,
+    PdfOcrViewMode, TranslationBlockInput, chat_citation_link, chat_with_book,
+    extract_pdf_metadata, recognize_pdf, resolve_chat_command, search_book, section_title,
+    set_pdf_ocr_view_mode, translate_blocks, translate_blocks_incremental,
 };
 use crate::semantic;
 
@@ -20,10 +20,10 @@ use super::chat_autocomplete::{
 };
 use super::{
     AssistantPanel, ChatStreamMessage, ChatStreamingState, ChatTask, ChatTaskMessage,
-    DesktopReader, FocusedMark, MarkRetention, PdfOcrTask, PdfOcrTaskMessage, PdfTocTask,
-    PdfTocTaskMessage, SearchMode, SearchTask, SearchTaskMessage, SemanticIndexTaskMessage,
-    SidebarTab, SnapshotEffects, TocTranslationTask, TocTranslationTaskMessage, TranslationTask,
-    TranslationTaskMessage,
+    DesktopReader, FocusedMark, MarkRetention, PdfMetadataUpdate, PdfOcrTask, PdfOcrTaskMessage,
+    PdfTocTask, PdfTocTaskMessage, SearchMode, SearchTask, SearchTaskMessage,
+    SemanticIndexTaskMessage, SidebarTab, SnapshotEffects, TocTranslationTask,
+    TocTranslationTaskMessage, TranslationTask, TranslationTaskMessage,
 };
 
 impl DesktopReader {
@@ -233,11 +233,17 @@ impl DesktopReader {
             runtime.spawn(async move {
                 let id = request.id;
                 let payload = request.payload;
-                let result = generate_pdf_toc(payload.source, payload.settings, move |message| {
-                    let _ = progress_proxy.send_event(UserEvent::ReaderPdfToc(
-                        PdfTocTaskMessage::Progress { id, message },
-                    ));
-                })
+                let result = extract_pdf_metadata(
+                    payload.source,
+                    payload.settings,
+                    payload.need_toc,
+                    payload.missing.any(),
+                    move |message| {
+                        let _ = progress_proxy.send_event(UserEvent::ReaderPdfToc(
+                            PdfTocTaskMessage::Progress { id, message },
+                        ));
+                    },
+                )
                 .await;
                 let _ = proxy.send_event(UserEvent::ReaderPdfToc(PdfTocTaskMessage::Complete(
                     crate::async_task::TaskResult { id, result },
@@ -258,7 +264,39 @@ impl DesktopReader {
         self.pdf_toc.editing = false;
         self.pdf_toc.progress = "正在准备页面…".into();
         self.pdf_toc.task.begin(PdfTocTask {
-            source: Arc::clone(&self.source),
+            source: self.pdf_ocr_controller.as_ref().map_or_else(
+                || Arc::clone(&self.source),
+                |controller| controller.original_source(),
+            ),
+            book_id: self.book_id.clone(),
+            need_toc: true,
+            missing: self.pdf_metadata_missing,
+            settings: self.plugin_settings.clone(),
+        });
+    }
+
+    pub(super) fn start_pdf_metadata_extraction(&mut self) {
+        let need_toc = self.source.book().table_of_contents.is_empty();
+        if self.pdf_toc.task.is_pending()
+            || self.format != rebook_formats::BookFormat::Pdf
+            || !self.plugin_settings.ocr_enabled
+            || (!need_toc && !self.pdf_metadata_missing.any())
+        {
+            return;
+        }
+        self.pdf_toc.error = None;
+        self.pdf_toc.progress = self
+            .language
+            .text("正在准备元数据提取…", "Preparing metadata extraction…")
+            .into();
+        self.pdf_toc.task.begin(PdfTocTask {
+            source: self.pdf_ocr_controller.as_ref().map_or_else(
+                || Arc::clone(&self.source),
+                |controller| controller.original_source(),
+            ),
+            book_id: self.book_id.clone(),
+            need_toc,
+            missing: self.pdf_metadata_missing,
             settings: self.plugin_settings.clone(),
         });
     }
@@ -331,6 +369,15 @@ impl DesktopReader {
             PdfOcrViewMode::Original => PdfOcrViewMode::Reflow,
             PdfOcrViewMode::Reflow => PdfOcrViewMode::Original,
         };
+        let navigation_target = match self.pdf_ocr.mode {
+            PdfOcrViewMode::Original => {
+                controller.reflow_target_for_page(self.reader.location().section_index)
+            }
+            PdfOcrViewMode::Reflow => self
+                .reader
+                .current_preceding_anchor(PDF_PAGE_ANCHOR_PREFIX)
+                .and_then(|fragment| controller.original_target_for_reflow_anchor(&fragment)),
+        };
         match set_pdf_ocr_view_mode(&self.book_id, mode) {
             Ok(()) => {
                 self.persist_progress();
@@ -347,7 +394,10 @@ impl DesktopReader {
                 } else {
                     rebook_layout::ReaderStyle::default().column_gap
                 };
-                match self.reader.refresh_source_with_style(style) {
+                match self
+                    .reader
+                    .refresh_source_with_style_at_href(style, navigation_target.as_ref())
+                {
                     Ok(snapshot) => {
                         self.pdf_ocr.mode = mode;
                         self.apply_snapshot(snapshot, SnapshotEffects::static_content_change());
@@ -390,32 +440,126 @@ impl DesktopReader {
         }
     }
 
-    pub(crate) fn complete_pdf_toc(&mut self, message: PdfTocTaskMessage) {
+    pub(crate) fn complete_pdf_toc(
+        &mut self,
+        message: PdfTocTaskMessage,
+    ) -> Option<PdfMetadataUpdate> {
         match message {
             PdfTocTaskMessage::Progress { id, message } => {
                 if self.pdf_toc.task.in_flight(id).is_some() {
                     self.pdf_toc.progress = message;
                 }
+                None
             }
             PdfTocTaskMessage::Complete(message) => {
-                let Some(_request) = self.pdf_toc.task.complete(message.id) else {
-                    return;
-                };
+                let request = self.pdf_toc.task.complete(message.id)?;
+                self.pdf_toc.progress.clear();
                 match message.result {
-                    Ok(draft) => {
-                        self.pdf_toc.progress.clear();
-                        self.pdf_toc.error = None;
-                        self.pdf_toc.draft = Some(draft);
-                        self.pdf_toc.editing = false;
-                        self.apply_generated_toc();
+                    Ok(mut extraction) => {
+                        let update = extraction.metadata.take().and_then(|metadata| {
+                            self.apply_recognized_pdf_metadata(
+                                &request.book_id,
+                                request.missing,
+                                &metadata,
+                            )
+                        });
+                        if request.missing.any() && update.is_none() {
+                            self.error_timer.show(
+                                &mut self.error,
+                                self.language
+                                    .text(
+                                        "没有识别出 PDF 缺失的标题或作者",
+                                        "The missing PDF title or authors could not be recognized",
+                                    )
+                                    .into(),
+                                Instant::now(),
+                            );
+                        }
+                        if let Some(draft) = extraction.toc {
+                            self.pdf_toc.error = None;
+                            self.pdf_toc.draft = Some(draft);
+                            self.pdf_toc.editing = false;
+                            self.apply_generated_toc();
+                        } else if request.need_toc {
+                            self.pdf_toc.error = extraction.toc_error;
+                        }
+                        update
                     }
                     Err(error) => {
-                        self.pdf_toc.progress.clear();
-                        self.pdf_toc.error = Some(error);
+                        if request.need_toc {
+                            self.pdf_toc.error = Some(error);
+                        } else {
+                            self.error_timer.show(
+                                &mut self.error,
+                                format!(
+                                    "{}: {error}",
+                                    self.language.text(
+                                        "PDF 元数据提取失败",
+                                        "PDF metadata extraction failed"
+                                    )
+                                ),
+                                Instant::now(),
+                            );
+                        }
+                        None
                     }
                 }
             }
         }
+    }
+
+    fn apply_recognized_pdf_metadata(
+        &mut self,
+        book_id: &str,
+        missing: super::PdfMetadataMissing,
+        metadata: &crate::generated_metadata::GeneratedPdfMetadata,
+    ) -> Option<PdfMetadataUpdate> {
+        let title_recognized = missing.title && !metadata.title.is_empty();
+        let authors_recognized = missing.authors && !metadata.authors.is_empty();
+        if !title_recognized && !authors_recognized {
+            return None;
+        }
+        if title_recognized {
+            self.display_metadata.title.clone_from(&metadata.title);
+            self.pdf_metadata_missing.title = false;
+        }
+        if authors_recognized {
+            self.display_metadata.authors.clone_from(&metadata.authors);
+            self.pdf_metadata_missing.authors = false;
+        }
+        let mut cached = crate::generated_metadata::load(book_id)
+            .unwrap_or_default()
+            .unwrap_or_default();
+        if !metadata.title.is_empty() {
+            cached.title.clone_from(&metadata.title);
+        }
+        if !metadata.authors.is_empty() {
+            cached.authors.clone_from(&metadata.authors);
+        }
+        cached.provider_name.clone_from(&metadata.provider_name);
+        cached.model.clone_from(&metadata.model);
+        if let Err(error) = crate::generated_metadata::save(book_id, &cached) {
+            self.error_timer.show(
+                &mut self.error,
+                format!(
+                    "{}: {error}",
+                    self.language
+                        .text("保存 PDF 元数据缓存失败", "Failed to cache PDF metadata")
+                ),
+                Instant::now(),
+            );
+        } else {
+            self.show_notice(
+                self.language
+                    .text("PDF 元数据提取完成", "PDF metadata extracted")
+                    .into(),
+            );
+        }
+        Some(PdfMetadataUpdate {
+            book_id: book_id.to_owned(),
+            title: self.display_metadata.title.clone(),
+            authors: self.display_metadata.authors.clone(),
+        })
     }
 
     pub(super) fn open_search(&mut self) {
@@ -889,7 +1033,15 @@ impl DesktopReader {
     }
 
     pub(super) fn open_chat_citation(&mut self, locator: &str) {
-        let Some(citation) = parse_chat_citation(locator) else {
+        let locators = locator
+            .lines()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let citations = locators
+            .iter()
+            .filter_map(|locator| parse_chat_citation(locator))
+            .collect::<Vec<_>>();
+        let Some(citation) = citations.first() else {
             self.chat.error = Some(
                 self.language
                     .text("引用链接无效", "Invalid citation link")
@@ -897,9 +1049,27 @@ impl DesktopReader {
             );
             return;
         };
-        let target_range = citation.node.as_deref().and_then(|node| {
-            source_range_for_node(self.source.as_ref(), citation.section_index, node)
-        });
+        if citations.len() != locators.len()
+            || citations
+                .iter()
+                .any(|candidate| candidate.section_index != citation.section_index)
+        {
+            self.chat.error = Some(
+                self.language
+                    .text("引用链接无效", "Invalid citation link")
+                    .into(),
+            );
+            return;
+        }
+        let target_ranges = citations
+            .iter()
+            .filter_map(|citation| {
+                citation.node.as_deref().and_then(|node| {
+                    source_range_for_node(self.source.as_ref(), citation.section_index, node)
+                })
+            })
+            .collect::<Vec<_>>();
+        let target_range = target_ranges.first();
         let result = if let Some(range) = &target_range {
             self.reader.go_to_source(&range.start)
         } else {
@@ -907,7 +1077,8 @@ impl DesktopReader {
         };
         match result {
             Ok(result) => {
-                self.focused_mark = target_range.map(|range| FocusedMark::assistant(vec![range]));
+                self.focused_mark =
+                    (!target_ranges.is_empty()).then(|| FocusedMark::assistant(target_ranges));
                 self.apply_snapshot(
                     result.snapshot,
                     SnapshotEffects {
@@ -1222,6 +1393,10 @@ impl DesktopReader {
             self.error = Some(error);
             return;
         }
+        self.translation_source.set_fixed_page_replacement_only(
+            self.format == rebook_formats::BookFormat::Pdf
+                && self.pdf_ocr.mode == PdfOcrViewMode::Original,
+        );
         if let Err(error) = self
             .translation_source
             .set_mode(self.plugin_settings.translation_mode)

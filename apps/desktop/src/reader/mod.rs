@@ -106,12 +106,43 @@ pub(super) fn open_reader(
     let cover = shelf_cover.or_else(|| publication.cover_bytes().map(<[u8]>::to_vec));
     let canonical_source = publication.source();
     let book_id = canonical_source.book().id.to_string();
-    let display_metadata = resolve_book_display_metadata(
+    let source_title_missing = canonical_source.book().metadata.title.trim().is_empty();
+    let source_authors_missing = canonical_source
+        .book()
+        .metadata
+        .authors
+        .iter()
+        .all(|author| author.trim().is_empty());
+    let cached_pdf_metadata = if format == BookFormat::Pdf {
+        crate::generated_metadata::load(&book_id).unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to load generated PDF metadata");
+            None
+        })
+    } else {
+        None
+    };
+    let mut display_metadata = resolve_book_display_metadata(
         shelf_metadata,
         &book_id,
         &canonical_source.book().metadata.title,
         &canonical_source.book().metadata.authors,
     );
+    if let Some(metadata) = cached_pdf_metadata.as_ref() {
+        if source_title_missing && !metadata.title.is_empty() {
+            display_metadata.title.clone_from(&metadata.title);
+        }
+        if source_authors_missing && !metadata.authors.is_empty() {
+            display_metadata.authors.clone_from(&metadata.authors);
+        }
+    }
+    let pdf_title_missing = source_title_missing
+        && cached_pdf_metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.title.is_empty());
+    let pdf_authors_missing = source_authors_missing
+        && cached_pdf_metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.authors.is_empty());
     let canonical_source = if format == BookFormat::Pdf {
         crate::generated_toc::load_source(Arc::clone(&canonical_source)).unwrap_or_else(|error| {
             tracing::warn!(%error, "failed to load generated PDF table of contents");
@@ -120,10 +151,17 @@ pub(super) fn open_reader(
     } else {
         canonical_source
     };
+    let plugin_settings = PluginSettings::load_default().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load plugin settings; using defaults");
+        PluginSettings::default()
+    });
     let source_wrappers_started = Instant::now();
     let (canonical_source, pdf_ocr_controller, pdf_ocr_available, pdf_ocr_mode) =
         if format == BookFormat::Pdf {
-            match load_pdf_ocr_source(Arc::clone(&canonical_source)) {
+            match load_pdf_ocr_source(
+                Arc::clone(&canonical_source),
+                plugin_settings.pdf_ocr_reflow_enabled,
+            ) {
                 Ok(loaded) => (
                     loaded.source,
                     loaded.controller,
@@ -141,10 +179,6 @@ pub(super) fn open_reader(
     let source_wrappers_ms = source_wrappers_started.elapsed().as_secs_f32() * 1_000.0;
     let fixed_page = canonical_source.book().metadata.layout == RenditionLayout::PrePaginated;
     let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
-    let plugin_settings = PluginSettings::load_default().unwrap_or_else(|error| {
-        tracing::warn!(%error, "failed to load plugin settings; using defaults");
-        PluginSettings::default()
-    });
     let translation_source = Arc::new(if fixed_page {
         TranslationBookSource::new_fixed_page(
             rewrite_source.clone(),
@@ -240,6 +274,10 @@ pub(super) fn open_reader(
             format,
             book_id,
             display_metadata,
+            pdf_metadata_missing: PdfMetadataMissing {
+                title: pdf_title_missing,
+                authors: pdf_authors_missing,
+            },
             highlight_store,
             highlights,
             progress_store,
@@ -295,6 +333,7 @@ pub(super) struct DesktopReader {
     format: BookFormat,
     book_id: String,
     display_metadata: BookDisplayMetadata,
+    pdf_metadata_missing: PdfMetadataMissing,
     highlight_store: HighlightStore,
     highlights: Vec<StoredHighlight>,
     progress_store: Option<SyncStore>,
@@ -597,6 +636,7 @@ struct DesktopReaderResources {
     format: BookFormat,
     book_id: String,
     display_metadata: BookDisplayMetadata,
+    pdf_metadata_missing: PdfMetadataMissing,
     highlight_store: HighlightStore,
     highlights: Vec<StoredHighlight>,
     progress_store: Option<SyncStore>,
@@ -771,12 +811,15 @@ pub(crate) type TocTranslationTaskMessage = TaskResult<Vec<BlockTranslation>>;
 #[derive(Clone)]
 struct PdfTocTask {
     source: Arc<dyn BookSource>,
+    book_id: String,
+    need_toc: bool,
+    missing: PdfMetadataMissing,
     settings: PluginSettings,
 }
 
 pub(crate) enum PdfTocTaskMessage {
     Progress { id: u64, message: String },
-    Complete(TaskResult<GeneratedTocDraft>),
+    Complete(TaskResult<crate::plugins::PdfMetadataExtraction>),
 }
 
 #[derive(Default)]
@@ -786,6 +829,24 @@ struct PdfTocUiState {
     draft: Option<GeneratedTocDraft>,
     editing: bool,
     task: TaskSlot<PdfTocTask>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PdfMetadataMissing {
+    title: bool,
+    authors: bool,
+}
+
+impl PdfMetadataMissing {
+    const fn any(self) -> bool {
+        self.title || self.authors
+    }
+}
+
+pub(crate) struct PdfMetadataUpdate {
+    pub(crate) book_id: String,
+    pub(crate) title: String,
+    pub(crate) authors: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -1139,6 +1200,7 @@ impl DesktopReader {
             format,
             book_id,
             display_metadata,
+            pdf_metadata_missing,
             highlight_store,
             highlights,
             progress_store,
@@ -1179,6 +1241,27 @@ impl DesktopReader {
                 settings: plugin_settings.clone(),
             });
         }
+        let pdf_visual_source = pdf_ocr_controller.as_ref().map_or_else(
+            || Arc::clone(&source),
+            |controller| controller.original_source(),
+        );
+        let mut pdf_toc = PdfTocUiState::default();
+        let need_toc = source.book().table_of_contents.is_empty();
+        if format == BookFormat::Pdf
+            && plugin_settings.ocr_enabled
+            && (need_toc || pdf_metadata_missing.any())
+        {
+            pdf_toc.progress = language
+                .text("正在准备元数据提取…", "Preparing metadata extraction…")
+                .into();
+            pdf_toc.task.begin(PdfTocTask {
+                source: pdf_visual_source,
+                book_id: book_id.clone(),
+                need_toc,
+                missing: pdf_metadata_missing,
+                settings: plugin_settings.clone(),
+            });
+        }
         let mut semantic_index = SemanticIndexUiState::default();
         if plugin_settings.semantic_search_enabled {
             let semantic_source: Arc<dyn BookSource> = rewrite_source.clone();
@@ -1205,6 +1288,7 @@ impl DesktopReader {
             format,
             book_id,
             display_metadata,
+            pdf_metadata_missing,
             highlight_store,
             highlights,
             progress_store,
@@ -1224,7 +1308,7 @@ impl DesktopReader {
             chat: ChatUiState::default(),
             chat_markdown: chat_markdown::ChatMarkdownState::default(),
             translation: TranslationUiState::default(),
-            pdf_toc: PdfTocUiState::default(),
+            pdf_toc,
             pdf_ocr,
             ui: ReaderUiState {
                 sidebar_open: true,

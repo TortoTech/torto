@@ -618,11 +618,22 @@ async fn translate_block_batch(
             }),
             json!({ "role": "user", "content": Value::Object(input.clone()).to_string() }),
         ];
-        let message =
-            request_completion(client, provider, model, &messages, None, None, None).await?;
-        let content = message_content(&message)
-            .filter(|content| !content.trim().is_empty())
-            .ok_or_else(|| "翻译服务返回了空内容".to_owned())?;
+        let content =
+            match request_completion(client, provider, model, &messages, None, None, None).await {
+                Ok(message) => {
+                    let Some(content) =
+                        message_content(&message).filter(|content| !content.trim().is_empty())
+                    else {
+                        last_error = Some("翻译服务返回了空内容".to_owned());
+                        continue;
+                    };
+                    content
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
         match parse_translation_object(&content, &keys) {
             Ok(values) => {
                 return Ok(blocks
@@ -3283,6 +3294,63 @@ mod tests {
                 segment_index: None,
                 text: "你好".into(),
             }]]
+        );
+    }
+
+    #[test]
+    fn translation_retries_one_failed_request_before_reporting_an_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _request = read_http_request(&mut stream);
+                let (status, body) = if attempt == 0 {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"error":{"message":"temporary"}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"你好\"}"}}]}"#,
+                    )
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let provider = AiProvider {
+            base_url: format!("http://{address}/v1"),
+            ..AiProvider::default()
+        };
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(translate_block_batch(
+                &Client::new(),
+                &provider,
+                "test-model",
+                "简体中文",
+                &[TranslationBlockInput {
+                    block_index: 7,
+                    segment_index: None,
+                    text: "Hello".into(),
+                }],
+            ));
+
+        server.join().unwrap();
+        assert_eq!(
+            result.unwrap(),
+            vec![BlockTranslation {
+                block_index: 7,
+                segment_index: None,
+                text: "你好".into(),
+            }]
         );
     }
 }

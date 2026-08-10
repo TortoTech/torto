@@ -173,6 +173,7 @@
                         <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.fb2' Type='string' Value='Torto.Book'/>
                         <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.fbz' Type='string' Value='Torto.Book'/>
                         <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.cbz' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.chm' Type='string' Value='Torto.Book'/>
                         <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.pdf' Type='string' Value='Torto.Book'/>
 
                         <RegistryValue Root='HKCR' Key='Torto.Book' Type='string' Value='Torto e-book'/>
@@ -186,6 +187,7 @@
                         <RegistryValue Root='HKCR' Key='.fb2\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
                         <RegistryValue Root='HKCR' Key='.fbz\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
                         <RegistryValue Root='HKCR' Key='.cbz\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
+                        <RegistryValue Root='HKCR' Key='.chm\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
                         <RegistryValue Root='HKCR' Key='.pdf\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
                     </Component>
                 </Directory>

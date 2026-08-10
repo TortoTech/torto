@@ -27,6 +27,7 @@ const COVER_HEIGHT: f32 = 228.0;
 
 pub(crate) struct ShelfFeature {
     shelf: ShelfState,
+    import_task: TaskSlot<()>,
     pending_reader: Option<DesktopReader>,
     reader_fonts: Arc<[Blob<u8>]>,
     local_store: Option<SyncStore>,
@@ -61,6 +62,7 @@ pub(crate) struct SyncTask {
 }
 
 pub(crate) type SyncTaskMessage = TaskResult<SyncReport>;
+pub(crate) type ShelfImportTaskMessage = TaskResult<Option<Vec<PathBuf>>>;
 
 #[derive(Clone, Debug)]
 struct ShelfRemoveConfirmation {
@@ -76,6 +78,15 @@ impl ShelfFeature {
             .iter()
             .find(|book| book.id == book_id)
             .map(|book| book.path.clone())
+    }
+
+    pub(crate) fn update_book_metadata(
+        &mut self,
+        book_id: &str,
+        title: &str,
+        authors: &[String],
+    ) -> crate::library::LibraryResult<bool> {
+        self.shelf.library.update_metadata(book_id, title, authors)
     }
 
     pub(crate) fn new(library: LocalLibrary, reader_fonts: Arc<[Blob<u8>]>) -> Self {
@@ -128,6 +139,7 @@ impl ShelfFeature {
                 error_dismiss_at: initial_error_dismiss_at,
                 remove_confirmation: None,
             },
+            import_task: TaskSlot::default(),
             pending_reader: None,
             reader_fonts,
             local_store,
@@ -333,47 +345,89 @@ impl ShelfFeature {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<crate::platform::UserEvent>,
     ) {
-        let Some(request) = self.sync.task.take_pending() else {
+        if let Some(request) = self.import_task.take_pending() {
+            let proxy = proxy.clone();
+            runtime.spawn(async move {
+                let paths = rfd::AsyncFileDialog::new()
+                    .add_filter(
+                        "E-books",
+                        &[
+                            "epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm", "pdf",
+                        ],
+                    )
+                    .pick_files()
+                    .await
+                    .map(|files| {
+                        files
+                            .into_iter()
+                            .map(|file| file.path().to_path_buf())
+                            .collect()
+                    });
+                let _ = proxy.send_event(crate::platform::UserEvent::ShelfImport(
+                    ShelfImportTaskMessage {
+                        id: request.id,
+                        result: Ok(paths),
+                    },
+                ));
+            });
+        }
+
+        if let Some(request) = self.sync.task.take_pending() {
+            let proxy = proxy.clone();
+            runtime.spawn(async move {
+                let id = request.id;
+                let payload = request.payload;
+                if let Err(log_error) = append_sync_log(
+                    "INFO",
+                    &format!("sync started books={}", payload.books.len()),
+                ) {
+                    tracing::warn!(%log_error, "failed to append WebDAV sync log");
+                }
+                let result = match run_sync(payload.settings, payload.password, payload.books).await
+                {
+                    Ok(report) => {
+                        if let Err(log_error) = append_sync_log(
+                            "INFO",
+                            &format!(
+                                "sync completed uploaded_books={} downloads={} updated_progress={}",
+                                report.uploaded_books,
+                                report.downloads.len(),
+                                report.updated_progress,
+                            ),
+                        ) {
+                            tracing::warn!(%log_error, "failed to append WebDAV sync log");
+                        }
+                        Ok(report)
+                    }
+                    Err(error) => {
+                        let detail = format_error_chain(error.as_ref());
+                        if let Err(log_error) = append_sync_log("ERROR", &detail) {
+                            tracing::warn!(%log_error, "failed to append WebDAV sync log");
+                        }
+                        Err(detail)
+                    }
+                };
+                let _ = proxy.send_event(crate::platform::UserEvent::ShelfSync(SyncTaskMessage {
+                    id,
+                    result,
+                }));
+            });
+        }
+    }
+
+    pub(crate) fn complete_import(&mut self, message: ShelfImportTaskMessage) {
+        if self.import_task.complete(message.id).is_none() {
             return;
-        };
-        let proxy = proxy.clone();
-        runtime.spawn(async move {
-            let id = request.id;
-            let payload = request.payload;
-            if let Err(log_error) = append_sync_log(
-                "INFO",
-                &format!("sync started books={}", payload.books.len()),
-            ) {
-                tracing::warn!(%log_error, "failed to append WebDAV sync log");
-            }
-            let result = match run_sync(payload.settings, payload.password, payload.books).await {
-                Ok(report) => {
-                    if let Err(log_error) = append_sync_log(
-                        "INFO",
-                        &format!(
-                            "sync completed uploaded_books={} downloads={} updated_progress={}",
-                            report.uploaded_books,
-                            report.downloads.len(),
-                            report.updated_progress,
-                        ),
-                    ) {
-                        tracing::warn!(%log_error, "failed to append WebDAV sync log");
-                    }
-                    Ok(report)
-                }
-                Err(error) => {
-                    let detail = format_error_chain(error.as_ref());
-                    if let Err(log_error) = append_sync_log("ERROR", &detail) {
-                        tracing::warn!(%log_error, "failed to append WebDAV sync log");
-                    }
-                    Err(detail)
-                }
-            };
-            let _ = proxy.send_event(crate::platform::UserEvent::ShelfSync(SyncTaskMessage {
-                id,
-                result,
-            }));
-        });
+        }
+        match message.result {
+            Ok(Some(paths)) => self.import_books(&paths),
+            Ok(None) => {}
+            Err(error) => self.show_error(format!(
+                "{}: {error}",
+                self.language
+                    .text("打开文件选择器失败", "Unable to open file picker")
+            )),
+        }
     }
 
     pub(crate) fn complete_sync(&mut self, message: SyncTaskMessage) {
@@ -491,14 +545,9 @@ impl ShelfFeature {
                         self.settings_requested = true;
                     }
                     if shelf_import_button(ui, self.language.text("导入", "Import")).clicked()
-                        && let Some(paths) = rfd::FileDialog::new()
-                            .add_filter(
-                                "E-books",
-                                &["epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "pdf"],
-                            )
-                            .pick_files()
+                        && !self.import_task.is_pending()
                     {
-                        self.import_books(&paths);
+                        self.import_task.begin(());
                     }
                 });
             },

@@ -13,7 +13,7 @@ use crate::reader::{
 };
 use crate::reader::{DesktopReader, ReaderFramePlan, ReaderPageTexture};
 use crate::settings::{SettingsFeature, settings_overlay};
-use crate::shelf::{ShelfFeature, SyncTaskMessage};
+use crate::shelf::{ShelfFeature, ShelfImportTaskMessage, SyncTaskMessage};
 
 pub(crate) struct DesktopApp {
     shelf: ShelfFeature,
@@ -120,6 +120,10 @@ impl DesktopApp {
         self.shelf.complete_sync(message);
     }
 
+    pub(crate) fn complete_shelf_import(&mut self, message: ShelfImportTaskMessage) {
+        self.shelf.complete_import(message);
+    }
+
     #[cfg(target_os = "windows")]
     pub(crate) fn complete_update(&mut self, message: crate::updater::UpdateTaskMessage) {
         if let Some(result) = self.updater.complete(message) {
@@ -187,8 +191,19 @@ impl DesktopApp {
     }
 
     pub(crate) fn complete_reader_pdf_toc(&mut self, message: PdfTocTaskMessage) {
-        if let Some(reader) = self.reader.as_mut() {
-            reader.complete_pdf_toc(message);
+        let update = self
+            .reader
+            .as_mut()
+            .and_then(|reader| reader.complete_pdf_toc(message));
+        let Some(update) = update else {
+            return;
+        };
+        if let Err(error) =
+            self.shelf
+                .update_book_metadata(&update.book_id, &update.title, &update.authors)
+            && let Some(reader) = self.reader.as_mut()
+        {
+            reader.report_settings_error(format!("保存书架元数据失败：{error}"));
         }
     }
 

@@ -100,8 +100,9 @@ impl ChatMarkdownState {
         if markdown.trim().is_empty() {
             return None;
         }
-        let normalized = normalize_math_delimiters(markdown);
-        let iconized = citation_icon_markdown(normalized.as_ref());
+        let strong = normalize_loose_strong_delimiters(markdown);
+        let normalized = normalize_math_delimiters(strong.as_ref());
+        let (iconized, citation_groups) = citation_icon_markdown_with_groups(normalized.as_ref());
         let markdown = iconized.as_ref();
         let layout_blocks = split_markdown_layout_blocks(markdown);
         let all_citation_locators = citation_locators(markdown);
@@ -134,7 +135,13 @@ impl ChatMarkdownState {
                     show_markdown_table(ui, table, cache, &formula_assets, &all_citation_locators)
                 }
             };
-            clicked = clicked.or(block_clicked);
+            clicked = clicked.or_else(|| {
+                block_clicked.map(|locator| {
+                    citation_groups
+                        .get(&locator)
+                        .map_or(locator, |group| group.join("\n"))
+                })
+            });
         }
         for locator in all_citation_locators {
             self.markdown_cache.remove_link_hook(&locator);
@@ -402,8 +409,11 @@ fn show_markdown_heading(ui: &mut egui::Ui, level: usize, source: &str, add_top_
             ui.add_space(6.0);
         }
         let size = match level {
-            1 => markdown_heading_font_size(),
-            2 => crate::ui::scaled_font_size(13.75),
+            1 => crate::ui::scaled_font_size(17.0),
+            2 => crate::ui::scaled_font_size(15.5),
+            3 => crate::ui::scaled_font_size(14.5),
+            4 => crate::ui::scaled_font_size(13.75),
+            5 => crate::ui::scaled_font_size(13.25),
             _ => markdown_font_size(),
         };
         ui.add(
@@ -411,6 +421,7 @@ fn show_markdown_heading(ui: &mut egui::Ui, level: usize, source: &str, add_top_
                 RichText::new(markdown_plain_text(source))
                     .size(size)
                     .strong()
+                    .family(markdown_strong_font_family())
                     .color(palette().text),
             )
             .wrap()
@@ -488,7 +499,7 @@ fn show_markdown_table(
                             .size(markdown_font_size())
                             .color(palette().text);
                         if row_index == 0 {
-                            text = text.strong();
+                            text = text.strong().family(markdown_strong_font_family());
                         }
                         cell_ui.add(egui::Label::new(text).wrap().selectable(true));
                     } else {
@@ -538,6 +549,10 @@ fn apply_markdown_text_visuals(ui: &mut egui::Ui) {
     visuals.override_text_color = Some(palette.text);
     visuals.selection.bg_fill = selection;
     visuals.selection.stroke = Stroke::new(1.0, palette.text);
+}
+
+fn markdown_strong_font_family() -> FontFamily {
+    FontFamily::Name(egui_commonmark_backend::STRONG_FONT_FAMILY.into())
 }
 
 fn opaque_over(foreground: Color32, background: Color32) -> Color32 {
@@ -1312,6 +1327,109 @@ fn markdown_options() -> Options {
         | Options::ENABLE_MATH
 }
 
+fn normalize_loose_strong_delimiters(source: &str) -> Cow<'_, str> {
+    let mut output = String::with_capacity(source.len());
+    let mut fence = None;
+    let mut changed = false;
+    for line in source.split_inclusive('\n') {
+        let line_content = line.trim_end_matches(['\r', '\n']);
+        let line_fence = markdown_fence(line_content).map(|(marker, _)| marker);
+        if let Some(active) = fence {
+            output.push_str(line);
+            if line_fence == Some(active) {
+                fence = None;
+            }
+        } else if let Some(opening) = line_fence {
+            fence = Some(opening);
+            output.push_str(line);
+        } else {
+            let normalized = normalize_loose_strong_line(line);
+            changed |= matches!(normalized, Cow::Owned(_));
+            output.push_str(normalized.as_ref());
+        }
+    }
+    if changed {
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(source)
+    }
+}
+
+fn normalize_loose_strong_line(line: &str) -> Cow<'_, str> {
+    let bytes = line.as_bytes();
+    let mut delimiters = Vec::new();
+    let mut code_ticks = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            let count = bytes[index..]
+                .iter()
+                .take_while(|byte| **byte == b'`')
+                .count();
+            if code_ticks == Some(count) {
+                code_ticks = None;
+            } else if code_ticks.is_none() {
+                code_ticks = Some(count);
+            }
+            index += count;
+            continue;
+        }
+        if code_ticks.is_none()
+            && bytes[index..].starts_with(b"**")
+            && bytes.get(index.wrapping_sub(1)) != Some(&b'*')
+            && bytes.get(index + 2) != Some(&b'*')
+            && !is_escaped(bytes, index)
+        {
+            delimiters.push(index);
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+
+    let mut replacements = Vec::new();
+    for pair in delimiters.chunks_exact(2) {
+        let open = pair[0];
+        let close = pair[1];
+        let inner = &line[open + 2..close];
+        let trimmed_start = inner.trim_start_matches(char::is_whitespace);
+        let leading_len = inner.len() - trimmed_start.len();
+        let trimmed = trimmed_start.trim_end_matches(char::is_whitespace);
+        let trailing_len = trimmed_start.len() - trimmed.len();
+        if trimmed.is_empty() || (leading_len == 0 && trailing_len == 0) {
+            continue;
+        }
+        replacements.push((open, close + 2, leading_len, trailing_len));
+    }
+    if replacements.is_empty() {
+        return Cow::Borrowed(line);
+    }
+
+    let mut output = String::with_capacity(line.len());
+    let mut cursor = 0;
+    for (open, end, leading_len, trailing_len) in replacements {
+        let before = &line[cursor..open];
+        output.push_str(before);
+        let inner = &line[open + 2..end - 2];
+        let leading = &inner[..leading_len];
+        let content_end = inner.len().saturating_sub(trailing_len);
+        let content = &inner[leading_len..content_end];
+        let trailing = &inner[content_end..];
+        if !leading.is_empty() && !output.chars().next_back().is_some_and(char::is_whitespace) {
+            output.push_str(leading);
+        }
+        output.push_str("**");
+        output.push_str(content);
+        output.push_str("**");
+        if !trailing.is_empty() && !line[end..].chars().next().is_some_and(char::is_whitespace) {
+            output.push_str(trailing);
+        }
+        cursor = end;
+    }
+    output.push_str(&line[cursor..]);
+    Cow::Owned(output)
+}
+
 fn normalize_math_delimiters(source: &str) -> Cow<'_, str> {
     let mut output = String::with_capacity(source.len());
     let mut fence = None;
@@ -1477,7 +1595,14 @@ fn clicked_citation(cache: &CommonMarkCache, locators: &[String]) -> Option<Stri
         .cloned()
 }
 
+#[cfg(test)]
 fn citation_icon_markdown(markdown: &str) -> Cow<'_, str> {
+    citation_icon_markdown_with_groups(markdown).0
+}
+
+fn citation_icon_markdown_with_groups(
+    markdown: &str,
+) -> (Cow<'_, str>, HashMap<String, Vec<String>>) {
     let normalized = normalize_internal_citations(markdown);
     let markdown = normalized.as_ref();
     let mut replacements = Vec::new();
@@ -1498,25 +1623,75 @@ fn citation_icon_markdown(markdown: &str) -> Cow<'_, str> {
         }
     }
     if replacements.is_empty() {
-        return normalized;
+        return (normalized, HashMap::new());
     }
 
     let mut output = String::with_capacity(markdown.len());
+    let mut groups = HashMap::new();
     let mut cursor = 0;
-    for (range, locator) in replacements {
+    let mut index = 0;
+    while index < replacements.len() {
+        let (range, locator) = &replacements[index];
         if range.start < cursor {
+            index += 1;
             continue;
+        }
+        let mut group_end = index + 1;
+        while group_end < replacements.len() {
+            let (previous_range, previous_locator) = &replacements[group_end - 1];
+            let (next_range, next_locator) = &replacements[group_end];
+            if !markdown[previous_range.end..next_range.start]
+                .trim()
+                .is_empty()
+                || !citation_locators_are_adjacent(previous_locator, next_locator)
+            {
+                break;
+            }
+            group_end += 1;
         }
         output.push_str(&markdown[cursor..range.start]);
         output.push('[');
         output.push_str(CITATION_ICON);
         output.push_str("](<");
-        output.push_str(&locator);
+        output.push_str(locator);
         output.push_str(">)");
-        cursor = range.end;
+        if group_end > index + 1 {
+            groups.insert(
+                locator.clone(),
+                replacements[index..group_end]
+                    .iter()
+                    .map(|(_, locator)| locator.clone())
+                    .collect(),
+            );
+        }
+        cursor = replacements[group_end - 1].0.end;
+        index = group_end;
     }
     output.push_str(&markdown[cursor..]);
-    Cow::Owned(output)
+    (Cow::Owned(output), groups)
+}
+
+fn citation_locators_are_adjacent(left: &str, right: &str) -> bool {
+    let Some((left_section, left_node)) = citation_locator_position(left) else {
+        return false;
+    };
+    let Some((right_section, right_node)) = citation_locator_position(right) else {
+        return false;
+    };
+    left_section == right_section && left_node.checked_add(1) == Some(right_node)
+}
+
+fn citation_locator_position(locator: &str) -> Option<(usize, u64)> {
+    let remainder = locator.strip_prefix(CHAT_CITATION_PREFIX)?;
+    let (section, node) = remainder.split_once('/')?;
+    let section = section.parse().ok()?;
+    let digits = node
+        .rsplit_once(|character: char| !character.is_ascii_digit())
+        .map_or(node, |(_, digits)| digits);
+    (!digits.is_empty())
+        .then(|| digits.parse().ok())
+        .flatten()
+        .map(|node| (section, node))
 }
 
 fn normalize_internal_citations(source: &str) -> Cow<'_, str> {
@@ -1882,6 +2057,24 @@ flowchart LR
     }
 
     #[test]
+    fn normalizes_model_authored_whitespace_inside_strong_delimiters() {
+        let source = "如** “可瞥见阅读”（glanceable reading）**，可快速浏览。";
+        let normalized = normalize_loose_strong_delimiters(source);
+        assert_eq!(
+            normalized,
+            "如 **“可瞥见阅读”（glanceable reading）**，可快速浏览。"
+        );
+        assert!(
+            Parser::new_ext(normalized.as_ref(), markdown_options())
+                .any(|event| matches!(event, Event::Start(Tag::Strong)))
+        );
+        assert_eq!(
+            normalize_loose_strong_delimiters("`** code **`\n\n```md\n** code **\n```"),
+            "`** code **`\n\n```md\n** code **\n```"
+        );
+    }
+
+    #[test]
     fn normalizes_latex_parentheses_without_touching_code() {
         let source =
             "Inline \\(x^2\\), display \\[y^2\\], and `\\(code\\)`.\n\n```tex\n\\(code\\)\n```";
@@ -2036,6 +2229,22 @@ flowchart LR
         let source = "[出处](link://j/1/n1)、[出处](link://j/2/n2)";
 
         assert!(citation_icon_markdown(source).contains("、"));
+    }
+
+    #[test]
+    fn adjacent_paragraph_citations_share_one_icon_and_click_target() {
+        let source = "结论【11/n17†source】【11/n18†source】";
+        let (iconized, groups) = citation_icon_markdown_with_groups(source);
+        assert_eq!(iconized.matches(CITATION_ICON).count(), 1);
+        assert_eq!(
+            groups.get("link://j/11/n17"),
+            Some(&vec!["link://j/11/n17".into(), "link://j/11/n18".into()])
+        );
+
+        let (iconized, groups) =
+            citation_icon_markdown_with_groups("结论【11/n17†source】【11/n19†source】");
+        assert_eq!(iconized.matches(CITATION_ICON).count(), 2);
+        assert!(groups.is_empty());
     }
 
     #[test]

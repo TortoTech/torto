@@ -1276,7 +1276,7 @@ impl ReaderSession {
             .copied()
             .unwrap_or(0);
         self.touch(key);
-        Ok(self.moved())
+        Ok(self.moved_to_toc_target(href))
     }
 
     /// Moves in constant time while pages are cached. Section boundaries compile
@@ -1404,14 +1404,55 @@ impl ReaderSession {
         &mut self,
         style: ReaderStyle,
     ) -> Result<ReaderSnapshot, ReaderError> {
+        self.refresh_source_with_style_at_href(style, None)
+    }
+
+    /// Rebuilds the active source and optionally restores a destination in the
+    /// new publication structure. This is used when an overlay changes the
+    /// number or identity of spine sections, such as PDF OCR reflow.
+    pub fn refresh_source_with_style_at_href(
+        &mut self,
+        style: ReaderStyle,
+        target: Option<&PublicationUrl>,
+    ) -> Result<ReaderSnapshot, ReaderError> {
         let fraction = page_fraction(self.current_page, self.current_page_count());
+        let toc_items: Arc<[TocViewItem]> =
+            flatten_toc(&self.source.book().table_of_contents).into();
+        let mut section_indices_by_path = HashMap::with_capacity(self.source.book().sections.len());
+        for (index, section) in self.source.book().sections.iter().enumerate() {
+            section_indices_by_path
+                .entry(section.href.path().to_owned())
+                .or_insert(index);
+        }
+        let toc_index = TocIndex::new(
+            &toc_items,
+            &section_indices_by_path,
+            self.source.book().sections.len(),
+        );
         let repository = Arc::new(SectionRepository::new(Arc::clone(&self.source)));
-        let section = repository.load(self.current_section)?;
-        let segment_index = self
-            .current_segment
-            .min(section.segments.len().saturating_sub(1));
+        let section_index = target.map_or_else(
+            || {
+                self.current_section
+                    .min(self.source.book().sections.len().saturating_sub(1))
+            },
+            |href| {
+                section_indices_by_path
+                    .get(href.path())
+                    .copied()
+                    .unwrap_or(0)
+            },
+        );
+        let section = repository.load(section_index)?;
+        let segment_index = target
+            .and_then(PublicationUrl::fragment)
+            .and_then(|fragment| section.anchor_segments.get(fragment))
+            .copied()
+            .unwrap_or_else(|| {
+                self.current_segment
+                    .min(section.segments.len().saturating_sub(1))
+            });
         let key = SegmentKey {
-            section_index: self.current_section,
+            section_index,
             segment_index,
         };
         let segment = compile_segment(
@@ -1428,19 +1469,59 @@ impl ReaderSession {
             Arc::clone(&repository),
             Arc::clone(&self.fonts),
         )?;
+        let target_page = target
+            .and_then(PublicationUrl::fragment)
+            .and_then(|fragment| segment.anchor_pages.get(fragment))
+            .copied();
 
         self.repository = repository;
         self.prefetch_worker = prefetch_worker;
+        self.toc_items = toc_items;
+        self.toc_index = toc_index;
+        self.section_indices_by_path = section_indices_by_path;
         self.prefetch_inflight.clear();
         self.prefetch_failures.clear();
         self.cache.clear();
         self.lru.clear();
         self.style = style;
+        self.current_section = section_index;
         self.current_segment = segment_index;
         self.cache.insert(key, Arc::new(segment));
         self.touch(key);
-        self.current_page = page_for_fraction(fraction, self.current_page_count());
+        self.current_page =
+            target_page.unwrap_or_else(|| page_for_fraction(fraction, self.current_page_count()));
         Ok(self.snapshot())
+    }
+
+    /// Returns the closest authored anchor at or before the current page whose
+    /// fragment starts with `prefix`.
+    pub fn current_preceding_anchor(&self, prefix: &str) -> Option<String> {
+        let section = self.current_section_data();
+        let current_segment = section.segments.get(self.current_segment)?;
+        let cached = self.cache.get(&SegmentKey {
+            section_index: self.current_section,
+            segment_index: self.current_segment,
+        })?;
+        section
+            .fragments
+            .iter()
+            .enumerate()
+            .take(current_segment.fragment_range.end)
+            .flat_map(|(fragment_index, fragment)| {
+                fragment
+                    .anchors
+                    .iter()
+                    .filter(move |anchor| {
+                        anchor.fragment.starts_with(prefix)
+                            && (fragment_index < current_segment.fragment_range.start
+                                || cached
+                                    .anchor_pages
+                                    .get(&anchor.fragment)
+                                    .is_some_and(|page| *page <= self.current_page))
+                    })
+                    .map(|anchor| anchor.fragment.clone())
+            })
+            .next_back()
     }
 
     pub fn cached_segment_count(&self) -> usize {
@@ -1981,6 +2062,25 @@ impl ReaderSession {
         }
     }
 
+    fn moved_to_toc_target(&self, target: &PublicationUrl) -> NavigationResult {
+        let mut snapshot = self.snapshot();
+        if let Some(item) = self
+            .toc_items
+            .iter()
+            .find(|item| item.target.as_ref() == Some(target))
+        {
+            snapshot.active_toc_id = Some(item.id.clone());
+            snapshot.active_toc_path.clone_from(&item.ancestors);
+            if item.has_children {
+                snapshot.active_toc_path.push(item.id.clone());
+            }
+        }
+        NavigationResult {
+            outcome: NavigationOutcome::Moved,
+            snapshot,
+        }
+    }
+
     fn boundary(&self) -> NavigationResult {
         NavigationResult {
             outcome: NavigationOutcome::Boundary,
@@ -2513,7 +2613,11 @@ fn range_ends_with_word(text: &str, range: &Range<usize>, word: &Range<usize>) -
         })
 }
 
-fn is_sentence_terminal(character: char) -> bool {
+/// Returns whether a character terminates a sentence for semantic selection.
+///
+/// OCR reflow also uses this rule so page-boundary merging and sentence
+/// selection agree on CJK and Latin terminal punctuation.
+pub fn is_sentence_terminal(character: char) -> bool {
     matches!(character, '.' | '!' | '?' | '。' | '！' | '？' | '…' | '‥')
 }
 
@@ -3087,6 +3191,56 @@ mod tests {
                 })?;
             self.parse_counts[index].fetch_add(1, Ordering::Relaxed);
             Ok(section)
+        }
+
+        fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+            Err(PublicationError::ResourceNotFound(href.to_string()))
+        }
+    }
+
+    struct SwitchingSource {
+        original_book: Book,
+        original_sections: Vec<Section>,
+        derived_book: Book,
+        derived_sections: Vec<Section>,
+        derived: AtomicBool,
+    }
+
+    impl SwitchingSource {
+        fn new(original: &Arc<CountingSource>, derived: &Arc<CountingSource>) -> Arc<Self> {
+            Arc::new(Self {
+                original_book: original.book.clone(),
+                original_sections: original.sections.clone(),
+                derived_book: derived.book.clone(),
+                derived_sections: derived.sections.clone(),
+                derived: AtomicBool::new(false),
+            })
+        }
+
+        fn set_derived(&self, derived: bool) {
+            self.derived.store(derived, Ordering::Release);
+        }
+
+        fn active(&self) -> (&Book, &[Section]) {
+            if self.derived.load(Ordering::Acquire) {
+                (&self.derived_book, &self.derived_sections)
+            } else {
+                (&self.original_book, &self.original_sections)
+            }
+        }
+    }
+
+    impl BookSource for SwitchingSource {
+        fn book(&self) -> &Book {
+            self.active().0
+        }
+
+        fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+            self.active()
+                .1
+                .get(index)
+                .cloned()
+                .ok_or_else(|| PublicationError::ResourceNotFound(format!("section {index}")))
         }
 
         fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
@@ -4043,6 +4197,56 @@ mod tests {
     }
 
     #[test]
+    fn explicit_toc_navigation_keeps_the_clicked_item_active_on_shared_pages() {
+        let mut source = CountingSource::new(&["Shared page content".into()]);
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        let spine = source_mut.sections[0].id.clone();
+        let source_range = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "n0".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "n0".into(),
+                text_offset: 19,
+            },
+        };
+        source_mut.sections[0].anchors = vec![
+            SectionAnchor {
+                fragment: "first".into(),
+                source: source_range.start.clone(),
+            },
+            SectionAnchor {
+                fragment: "second".into(),
+                source: source_range.start,
+            },
+        ];
+        source_mut.book.table_of_contents = vec![
+            TocEntry {
+                label: "First".into(),
+                href: Some(PublicationUrl::parse("section-0.xhtml#first").unwrap()),
+                children: Vec::new(),
+            },
+            TocEntry {
+                label: "Second".into(),
+                href: Some(PublicationUrl::parse("section-0.xhtml#second").unwrap()),
+                children: Vec::new(),
+            },
+        ];
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+
+        assert_eq!(reader.snapshot().active_toc_id.as_deref(), Some("1"));
+        let result = reader
+            .go_to_href(&PublicationUrl::parse("section-0.xhtml#first").unwrap())
+            .unwrap();
+
+        assert_eq!(result.snapshot.active_toc_id.as_deref(), Some("0"));
+    }
+
+    #[test]
     fn distant_anchor_navigation_resolves_within_continuous_section_layout() {
         let mut source = CountingSource::new(&["placeholder".into()]);
         let source_mut = Arc::get_mut(&mut source).unwrap();
@@ -4405,6 +4609,38 @@ mod tests {
         assert!((new_fraction - old_fraction).abs() <= one_page);
         assert_eq!(source.parse_count(0), 2);
         assert_eq!(reader.cached_segment_count(), 1);
+    }
+
+    #[test]
+    fn source_refresh_rebuilds_navigation_when_reading_order_changes() {
+        let original = CountingSource::new(&[
+            "Original page one".into(),
+            "Original page two".into(),
+            "Original page three".into(),
+        ]);
+        let derived = CountingSource::new(&["Continuous OCR section".into()]);
+        let source = SwitchingSource::new(&original, &derived);
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+
+        source.set_derived(true);
+        let derived_target = source.derived_book.sections[0].href.clone();
+        let snapshot = reader
+            .refresh_source_with_style_at_href(ReaderStyle::default(), Some(&derived_target))
+            .unwrap();
+        assert_eq!(snapshot.location.section_index, 0);
+        assert_eq!(reader.section_index_for_href(&derived_target), Some(0));
+        assert_eq!(reader.section_count(), 1);
+
+        source.set_derived(false);
+        let original_target = source.original_book.sections[2].href.clone();
+        let snapshot = reader
+            .refresh_source_with_style_at_href(ReaderStyle::default(), Some(&original_target))
+            .unwrap();
+        assert_eq!(snapshot.location.section_index, 2);
+        assert_eq!(reader.section_index_for_href(&original_target), Some(2));
+        assert_eq!(reader.section_count(), 3);
     }
 
     #[test]

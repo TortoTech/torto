@@ -240,6 +240,41 @@ impl LocalLibrary {
         Ok(true)
     }
 
+    pub(crate) fn update_metadata(
+        &mut self,
+        id: &str,
+        title: &str,
+        authors: &[String],
+    ) -> LibraryResult<bool> {
+        let Some(index) = self.books.iter().position(|book| book.id == id) else {
+            return Ok(false);
+        };
+        let mut books = self.books.clone();
+        let book = &mut books[index];
+        let title = title.trim();
+        let mut normalized_authors = authors
+            .iter()
+            .map(|author| author.trim().to_owned())
+            .filter(|author| !author.is_empty())
+            .collect::<Vec<_>>();
+        normalized_authors.dedup();
+        let mut changed = false;
+        if !title.is_empty() && book.title != title {
+            title.clone_into(&mut book.title);
+            changed = true;
+        }
+        if !normalized_authors.is_empty() && book.authors != normalized_authors {
+            book.authors = normalized_authors;
+            changed = true;
+        }
+        if !changed {
+            return Ok(false);
+        }
+        self.persist_books(&books)?;
+        self.books = books;
+        Ok(true)
+    }
+
     #[cfg(test)]
     fn persist(&self) -> LibraryResult<()> {
         self.persist_books(&self.books)
@@ -433,6 +468,40 @@ mod tests {
         assert_eq!(second.duplicates, 1);
         assert_eq!(library.books.len(), 1);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_update_is_persisted_without_replacing_values_with_empty_fields() {
+        let root = test_directory("metadata-update");
+        let mut library = LocalLibrary::load_from(root.clone()).unwrap();
+        let managed_path = root.join(BOOKS_DIRECTORY).join("book.pdf");
+        fs::write(&managed_path, b"fixture").unwrap();
+        library.books.push(LibraryBook {
+            id: "book".into(),
+            title: "filename".into(),
+            authors: Vec::new(),
+            file_name: "book.pdf".into(),
+            path: managed_path,
+            cover_bytes: None,
+            added_at: 1,
+        });
+        library.persist().unwrap();
+
+        assert!(
+            library
+                .update_metadata("book", "Recognized title", &[" Author ".into()])
+                .unwrap()
+        );
+        assert!(
+            !library
+                .update_metadata("book", "", &Vec::<String>::new())
+                .unwrap()
+        );
+
+        let loaded = LocalLibrary::load_from(root.clone()).unwrap();
+        assert_eq!(loaded.books[0].title, "Recognized title");
+        assert_eq!(loaded.books[0].authors, ["Author"]);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -200,6 +200,7 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::OpenBook(path) => self.app.open_book(&path),
             #[cfg(target_os = "windows")]
             UserEvent::Update(message) => self.app.complete_update(message),
+            UserEvent::ShelfImport(message) => self.app.complete_shelf_import(message),
             UserEvent::ShelfSync(message) => self.app.complete_shelf_sync(message),
             UserEvent::ReaderSearch(message) => self.app.complete_reader_search(message),
             UserEvent::ReaderSemanticIndex(message) => {
@@ -376,7 +377,9 @@ mod tests {
         assert!(wix.contains("Id='FileAssociationsFeature'"));
         assert!(wix.contains("Title='E-book file associations'"));
         assert!(wix.contains("Value='&quot;[APPLICATIONFOLDER]torto.exe&quot; &quot;%1&quot;'"));
-        for extension in ["epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "pdf"] {
+        for extension in [
+            "epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm", "pdf",
+        ] {
             assert!(
                 wix.contains(&format!(
                     "Name='.{extension}' Type='string' Value='Torto.Book'"
@@ -416,7 +419,7 @@ mod tests {
         assert!(document_types.contains("<key>CFBundleDocumentTypes</key>"));
         assert!(document_types.contains("<string>org.idpf.epub-container</string>"));
         assert!(document_types.contains("<string>com.adobe.pdf</string>"));
-        for extension in ["mobi", "azw", "azw3", "fb2", "fbz", "cbz"] {
+        for extension in ["mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm"] {
             assert!(
                 document_types.contains(&format!("<string>{extension}</string>")),
                 "missing macOS document declaration for .{extension}"

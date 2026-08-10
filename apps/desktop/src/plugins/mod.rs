@@ -35,10 +35,10 @@ pub use commands::{
     resolve_chat_command,
 };
 pub(crate) use pdf_ocr::{
-    PdfOcrSourceController, PdfOcrViewMode, has_pending_pdf_ocr_task, load_pdf_ocr_source,
-    recognize_pdf, set_pdf_ocr_view_mode,
+    PDF_PAGE_ANCHOR_PREFIX, PdfOcrSourceController, PdfOcrViewMode, has_pending_pdf_ocr_task,
+    load_pdf_ocr_source, recognize_pdf, set_pdf_ocr_view_mode,
 };
-pub(crate) use pdf_toc::generate_pdf_toc;
+pub(crate) use pdf_toc::{PdfMetadataExtraction, extract_pdf_metadata};
 pub use rewrite::RewriteBookSource;
 pub use search::{BookSearchResult, search_book};
 pub(crate) use search::{section_title, text_block_kind, text_block_text};
@@ -78,6 +78,13 @@ impl PdfOcrProviderKind {
         match self {
             Self::PaddleOcr => "PaddleOCR",
             Self::MinerU => "MinerU",
+        }
+    }
+
+    pub(crate) const fn credential_url(self) -> &'static str {
+        match self {
+            Self::PaddleOcr => "https://aistudio.baidu.com/paddleocr/task",
+            Self::MinerU => "https://mineru.net/apiManage/docs",
         }
     }
 }
@@ -231,6 +238,7 @@ pub struct PluginSettings {
     pub embedding_provider: String,
     pub embedding_model: String,
     pub pdf_ocr_enabled: bool,
+    pub pdf_ocr_reflow_enabled: bool,
     pub pdf_ocr_provider: PdfOcrProviderKind,
     pub paddle_ocr_model: String,
     #[serde(skip)]
@@ -268,6 +276,7 @@ impl Default for PluginSettings {
             embedding_provider: DEFAULT_PROVIDER_ID.into(),
             embedding_model: String::new(),
             pdf_ocr_enabled: false,
+            pdf_ocr_reflow_enabled: false,
             pdf_ocr_provider: PdfOcrProviderKind::PaddleOcr,
             paddle_ocr_model: "PaddleOCR-VL-1.6".into(),
             paddle_ocr_token: String::new(),
@@ -971,6 +980,7 @@ mod tests {
     fn ocr_selection_round_trips_and_only_accepts_configured_models() {
         let mut settings = PluginSettings {
             ocr_enabled: false,
+            pdf_ocr_reflow_enabled: true,
             ..PluginSettings::default()
         };
         settings.providers[0]
@@ -985,6 +995,7 @@ mod tests {
         let json = serde_json::to_string(&settings).unwrap();
         let restored: PluginSettings = serde_json::from_str(&json).unwrap();
         assert!(!restored.ocr_enabled);
+        assert!(restored.pdf_ocr_reflow_enabled);
         assert_eq!(restored.ocr_provider, DEFAULT_PROVIDER_ID);
         assert_eq!(restored.ocr_model, "qwen/base");
 

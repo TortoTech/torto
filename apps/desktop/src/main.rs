@@ -6,6 +6,7 @@ mod app;
 mod async_task;
 mod diagnostics;
 mod fonts;
+mod generated_metadata;
 mod generated_toc;
 mod highlights;
 mod library;

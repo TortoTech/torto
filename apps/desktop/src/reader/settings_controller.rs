@@ -72,6 +72,10 @@ impl DesktopReader {
             || old_embedding_provider != new_embedding_provider;
         let semantic_enable_changed =
             self.plugin_settings.semantic_search_enabled != plugin_settings.semantic_search_enabled;
+        let toc_recognition_enable_changed =
+            self.plugin_settings.ocr_enabled != plugin_settings.ocr_enabled;
+        let pdf_ocr_reflow_changed =
+            self.plugin_settings.pdf_ocr_reflow_enabled != plugin_settings.pdf_ocr_reflow_enabled;
 
         if let Err(error) = self
             .translation_source
@@ -127,6 +131,12 @@ impl DesktopReader {
                         self.search.mode = SearchMode::Semantic;
                     }
                 }
+                if !self.plugin_settings.ocr_enabled {
+                    self.pdf_toc.task.cancel();
+                    self.pdf_toc.progress.clear();
+                } else if toc_recognition_enable_changed {
+                    self.start_pdf_metadata_extraction();
+                }
                 self.apply_snapshot(
                     snapshot,
                     SnapshotEffects {
@@ -135,6 +145,15 @@ impl DesktopReader {
                     },
                 );
                 self.queue_toc_translation();
+                if pdf_ocr_reflow_changed && self.pdf_ocr.available {
+                    self.persist_progress();
+                    self.reopen_notice = Some(
+                        language
+                            .text("已更新 PDF OCR 内容重排", "PDF OCR content reflow updated")
+                            .into(),
+                    );
+                    self.reopen_requested = Some(self.source_path.clone());
+                }
             }
             Err(error) => {
                 self.error = Some(format!(

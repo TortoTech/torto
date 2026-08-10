@@ -146,7 +146,9 @@ impl TranslationBookSource {
                     section
                         .blocks
                         .get(input.block_index)
-                        .and_then(block_source_range)
+                        .and_then(|block| {
+                            translation_input_source_range(block, input.segment_index)
+                        })
                         .is_some_and(|source| {
                             visible_ranges
                                 .iter()
@@ -241,7 +243,24 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
                     });
                 }
             }
-            Block::Table(_) | Block::Separator | Block::PageBreak => {}
+            Block::Table(table) => {
+                blocks.extend(
+                    table
+                        .rows
+                        .iter()
+                        .flat_map(|row| &row.cells)
+                        .enumerate()
+                        .filter_map(|(cell_index, cell)| {
+                            let text = text_block_text(&cell.text);
+                            (!text.trim().is_empty()).then_some(TranslationBlockInput {
+                                block_index,
+                                segment_index: Some(cell_index),
+                                text,
+                            })
+                        }),
+                );
+            }
+            Block::Separator | Block::PageBreak => {}
         }
     }
     blocks
@@ -275,6 +294,21 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
     }
 }
 
+fn translation_input_source_range(
+    block: &Block,
+    segment_index: Option<usize>,
+) -> Option<&SourceRange> {
+    if let (Block::Table(table), Some(segment_index)) = (block, segment_index) {
+        return table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .nth(segment_index)
+            .and_then(|cell| cell.text.source.as_ref());
+    }
+    block_source_range(block)
+}
+
 fn source_range_nodes_overlap(source: &SourceRange, visible: &SourceRange) -> bool {
     source.start.spine == visible.start.spine
         && (source.start.node == visible.start.node
@@ -299,18 +333,10 @@ impl BookSource for TranslationBookSource {
             .state
             .read()
             .map_err(|_| PublicationError::InvalidPublication("正文翻译状态已损坏".to_owned()))?;
-        if !state.enabled {
-            return Ok(section);
-        }
-        let Some(translations) = state.sections.get(&index) else {
+        let Some(translations) = active_translations(&state, index) else {
             return Ok(section);
         };
-        let mode = if is_pdf {
-            TranslationMode::Replace
-        } else {
-            state.mode
-        };
-
+        let mode = normalized_translation_mode(is_pdf, state.mode);
         let mut rendered = Vec::with_capacity(section.blocks.len() * 2);
         for (block_index, block) in section.blocks.into_iter().enumerate() {
             let Some(translation) = translations.get(&block_index) else {
@@ -386,6 +412,14 @@ impl BookSource for TranslationBookSource {
                         rendered.push(Block::Text(translated));
                     }
                 }
+                Block::Table(table) if !translation.segments.is_empty() => {
+                    rendered.push(Block::Table(translated_table(
+                        table,
+                        &translation.segments,
+                        mode,
+                        &mut section.anchors,
+                    )));
+                }
                 other => rendered.push(other),
             }
         }
@@ -403,6 +437,53 @@ impl BookSource for TranslationBookSource {
     ) -> Result<Option<RasterResource>, PublicationError> {
         self.inner.raster_resource(href)
     }
+}
+
+fn active_translations(
+    state: &TranslationState,
+    section_index: usize,
+) -> Option<&HashMap<usize, StoredBlockTranslation>> {
+    state
+        .enabled
+        .then(|| state.sections.get(&section_index))
+        .flatten()
+}
+
+fn translated_table(
+    mut table: rebook_publication::TableBlock,
+    translations: &HashMap<usize, String>,
+    mode: TranslationMode,
+    anchors: &mut [SectionAnchor],
+) -> rebook_publication::TableBlock {
+    for (cell_index, cell) in table
+        .rows
+        .iter_mut()
+        .flat_map(|row| &mut row.cells)
+        .enumerate()
+    {
+        let Some(translated) = translations.get(&cell_index) else {
+            continue;
+        };
+        let style = cell
+            .text
+            .content
+            .iter()
+            .find_map(|inline| match inline {
+                Inline::Text(run) => Some(run.style),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .unwrap_or_default();
+        if mode == TranslationMode::Replace {
+            cell.text.content = replacement_content(translated, style);
+            update_translated_source(cell.text.source.as_mut(), translated, anchors);
+        } else {
+            cell.text.content.push(Inline::Break);
+            cell.text
+                .content
+                .extend(replacement_content(translated, style));
+        }
+    }
+    table
 }
 
 fn normalized_translation_mode(
@@ -1046,6 +1127,49 @@ mod tests {
             Block::Image(image)
                 if image.text_layer.as_ref().unwrap().replacement.as_ref().unwrap().segments[0].text == "你好，PDF"
         ));
+    }
+
+    #[test]
+    fn translates_ocr_reflow_table_cells_and_matches_their_visible_ranges() {
+        let base = source();
+        let book = base.book().clone();
+        let descriptor = book.sections[0].clone();
+        let section = rebook_html::parse_section(
+            "<html><body><table><tr><td>Hello</td><td>World</td></tr></table></body></html>",
+            &descriptor,
+            |_| None,
+        )
+        .unwrap();
+        let visible = match &section.blocks[0] {
+            Block::Table(table) => table.rows[0].cells[0].text.source.clone().unwrap(),
+            _ => panic!("expected table"),
+        };
+        let source = TranslationBookSource::new(
+            Arc::new(TestSource { book, section }),
+            TranslationMode::Replace,
+        );
+        let pending = source
+            .untranslated_blocks_for_ranges(0, &[visible])
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].segment_index, Some(0));
+        source
+            .store_section(
+                0,
+                &[BlockTranslation {
+                    block_index: 0,
+                    segment_index: Some(0),
+                    text: "你好".into(),
+                }],
+            )
+            .unwrap();
+        source.set_enabled(true).unwrap();
+        let section = source.parse_section(0).unwrap();
+        let Block::Table(table) = &section.blocks[0] else {
+            panic!("expected translated table");
+        };
+        assert_eq!(text_block_text(&table.rows[0].cells[0].text), "你好");
+        assert_eq!(text_block_text(&table.rows[0].cells[1].text), "World");
     }
 
     #[test]

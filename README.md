@@ -42,7 +42,7 @@ Unlike browser-based readers, Torto parses, lays out, paginates, and renders boo
 
 | **Feature** | **Description** | **Status** |
 | --- | --- | --- |
-| **Multi-format support** | Read DRM-free EPUB, MOBI, AZW, AZW3/KF8, FB2, FBZ, CBZ, and PDF files. | ✅ |
+| **Multi-format support** | Read DRM-free EPUB, MOBI, AZW, AZW3/KF8, FB2, FBZ, CBZ, CHM, and PDF files. | ✅ |
 | **Native rendering** | Parse, lay out, paginate, and render books with Rust instead of embedding a browser or WebView. | ✅ |
 | **Page and scroll modes** | Switch between single-page, two-page, and chapter-based vertical scrolling layouts. | ✅ |
 | **Library management** | Import books in bulk, display metadata and covers, search by title or author, and detect duplicates. | ✅ |

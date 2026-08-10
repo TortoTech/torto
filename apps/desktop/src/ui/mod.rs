@@ -229,12 +229,24 @@ pub(crate) fn apply_interface_typography(
             .collect()
     };
     let mut interface_fonts = Vec::new();
+    let mut interface_bold_fonts = Vec::new();
     for family in requested_families {
         if interface_fonts.iter().any(|loaded| loaded == &family) {
             continue;
         }
-        if let Some(key) = load_system_font(&database, &family, &mut fonts) {
+        if let Some(key) = load_system_font(
+            &database,
+            &family,
+            fontdb::Weight::NORMAL,
+            "regular",
+            &mut fonts,
+        ) {
             interface_fonts.push(key);
+        }
+        if let Some(key) =
+            load_system_font(&database, &family, fontdb::Weight::BOLD, "bold", &mut fonts)
+        {
+            interface_bold_fonts.push(key);
         }
     }
     let proportional_fallbacks = fonts
@@ -247,7 +259,13 @@ pub(crate) fn apply_interface_typography(
     interface_fonts.dedup();
     fonts
         .families
-        .insert(FontFamily::Proportional, interface_fonts);
+        .insert(FontFamily::Proportional, interface_fonts.clone());
+    interface_bold_fonts.extend(interface_fonts);
+    interface_bold_fonts.dedup();
+    fonts.families.insert(
+        FontFamily::Name(egui_commonmark_backend::STRONG_FONT_FAMILY.into()),
+        interface_bold_fonts,
+    );
 
     let monospace_fonts = fonts.families.entry(FontFamily::Monospace).or_default();
     monospace_fonts.push("reader-cjk".into());
@@ -290,16 +308,18 @@ pub(crate) fn available_interface_font_families() -> Vec<String> {
 fn load_system_font(
     database: &fontdb::Database,
     family: &str,
+    weight: fontdb::Weight,
+    variant: &str,
     fonts: &mut FontDefinitions,
 ) -> Option<String> {
     let families = [fontdb::Family::Name(family)];
     let id = database.query(&fontdb::Query {
         families: &families,
-        weight: fontdb::Weight::NORMAL,
+        weight,
         stretch: fontdb::Stretch::Normal,
         style: fontdb::Style::Normal,
     })?;
-    let key = format!("system-ui-{family}");
+    let key = format!("system-ui-{variant}-{family}");
     let data = database.with_face_data(id, |bytes, index| {
         let mut data = FontData::from_owned(bytes.to_vec());
         data.index = index;

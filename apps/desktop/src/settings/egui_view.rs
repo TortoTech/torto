@@ -621,25 +621,28 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             field_label(ui, language.text("模型", "Models"));
             for model_index in 0..provider.models.len() {
                 let can_remove_model = provider.models.len() > 1;
-                ui.horizontal_centered(|ui| {
-                    ai_model_kind_selector(
-                        ui,
-                        &provider.id,
-                        model_index,
-                        &mut provider.models[model_index],
-                    );
-                    let available_width = if can_remove_model {
-                        ui.available_width() - 40.0
-                    } else {
-                        ui.available_width()
-                    };
-                    let width = available_width.clamp(96.0, 520.0);
-                    text_field_sized(ui, &mut provider.models[model_index].id, false, width);
-                    if can_remove_model && icon_button(ui, Icon::Minus).clicked() {
-                        remove_model = Some((index, model_index));
-                    }
-                });
-                ui.add_space(6.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), 36.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ai_model_kind_selector(
+                            ui,
+                            &provider.id,
+                            model_index,
+                            &mut provider.models[model_index],
+                        );
+                        let available_width = if can_remove_model {
+                            ui.available_width() - 40.0
+                        } else {
+                            ui.available_width()
+                        };
+                        let width = available_width.clamp(96.0, 520.0);
+                        text_field_sized(ui, &mut provider.models[model_index].id, false, width);
+                        if can_remove_model && icon_button(ui, Icon::Minus).clicked() {
+                            remove_model = Some((index, model_index));
+                        }
+                    },
+                );
             }
             if secondary_button(ui, language.text("添加模型", "Add model")).clicked() {
                 provider.models.push(AiModelConfig::language(String::new()));
@@ -722,13 +725,10 @@ fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     settings_card(ui, |ui| {
         ui.checkbox(
             &mut settings.ocr_enabled,
-            language.text("启用目录识别", "Enable contents recognition"),
+            language.text("启用元数据提取", "Enable metadata extraction"),
         );
         ui.add_space(8.0);
-        field_label(
-            ui,
-            language.text("目录识别模型", "Contents recognition model"),
-        );
+        field_label(ui, language.text("视觉识别模型", "Vision model"));
         configured_model_selector(
             ui,
             "ocr-model",
@@ -744,16 +744,37 @@ fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             &mut settings.pdf_ocr_enabled,
             language.text("启用 PDF 正文 OCR", "Enable PDF document OCR"),
         );
+        ui.add_enabled_ui(settings.pdf_ocr_enabled, |ui| {
+            ui.checkbox(
+                &mut settings.pdf_ocr_reflow_enabled,
+                language.text("启用内容重排", "Enable content reflow"),
+            );
+        });
         ui.add_space(8.0);
         field_label(ui, language.text("OCR 服务", "OCR provider"));
-        egui::ComboBox::from_id_salt("pdf-ocr-provider")
-            .width(SETTINGS_MODEL_SELECT_WIDTH)
-            .selected_text(settings.pdf_ocr_provider.label())
-            .show_ui(ui, |ui| {
-                for provider in PdfOcrProviderKind::ALL {
-                    ui.selectable_value(&mut settings.pdf_ocr_provider, provider, provider.label());
-                }
-            });
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 28.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                egui::ComboBox::from_id_salt("pdf-ocr-provider")
+                    .width(SETTINGS_MODEL_SELECT_WIDTH)
+                    .selected_text(settings.pdf_ocr_provider.label())
+                    .show_ui(ui, |ui| {
+                        for provider in PdfOcrProviderKind::ALL {
+                            ui.selectable_value(
+                                &mut settings.pdf_ocr_provider,
+                                provider,
+                                provider.label(),
+                            );
+                        }
+                    });
+                provider_credential_button(
+                    ui,
+                    settings.pdf_ocr_provider.credential_url(),
+                    language.text("获取 API Token", "Get API token"),
+                );
+            },
+        );
         ui.add_space(8.0);
         match settings.pdf_ocr_provider {
             PdfOcrProviderKind::PaddleOcr => {
@@ -816,24 +837,6 @@ fn semantic_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             &mut settings.embedding_provider,
             &mut settings.embedding_model,
             language,
-        );
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new(language.text(
-                "隐私提示：启用后，Torto 会把打开书籍的正文段落发送给第三方 Embedding Provider。",
-                "Privacy: Torto sends paragraphs from opened books to your third-party Embedding Provider.",
-            ))
-            .size(crate::ui::scaled_font_size(12.0))
-            .color(palette().muted),
-        );
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new(language.text(
-                "索引、正文分段和向量只保存在本机 semantic-v1.sqlite3 中，不会上传到 WebDAV。更换模型或向量维度后，旧索引会失效，并在再次打开书籍时重建。",
-                "The index, chunks, and vectors stay only in local semantic-v1.sqlite3 and are never uploaded to WebDAV. Changing the model or vector dimensions invalidates the old index; books rebuild when opened again.",
-            ))
-            .size(crate::ui::scaled_font_size(12.0))
-            .color(palette().muted),
         );
     });
 }
@@ -1061,14 +1064,25 @@ fn cloud_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         ui.add_space(8.0);
         field_label(ui, language.text("云盘提供商", "Cloud provider"));
         let mut selected_provider = settings.provider;
-        egui::ComboBox::from_id_salt("cloud-provider")
-            .width(SETTINGS_SELECT_WIDTH)
-            .selected_text(selected_provider.label())
-            .show_ui(ui, |ui| {
-                for provider in CloudProviderKind::ALL {
-                    ui.selectable_value(&mut selected_provider, provider, provider.label());
-                }
-            });
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 28.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                egui::ComboBox::from_id_salt("cloud-provider")
+                    .width(SETTINGS_SELECT_WIDTH)
+                    .selected_text(selected_provider.label())
+                    .show_ui(ui, |ui| {
+                        for provider in CloudProviderKind::ALL {
+                            ui.selectable_value(&mut selected_provider, provider, provider.label());
+                        }
+                    });
+                provider_credential_button(
+                    ui,
+                    selected_provider.credential_url(),
+                    language.text("获取连接凭据", "Get connection credentials"),
+                );
+            },
+        );
         if selected_provider != settings.provider {
             settings.select_provider(selected_provider);
         }
@@ -1103,6 +1117,15 @@ fn sync_interval_label(minutes: u32, language: AppLanguage) -> String {
         60 => language.text("1 小时", "1 h").into(),
         180 => language.text("3 小时", "3 h").into(),
         _ => format!("{minutes} {}", language.text("分钟", "min")),
+    }
+}
+
+fn provider_credential_button(ui: &mut egui::Ui, url: &str, tooltip: &str) {
+    if icon_button(ui, Icon::ExternalLink)
+        .on_hover_text(tooltip)
+        .clicked()
+    {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
     }
 }
 

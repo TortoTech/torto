@@ -41,6 +41,7 @@ const ASSISTANT_INPUT_HEIGHT: f32 = 32.0;
 const ASSISTANT_SELECTION_SCROLL_EDGE: f32 = 36.0;
 const ASSISTANT_SELECTION_SCROLL_MIN_SPEED: f32 = 90.0;
 const ASSISTANT_SELECTION_SCROLL_MAX_SPEED: f32 = 640.0;
+const ASSISTANT_KEYBOARD_SCROLL_STEP: f32 = 64.0;
 const TOOLBAR_HEIGHT: f32 = 48.0;
 const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
 const TOOLBAR_TITLE_SIZE: f32 = 15.0;
@@ -1561,6 +1562,12 @@ impl DesktopReader {
             .streaming
             .as_ref()
             .map(|streaming| streaming.content.clone());
+        let keyboard_scroll = assistant_keyboard_scroll_input(
+            ui,
+            &self.chat.input,
+            self.chat.cursor_char_index,
+            &self.chat.references,
+        );
         let mut clicked_citation = None;
         let scroll_output = egui::ScrollArea::vertical()
             .stick_to_bottom(true)
@@ -1568,6 +1575,9 @@ impl DesktopReader {
             .min_scrolled_height(height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if let Some(delta) = keyboard_scroll.filter(|delta| *delta != 0.0) {
+                    ui.scroll_with_delta(Vec2::new(0.0, -delta));
+                }
                 let content_width =
                     (ui.available_width() - ASSISTANT_SCROLLBAR_GUTTER).max(1.0);
                 ui.set_width(content_width);
@@ -2734,6 +2744,28 @@ fn assistant_composer_keys(
             AssistantSuggestionAcceptance::None
         },
     }
+}
+
+fn assistant_keyboard_scroll_input(
+    ui: &mut egui::Ui,
+    input_text: &str,
+    cursor_char_index: usize,
+    references: &[ChatReference],
+) -> Option<f32> {
+    let suggestions_active = chat_reference_token(input_text, cursor_char_index, references)
+        .is_some()
+        || !chat_command_suggestions(input_text).is_empty();
+    (!suggestions_active).then(|| {
+        ui.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                -ASSISTANT_KEYBOARD_SCROLL_STEP
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                ASSISTANT_KEYBOARD_SCROLL_STEP
+            } else {
+                0.0
+            }
+        })
+    })
 }
 
 fn active_suggestion_count(references: &[ChatReference], commands: &[ChatCommand]) -> usize {

@@ -3,6 +3,8 @@ use egui::{
     CursorIcon, Response, RichText, Sense, Stroke, TextBuffer, TextStyle, Ui, WidgetInfo,
     WidgetType, pos2, text::LayoutJob, vec2,
 };
+
+pub const STRONG_FONT_FAMILY: &str = "egui-commonmark-strong";
 use std::collections::HashMap;
 
 use crate::pulldown::ScrollableCache;
@@ -167,6 +169,7 @@ impl Style {
                     text = text.size(size);
                 }
             }
+            text = text.family(egui::FontFamily::Name(STRONG_FONT_FAMILY.into()));
         }
 
         if self.quote {
@@ -174,7 +177,9 @@ impl Style {
         }
 
         if self.strong {
-            text = text.strong();
+            text = text
+                .strong()
+                .family(egui::FontFamily::Name(STRONG_FONT_FAMILY.into()));
         }
 
         if self.emphasis {

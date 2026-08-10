@@ -49,6 +49,7 @@ fontdb = "0.23.0"
 hayro = "0.7.1"
 image = { version = "=0.25.6", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 kurbo = "0.13.1"
+libchm = "0.2.0"
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 parley = { version = "0.10.0", features = ["complex-scripts"] }
 peniko = "0.6.1"
@@ -66,6 +67,7 @@ resvg = "0.47.0"
 rfd = "0.17.2"
 roxmltree = "0.21.1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+scraper = { version = "0.27.0", default-features = false }
 sqlite-vec = "=0.1.9"
 rebook-sqlite-vec-extension = { path = "crates/sqlite-vec-extension" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
