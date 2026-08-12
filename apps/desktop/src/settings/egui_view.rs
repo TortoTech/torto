@@ -375,43 +375,45 @@ fn reading_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 });
                 ui.end_row();
 
-                settings_row_label(ui, state.draft_language.text("分页模式", "Page layout"));
-                settings_row_control_sized(ui, 250.0, |ui| {
-                    let single = state.draft_spread == SpreadMode::Single;
-                    if choice_button(
-                        ui,
-                        state.draft_language.text("单页", "Single"),
-                        single,
-                        72.0,
-                    )
-                    .clicked()
-                    {
-                        state.draft_spread = SpreadMode::Single;
-                    }
-                    let double = state.draft_spread == SpreadMode::Double;
-                    if choice_button(
-                        ui,
-                        state.draft_language.text("双页", "Double"),
-                        double,
-                        72.0,
-                    )
-                    .clicked()
-                    {
-                        state.draft_spread = SpreadMode::Double;
-                    }
-                    let scroll = state.draft_spread == SpreadMode::Scroll;
-                    if choice_button(
-                        ui,
-                        state.draft_language.text("滑动", "Scroll"),
-                        scroll,
-                        72.0,
-                    )
-                    .clicked()
-                    {
-                        state.draft_spread = SpreadMode::Scroll;
-                    }
-                });
-                ui.end_row();
+                if state.draft_reading_mode == ReadingMode::Classic {
+                    settings_row_label(ui, state.draft_language.text("分页模式", "Page layout"));
+                    settings_row_control_sized(ui, 250.0, |ui| {
+                        let single = state.draft_spread == SpreadMode::Single;
+                        if choice_button(
+                            ui,
+                            state.draft_language.text("单页", "Single"),
+                            single,
+                            72.0,
+                        )
+                        .clicked()
+                        {
+                            state.draft_spread = SpreadMode::Single;
+                        }
+                        let double = state.draft_spread == SpreadMode::Double;
+                        if choice_button(
+                            ui,
+                            state.draft_language.text("双页", "Double"),
+                            double,
+                            72.0,
+                        )
+                        .clicked()
+                        {
+                            state.draft_spread = SpreadMode::Double;
+                        }
+                        let scroll = state.draft_spread == SpreadMode::Scroll;
+                        if choice_button(
+                            ui,
+                            state.draft_language.text("滑动", "Scroll"),
+                            scroll,
+                            72.0,
+                        )
+                        .clicked()
+                        {
+                            state.draft_spread = SpreadMode::Scroll;
+                        }
+                    });
+                    ui.end_row();
+                }
 
                 settings_row_label(ui, state.draft_language.text("主题", "Theme"));
                 settings_row_control_sized(ui, 250.0, |ui| {
