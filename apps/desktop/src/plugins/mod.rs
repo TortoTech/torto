@@ -3,6 +3,7 @@
 
 mod ai;
 mod commands;
+mod llm_json;
 mod pdf_ocr;
 mod pdf_toc;
 mod pdf_vision;
@@ -35,7 +36,8 @@ pub use commands::{
     resolve_chat_command,
 };
 pub(crate) use pdf_ocr::{
-    PDF_PAGE_ANCHOR_PREFIX, PdfOcrSourceController, PdfOcrViewMode, has_pending_pdf_ocr_task,
+    PDF_PAGE_ANCHOR_PREFIX, PdfOcrSourceController, PdfOcrSyncData, PdfOcrViewMode,
+    export_pdf_ocr_sync_data, has_pending_pdf_ocr_task, import_pdf_ocr_sync_data,
     load_pdf_ocr_source, recognize_pdf, set_pdf_ocr_view_mode,
 };
 pub(crate) use pdf_toc::{PdfMetadataExtraction, extract_pdf_metadata};

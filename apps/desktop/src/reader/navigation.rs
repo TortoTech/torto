@@ -48,7 +48,11 @@ impl DesktopReader {
         match result {
             Ok(snapshot) => {
                 self.canvas_size = Some((width, height));
-                self.apply_snapshot(snapshot, SnapshotEffects::static_content_change());
+                // Resizing repaginates the current spread and can expose source
+                // ranges that were outside the previous viewport. Re-run the
+                // incremental scheduler so those newly visible blocks are
+                // translated without requiring an artificial page turn.
+                self.apply_snapshot(snapshot, SnapshotEffects::viewport_change());
             }
             Err(error) => self.error = Some(format!("调整页面失败：{error}")),
         }

@@ -259,7 +259,6 @@ impl DesktopReader {
         {
             return;
         }
-        self.pdf_toc.error = None;
         self.pdf_toc.draft = None;
         self.pdf_toc.editing = false;
         self.pdf_toc.progress = "正在准备页面…".into();
@@ -276,15 +275,15 @@ impl DesktopReader {
     }
 
     pub(super) fn start_pdf_metadata_extraction(&mut self) {
-        let need_toc = self.source.book().table_of_contents.is_empty();
+        let need_toc = super::needs_generated_toc(self.source.as_ref());
         if self.pdf_toc.task.is_pending()
             || self.format != rebook_formats::BookFormat::Pdf
             || !self.plugin_settings.ocr_enabled
+            || self.plugin_settings.ocr_endpoint().is_err()
             || (!need_toc && !self.pdf_metadata_missing.any())
         {
             return;
         }
-        self.pdf_toc.error = None;
         self.pdf_toc.progress = self
             .language
             .text("正在准备元数据提取…", "Preparing metadata extraction…")
@@ -455,56 +454,122 @@ impl DesktopReader {
                 let request = self.pdf_toc.task.complete(message.id)?;
                 self.pdf_toc.progress.clear();
                 match message.result {
-                    Ok(mut extraction) => {
-                        let update = extraction.metadata.take().and_then(|metadata| {
-                            self.apply_recognized_pdf_metadata(
-                                &request.book_id,
-                                request.missing,
-                                &metadata,
-                            )
-                        });
-                        if request.missing.any() && update.is_none() {
-                            self.error_timer.show(
-                                &mut self.error,
-                                self.language
-                                    .text(
-                                        "没有识别出 PDF 缺失的标题或作者",
-                                        "The missing PDF title or authors could not be recognized",
-                                    )
-                                    .into(),
-                                Instant::now(),
-                            );
-                        }
-                        if let Some(draft) = extraction.toc {
-                            self.pdf_toc.error = None;
-                            self.pdf_toc.draft = Some(draft);
-                            self.pdf_toc.editing = false;
-                            self.apply_generated_toc();
-                        } else if request.need_toc {
-                            self.pdf_toc.error = extraction.toc_error;
-                        }
-                        update
-                    }
+                    Ok(extraction) => self.apply_pdf_metadata_extraction(&request, extraction),
                     Err(error) => {
-                        if request.need_toc {
-                            self.pdf_toc.error = Some(error);
+                        let prefix = if request.need_toc && !request.missing.any() {
+                            self.language
+                                .text("PDF 目录识别失败", "PDF contents recognition failed")
                         } else {
-                            self.error_timer.show(
-                                &mut self.error,
-                                format!(
-                                    "{}: {error}",
-                                    self.language.text(
-                                        "PDF 元数据提取失败",
-                                        "PDF metadata extraction failed"
-                                    )
-                                ),
-                                Instant::now(),
-                            );
-                        }
+                            self.language
+                                .text("PDF 元数据提取失败", "PDF metadata extraction failed")
+                        };
+                        self.show_error(format!("{prefix}：{error}"));
                         None
                     }
                 }
             }
+        }
+    }
+
+    fn apply_pdf_metadata_extraction(
+        &mut self,
+        request: &super::PdfTocTask,
+        mut extraction: crate::plugins::PdfMetadataExtraction,
+    ) -> Option<PdfMetadataUpdate> {
+        let mut failures = Vec::new();
+        let mut update = None;
+        if request.missing.any() {
+            match extraction.metadata.take() {
+                Some(metadata) => match self.apply_recognized_pdf_metadata(
+                    &request.book_id,
+                    request.missing,
+                    &metadata,
+                ) {
+                    Ok(metadata_update) => update = metadata_update,
+                    Err(error) => failures.push(error),
+                },
+                None => failures.push(
+                    self.language
+                        .text(
+                            "没有识别出 PDF 缺失的标题或作者",
+                            "The missing PDF title or authors could not be recognized",
+                        )
+                        .to_owned(),
+                ),
+            }
+            if failures.is_empty()
+                && ((request.missing.title && self.pdf_metadata_missing.title)
+                    || (request.missing.authors && self.pdf_metadata_missing.authors))
+            {
+                failures.push(
+                    self.language
+                        .text(
+                            "没有完整识别出 PDF 缺失的标题或作者",
+                            "The missing PDF title or authors were not fully recognized",
+                        )
+                        .to_owned(),
+                );
+            }
+        }
+
+        let mut reopens_reader = false;
+        if let Some(draft) = extraction.toc {
+            self.pdf_toc.draft = Some(draft);
+            self.pdf_toc.editing = false;
+            match self.apply_generated_toc() {
+                Ok(()) => reopens_reader = true,
+                Err(error) => failures.push(error),
+            }
+        } else if request.need_toc {
+            failures.push(
+                extraction
+                    .toc_error
+                    .unwrap_or_else(|| "没有识别出可用的 PDF 目录".into()),
+            );
+        }
+
+        self.finish_pdf_metadata_extraction(request, &failures, reopens_reader);
+        update
+    }
+
+    fn finish_pdf_metadata_extraction(
+        &mut self,
+        request: &super::PdfTocTask,
+        failures: &[String],
+        reopens_reader: bool,
+    ) {
+        let requested_metadata = request.missing.any();
+        if failures.is_empty() {
+            let success = if request.need_toc && !requested_metadata {
+                self.language
+                    .text("PDF 目录识别完成", "PDF contents recognized")
+            } else {
+                self.language
+                    .text("PDF 元数据提取完成", "PDF metadata extracted")
+            }
+            .to_owned();
+            if reopens_reader {
+                self.reopen_notice = Some(success);
+                self.reopen_error = None;
+            } else {
+                self.show_notice(success);
+            }
+            return;
+        }
+
+        let prefix = if request.need_toc && !requested_metadata {
+            self.language
+                .text("PDF 目录识别失败", "PDF contents recognition failed")
+        } else {
+            self.language
+                .text("PDF 元数据提取失败", "PDF metadata extraction failed")
+        };
+        let error = format!("{prefix}：{}", failures.join("；"));
+        if reopens_reader {
+            self.reopen_error = Some(error);
+            self.reopen_notice = None;
+        } else {
+            self.show_error(error);
         }
     }
 
@@ -513,19 +578,11 @@ impl DesktopReader {
         book_id: &str,
         missing: super::PdfMetadataMissing,
         metadata: &crate::generated_metadata::GeneratedPdfMetadata,
-    ) -> Option<PdfMetadataUpdate> {
+    ) -> Result<Option<PdfMetadataUpdate>, String> {
         let title_recognized = missing.title && !metadata.title.is_empty();
         let authors_recognized = missing.authors && !metadata.authors.is_empty();
         if !title_recognized && !authors_recognized {
-            return None;
-        }
-        if title_recognized {
-            self.display_metadata.title.clone_from(&metadata.title);
-            self.pdf_metadata_missing.title = false;
-        }
-        if authors_recognized {
-            self.display_metadata.authors.clone_from(&metadata.authors);
-            self.pdf_metadata_missing.authors = false;
+            return Ok(None);
         }
         let mut cached = crate::generated_metadata::load(book_id)
             .unwrap_or_default()
@@ -538,28 +595,26 @@ impl DesktopReader {
         }
         cached.provider_name.clone_from(&metadata.provider_name);
         cached.model.clone_from(&metadata.model);
-        if let Err(error) = crate::generated_metadata::save(book_id, &cached) {
-            self.error_timer.show(
-                &mut self.error,
-                format!(
-                    "{}: {error}",
-                    self.language
-                        .text("保存 PDF 元数据缓存失败", "Failed to cache PDF metadata")
-                ),
-                Instant::now(),
-            );
-        } else {
-            self.show_notice(
+        crate::generated_metadata::save(book_id, &cached).map_err(|error| {
+            format!(
+                "{}：{error}",
                 self.language
-                    .text("PDF 元数据提取完成", "PDF metadata extracted")
-                    .into(),
-            );
+                    .text("保存 PDF 元数据缓存失败", "Failed to cache PDF metadata")
+            )
+        })?;
+        if title_recognized {
+            self.display_metadata.title.clone_from(&metadata.title);
+            self.pdf_metadata_missing.title = false;
         }
-        Some(PdfMetadataUpdate {
+        if authors_recognized {
+            self.display_metadata.authors.clone_from(&metadata.authors);
+            self.pdf_metadata_missing.authors = false;
+        }
+        Ok(Some(PdfMetadataUpdate {
             book_id: book_id.to_owned(),
             title: self.display_metadata.title.clone(),
             authors: self.display_metadata.authors.clone(),
-        })
+        }))
     }
 
     pub(super) fn open_search(&mut self) {

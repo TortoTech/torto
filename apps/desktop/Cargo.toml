@@ -46,6 +46,7 @@ egui-wgpu.workspace = true
 egui-winit.workspace = true
 fontdb.workspace = true
 image.workspace = true
+jsonrepair-rs.workspace = true
 keyring.workspace = true
 kurbo.workspace = true
 mermaid-rs-renderer.workspace = true

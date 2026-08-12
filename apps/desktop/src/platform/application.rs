@@ -201,6 +201,7 @@ impl ApplicationHandler<UserEvent> for Application {
             #[cfg(target_os = "windows")]
             UserEvent::Update(message) => self.app.complete_update(message),
             UserEvent::ShelfImport(message) => self.app.complete_shelf_import(message),
+            UserEvent::ShelfSyncProgress(message) => self.app.update_shelf_sync_progress(message),
             UserEvent::ShelfSync(message) => self.app.complete_shelf_sync(message),
             UserEvent::ReaderSearch(message) => self.app.complete_reader_search(message),
             UserEvent::ReaderSemanticIndex(message) => {
@@ -269,10 +270,19 @@ impl ApplicationHandler<UserEvent> for Application {
             }
             WindowEvent::Resized(size) => {
                 state.gpu.resize(size);
+                // Repagination may take longer than the compositor allows for a resize frame.
+                // Present the app background immediately so newly exposed pixels never fall
+                // back to Windows' black client-area fill while the full frame is being built.
+                if let Err(error) = state.gpu.present_background(&state.window) {
+                    tracing::warn!(%error, "failed to present resize background frame");
+                }
                 state.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 state.gpu.resize(state.window.inner_size());
+                if let Err(error) = state.gpu.present_background(&state.window) {
+                    tracing::warn!(%error, "failed to present scale-change background frame");
+                }
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {

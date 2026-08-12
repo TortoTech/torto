@@ -11,9 +11,10 @@ use rebook_publication::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::persistence::write_json_atomic;
+use crate::persistence::{write_bytes_atomic, write_json_atomic};
 
 const GENERATED_TOC_VERSION: u8 = 1;
+const PAGE_MAPPING_REVISION: u8 = 1;
 const GENERATED_TOC_DIRECTORY: &str = "generated-toc";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -42,6 +43,10 @@ struct StoredGeneratedToc {
     model: String,
     source_pages: Vec<usize>,
     entries: Vec<GeneratedTocEntry>,
+    #[serde(default)]
+    verified_pages: bool,
+    #[serde(default)]
+    page_mapping_revision: u8,
 }
 
 impl StoredGeneratedToc {
@@ -53,6 +58,8 @@ impl StoredGeneratedToc {
             model: draft.model.clone(),
             source_pages: draft.source_pages.clone(),
             entries: normalize_entries(draft.entries.clone()),
+            verified_pages: true,
+            page_mapping_revision: PAGE_MAPPING_REVISION,
         }
     }
 }
@@ -66,7 +73,36 @@ pub(crate) fn save(book_id: &str, draft: &GeneratedTocDraft) -> io::Result<()> {
         )
     })?;
     fs::create_dir_all(parent)?;
-    write_json_atomic(&path, &StoredGeneratedToc::from_draft(book_id, draft))
+    write_json_atomic(&path, &StoredGeneratedToc::from_draft(book_id, draft))?;
+    crate::sync::mark_derived_dirty(book_id, crate::sync::DerivedDataKind::Metadata)
+}
+
+pub(crate) fn export_sync_bytes(book_id: &str) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(generated_toc_path(book_id)?) {
+        Ok(bytes) => {
+            validate_sync_bytes(book_id, &bytes)?;
+            Ok(Some(bytes))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn import_sync_bytes(book_id: &str, bytes: &[u8]) -> io::Result<()> {
+    validate_sync_bytes(book_id, bytes)?;
+    write_bytes_atomic(&generated_toc_path(book_id)?, bytes)
+}
+
+pub(crate) fn validate_sync_bytes(book_id: &str, bytes: &[u8]) -> io::Result<()> {
+    let stored: StoredGeneratedToc = serde_json::from_slice(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if stored.version != GENERATED_TOC_VERSION || stored.book_id != book_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "generated TOC does not match the synced book",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn load(book_id: &str) -> io::Result<Option<GeneratedTocDraft>> {
@@ -78,7 +114,11 @@ pub(crate) fn load(book_id: &str) -> io::Result<Option<GeneratedTocDraft>> {
     };
     let stored: StoredGeneratedToc = serde_json::from_slice(&bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if stored.version != GENERATED_TOC_VERSION || stored.book_id != book_id {
+    if stored.version != GENERATED_TOC_VERSION
+        || stored.book_id != book_id
+        || !stored.verified_pages
+        || stored.page_mapping_revision != PAGE_MAPPING_REVISION
+    {
         return Ok(None);
     }
     Ok(Some(GeneratedTocDraft {

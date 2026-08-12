@@ -1,14 +1,23 @@
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::Path;
+use std::time::Duration;
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use reqwest::header::{CONTENT_TYPE, ETAG, HeaderName, HeaderValue, IF_MATCH, IF_NONE_MATCH};
+use reqwest::header::{
+    CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderName, HeaderValue, IF_MATCH, IF_NONE_MATCH, RANGE,
+};
 use reqwest::{Client, Method, StatusCode, Url};
 
 use super::SyncResult;
 use super::settings::SyncSettings;
 
 const DEPTH: HeaderName = HeaderName::from_static("depth");
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(30);
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_mins(2);
+const DOWNLOAD_PROGRESS_INTERVAL: u64 = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteObject {
@@ -19,6 +28,7 @@ pub(crate) struct RemoteObject {
 #[derive(Clone)]
 pub(crate) struct WebDavClient {
     client: Client,
+    download_client: Client,
     root: Url,
     username: String,
     password: String,
@@ -39,7 +49,10 @@ impl WebDavClient {
             root.set_path(&format!("{}/", root.path()));
         }
         let allowed_origin = root.origin();
+        let download_allowed_origin = allowed_origin.clone();
         let client = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 if attempt.url().origin() == allowed_origin {
                     attempt.follow()
@@ -48,8 +61,20 @@ impl WebDavClient {
                 }
             }))
             .build()?;
+        let download_client = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(DOWNLOAD_READ_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.url().origin() == download_allowed_origin {
+                    attempt.follow()
+                } else {
+                    attempt.error("WebDAV download redirected to a different origin")
+                }
+            }))
+            .build()?;
         Ok(Self {
             client,
+            download_client,
             root,
             username: settings.username.clone(),
             password,
@@ -60,7 +85,14 @@ impl WebDavClient {
         self.ensure_collection_absolute(self.root.join("../")?)
             .await?;
         self.ensure_collection_absolute(self.root.clone()).await?;
-        for path in ["library/", "library/devices/", "books/", "state/", "tmp/"] {
+        for path in [
+            "library/",
+            "library/devices/",
+            "books/",
+            "state/",
+            "derived/",
+            "tmp/",
+        ] {
             self.ensure_collection(path).await?;
         }
         Ok(())
@@ -95,6 +127,117 @@ impl WebDavClient {
         }))
     }
 
+    pub(crate) async fn download_to_file<F>(
+        &self,
+        path: &str,
+        destination: &Path,
+        expected_length: u64,
+        mut progress: F,
+    ) -> SyncResult<bool>
+    where
+        F: FnMut(u64),
+    {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut downloaded = fs::metadata(destination)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        if downloaded > expected_length {
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(destination)?;
+            downloaded = 0;
+        }
+        if downloaded == expected_length {
+            progress(downloaded);
+            return Ok(true);
+        }
+
+        let mut request = self
+            .download_client
+            .request(Method::GET, self.url(path)?)
+            .basic_auth(&self.username, Some(&self.password));
+        if downloaded > 0 {
+            request = request.header(RANGE, format!("bytes={downloaded}-"));
+        }
+        let response = request.send().await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+
+        let append = downloaded > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
+        if append {
+            let range_start = response
+                .headers()
+                .get(CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(content_range_start);
+            if range_start != Some(downloaded) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WebDAV server returned an invalid Content-Range",
+                )
+                .into());
+            }
+        } else if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            if downloaded == expected_length {
+                progress(downloaded);
+                return Ok(true);
+            }
+            fs::remove_file(destination).ok();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebDAV server rejected the saved download range",
+            )
+            .into());
+        } else {
+            downloaded = 0;
+            progress(0);
+        }
+
+        let mut response = response.error_for_status()?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(destination)?;
+        let mut last_reported = downloaded;
+        while let Some(chunk) = response.chunk().await? {
+            let chunk_length = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            let next = downloaded.saturating_add(chunk_length);
+            if next > expected_length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WebDAV download is larger than its manifest",
+                )
+                .into());
+            }
+            file.write_all(&chunk)?;
+            downloaded = next;
+            if downloaded.saturating_sub(last_reported) >= DOWNLOAD_PROGRESS_INTERVAL
+                || downloaded == expected_length
+            {
+                progress(downloaded);
+                last_reported = downloaded;
+            }
+        }
+        file.flush()?;
+        if downloaded != expected_length {
+            progress(downloaded);
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("WebDAV download ended at {downloaded} of {expected_length} bytes"),
+            )
+            .into());
+        }
+        progress(downloaded);
+        Ok(true)
+    }
+
     pub(crate) async fn put_immutable(
         &self,
         path: &str,
@@ -113,6 +256,21 @@ impl WebDavClient {
         }
         response.error_for_status()?;
         Ok(true)
+    }
+
+    pub(crate) async fn put_mutable_bytes(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+        content_type: &'static str,
+    ) -> SyncResult<()> {
+        self.request(Method::PUT, self.url(path)?)
+            .header(CONTENT_TYPE, content_type)
+            .body(bytes)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     pub(crate) async fn put_mutable_json<T: serde::Serialize + ?Sized>(
@@ -201,6 +359,15 @@ impl WebDavClient {
     }
 }
 
+fn content_range_start(value: &str) -> Option<u64> {
+    value
+        .strip_prefix("bytes ")?
+        .split_once('-')?
+        .0
+        .parse()
+        .ok()
+}
+
 fn parse_propfind_hrefs(xml: &str, base: &Url) -> SyncResult<Vec<Url>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -240,5 +407,14 @@ mod tests {
         assert_eq!(hrefs.len(), 2);
         assert!(hrefs[0].path().ends_with("device-a.json"));
         assert!(hrefs[1].path().ends_with("a%20b.json"));
+    }
+
+    #[test]
+    fn parses_content_range_start() {
+        assert_eq!(
+            content_range_start("bytes 262144-524287/1048576"),
+            Some(262_144)
+        );
+        assert_eq!(content_range_start("bytes */1048576"), None);
     }
 }

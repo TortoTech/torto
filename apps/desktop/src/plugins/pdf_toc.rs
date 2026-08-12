@@ -26,6 +26,8 @@ const SCAN_IMAGE_MAX_DIMENSION: u32 = 560;
 const EXTRACTION_BATCH_SIZE: usize = 1;
 const VISION_REQUEST_CONCURRENCY: usize = 4;
 const METADATA_PAGE_LIMIT: usize = 6;
+const PAGE_VERIFICATION_BATCH_SIZE: usize = 2;
+const PAGE_VERIFICATION_RADIUS: usize = 2;
 
 #[derive(Debug, Deserialize)]
 struct ScanResponse {
@@ -42,12 +44,34 @@ struct ScannedPage {
     k: String,
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     n: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    h: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct ExtractionResponse {
     #[serde(default)]
     e: Vec<ExtractedEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageVerificationResponse {
+    #[serde(default)]
+    r: Vec<PageVerificationChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageVerificationChoice {
+    id: usize,
+    #[serde(default)]
+    i: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct PageVerificationTarget {
+    entry_index: usize,
+    title: String,
+    candidates: Vec<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +144,12 @@ where
 struct PageNumberAnchor {
     physical_page: usize,
     printed_page: String,
+}
+
+#[derive(Clone, Debug)]
+struct PageHeadingAnchor {
+    physical_page: usize,
+    title: String,
 }
 
 pub(crate) async fn generate_pdf_metadata(
@@ -216,7 +246,7 @@ where
         return Err("PDF 没有可识别的页面".into());
     }
 
-    let (toc_pages, anchors, metadata) = locate_toc_pages(
+    let (toc_pages, anchors, heading_anchors, metadata) = locate_toc_pages(
         &client,
         &provider,
         &model,
@@ -239,7 +269,7 @@ where
         &client,
         &provider,
         &model,
-        source,
+        Arc::clone(&source),
         &toc_pages,
         &mut on_progress,
     )
@@ -296,6 +326,28 @@ where
             metadata,
         });
     }
+    let mut heading_verified = apply_restarted_page_sequences(&mut entries, &anchors);
+    heading_verified.extend(apply_scanned_heading_anchors(
+        &mut entries,
+        &heading_anchors,
+    ));
+    if let Err(error) = verify_top_level_toc_pages(
+        &client,
+        &provider,
+        &model,
+        Arc::clone(&source),
+        page_count,
+        &mut entries,
+        &heading_verified,
+        &mut on_progress,
+    )
+    .await
+    {
+        // Page verification only refines the offset-derived positions. The
+        // inferred mapping remains usable if a model request or page render
+        // fails, so do not discard an otherwise valid TOC.
+        tracing::warn!(%error, "failed to refine generated PDF TOC pages");
+    }
     on_progress(format!("已生成 {} 个目录条目", entries.len()));
     Ok(PdfMetadataExtraction {
         toc: Some(GeneratedTocDraft {
@@ -309,6 +361,10 @@ where
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the shared opening-page scan collects TOC pages, page numbers, headings, and metadata from one request"
+)]
 async fn locate_toc_pages<F>(
     client: &Client,
     provider: &AiProvider,
@@ -321,6 +377,7 @@ async fn locate_toc_pages<F>(
     (
         Vec<usize>,
         Vec<PageNumberAnchor>,
+        Vec<PageHeadingAnchor>,
         Option<GeneratedPdfMetadata>,
     ),
     String,
@@ -345,14 +402,14 @@ where
             ""
         };
         let response_shape = if extract_metadata && batch_start == 0 {
-            "{\"p\":[{\"i\":0,\"k\":\"toc|other\",\"n\":\"visible printed page number or empty\"}],\"m\":{\"t\":\"title\",\"a\":[\"author\"]}}"
+            "{\"p\":[{\"i\":0,\"k\":\"toc|other\",\"n\":\"printed page number or empty\",\"h\":\"section heading or empty\"}],\"m\":{\"t\":\"title\",\"a\":[\"author\"]}}"
         } else {
-            "{\"p\":[{\"i\":0,\"k\":\"toc|other\",\"n\":\"visible printed page number or empty\"}]}"
+            "{\"p\":[{\"i\":0,\"k\":\"toc|other\",\"n\":\"printed page number or empty\",\"h\":\"section heading or empty\"}]}"
         };
         let content = vec![
             json!({
                 "type": "text",
-                "text": format!("The image is a 2-column contact sheet in row-major slot order. Slot-to-PDF-page mapping: {page_mapping}. Inspect every slot. A toc page is a printed table-of-contents page listing multiple headings with page numbers; covers, copyright pages, prefaces and chapter opening pages are other.{metadata_instruction} Return compact JSON only: {response_shape}. Include exactly one p item for every slot. Do not infer n when it is not visibly printed."),
+                "text": format!("The image is a 2-column contact sheet in row-major slot order. Slot-to-PDF-page mapping: {page_mapping}. Inspect every slot. A toc page is a printed table-of-contents page listing multiple headings with page numbers; covers, copyright pages, prefaces and chapter opening pages are other. For h, return the full visible heading only when that page starts a chapter, preface, acknowledgements, introduction, appendix, or other navigable section; otherwise return an empty string. Do not use running headers or incidental mentions as h.{metadata_instruction} Return compact JSON only: {response_shape}. Include exactly one p item for every slot. Do not infer n when it is not visibly printed."),
             }),
             json!({
                 "type": "image_url",
@@ -381,6 +438,7 @@ where
 
     let mut toc_pages = Vec::new();
     let mut anchors = Vec::new();
+    let mut heading_anchors = Vec::new();
     let mut metadata = None;
     let mut completed_batches = 0;
     while let Some(result) = tasks.join_next().await {
@@ -409,6 +467,13 @@ where
                     printed_page: page.n,
                 });
             }
+            let title = page.h.trim();
+            if !title.is_empty() {
+                heading_anchors.push(PageHeadingAnchor {
+                    physical_page,
+                    title: title.to_owned(),
+                });
+            }
         }
 
         if let Some((batch_start, batch_end, content)) = jobs.pop_front() {
@@ -424,7 +489,11 @@ where
     }
     toc_pages.sort_unstable();
     toc_pages.dedup();
-    Ok((toc_pages, anchors, metadata))
+    heading_anchors.sort_unstable_by_key(|anchor| anchor.physical_page);
+    heading_anchors.dedup_by(|left, right| {
+        left.physical_page == right.physical_page && left.title == right.title
+    });
+    Ok((toc_pages, anchors, heading_anchors, metadata))
 }
 
 async fn extract_entries<F>(
@@ -499,6 +568,336 @@ where
         .collect())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "page verification needs the shared AI endpoint plus the headings already confirmed by the opening-page scan"
+)]
+async fn verify_top_level_toc_pages<F>(
+    client: &Client,
+    provider: &AiProvider,
+    model: &str,
+    source: Arc<dyn BookSource>,
+    page_count: usize,
+    entries: &mut [GeneratedTocEntry],
+    heading_verified: &HashSet<usize>,
+    on_progress: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(String),
+{
+    let targets = entries
+        .iter()
+        .enumerate()
+        .filter(|(entry_index, entry)| entry.depth == 0 && !heading_verified.contains(entry_index))
+        .map(|(entry_index, entry)| PageVerificationTarget {
+            entry_index,
+            title: entry.title.clone(),
+            candidates: verification_candidate_pages(entry.physical_page, page_count),
+        })
+        .filter(|target| !target.candidates.is_empty())
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let mut jobs = VecDeque::new();
+    for batch in targets.chunks(PAGE_VERIFICATION_BATCH_SIZE) {
+        let batch = batch.to_vec();
+        let content = page_verification_content(source.as_ref(), &batch)?;
+        jobs.push_back((batch, content));
+    }
+
+    let total_batches = jobs.len();
+    let mut tasks = JoinSet::new();
+    while tasks.len() < VISION_REQUEST_CONCURRENCY
+        && let Some((batch, content)) = jobs.pop_front()
+    {
+        let client = client.clone();
+        let provider = provider.clone();
+        let model = model.to_owned();
+        tasks.spawn(async move {
+            let value = request_vision_json(&client, &provider, &model, content).await?;
+            let response: PageVerificationResponse = parse_json_value(&value)?;
+            Ok::<_, String>((batch, response))
+        });
+    }
+
+    let mut completed_batches = 0;
+    let mut verified = HashMap::new();
+    while let Some(result) = tasks.join_next().await {
+        let (batch, response) =
+            result.map_err(|error| format!("目录页校准任务异常结束：{error}"))??;
+        completed_batches += 1;
+        on_progress(format!(
+            "正在校准目录页：{completed_batches}/{total_batches} 批"
+        ));
+        for choice in response.r {
+            let Some(target) = batch.iter().find(|target| target.entry_index == choice.id) else {
+                continue;
+            };
+            let Some(page) = choice
+                .i
+                .and_then(|slot| target.candidates.get(slot))
+                .copied()
+            else {
+                continue;
+            };
+            verified.insert(target.entry_index, page);
+        }
+
+        if let Some((batch, content)) = jobs.pop_front() {
+            let client = client.clone();
+            let provider = provider.clone();
+            let model = model.to_owned();
+            tasks.spawn(async move {
+                let value = request_vision_json(&client, &provider, &model, content).await?;
+                let response: PageVerificationResponse = parse_json_value(&value)?;
+                Ok::<_, String>((batch, response))
+            });
+        }
+    }
+    apply_consistent_top_level_page_correction(entries, &verified, heading_verified, page_count);
+    if verified.len() != targets.len() {
+        tracing::warn!(
+            verified = verified.len(),
+            total = targets.len(),
+            "some top-level PDF TOC pages kept their offset-derived positions"
+        );
+    }
+    Ok(())
+}
+
+fn page_verification_content(
+    source: &dyn BookSource,
+    batch: &[PageVerificationTarget],
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut content = vec![json!({
+        "type": "text",
+        "text": "Verify the physical PDF page where each requested top-level chapter or introduction begins. Each following image is an independent 2-column contact sheet in row-major slot order. Select the slot where the requested heading visibly starts the chapter; ignore running headers and incidental mentions. The heading may appear anywhere on the page and may use different Chinese scripts. Return compact JSON only: {\"r\":[{\"id\":0,\"i\":1}]}. id must equal the supplied entry id. i is the zero-based candidate slot, or null when none matches. Never invent a page outside the supplied candidates."
+    })];
+    for target in batch {
+        let mapping = target
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(slot, page)| format!("{slot}=PDF page {page}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let title = serde_json::to_string(&target.title)
+            .map_err(|error| format!("无法编码目录标题：{error}"))?;
+        content.push(json!({
+            "type": "text",
+            "text": format!("Entry id {}. Requested heading: {title}. Slot mapping: {mapping}.", target.entry_index)
+        }));
+        let page_indices = target
+            .candidates
+            .iter()
+            .map(|page| page - 1)
+            .collect::<Vec<_>>();
+        content.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": render_contact_sheet(source, &page_indices, 1_000)?
+            }
+        }));
+    }
+    Ok(content)
+}
+
+fn verification_candidate_pages(predicted_page: usize, page_count: usize) -> Vec<usize> {
+    if page_count == 0 || predicted_page == 0 {
+        return Vec::new();
+    }
+    let start = predicted_page
+        .saturating_sub(PAGE_VERIFICATION_RADIUS)
+        .max(1);
+    let end = predicted_page
+        .saturating_add(PAGE_VERIFICATION_RADIUS)
+        .min(page_count);
+    (start..=end).collect()
+}
+
+fn apply_scanned_heading_anchors(
+    entries: &mut [GeneratedTocEntry],
+    anchors: &[PageHeadingAnchor],
+) -> HashSet<usize> {
+    let top_level = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.depth == 0).then_some(index))
+        .collect::<Vec<_>>();
+    let mut used_pages = HashSet::new();
+    let mut verified = HashSet::new();
+    for (position, start) in top_level.iter().copied().enumerate() {
+        let key = normalized_heading_key(&entries[start].title);
+        if key.is_empty() {
+            continue;
+        }
+        let matches = anchors
+            .iter()
+            .filter(|anchor| {
+                !used_pages.contains(&anchor.physical_page)
+                    && headings_match(&key, &normalized_heading_key(&anchor.title))
+            })
+            .collect::<Vec<_>>();
+        let [anchor] = matches.as_slice() else {
+            continue;
+        };
+        shift_top_level_group(
+            entries,
+            &top_level,
+            position,
+            anchor.physical_page,
+            usize::MAX,
+        );
+        used_pages.insert(anchor.physical_page);
+        verified.insert(start);
+    }
+    verified
+}
+
+fn apply_restarted_page_sequences(
+    entries: &mut [GeneratedTocEntry],
+    anchors: &[PageNumberAnchor],
+) -> HashSet<usize> {
+    let top_level = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.depth == 0).then_some(index))
+        .collect::<Vec<_>>();
+    let mut entries_by_printed_page = HashMap::<usize, Vec<usize>>::new();
+    for &entry_index in &top_level {
+        if let Some(printed_page) = parse_arabic_page_number(&entries[entry_index].printed_page) {
+            entries_by_printed_page
+                .entry(printed_page)
+                .or_default()
+                .push(entry_index);
+        }
+    }
+    let mut verified = HashSet::new();
+    for (printed_page, entry_indices) in entries_by_printed_page {
+        if entry_indices.len() < 2 {
+            continue;
+        }
+        let mut physical_pages = anchors
+            .iter()
+            .filter_map(|anchor| {
+                (parse_arabic_page_number(&anchor.printed_page) == Some(printed_page))
+                    .then_some(anchor.physical_page)
+            })
+            .collect::<Vec<_>>();
+        physical_pages.sort_unstable();
+        physical_pages.dedup();
+        if physical_pages.len() != entry_indices.len() {
+            continue;
+        }
+        for (entry_index, physical_page) in entry_indices.into_iter().zip(physical_pages) {
+            let Some(position) = top_level.iter().position(|index| *index == entry_index) else {
+                continue;
+            };
+            shift_top_level_group(entries, &top_level, position, physical_page, usize::MAX);
+            verified.insert(entry_index);
+        }
+    }
+    verified
+}
+
+fn normalized_heading_key(title: &str) -> String {
+    title
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn headings_match(left: &str, right: &str) -> bool {
+    left == right
+        || (left.chars().count().min(right.chars().count()) >= 4
+            && (left.contains(right) || right.contains(left)))
+}
+
+fn apply_consistent_top_level_page_correction(
+    entries: &mut [GeneratedTocEntry],
+    verified: &HashMap<usize, usize>,
+    heading_verified: &HashSet<usize>,
+    page_count: usize,
+) {
+    let top_level = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.depth == 0).then_some(index))
+        .collect::<Vec<_>>();
+    let mut delta_counts = HashMap::<isize, usize>::new();
+    for (&entry_index, &verified_page) in verified {
+        let Some(entry) = entries.get(entry_index) else {
+            continue;
+        };
+        let (Ok(predicted), Ok(verified)) = (
+            isize::try_from(entry.physical_page),
+            isize::try_from(verified_page),
+        ) else {
+            continue;
+        };
+        *delta_counts.entry(verified - predicted).or_default() += 1;
+    }
+    let Some((delta, support)) = delta_counts
+        .into_iter()
+        .max_by_key(|(delta, support)| (*support, std::cmp::Reverse(delta.abs())))
+    else {
+        return;
+    };
+    if support < 2 || support * 2 <= verified.len() || delta == 0 {
+        return;
+    }
+    for (position, start) in top_level.iter().copied().enumerate() {
+        if heading_verified.contains(&start) {
+            continue;
+        }
+        let Some(target_page) = isize::try_from(entries[start].physical_page)
+            .ok()
+            .and_then(|page| page.checked_add(delta))
+            .and_then(|page| usize::try_from(page).ok())
+            .filter(|page| (1..=page_count).contains(page))
+        else {
+            continue;
+        };
+        shift_top_level_group(entries, &top_level, position, target_page, page_count);
+    }
+}
+
+fn shift_top_level_group(
+    entries: &mut [GeneratedTocEntry],
+    top_level: &[usize],
+    position: usize,
+    target_page: usize,
+    page_count: usize,
+) {
+    let start = top_level[position];
+    let end = top_level
+        .get(position + 1)
+        .copied()
+        .unwrap_or(entries.len());
+    let (Ok(predicted_page), Ok(target_page_signed)) = (
+        isize::try_from(entries[start].physical_page),
+        isize::try_from(target_page),
+    ) else {
+        return;
+    };
+    let delta = target_page_signed - predicted_page;
+    for entry in &mut entries[start..end] {
+        let Some(page) = isize::try_from(entry.physical_page)
+            .ok()
+            .and_then(|page| page.checked_add(delta))
+            .and_then(|page| usize::try_from(page).ok())
+            .filter(|page| *page > 0 && (page_count == usize::MAX || *page <= page_count))
+        else {
+            continue;
+        };
+        entry.physical_page = page;
+    }
+    entries[start].physical_page = target_page;
+}
+
 fn render_contact_sheet(
     source: &dyn BookSource,
     page_indices: &[usize],
@@ -564,15 +963,18 @@ fn parse_arabic_page_number(label: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::time::Duration;
 
     use reqwest::Client;
     use serde_json::json;
 
     use super::{
-        MetadataResponse, PageNumberAnchor, ScanResponse, generate_pdf_toc, infer_page_offset,
+        MetadataResponse, PageHeadingAnchor, PageNumberAnchor, ScanResponse,
+        apply_consistent_top_level_page_correction, apply_restarted_page_sequences,
+        apply_scanned_heading_anchors, generate_pdf_toc, infer_page_offset,
         is_retryable_vision_response_error, parse_arabic_page_number, render_page_data_url,
-        request_vision_json,
+        request_vision_json, verification_candidate_pages,
     };
 
     #[test]
@@ -624,6 +1026,151 @@ mod tests {
         ];
         assert_eq!(infer_page_offset(&anchors, 10), Some((13, 3)));
         assert_eq!(parse_arabic_page_number("第 128 页"), Some(128));
+    }
+
+    #[test]
+    fn verification_candidates_stay_within_the_pdf() {
+        assert_eq!(verification_candidate_pages(1, 10), vec![1, 2, 3]);
+        assert_eq!(verification_candidate_pages(9, 10), vec![7, 8, 9, 10]);
+        assert!(verification_candidate_pages(0, 10).is_empty());
+        assert!(verification_candidate_pages(1, 0).is_empty());
+    }
+
+    #[test]
+    fn scanned_headings_locate_independent_front_matter_page_sequences() {
+        let entry = |title: &str, page: usize| crate::generated_toc::GeneratedTocEntry {
+            depth: 0,
+            title: title.into(),
+            printed_page: "1".into(),
+            physical_page: page,
+            confidence: 0.9,
+        };
+        let mut entries = vec![
+            entry("致谢", 19),
+            entry("序言", 19),
+            entry("第1章 手之初", 19),
+            entry("第2章 手、思想和语言", 35),
+        ];
+        let anchors = vec![
+            PageHeadingAnchor {
+                physical_page: 7,
+                title: "致谢".into(),
+            },
+            PageHeadingAnchor {
+                physical_page: 10,
+                title: "序言".into(),
+            },
+            PageHeadingAnchor {
+                physical_page: 19,
+                title: "第1章 手之初".into(),
+            },
+        ];
+
+        let verified = apply_scanned_heading_anchors(&mut entries, &anchors);
+
+        assert_eq!(verified, HashSet::from([0, 1, 2]));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.physical_page)
+                .collect::<Vec<_>>(),
+            [7, 10, 19, 35]
+        );
+    }
+
+    #[test]
+    fn repeated_printed_pages_reuse_scan_anchors_in_toc_order() {
+        let entry = |title: &str, page: usize| crate::generated_toc::GeneratedTocEntry {
+            depth: 0,
+            title: title.into(),
+            printed_page: "1".into(),
+            physical_page: page,
+            confidence: 0.9,
+        };
+        let mut entries = vec![
+            entry("致谢", 19),
+            entry("序言", 19),
+            entry("第1章 手之初", 19),
+        ];
+        let anchors = vec![
+            PageNumberAnchor {
+                physical_page: 7,
+                printed_page: "1".into(),
+            },
+            PageNumberAnchor {
+                physical_page: 10,
+                printed_page: "1".into(),
+            },
+            PageNumberAnchor {
+                physical_page: 19,
+                printed_page: "1".into(),
+            },
+        ];
+
+        let verified = apply_restarted_page_sequences(&mut entries, &anchors);
+
+        assert_eq!(verified, HashSet::from([0, 1, 2]));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.physical_page)
+                .collect::<Vec<_>>(),
+            [7, 10, 19]
+        );
+    }
+
+    #[test]
+    fn inconsistent_visual_page_offsets_do_not_override_inferred_mapping() {
+        let entry = |page: usize| crate::generated_toc::GeneratedTocEntry {
+            depth: 0,
+            title: format!("entry-{page}"),
+            printed_page: page.to_string(),
+            physical_page: page,
+            confidence: 0.9,
+        };
+        let mut entries = vec![entry(19), entry(35), entry(55), entry(69)];
+        let verified = HashMap::from([(0, 20), (1, 35), (2, 53), (3, 70)]);
+
+        apply_consistent_top_level_page_correction(&mut entries, &verified, &HashSet::new(), 100);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.physical_page)
+                .collect::<Vec<_>>(),
+            [19, 35, 55, 69]
+        );
+    }
+
+    #[test]
+    fn dominant_visual_page_offset_applies_to_unanchored_groups() {
+        let entry = |depth: usize, page: usize| crate::generated_toc::GeneratedTocEntry {
+            depth,
+            title: format!("entry-{depth}-{page}"),
+            printed_page: page.to_string(),
+            physical_page: page,
+            confidence: 0.9,
+        };
+        let mut entries = vec![
+            entry(0, 10),
+            entry(1, 12),
+            entry(0, 30),
+            entry(1, 32),
+            entry(0, 50),
+        ];
+        apply_consistent_top_level_page_correction(
+            &mut entries,
+            &HashMap::from([(0, 11), (2, 31), (4, 51)]),
+            &HashSet::new(),
+            60,
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.physical_page)
+                .collect::<Vec<_>>(),
+            [11, 13, 31, 33, 51]
+        );
     }
 
     #[test]

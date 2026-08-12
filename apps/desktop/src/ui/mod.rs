@@ -19,7 +19,21 @@ use crate::preferences::{
 
 const EGUI_BASE_FONT_SIZE: f32 = 13.0;
 const EGUI_BASE_EXTRA_TEXT_LINE_SPACING: f32 = 1.0;
+const TOAST_MAX_WIDTH: f32 = 400.0;
+const TOAST_MIN_WIDTH: f32 = 96.0;
+const TOAST_SCREEN_MARGIN: f32 = 48.0;
+const TOAST_HORIZONTAL_PADDING: f32 = 28.0;
+const TOAST_ICON_SIZE: f32 = 18.0;
+const TOAST_ITEM_SPACING: f32 = 10.0;
+const TOAST_CLOSE_SIZE: f32 = 28.0;
 static INTERFACE_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(DEFAULT_INTERFACE_FONT_SIZE.to_bits());
+
+#[derive(Clone, Copy)]
+pub(crate) enum ToastKind {
+    Success,
+    Error,
+    Loading,
+}
 
 /// Theme-dependent color set. Chrome reads colors through `palette()` so a
 /// saved theme switch recolors the whole app without threading state through
@@ -46,7 +60,6 @@ pub(crate) struct Palette {
     pub(crate) error_fill: Color32,
     pub(crate) error_stroke: Color32,
     pub(crate) error_text: Color32,
-    pub(crate) toast_error_fill: Color32,
     pub(crate) card_fill: Color32,
     pub(crate) accent_border: Color32,
     pub(crate) pill_fill: Color32,
@@ -76,7 +89,6 @@ impl Palette {
             error_fill: Color32::from_rgb(252, 239, 238),
             error_stroke: Color32::from_rgb(226, 180, 176),
             error_text: Color32::from_rgb(151, 54, 50),
-            toast_error_fill: Color32::from_rgb(78, 39, 39),
             card_fill: Color32::from_rgb(251, 250, 247),
             accent_border: Color32::from_rgb(177, 209, 190),
             pill_fill: Color32::from_rgb(231, 235, 242),
@@ -106,7 +118,6 @@ impl Palette {
             error_fill: Color32::from_rgb(64, 40, 38),
             error_stroke: Color32::from_rgb(110, 64, 60),
             error_text: Color32::from_rgb(224, 138, 130),
-            toast_error_fill: Color32::from_rgb(96, 46, 44),
             card_fill: Color32::from_rgb(47, 46, 42),
             accent_border: Color32::from_rgb(62, 94, 78),
             pill_fill: Color32::from_rgb(54, 53, 48),
@@ -388,6 +399,99 @@ pub(crate) fn apply_visuals(ctx: &egui::Context, palette: &Palette) {
 
 pub(crate) const fn icon(icon: Icon) -> IconWidget {
     IconWidget::new(icon)
+}
+
+/// Show a compact notification that follows its text up to a shared maximum width.
+/// Longer messages wrap instead of stretching the notification across the window.
+pub(crate) fn show_toast(
+    ctx: &egui::Context,
+    id: &'static str,
+    message: &str,
+    kind: ToastKind,
+    anchor_offset: Vec2,
+    dismissible: bool,
+) -> bool {
+    let palette = palette();
+    let (icon_kind, fill, border, foreground) = match kind {
+        ToastKind::Success => (
+            Some(Icon::CheckCircle),
+            palette.accent_soft,
+            palette.accent_border,
+            palette.accent,
+        ),
+        ToastKind::Error => (
+            Some(Icon::AlertCircle),
+            palette.error_fill,
+            palette.error_stroke,
+            palette.error_text,
+        ),
+        ToastKind::Loading => (
+            None,
+            palette.accent_soft,
+            palette.accent_border,
+            palette.accent,
+        ),
+    };
+    let font_size = scaled_font_size(13.0);
+    let text_width = ctx.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(
+                message.to_owned(),
+                egui::FontId::proportional(font_size),
+                foreground,
+            )
+            .size()
+            .x
+    });
+    let close_width = if dismissible {
+        TOAST_ITEM_SPACING + TOAST_CLOSE_SIZE
+    } else {
+        0.0
+    };
+    let fixed_content_width = TOAST_ICON_SIZE + TOAST_ITEM_SPACING + close_width;
+    let available_width = (ctx.content_rect().width() - TOAST_SCREEN_MARGIN).max(1.0);
+    let max_width = TOAST_MAX_WIDTH.min(available_width);
+    let min_width = TOAST_MIN_WIDTH.min(max_width);
+    let width =
+        (TOAST_HORIZONTAL_PADDING + fixed_content_width + text_width).clamp(min_width, max_width);
+    let label_width = (width - TOAST_HORIZONTAL_PADDING - fixed_content_width).max(1.0);
+    let mut dismissed = false;
+
+    egui::Area::new(id.into())
+        .order(egui::Order::Tooltip)
+        .anchor(Align2::RIGHT_TOP, anchor_offset)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .fill(fill)
+                .stroke(Stroke::new(1.0, border))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(14, 11))
+                .show(ui, |ui| {
+                    ui.set_width((width - TOAST_HORIZONTAL_PADDING).max(1.0));
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = TOAST_ITEM_SPACING;
+                        if let Some(icon_kind) = icon_kind {
+                            ui.add(icon(icon_kind).size(TOAST_ICON_SIZE).color(foreground));
+                        } else {
+                            ui.add(egui::Spinner::new().size(TOAST_ICON_SIZE).color(foreground));
+                        }
+                        ui.vertical(|ui| {
+                            ui.set_width(label_width);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(message).size(font_size).color(foreground),
+                                )
+                                .wrap(),
+                            );
+                        });
+                        if dismissible && small_icon_button(ui, Icon::X).clicked() {
+                            dismissed = true;
+                        }
+                    });
+                });
+        });
+
+    dismissed
 }
 
 /// A compact icon action painted as one borderless rounded layer.

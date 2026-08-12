@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Cursor, Read};
@@ -25,6 +25,7 @@ use tokio::sync::watch;
 use zip::ZipArchive;
 
 use super::{MINERU_API_URL, PADDLE_OCR_JOBS_URL, PdfOcrProviderKind, PluginSettings};
+use crate::persistence::write_bytes_atomic;
 use crate::persistence::write_json_atomic;
 
 const PDF_OCR_VERSION: u8 = 1;
@@ -170,6 +171,11 @@ struct StoredOcrResource {
     href: String,
     file_name: String,
     media_type: String,
+}
+
+pub(crate) struct PdfOcrSyncData {
+    pub(crate) document: Vec<u8>,
+    pub(crate) resources: Vec<(String, Vec<u8>)>,
 }
 
 struct OcrResourceData {
@@ -644,7 +650,7 @@ where
         {
             let completed = chunk.start_page.saturating_sub(1);
             let overall = completed.saturating_add(extracted).min(page_count);
-            progress(format!("PaddleOCR 正在解析 {overall}/{page_count} 页…"));
+            progress(format!("正在解析 {overall}/{page_count} 页…"));
         } else {
             progress(paddle_pending_message(chunk_index, chunk_count));
         }
@@ -667,17 +673,17 @@ where
 
 fn paddle_resume_message(chunk_index: usize, chunk_count: usize) -> String {
     let chunk = paddle_chunk_label(chunk_index, chunk_count);
-    format!("正在恢复 PaddleOCR{chunk}任务…")
+    format!("正在恢复{chunk}识别任务…")
 }
 
 fn paddle_pending_message(chunk_index: usize, chunk_count: usize) -> String {
     let chunk = paddle_chunk_label(chunk_index, chunk_count);
-    format!("PaddleOCR{chunk}正在排队解析…")
+    format!("{chunk}正在排队解析…")
 }
 
 fn paddle_download_message(chunk_index: usize, chunk_count: usize) -> String {
     let chunk = paddle_chunk_label(chunk_index, chunk_count);
-    format!("正在下载 PaddleOCR{chunk}结构化结果…")
+    format!("正在下载{chunk}结构化结果…")
 }
 
 fn paddle_chunk_label(chunk_index: usize, chunk_count: usize) -> String {
@@ -959,9 +965,9 @@ where
                 .pointer("/extract_progress/total_pages")
                 .and_then(value_as_usize)
                 .unwrap_or(extracted);
-            progress(format!("MinerU 正在解析 {extracted}/{total} 页…"));
+            progress(format!("正在解析 {extracted}/{total} 页…"));
         } else {
-            progress("MinerU 正在排队解析…".into());
+            progress("正在排队解析…".into());
         }
         match state {
             "done" => {
@@ -981,7 +987,7 @@ where
             _ => {}
         }
     };
-    progress("正在下载 MinerU 结构化结果…".into());
+    progress("正在下载结构化结果…".into());
     let bytes = download_bytes(client, &zip_url, "MinerU ZIP").await?;
     let (pages, resources) = parse_mineru_zip(bytes)?;
     if pages.is_empty() {
@@ -1396,7 +1402,95 @@ fn save_document(book_id: &str, parsed: ParsedOcrDocument) -> io::Result<()> {
         resources,
     };
     write_json_atomic(&directory.join(DOCUMENT_FILE), &document)?;
-    write_json_atomic(&directory.join(VIEW_MODE_FILE), &PdfOcrViewMode::Reflow)
+    write_json_atomic(&directory.join(VIEW_MODE_FILE), &PdfOcrViewMode::Reflow)?;
+    crate::sync::mark_derived_dirty(book_id, crate::sync::DerivedDataKind::Ocr)
+}
+
+pub(crate) fn export_pdf_ocr_sync_data(book_id: &str) -> io::Result<Option<PdfOcrSyncData>> {
+    let Some(mut document) = load_document(book_id)? else {
+        return Ok(None);
+    };
+    // The selected PDF/OCR view is a per-device preference, not derived content.
+    document.view_mode = PdfOcrViewMode::Original;
+    let resource_directory = book_directory(book_id)?.join("resources");
+    let mut resources = Vec::with_capacity(document.resources.len());
+    for resource in &document.resources {
+        validate_sync_resource_name(&resource.file_name)?;
+        resources.push((
+            resource.file_name.clone(),
+            fs::read(resource_directory.join(&resource.file_name))?,
+        ));
+    }
+    resources.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(Some(PdfOcrSyncData {
+        document: serde_json::to_vec_pretty(&document).map_err(io::Error::other)?,
+        resources,
+    }))
+}
+
+pub(crate) fn import_pdf_ocr_sync_data(book_id: &str, data: PdfOcrSyncData) -> io::Result<()> {
+    let mut document: StoredPdfOcrDocument = serde_json::from_slice(&data.document)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if document.version != PDF_OCR_VERSION || document.book_id != book_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PDF OCR result does not match the synced book",
+        ));
+    }
+    document.view_mode = PdfOcrViewMode::Original;
+    let resources = data.resources.into_iter().collect::<BTreeMap<_, _>>();
+    let expected_resources = document
+        .resources
+        .iter()
+        .map(|resource| resource.file_name.clone())
+        .collect::<BTreeSet<_>>();
+    if expected_resources.len() != document.resources.len()
+        || expected_resources.len() != resources.len()
+        || !expected_resources
+            .iter()
+            .all(|file_name| resources.contains_key(file_name))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PDF OCR resource list contains duplicates or missing files",
+        ));
+    }
+    for resource in &document.resources {
+        validate_sync_resource_name(&resource.file_name)?;
+    }
+
+    let directory = book_directory(book_id)?;
+    let resource_directory = directory.join("resources");
+    fs::create_dir_all(&resource_directory)?;
+    for (file_name, bytes) in &resources {
+        validate_sync_resource_name(file_name)?;
+        write_bytes_atomic(&resource_directory.join(file_name), bytes)?;
+    }
+    write_json_atomic(&directory.join(DOCUMENT_FILE), &document)?;
+    if let Ok(entries) = fs::read_dir(&resource_directory) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            if !resources.contains_key(&file_name) {
+                fs::remove_file(entry.path()).ok();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_sync_resource_name(file_name: &str) -> io::Result<()> {
+    if file_name.is_empty()
+        || file_name.contains(['/', '\\'])
+        || !file_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PDF OCR resource name is unsafe",
+        ));
+    }
+    Ok(())
 }
 
 fn load_document(book_id: &str) -> io::Result<Option<StoredPdfOcrDocument>> {

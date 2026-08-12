@@ -70,6 +70,7 @@ impl GpuState {
         surface_config.format = format;
         surface_config.usage = TextureUsages::RENDER_ATTACHMENT;
         surface_config.view_formats = vec![format];
+        surface_config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &surface_config);
 
         let egui_renderer = Renderer::new(&device, format, RendererOptions::default());
@@ -100,7 +101,11 @@ impl GpuState {
     }
 
     pub(super) fn resize(&mut self, size: PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 {
+        if size.width == 0
+            || size.height == 0
+            || (self.surface_config.width == size.width
+                && self.surface_config.height == size.height)
+        {
             return;
         }
         self.surface_config.width = size.width;
@@ -112,6 +117,45 @@ impl GpuState {
         self.clear_color = color;
     }
 
+    pub(super) fn present_background(&mut self, window: &Window) -> Result<(), String> {
+        if self.surface_config.width == 0 || self.surface_config.height == 0 {
+            return Ok(());
+        }
+        let Some(frame) = self.acquire_surface_frame(window)? else {
+            return Ok(());
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("resize-background-encoder"),
+            });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("resize-background-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.queue.submit([encoder.finish()]);
+        window.pre_present_notify();
+        frame.present();
+        Ok(())
+    }
+
     fn take_egui_input(
         &self,
         window: &Window,
@@ -121,6 +165,41 @@ impl GpuState {
         input.max_texture_side =
             usize::try_from(self.device.limits().max_texture_dimension_2d).ok();
         input
+    }
+
+    fn acquire_surface_frame(
+        &mut self,
+        window: &Window,
+    ) -> Result<Option<wgpu::SurfaceTexture>, String> {
+        let mut recovery_attempted = false;
+        loop {
+            match self.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(frame) => return Ok(Some(frame)),
+                wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                    window.request_redraw();
+                    return Ok(Some(frame));
+                }
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost
+                    if !recovery_attempted =>
+                {
+                    // A fullscreen/IME compositor transition can invalidate the
+                    // swapchain between redraw events. Recover and acquire again
+                    // now so the current redraw still presents a complete frame.
+                    self.surface.configure(&self.device, &self.surface_config);
+                    recovery_attempted = true;
+                }
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    window.request_redraw();
+                    return Ok(None);
+                }
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return Ok(None);
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    return Err("Surface validation failed".into());
+                }
+            }
+        }
     }
 
     pub(super) fn render(
@@ -171,26 +250,9 @@ impl GpuState {
             }
         }
 
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                window.request_redraw();
-                frame
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.surface_config);
-                window.request_redraw();
-                self.free_egui_textures(&mut output.textures_delta);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                self.free_egui_textures(&mut output.textures_delta);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                self.free_egui_textures(&mut output.textures_delta);
-                return Err("Surface validation failed".into());
-            }
+        let Some(frame) = self.acquire_surface_frame(window)? else {
+            self.free_egui_textures(&mut output.textures_delta);
+            return Ok(());
         };
         let view = frame
             .texture
@@ -229,6 +291,7 @@ impl GpuState {
         }
         self.queue
             .submit(callback_commands.into_iter().chain([encoder.finish()]));
+        window.pre_present_notify();
         frame.present();
         for id in self.retired_page_textures.drain(..) {
             self.egui_renderer.free_texture(&id);

@@ -9,7 +9,7 @@ use crate::plugins::{
     TranslationMode,
 };
 use crate::preferences::{AppLanguage, AppTheme};
-use crate::sync::{CloudProviderKind, SYNC_INTERVAL_OPTIONS};
+use crate::sync::CloudProviderKind;
 use crate::ui::{Icon, dialog_action_button, icon_button, navigation_button, palette};
 
 const SETTINGS_SELECT_WIDTH: f32 = 156.0;
@@ -60,7 +60,7 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
         .show(ctx, |ui| {
             ui.set_width(modal_size.x);
             ui.set_height(modal_size.y);
-            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
             ui.style_mut().visuals.widgets.hovered.expansion = 0.0;
             ui.style_mut().visuals.widgets.active.expansion = 0.0;
             ui.style_mut().visuals.widgets.open.expansion = 0.0;
@@ -1001,10 +1001,12 @@ fn font_family_selector(
     selected: &mut String,
     font_families: &[String],
 ) {
-    let combo_box_id = ui.make_persistent_id(id_salt);
-    let was_open = egui::ComboBox::is_open(ui.ctx(), combo_box_id);
+    let popup_state_id = ui.make_persistent_id((id_salt, "popup-was-open"));
+    let was_open = ui
+        .ctx()
+        .data(|data| data.get_temp::<bool>(popup_state_id).unwrap_or(false));
     let selected_text = selected.clone();
-    egui::ComboBox::from_id_salt(id_salt)
+    let response = egui::ComboBox::from_id_salt(id_salt)
         .width(SETTINGS_FONT_SELECT_WIDTH)
         .truncate()
         .selected_text(selected_text)
@@ -1017,6 +1019,9 @@ fn font_family_selector(
                 }
             }
         });
+    let is_open = egui::ComboBox::is_open(ui.ctx(), response.response.id);
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(popup_state_id, is_open));
 }
 
 fn choice_button(ui: &mut egui::Ui, text: &str, selected: bool, width: f32) -> Response {
@@ -1096,28 +1101,7 @@ fn cloud_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         text_field(ui, &mut state.draft_sync_password, true);
         field_label(ui, language.text("设备名称", "Device name"));
         text_field(ui, &mut settings.device_name, false);
-        field_label(ui, language.text("同步间隔", "Sync interval"));
-        egui::ComboBox::from_id_salt("sync-interval")
-            .width(SETTINGS_SELECT_WIDTH)
-            .selected_text(sync_interval_label(settings.interval_minutes, language))
-            .show_ui(ui, |ui| {
-                for interval in SYNC_INTERVAL_OPTIONS {
-                    ui.selectable_value(
-                        &mut settings.interval_minutes,
-                        interval,
-                        sync_interval_label(interval, language),
-                    );
-                }
-            });
     });
-}
-
-fn sync_interval_label(minutes: u32, language: AppLanguage) -> String {
-    match minutes {
-        60 => language.text("1 小时", "1 h").into(),
-        180 => language.text("3 小时", "3 h").into(),
-        _ => format!("{minutes} {}", language.text("分钟", "min")),
-    }
 }
 
 fn provider_credential_button(ui: &mut egui::Ui, url: &str, tooltip: &str) {

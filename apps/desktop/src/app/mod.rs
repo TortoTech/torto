@@ -13,7 +13,7 @@ use crate::reader::{
 };
 use crate::reader::{DesktopReader, ReaderFramePlan, ReaderPageTexture};
 use crate::settings::{SettingsFeature, settings_overlay};
-use crate::shelf::{ShelfFeature, ShelfImportTaskMessage, SyncTaskMessage};
+use crate::shelf::{ShelfFeature, ShelfImportTaskMessage, SyncProgressMessage, SyncTaskMessage};
 
 pub(crate) struct DesktopApp {
     shelf: ShelfFeature,
@@ -21,6 +21,7 @@ pub(crate) struct DesktopApp {
     settings: SettingsFeature,
     applied_settings_revision: u64,
     pending_reader_notice: Option<String>,
+    pending_reader_error: Option<String>,
     pending_search_navigation: Option<crate::plugins::BookSearchResult>,
     #[cfg(target_os = "windows")]
     updater: crate::updater::WindowsUpdater,
@@ -35,6 +36,7 @@ impl DesktopApp {
             settings,
             applied_settings_revision: 0,
             pending_reader_notice: None,
+            pending_reader_error: None,
             pending_search_navigation: None,
             #[cfg(target_os = "windows")]
             updater: crate::updater::WindowsUpdater::new(),
@@ -43,6 +45,7 @@ impl DesktopApp {
 
     pub(crate) fn open_book(&mut self, path: &Path) {
         self.pending_reader_notice = None;
+        self.pending_reader_error = None;
         self.pending_search_navigation = None;
         self.shelf.open_book(path);
         if let Some(next_reader) = self.shelf.take_opened_reader() {
@@ -118,6 +121,10 @@ impl DesktopApp {
 
     pub(crate) fn complete_shelf_sync(&mut self, message: SyncTaskMessage) {
         self.shelf.complete_sync(message);
+    }
+
+    pub(crate) fn update_shelf_sync_progress(&mut self, message: SyncProgressMessage) {
+        self.shelf.update_sync_progress(message);
     }
 
     pub(crate) fn complete_shelf_import(&mut self, message: ShelfImportTaskMessage) {
@@ -261,12 +268,17 @@ impl DesktopApp {
             }
         }
         let reopen = self.reader.as_mut().and_then(|reader| {
-            reader
-                .take_reopen_request()
-                .map(|path| (path, reader.take_reopen_notice()))
+            reader.take_reopen_request().map(|path| {
+                (
+                    path,
+                    reader.take_reopen_notice(),
+                    reader.take_reopen_error(),
+                )
+            })
         });
-        if let Some((path, notice)) = reopen {
+        if let Some((path, notice, error)) = reopen {
             self.pending_reader_notice = notice;
+            self.pending_reader_error = error;
             self.reader = None;
             self.shelf.open_book(&path);
         }
@@ -285,7 +297,10 @@ impl DesktopApp {
     fn promote_opened_reader(&mut self) {
         if self.reader.is_none() {
             self.reader = self.shelf.take_opened_reader().map(|mut reader| {
-                if let Some(notice) = self.pending_reader_notice.take() {
+                if let Some(error) = self.pending_reader_error.take() {
+                    self.pending_reader_notice = None;
+                    reader.report_settings_error(error);
+                } else if let Some(notice) = self.pending_reader_notice.take() {
                     reader.show_notice(notice);
                 }
                 if let Some(result) = self.pending_search_navigation.take() {

@@ -16,7 +16,6 @@ const SETTINGS_VERSION: u32 = 2;
 const FIRST_SUPPORTED_SETTINGS_VERSION: u32 = 1;
 const SETTINGS_FILE: &str = "webdav-sync.json";
 const CREDENTIAL_SERVICE: &str = "Rebook WebDAV";
-pub(crate) const SYNC_INTERVAL_OPTIONS: [u32; 4] = [10, 30, 60, 180];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -86,8 +85,6 @@ pub(crate) struct SyncSettings {
     pub username: String,
     pub device_id: String,
     pub device_name: String,
-    #[serde(default = "default_interval_minutes")]
-    pub interval_minutes: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,7 +132,6 @@ impl SyncSettings {
                 .ok()
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| "Torto Desktop".into()),
-            interval_minutes: default_interval_minutes(),
         }
     }
 
@@ -149,7 +145,6 @@ impl SyncSettings {
         if self.device_name.is_empty() {
             self.device_name = "Torto Desktop".into();
         }
-        self.interval_minutes = nearest_interval(self.interval_minutes);
     }
 
     pub(crate) fn select_provider(&mut self, provider: CloudProviderKind) {
@@ -226,17 +221,6 @@ impl SyncSettings {
     }
 }
 
-fn default_interval_minutes() -> u32 {
-    30
-}
-
-fn nearest_interval(value: u32) -> u32 {
-    SYNC_INTERVAL_OPTIONS
-        .into_iter()
-        .min_by_key(|candidate| candidate.abs_diff(value))
-        .unwrap_or_else(default_interval_minutes)
-}
-
 fn credential_entry(device_id: &str) -> SyncResult<Entry> {
     Ok(Entry::new(CREDENTIAL_SERVICE, device_id)?)
 }
@@ -258,7 +242,6 @@ mod tests {
         settings.base_url = " https://dav.example.test/books/// ".into();
         settings.username = " chris ".into();
         settings.device_name = " ".into();
-        settings.interval_minutes = 0;
         let device_id = settings.device_id.clone();
 
         settings.normalize();
@@ -266,20 +249,8 @@ mod tests {
         assert_eq!(settings.base_url, "https://dav.example.test/books");
         assert_eq!(settings.username, "chris");
         assert_eq!(settings.device_name, "Torto Desktop");
-        assert_eq!(settings.interval_minutes, 10);
         assert_eq!(settings.device_id, device_id);
         settings.validate().unwrap();
-    }
-
-    #[test]
-    fn interval_is_normalized_to_a_supported_choice() {
-        let mut settings = SyncSettings::new_device();
-        assert_eq!(settings.interval_minutes, 30);
-
-        settings.interval_minutes = 52;
-        settings.normalize();
-
-        assert_eq!(settings.interval_minutes, 60);
     }
 
     #[test]
@@ -309,8 +280,7 @@ mod tests {
             "base_url": "https://dav.example.test/books",
             "username": "reader",
             "device_id": "d6e21c7d-6f6b-40db-a87c-bef85c12fa47",
-            "device_name": "Legacy device",
-            "interval_minutes": 30
+            "device_name": "Legacy device"
         }"#;
         let mut settings: SyncSettings = serde_json::from_str(json).unwrap();
 
@@ -329,8 +299,7 @@ mod tests {
                 "base_url": "",
                 "username": "",
                 "device_id": "d6e21c7d-6f6b-40db-a87c-bef85c12fa47",
-                "device_name": "Legacy device",
-                "interval_minutes": 30
+                "device_name": "Legacy device"
             }
         }"#;
         let stored: StoredSettings = serde_json::from_str(json).unwrap();

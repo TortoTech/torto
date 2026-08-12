@@ -6,7 +6,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::persistence::write_json_atomic;
+use crate::persistence::{write_bytes_atomic, write_json_atomic};
 
 const GENERATED_METADATA_VERSION: u8 = 1;
 const GENERATED_METADATA_DIRECTORY: &str = "generated-metadata";
@@ -42,7 +42,36 @@ pub(crate) fn save(book_id: &str, metadata: &GeneratedPdfMetadata) -> io::Result
             book_id: book_id.to_owned(),
             metadata: normalize(metadata.clone()),
         },
-    )
+    )?;
+    crate::sync::mark_derived_dirty(book_id, crate::sync::DerivedDataKind::Metadata)
+}
+
+pub(crate) fn export_sync_bytes(book_id: &str) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(generated_metadata_path(book_id)?) {
+        Ok(bytes) => {
+            validate_sync_bytes(book_id, &bytes)?;
+            Ok(Some(bytes))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn import_sync_bytes(book_id: &str, bytes: &[u8]) -> io::Result<()> {
+    validate_sync_bytes(book_id, bytes)?;
+    write_bytes_atomic(&generated_metadata_path(book_id)?, bytes)
+}
+
+pub(crate) fn validate_sync_bytes(book_id: &str, bytes: &[u8]) -> io::Result<()> {
+    let stored: StoredGeneratedMetadata = serde_json::from_slice(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if stored.version != GENERATED_METADATA_VERSION || stored.book_id != book_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "generated metadata does not match the synced book",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn load(book_id: &str) -> io::Result<Option<GeneratedPdfMetadata>> {

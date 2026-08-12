@@ -72,6 +72,18 @@ impl DesktopReader {
             || old_embedding_provider != new_embedding_provider;
         let semantic_enable_changed =
             self.plugin_settings.semantic_search_enabled != plugin_settings.semantic_search_enabled;
+        let old_ocr_provider = self
+            .plugin_settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == self.plugin_settings.ocr_provider);
+        let new_ocr_provider = plugin_settings
+            .providers
+            .iter()
+            .find(|provider| provider.id == plugin_settings.ocr_provider);
+        let ocr_backend_changed = self.plugin_settings.ocr_provider != plugin_settings.ocr_provider
+            || self.plugin_settings.ocr_model != plugin_settings.ocr_model
+            || old_ocr_provider != new_ocr_provider;
         let toc_recognition_enable_changed =
             self.plugin_settings.ocr_enabled != plugin_settings.ocr_enabled;
         let pdf_ocr_reflow_changed =
@@ -134,7 +146,7 @@ impl DesktopReader {
                 if !self.plugin_settings.ocr_enabled {
                     self.pdf_toc.task.cancel();
                     self.pdf_toc.progress.clear();
-                } else if toc_recognition_enable_changed {
+                } else if toc_recognition_enable_changed || ocr_backend_changed {
                     self.start_pdf_metadata_extraction();
                 }
                 self.apply_snapshot(

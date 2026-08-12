@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use peniko::{Blob, Color};
 use rebook_formats::{BookFormat, open_file_for_reading as open_publication_file_for_reading};
 use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
-use rebook_publication::{BookSource, RenditionLayout, Rgba, SourceRange};
+use rebook_publication::{BookSource, RenditionLayout, Rgba, SourceRange, TableOfContentsOrigin};
 use rebook_reader::{
     PageDirection, ReaderPosition, ReaderSectionPage, ReaderSelection, ReaderSession,
     ReaderSnapshot, ReaderTextHit, SelectionGranularity,
@@ -378,6 +378,7 @@ pub(super) struct DesktopReader {
     source_path: PathBuf,
     reopen_requested: Option<PathBuf>,
     reopen_notice: Option<String>,
+    reopen_error: Option<String>,
     pub(super) exit_requested: bool,
 }
 
@@ -586,40 +587,44 @@ impl DesktopReader {
         self.reopen_notice.take()
     }
 
+    pub(crate) fn take_reopen_error(&mut self) -> Option<String> {
+        self.reopen_error.take()
+    }
+
     pub(crate) fn show_notice(&mut self, message: String) {
         self.notice_timer
             .show(&mut self.notice, message, Instant::now());
     }
 
-    fn apply_generated_toc(&mut self) {
+    fn show_error(&mut self, message: String) {
+        self.error_timer
+            .show(&mut self.error, message, Instant::now());
+    }
+
+    fn apply_generated_toc(&mut self) -> Result<(), String> {
         let Some(draft) = self.pdf_toc.draft.as_ref() else {
-            return;
+            return Err("没有可应用的 AI 目录".into());
         };
-        match crate::generated_toc::save(&self.book_id, draft) {
-            Ok(()) => {
-                self.pdf_toc.editing = false;
-                self.pdf_toc.draft = None;
-                self.persist_progress();
-                self.reopen_requested = Some(self.source_path.clone());
-            }
-            Err(error) => {
-                self.pdf_toc.error = Some(format!("保存 AI 目录失败：{error}"));
-            }
-        }
+        crate::generated_toc::save(&self.book_id, draft)
+            .map_err(|error| format!("保存 AI 目录失败：{error}"))?;
+        self.pdf_toc.editing = false;
+        self.pdf_toc.draft = None;
+        self.persist_progress();
+        self.reopen_requested = Some(self.source_path.clone());
+        Ok(())
     }
 
     fn edit_generated_toc(&mut self) {
         match crate::generated_toc::load(&self.book_id) {
             Ok(Some(draft)) => {
-                self.pdf_toc.error = None;
                 self.pdf_toc.draft = Some(draft);
                 self.pdf_toc.editing = true;
             }
             Ok(None) => {
-                self.pdf_toc.error = Some("没有可编辑的 AI 目录".into());
+                self.show_error("没有可编辑的 AI 目录".into());
             }
             Err(error) => {
-                self.pdf_toc.error = Some(format!("读取 AI 目录失败：{error}"));
+                self.show_error(format!("读取 AI 目录失败：{error}"));
             }
         }
     }
@@ -825,7 +830,6 @@ pub(crate) enum PdfTocTaskMessage {
 #[derive(Default)]
 struct PdfTocUiState {
     progress: String,
-    error: Option<String>,
     draft: Option<GeneratedTocDraft>,
     editing: bool,
     task: TaskSlot<PdfTocTask>,
@@ -991,6 +995,13 @@ impl SnapshotEffects {
             prefetch: FollowUp::Run,
             translation: FollowUp::None,
             progress: ProgressChange::Keep,
+        }
+    }
+
+    const fn viewport_change() -> Self {
+        Self {
+            translation: FollowUp::Run,
+            ..Self::static_content_change()
         }
     }
 }
@@ -1246,9 +1257,10 @@ impl DesktopReader {
             |controller| controller.original_source(),
         );
         let mut pdf_toc = PdfTocUiState::default();
-        let need_toc = source.book().table_of_contents.is_empty();
+        let need_toc = needs_generated_toc(source.as_ref());
         if format == BookFormat::Pdf
             && plugin_settings.ocr_enabled
+            && plugin_settings.ocr_endpoint().is_ok()
             && (need_toc || pdf_metadata_missing.any())
         {
             pdf_toc.progress = language
@@ -1352,9 +1364,15 @@ impl DesktopReader {
             source_path,
             reopen_requested: None,
             reopen_notice: None,
+            reopen_error: None,
             exit_requested: false,
         }
     }
+}
+
+fn needs_generated_toc(source: &dyn BookSource) -> bool {
+    source.book().table_of_contents.is_empty()
+        || source.table_of_contents_origin() == TableOfContentsOrigin::Fallback
 }
 
 #[derive(Default)]
@@ -1374,10 +1392,10 @@ fn logical_dimension(value: f64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BookDisplayMetadata, Duration, HashSet, Instant, MOTION_DURATION, Motion,
-        NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, SidebarTab, TOOLBAR_HIDE_DELAY,
-        TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState, logical_dimension,
-        resolve_book_display_metadata,
+        BookDisplayMetadata, Duration, FollowUp, HashSet, Instant, MOTION_DURATION, Motion,
+        NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, SidebarTab, SnapshotEffects,
+        TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState,
+        logical_dimension, resolve_book_display_metadata,
     };
 
     #[test]
@@ -1388,6 +1406,18 @@ mod tests {
         assert_eq!(logical_dimension(0.0), 0);
         assert_eq!(logical_dimension(10.4), 10);
         assert_eq!(logical_dimension(10.6), 11);
+    }
+
+    #[test]
+    fn viewport_changes_reschedule_visible_translation() {
+        assert!(matches!(
+            SnapshotEffects::viewport_change().translation,
+            FollowUp::Run
+        ));
+        assert!(matches!(
+            SnapshotEffects::static_content_change().translation,
+            FollowUp::None
+        ));
     }
 
     #[test]

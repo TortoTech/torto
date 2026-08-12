@@ -1416,6 +1416,11 @@ impl ReaderSession {
         target: Option<&PublicationUrl>,
     ) -> Result<ReaderSnapshot, ReaderError> {
         let fraction = page_fraction(self.current_page, self.current_page_count());
+        let visible_source_anchor = target
+            .is_none()
+            .then(|| self.current_page().leading_source_range())
+            .flatten()
+            .map(|range| range.start);
         let toc_items: Arc<[TocViewItem]> =
             flatten_toc(&self.source.book().table_of_contents).into();
         let mut section_indices_by_path = HashMap::with_capacity(self.source.book().sections.len());
@@ -1472,7 +1477,15 @@ impl ReaderSession {
         let target_page = target
             .and_then(PublicationUrl::fragment)
             .and_then(|fragment| segment.anchor_pages.get(fragment))
-            .copied();
+            .copied()
+            .or_else(|| {
+                visible_source_anchor.as_ref().and_then(|anchor| {
+                    segment
+                        .pages
+                        .iter()
+                        .position(|page| page.contains_source_anchor(anchor))
+                })
+            });
 
         self.repository = repository;
         self.prefetch_worker = prefetch_worker;
@@ -4609,6 +4622,25 @@ mod tests {
         assert!((new_fraction - old_fraction).abs() <= one_page);
         assert_eq!(source.parse_count(0), 2);
         assert_eq!(reader.cached_segment_count(), 1);
+    }
+
+    #[test]
+    fn source_refresh_preserves_the_first_visible_source_anchor_after_repagination() {
+        let original = CountingSource::new(&["stable anchor ".repeat(1_600)]);
+        let derived = CountingSource::new(&["stable anchor ".repeat(2_400)]);
+        let source = SwitchingSource::new(&original, &derived);
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        for _ in 0..reader.location().page_count / 2 {
+            reader.turn_page(PageDirection::Next).unwrap();
+        }
+        let anchor = reader.current_page().leading_source_range().unwrap().start;
+
+        source.set_derived(true);
+        reader.refresh_source().unwrap();
+
+        assert!(reader.current_page().contains_source_anchor(&anchor));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,18 +13,64 @@ use crate::preferences::{self, AppLanguage};
 use crate::reader::{BookDisplayMetadata, DesktopReader, open_reader};
 use crate::settings::AppliedSettings;
 use crate::sync::{
-    LocalSyncBook, SyncReport, SyncSettings, SyncStore, append_sync_log, format_error_chain,
-    run_sync,
+    LocalSyncBook, SyncProgress, SyncReport, SyncSettings, SyncStage, SyncStore, append_sync_log,
+    format_error_chain, run_sync,
 };
-use crate::ui::{Icon, decode_color_image, icon, icon_button, paint_icon, palette};
+use crate::ui::{
+    Icon, ToastKind, decode_color_image, icon, icon_button, paint_icon, palette, show_toast,
+};
 
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
-const TOAST_MAX_WIDTH: f32 = 400.0;
+// Keep shelf notifications below the 28 px top inset and 44 px header so they
+// never cover the import or settings actions. Success, error, and sync progress
+// all flow through the same shelf notification slot.
+const SHELF_TOAST_TOP_OFFSET: f32 = 84.0;
 const SHELF_SCROLLBAR_GUTTER: f32 = 16.0;
 const CARD_WIDTH: f32 = 180.0;
 const CARD_HEIGHT: f32 = 336.0;
 const COVER_WIDTH: f32 = 160.0;
 const COVER_HEIGHT: f32 = 228.0;
+
+fn sync_progress_text(
+    language: AppLanguage,
+    stage: SyncStage,
+    completed: u64,
+    total: u64,
+) -> String {
+    let label = match stage {
+        SyncStage::Checking => language.text("检查同步状态", "Checking sync status"),
+        SyncStage::Uploading => language.text("上传中", "Uploading"),
+        SyncStage::Downloading => language.text("下载中", "Downloading"),
+        SyncStage::ReadingData => language.text("同步阅读数据", "Syncing reading data"),
+        SyncStage::DerivedData => language.text("同步 OCR 数据", "Syncing OCR data"),
+    };
+    let percent = if total == 0 {
+        100
+    } else {
+        u64::try_from(
+            (u128::from(completed).saturating_mul(100) + u128::from(total / 2)) / u128::from(total),
+        )
+        .unwrap_or(100)
+        .min(100)
+    };
+    format!("{label} {percent}%")
+}
+
+fn sync_progress_log(progress: &SyncProgress) -> Option<String> {
+    match progress {
+        SyncProgress::Stage {
+            stage,
+            completed,
+            total,
+        } if *completed == 0 || *completed == *total => {
+            Some(format!("sync stage={stage:?} progress={completed}/{total}"))
+        }
+        SyncProgress::Downloaded {
+            completed, total, ..
+        } => Some(format!("sync downloaded_book progress={completed}/{total}")),
+        SyncProgress::Stage { .. } => None,
+    }
+}
 
 pub(crate) struct ShelfFeature {
     shelf: ShelfState,
@@ -52,6 +99,8 @@ struct SyncUiState {
     password: String,
     task: TaskSlot<SyncTask>,
     status: String,
+    imported_books: usize,
+    import_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -62,6 +111,10 @@ pub(crate) struct SyncTask {
 }
 
 pub(crate) type SyncTaskMessage = TaskResult<SyncReport>;
+pub(crate) struct SyncProgressMessage {
+    pub(crate) id: u64,
+    pub(crate) progress: SyncProgress,
+}
 pub(crate) type ShelfImportTaskMessage = TaskResult<Option<Vec<PathBuf>>>;
 
 #[derive(Clone, Debug)]
@@ -126,10 +179,11 @@ impl ShelfFeature {
             .or(settings_error)
             .or(password_error)
             .or(store_error);
+        let can_start_sync = initial_error.is_none();
         let initial_error_dismiss_at = initial_error
             .as_ref()
             .map(|_| Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
-        Self {
+        let mut feature = Self {
             shelf: ShelfState {
                 library,
                 query: String::new(),
@@ -148,11 +202,17 @@ impl ShelfFeature {
                 password,
                 task: TaskSlot::default(),
                 status: String::new(),
+                imported_books: 0,
+                import_error: None,
             },
             language,
             settings_requested: false,
             cover_textures: HashMap::new(),
+        };
+        if can_start_sync {
+            feature.start_sync();
         }
+        feature
     }
 
     pub(crate) fn open_book(&mut self, path: &Path) {
@@ -319,6 +379,10 @@ impl ShelfFeature {
             .language
             .text("正在同步书籍与阅读数据…", "Syncing books and reading data…")
             .into();
+        self.sync.imported_books = 0;
+        self.sync.import_error = None;
+        self.shelf.notice = Some(self.sync.status.clone());
+        self.shelf.notice_dismiss_at = None;
         self.sync.task.begin(SyncTask {
             settings: self.sync.settings.clone(),
             password: self.sync.password.clone(),
@@ -383,7 +447,26 @@ impl ShelfFeature {
                 ) {
                     tracing::warn!(%log_error, "failed to append WebDAV sync log");
                 }
-                let result = match run_sync(payload.settings, payload.password, payload.books).await
+                let progress_proxy = proxy.clone();
+                let result = match run_sync(
+                    payload.settings,
+                    payload.password,
+                    payload.books,
+                    move |progress| {
+                        if let Some(message) = sync_progress_log(&progress)
+                            && let Err(error) = append_sync_log("INFO", &message)
+                        {
+                            tracing::warn!(%error, "failed to append WebDAV sync log");
+                        }
+                        let _ = progress_proxy.send_event(
+                            crate::platform::UserEvent::ShelfSyncProgress(SyncProgressMessage {
+                                id,
+                                progress,
+                            }),
+                        );
+                    },
+                )
+                .await
                 {
                     Ok(report) => {
                         if let Err(log_error) = append_sync_log(
@@ -391,7 +474,7 @@ impl ShelfFeature {
                             &format!(
                                 "sync completed uploaded_books={} downloads={} updated_progress={}",
                                 report.uploaded_books,
-                                report.downloads.len(),
+                                report.downloaded_books,
                                 report.updated_progress,
                             ),
                         ) {
@@ -435,21 +518,22 @@ impl ShelfFeature {
             return;
         }
         match message.result {
-            Ok(mut report) => {
-                let mut imported = 0;
-                for download in report.downloads.drain(..) {
-                    match self.shelf.library.import_remote(download) {
-                        Ok(true) => imported += 1,
-                        Ok(false) => {}
-                        Err(error) => {
-                            self.show_error(error.to_string());
-                            return;
-                        }
-                    }
+            Ok(report) => {
+                if let Some(error) = self.sync.import_error.take() {
+                    self.show_error(error);
+                    return;
                 }
-                if imported > 0 {
-                    self.cover_textures.clear();
+                if let Err(error) = self.apply_synced_generated_metadata() {
+                    self.show_error(format!(
+                        "{}: {error}",
+                        self.language.text(
+                            "应用同步的书籍元数据失败",
+                            "Failed to apply synced book metadata"
+                        )
+                    ));
+                    return;
                 }
+                let imported = self.sync.imported_books;
                 self.sync.status = format!(
                     "{} · ↑{} ↓{} · {}",
                     self.language.text("同步完成", "Sync complete"),
@@ -466,6 +550,71 @@ impl ShelfFeature {
                 ));
             }
         }
+    }
+
+    pub(crate) fn update_sync_progress(&mut self, message: SyncProgressMessage) {
+        if self.sync.task.in_flight(message.id).is_none() {
+            return;
+        }
+        match message.progress {
+            SyncProgress::Stage {
+                stage,
+                completed,
+                total,
+            } => {
+                self.sync.status = sync_progress_text(self.language, stage, completed, total);
+            }
+            SyncProgress::Downloaded {
+                book,
+                cache_path,
+                completed,
+                total,
+            } => {
+                match self.shelf.library.import_remote(*book) {
+                    Ok(true) => {
+                        self.sync.imported_books += 1;
+                        self.cover_textures.clear();
+                        fs::remove_file(&cache_path).ok();
+                    }
+                    Ok(false) => {
+                        fs::remove_file(&cache_path).ok();
+                    }
+                    Err(error) => {
+                        self.sync.import_error = Some(format!(
+                            "{}: {error}",
+                            self.language
+                                .text("导入云端书籍失败", "Failed to import a cloud book")
+                        ));
+                    }
+                }
+                self.sync.status =
+                    sync_progress_text(self.language, SyncStage::Downloading, completed, total);
+            }
+        }
+        if self.sync.import_error.is_none() {
+            self.shelf.error = None;
+            self.shelf.error_dismiss_at = None;
+            self.shelf.notice = Some(self.sync.status.clone());
+            self.shelf.notice_dismiss_at = None;
+        }
+    }
+
+    fn apply_synced_generated_metadata(&mut self) -> crate::library::LibraryResult<()> {
+        let book_ids = self
+            .shelf
+            .library
+            .books()
+            .iter()
+            .map(|book| book.id.clone())
+            .collect::<Vec<_>>();
+        for book_id in book_ids {
+            if let Some(metadata) = crate::generated_metadata::load(&book_id)? {
+                self.shelf
+                    .library
+                    .update_metadata(&book_id, &metadata.title, &metadata.authors)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn ui(&mut self, root_ui: &mut egui::Ui) {
@@ -709,9 +858,27 @@ impl ShelfFeature {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(error) = &self.shelf.error {
-            shelf_toast(ctx, "shelf-error", error, ShelfToastKind::Error);
+            show_toast(
+                ctx,
+                "shelf-error",
+                error,
+                ToastKind::Error,
+                Vec2::new(-24.0, SHELF_TOAST_TOP_OFFSET),
+                false,
+            );
         } else if let Some(notice) = &self.shelf.notice {
-            shelf_toast(ctx, "shelf-notice", notice, ShelfToastKind::Success);
+            show_toast(
+                ctx,
+                "shelf-notice",
+                notice,
+                if self.sync.task.is_pending() {
+                    ToastKind::Loading
+                } else {
+                    ToastKind::Success
+                },
+                Vec2::new(-24.0, SHELF_TOAST_TOP_OFFSET),
+                false,
+            );
         }
         let confirmation = self.shelf.remove_confirmation.clone();
         if let Some(confirmation) = confirmation {
@@ -779,57 +946,6 @@ impl ShelfFeature {
             ctx.request_repaint_after(deadline.saturating_duration_since(now));
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum ShelfToastKind {
-    Success,
-    Error,
-}
-
-fn shelf_toast(ctx: &egui::Context, id: &'static str, message: &str, kind: ShelfToastKind) {
-    let available_width = (ctx.content_rect().width() - 48.0).max(200.0);
-    let width = TOAST_MAX_WIDTH.min(available_width);
-    let (icon_kind, fill, border, foreground) = match kind {
-        ShelfToastKind::Success => (
-            Icon::CheckCircle,
-            palette().accent_soft,
-            palette().accent_border,
-            palette().accent,
-        ),
-        ShelfToastKind::Error => (
-            Icon::AlertCircle,
-            palette().error_fill,
-            palette().error_stroke,
-            palette().error_text,
-        ),
-    };
-
-    egui::Area::new(id.into())
-        .order(egui::Order::Tooltip)
-        .anchor(egui::Align2::RIGHT_TOP, [-24.0, 24.0])
-        .show(ctx, |ui| {
-            egui::Frame::popup(ui.style())
-                .fill(fill)
-                .stroke(egui::Stroke::new(1.0, border))
-                .corner_radius(8)
-                .inner_margin(egui::Margin::symmetric(14, 11))
-                .show(ui, |ui| {
-                    ui.set_width((width - 28.0).max(0.0));
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 10.0;
-                        ui.add(icon(icon_kind).size(18.0).color(foreground));
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(message)
-                                    .size(crate::ui::scaled_font_size(13.0))
-                                    .color(foreground),
-                            )
-                            .wrap(),
-                        );
-                    });
-                });
-        });
 }
 
 fn two_line_card_text_job(

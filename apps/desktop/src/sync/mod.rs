@@ -1,3 +1,4 @@
+mod derived;
 mod engine;
 mod protocol;
 mod settings;
@@ -12,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
 
-pub(crate) use engine::{LocalSyncBook, SyncReport, run_sync};
-pub(crate) use settings::{CloudProviderKind, SYNC_INTERVAL_OPTIONS, SyncSettings};
+pub(crate) use engine::{LocalSyncBook, SyncProgress, SyncReport, SyncStage, run_sync};
+pub(crate) use settings::{CloudProviderKind, SyncSettings};
 pub(crate) use store::SyncStore;
 
 pub(crate) type SyncResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -48,3 +49,4 @@ pub(crate) fn append_sync_log(level: &str, message: &str) -> io::Result<PathBuf>
     writeln!(file, "[{timestamp}] {level} {message}")?;
     Ok(path)
 }
+pub(crate) use derived::{DerivedDataKind, mark_derived_dirty};

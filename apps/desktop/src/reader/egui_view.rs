@@ -19,8 +19,9 @@ use crate::plugins::{
 use crate::preferences::{AppLanguage, AppTheme};
 use crate::settings::ReaderSettingsChange;
 use crate::ui::{
-    Icon, decode_color_image, dialog_action_button, icon, icon_button, navigation_button,
-    navigation_text_button, paint_icon, palette, selectable_icon_button, small_icon_button,
+    Icon, ToastKind, decode_color_image, dialog_action_button, icon, icon_button,
+    navigation_button, navigation_text_button, paint_icon, palette, selectable_icon_button,
+    show_toast, small_icon_button,
 };
 
 pub(super) const SIDEBAR_WIDTH: f32 = 256.0;
@@ -1200,10 +1201,14 @@ impl DesktopReader {
                 .text("AI 识别目录", "Generate contents with AI")
         };
         ui.horizontal(|ui| {
-            let recognize = ui
-                .add_enabled_ui(!pending, |ui| small_icon_button(ui, Icon::ScanText))
-                .inner
-                .on_hover_text(recognize_label);
+            let recognize = ui.add_enabled_ui(!pending, |ui| small_icon_button(ui, Icon::ScanText));
+            let recognize = if pending {
+                recognize
+                    .inner
+                    .on_disabled_hover_text(self.pdf_toc.progress.as_str())
+            } else {
+                recognize.inner.on_hover_text(recognize_label)
+            };
             if recognize.clicked() {
                 self.start_pdf_toc_generation();
             }
@@ -1215,19 +1220,6 @@ impl DesktopReader {
                 self.edit_generated_toc();
             }
         });
-        if pending {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0));
-                ui.label(
-                    RichText::new(&self.pdf_toc.progress)
-                        .size(crate::ui::scaled_font_size(12.0))
-                        .color(palette().muted),
-                );
-            });
-        }
-        if let Some(error) = &self.pdf_toc.error {
-            ui.colored_label(palette().error, error);
-        }
     }
 
     fn pdf_toc_review(&mut self, ctx: &egui::Context) {
@@ -1302,7 +1294,17 @@ impl DesktopReader {
             cancel = true;
         }
         if apply {
-            self.apply_generated_toc();
+            match self.apply_generated_toc() {
+                Ok(()) => {
+                    self.reopen_notice = Some(
+                        self.language
+                            .text("PDF 目录已更新", "PDF contents updated")
+                            .into(),
+                    );
+                    self.reopen_error = None;
+                }
+                Err(error) => self.show_error(error),
+            }
         } else if cancel {
             self.pdf_toc.editing = false;
             self.pdf_toc.draft = None;
@@ -2484,52 +2486,36 @@ impl DesktopReader {
 
     fn feedback(&mut self, ctx: &egui::Context) {
         if let Some(error) = self.translation.error.clone() {
-            egui::Area::new("translation-error".into())
-                .order(egui::Order::Tooltip)
-                .anchor(egui::Align2::RIGHT_TOP, [-18.0, 62.0])
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style())
-                        .fill(palette().toast_error_fill)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(error).color(Color32::WHITE));
-                                if icon_button(ui, Icon::X).clicked() {
-                                    self.dismiss_translation_notice();
-                                }
-                            });
-                        });
-                });
+            if show_toast(
+                ctx,
+                "translation-error",
+                &error,
+                ToastKind::Error,
+                Vec2::new(-18.0, 62.0),
+                true,
+            ) {
+                self.dismiss_translation_notice();
+            }
             return;
         }
         if let Some(error) = &self.error {
-            egui::Area::new("reader-error".into())
-                .order(egui::Order::Tooltip)
-                .anchor(egui::Align2::RIGHT_TOP, [-18.0, 62.0])
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style())
-                        .fill(palette().toast_error_fill)
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(error).color(Color32::WHITE));
-                        });
-                });
+            show_toast(
+                ctx,
+                "reader-error",
+                error,
+                ToastKind::Error,
+                Vec2::new(-18.0, 62.0),
+                false,
+            );
         } else if let Some(notice) = &self.notice {
-            egui::Area::new("reader-notice".into())
-                .order(egui::Order::Tooltip)
-                .anchor(egui::Align2::RIGHT_TOP, [-18.0, 62.0])
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style())
-                        .fill(palette().accent_soft)
-                        .stroke(egui::Stroke::new(1.0, palette().accent_border))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::symmetric(14, 11))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 10.0;
-                                ui.add(icon(Icon::CheckCircle).color(palette().accent));
-                                ui.label(RichText::new(notice).color(palette().accent));
-                            });
-                        });
-                });
+            show_toast(
+                ctx,
+                "reader-notice",
+                notice,
+                ToastKind::Success,
+                Vec2::new(-18.0, 62.0),
+                false,
+            );
         }
     }
 }
@@ -3073,29 +3059,9 @@ fn annotation_editor(
 ) -> AnnotationEditorAction {
     let mut action = AnnotationEditorAction::None;
     ui.set_width(312.0);
-    ui.horizontal(|ui| {
-        ui.add(
-            icon(Icon::MessageSquarePlus)
-                .size(crate::ui::scaled_font_size(16.0))
-                .color(palette().accent),
-        );
-        ui.label(
-            RichText::new(language.text("添加批注", "Add annotation"))
-                .size(crate::ui::scaled_font_size(13.0))
-                .strong()
-                .color(palette().text),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if icon_button(ui, Icon::X)
-                .on_hover_text(language.text("关闭", "Close"))
-                .clicked()
-            {
-                action = AnnotationEditorAction::Cancel;
-            }
-        });
-    });
-    ui.add_space(9.0);
-    annotation_text_editor(ui, draft, language);
+    if annotation_text_editor(ui, draft, language) {
+        action = AnnotationEditorAction::Cancel;
+    }
     ui.add_space(10.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if annotation_action_button(
@@ -3108,9 +3074,6 @@ fn annotation_editor(
         {
             action = AnnotationEditorAction::Save;
         }
-        if annotation_action_button(ui, language.text("取消", "Cancel"), false, true).clicked() {
-            action = AnnotationEditorAction::Cancel;
-        }
     });
     action
 }
@@ -3119,40 +3082,41 @@ fn annotation_text_editor(
     ui: &mut egui::Ui,
     draft: &mut AnnotationDraft,
     language: crate::preferences::AppLanguage,
-) {
+) -> bool {
     let input_id = ui.make_persistent_id("selection-annotation-input");
-    let input_focused = ui.memory(|memory| memory.has_focus(input_id));
+    let mut close_clicked = false;
     let input = egui::Frame::new()
-        .fill(if input_focused {
-            palette().accent
-        } else {
-            palette().border
-        })
+        .fill(palette().surface)
         .corner_radius(7)
-        .inner_margin(1)
+        .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
-            egui::Frame::new()
-                .fill(palette().surface)
-                .corner_radius(6)
-                .inner_margin(egui::Margin::symmetric(8, 6))
-                .show(ui, |ui| {
-                    ui.add_sized(
-                        [ui.available_width(), 72.0],
-                        egui::TextEdit::multiline(&mut draft.note)
-                            .id(input_id)
-                            .frame(egui::Frame::NONE)
-                            .margin(0)
-                            .text_color(palette().text)
-                            .hint_text(language.text("写下你的想法…", "Write a note…")),
-                    )
-                })
-                .inner
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.horizontal_top(|ui| {
+                let text_width = (ui.available_width() - 32.0).max(1.0);
+                let input = ui.add_sized(
+                    [text_width, 72.0],
+                    egui::TextEdit::multiline(&mut draft.note)
+                        .id(input_id)
+                        .frame(egui::Frame::NONE)
+                        .margin(0)
+                        .text_color(palette().text)
+                        .hint_text(
+                            language.text("写下这一刻的想法", "Write down what you are thinking"),
+                        ),
+                );
+                close_clicked = small_icon_button(ui, Icon::X)
+                    .on_hover_text(language.text("关闭", "Close"))
+                    .clicked();
+                input
+            })
+            .inner
         })
         .inner;
     if draft.focus_pending {
         input.request_focus();
         draft.focus_pending = false;
     }
+    close_clicked
 }
 
 fn annotation_action_button(
@@ -3161,29 +3125,51 @@ fn annotation_action_button(
     primary: bool,
     enabled: bool,
 ) -> egui::Response {
-    let text = RichText::new(label)
-        .size(crate::ui::scaled_font_size(12.0))
-        .color(if primary {
-            Color32::WHITE
-        } else {
-            palette().text
-        });
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(text)
-            .fill(if primary {
-                palette().accent
-            } else {
-                palette().surface
-            })
-            .stroke(if primary {
-                egui::Stroke::NONE
-            } else {
-                egui::Stroke::new(1.0, palette().border)
-            })
-            .corner_radius(6)
-            .min_size(Vec2::new(68.0, 30.0)),
-    )
+    let size = Vec2::new(68.0, 30.0);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let colors = palette();
+    let fill = if !enabled {
+        colors.surface_muted
+    } else if primary && response.hovered() {
+        colors.accent.gamma_multiply(0.88)
+    } else if response.hovered() {
+        colors.active_fill
+    } else if primary {
+        colors.accent
+    } else {
+        colors.surface
+    };
+    let stroke = if enabled && primary {
+        egui::Stroke::NONE
+    } else {
+        egui::Stroke::new(1.0, colors.border)
+    };
+    let text_color = if !enabled {
+        colors.muted
+    } else if primary {
+        Color32::WHITE
+    } else {
+        colors.text
+    };
+    ui.painter()
+        .rect(rect, 6, fill, stroke, egui::StrokeKind::Inside);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(crate::ui::scaled_font_size(12.0)),
+        text_color,
+    );
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
 }
 
 fn clipped_annotation_action_text(value: &str) -> String {

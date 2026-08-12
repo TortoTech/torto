@@ -7,11 +7,11 @@ use image::imageops::FilterType;
 use image::{DynamicImage, ImageBuffer, RgbaImage};
 use rebook_publication::{Block, BookSource};
 use reqwest::Client;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::AiProvider;
 use super::ai::{message_content, request_completion};
+use super::llm_json;
 
 pub(super) const PAGE_IMAGE_MAX_DIMENSION: u32 = 1_600;
 const VISION_RESPONSE_RETRIES: usize = 1;
@@ -87,7 +87,7 @@ pub(super) fn is_retryable_vision_response_error(error: &str) -> bool {
 
 pub(super) fn parse_json_value<T>(value: &Value) -> Result<T, String>
 where
-    T: for<'de> Deserialize<'de>,
+    T: serde::de::DeserializeOwned,
 {
     let text = if let Some(text) = value.as_str() {
         text.to_owned()
@@ -100,19 +100,7 @@ where
     } else {
         return Err("AI 视觉识别响应内容为空".into());
     };
-    let trimmed = text.trim();
-    let candidate = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|value| value.strip_suffix("```"))
-        .map(str::trim)
-        .or_else(|| {
-            let start = trimmed.find('{')?;
-            let end = trimmed.rfind('}')?;
-            (start <= end).then(|| &trimmed[start..=end])
-        })
-        .unwrap_or(trimmed);
-    serde_json::from_str(candidate).map_err(|error| format!("AI 视觉识别结果协议无效：{error}"))
+    llm_json::parse(&text).map_err(|error| format!("AI 视觉识别结果协议无效：{error}"))
 }
 
 pub(super) fn render_page_data_url(
@@ -187,4 +175,41 @@ fn encode_jpeg_data_url_with_quality(
         "data:image/jpeg;base64,{}",
         BASE64.encode(bytes.into_inner())
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+    use serde_json::{Value, json};
+
+    use super::parse_json_value;
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct ExampleResponse {
+        title: String,
+        note: String,
+    }
+
+    #[test]
+    fn vision_json_repairs_only_invalid_string_escapes() {
+        let value = Value::String(
+            r#"{"title":"第二章 \《红颜祸水\》","note":"keep \"quote\", \\ slash, \n newline, \u7ae0 and \(text\)"}"#
+                .into(),
+        );
+        let parsed: ExampleResponse = parse_json_value(&value).unwrap();
+        assert_eq!(
+            parsed,
+            ExampleResponse {
+                title: "第二章 《红颜祸水》".into(),
+                note: "keep \"quote\", \\ slash, \n newline, 章 and (text)".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn vision_json_keeps_structural_validation_after_repair() {
+        let value = json!(r#"{"title":"\(text\)"}"#);
+        let error = parse_json_value::<ExampleResponse>(&value).unwrap_err();
+        assert!(error.contains("AI 视觉识别结果协议无效"));
+    }
 }

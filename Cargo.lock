@@ -2321,6 +2321,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonrepair-rs"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5bb8db9715bb6f3f7bb38c78bd572b18757e27aa79d029859268fc9d8b3d21f9"
+
+[[package]]
 name = "keyring"
 version = "4.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3792,7 +3798,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-desktop"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "anyrender",
  "atomicwrites",
@@ -3808,6 +3814,7 @@ dependencies = [
  "egui_extras",
  "fontdb",
  "image",
+ "jsonrepair-rs",
  "keyring",
  "kurbo",
  "mermaid-rs-renderer",
@@ -3845,7 +3852,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-formats"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "base64",
  "crc32fast",
@@ -3866,7 +3873,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-html"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "rebook-publication",
  "roxmltree 0.21.1",
@@ -3875,7 +3882,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-inspect"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "rebook-formats",
  "rebook-publication",
@@ -3886,7 +3893,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-layout"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "image",
  "parley",
@@ -3899,7 +3906,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-macos-open-file"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
@@ -3908,7 +3915,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-math"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "ratex-layout",
  "ratex-parser",
@@ -3918,7 +3925,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-publication"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "percent-encoding",
  "serde",
@@ -3927,7 +3934,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-reader"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "rebook-layout",
  "rebook-publication",
@@ -3938,7 +3945,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-renderer"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "anyrender",
  "kurbo",
@@ -3950,7 +3957,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-sqlite-vec-extension"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "sqlite-vec",

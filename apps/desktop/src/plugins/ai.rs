@@ -17,6 +17,7 @@ use crate::highlights::StoredHighlight;
 use crate::semantic::{self, SemanticSearchResult, SemanticSearchScope};
 
 use super::commands::ChatRequestKind;
+use super::llm_json;
 use super::pdf_vision::{
     PAGE_IMAGE_MAX_DIMENSION, parse_json_value, render_page_data_url,
     render_page_data_url_with_quality, request_vision_json,
@@ -330,7 +331,7 @@ pub async fn chat_with_book(
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            let result = match serde_json::from_str::<Value>(arguments) {
+            let result = match llm_json::parse::<Value>(arguments) {
                 Ok(arguments) if arguments.is_object() && name == "semanticSearch" => {
                     semantic_search_tool(&book_id, &settings, &arguments).await
                 }
@@ -675,20 +676,8 @@ fn translation_batches(
 }
 
 fn parse_translation_object(content: &str, keys: &[String]) -> Result<Vec<String>, String> {
-    let trimmed = content.trim();
-    let candidate = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|value| value.strip_suffix("```"))
-        .map(str::trim)
-        .or_else(|| {
-            let start = trimmed.find('{')?;
-            let end = trimmed.rfind('}')?;
-            (start <= end).then(|| &trimmed[start..=end])
-        })
-        .unwrap_or(trimmed);
-    let output: Value = serde_json::from_str(candidate)
-        .map_err(|error| format!("翻译结果不是有效 JSON：{error}"))?;
+    let output: Value =
+        llm_json::parse(content).map_err(|error| format!("翻译结果不是有效 JSON：{error}"))?;
     let output = output
         .as_object()
         .ok_or_else(|| "翻译结果必须是 JSON 对象".to_owned())?;
@@ -2566,6 +2555,17 @@ mod tests {
     fn translation_json_accepts_fenced_output_and_keeps_key_order() {
         let output = parse_translation_object(
             "```json\n{\"1\":\"第二段\",\"0\":\"第一段\"}\n```",
+            &["0".into(), "1".into()],
+        )
+        .unwrap();
+
+        assert_eq!(output, vec!["第一段", "第二段"]);
+    }
+
+    #[test]
+    fn translation_json_repairs_llm_syntax_errors() {
+        let output = parse_translation_object(
+            "```json\n{'0':'第一段','1':'第二段',}\n```",
             &["0".into(), "1".into()],
         )
         .unwrap();
