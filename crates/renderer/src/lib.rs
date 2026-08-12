@@ -47,6 +47,7 @@ pub struct PageImageHit {
 pub struct PageDisplayList {
     width: u32,
     height: u32,
+    content_top: Option<f32>,
     content_bottom: Option<f32>,
     background: Color,
     commands: Vec<DisplayCommand>,
@@ -62,6 +63,11 @@ impl PageDisplayList {
     /// Logical height of the compiled page.
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// Top edge of retained page content in logical page coordinates.
+    pub fn content_top(&self) -> Option<f32> {
+        self.content_top
     }
 
     /// Bottom edge of the retained page content in logical page coordinates.
@@ -969,6 +975,7 @@ pub struct DisplayListCompiler;
 
 impl DisplayListCompiler {
     pub fn compile(&self, page: &PageLayout) -> PageDisplayList {
+        let content_top = page.items.iter().filter_map(page_item_top).reduce(f32::min);
         let content_bottom = page
             .items
             .iter()
@@ -1051,6 +1058,7 @@ impl DisplayListCompiler {
         PageDisplayList {
             width: page.viewport.width,
             height: page.viewport.height,
+            content_top,
             content_bottom,
             background: color(page.background),
             commands,
@@ -1104,6 +1112,18 @@ fn compile_table_commands(
                 color: border,
             }));
         }
+    }
+}
+
+fn page_item_top(item: &PageItem) -> Option<f32> {
+    match item {
+        PageItem::Text(text) => text
+            .layout
+            .get(text.lines.start)
+            .map(|line| text.origin_y + line.metrics().block_min_coord),
+        PageItem::Image(image) => Some(image.y),
+        PageItem::Table(table) => Some(table.y),
+        PageItem::Separator(separator) => Some(separator.y),
     }
 }
 
@@ -1358,6 +1378,7 @@ mod tests {
         let list = DisplayListCompiler.compile(&page);
         assert_eq!(list.width(), 320);
         assert_eq!(list.height(), 240);
+        assert_eq!(list.content_top(), None);
         assert_eq!(list.content_bottom(), None);
         assert_eq!(list.command_count(), 0);
     }

@@ -27,6 +27,38 @@ use super::{
 };
 
 impl DesktopReader {
+    pub(super) fn attach_current_focus_reference(&mut self) {
+        let Some(unit) = self.focus_units.get(self.focus_unit_index).cloned() else {
+            return;
+        };
+        let section_index = unit.position.section_index;
+        let node = unit.range.start.node.clone();
+        let id = format!("focus:{section_index}:{node}");
+        self.chat
+            .references
+            .retain(|reference| !reference.id.starts_with("focus:"));
+        let title = self
+            .reader
+            .toc_items()
+            .iter()
+            .find(|item| self.snapshot.active_toc_id.as_deref() == Some(item.id.as_str()))
+            .map_or_else(
+                || self.display_metadata.title.clone(),
+                |item| item.label.clone(),
+            );
+        let reference = paragraph_reference(
+            section_index,
+            self.focus_unit_index + 1,
+            &title,
+            &node,
+            0,
+            &unit.text,
+            self.language == crate::preferences::AppLanguage::English,
+        );
+        self.chat.references.push(ChatReference { id, ..reference });
+        self.chat.move_cursor_to_end = true;
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "reader background work is dispatched from one event-loop integration point"
@@ -803,9 +835,16 @@ impl DesktopReader {
         };
         match navigation {
             Ok(navigation) => {
+                let focus_anchor = (!result.is_image).then(|| result.range.start.clone());
                 self.focused_mark =
                     (!result.is_image).then(|| FocusedMark::search(result.range.clone()));
                 self.apply_snapshot(navigation.snapshot, SnapshotEffects::navigation());
+                if self.is_focus_mode() {
+                    self.focus_anchor = focus_anchor;
+                    self.focus_units.clear();
+                    self.focus_target_offset = None;
+                    self.ui.focus_scroll_motion = None;
+                }
             }
             Err(error) => {
                 self.search.status = format!(
@@ -828,7 +867,7 @@ impl DesktopReader {
         self.log_diagnostic_snapshot("assistant.toggle.after", None);
     }
 
-    fn open_assistant_panel(&mut self, panel: AssistantPanel) {
+    pub(super) fn open_assistant_panel(&mut self, panel: AssistantPanel) {
         self.ui.assistant_panel = Some(panel);
         self.chat.move_cursor_to_end = true;
         if self.ui.assistant_motion.animate_to(1.0) {
@@ -837,6 +876,9 @@ impl DesktopReader {
     }
 
     pub(super) fn close_assistant_panel(&mut self) {
+        if self.is_focus_mode() {
+            self.ui.focus_chat_minimized = true;
+        }
         self.log_diagnostic_snapshot("assistant.close.before", None);
         if self.ui.assistant_motion.animate_to(0.0) {
             self.ui.last_motion_tick = Some(std::time::Instant::now());
@@ -1132,6 +1174,7 @@ impl DesktopReader {
         };
         match result {
             Ok(result) => {
+                let focus_anchor = target_range.map(|range| range.start.clone());
                 self.focused_mark =
                     (!target_ranges.is_empty()).then(|| FocusedMark::assistant(target_ranges));
                 self.apply_snapshot(
@@ -1141,6 +1184,12 @@ impl DesktopReader {
                         ..SnapshotEffects::navigation()
                     },
                 );
+                if self.is_focus_mode() {
+                    self.focus_anchor = focus_anchor;
+                    self.focus_units.clear();
+                    self.focus_target_offset = None;
+                    self.ui.focus_scroll_motion = None;
+                }
             }
             Err(error) => {
                 self.chat.error = Some(format!(
@@ -1647,20 +1696,25 @@ impl DesktopReader {
     fn current_translation_ranges(
         &mut self,
     ) -> Result<Vec<(usize, Vec<SourceRange>)>, rebook_reader::ReaderError> {
-        let fragments = if self.is_scroll_mode() {
-            let positions = self
-                .scroll_section
-                .as_ref()
-                .zip(self.scroll_viewport)
-                .map(|(layout, viewport)| layout.visible_pages(viewport));
-            if let Some(positions) = positions {
-                self.reader.visible_text_fragments_for_pages(&positions)?
+        let fragments =
+            if self.is_scroll_mode() {
+                let positions = self.scroll_section.as_ref().zip(self.scroll_viewport).map(
+                    |(layout, viewport)| {
+                        let padding = self.scroll_content_padding(viewport.size.y);
+                        layout.visible_pages(super::ScrollViewportState {
+                            offset_y: (viewport.offset_y - padding).max(0.0),
+                            size: viewport.size,
+                        })
+                    },
+                );
+                if let Some(positions) = positions {
+                    self.reader.visible_text_fragments_for_pages(&positions)?
+                } else {
+                    self.reader.current_visible_text_fragments()?
+                }
             } else {
                 self.reader.current_visible_text_fragments()?
-            }
-        } else {
-            self.reader.current_visible_text_fragments()?
-        };
+            };
         let mut sections = Vec::<(usize, Vec<SourceRange>)>::new();
         for fragment in fragments {
             let section_index = fragment.position.section_index;

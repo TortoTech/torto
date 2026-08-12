@@ -74,6 +74,9 @@ impl DesktopReader {
         self.ui.sidebar_motion.advance(delta);
         self.ui.assistant_motion.advance(delta);
         self.ui.menu_motion.advance(delta);
+        if let Some(motion) = self.ui.focus_scroll_motion.as_mut() {
+            motion.advance(delta);
+        }
         self.translation.dismiss_if_due(now);
 
         if (sidebar_was_animating && !self.ui.sidebar_motion.is_animating())

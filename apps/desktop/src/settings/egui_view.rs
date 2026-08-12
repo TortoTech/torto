@@ -8,7 +8,7 @@ use crate::plugins::{
     TARGET_LANGUAGE_ENGLISH, TARGET_LANGUAGE_INTERFACE, TARGET_LANGUAGE_SIMPLIFIED_CHINESE,
     TranslationMode,
 };
-use crate::preferences::{AppLanguage, AppTheme};
+use crate::preferences::{AppLanguage, AppTheme, ReadingMode};
 use crate::sync::CloudProviderKind;
 use crate::ui::{Icon, dialog_action_button, icon_button, navigation_button, palette};
 
@@ -343,12 +343,38 @@ fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     });
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "reader preferences are rendered as one cohesive settings grid"
+)]
 fn reading_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     settings_card(ui, |ui| {
         egui::Grid::new("reading-settings-grid")
             .num_columns(2)
             .spacing([24.0, 16.0])
             .show(ui, |ui| {
+                settings_row_label(ui, state.draft_language.text("阅读模式", "Reading mode"));
+                settings_row_control_sized(ui, 250.0, |ui| {
+                    let classic = state.draft_reading_mode == ReadingMode::Classic;
+                    if choice_button(
+                        ui,
+                        state.draft_language.text("经典", "Classic"),
+                        classic,
+                        72.0,
+                    )
+                    .clicked()
+                    {
+                        state.draft_reading_mode = ReadingMode::Classic;
+                    }
+                    let focus = state.draft_reading_mode == ReadingMode::Focus;
+                    if choice_button(ui, state.draft_language.text("专注", "Focus"), focus, 72.0)
+                        .clicked()
+                    {
+                        state.draft_reading_mode = ReadingMode::Focus;
+                    }
+                });
+                ui.end_row();
+
                 settings_row_label(ui, state.draft_language.text("分页模式", "Page layout"));
                 settings_row_control_sized(ui, 250.0, |ui| {
                     let single = state.draft_spread == SpreadMode::Single;

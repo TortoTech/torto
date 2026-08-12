@@ -3,7 +3,9 @@ use rebook_layout::{LayoutEngine, ReaderTypography, SpreadMode};
 use rebook_reader::SelectionGranularity;
 
 use crate::plugins::PluginSettings;
-use crate::preferences::{self, AppLanguage, AppTheme, InterfaceTypography, ReaderPreferences};
+use crate::preferences::{
+    self, AppLanguage, AppTheme, InterfaceTypography, ReaderPreferences, ReadingMode,
+};
 use crate::sync::SyncSettings;
 
 mod egui_view;
@@ -13,6 +15,7 @@ pub(crate) use egui_view::settings_overlay;
 #[derive(Clone)]
 pub(crate) struct AppliedSettings {
     pub(crate) spread: SpreadMode,
+    pub(crate) reading_mode: ReadingMode,
     pub(crate) interface_typography: InterfaceTypography,
     pub(crate) typography: ReaderTypography,
     pub(crate) plugin_settings: PluginSettings,
@@ -26,6 +29,7 @@ pub(crate) struct AppliedSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReaderSettingsChange {
     Spread(SpreadMode),
+    ReadingMode(ReadingMode),
     Theme(AppTheme),
     SelectionGranularity(SelectionGranularity),
 }
@@ -33,6 +37,7 @@ pub(crate) enum ReaderSettingsChange {
 pub(crate) struct SettingsFeature {
     settings_tab: SettingsTab,
     draft_spread: SpreadMode,
+    draft_reading_mode: ReadingMode,
     draft_interface_typography: InterfaceTypography,
     draft_typography: ReaderTypography,
     draft_plugin_settings: PluginSettings,
@@ -77,6 +82,7 @@ impl SettingsFeature {
         let available_interface_font_families = crate::ui::available_interface_font_families();
         let applied = AppliedSettings {
             spread: preferences.spread,
+            reading_mode: preferences.reading_mode,
             interface_typography: preferences.interface_typography,
             typography: preferences.typography,
             plugin_settings,
@@ -89,6 +95,7 @@ impl SettingsFeature {
         Self {
             settings_tab: SettingsTab::Reading,
             draft_spread: applied.spread,
+            draft_reading_mode: applied.reading_mode,
             draft_interface_typography: applied.interface_typography.clone(),
             draft_typography: applied.typography.clone(),
             draft_plugin_settings: applied.plugin_settings.clone(),
@@ -114,6 +121,7 @@ impl SettingsFeature {
     pub(crate) fn open(&mut self) {
         self.settings_tab = SettingsTab::Reading;
         self.draft_spread = self.applied.spread;
+        self.draft_reading_mode = self.applied.reading_mode;
         self.draft_interface_typography
             .clone_from(&self.applied.interface_typography);
         self.draft_typography.clone_from(&self.applied.typography);
@@ -172,21 +180,26 @@ impl SettingsFeature {
             typography: self.applied.typography.clone(),
             language: self.applied.language,
             spread: self.applied.spread,
+            reading_mode: self.applied.reading_mode,
             theme: self.applied.theme,
             selection_granularity: self.applied.selection_granularity,
         };
         let layout_changed = matches!(
             change,
-            ReaderSettingsChange::Spread(_) | ReaderSettingsChange::Theme(_)
+            ReaderSettingsChange::Spread(_)
+                | ReaderSettingsChange::ReadingMode(_)
+                | ReaderSettingsChange::Theme(_)
         );
         match change {
             ReaderSettingsChange::Spread(spread) => preferences.spread = spread,
+            ReaderSettingsChange::ReadingMode(mode) => preferences.reading_mode = mode,
             ReaderSettingsChange::Theme(theme) => preferences.theme = theme,
             ReaderSettingsChange::SelectionGranularity(granularity) => {
                 preferences.selection_granularity = granularity;
             }
         }
         if preferences.spread == self.applied.spread
+            && preferences.reading_mode == self.applied.reading_mode
             && preferences.theme == self.applied.theme
             && preferences.selection_granularity == self.applied.selection_granularity
         {
@@ -201,9 +214,11 @@ impl SettingsFeature {
             )
         })?;
         self.applied.spread = preferences.spread;
+        self.applied.reading_mode = preferences.reading_mode;
         self.applied.theme = preferences.theme;
         self.applied.selection_granularity = preferences.selection_granularity;
         self.draft_spread = preferences.spread;
+        self.draft_reading_mode = preferences.reading_mode;
         self.draft_theme = preferences.theme;
         if layout_changed {
             self.revision = self.revision.wrapping_add(1);
@@ -232,6 +247,7 @@ impl SettingsFeature {
             language,
             theme,
             spread: self.draft_spread,
+            reading_mode: self.draft_reading_mode,
             selection_granularity: self.applied.selection_granularity,
         };
         if sync_settings.enabled
@@ -259,6 +275,7 @@ impl SettingsFeature {
         };
         self.applied = AppliedSettings {
             spread: self.draft_spread,
+            reading_mode: self.draft_reading_mode,
             interface_typography,
             typography,
             plugin_settings,

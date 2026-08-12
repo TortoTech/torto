@@ -107,8 +107,20 @@ impl DesktopReader {
             return;
         }
 
+        let mode_changed = self.reading_mode != settings.reading_mode;
+        self.reading_mode = settings.reading_mode;
         let mut style = self.reader.style();
-        style.spread = settings.spread;
+        style.spread = if self.reading_mode == crate::preferences::ReadingMode::Focus {
+            rebook_layout::SpreadMode::Scroll
+        } else {
+            settings.spread
+        };
+        style.minimum_paragraph_gap = if self.reading_mode == crate::preferences::ReadingMode::Focus
+        {
+            super::FOCUS_MINIMUM_PARAGRAPH_GAP
+        } else {
+            0.0
+        };
         style.typography.clone_from(&settings.typography);
         self.selection_granularity = settings.selection_granularity;
         super::apply_theme_colors(&mut style, settings.theme);
@@ -116,6 +128,18 @@ impl DesktopReader {
             Ok(snapshot) => {
                 self.plugin_settings = plugin_settings;
                 self.language = language;
+                if mode_changed {
+                    self.focus_units.clear();
+                    self.focus_target_offset = None;
+                    self.ui.focus_scroll_motion = None;
+                    self.ui.sidebar_pinned =
+                        self.reading_mode == crate::preferences::ReadingMode::Classic;
+                    self.set_sidebar_open(
+                        self.reading_mode == crate::preferences::ReadingMode::Classic,
+                    );
+                    self.close_assistant_panel();
+                    self.ui.focus_chat_minimized = false;
+                }
                 self.sync_settings.clone_from(&settings.sync_settings);
                 self.sync_password.clone_from(&settings.sync_password);
                 self.translation.clear_error();

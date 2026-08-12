@@ -65,10 +65,11 @@ impl DesktopReader {
                 return Arc::new(Scene::new());
             }
         };
+        let content_padding = self.scroll_content_padding(viewport.size.y);
         let visible_bottom = viewport.offset_y + viewport.size.y;
         let mut scene = Scene::new();
         for (index, entry) in layout.pages.iter().enumerate() {
-            let top = layout.page_tops[index];
+            let top = layout.page_tops[index] + content_padding;
             let bottom = top + layout.page_heights[index];
             if bottom <= viewport.offset_y || top >= visible_bottom {
                 continue;
@@ -80,7 +81,10 @@ impl DesktopReader {
             page_scene.append(&layers.content, None);
             scene.append(
                 &page_scene,
-                Some(Affine::translate((0.0, f64::from(top - viewport.offset_y)))),
+                Some(Affine::translate((
+                    0.0,
+                    f64::from(top - viewport.offset_y - layout.page_origins[index]),
+                ))),
             );
         }
         Arc::new(scene)
@@ -99,7 +103,6 @@ impl DesktopReader {
 
         let mut underlay = Scene::new();
         let mut underlay_bridge = VelloScene::new(&mut underlay);
-        entry.page.paint_background(&mut underlay_bridge);
         entry.page.paint_images_at(&mut underlay_bridge, 0.0);
         let mut content = Scene::new();
         entry
@@ -197,6 +200,16 @@ impl DesktopReader {
         }
         if let Some(selection) = &self.selection {
             page.paint_source_ranges(scene, &selection.ranges, TEXT_SELECTION_COLOR, offset_x);
+        }
+        if self.is_focus_mode()
+            && let Some(unit) = self.focus_units.get(self.focus_unit_index)
+        {
+            page.paint_source_ranges(
+                scene,
+                std::slice::from_ref(&unit.range),
+                TEXT_SELECTION_COLOR,
+                offset_x,
+            );
         }
     }
 

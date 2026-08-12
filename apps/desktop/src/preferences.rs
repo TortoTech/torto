@@ -60,6 +60,7 @@ pub(crate) struct ReaderPreferences {
     pub(crate) typography: ReaderTypography,
     pub(crate) language: AppLanguage,
     pub(crate) spread: SpreadMode,
+    pub(crate) reading_mode: ReadingMode,
     pub(crate) theme: AppTheme,
     pub(crate) selection_granularity: SelectionGranularity,
 }
@@ -71,10 +72,18 @@ impl Default for ReaderPreferences {
             typography: ReaderTypography::default(),
             language: AppLanguage::default(),
             spread: SpreadMode::Double,
+            reading_mode: ReadingMode::Classic,
             theme: AppTheme::default(),
             selection_granularity: SelectionGranularity::Free,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ReadingMode {
+    #[default]
+    Classic,
+    Focus,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -119,7 +128,35 @@ struct StoredReaderPreferences {
     #[serde(default = "default_spread")]
     spread: StoredSpreadMode,
     #[serde(default)]
+    reading_mode: StoredReadingMode,
+    #[serde(default)]
     selection_granularity: StoredSelectionGranularity,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum StoredReadingMode {
+    #[default]
+    Classic,
+    Focus,
+}
+
+impl From<StoredReadingMode> for ReadingMode {
+    fn from(value: StoredReadingMode) -> Self {
+        match value {
+            StoredReadingMode::Classic => Self::Classic,
+            StoredReadingMode::Focus => Self::Focus,
+        }
+    }
+}
+
+impl From<ReadingMode> for StoredReadingMode {
+    fn from(value: ReadingMode) -> Self {
+        match value {
+            ReadingMode::Classic => Self::Classic,
+            ReadingMode::Focus => Self::Focus,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -253,6 +290,7 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
         typography,
         language: stored.language,
         spread: stored.spread.into(),
+        reading_mode: stored.reading_mode.into(),
         theme: stored.theme.into(),
         selection_granularity: stored.selection_granularity.into(),
     })
@@ -273,6 +311,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
         typography,
         language: preferences.language,
         spread: preferences.spread.into(),
+        reading_mode: preferences.reading_mode.into(),
         theme: preferences.theme.into(),
         selection_granularity: preferences.selection_granularity.into(),
     };
@@ -308,6 +347,7 @@ mod tests {
             typography,
             language: AppLanguage::English,
             spread: SpreadMode::Single,
+            reading_mode: ReadingMode::Focus,
             theme: AppTheme::Dark,
             selection_granularity: SelectionGranularity::Sentence,
         };
@@ -326,6 +366,7 @@ mod tests {
         assert_eq!(loaded.typography.font_weight, 600);
         assert_eq!(loaded.language, AppLanguage::English);
         assert_eq!(loaded.spread, SpreadMode::Single);
+        assert_eq!(loaded.reading_mode, ReadingMode::Focus);
         assert_eq!(loaded.theme, AppTheme::Dark);
         assert_eq!(loaded.selection_granularity, SelectionGranularity::Sentence);
         fs::remove_file(path).unwrap();
@@ -338,6 +379,7 @@ mod tests {
         assert_eq!(stored.language, AppLanguage::SimplifiedChinese);
         assert_eq!(stored.interface_typography, InterfaceTypography::default());
         assert!(matches!(stored.spread, StoredSpreadMode::Double));
+        assert!(matches!(stored.reading_mode, StoredReadingMode::Classic));
         assert!(matches!(stored.theme, StoredAppTheme::Light));
         assert!(matches!(
             stored.selection_granularity,

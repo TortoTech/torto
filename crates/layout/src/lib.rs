@@ -50,6 +50,9 @@ pub struct ReaderStyle {
     pub top_margin: f32,
     pub bottom_margin: f32,
     pub column_gap: f32,
+    /// Minimum visual gap between consecutive prose paragraphs. A zero value
+    /// preserves the publication-authored margins exactly.
+    pub minimum_paragraph_gap: f32,
     pub spread: SpreadMode,
     pub foreground: Rgba,
     pub background: Rgba,
@@ -202,6 +205,7 @@ impl Default for ReaderStyle {
             top_margin: DEFAULT_TOP_MARGIN,
             bottom_margin: DEFAULT_BOTTOM_MARGIN,
             column_gap: DEFAULT_COLUMN_GAP,
+            minimum_paragraph_gap: 0.0,
             spread: SpreadMode::Double,
             foreground: Rgba::BLACK,
             background: Rgba {
@@ -458,6 +462,7 @@ impl LayoutEngine {
             reader_style.background,
             geometry,
             center_standalone_image,
+            reader_style.minimum_paragraph_gap,
         );
 
         for blocks in fragments {
@@ -824,6 +829,11 @@ pub fn reading_content_left(page_width: f32, reader_style: &ReaderStyle) -> f32 
     resolve_horizontal_page_geometry(page_width, reader_style).0
 }
 
+/// Returns the width of one reading column for a viewport.
+pub fn reading_content_width(page_width: f32, reader_style: &ReaderStyle) -> f32 {
+    resolve_horizontal_page_geometry(page_width, reader_style).1
+}
+
 struct StyledRange {
     range: Range<usize>,
     style: TextStyle,
@@ -1092,6 +1102,8 @@ struct Paginator {
     pages: Vec<PageLayout>,
     items: Vec<PageItem>,
     center_standalone_image: bool,
+    minimum_paragraph_gap: f32,
+    previous_block_was_paragraph: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1110,6 +1122,7 @@ impl Paginator {
         background: Rgba,
         geometry: PageGeometry,
         center_standalone_image: bool,
+        minimum_paragraph_gap: f32,
     ) -> Self {
         Self {
             viewport,
@@ -1123,10 +1136,16 @@ impl Paginator {
             pages: Vec::new(),
             items: Vec::new(),
             center_standalone_image,
+            minimum_paragraph_gap: minimum_paragraph_gap.max(0.0),
+            previous_block_was_paragraph: false,
         }
     }
 
     fn push_text(&mut self, prepared: &PreparedText, block: &TextBlock) -> Result<(), LayoutError> {
+        let is_paragraph = matches!(block.kind, TextBlockKind::Paragraph);
+        if is_paragraph && self.previous_block_was_paragraph {
+            self.ensure_minimum_spacing(self.minimum_paragraph_gap);
+        }
         self.add_spacing(block.style.margin_before);
         let mut line_start = 0;
         while line_start < prepared.layout.len() {
@@ -1175,10 +1194,12 @@ impl Paginator {
             }
         }
         self.add_spacing(block.style.margin_after);
+        self.previous_block_was_paragraph = is_paragraph;
         Ok(())
     }
 
     fn push_table(&mut self, table: &PreparedTable) {
+        self.previous_block_was_paragraph = false;
         if table.row_heights.is_empty() || table.column_width <= 0.0 {
             return;
         }
@@ -1297,6 +1318,7 @@ impl Paginator {
         source: Option<SourceRange>,
         text_layer: Option<FixedPageTextLayer>,
     ) -> Vec<FixedPageReplacementRequest> {
+        self.previous_block_was_paragraph = false;
         let intrinsic_width = image.width.max(1) as f32;
         let intrinsic_height = image.height.max(1) as f32;
         let aspect_ratio = intrinsic_width / intrinsic_height;
@@ -1426,6 +1448,7 @@ impl Paginator {
     }
 
     fn push_separator(&mut self) {
+        self.previous_block_was_paragraph = false;
         self.add_spacing(12.0);
         if self.cursor_y + 1.0 > self.bottom && self.column_has_content {
             self.advance_column();
@@ -1722,6 +1745,65 @@ mod tests {
             )
             .unwrap();
         assert!(layout.pages.len() > 1);
+    }
+
+    #[test]
+    fn minimum_paragraph_gap_only_expands_consecutive_prose_spacing() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("paragraph-gap-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let paragraph = |text: &str| {
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle {
+                    margin_before: 0.0,
+                    margin_after: 0.0,
+                    ..rebook_publication::BlockStyle::default()
+                },
+                source: None,
+            })
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![paragraph("First paragraph"), paragraph("Second paragraph")],
+            anchors: Vec::new(),
+        };
+        let style = ReaderStyle {
+            minimum_paragraph_gap: 12.0,
+            ..ReaderStyle::default()
+        };
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(600, 400).unwrap(),
+                &style,
+            )
+            .unwrap();
+        let placements = layout.pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                PageItem::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let first_line = placements[0].layout.get(0).unwrap();
+        let first_bottom = placements[0].origin_y + first_line.metrics().block_max_coord;
+
+        assert!((placements[1].origin_y - first_bottom - 12.0).abs() < 0.001);
     }
 
     #[test]
@@ -2036,6 +2118,7 @@ mod tests {
                 continuation_offset_x: 0.0,
             },
             false,
+            0.0,
         );
         paginator.push_image(
             RasterImage {
@@ -2134,6 +2217,7 @@ mod tests {
                 continuation_offset_x: 0.0,
             },
             false,
+            0.0,
         );
         paginator.push_separator();
         paginator.push_image(
@@ -2227,6 +2311,7 @@ mod tests {
                 continuation_offset_x: 0.0,
             },
             true,
+            0.0,
         );
         paginator.push_image(
             RasterImage {

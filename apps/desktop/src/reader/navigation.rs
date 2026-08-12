@@ -93,8 +93,24 @@ impl DesktopReader {
         };
         self.pending_page_turn = None;
         self.install_snapshot(snapshot);
+        if self.is_focus_mode() {
+            self.focus_anchor = self
+                .reader
+                .current_page()
+                .leading_source_range()
+                .map(|range| range.start.clone());
+        }
         if previous_section != target_position.section_index {
             self.scroll_section = None;
+            self.focus_units.clear();
+            self.focus_unit_index = 0;
+            self.focus_target_offset = None;
+            self.ui.focus_scroll_motion = None;
+        }
+        if self.is_focus_mode() && matches!(effects.scene, SceneChange::StaticContent) {
+            self.focus_units.clear();
+            self.focus_target_offset = None;
+            self.ui.focus_scroll_motion = None;
         }
         if self.is_scroll_mode() {
             self.scroll_target_position = Some(target_position);

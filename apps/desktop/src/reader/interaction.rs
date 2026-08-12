@@ -4,6 +4,31 @@ use rebook_reader::{NavigationAttempt, NavigationOutcome, PageDirection, Selecti
 use super::{DesktopReader, FollowUp, MarkRetention, ProgressChange, SidebarTab, SnapshotEffects};
 
 impl DesktopReader {
+    fn focus_unit_at_canvas(&mut self, x: f32, y: f32) -> Option<usize> {
+        if !self.is_focus_mode() {
+            return None;
+        }
+        let hit = self.hit_test_canvas(x, y, true).ok().flatten()?;
+        let selection = self
+            .reader
+            .selection_between_with_granularity(&hit, &hit, SelectionGranularity::Paragraph)
+            .ok()
+            .flatten()?;
+        let range = selection.ranges.first()?;
+        self.focus_units.iter().position(|unit| {
+            unit.range.start.spine == range.start.spine
+                && unit.range.start.node == range.start.node
+                && unit.range.start.text_offset < range.end.text_offset
+                && range.start.text_offset < unit.range.end.text_offset
+        })
+    }
+
+    pub(in crate::reader) fn focus_clicked_unit(&mut self, x: f32, y: f32) {
+        if let Some(index) = self.focus_unit_at_canvas(x, y) {
+            self.select_focus_unit(index);
+        }
+    }
+
     fn hit_test_canvas(
         &mut self,
         x: f32,

@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use peniko::{Blob, Color};
 use rebook_formats::{BookFormat, open_file_for_reading as open_publication_file_for_reading};
 use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
-use rebook_publication::{BookSource, RenditionLayout, Rgba, SourceRange, TableOfContentsOrigin};
+use rebook_publication::{
+    Block, BookSource, RenditionLayout, Rgba, SourceAnchor, SourceRange, TableOfContentsOrigin,
+    TextBlockKind,
+};
 use rebook_reader::{
     PageDirection, ReaderPosition, ReaderSectionPage, ReaderSelection, ReaderSession,
     ReaderSnapshot, ReaderTextHit, SelectionGranularity,
@@ -22,7 +25,7 @@ use crate::plugins::{
     ChatTurn, PdfOcrSourceController, PdfOcrViewMode, PluginSettings, RewriteBookSource,
     TranslationBlockInput, TranslationBookSource, has_pending_pdf_ocr_task, load_pdf_ocr_source,
 };
-use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences};
+use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences, ReadingMode};
 use crate::semantic::{SemanticIndexSummary, SemanticSearchScope};
 use crate::settings::ReaderSettingsChange;
 use crate::sync::{SyncSettings, SyncStore};
@@ -31,6 +34,7 @@ const INITIAL_WIDTH: u32 = 1200;
 const INITIAL_HEIGHT: u32 = 800;
 const MOTION_DURATION: Duration = Duration::from_millis(180);
 const TOOLBAR_MOTION_DURATION: Duration = Duration::from_millis(200);
+const FOCUS_SCROLL_MOTION_DURATION: Duration = Duration::from_millis(240);
 const TOOLBAR_HIDE_DELAY: Duration = Duration::from_millis(500);
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const MOTION_EPSILON: f32 = 0.001;
@@ -39,6 +43,7 @@ const ASSISTANT_MARK_COLOR: Color = Color::from_rgba8(245, 158, 11, 56);
 const SCROLL_PAGE_GAP: f32 = 24.0;
 const SCROLL_PREVIOUS_REGION_HEIGHT: f32 = 56.0;
 const SCROLL_NEXT_REGION_HEIGHT: f32 = 88.0;
+const FOCUS_MINIMUM_PARAGRAPH_GAP: f32 = 12.0;
 static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SEMANTIC_TASK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -196,10 +201,17 @@ pub(super) fn open_reader(
         ReaderPreferences::default()
     });
     let mut style = ReaderStyle {
-        spread: reader_preferences.spread,
+        spread: if reader_preferences.reading_mode == ReadingMode::Focus {
+            SpreadMode::Scroll
+        } else {
+            reader_preferences.spread
+        },
         typography: reader_preferences.typography.clone(),
         ..ReaderStyle::default()
     };
+    if reader_preferences.reading_mode == ReadingMode::Focus {
+        style.minimum_paragraph_gap = FOCUS_MINIMUM_PARAGRAPH_GAP;
+    }
     if fixed_page {
         style.column_gap = 0.0;
     }
@@ -283,6 +295,7 @@ pub(super) fn open_reader(
             progress_store,
             plugin_settings,
             language: reader_preferences.language,
+            reading_mode: reader_preferences.reading_mode,
             selection_granularity: reader_preferences.selection_granularity,
             sync_settings,
             sync_password,
@@ -349,6 +362,7 @@ pub(super) struct DesktopReader {
     focused_mark: Option<FocusedMark>,
     plugin_settings: PluginSettings,
     language: AppLanguage,
+    reading_mode: ReadingMode,
     sync_settings: SyncSettings,
     sync_password: String,
     search: SearchUiState,
@@ -368,6 +382,10 @@ pub(super) struct DesktopReader {
     scroll_section: Option<Arc<ScrollSectionLayout>>,
     scroll_viewport: Option<ScrollViewportState>,
     scroll_target_position: Option<ReaderPosition>,
+    focus_units: Vec<FocusUnit>,
+    focus_unit_index: usize,
+    focus_target_offset: Option<f32>,
+    focus_anchor: Option<SourceAnchor>,
     pending_page_turn: Option<PageDirection>,
     settings_requested: bool,
     settings_change_requested: Option<ReaderSettingsChange>,
@@ -414,9 +432,31 @@ struct ScrollSectionLayout {
     section_index: usize,
     pages: Vec<ReaderSectionPage>,
     page_tops: Vec<f32>,
+    page_origins: Vec<f32>,
     page_heights: Vec<f32>,
     content_height: f32,
     next_button_top: Option<f32>,
+}
+
+#[derive(Clone)]
+struct FocusUnit {
+    range: SourceRange,
+    text: String,
+    position: ReaderPosition,
+    rect: egui::Rect,
+}
+
+fn source_range_contains_anchor(range: &SourceRange, anchor: &SourceAnchor) -> bool {
+    if range.start.spine != anchor.spine || range.start.node != anchor.node {
+        return false;
+    }
+    if range.start.spine != range.end.spine || range.start.node != range.end.node {
+        return range.start == *anchor;
+    }
+    anchor.text_offset >= range.start.text_offset
+        && (anchor.text_offset < range.end.text_offset
+            || (range.start.text_offset == range.end.text_offset
+                && anchor.text_offset == range.start.text_offset))
 }
 
 impl ScrollSectionLayout {
@@ -424,7 +464,12 @@ impl ScrollSectionLayout {
         clippy::cast_precision_loss,
         reason = "logical page dimensions are GPU-bounded and egui geometry uses f32"
     )]
-    fn new(section_index: usize, section_count: usize, pages: Vec<ReaderSectionPage>) -> Self {
+    fn new(
+        section_index: usize,
+        section_count: usize,
+        pages: Vec<ReaderSectionPage>,
+        preserve_physical_pages: bool,
+    ) -> Self {
         let has_previous = section_index > 0;
         let has_next = section_index + 1 < section_count;
         let mut cursor = if has_previous {
@@ -433,13 +478,35 @@ impl ScrollSectionLayout {
             0.0
         };
         let mut page_tops = Vec::with_capacity(pages.len());
+        let mut page_origins = Vec::with_capacity(pages.len());
         let mut page_heights = Vec::with_capacity(pages.len());
         for (index, entry) in pages.iter().enumerate() {
-            let page_height = entry.page.height() as f32;
+            let logical_height = entry.page.height() as f32;
+            let content_top = entry
+                .page
+                .content_top()
+                .unwrap_or(0.0)
+                .clamp(0.0, logical_height);
+            let content_bottom = entry
+                .page
+                .content_bottom()
+                .unwrap_or(logical_height)
+                .clamp(content_top, logical_height);
+            let page_origin = if preserve_physical_pages || index == 0 {
+                0.0
+            } else {
+                content_top
+            };
+            let page_height = if preserve_physical_pages {
+                logical_height
+            } else {
+                content_bottom - page_origin
+            };
             page_tops.push(cursor);
+            page_origins.push(page_origin);
             page_heights.push(page_height);
             cursor += page_height;
-            if index + 1 < pages.len() {
+            if preserve_physical_pages && index + 1 < pages.len() {
                 cursor += SCROLL_PAGE_GAP;
             }
         }
@@ -447,9 +514,11 @@ impl ScrollSectionLayout {
             .last()
             .and_then(|entry| {
                 let bottom = entry.page.content_bottom()?;
-                page_tops
-                    .last()
-                    .map(|top| top + bottom.clamp(0.0, entry.page.height() as f32))
+                let index = pages.len().checked_sub(1)?;
+                Some(
+                    page_tops[index] + bottom.clamp(0.0, entry.page.height() as f32)
+                        - page_origins[index],
+                )
             })
             .unwrap_or(cursor);
         let next_button_top = has_next.then_some(chapter_content_bottom + SCROLL_PAGE_GAP);
@@ -460,6 +529,7 @@ impl ScrollSectionLayout {
             section_index,
             pages,
             page_tops,
+            page_origins,
             page_heights,
             content_height,
             next_button_top,
@@ -477,8 +547,21 @@ impl ScrollSectionLayout {
         self.pages.iter().enumerate().find_map(|(index, _)| {
             let top = self.page_tops[index];
             let local_y = y - top;
-            (local_y >= 0.0 && local_y < self.page_heights[index]).then_some((index, local_y))
+            (local_y >= 0.0 && local_y < self.page_heights[index])
+                .then_some((index, local_y + self.page_origins[index]))
         })
+    }
+
+    fn content_y(&self, index: usize, page_y: f32) -> f32 {
+        self.page_tops[index] + page_y - self.page_origins[index]
+    }
+
+    fn content_y_for_position(&self, position: ReaderPosition, page_y: f32) -> Option<f32> {
+        let index = self
+            .pages
+            .iter()
+            .position(|entry| entry.position == position)?;
+        Some(self.content_y(index, page_y))
     }
 
     fn first_visible_page(&self, offset_y: f32) -> Option<ReaderPosition> {
@@ -511,8 +594,20 @@ struct ScrollViewportState {
 }
 
 impl DesktopReader {
+    fn is_focus_mode(&self) -> bool {
+        self.reading_mode == ReadingMode::Focus
+    }
+
     fn is_scroll_mode(&self) -> bool {
         self.reader.style().spread == SpreadMode::Scroll
+    }
+
+    fn scroll_content_padding(&self, viewport_height: f32) -> f32 {
+        if self.is_focus_mode() {
+            viewport_height * 0.5
+        } else {
+            0.0
+        }
     }
 
     fn current_scroll_layout(
@@ -525,19 +620,152 @@ impl DesktopReader {
             return Ok(Arc::clone(layout));
         }
         let pages = self.reader.current_section_pages()?;
+        let preserve_physical_pages =
+            self.format == BookFormat::Pdf && self.pdf_ocr.mode == PdfOcrViewMode::Original;
         let layout = Arc::new(ScrollSectionLayout::new(
             section_index,
             self.reader.section_count(),
             pages,
+            preserve_physical_pages,
         ));
         self.scroll_section = Some(Arc::clone(&layout));
         Ok(layout)
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "renderer page coordinates are GPU-bounded and egui geometry uses f32"
+    )]
+    fn rebuild_focus_units(&mut self, layout: &ScrollSectionLayout) {
+        let Ok(section) = self.source.parse_section(layout.section_index) else {
+            self.focus_units.clear();
+            self.focus_unit_index = 0;
+            return;
+        };
+        let mut units = Vec::new();
+        for block in &section.blocks {
+            let (range, text) = match block {
+                Block::Text(block) => {
+                    if matches!(block.kind, TextBlockKind::Heading(_)) {
+                        continue;
+                    }
+                    let Some(range) = block.source.clone() else {
+                        continue;
+                    };
+                    (range, crate::plugins::text_block_text(block))
+                }
+                Block::Table(table) => {
+                    let Some(range) = table.source.clone() else {
+                        continue;
+                    };
+                    let text = table
+                        .rows
+                        .iter()
+                        .flat_map(|row| &row.cells)
+                        .map(|cell| crate::plugins::text_block_text(&cell.text))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (range, text)
+                }
+                Block::Image(_) | Block::Separator | Block::PageBreak => continue,
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let mut bounds: Option<egui::Rect> = None;
+            let mut position = None;
+            for (page_index, page) in layout.pages.iter().enumerate() {
+                for rect in page.page.source_rects(std::slice::from_ref(&range)) {
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.x0 as f32, layout.content_y(page_index, rect.y0 as f32)),
+                        egui::pos2(rect.x1 as f32, layout.content_y(page_index, rect.y1 as f32)),
+                    );
+                    bounds = Some(bounds.map_or(rect, |current| current.union(rect)));
+                    position.get_or_insert(page.position);
+                }
+            }
+            if let (Some(rect), Some(position)) = (bounds, position) {
+                units.push(FocusUnit {
+                    range,
+                    text,
+                    position,
+                    rect,
+                });
+            }
+        }
+        let current = ReaderPosition {
+            section_index: self.snapshot.location.section_index,
+            segment_index: self.snapshot.location.segment_index,
+            page_index: self.snapshot.location.page_index,
+        };
+        self.focus_unit_index = self
+            .focus_anchor
+            .as_ref()
+            .and_then(|anchor| {
+                units
+                    .iter()
+                    .position(|unit| source_range_contains_anchor(&unit.range, anchor))
+            })
+            .or_else(|| units.iter().position(|unit| unit.position == current))
+            .unwrap_or(0);
+        self.focus_anchor = units
+            .get(self.focus_unit_index)
+            .map(|unit| unit.range.start.clone());
+        self.focus_units = units;
+        self.bump_scene_revision();
+    }
+
+    fn focus_unit_target_offset(&self, viewport_height: f32) -> Option<f32> {
+        let unit = self.focus_units.get(self.focus_unit_index)?;
+        let padding = self.scroll_content_padding(viewport_height);
+        Some((unit.rect.center().y + padding - viewport_height / 2.0).max(0.0))
+    }
+
+    fn move_focus_unit(&mut self, direction: PageDirection) {
+        if self.focus_units.is_empty() {
+            return;
+        }
+        let next = match direction {
+            PageDirection::Previous => self.focus_unit_index.saturating_sub(1),
+            PageDirection::Next => (self.focus_unit_index + 1).min(self.focus_units.len() - 1),
+        };
+        self.select_focus_unit(next);
+    }
+
+    fn select_focus_unit(&mut self, index: usize) {
+        if index == self.focus_unit_index || index >= self.focus_units.len() {
+            return;
+        }
+        self.focus_unit_index = index;
+        self.focus_anchor = self
+            .focus_units
+            .get(index)
+            .map(|unit| unit.range.start.clone());
+        if let Some(target) = self
+            .scroll_viewport
+            .and_then(|viewport| self.focus_unit_target_offset(viewport.size.y))
+        {
+            let current = self.ui.focus_scroll_motion.map_or_else(
+                || {
+                    self.scroll_viewport
+                        .map_or(target, |viewport| viewport.offset_y)
+                },
+                |motion| motion.value,
+            );
+            let mut motion = Motion::settled_with_duration(current, FOCUS_SCROLL_MOTION_DURATION);
+            motion.animate_to(target);
+            self.ui.focus_scroll_motion = Some(motion);
+            self.ui.last_motion_tick = Some(Instant::now());
+        }
+        self.bump_scene_revision();
+        self.persist_progress();
+    }
+
     fn scroll_page_coordinates(&self, x: f32, y: f32) -> Option<(ReaderPosition, f32, f32)> {
         let viewport = self.scroll_viewport?;
         let layout = self.scroll_section.as_ref()?;
-        let (index, local_y) = layout.page_at_content_y(viewport.offset_y + y)?;
+        let padding = self.scroll_content_padding(viewport.size.y);
+        let (index, local_y) = layout.page_at_content_y(viewport.offset_y + y - padding)?;
         Some((layout.pages[index].position, x, local_y))
     }
 
@@ -550,10 +778,10 @@ impl DesktopReader {
             self.bump_scene_revision();
         }
 
-        let visible_position = self
-            .scroll_section
-            .as_ref()
-            .and_then(|layout| layout.first_visible_page(viewport.offset_y));
+        let visible_position = self.scroll_section.as_ref().and_then(|layout| {
+            let padding = self.scroll_content_padding(viewport.size.y);
+            layout.first_visible_page((viewport.offset_y - padding).max(0.0))
+        });
         let current = ReaderPosition {
             section_index: self.snapshot.location.section_index,
             segment_index: self.snapshot.location.segment_index,
@@ -647,6 +875,7 @@ struct DesktopReaderResources {
     progress_store: Option<SyncStore>,
     plugin_settings: PluginSettings,
     language: AppLanguage,
+    reading_mode: ReadingMode,
     selection_granularity: SelectionGranularity,
     sync_settings: SyncSettings,
     sync_password: String,
@@ -1087,6 +1316,10 @@ impl Motion {
     }
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent reader overlays and interaction states are intentionally orthogonal"
+)]
 struct ReaderUiState {
     sidebar_open: bool,
     sidebar_pinned: bool,
@@ -1101,11 +1334,13 @@ struct ReaderUiState {
     sidebar_motion: Motion,
     assistant_motion: Motion,
     menu_motion: Motion,
+    focus_scroll_motion: Option<Motion>,
     last_motion_tick: Option<Instant>,
     wheel_accumulator: f32,
     last_wheel_turn: Option<Instant>,
     expanded_toc: HashSet<String>,
     last_auto_scrolled_toc: Option<String>,
+    focus_chat_minimized: bool,
 }
 
 impl ReaderUiState {
@@ -1127,6 +1362,7 @@ impl ReaderUiState {
             || self.sidebar_motion.is_animating()
             || self.assistant_motion.is_animating()
             || self.menu_motion.is_animating()
+            || self.focus_scroll_motion.is_some_and(Motion::is_animating)
     }
 
     fn needs_motion_tick(&self) -> bool {
@@ -1217,6 +1453,7 @@ impl DesktopReader {
             progress_store,
             plugin_settings,
             language,
+            reading_mode,
             selection_granularity,
             sync_settings,
             sync_password,
@@ -1323,8 +1560,8 @@ impl DesktopReader {
             pdf_toc,
             pdf_ocr,
             ui: ReaderUiState {
-                sidebar_open: true,
-                sidebar_pinned: true,
+                sidebar_open: reading_mode == ReadingMode::Classic,
+                sidebar_pinned: reading_mode == ReadingMode::Classic,
                 sidebar_width: egui_view::SIDEBAR_WIDTH,
                 sidebar_tab: SidebarTab::Toc,
                 toolbar_hovered: false,
@@ -1333,17 +1570,24 @@ impl DesktopReader {
                 assistant_panel: None,
                 assistant_width: egui_view::ASSISTANT_WIDTH,
                 toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
-                sidebar_motion: Motion::settled(1.0),
+                sidebar_motion: Motion::settled(if reading_mode == ReadingMode::Classic {
+                    1.0
+                } else {
+                    0.0
+                }),
                 assistant_motion: Motion::settled(0.0),
                 menu_motion: Motion::settled(0.0),
+                focus_scroll_motion: None,
                 last_motion_tick: None,
                 wheel_accumulator: 0.0,
                 last_wheel_turn: None,
                 expanded_toc,
                 last_auto_scrolled_toc: None,
+                focus_chat_minimized: false,
             },
             plugin_settings,
             language,
+            reading_mode,
             sync_settings,
             sync_password,
             canvas_size: None,
@@ -1354,6 +1598,10 @@ impl DesktopReader {
             scroll_section: None,
             scroll_viewport: None,
             scroll_target_position,
+            focus_units: Vec::new(),
+            focus_unit_index: 0,
+            focus_target_offset: None,
+            focus_anchor: None,
             pending_page_turn: None,
             settings_requested: false,
             settings_change_requested: None,
@@ -1395,8 +1643,9 @@ mod tests {
         BookDisplayMetadata, Duration, FollowUp, HashSet, Instant, MOTION_DURATION, Motion,
         NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, SidebarTab, SnapshotEffects,
         TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState,
-        logical_dimension, resolve_book_display_metadata,
+        logical_dimension, resolve_book_display_metadata, source_range_contains_anchor,
     };
+    use rebook_publication::{SourceAnchor, SourceRange, SpineItemId};
 
     #[test]
     fn logical_dimension_rejects_invalid_sizes_and_rounds_pixels() {
@@ -1406,6 +1655,36 @@ mod tests {
         assert_eq!(logical_dimension(0.0), 0);
         assert_eq!(logical_dimension(10.4), 10);
         assert_eq!(logical_dimension(10.6), 11);
+    }
+
+    #[test]
+    fn focus_unit_anchor_matching_uses_half_open_source_ranges() {
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let range = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "paragraph-1".into(),
+                text_offset: 4,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: "paragraph-1".into(),
+                text_offset: 12,
+            },
+        };
+        let at_start = SourceAnchor {
+            spine: spine.clone(),
+            node: "paragraph-1".into(),
+            text_offset: 4,
+        };
+        let at_end = SourceAnchor {
+            spine,
+            node: "paragraph-1".into(),
+            text_offset: 12,
+        };
+
+        assert!(source_range_contains_anchor(&range, &at_start));
+        assert!(!source_range_contains_anchor(&range, &at_end));
     }
 
     #[test]
@@ -1465,11 +1744,13 @@ mod tests {
             sidebar_motion: Motion::settled(0.0),
             assistant_motion: Motion::settled(0.0),
             menu_motion: Motion::settled(0.0),
+            focus_scroll_motion: None,
             last_motion_tick: None,
             wheel_accumulator: 0.0,
             last_wheel_turn: None,
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
+            focus_chat_minimized: false,
         };
 
         ui.reveal_toolbar(now);
@@ -1499,11 +1780,13 @@ mod tests {
             sidebar_motion: Motion::settled(0.0),
             assistant_motion: Motion::settled(0.0),
             menu_motion: Motion::settled(0.0),
+            focus_scroll_motion: None,
             last_motion_tick: None,
             wheel_accumulator: 0.0,
             last_wheel_turn: None,
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
+            focus_chat_minimized: false,
         };
 
         assert!(ui.set_toolbar_hovered(true, now));
