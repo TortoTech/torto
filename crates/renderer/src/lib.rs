@@ -125,6 +125,27 @@ impl PageDisplayList {
             })
     }
 
+    /// Resolves source-backed block images to page-coordinate rectangles.
+    pub fn image_source_rects(&self, ranges: &[SourceRange]) -> Vec<Rect> {
+        self.commands
+            .iter()
+            .filter_map(|command| match command {
+                DisplayCommand::Image(command)
+                    if command
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| ranges.iter().any(|range| range == source)) =>
+                {
+                    Some(command.bounds)
+                }
+                DisplayCommand::Glyphs(_)
+                | DisplayCommand::Image(_)
+                | DisplayCommand::FillRect(_)
+                | DisplayCommand::Rule(_) => None,
+            })
+            .collect()
+    }
+
     /// Visible UTF-8 byte range for a retained text placement.
     pub fn text_region_visible_range(&self, region_index: usize) -> Option<Range<usize>> {
         self.text_regions
@@ -320,6 +341,20 @@ impl PageDisplayList {
     ) {
         let transform = Affine::translate((f64::from(offset_x), 0.0));
         for rect in self.source_rects(ranges) {
+            scene.fill(Fill::NonZero, transform, color, None, &rect);
+        }
+    }
+
+    /// Paints translucent marks over source-backed block images.
+    pub fn paint_image_source_ranges(
+        &self,
+        scene: &mut impl PaintScene,
+        ranges: &[SourceRange],
+        color: Color,
+        offset_x: f32,
+    ) {
+        let transform = Affine::translate((f64::from(offset_x), 0.0));
+        for rect in self.image_source_rects(ranges) {
             scene.fill(Fill::NonZero, transform, color, None, &rect);
         }
     }
@@ -955,6 +990,7 @@ struct ImageCommand {
     height: u32,
     pixels: Arc<[u8]>,
     interactive: bool,
+    source: Option<SourceRange>,
 }
 
 struct FillRectCommand {
@@ -1020,6 +1056,7 @@ impl DisplayListCompiler {
                         height: image.image.height,
                         pixels: Arc::clone(&image.image.pixels),
                         interactive: true,
+                        source: image.source.clone(),
                     }));
                     if let Some(replacement) = &image.replacement {
                         for segment in &replacement.segments {
@@ -1305,6 +1342,7 @@ fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacemen
                     height: image.image.height,
                     pixels: Arc::clone(&image.image.pixels),
                     interactive: false,
+                    source: None,
                 }));
                 continue;
             };
@@ -1602,6 +1640,10 @@ mod tests {
         assert_eq!(
             list.image_bounds(),
             Some(Rect::new(50.0, 40.0, 150.0, 140.0))
+        );
+        assert_eq!(
+            list.image_source_rects(std::slice::from_ref(&source)),
+            [Rect::new(50.0, 40.0, 150.0, 140.0)]
         );
         let rects = list.source_rects(std::slice::from_ref(&source));
         assert_eq!(rects.len(), 1);

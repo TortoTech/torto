@@ -553,6 +553,9 @@ mod tests {
         assert!(wix.contains("Id='DesktopShortcutFeature'"));
         assert!(wix.contains("Title='Desktop shortcut'"));
         assert!(wix.contains("<ComponentRef Id='DesktopShortcutComponent'/>"));
+        assert!(wix.contains("<Directory Id='DesktopFolder'>"));
+        assert!(!wix.contains("<Directory Id='CommonDesktopFolder'"));
+        assert!(wix.contains("Root='HKCU'\n                        Key='Software\\TortoTech\\Torto'\n                        Name='DesktopShortcut'"));
         assert_eq!(wix.matches("Absent='allow'").count(), 2);
         assert!(wix.contains("MigrateFeatures='yes'"));
         assert!(license.contains("Copyright (c) 2026 TortoTech"));

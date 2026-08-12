@@ -7,6 +7,10 @@ use super::{
     logical_dimension,
 };
 
+pub(super) const fn snapshot_reanchors_focus(effects: SnapshotEffects) -> bool {
+    matches!(effects.scene, SceneChange::Overlays)
+}
+
 impl DesktopReader {
     pub(in crate::reader) fn go_to(&mut self, target: &PublicationUrl) {
         let result = self.reader.go_to_href(target);
@@ -93,7 +97,12 @@ impl DesktopReader {
         };
         self.pending_page_turn = None;
         self.install_snapshot(snapshot);
-        if self.is_focus_mode() {
+        // Focus navigation owns a source anchor that can be more precise than the
+        // ReaderSession's page-level location. A source refresh or resize rebuilds
+        // pagination asynchronously, but must not replace the paragraph selected
+        // by the user with the current page's leading range. Only an explicit
+        // navigation operation establishes a new anchor here.
+        if self.is_focus_mode() && snapshot_reanchors_focus(effects) {
             self.focus_anchor = self
                 .reader
                 .current_page()

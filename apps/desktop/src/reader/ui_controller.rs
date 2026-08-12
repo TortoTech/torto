@@ -3,6 +3,21 @@ use std::time::{Duration, Instant};
 use super::{DesktopReader, ReaderOverlay};
 
 impl DesktopReader {
+    pub(in crate::reader) fn request_frame_repaint(&self, ctx: &egui::Context) {
+        if self
+            .ui
+            .focus_scroll_motion
+            .is_some_and(super::Motion::is_animating)
+        {
+            // Let the native presentation loop pace focus scrolling. A fixed
+            // 16 ms timer produces uneven frame intervals on displays whose
+            // refresh period is not exactly 60 Hz.
+            ctx.request_repaint();
+        } else if self.ui.needs_motion_tick() || self.pending_page_turn.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
     pub(in crate::reader) fn set_sidebar_open(&mut self, open: bool) {
         self.ui.sidebar_open = open;
         if self
@@ -76,6 +91,17 @@ impl DesktopReader {
         self.ui.menu_motion.advance(delta);
         if let Some(motion) = self.ui.focus_scroll_motion.as_mut() {
             motion.advance(delta);
+        }
+        if let Some(target) = self
+            .ui
+            .focus_scroll_motion
+            .filter(|motion| !motion.is_animating())
+            .map(|motion| motion.target)
+        {
+            // Apply the exact endpoint once after the last interpolated frame,
+            // then release the animation state.
+            self.focus_target_offset = Some(target);
+            self.ui.focus_scroll_motion = None;
         }
         self.translation.dismiss_if_due(now);
 

@@ -193,8 +193,12 @@
                 </Directory>
             </Directory>
             <Directory Id='ProgramMenuFolder'/>
-            <Directory Id='CommonDesktopFolder'>
-                <Component Id='DesktopShortcutComponent' Guid='*' Win64='yes'>
+            <!-- DesktopFolder is the Windows Installer standard directory.
+                 Because this package is per-machine, MSI resolves it to the
+                 shared desktop. CommonDesktopFolder is not a WiX 3 standard
+                 directory and falls back to TARGETDIR (the install drive). -->
+            <Directory Id='DesktopFolder'>
+                <Component Id='DesktopShortcutComponent' Guid='*'>
                     <Shortcut
                         Id='DesktopShortcut'
                         Name='Torto'
@@ -204,7 +208,7 @@
                         Icon='ProductIcon.exe'
                         IconIndex='0'/>
                     <RegistryValue
-                        Root='HKLM'
+                        Root='HKCU'
                         Key='Software\TortoTech\Torto'
                         Name='DesktopShortcut'
                         Type='integer'

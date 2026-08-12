@@ -1,9 +1,65 @@
 # 核心依赖已知问题
 
-- 最近更新：2026-08-05
-- 记录范围：已经在 Torto 中复现、确认存在上游问题，并需要本地兼容代码的问题
+- 最近更新：2026-08-12
+- 记录范围：已经在 Torto 中复现、确认与上游依赖或 Windows 图形栈交互有关，并需要本地兼容代码的问题
 
 依赖升级时应逐项检查本文。只有在上游修复已经进入当前版本，并且移除本地兼容代码后相关回归测试仍能通过，才删除对应兼容代码和本文条目。
+
+## winit/wgpu/Windows：原生全屏切换及输入期间出现黑帧
+
+- 影响版本：`winit 0.30.13`、`wgpu 29.0.3`，Windows 10/11
+- 上游状态：截至 2026-08-12，尚未找到与“无边框全屏 + IME/文本输入”完全一致的上游 issue；现象涉及 winit 的 Win32 全屏窗口状态、DWM 和 wgpu flip-model surface 的组合行为
+- 相关上游讨论：[rust-windowing/winit#3730](https://github.com/rust-windowing/winit/issues/3730)（Windows 窗口装饰控制）；surface 在 Windows 合成状态变化时的相近问题另见 [gfx-rs/wgpu#5374](https://github.com/gfx-rs/wgpu/issues/5374)
+- 本地位置：`apps/desktop/src/platform/application.rs` 中的 `toggle_fullscreen`、`compositor_fullscreen_bounds`，以及 `apps/desktop/src/platform/gpu.rs` 中的 `acquire_surface_frame` 和 `render`
+- 回归测试：`compositor_fullscreen_overscans_the_monitor_by_one_pixel`；输入与显卡合成行为仍需人工检查
+
+### 表现
+
+在 Windows 上按 `F11` 进入或退出全屏时，窗口可能短暂整屏变黑。进入全屏后，在批注输入框或 AI Chat 输入框中打字、唤起输入法候选窗口时也可能再次出现黑帧。问题与具体书籍和输入框实现无关，普通窗口状态下通常不出现。
+
+### 原因
+
+Windows 上调用 winit 的原生 `set_fullscreen(Borderless)` 不仅会改变窗口边框和尺寸，还会让窗口进入由任务栏与 DWM 识别的全屏合成路径。IME 候选窗等额外原生窗口出现时，这条路径可能令 wgpu 的 flip-model surface 在相邻帧间变为 `Outdated` 或 `Lost`；如果本帧未能立即重新配置并呈现完整内容，DWM 会短暂显示黑色后备画面。
+
+### 当前规避方案
+
+Windows 不再调用原生 `set_fullscreen`，而是保存原窗口位置、尺寸和最大化状态，移除装饰后将普通窗口扩展到显示器边界，并在退出时完整恢复。边界额外外扩一个物理像素，避免 DWM 在屏幕边缘露出缝隙。每次渲染前都按当前客户区尺寸重新检查 surface；首次获取遇到 `Outdated` 或 `Lost` 时立即重新配置并在同一帧重试。其他平台继续使用 winit 原生无边框全屏。
+
+### 升级检查
+
+1. 检查 winit 是否提供不会切换 Windows 特殊全屏合成状态的独立装饰/铺满屏幕 API，并搜索是否新增对应 IME 黑帧 issue。
+2. 检查 wgpu/DXGI surface 在全屏、IME 子窗口出现和 `Outdated`/`Lost` 恢复方面的更新。
+3. 临时恢复 Windows 原生 `set_fullscreen`，连续切换 `F11`，并分别在批注和 AI Chat 输入框中使用中英文输入法输入。
+4. 在多显示器、不同 DPI 和窗口原本已最大化的状态下验证进入与退出全屏，确认无黑帧且窗口位置能够恢复。
+5. 上游路径稳定后，才移除 Windows 模拟全屏和 surface 同帧重试逻辑，并删除本条记录。
+
+## wgpu/Windows：窗口放大时新暴露区域短暂显示黑色
+
+- 影响版本：`wgpu 29.0.3`，Windows 10/11 的 DX12/Vulkan surface
+- 上游状态：截至 2026-08-12 仍为 Open
+- 上游问题：[gfx-rs/wgpu#5374](https://github.com/gfx-rs/wgpu/issues/5374)；相近历史问题见该 issue 引用的 [#3868](https://github.com/gfx-rs/wgpu/issues/3868)、[#3756](https://github.com/gfx-rs/wgpu/issues/3756) 和 [#1168](https://github.com/gfx-rs/wgpu/issues/1168)
+- 本地位置：`apps/desktop/src/platform/application.rs` 中的 `render_window_state`、`WindowEvent::Resized` 和 `WindowEvent::ScaleFactorChanged`，`apps/desktop/src/platform/gpu.rs` 中的 `resize` 和 `render`，以及 `crates/windows-window-background`
+- 回归测试：surface 尺寸和背景色逻辑由单元测试覆盖；DWM 呈现时序仍需人工检查
+
+### 表现
+
+拖动窗口边缘放大、点击右上角最大化或通过 `F11` 扩大窗口时，新增加的客户区可能先显示黑色，再被下一帧应用界面覆盖。较早的处理还会先横向拉伸旧画面、再纵向完成布局，视觉上像内容被短暂拉长。缩小窗口通常不容易看到同样的问题。
+
+### 原因
+
+Windows 的 DWM 可以在应用排队的 `RedrawRequested` 得到处理之前，先按新的客户区尺寸合成窗口。此时 wgpu swapchain 仍保存旧尺寸或尚未提交新尺寸的完整帧，DWM 只能拉伸旧帧，或者暴露非透明窗口默认的黑色客户区。阅读器重新分页和构建场景所需的时间会放大这个窗口期。该现象与上游 #5374 对 Windows DX12/Vulkan surface 的描述一致。
+
+### 当前规避方案
+
+原生 Windows 客户区后备背景跟随当前主题色，避免 swapchain 尚未覆盖的像素使用系统黑色默认值。收到 `Resized` 或 `ScaleFactorChanged` 后，立即更新 surface，并在该事件处理中同步构建和提交完整 UI 帧，而不是只请求稍后的重绘或仅提交一张纯背景帧。正常渲染开始时也会再次以窗口当前尺寸校准 surface，并在提交前调用 `pre_present_notify`。
+
+### 升级检查
+
+1. 检查 wgpu #5374 及其关联问题是否已有 Windows DX12/Vulkan 修复，并确认进入的版本。
+2. 升级 wgpu/winit 后，临时移除尺寸事件中的同步完整渲染，恢复普通的 `request_redraw` 路径。
+3. 分别拖动四边与四角、点击最大化/还原、切换 `F11`，并在浅色和深色主题下录屏逐帧检查。
+4. 在 100%、125%、150% 和 200% DPI，以及跨不同 DPI 显示器拖动窗口时，确认没有黑色新区域、旧帧拉伸或横纵分阶段变化。
+5. 上游行为稳定后，才移除同步 resize 呈现和原生背景兼容层，并删除本条记录。
 
 ## Parley：两端对齐文本的选区宽度不足
 

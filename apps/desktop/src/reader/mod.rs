@@ -34,7 +34,10 @@ const INITIAL_WIDTH: u32 = 1200;
 const INITIAL_HEIGHT: u32 = 800;
 const MOTION_DURATION: Duration = Duration::from_millis(180);
 const TOOLBAR_MOTION_DURATION: Duration = Duration::from_millis(200);
-const FOCUS_SCROLL_MOTION_DURATION: Duration = Duration::from_millis(240);
+const FOCUS_SCROLL_POINTS_PER_SECOND: f32 = 1_000.0;
+const FOCUS_SCROLL_MIN_DURATION: Duration = Duration::from_millis(160);
+const FOCUS_SCROLL_MAX_DURATION: Duration = Duration::from_millis(360);
+const FOCUS_UNIT_MIN_HEIGHT: f32 = 240.0;
 const TOOLBAR_HIDE_DELAY: Duration = Duration::from_millis(500);
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const MOTION_EPSILON: f32 = 0.001;
@@ -459,6 +462,24 @@ fn source_range_contains_anchor(range: &SourceRange, anchor: &SourceAnchor) -> b
                 && anchor.text_offset == range.start.text_offset))
 }
 
+fn focus_unit_container_center_y(rect: egui::Rect) -> f32 {
+    rect.top() + rect.height().max(FOCUS_UNIT_MIN_HEIGHT) / 2.0
+}
+
+fn focus_unit_screen_center_y(
+    rect: egui::Rect,
+    scroll_offset_y: f32,
+    content_padding: f32,
+    page_rect: egui::Rect,
+) -> f32 {
+    page_rect.top() + rect.center().y + content_padding - scroll_offset_y
+}
+
+fn focus_scroll_duration(distance: f32) -> Duration {
+    let duration = Duration::from_secs_f32(distance.abs() / FOCUS_SCROLL_POINTS_PER_SECOND);
+    duration.clamp(FOCUS_SCROLL_MIN_DURATION, FOCUS_SCROLL_MAX_DURATION)
+}
+
 impl ScrollSectionLayout {
     #[allow(
         clippy::cast_precision_loss,
@@ -667,7 +688,25 @@ impl DesktopReader {
                         .join(" ");
                     (range, text)
                 }
-                Block::Image(_) | Block::Separator | Block::PageBreak => continue,
+                Block::Image(image) => {
+                    // Fixed-layout PDF pages are represented as images with a text
+                    // layer; their paragraphs already supply the focus units. A
+                    // source-backed image without a text layer is an authored block
+                    // image and should occupy one step in focus navigation.
+                    if image.text_layer.is_some() {
+                        continue;
+                    }
+                    let Some(range) = image.source.clone() else {
+                        continue;
+                    };
+                    let text = if image.alt.trim().is_empty() {
+                        self.language.text("图片", "Image").to_owned()
+                    } else {
+                        image.alt.clone()
+                    };
+                    (range, text)
+                }
+                Block::Separator | Block::PageBreak => continue,
             };
             if text.trim().is_empty() {
                 continue;
@@ -675,7 +714,12 @@ impl DesktopReader {
             let mut bounds: Option<egui::Rect> = None;
             let mut position = None;
             for (page_index, page) in layout.pages.iter().enumerate() {
-                for rect in page.page.source_rects(std::slice::from_ref(&range)) {
+                for rect in page
+                    .page
+                    .source_rects(std::slice::from_ref(&range))
+                    .into_iter()
+                    .chain(page.page.image_source_rects(std::slice::from_ref(&range)))
+                {
                     let rect = egui::Rect::from_min_max(
                         egui::pos2(rect.x0 as f32, layout.content_y(page_index, rect.y0 as f32)),
                         egui::pos2(rect.x1 as f32, layout.content_y(page_index, rect.y1 as f32)),
@@ -718,7 +762,7 @@ impl DesktopReader {
     fn focus_unit_target_offset(&self, viewport_height: f32) -> Option<f32> {
         let unit = self.focus_units.get(self.focus_unit_index)?;
         let padding = self.scroll_content_padding(viewport_height);
-        Some((unit.rect.center().y + padding - viewport_height / 2.0).max(0.0))
+        Some((focus_unit_container_center_y(unit.rect) + padding - viewport_height / 2.0).max(0.0))
     }
 
     fn move_focus_unit(&mut self, direction: PageDirection) {
@@ -752,7 +796,11 @@ impl DesktopReader {
                 },
                 |motion| motion.value,
             );
-            let mut motion = Motion::settled_with_duration(current, FOCUS_SCROLL_MOTION_DURATION);
+            let mut motion = Motion::settled_with_curve(
+                current,
+                focus_scroll_duration(target - current),
+                MotionCurve::EaseInOut,
+            );
             motion.animate_to(target);
             self.ui.focus_scroll_motion = Some(motion);
             self.ui.last_motion_tick = Some(Instant::now());
@@ -798,7 +846,12 @@ impl DesktopReader {
                 Err(error) => self.error = Some(format!("更新滑动阅读位置失败：{error}")),
             }
         }
-        if changed {
+        if changed
+            && !self
+                .ui
+                .focus_scroll_motion
+                .is_some_and(Motion::is_animating)
+        {
             self.queue_visible_section_translation();
         }
     }
@@ -1261,6 +1314,13 @@ struct Motion {
     target: f32,
     elapsed: Duration,
     duration: Duration,
+    curve: MotionCurve,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MotionCurve {
+    EaseOut,
+    EaseInOut,
 }
 
 impl Motion {
@@ -1269,12 +1329,17 @@ impl Motion {
     }
 
     const fn settled_with_duration(value: f32, duration: Duration) -> Self {
+        Self::settled_with_curve(value, duration, MotionCurve::EaseOut)
+    }
+
+    const fn settled_with_curve(value: f32, duration: Duration, curve: MotionCurve) -> Self {
         Self {
             value,
             start: value,
             target: value,
             elapsed: Duration::ZERO,
             duration,
+            curve,
         }
     }
 
@@ -1298,7 +1363,10 @@ impl Motion {
         } else {
             (self.elapsed.as_secs_f32() / self.duration.as_secs_f32()).min(1.0)
         };
-        let eased = 1.0 - (1.0 - progress).powi(3);
+        let eased = match self.curve {
+            MotionCurve::EaseOut => 1.0 - (1.0 - progress).powi(3),
+            MotionCurve::EaseInOut => progress * progress * (3.0 - 2.0 * progress),
+        };
         self.value = self.start + (self.target - self.start) * eased;
         if progress >= 1.0 {
             self.value = self.target;
@@ -1639,10 +1707,13 @@ fn logical_dimension(value: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use super::navigation::snapshot_reanchors_focus;
     use super::{
-        BookDisplayMetadata, Duration, FollowUp, HashSet, Instant, MOTION_DURATION, Motion,
+        BookDisplayMetadata, Duration, FOCUS_SCROLL_MAX_DURATION, FOCUS_SCROLL_MIN_DURATION,
+        FollowUp, HashSet, Instant, MOTION_DURATION, Motion, MotionCurve,
         NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, SidebarTab, SnapshotEffects,
         TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState,
+        focus_scroll_duration, focus_unit_container_center_y, focus_unit_screen_center_y,
         logical_dimension, resolve_book_display_metadata, source_range_contains_anchor,
     };
     use rebook_publication::{SourceAnchor, SourceRange, SpineItemId};
@@ -1685,6 +1756,75 @@ mod tests {
 
         assert!(source_range_contains_anchor(&range, &at_start));
         assert!(!source_range_contains_anchor(&range, &at_end));
+    }
+
+    #[test]
+    fn focus_anchor_survives_async_content_and_viewport_refreshes() {
+        assert!(!snapshot_reanchors_focus(
+            SnapshotEffects::static_content_change()
+        ));
+        assert!(!snapshot_reanchors_focus(SnapshotEffects::viewport_change()));
+        assert!(snapshot_reanchors_focus(SnapshotEffects::navigation()));
+    }
+
+    #[test]
+    fn short_focus_units_share_a_stable_top_inside_the_centered_container() {
+        let short = egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 48.0));
+        let medium = egui::Rect::from_min_size(egui::pos2(20.0, 900.0), egui::vec2(600.0, 180.0));
+
+        assert!((focus_unit_container_center_y(short) - short.top() - 120.0).abs() < f32::EPSILON);
+        assert!(
+            (focus_unit_container_center_y(medium) - medium.top() - 120.0).abs() < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn tall_focus_units_expand_the_centered_container() {
+        let tall = egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 360.0));
+
+        assert!((focus_unit_container_center_y(tall) - tall.center().y).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn focus_unit_screen_position_tracks_the_highlight_center_and_scroll_offset() {
+        let page_rect = egui::Rect::from_min_size(egui::pos2(40.0, 80.0), egui::vec2(800.0, 600.0));
+        let unit = egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 48.0));
+        let padding = 300.0;
+        let centered_offset =
+            focus_unit_container_center_y(unit) + padding - page_rect.height() / 2.0;
+
+        let anchored = focus_unit_screen_center_y(unit, centered_offset, padding, page_rect);
+        let moving = focus_unit_screen_center_y(unit, centered_offset - 75.0, padding, page_rect);
+        let expected = page_rect.center().y + unit.center().y - focus_unit_container_center_y(unit);
+
+        assert!((anchored - expected).abs() < f32::EPSILON);
+        assert!((moving - anchored - 75.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn focus_scroll_duration_scales_with_distance_and_stays_bounded() {
+        assert_eq!(focus_scroll_duration(20.0), FOCUS_SCROLL_MIN_DURATION);
+        assert!(
+            focus_scroll_duration(220.0).abs_diff(Duration::from_millis(220))
+                < Duration::from_micros(1)
+        );
+        assert_eq!(focus_scroll_duration(2_000.0), FOCUS_SCROLL_MAX_DURATION);
+    }
+
+    #[test]
+    fn focus_scroll_uses_smooth_acceleration_and_deceleration() {
+        let mut motion =
+            Motion::settled_with_curve(0.0, Duration::from_millis(200), MotionCurve::EaseInOut);
+        motion.animate_to(100.0);
+
+        motion.advance(Duration::from_millis(50));
+        assert!(motion.value < 25.0);
+        motion.advance(Duration::from_millis(50));
+        assert!((motion.value - 50.0).abs() < f32::EPSILON);
+        motion.advance(Duration::from_millis(50));
+        assert!(motion.value > 75.0);
+        motion.advance(Duration::from_millis(50));
+        assert!((motion.value - 100.0).abs() < f32::EPSILON);
     }
 
     #[test]

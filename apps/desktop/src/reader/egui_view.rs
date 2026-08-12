@@ -12,6 +12,7 @@ use super::chat_markdown::ChatMarkdownState;
 use super::{
     AnnotationDraft, AssistantPanel, DesktopReader, GeneratedTocDraft, ImagePointerState,
     ImagePressCandidate, ReaderOverlay, ScrollSectionLayout, SelectedImage, SidebarTab,
+    focus_unit_screen_center_y,
 };
 use crate::plugins::{
     BookSearchResult, ChatCommand, ChatRole, PdfOcrViewMode, chat_command_suggestions,
@@ -294,9 +295,7 @@ impl DesktopReader {
         self.advance_frame(now);
         self.copy_shortcut(&ctx);
         self.keyboard_shortcuts(&ctx, interaction_blocked);
-        if self.ui.needs_motion_tick() || self.pending_page_turn.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        }
+        self.request_frame_repaint(&ctx);
         if let Some(deadline) = self.next_transient_message_deadline() {
             ctx.request_repaint_after(deadline.saturating_duration_since(now));
         }
@@ -452,10 +451,12 @@ impl DesktopReader {
             let content_padding = self.scroll_content_padding(viewport.height());
             ui.set_height((layout.content_height + content_padding * 2.0).max(viewport.height()));
             let content_rect = ui.max_rect();
-            let visible_rect = Rect::from_min_size(
-                Pos2::new(content_rect.left(), content_rect.top() + viewport.min.y),
-                viewport.size(),
-            );
+            // ScrollArea rounds the moving content origin to physical pixels. Rebuilding
+            // the viewport from that rounded origin plus the unrounded logical offset
+            // leaks the rounding residue into the page texture position and produces a
+            // one-pixel wobble near the end of programmatic scrolling. Its clip rect is
+            // already the stable viewport in screen coordinates.
+            let visible_rect = ui.clip_rect();
             page_rect = visible_rect;
             let painter = ui.painter().with_clip_rect(visible_rect);
             painter.rect_filled(visible_rect, 0.0, background);
@@ -652,6 +653,12 @@ impl DesktopReader {
         {
             return;
         }
+        // The focus-mode sidebar is a floating interaction layer. While it is open,
+        // navigation keys belong to its scrollable content and must never advance the
+        // active paragraph or section underneath it.
+        if self.is_focus_mode() && self.ui.sidebar_open {
+            return;
+        }
         if self.is_focus_mode() {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
                 self.attach_current_focus_reference();
@@ -701,6 +708,10 @@ impl DesktopReader {
     }
 
     fn focus_wheel_interaction(&mut self, response: &egui::Response) {
+        if self.ui.sidebar_open {
+            self.ui.wheel_accumulator = 0.0;
+            return;
+        }
         let delta = response.ctx.input(|input| {
             input
                 .raw
@@ -1114,7 +1125,9 @@ impl DesktopReader {
             return;
         }
         let viewport = ctx.content_rect();
-        let anchor_y = page_rect.center().y;
+        let anchor_y = self
+            .focused_unit_screen_center_y(page_rect)
+            .unwrap_or_else(|| page_rect.center().y);
         let style = self.reader.style();
         let content_right = page_rect.left()
             + reading_content_left(page_rect.width(), &style)
@@ -1149,13 +1162,19 @@ impl DesktopReader {
         let has_conversation = !self.chat.messages.is_empty()
             || self.chat.task.is_pending()
             || self.chat.error.is_some();
-        let height = if has_conversation {
-            (viewport.height() * 0.58).clamp(280.0, 520.0)
+        let (content_height, frame_margin) = if has_conversation {
+            (
+                (viewport.height() * 0.58).clamp(280.0, 520.0),
+                egui::Margin::same(12),
+            )
         } else {
-            56.0
+            (ASSISTANT_INPUT_HEIGHT, egui::Margin::symmetric(10, 6))
         };
-        let y = (anchor_y - height / 2.0)
-            .clamp(viewport.top() + 16.0, viewport.bottom() - height - 16.0);
+        let height = content_height + f32::from(frame_margin.top) + f32::from(frame_margin.bottom);
+        let y = (anchor_y - height / 2.0).clamp(
+            viewport.top() + 16.0,
+            (viewport.bottom() - height - 16.0).max(viewport.top() + 16.0),
+        );
         let dialog = egui::Area::new("focus-assistant".into())
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))
@@ -1164,7 +1183,7 @@ impl DesktopReader {
                     .fill(palette().surface)
                     .stroke(egui::Stroke::new(1.0, palette().border))
                     .corner_radius(12)
-                    .inner_margin(12)
+                    .inner_margin(frame_margin)
                     .shadow(egui::Shadow {
                         offset: [0, 5],
                         blur: 20,
@@ -1172,8 +1191,10 @@ impl DesktopReader {
                         color: Color32::from_black_alpha(36),
                     })
                     .show(ui, |ui| {
-                        ui.set_width(width - 24.0);
-                        ui.set_height(height);
+                        ui.set_width(
+                            width - f32::from(frame_margin.left) - f32::from(frame_margin.right),
+                        );
+                        ui.set_height(content_height);
                         self.focus_assistant_dialog(ui, has_conversation);
                     });
             });
@@ -1203,7 +1224,18 @@ impl DesktopReader {
             self.assistant_error(ui);
             self.assistant_annotation_confirmation(ui);
         }
-        self.assistant_composer_with_options(ui, false, false);
+        self.assistant_composer_with_options(ui, false, false, !has_conversation);
+    }
+
+    fn focused_unit_screen_center_y(&self, page_rect: Rect) -> Option<f32> {
+        let viewport = self.scroll_viewport?;
+        let unit = self.focus_units.get(self.focus_unit_index)?;
+        Some(focus_unit_screen_center_y(
+            unit.rect,
+            viewport.offset_y,
+            self.scroll_content_padding(viewport.size.y),
+            page_rect,
+        ))
     }
 
     fn book_summary(&mut self, ui: &mut egui::Ui) {
@@ -1366,9 +1398,30 @@ impl DesktopReader {
         let scroll_area = egui::ScrollArea::vertical()
             .id_salt(TOC_SCROLL_ID_SALT)
             .auto_shrink([false, false]);
+        let keyboard_scroll_delta = if self.is_focus_mode() && self.ui.sidebar_open {
+            ui.input(|input| {
+                if input.key_pressed(egui::Key::ArrowUp) {
+                    TOC_ROW_HEIGHT
+                } else if input.key_pressed(egui::Key::ArrowDown) {
+                    -TOC_ROW_HEIGHT
+                } else if input.key_pressed(egui::Key::PageUp) {
+                    ui.available_height() * 0.8
+                } else if input.key_pressed(egui::Key::PageDown) {
+                    -ui.available_height() * 0.8
+                } else {
+                    0.0
+                }
+            })
+        } else {
+            0.0
+        };
         let mut preserve_bottom_after_navigation = false;
         scroll_area.show_viewport(ui, |ui, viewport| {
             ui.set_height(content_height);
+
+            if keyboard_scroll_delta.abs() > f32::EPSILON {
+                ui.scroll_with_delta(Vec2::new(0.0, keyboard_scroll_delta));
+            }
 
             if should_auto_scroll && let Some(active_row) = active_row {
                 let row_top = ui.max_rect().top() + toc_row_top(active_row, item_spacing);
@@ -1964,7 +2017,7 @@ impl DesktopReader {
     }
 
     fn assistant_composer(&mut self, ui: &mut egui::Ui) {
-        self.assistant_composer_with_options(ui, true, true);
+        self.assistant_composer_with_options(ui, true, true, false);
     }
 
     fn assistant_composer_with_options(
@@ -1972,8 +2025,11 @@ impl DesktopReader {
         ui: &mut egui::Ui,
         show_reference_chips: bool,
         show_container: bool,
+        compact: bool,
     ) {
-        ui.add_space(6.0);
+        if !compact {
+            ui.add_space(6.0);
+        }
         let busy = self.chat.task.is_pending();
         let input_id = ui.make_persistent_id("assistant-chat-input");
         let (initial_references, initial_commands) = self.assistant_suggestions(busy);
@@ -2023,7 +2079,9 @@ impl DesktopReader {
         if submit {
             self.send_chat();
         }
-        ui.add_space(ASSISTANT_BOTTOM_PADDING);
+        if !compact {
+            ui.add_space(ASSISTANT_BOTTOM_PADDING);
+        }
     }
 
     fn assistant_suggestions(&mut self, busy: bool) -> (Vec<ChatReference>, Vec<ChatCommand>) {
