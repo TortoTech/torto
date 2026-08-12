@@ -11,6 +11,7 @@ members = [
     "crates/reader",
     "crates/renderer",
     "crates/sqlite-vec-extension",
+    "crates/windows-window-background",
 ]
 exclude = [
     "third_party/egui",

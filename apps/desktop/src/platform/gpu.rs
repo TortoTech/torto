@@ -117,45 +117,6 @@ impl GpuState {
         self.clear_color = color;
     }
 
-    pub(super) fn present_background(&mut self, window: &Window) -> Result<(), String> {
-        if self.surface_config.width == 0 || self.surface_config.height == 0 {
-            return Ok(());
-        }
-        let Some(frame) = self.acquire_surface_frame(window)? else {
-            return Ok(());
-        };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("resize-background-encoder"),
-            });
-        {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("resize-background-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        }
-        self.queue.submit([encoder.finish()]);
-        window.pre_present_notify();
-        frame.present();
-        Ok(())
-    }
-
     fn take_egui_input(
         &self,
         window: &Window,
@@ -176,12 +137,23 @@ impl GpuState {
             match self.surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(frame) => return Ok(Some(frame)),
                 wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                    crate::diagnostics::log(
+                        "render.surface",
+                        &[crate::diagnostics::Field::Text("status", "suboptimal")],
+                    );
                     window.request_redraw();
                     return Ok(Some(frame));
                 }
                 wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost
                     if !recovery_attempted =>
                 {
+                    crate::diagnostics::log(
+                        "render.surface",
+                        &[crate::diagnostics::Field::Text(
+                            "status",
+                            "lost_or_outdated_recovering",
+                        )],
+                    );
                     // A fullscreen/IME compositor transition can invalidate the
                     // swapchain between redraw events. Recover and acquire again
                     // now so the current redraw still presents a complete frame.
@@ -189,10 +161,24 @@ impl GpuState {
                     recovery_attempted = true;
                 }
                 wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    crate::diagnostics::log(
+                        "render.surface",
+                        &[crate::diagnostics::Field::Text(
+                            "status",
+                            "lost_or_outdated_deferred",
+                        )],
+                    );
                     window.request_redraw();
                     return Ok(None);
                 }
                 wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    crate::diagnostics::log(
+                        "render.surface",
+                        &[crate::diagnostics::Field::Text(
+                            "status",
+                            "timeout_or_occluded",
+                        )],
+                    );
                     return Ok(None);
                 }
                 wgpu::CurrentSurfaceTexture::Validation => {
@@ -209,13 +195,19 @@ impl GpuState {
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
     ) -> Result<(), String> {
+        // Fullscreen transitions can deliver a redraw before their Resized event.
+        // Always configure from the window's current client size before acquiring.
+        self.resize(window.inner_size());
+
         let raw_input = self.take_egui_input(window, egui_state);
         let mut viewport_info = root_viewport_info(&raw_input);
-        let pixels_per_point = egui_ctx.pixels_per_point();
         let mut plan = None;
         let mut output = egui_ctx.run_ui(raw_input, |ui| {
             plan = app.ui(ui, self.page_texture());
         });
+        // ScaleFactorChanged is applied by begin_pass, so read this only after
+        // run_ui instead of using the previous frame's scale.
+        let pixels_per_point = egui_ctx.pixels_per_point();
         egui_state.handle_platform_output(window, std::mem::take(&mut output.platform_output));
         process_root_viewport_commands(window, egui_ctx, &mut viewport_info, &mut output);
 
@@ -233,8 +225,9 @@ impl GpuState {
             }
         }
         if page_target_recreated {
-            // The current egui frame still references the previous native texture.
-            // Schedule a fresh frame that will pick up the newly rendered target.
+            // This frame intentionally retains the old texture at its old logical
+            // size, so it is clipped instead of stretched. The next frame uses the
+            // freshly rendered target without rerunning stateful UI in this frame.
             window.request_redraw();
         }
 

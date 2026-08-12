@@ -3832,6 +3832,7 @@ dependencies = [
  "rebook-reader",
  "rebook-renderer",
  "rebook-sqlite-vec-extension",
+ "rebook-windows-window-background",
  "regex",
  "reqwest",
  "resvg",
@@ -3961,6 +3962,13 @@ version = "0.3.0"
 dependencies = [
  "rusqlite",
  "sqlite-vec",
+]
+
+[[package]]
+name = "rebook-windows-window-background"
+version = "0.3.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

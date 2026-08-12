@@ -2,11 +2,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Fullscreen, Icon, Theme, Window, WindowId};
+#[cfg(target_os = "windows")]
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+#[cfg(not(target_os = "windows"))]
+use winit::window::Fullscreen;
+use winit::window::{Icon, Theme, Window, WindowId};
 
 use super::UserEvent;
 use super::gpu::GpuState;
@@ -15,6 +19,8 @@ use crate::preferences::AppTheme;
 
 const INITIAL_WIDTH: u32 = 1200;
 const INITIAL_HEIGHT: u32 = 800;
+#[cfg(target_os = "windows")]
+const FULLSCREEN_COMPOSITOR_OVERSCAN: u32 = 1;
 fn app_icon() -> Option<Icon> {
     let image = image::load_from_memory(include_bytes!("../../../../assets/windows/torto-256.png"))
         .ok()?
@@ -52,17 +58,83 @@ fn clear_color() -> wgpu::Color {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn native_background_color() -> [u8; 3] {
+    let background = crate::ui::palette().background;
+    [background.r(), background.g(), background.b()]
+}
+
 fn is_fullscreen_toggle(state: ElementState, repeat: bool, logical_key: &Key) -> bool {
     state == ElementState::Pressed && !repeat && logical_key == &NamedKey::F11
 }
 
-fn toggle_fullscreen(window: &Window) {
-    let fullscreen = window
-        .fullscreen()
-        .is_none()
-        .then_some(Fullscreen::Borderless(None));
-    window.set_fullscreen(fullscreen);
-    window.request_redraw();
+fn toggle_fullscreen(state: &mut WindowState) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(placement) = state.windowed_placement.take() {
+            state.window.set_decorations(true);
+            let _ = state.window.request_inner_size(placement.inner_size);
+            state.window.set_outer_position(placement.outer_position);
+            state.window.set_maximized(placement.maximized);
+        } else {
+            let Some(monitor) = state.window.current_monitor() else {
+                return;
+            };
+            let Ok(outer_position) = state.window.outer_position() else {
+                return;
+            };
+            let placement = WindowedPlacement {
+                outer_position,
+                inner_size: state.window.inner_size(),
+                maximized: state.window.is_maximized(),
+            };
+            if placement.maximized {
+                state.window.set_maximized(false);
+            }
+            // Do not call winit's set_fullscreen on Windows. Besides changing the
+            // border and bounds it registers a taskbar/DWM fullscreen window. That
+            // special compositor path can invalidate a wgpu flip-model surface when
+            // an IME candidate window appears, producing a black frame while typing.
+            let (position, size) = compositor_fullscreen_bounds(monitor.position(), monitor.size());
+            state.window.set_decorations(false);
+            state.window.set_outer_position(position);
+            let _ = state.window.request_inner_size(size);
+            state.windowed_placement = Some(placement);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let fullscreen = state
+            .window
+            .fullscreen()
+            .is_none()
+            .then_some(Fullscreen::Borderless(None));
+        state.window.set_fullscreen(fullscreen);
+    }
+    state.window.request_redraw();
+}
+
+#[cfg(target_os = "windows")]
+fn compositor_fullscreen_bounds(
+    monitor_position: PhysicalPosition<i32>,
+    monitor_size: PhysicalSize<u32>,
+) -> (PhysicalPosition<i32>, PhysicalSize<u32>) {
+    let overscan = FULLSCREEN_COMPOSITOR_OVERSCAN;
+    let overscan_i32 = i32::try_from(overscan).unwrap_or(0);
+    (
+        PhysicalPosition::new(
+            monitor_position.x.saturating_sub(overscan_i32),
+            monitor_position.y.saturating_sub(overscan_i32),
+        ),
+        PhysicalSize::new(
+            monitor_size
+                .width
+                .saturating_add(overscan.saturating_mul(2)),
+            monitor_size
+                .height
+                .saturating_add(overscan.saturating_mul(2)),
+        ),
+    )
 }
 
 const fn native_window_theme(theme: AppTheme) -> Theme {
@@ -74,8 +146,19 @@ const fn native_window_theme(theme: AppTheme) -> Theme {
 
 struct WindowState {
     window: Arc<Window>,
+    #[cfg(target_os = "windows")]
+    native_background: rebook_windows_window_background::WindowBackground,
     gpu: GpuState,
     egui_state: egui_winit::State,
+    #[cfg(target_os = "windows")]
+    windowed_placement: Option<WindowedPlacement>,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowedPlacement {
+    outer_position: PhysicalPosition<i32>,
+    inner_size: PhysicalSize<u32>,
+    maximized: bool,
 }
 
 struct Application {
@@ -127,6 +210,20 @@ impl Application {
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         }
     }
+
+    fn render_window_state(
+        state: &mut WindowState,
+        app: &mut DesktopApp,
+        egui_ctx: &egui::Context,
+    ) {
+        if let Err(error) = state
+            .gpu
+            .render(&state.window, app, egui_ctx, &mut state.egui_state)
+        {
+            tracing::warn!(%error, "failed to present resized window frame");
+            state.window.request_redraw();
+        }
+    }
 }
 
 impl ApplicationHandler<UserEvent> for Application {
@@ -154,6 +251,33 @@ impl ApplicationHandler<UserEvent> for Application {
                 return;
             }
         };
+        #[cfg(target_os = "windows")]
+        let native_background = {
+            let hwnd = match window.window_handle().map(|handle| handle.as_raw()) {
+                Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
+                Ok(_) => {
+                    self.fatal_error = Some("当前窗口没有可用的 Win32 句柄".to_owned());
+                    event_loop.exit();
+                    return;
+                }
+                Err(error) => {
+                    self.fatal_error = Some(error.to_string());
+                    event_loop.exit();
+                    return;
+                }
+            };
+            match rebook_windows_window_background::WindowBackground::install(
+                hwnd,
+                native_background_color(),
+            ) {
+                Ok(background) => background,
+                Err(error) => {
+                    self.fatal_error = Some(error.to_string());
+                    event_loop.exit();
+                    return;
+                }
+            }
+        };
         let egui_state = egui_winit::State::new(
             self.egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -175,8 +299,12 @@ impl ApplicationHandler<UserEvent> for Application {
         window.request_redraw();
         self.window = Some(WindowState {
             window,
+            #[cfg(target_os = "windows")]
+            native_background,
             gpu,
             egui_state,
+            #[cfg(target_os = "windows")]
+            windowed_placement: None,
         });
     }
 
@@ -242,7 +370,7 @@ impl ApplicationHandler<UserEvent> for Application {
             WindowEvent::KeyboardInput { event, .. }
                 if is_fullscreen_toggle(event.state, event.repeat, &event.logical_key) =>
             {
-                toggle_fullscreen(&state.window);
+                toggle_fullscreen(state);
             }
             WindowEvent::Focused(focused) => {
                 let size = state.window.inner_size();
@@ -270,20 +398,14 @@ impl ApplicationHandler<UserEvent> for Application {
             }
             WindowEvent::Resized(size) => {
                 state.gpu.resize(size);
-                // Repagination may take longer than the compositor allows for a resize frame.
-                // Present the app background immediately so newly exposed pixels never fall
-                // back to Windows' black client-area fill while the full frame is being built.
-                if let Err(error) = state.gpu.present_background(&state.window) {
-                    tracing::warn!(%error, "failed to present resize background frame");
-                }
-                state.window.request_redraw();
+                // Windows may compose the resized client area before a queued redraw
+                // is serviced. Submit a complete frame synchronously so DWM never has
+                // to stretch the previous frame or expose its black default fill.
+                Self::render_window_state(state, &mut self.app, &self.egui_ctx);
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 state.gpu.resize(state.window.inner_size());
-                if let Err(error) = state.gpu.present_background(&state.window) {
-                    tracing::warn!(%error, "failed to present scale-change background frame");
-                }
-                state.window.request_redraw();
+                Self::render_window_state(state, &mut self.app, &self.egui_ctx);
             }
             WindowEvent::RedrawRequested => {
                 if state.window.inner_size() == PhysicalSize::new(0, 0) {
@@ -308,6 +430,8 @@ impl ApplicationHandler<UserEvent> for Application {
                     // A theme switch lands during render; keep the surface
                     // clear color in step for the next frame.
                     state.gpu.set_clear_color(clear_color());
+                    #[cfg(target_os = "windows")]
+                    state.native_background.set_color(native_background_color());
                     self.app.spawn_pending_tasks(&self.runtime, &self.proxy);
                     #[cfg(target_os = "windows")]
                     if let Some(request) = self.app.take_update_install_request() {
@@ -357,6 +481,21 @@ mod tests {
             false,
             &Key::Named(NamedKey::F10),
         ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn compositor_fullscreen_overscans_the_monitor_by_one_pixel() {
+        assert_eq!(
+            compositor_fullscreen_bounds(
+                PhysicalPosition::new(100, -200),
+                PhysicalSize::new(2560, 1440),
+            ),
+            (
+                PhysicalPosition::new(99, -201),
+                PhysicalSize::new(2562, 1442),
+            )
+        );
     }
 
     #[test]
