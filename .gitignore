@@ -1,5 +1,7 @@
 /target/
 /test-data/
+/dist/
+/tmp/
 *.epub
 *.profraw
 .DS_Store

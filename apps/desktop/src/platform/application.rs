@@ -555,7 +555,14 @@ mod tests {
         assert!(wix.contains("<ComponentRef Id='DesktopShortcutComponent'/>"));
         assert!(wix.contains("<Directory Id='DesktopFolder'>"));
         assert!(!wix.contains("<Directory Id='CommonDesktopFolder'"));
-        assert!(wix.contains("Root='HKCU'\n                        Key='Software\\TortoTech\\Torto'\n                        Name='DesktopShortcut'"));
+        let desktop_shortcut = wix
+            .split("<Component Id='DesktopShortcutComponent'")
+            .nth(1)
+            .and_then(|component| component.split("</Component>").next())
+            .expect("desktop shortcut component");
+        assert!(desktop_shortcut.contains("Root='HKCU'"));
+        assert!(desktop_shortcut.contains("Key='Software\\TortoTech\\Torto'"));
+        assert!(desktop_shortcut.contains("Name='DesktopShortcut'"));
         assert_eq!(wix.matches("Absent='allow'").count(), 2);
         assert!(wix.contains("MigrateFeatures='yes'"));
         assert!(license.contains("Copyright (c) 2026 TortoTech"));
