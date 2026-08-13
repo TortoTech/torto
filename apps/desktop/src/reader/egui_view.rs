@@ -3798,21 +3798,6 @@ fn chat_message_card(
         .inner_margin(egui::Margin::symmetric(10, 9))
         .show(ui, |ui| {
             ui.set_min_width((width - 20.0).max(1.0));
-            ui.label(
-                RichText::new(if is_user {
-                    language.text("你", "You")
-                } else {
-                    "Torto AI"
-                })
-                .size(crate::ui::scaled_font_size(10.5))
-                .strong()
-                .color(if is_user {
-                    palette().accent
-                } else {
-                    palette().muted
-                }),
-            );
-            ui.add_space(3.0);
             if is_user {
                 ui.add(
                     egui::Label::new(
