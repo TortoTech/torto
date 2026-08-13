@@ -269,6 +269,7 @@ impl DesktopReader {
                     payload.source,
                     payload.settings,
                     payload.need_toc,
+                    payload.need_page_roles,
                     payload.missing.any(),
                     move |message| {
                         let _ = progress_proxy.send_event(UserEvent::ReaderPdfToc(
@@ -278,7 +279,7 @@ impl DesktopReader {
                 )
                 .await;
                 let _ = proxy.send_event(UserEvent::ReaderPdfToc(PdfTocTaskMessage::Complete(
-                    crate::async_task::TaskResult { id, result },
+                    Box::new(crate::async_task::TaskResult { id, result }),
                 )));
             });
         }
@@ -301,6 +302,7 @@ impl DesktopReader {
             ),
             book_id: self.book_id.clone(),
             need_toc: true,
+            need_page_roles: true,
             missing: self.pdf_metadata_missing,
             settings: self.plugin_settings.clone(),
         });
@@ -327,6 +329,7 @@ impl DesktopReader {
             ),
             book_id: self.book_id.clone(),
             need_toc,
+            need_page_roles: true,
             missing: self.pdf_metadata_missing,
             settings: self.plugin_settings.clone(),
         });
@@ -346,6 +349,26 @@ impl DesktopReader {
             page_count: self.source.book().sections.len(),
             settings: self.plugin_settings.clone(),
         });
+        if !self.pdf_toc.task.is_pending()
+            && self.plugin_settings.ocr_enabled
+            && self.plugin_settings.ocr_endpoint().is_ok()
+        {
+            self.pdf_toc.progress = self
+                .language
+                .text("正在识别 PDF 特殊页面…", "Identifying special PDF pages…")
+                .into();
+            self.pdf_toc.task.begin(PdfTocTask {
+                source: self.pdf_ocr_controller.as_ref().map_or_else(
+                    || Arc::clone(&self.source),
+                    |controller| controller.original_source(),
+                ),
+                book_id: self.book_id.clone(),
+                need_toc: false,
+                need_page_roles: true,
+                missing: super::PdfMetadataMissing::default(),
+                settings: self.plugin_settings.clone(),
+            });
+        }
     }
 
     pub(crate) fn complete_pdf_ocr(&mut self, message: PdfOcrTaskMessage) {
@@ -425,12 +448,23 @@ impl DesktopReader {
                 } else {
                     rebook_layout::ReaderStyle::default().column_gap
                 };
+                let leave_focus_mode = fixed_page && self.is_focus_mode();
+                if leave_focus_mode {
+                    style.spread = crate::preferences::load_reader_preferences()
+                        .map_or(rebook_layout::SpreadMode::Double, |settings| {
+                            settings.spread
+                        });
+                    style.minimum_paragraph_gap = 0.0;
+                }
                 match self
                     .reader
                     .refresh_source_with_style_at_href(style, navigation_target.as_ref())
                 {
                     Ok(snapshot) => {
                         self.pdf_ocr.mode = mode;
+                        if leave_focus_mode {
+                            self.leave_focus_mode_for_pdf();
+                        }
                         self.apply_snapshot(snapshot, SnapshotEffects::static_content_change());
                         true
                     }
@@ -510,6 +544,15 @@ impl DesktopReader {
     ) -> Option<PdfMetadataUpdate> {
         let mut failures = Vec::new();
         let mut update = None;
+        let mut page_roles_updated = false;
+        if request.need_page_roles
+            && let Err(error) =
+                crate::plugins::save_pdf_ocr_page_roles(&request.book_id, &extraction.page_roles)
+        {
+            failures.push(format!("保存 PDF 特殊页面识别结果失败：{error}"));
+        } else if request.need_page_roles {
+            page_roles_updated = true;
+        }
         if request.missing.any() {
             match extraction.metadata.take() {
                 Some(metadata) => match self.apply_recognized_pdf_metadata(
@@ -544,7 +587,7 @@ impl DesktopReader {
             }
         }
 
-        let mut reopens_reader = false;
+        let mut reopens_reader = page_roles_updated && self.pdf_ocr.available;
         if let Some(draft) = extraction.toc {
             self.pdf_toc.draft = Some(draft);
             self.pdf_toc.editing = false;
@@ -558,6 +601,11 @@ impl DesktopReader {
                     .toc_error
                     .unwrap_or_else(|| "没有识别出可用的 PDF 目录".into()),
             );
+        }
+
+        if reopens_reader && self.reopen_requested.is_none() {
+            self.persist_progress();
+            self.reopen_requested = Some(self.source_path.clone());
         }
 
         self.finish_pdf_metadata_extraction(request, &failures, reopens_reader);
@@ -575,6 +623,9 @@ impl DesktopReader {
             let success = if request.need_toc && !requested_metadata {
                 self.language
                     .text("PDF 目录识别完成", "PDF contents recognized")
+            } else if request.need_page_roles && !requested_metadata {
+                self.language
+                    .text("PDF 特殊页面识别完成", "Special PDF pages identified")
             } else {
                 self.language
                     .text("PDF 元数据提取完成", "PDF metadata extracted")

@@ -23,6 +23,21 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn request_settings_change(&mut self, change: ReaderSettingsChange) {
+        if change == ReaderSettingsChange::ReadingMode(crate::preferences::ReadingMode::Focus)
+            && !self.focus_mode_allowed()
+        {
+            self.notice_timer.show(
+                &mut self.notice,
+                self.language
+                    .text(
+                        "原始 PDF 不支持专注模式，请先切换到 OCR 版式",
+                        "Focus mode requires the OCR reflow view for PDF",
+                    )
+                    .into(),
+                std::time::Instant::now(),
+            );
+            return;
+        }
         self.cancel_text_selection();
         self.close_overlay();
         self.settings_change_requested = Some(change);
@@ -34,6 +49,23 @@ impl DesktopReader {
 
     pub(crate) fn report_settings_error(&mut self, error: String) {
         self.error = Some(error);
+    }
+
+    pub(super) fn leave_focus_mode_for_pdf(&mut self) {
+        if !self.is_focus_mode() {
+            return;
+        }
+        self.reading_mode = crate::preferences::ReadingMode::Classic;
+        self.focus_units.clear();
+        self.focus_target_offset = None;
+        self.ui.focus_scroll_motion = None;
+        self.ui.sidebar_pinned = true;
+        self.set_sidebar_open(true);
+        self.close_assistant_panel();
+        self.ui.focus_chat_minimized = false;
+        self.ui.focus_actions_visible = false;
+        self.focus_toc_override = None;
+        self.cancel_text_selection();
     }
 
     #[allow(
@@ -107,8 +139,29 @@ impl DesktopReader {
             return;
         }
 
-        let mode_changed = self.reading_mode != settings.reading_mode;
-        self.reading_mode = settings.reading_mode;
+        let reading_mode = if settings.reading_mode == crate::preferences::ReadingMode::Focus
+            && !self.focus_mode_allowed()
+        {
+            crate::preferences::ReadingMode::Classic
+        } else {
+            settings.reading_mode
+        };
+        if settings.reading_mode == crate::preferences::ReadingMode::Focus
+            && reading_mode == crate::preferences::ReadingMode::Classic
+        {
+            self.notice_timer.show(
+                &mut self.notice,
+                language
+                    .text(
+                        "原始 PDF 不支持专注模式，请先切换到 OCR 版式",
+                        "Focus mode requires the OCR reflow view for PDF",
+                    )
+                    .into(),
+                std::time::Instant::now(),
+            );
+        }
+        let mode_changed = self.reading_mode != reading_mode;
+        self.reading_mode = reading_mode;
         let mut style = self.reader.style();
         style.spread = if self.reading_mode == crate::preferences::ReadingMode::Focus {
             rebook_layout::SpreadMode::Scroll

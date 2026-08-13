@@ -17,6 +17,7 @@ use super::pdf_vision::{
     render_page_image, request_vision_json,
 };
 use super::{AiProvider, PluginSettings};
+use super::{PdfOcrPageRole, PdfOcrPageRoleAssignment};
 use crate::generated_metadata::GeneratedPdfMetadata;
 use crate::generated_toc::{GeneratedTocDraft, GeneratedTocEntry};
 
@@ -46,6 +47,15 @@ struct ScannedPage {
     n: String,
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     h: String,
+}
+
+fn scanned_page_role(kind: &str) -> Option<PdfOcrPageRole> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "cover" => Some(PdfOcrPageRole::Cover),
+        "title_page" | "title-page" => Some(PdfOcrPageRole::TitlePage),
+        "back_cover" | "back-cover" => Some(PdfOcrPageRole::BackCover),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +201,7 @@ pub(crate) struct PdfMetadataExtraction {
     pub(crate) toc: Option<GeneratedTocDraft>,
     pub(crate) toc_error: Option<String>,
     pub(crate) metadata: Option<GeneratedPdfMetadata>,
+    pub(crate) page_roles: Vec<PdfOcrPageRoleAssignment>,
 }
 
 #[cfg(test)]
@@ -202,7 +213,7 @@ pub(crate) async fn generate_pdf_toc<F>(
 where
     F: FnMut(String) + Send,
 {
-    let result = extract_pdf_metadata(source, settings, true, false, on_progress).await?;
+    let result = extract_pdf_metadata(source, settings, true, true, false, on_progress).await?;
     result
         .toc
         .ok_or_else(|| result.toc_error.unwrap_or_else(|| "目录识别失败".into()))
@@ -216,13 +227,14 @@ pub(crate) async fn extract_pdf_metadata<F>(
     source: Arc<dyn BookSource>,
     settings: PluginSettings,
     need_toc: bool,
+    need_page_roles: bool,
     need_book_metadata: bool,
     mut on_progress: F,
 ) -> Result<PdfMetadataExtraction, String>
 where
     F: FnMut(String) + Send,
 {
-    if !need_toc {
+    if !need_toc && !need_page_roles {
         let metadata = if need_book_metadata {
             Some(generate_pdf_metadata(source, settings).await?)
         } else {
@@ -232,6 +244,7 @@ where
             toc: None,
             toc_error: None,
             metadata,
+            page_roles: Vec::new(),
         });
     }
     let (provider, model) = settings.ocr_endpoint()?;
@@ -246,7 +259,7 @@ where
         return Err("PDF 没有可识别的页面".into());
     }
 
-    let (toc_pages, anchors, heading_anchors, metadata) = locate_toc_pages(
+    let (toc_pages, anchors, heading_anchors, metadata, page_roles) = locate_toc_pages(
         &client,
         &provider,
         &model,
@@ -256,11 +269,20 @@ where
         &mut on_progress,
     )
     .await?;
+    if !need_toc {
+        return Ok(PdfMetadataExtraction {
+            toc: None,
+            toc_error: None,
+            metadata,
+            page_roles,
+        });
+    }
     if toc_pages.is_empty() {
         return Ok(PdfMetadataExtraction {
             toc: None,
             toc_error: Some("未在 PDF 前部识别到印刷目录页".into()),
             metadata,
+            page_roles,
         });
     }
 
@@ -281,6 +303,7 @@ where
                 toc: None,
                 toc_error: Some(error),
                 metadata,
+                page_roles,
             });
         }
     };
@@ -290,6 +313,7 @@ where
             toc: None,
             toc_error: Some("已识别目录，但无法建立印刷页码与 PDF 页码的映射".into()),
             metadata,
+            page_roles,
         });
     };
     let confidence_factor = if offset_support >= 3 { 1.0 } else { 0.88 };
@@ -324,6 +348,7 @@ where
             toc: None,
             toc_error: Some("目录条目过少，无法生成可靠的导航目录".into()),
             metadata,
+            page_roles,
         });
     }
     let mut heading_verified = apply_restarted_page_sequences(&mut entries, &anchors);
@@ -358,6 +383,7 @@ where
         }),
         toc_error: None,
         metadata,
+        page_roles,
     })
 }
 
@@ -379,6 +405,7 @@ async fn locate_toc_pages<F>(
         Vec<PageNumberAnchor>,
         Vec<PageHeadingAnchor>,
         Option<GeneratedPdfMetadata>,
+        Vec<PdfOcrPageRoleAssignment>,
     ),
     String,
 >
@@ -387,8 +414,19 @@ where
 {
     let scan_limit = page_count.min(SCAN_PAGE_LIMIT);
     let mut jobs = VecDeque::new();
-    for batch_start in (0..scan_limit).step_by(SCAN_BATCH_SIZE) {
-        let batch_end = (batch_start + SCAN_BATCH_SIZE).min(scan_limit);
+    let mut scan_ranges = (0..scan_limit)
+        .step_by(SCAN_BATCH_SIZE)
+        .map(|batch_start| (batch_start, (batch_start + SCAN_BATCH_SIZE).min(scan_limit)))
+        .collect::<Vec<_>>();
+    let back_start = page_count.saturating_sub(SCAN_BATCH_SIZE);
+    if page_count > scan_limit
+        && !scan_ranges
+            .iter()
+            .any(|(start, end)| back_start >= *start && back_start < *end)
+    {
+        scan_ranges.push((back_start, page_count));
+    }
+    for (batch_start, batch_end) in scan_ranges {
         let page_indices = (batch_start..batch_end).collect::<Vec<_>>();
         let page_mapping = page_indices
             .iter()
@@ -402,14 +440,14 @@ where
             ""
         };
         let response_shape = if extract_metadata && batch_start == 0 {
-            "{\"p\":[{\"i\":0,\"k\":\"toc|other\",\"n\":\"printed page number or empty\",\"h\":\"section heading or empty\"}],\"m\":{\"t\":\"title\",\"a\":[\"author\"]}}"
+            "{\"p\":[{\"i\":0,\"k\":\"toc|cover|title_page|back_cover|other\",\"n\":\"printed page number or empty\",\"h\":\"section heading or empty\"}],\"m\":{\"t\":\"title\",\"a\":[\"author\"]}}"
         } else {
-            "{\"p\":[{\"i\":0,\"k\":\"toc|other\",\"n\":\"printed page number or empty\",\"h\":\"section heading or empty\"}]}"
+            "{\"p\":[{\"i\":0,\"k\":\"toc|cover|title_page|back_cover|other\",\"n\":\"printed page number or empty\",\"h\":\"section heading or empty\"}]}"
         };
         let content = vec![
             json!({
                 "type": "text",
-                "text": format!("The image is a 2-column contact sheet in row-major slot order. Slot-to-PDF-page mapping: {page_mapping}. Inspect every slot. A toc page is a printed table-of-contents page listing multiple headings with page numbers; covers, copyright pages, prefaces and chapter opening pages are other. For h, return the full visible heading only when that page starts a chapter, preface, acknowledgements, introduction, appendix, or other navigable section; otherwise return an empty string. Do not use running headers or incidental mentions as h.{metadata_instruction} Return compact JSON only: {response_shape}. Include exactly one p item for every slot. Do not infer n when it is not visibly printed."),
+                "text": format!("The image is a 2-column contact sheet in row-major slot order. Slot-to-PDF-page mapping: {page_mapping}. Inspect every slot. Classify k as toc for a printed table-of-contents page listing multiple headings with page numbers; cover for the exterior front cover; title_page for a formal interior title page or half-title page; back_cover for the exterior rear cover; otherwise other. A copyright page is other. Use each special role only when visually supported. For h, return the full visible heading only when that page starts a chapter, preface, acknowledgements, introduction, appendix, or other navigable section; otherwise return an empty string. Do not use running headers or incidental mentions as h.{metadata_instruction} Return compact JSON only: {response_shape}. Include exactly one p item for every slot. Do not infer n when it is not visibly printed."),
             }),
             json!({
                 "type": "image_url",
@@ -439,6 +477,7 @@ where
     let mut toc_pages = Vec::new();
     let mut anchors = Vec::new();
     let mut heading_anchors = Vec::new();
+    let mut page_roles = Vec::new();
     let mut metadata = None;
     let mut completed_batches = 0;
     while let Some(result) = tasks.join_next().await {
@@ -460,6 +499,12 @@ where
             let physical_page = batch_start + page.i + 1;
             if page.k.eq_ignore_ascii_case("toc") {
                 toc_pages.push(physical_page);
+            }
+            if let Some(role) = scanned_page_role(&page.k) {
+                page_roles.push(PdfOcrPageRoleAssignment {
+                    physical_page,
+                    role,
+                });
             }
             if !page.n.trim().is_empty() {
                 anchors.push(PageNumberAnchor {
@@ -493,7 +538,9 @@ where
     heading_anchors.dedup_by(|left, right| {
         left.physical_page == right.physical_page && left.title == right.title
     });
-    Ok((toc_pages, anchors, heading_anchors, metadata))
+    page_roles.sort_unstable_by_key(|assignment| assignment.physical_page);
+    page_roles.dedup_by_key(|assignment| assignment.physical_page);
+    Ok((toc_pages, anchors, heading_anchors, metadata, page_roles))
 }
 
 async fn extract_entries<F>(
@@ -974,8 +1021,24 @@ mod tests {
         apply_consistent_top_level_page_correction, apply_restarted_page_sequences,
         apply_scanned_heading_anchors, generate_pdf_toc, infer_page_offset,
         is_retryable_vision_response_error, parse_arabic_page_number, render_page_data_url,
-        request_vision_json, verification_candidate_pages,
+        request_vision_json, scanned_page_role, verification_candidate_pages,
     };
+    use crate::plugins::PdfOcrPageRole;
+
+    #[test]
+    fn page_classification_accepts_cover_title_page_and_back_cover_roles() {
+        assert_eq!(scanned_page_role("cover"), Some(PdfOcrPageRole::Cover));
+        assert_eq!(
+            scanned_page_role("title_page"),
+            Some(PdfOcrPageRole::TitlePage)
+        );
+        assert_eq!(
+            scanned_page_role("back-cover"),
+            Some(PdfOcrPageRole::BackCover)
+        );
+        assert_eq!(scanned_page_role("toc"), None);
+        assert_eq!(scanned_page_role("other"), None);
+    }
 
     #[test]
     fn combined_scan_response_keeps_book_metadata_beside_page_classification() {
@@ -1285,6 +1348,7 @@ mod tests {
             .block_on(super::extract_pdf_metadata(
                 source,
                 settings,
+                true,
                 true,
                 true,
                 |message| eprintln!("{message}"),

@@ -58,7 +58,7 @@ peniko = "0.6.1"
 percent-encoding = "2.3.2"
 pollster = "0.4.0"
 pulldown-cmark = "0.13.0"
-quick-xml = { version = "0.41.0", features = ["encoding"] }
+quick-xml = { version = "0.41.0", features = ["encoding", "escape-html"] }
 ratex-layout = "0.1.14"
 ratex-parser = "0.1.14"
 ratex-svg = { version = "0.1.14", features = ["embed-fonts"] }

@@ -15,6 +15,11 @@ const PDF_PAGE_SCENE_CACHE_CAPACITY: usize = 4;
 const ANNOTATION_MARK_COLOR: Color = Color::from_rgba8(96, 165, 250, 72);
 const TEXT_SELECTION_COLOR: Color = Color::from_rgba8(68, 137, 103, 72);
 
+fn focus_block_border_color() -> Color {
+    let accent = crate::ui::palette().accent;
+    Color::from_rgba8(accent.r(), accent.g(), accent.b(), accent.a())
+}
+
 pub(in crate::reader) fn text_selection_fill() -> egui::Color32 {
     let rgba = TEXT_SELECTION_COLOR.to_rgba8();
     egui::Color32::from_rgba_unmultiplied(rgba.r, rgba.g, rgba.b, rgba.a)
@@ -51,6 +56,24 @@ impl DesktopReader {
             Err(error) => self.error = Some(format!("组合双页失败：{error}")),
         }
         scene.append(&layers.content, None);
+        match self.reader.current_spread() {
+            Ok(spread) => {
+                let mut bridge = VelloScene::new(&mut scene);
+                self.paint_focus_table_border(
+                    &spread.primary,
+                    &mut bridge,
+                    spread.primary_offset_x,
+                );
+                if let Some(secondary) = spread.secondary {
+                    self.paint_focus_table_border(
+                        &secondary,
+                        &mut bridge,
+                        spread.secondary_offset_x,
+                    );
+                }
+            }
+            Err(error) => self.error = Some(format!("组合双页失败：{error}")),
+        }
         Arc::new(scene)
     }
 
@@ -79,6 +102,7 @@ impl DesktopReader {
             page_scene.append(&layers.underlay, None);
             self.paint_page_overlays(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
             page_scene.append(&layers.content, None);
+            self.paint_focus_table_border(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
             scene.append(
                 &page_scene,
                 Some(Affine::translate((
@@ -203,11 +227,28 @@ impl DesktopReader {
         }
         if self.is_focus_mode()
             && let Some(unit) = self.focus_units.get(self.focus_unit_index)
+            && !unit.is_table
         {
-            page.paint_source_ranges(
+            page.paint_source_ranges(scene, &unit.paint_ranges, TEXT_SELECTION_COLOR, offset_x);
+        }
+    }
+
+    fn paint_focus_table_border(
+        &self,
+        page: &PageDisplayList,
+        scene: &mut VelloScene<'_>,
+        offset_x: f32,
+    ) {
+        if self.is_focus_mode()
+            && let Some(unit) = self
+                .focus_units
+                .get(self.focus_unit_index)
+                .filter(|unit| unit.is_table)
+        {
+            page.paint_source_table_borders(
                 scene,
-                std::slice::from_ref(&unit.range),
-                TEXT_SELECTION_COLOR,
+                &unit.paint_ranges,
+                focus_block_border_color(),
                 offset_x,
             );
         }

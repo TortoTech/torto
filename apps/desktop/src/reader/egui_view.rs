@@ -700,9 +700,13 @@ impl DesktopReader {
             let previous_section = ctx.input(|input| input.key_pressed(egui::Key::ArrowLeft));
             let next_section = ctx.input(|input| input.key_pressed(egui::Key::ArrowRight));
             if previous_unit {
-                self.move_focus_unit(PageDirection::Previous);
+                if !self.scroll_within_tall_focus_unit(PageDirection::Previous) {
+                    self.move_focus_unit(PageDirection::Previous);
+                }
             } else if next_unit {
-                self.move_focus_unit(PageDirection::Next);
+                if !self.scroll_within_tall_focus_unit(PageDirection::Next) {
+                    self.move_focus_unit(PageDirection::Next);
+                }
             } else if previous_section {
                 self.go_to_adjacent_section(PageDirection::Previous);
             } else if next_section {
@@ -824,7 +828,9 @@ impl DesktopReader {
         };
         self.ui.wheel_accumulator = 0.0;
         self.ui.last_wheel_turn = Some(now);
-        self.move_focus_unit(direction);
+        if !self.scroll_within_tall_focus_unit(direction) {
+            self.move_focus_unit(direction);
+        }
         response.ctx.input_mut(|input| {
             input.smooth_scroll_delta.y = 0.0;
         });
@@ -2424,17 +2430,28 @@ impl DesktopReader {
                         {
                             self.request_settings();
                         }
-                        if navigation_button(
-                            ui,
-                            Icon::BrainCircuit,
-                            if self.is_focus_mode() {
-                                self.language.text("专注模式", "Focus mode")
-                            } else {
-                                self.language.text("经典模式", "Classic mode")
-                            },
-                            false,
-                        )
-                        .clicked()
+                        let focus_allowed = self.focus_mode_allowed() || self.is_focus_mode();
+                        let mode_button = ui.add_enabled_ui(focus_allowed, |ui| {
+                            navigation_button(
+                                ui,
+                                Icon::BrainCircuit,
+                                if self.is_focus_mode() {
+                                    self.language.text("专注模式", "Focus mode")
+                                } else {
+                                    self.language.text("经典模式", "Classic mode")
+                                },
+                                false,
+                            )
+                        });
+                        let mode_button = if focus_allowed {
+                            mode_button.inner
+                        } else {
+                            mode_button.inner.on_disabled_hover_text(self.language.text(
+                                "原始 PDF 仅支持经典模式，请先切换到 OCR 版式",
+                                "Original PDF supports Classic mode only; switch to OCR reflow first",
+                            ))
+                        };
+                        if mode_button.clicked()
                         {
                             let mode = if self.is_focus_mode() {
                                 crate::preferences::ReadingMode::Classic

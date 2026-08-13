@@ -47,6 +47,7 @@ const SCROLL_PAGE_GAP: f32 = 24.0;
 const SCROLL_PREVIOUS_REGION_HEIGHT: f32 = 56.0;
 const SCROLL_NEXT_REGION_HEIGHT: f32 = 88.0;
 const FOCUS_MINIMUM_PARAGRAPH_GAP: f32 = 12.0;
+const FOCUS_TABLE_BOTTOM_MARGIN: f32 = 24.0;
 static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SEMANTIC_TASK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -203,8 +204,9 @@ pub(super) fn open_reader(
         tracing::warn!(%error, "failed to load reader preferences; using defaults");
         ReaderPreferences::default()
     });
+    let reading_mode = allowed_reading_mode(format, pdf_ocr_mode, reader_preferences.reading_mode);
     let mut style = ReaderStyle {
-        spread: if reader_preferences.reading_mode == ReadingMode::Focus {
+        spread: if reading_mode == ReadingMode::Focus {
             SpreadMode::Scroll
         } else {
             reader_preferences.spread
@@ -212,7 +214,7 @@ pub(super) fn open_reader(
         typography: reader_preferences.typography.clone(),
         ..ReaderStyle::default()
     };
-    if reader_preferences.reading_mode == ReadingMode::Focus {
+    if reading_mode == ReadingMode::Focus {
         style.minimum_paragraph_gap = FOCUS_MINIMUM_PARAGRAPH_GAP;
     }
     if fixed_page {
@@ -298,7 +300,7 @@ pub(super) fn open_reader(
             progress_store,
             plugin_settings,
             language: reader_preferences.language,
-            reading_mode: reader_preferences.reading_mode,
+            reading_mode,
             selection_granularity: reader_preferences.selection_granularity,
             sync_settings,
             sync_password,
@@ -445,10 +447,12 @@ struct ScrollSectionLayout {
 #[derive(Clone)]
 struct FocusUnit {
     range: SourceRange,
+    paint_ranges: Vec<SourceRange>,
     text: String,
     position: ReaderPosition,
     rect: egui::Rect,
     is_image: bool,
+    is_table: bool,
 }
 
 fn block_source_range(block: &Block) -> Option<&SourceRange> {
@@ -458,6 +462,65 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Image(image) => image.source.as_ref(),
         Block::Separator | Block::PageBreak => None,
     }
+}
+
+fn focus_block_paint_ranges(block: &Block, range: &SourceRange) -> Vec<SourceRange> {
+    if let Block::Table(table) = block {
+        let cell_ranges = table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .filter_map(|cell| cell.text.source.clone())
+            .collect::<Vec<_>>();
+        if !cell_ranges.is_empty() {
+            return cell_ranges;
+        }
+    }
+    vec![range.clone()]
+}
+
+fn focus_unit_geometry_ranges(
+    is_first_unit: bool,
+    leading_heading_ranges: &[SourceRange],
+    paint_ranges: &[SourceRange],
+) -> Vec<SourceRange> {
+    if !is_first_unit || leading_heading_ranges.is_empty() {
+        return paint_ranges.to_vec();
+    }
+    leading_heading_ranges
+        .iter()
+        .chain(paint_ranges)
+        .cloned()
+        .collect()
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "renderer page coordinates are GPU-bounded and egui geometry uses f32"
+)]
+fn focus_unit_geometry(
+    layout: &ScrollSectionLayout,
+    paint_ranges: &[SourceRange],
+) -> Option<(egui::Rect, ReaderPosition)> {
+    let mut bounds: Option<egui::Rect> = None;
+    let mut position = None;
+    for (page_index, page) in layout.pages.iter().enumerate() {
+        for rect in page
+            .page
+            .source_rects(paint_ranges)
+            .into_iter()
+            .chain(page.page.image_source_rects(paint_ranges))
+            .chain(page.page.source_table_bounds(paint_ranges))
+        {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(rect.x0 as f32, layout.content_y(page_index, rect.y0 as f32)),
+                egui::pos2(rect.x1 as f32, layout.content_y(page_index, rect.y1 as f32)),
+            );
+            bounds = Some(bounds.map_or(rect, |current| current.union(rect)));
+            position.get_or_insert(page.position);
+        }
+    }
+    bounds.zip(position)
 }
 
 fn focus_anchor_block_index(blocks: &[Block], anchor: Option<&SourceAnchor>) -> Option<usize> {
@@ -507,6 +570,26 @@ fn source_range_contains_anchor(range: &SourceRange, anchor: &SourceAnchor) -> b
 
 fn focus_unit_container_center_y(rect: egui::Rect) -> f32 {
     rect.top() + rect.height().max(FOCUS_UNIT_MIN_HEIGHT) / 2.0
+}
+
+fn focus_unit_scroll_bounds(
+    rect: egui::Rect,
+    viewport_height: f32,
+    content_padding: f32,
+) -> (f32, f32) {
+    let top = (rect.top() + content_padding).max(0.0);
+    let bottom = (rect.bottom() + content_padding - viewport_height).max(top);
+    (top, bottom)
+}
+
+fn focus_unit_target_offset_for_rect(rect: egui::Rect, viewport_height: f32) -> f32 {
+    let padding = viewport_height * 0.5;
+    let (top, bottom) = focus_unit_scroll_bounds(rect, viewport_height, padding);
+    if bottom > top {
+        top
+    } else {
+        (focus_unit_container_center_y(rect) + padding - viewport_height / 2.0).max(0.0)
+    }
 }
 
 fn focus_unit_screen_center_y(
@@ -658,6 +741,14 @@ struct ScrollViewportState {
 }
 
 impl DesktopReader {
+    fn focus_mode_allowed(&self) -> bool {
+        self.format != BookFormat::Pdf
+            || self
+                .pdf_ocr_controller
+                .as_ref()
+                .is_some_and(|controller| controller.is_reflow_enabled())
+    }
+
     fn is_focus_mode(&self) -> bool {
         self.reading_mode == ReadingMode::Focus
     }
@@ -697,8 +788,8 @@ impl DesktopReader {
     }
 
     #[allow(
-        clippy::cast_possible_truncation,
-        reason = "renderer page coordinates are GPU-bounded and egui geometry uses f32"
+        clippy::too_many_lines,
+        reason = "focus-unit construction keeps semantic, paint, and geometry ranges synchronized"
     )]
     fn rebuild_focus_units(&mut self, layout: &ScrollSectionLayout) {
         let Ok(section) = self.source.parse_section(layout.section_index) else {
@@ -709,22 +800,35 @@ impl DesktopReader {
         let focus_block_index =
             focus_anchor_block_index(&section.blocks, self.focus_anchor.as_ref());
         let mut first_unit_after_anchor = None;
+        let mut leading_heading_ranges = Vec::new();
         let mut units = Vec::new();
         for (block_index, block) in section.blocks.iter().enumerate() {
-            let (range, text, is_image) = match block {
+            let (range, paint_ranges, text, is_image, is_table) = match block {
                 Block::Text(block) => {
                     if matches!(block.kind, TextBlockKind::Heading(_)) {
+                        if units.is_empty()
+                            && let Some(range) = block.source.clone()
+                        {
+                            leading_heading_ranges.push(range);
+                        }
                         continue;
                     }
                     let Some(range) = block.source.clone() else {
                         continue;
                     };
-                    (range, crate::plugins::text_block_text(block), false)
+                    (
+                        range.clone(),
+                        vec![range],
+                        crate::plugins::text_block_text(block),
+                        false,
+                        false,
+                    )
                 }
                 Block::Table(table) => {
                     let Some(range) = table.source.clone() else {
                         continue;
                     };
+                    let paint_ranges = focus_block_paint_ranges(block, &range);
                     let text = table
                         .rows
                         .iter()
@@ -732,7 +836,7 @@ impl DesktopReader {
                         .map(|cell| crate::plugins::text_block_text(&cell.text))
                         .collect::<Vec<_>>()
                         .join(" ");
-                    (range, text, false)
+                    (range, paint_ranges, text, false, true)
                 }
                 Block::Image(image) => {
                     // Fixed-layout PDF pages are represented as images with a text
@@ -750,33 +854,24 @@ impl DesktopReader {
                     } else {
                         image.alt.clone()
                     };
-                    (range, text, true)
+                    (range.clone(), vec![range], text, true, false)
                 }
                 Block::Separator | Block::PageBreak => continue,
             };
             if text.trim().is_empty() {
                 continue;
             }
-            let mut bounds: Option<egui::Rect> = None;
-            let mut position = None;
-            for (page_index, page) in layout.pages.iter().enumerate() {
-                for rect in page
-                    .page
-                    .source_rects(std::slice::from_ref(&range))
-                    .into_iter()
-                    .chain(page.page.image_source_rects(std::slice::from_ref(&range)))
-                {
-                    let rect = egui::Rect::from_min_max(
-                        egui::pos2(rect.x0 as f32, layout.content_y(page_index, rect.y0 as f32)),
-                        egui::pos2(rect.x1 as f32, layout.content_y(page_index, rect.y1 as f32)),
-                    );
-                    bounds = Some(bounds.map_or(rect, |current| current.union(rect)));
-                    position.get_or_insert(page.position);
-                }
-            }
-            let (Some(rect), Some(position)) = (bounds, position) else {
+            let geometry_ranges = focus_unit_geometry_ranges(
+                units.is_empty(),
+                &leading_heading_ranges,
+                &paint_ranges,
+            );
+            let Some((mut rect, position)) = focus_unit_geometry(layout, &geometry_ranges) else {
                 continue;
             };
+            if is_table {
+                rect.max.y += FOCUS_TABLE_BOTTOM_MARGIN;
+            }
             if first_unit_after_anchor.is_none()
                 && focus_block_index.is_some_and(|target| block_index >= target)
             {
@@ -784,10 +879,12 @@ impl DesktopReader {
             }
             units.push(FocusUnit {
                 range,
+                paint_ranges,
                 text,
                 position,
                 rect,
                 is_image,
+                is_table,
             });
         }
         let current = snapshot_position(&self.snapshot);
@@ -807,8 +904,57 @@ impl DesktopReader {
 
     fn focus_unit_target_offset(&self, viewport_height: f32) -> Option<f32> {
         let unit = self.focus_units.get(self.focus_unit_index)?;
-        let padding = self.scroll_content_padding(viewport_height);
-        Some((focus_unit_container_center_y(unit.rect) + padding - viewport_height / 2.0).max(0.0))
+        Some(focus_unit_target_offset_for_rect(
+            unit.rect,
+            viewport_height,
+        ))
+    }
+
+    fn animate_focus_scroll_to(&mut self, target: f32) {
+        let current = self.ui.focus_scroll_motion.map_or_else(
+            || {
+                self.scroll_viewport
+                    .map_or(target, |viewport| viewport.offset_y)
+            },
+            |motion| motion.value,
+        );
+        let mut motion = Motion::settled_with_curve(
+            current,
+            focus_scroll_duration(target - current),
+            MotionCurve::EaseInOut,
+        );
+        motion.animate_to(target);
+        self.ui.focus_scroll_motion = Some(motion);
+        self.ui.last_motion_tick = Some(Instant::now());
+    }
+
+    fn scroll_within_tall_focus_unit(&mut self, direction: PageDirection) -> bool {
+        let Some(viewport) = self.scroll_viewport else {
+            return false;
+        };
+        let Some(unit) = self.focus_units.get(self.focus_unit_index) else {
+            return false;
+        };
+        let padding = self.scroll_content_padding(viewport.size.y);
+        let (top, bottom) = focus_unit_scroll_bounds(unit.rect, viewport.size.y, padding);
+        if bottom <= top {
+            return false;
+        }
+        let current = self
+            .ui
+            .focus_scroll_motion
+            .map_or(viewport.offset_y, |motion| motion.target)
+            .clamp(top, bottom);
+        let step = (viewport.size.y * 0.8).max(FOCUS_UNIT_MIN_HEIGHT);
+        let target = match direction {
+            PageDirection::Previous if current > top + MOTION_EPSILON => (current - step).max(top),
+            PageDirection::Next if current < bottom - MOTION_EPSILON => {
+                (current + step).min(bottom)
+            }
+            _ => return false,
+        };
+        self.animate_focus_scroll_to(target);
+        true
     }
 
     fn move_focus_unit(&mut self, direction: PageDirection) {
@@ -837,21 +983,7 @@ impl DesktopReader {
             .scroll_viewport
             .and_then(|viewport| self.focus_unit_target_offset(viewport.size.y))
         {
-            let current = self.ui.focus_scroll_motion.map_or_else(
-                || {
-                    self.scroll_viewport
-                        .map_or(target, |viewport| viewport.offset_y)
-                },
-                |motion| motion.value,
-            );
-            let mut motion = Motion::settled_with_curve(
-                current,
-                focus_scroll_duration(target - current),
-                MotionCurve::EaseInOut,
-            );
-            motion.animate_to(target);
-            self.ui.focus_scroll_motion = Some(motion);
-            self.ui.last_motion_tick = Some(Instant::now());
+            self.animate_focus_scroll_to(target);
         }
         self.bump_scene_revision();
         self.persist_progress();
@@ -993,6 +1125,22 @@ impl DesktopReader {
                 self.show_error(format!("读取 AI 目录失败：{error}"));
             }
         }
+    }
+}
+
+fn focus_mode_allowed(format: BookFormat, pdf_ocr_mode: PdfOcrViewMode) -> bool {
+    format != BookFormat::Pdf || pdf_ocr_mode == PdfOcrViewMode::Reflow
+}
+
+fn allowed_reading_mode(
+    format: BookFormat,
+    pdf_ocr_mode: PdfOcrViewMode,
+    requested: ReadingMode,
+) -> ReadingMode {
+    if requested == ReadingMode::Focus && !focus_mode_allowed(format, pdf_ocr_mode) {
+        ReadingMode::Classic
+    } else {
+        requested
     }
 }
 
@@ -1185,13 +1333,14 @@ struct PdfTocTask {
     source: Arc<dyn BookSource>,
     book_id: String,
     need_toc: bool,
+    need_page_roles: bool,
     missing: PdfMetadataMissing,
     settings: PluginSettings,
 }
 
 pub(crate) enum PdfTocTaskMessage {
     Progress { id: u64, message: String },
-    Complete(TaskResult<crate::plugins::PdfMetadataExtraction>),
+    Complete(Box<TaskResult<crate::plugins::PdfMetadataExtraction>>),
 }
 
 #[derive(Default)]
@@ -1661,6 +1810,7 @@ impl DesktopReader {
                 source: pdf_visual_source,
                 book_id: book_id.clone(),
                 need_toc,
+                need_page_roles: true,
                 missing: pdf_metadata_missing,
                 settings: plugin_settings.clone(),
             });
@@ -1801,12 +1951,43 @@ mod tests {
         FocusUnit, FollowUp, HashSet, Instant, MOTION_DURATION, Motion, MotionCurve,
         NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, SidebarTab, SnapshotEffects,
         TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState,
-        focus_scroll_duration, focus_unit_container_center_y, focus_unit_screen_center_y,
-        logical_dimension, resolve_book_display_metadata, resolved_focus_unit_index,
-        source_range_contains_anchor,
+        allowed_reading_mode, focus_block_paint_ranges, focus_scroll_duration,
+        focus_unit_container_center_y, focus_unit_geometry_ranges, focus_unit_screen_center_y,
+        focus_unit_scroll_bounds, focus_unit_target_offset_for_rect, logical_dimension,
+        resolve_book_display_metadata, resolved_focus_unit_index, source_range_contains_anchor,
     };
-    use rebook_publication::{SourceAnchor, SourceRange, SpineItemId};
+    use crate::plugins::PdfOcrViewMode;
+    use crate::preferences::ReadingMode;
+    use rebook_formats::BookFormat;
+    use rebook_publication::{
+        Block, BlockStyle, SourceAnchor, SourceRange, SpineItemId, TableBlock, TableCell, TableRow,
+        TextBlock, TextBlockKind,
+    };
     use rebook_reader::ReaderPosition;
+
+    #[test]
+    fn original_pdf_forces_classic_mode_until_ocr_reflow_is_active() {
+        assert_eq!(
+            allowed_reading_mode(
+                BookFormat::Pdf,
+                PdfOcrViewMode::Original,
+                ReadingMode::Focus
+            ),
+            ReadingMode::Classic
+        );
+        assert_eq!(
+            allowed_reading_mode(BookFormat::Pdf, PdfOcrViewMode::Reflow, ReadingMode::Focus),
+            ReadingMode::Focus
+        );
+        assert_eq!(
+            allowed_reading_mode(
+                BookFormat::Epub,
+                PdfOcrViewMode::Original,
+                ReadingMode::Focus
+            ),
+            ReadingMode::Focus
+        );
+    }
 
     #[test]
     fn logical_dimension_rejects_invalid_sizes_and_rounds_pixels() {
@@ -1849,6 +2030,84 @@ mod tests {
     }
 
     #[test]
+    fn table_focus_unit_uses_cell_ranges_for_layout_and_highlighting() {
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let range = |node: &str| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 8,
+            },
+        };
+        let table_range = range("table");
+        let first_cell = range("cell-1");
+        let second_cell = range("cell-2");
+        let cell = |source| TableCell {
+            text: TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: Vec::new(),
+                style: BlockStyle::default(),
+                source: Some(source),
+            },
+            column_span: 1,
+            row_span: 1,
+            header: false,
+        };
+        let block = Block::Table(TableBlock {
+            rows: vec![TableRow {
+                cells: vec![cell(first_cell.clone()), cell(second_cell.clone())],
+            }],
+            source: Some(table_range.clone()),
+        });
+
+        assert_eq!(
+            focus_block_paint_ranges(&block, &table_range),
+            vec![first_cell, second_cell]
+        );
+    }
+
+    #[test]
+    fn first_focus_unit_geometry_includes_leading_headings_without_highlighting_them() {
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let range = |node: &str| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 8,
+            },
+        };
+        let heading = range("heading");
+        let table_cell = range("cell");
+
+        assert_eq!(
+            focus_unit_geometry_ranges(
+                true,
+                std::slice::from_ref(&heading),
+                std::slice::from_ref(&table_cell),
+            ),
+            vec![heading, table_cell.clone()]
+        );
+        assert_eq!(
+            focus_unit_geometry_ranges(
+                false,
+                std::slice::from_ref(&range("later-heading")),
+                std::slice::from_ref(&table_cell),
+            ),
+            vec![table_cell]
+        );
+    }
+
+    #[test]
     fn heading_toc_anchor_selects_the_first_readable_unit_after_it() {
         let spine = SpineItemId::new("chapter-1").unwrap();
         let range = |node: &str| SourceRange {
@@ -1870,10 +2129,12 @@ mod tests {
         };
         let units = ["previous", "target"].map(|node| FocusUnit {
             range: range(node),
+            paint_ranges: vec![range(node)],
             text: node.into(),
             position: current,
             rect: egui::Rect::ZERO,
             is_image: false,
+            is_table: false,
         });
         let heading_anchor = SourceAnchor {
             spine,
@@ -1912,6 +2173,30 @@ mod tests {
         let tall = egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 360.0));
 
         assert!((focus_unit_container_center_y(tall) - tall.center().y).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn oversized_focus_units_start_at_the_top_and_expose_their_full_scroll_range() {
+        let table =
+            egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(1_200.0, 2_400.0));
+        let viewport_height = 800.0;
+        let padding = viewport_height * 0.5;
+
+        let (top, bottom) = focus_unit_scroll_bounds(table, viewport_height, padding);
+
+        assert!(
+            (focus_unit_target_offset_for_rect(table, viewport_height) - top).abs() < f32::EPSILON
+        );
+        assert!((top - 900.0).abs() < f32::EPSILON);
+        assert!((bottom - 2_500.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn focus_units_that_fit_the_viewport_remain_centered() {
+        let paragraph =
+            egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 180.0));
+
+        assert!((focus_unit_target_offset_for_rect(paragraph, 800.0) - 620.0).abs() < f32::EPSILON);
     }
 
     #[test]

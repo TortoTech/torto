@@ -12,6 +12,7 @@ use base64::Engine;
 use bytes::Bytes;
 use directories::ProjectDirs;
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
+use quick_xml::escape::unescape;
 use rebook_publication::{
     Book, BookSource, PublicationError, PublicationUrl, RasterResource, RenditionLayout, Resource,
     Section, SpineItem, SpineItemId, TableOfContentsOrigin, TocEntry,
@@ -32,6 +33,8 @@ const PDF_OCR_VERSION: u8 = 1;
 const PDF_OCR_DIRECTORY: &str = "pdf-ocr";
 const DOCUMENT_FILE: &str = "document.json";
 const VIEW_MODE_FILE: &str = "view-mode.json";
+const PAGE_ROLES_FILE: &str = "page-roles.json";
+const PAGE_ROLES_VERSION: u8 = 1;
 const PADDLE_JOB_FILE: &str = "paddle-job.json";
 const PADDLE_JOB_VERSION: u8 = 1;
 const PADDLE_PAGE_CHUNK_SIZE: usize = 100;
@@ -49,6 +52,28 @@ pub(crate) enum PdfOcrViewMode {
     #[default]
     Original,
     Reflow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PdfOcrPageRole {
+    Cover,
+    TitlePage,
+    BackCover,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PdfOcrPageRoleAssignment {
+    /// One-based physical PDF page.
+    pub(crate) physical_page: usize,
+    pub(crate) role: PdfOcrPageRole,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredPdfOcrPageRoles {
+    version: u8,
+    book_id: String,
+    roles: Vec<PdfOcrPageRoleAssignment>,
 }
 
 pub(crate) struct PdfOcrLoadedSource {
@@ -91,6 +116,10 @@ impl PdfOcrSourceController {
     pub(crate) fn set_mode(&self, mode: PdfOcrViewMode) {
         self.reflow_enabled
             .store(mode == PdfOcrViewMode::Reflow, Ordering::Release);
+    }
+
+    pub(crate) fn is_reflow_enabled(&self) -> bool {
+        self.reflow_enabled.load(Ordering::Acquire)
     }
 
     pub(crate) fn original_source(&self) -> Arc<dyn BookSource> {
@@ -159,6 +188,8 @@ struct StoredPdfOcrDocument {
     view_mode: PdfOcrViewMode,
     pages: Vec<StoredOcrPage>,
     resources: Vec<StoredOcrResource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    page_roles: Vec<PdfOcrPageRoleAssignment>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -251,6 +282,7 @@ struct OcrReflowBookSource {
     page_ranges: Vec<Range<usize>>,
     page_targets: Vec<PublicationUrl>,
     toc_anchors: Vec<Vec<OcrTocAnchor>>,
+    page_roles: HashMap<usize, PdfOcrPageRole>,
     resources: HashMap<String, StoredResourceLocation>,
 }
 
@@ -1356,10 +1388,7 @@ fn normalize_page_count(pages: &mut Vec<StoredOcrPage>, page_count: usize) {
         pages.truncate(page_count);
     }
     while pages.len() < page_count {
-        let page = pages.len() + 1;
-        pages.push(StoredOcrPage {
-            markdown: format!("## 第 {page} 页\n\n本页未识别到正文。"),
-        });
+        pages.push(StoredOcrPage::default());
     }
 }
 
@@ -1369,10 +1398,7 @@ fn normalize_page_range(pages: &mut Vec<StoredOcrPage>, start_page: usize, end_p
         pages.truncate(page_count);
     }
     while pages.len() < page_count {
-        let page = start_page.saturating_add(pages.len());
-        pages.push(StoredOcrPage {
-            markdown: format!("## 第 {page} 页\n\n本页未识别到正文。"),
-        });
+        pages.push(StoredOcrPage::default());
     }
 }
 
@@ -1400,10 +1426,51 @@ fn save_document(book_id: &str, parsed: ParsedOcrDocument) -> io::Result<()> {
         view_mode: PdfOcrViewMode::Reflow,
         pages: parsed.pages,
         resources,
+        page_roles: load_pdf_ocr_page_roles(book_id)?,
     };
     write_json_atomic(&directory.join(DOCUMENT_FILE), &document)?;
     write_json_atomic(&directory.join(VIEW_MODE_FILE), &PdfOcrViewMode::Reflow)?;
     crate::sync::mark_derived_dirty(book_id, crate::sync::DerivedDataKind::Ocr)
+}
+
+pub(crate) fn save_pdf_ocr_page_roles(
+    book_id: &str,
+    roles: &[PdfOcrPageRoleAssignment],
+) -> io::Result<()> {
+    let directory = book_directory(book_id)?;
+    fs::create_dir_all(&directory)?;
+    let mut roles = roles.to_vec();
+    roles.retain(|assignment| assignment.physical_page > 0);
+    roles.sort_unstable_by_key(|assignment| assignment.physical_page);
+    roles.dedup_by_key(|assignment| assignment.physical_page);
+    write_json_atomic(
+        &directory.join(PAGE_ROLES_FILE),
+        &StoredPdfOcrPageRoles {
+            version: PAGE_ROLES_VERSION,
+            book_id: book_id.to_owned(),
+            roles: roles.clone(),
+        },
+    )?;
+    if let Some(mut document) = load_document(book_id)? {
+        document.page_roles = roles;
+        write_json_atomic(&directory.join(DOCUMENT_FILE), &document)?;
+        crate::sync::mark_derived_dirty(book_id, crate::sync::DerivedDataKind::Ocr)?;
+    }
+    Ok(())
+}
+
+fn load_pdf_ocr_page_roles(book_id: &str) -> io::Result<Vec<PdfOcrPageRoleAssignment>> {
+    let bytes = match fs::read(book_directory(book_id)?.join(PAGE_ROLES_FILE)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let stored: StoredPdfOcrPageRoles = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if stored.version != PAGE_ROLES_VERSION || stored.book_id != book_id {
+        return Ok(Vec::new());
+    }
+    Ok(stored.roles)
 }
 
 pub(crate) fn export_pdf_ocr_sync_data(book_id: &str) -> io::Result<Option<PdfOcrSyncData>> {
@@ -1550,8 +1617,14 @@ fn book_directory(book_id: &str) -> io::Result<PathBuf> {
         .join(safe_id))
 }
 
-fn reflow_ocr_page_boundaries(pages: &mut [StoredOcrPage]) {
+fn reflow_ocr_page_boundaries(
+    pages: &mut [StoredOcrPage],
+    page_roles: &HashMap<usize, PdfOcrPageRole>,
+) {
     for index in 0..pages.len().saturating_sub(1) {
+        if page_roles.contains_key(&index) || page_roles.contains_key(&(index + 1)) {
+            continue;
+        }
         let mut current = markdown_blocks(&pages[index].markdown);
         let mut next = markdown_blocks(&pages[index + 1].markdown);
         let Some((tail, head)) = current.last().zip(next.first()) else {
@@ -1567,6 +1640,21 @@ fn reflow_ocr_page_boundaries(pages: &mut [StoredOcrPage]) {
         next.remove(0);
         pages[index].markdown = current.join("\n\n");
         pages[index + 1].markdown = next.join("\n\n");
+    }
+}
+
+fn remove_missing_ocr_page_placeholders(pages: &mut [StoredOcrPage]) {
+    static PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
+    let regex = PLACEHOLDER.get_or_init(|| {
+        Regex::new(
+            r"(?s)^\s*#{1,6}\s*第\s*\d+\s*页\s*本页(?:未识别到|尚未生成\s*OCR\s*)正文[。.]?\s*$",
+        )
+        .expect("missing OCR page placeholder regex should compile")
+    });
+    for page in pages {
+        if regex.is_match(&page.markdown) {
+            page.markdown.clear();
+        }
     }
 }
 
@@ -1663,9 +1751,20 @@ impl OcrReflowBookSource {
                 )
             })
             .collect();
+        let page_roles = document
+            .page_roles
+            .into_iter()
+            .filter_map(|assignment| {
+                assignment
+                    .physical_page
+                    .checked_sub(1)
+                    .map(|index| (index, assignment.role))
+            })
+            .collect::<HashMap<_, _>>();
         let mut pages = document.pages;
+        remove_missing_ocr_page_placeholders(&mut pages);
         if reflow_content {
-            reflow_ocr_page_boundaries(&mut pages);
+            reflow_ocr_page_boundaries(&mut pages, &page_roles);
         }
         let reflow_sections = if reflow_content {
             build_continuous_reflow_sections(&mut book, &pages, inner.table_of_contents_origin())?
@@ -1691,6 +1790,7 @@ impl OcrReflowBookSource {
             page_ranges: reflow_sections.page_ranges,
             page_targets: reflow_sections.page_targets,
             toc_anchors: reflow_sections.toc_anchors,
+            page_roles,
             resources,
         })
     }
@@ -1859,21 +1959,41 @@ impl BookSource for OcrReflowBookSource {
             .ok_or_else(|| PublicationError::ResourceNotFound(format!("section {index}")))?;
         let mut body = String::new();
         for page_index in range.clone() {
-            let markdown = self
-                .pages
-                .get(page_index)
-                .map_or("本页尚未生成 OCR 正文。", |page| {
-                    page.markdown.as_str()
-                });
             let _ = write!(
                 body,
                 r#"<div id="{PDF_PAGE_ANCHOR_PREFIX}{}"></div>"#,
                 page_index + 1
             );
-            body.push_str(&markdown_to_html_with_toc_anchors(
-                markdown,
-                self.toc_anchors.get(page_index).map_or(&[], Vec::as_slice),
-            ));
+            if self.page_roles.contains_key(&page_index) {
+                if let Ok(page) = self.inner.parse_section(page_index)
+                    && let Some(image) = page.blocks.iter().find_map(|block| match block {
+                        rebook_publication::Block::Image(image) => Some(image),
+                        rebook_publication::Block::Text(_)
+                        | rebook_publication::Block::Table(_)
+                        | rebook_publication::Block::Separator
+                        | rebook_publication::Block::PageBreak => None,
+                    })
+                {
+                    let _ = write!(
+                        body,
+                        r#"<img src="{}" alt="PDF page {}" style="display:block;max-width:100%;max-height:100%;margin:0 auto" />"#,
+                        format_args!("../{}", image.href.path()),
+                        page_index + 1
+                    );
+                }
+                body.push_str("<br />");
+                continue;
+            }
+            let markdown = self
+                .pages
+                .get(page_index)
+                .map_or("", |page| page.markdown.as_str());
+            if !markdown.trim().is_empty() {
+                body.push_str(&markdown_to_html_with_toc_anchors(
+                    markdown,
+                    self.toc_anchors.get(page_index).map_or(&[], Vec::as_slice),
+                ));
+            }
         }
         let document = format!(
             "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title></title><style>h1 {{ font-size: 1.75em; margin-top: 32px; margin-bottom: 12px; }} h2 {{ font-size: 1.5em; margin-top: 28px; margin-bottom: 10px; }} h3 {{ font-size: 1.28em; margin-top: 22px; margin-bottom: 8px; }} h4, h5, h6 {{ font-size: 1.12em; margin-top: 18px; margin-bottom: 6px; }}</style></head><body>{body}</body></html>"
@@ -2123,6 +2243,26 @@ fn escape_xml_text(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn decode_html_entities_once(value: &str) -> String {
+    static ENTITY: OnceLock<Regex> = OnceLock::new();
+    let regex = ENTITY.get_or_init(|| {
+        Regex::new(r"&(?:#[xX][0-9A-Fa-f]+|#[0-9]+|[A-Za-z][A-Za-z0-9]+);")
+            .expect("HTML entity regex should compile")
+    });
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    for entity in regex.find_iter(value) {
+        output.push_str(&value[cursor..entity.start()]);
+        match unescape(entity.as_str()) {
+            Ok(decoded) => output.push_str(&decoded),
+            Err(_) => output.push_str(entity.as_str()),
+        }
+        cursor = entity.end();
+    }
+    output.push_str(&value[cursor..]);
+    output
+}
+
 fn sanitize_ocr_html(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0;
@@ -2151,6 +2291,8 @@ fn sanitize_ocr_html(value: &str) -> String {
 }
 
 fn sanitize_ocr_html_text(value: &str) -> String {
+    let decoded = decode_html_entities_once(value);
+    let value = decoded.as_str();
     let bytes = value.as_bytes();
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0;
@@ -2301,7 +2443,9 @@ fn html_attribute(tag: &str, expected: &str) -> Option<String> {
             capture
                 .get(2)
                 .or_else(|| capture.get(3))
-                .map_or(String::new(), |value| value.as_str().to_owned())
+                .map_or(String::new(), |value| {
+                    decode_html_entities_once(value.as_str())
+                })
         })
     })
 }
@@ -2414,6 +2558,23 @@ fn value_as_usize(value: &Value) -> Option<usize> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_ocr_documents_default_to_no_special_page_roles() {
+        let document: StoredPdfOcrDocument = serde_json::from_value(json!({
+            "version": PDF_OCR_VERSION,
+            "book_id": "legacy",
+            "provider": "paddle-ocr",
+            "model": "legacy-model",
+            "view_mode": "reflow",
+            "pages": [{"markdown": "legacy OCR text"}],
+            "resources": []
+        }))
+        .unwrap();
+
+        assert!(document.page_roles.is_empty());
+        assert_eq!(document.pages[0].markdown, "legacy OCR text");
+    }
+
     struct StubBookSource {
         book: Book,
     }
@@ -2454,14 +2615,106 @@ mod tests {
             PdfOcrSourceController::new(original, reflow, Vec::new(), PdfOcrViewMode::Original);
 
         assert_eq!(source.book().metadata.layout, RenditionLayout::PrePaginated);
+        assert!(!source.is_reflow_enabled());
         source.set_mode(PdfOcrViewMode::Reflow);
         assert_eq!(source.book().metadata.layout, RenditionLayout::Reflowable);
+        assert!(source.is_reflow_enabled());
         assert_eq!(
             source.original_source().book().metadata.layout,
             RenditionLayout::PrePaginated
         );
         source.set_mode(PdfOcrViewMode::Original);
         assert_eq!(source.book().metadata.layout, RenditionLayout::PrePaginated);
+        assert!(!source.is_reflow_enabled());
+    }
+
+    #[test]
+    fn special_pdf_pages_render_the_original_page_image_instead_of_ocr_text() {
+        struct SpecialPageSource {
+            book: Book,
+        }
+
+        impl BookSource for SpecialPageSource {
+            fn book(&self) -> &Book {
+                &self.book
+            }
+
+            fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+                let descriptor = self.book.sections.get(index).ok_or_else(|| {
+                    PublicationError::ResourceNotFound(format!("section {index}"))
+                })?;
+                Ok(Section {
+                    id: descriptor.id.clone(),
+                    href: descriptor.href.clone(),
+                    blocks: vec![rebook_publication::Block::Image(
+                        rebook_publication::ImageBlock {
+                            href: PublicationUrl::parse("Pages/page-00001.png")?,
+                            alt: "PDF cover".into(),
+                            style: rebook_publication::ImageStyle::default(),
+                            source: None,
+                            text_layer: None,
+                        },
+                    )],
+                    anchors: Vec::new(),
+                })
+            }
+
+            fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+                Err(PublicationError::ResourceNotFound(href.to_string()))
+            }
+        }
+
+        let section = SpineItem {
+            id: SpineItemId::new("page-1").unwrap(),
+            href: PublicationUrl::parse("Text/page-1.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let source: Arc<dyn BookSource> = Arc::new(SpecialPageSource {
+            book: Book {
+                id: rebook_publication::PublicationId::new("special-page-test").unwrap(),
+                metadata: rebook_publication::Metadata {
+                    layout: RenditionLayout::PrePaginated,
+                    ..rebook_publication::Metadata::default()
+                },
+                cover: None,
+                sections: vec![section],
+                table_of_contents: Vec::new(),
+            },
+        });
+        let reflow = OcrReflowBookSource::new(
+            source,
+            StoredPdfOcrDocument {
+                version: PDF_OCR_VERSION,
+                book_id: "special-page-test".into(),
+                provider: PdfOcrProviderKind::PaddleOcr,
+                model: "test".into(),
+                view_mode: PdfOcrViewMode::Reflow,
+                pages: vec![StoredOcrPage {
+                    markdown: "OCR text must remain cached but hidden in reflow.".into(),
+                }],
+                resources: Vec::new(),
+                page_roles: vec![PdfOcrPageRoleAssignment {
+                    physical_page: 1,
+                    role: PdfOcrPageRole::Cover,
+                }],
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reflow.pages[0].markdown,
+            "OCR text must remain cached but hidden in reflow."
+        );
+        let parsed = reflow.parse_section(0).unwrap();
+        assert!(parsed.blocks.iter().any(|block| {
+            matches!(block, rebook_publication::Block::Image(image) if image.href.path() == "Pages/page-00001.png" && image.text_layer.is_none())
+        }));
+        assert!(!parsed.blocks.iter().any(|block| {
+            matches!(block, rebook_publication::Block::Text(text) if crate::plugins::text_block_text(text).contains("OCR text must remain cached"))
+        }));
     }
 
     #[test]
@@ -2480,11 +2733,67 @@ mod tests {
                 markdown: "# 新标题".into(),
             },
         ];
-        reflow_ocr_page_boundaries(&mut pages);
+        reflow_ocr_page_boundaries(&mut pages, &HashMap::new());
         assert_eq!(pages[0].markdown, "作为一个物理学研究生，我担任课程助教。");
         assert_eq!(pages[1].markdown, "下一段。");
         assert_eq!(pages[2].markdown, "完整句子。");
         assert_eq!(pages[3].markdown, "# 新标题");
+    }
+
+    #[test]
+    fn missing_ocr_page_placeholders_are_hidden_but_real_content_is_preserved() {
+        let mut pages = vec![
+            StoredOcrPage {
+                markdown: "## 第 7 页\n\n本页未识别到正文。".into(),
+            },
+            StoredOcrPage {
+                markdown: "## 第 9 页\n\n本页尚未生成 OCR 正文。".into(),
+            },
+            StoredOcrPage {
+                markdown: "正文中提到本页未识别到正文。".into(),
+            },
+        ];
+
+        remove_missing_ocr_page_placeholders(&mut pages);
+
+        assert!(pages[0].markdown.is_empty());
+        assert!(pages[1].markdown.is_empty());
+        assert_eq!(pages[2].markdown, "正文中提到本页未识别到正文。");
+    }
+
+    #[test]
+    fn html_entities_are_decoded_once_without_dropping_unknown_entities() {
+        assert_eq!(decode_html_entities_once("Newton&#x27;s"), "Newton's");
+        assert_eq!(decode_html_entities_once("A &amp; B"), "A & B");
+        assert_eq!(
+            decode_html_entities_once("&#39; &#x27; &nbsp;"),
+            "' ' \u{a0}"
+        );
+        assert_eq!(decode_html_entities_once("&unknown;"), "&unknown;");
+        assert_eq!(decode_html_entities_once("&amp;#x27;"), "&#x27;");
+    }
+
+    #[test]
+    fn ocr_html_table_text_decodes_character_entities() {
+        let html = markdown_to_html(
+            "<table><tr><th>Quantity</th></tr><tr><td>Newton&#x27;s constant &amp; value</td></tr></table>",
+        );
+
+        assert!(html.contains("Newton's constant &amp; value"), "{html}");
+        assert!(!html.contains("&amp;#x27;"), "{html}");
+    }
+
+    #[test]
+    fn ocr_markdown_text_and_tables_decode_character_entities() {
+        let html = markdown_to_html(
+            "# Newton&#x27;s laws\n\nA &amp; B\n\n| Name | Value |\n| --- | --- |\n| Newton&#39;s constant | 1&nbsp;unit |",
+        );
+
+        assert!(html.contains("Newton's laws"), "{html}");
+        assert!(html.contains("A &amp; B"), "{html}");
+        assert!(html.contains("Newton's constant"), "{html}");
+        assert!(html.contains("1\u{a0}unit"), "{html}");
+        assert!(!html.contains("&amp;#"), "{html}");
     }
 
     #[test]
@@ -2497,7 +2806,7 @@ mod tests {
                 markdown: "national example.\n\nAnother paragraph.".into(),
             },
         ];
-        reflow_ocr_page_boundaries(&mut pages);
+        reflow_ocr_page_boundaries(&mut pages, &HashMap::new());
         assert_eq!(pages[0].markdown, "An international example.");
         assert_eq!(pages[1].markdown, "Another paragraph.");
     }
@@ -2559,6 +2868,7 @@ mod tests {
                 })
                 .collect(),
                 resources: Vec::new(),
+                page_roles: Vec::new(),
             },
             true,
         )
@@ -2776,8 +3086,8 @@ mod tests {
         }];
         normalize_page_range(&mut pages, 101, 103);
         assert_eq!(pages.len(), 3);
-        assert!(pages[1].markdown.contains("第 102 页"));
-        assert!(pages[2].markdown.contains("第 103 页"));
+        assert!(pages[1].markdown.is_empty());
+        assert!(pages[2].markdown.is_empty());
     }
 
     #[test]
@@ -2845,6 +3155,7 @@ mod tests {
                     file_name: "figure.jpg".into(),
                     media_type: "application/octet-stream".into(),
                 }],
+                page_roles: Vec::new(),
             },
             false,
         )

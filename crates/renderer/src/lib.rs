@@ -52,6 +52,12 @@ pub struct PageDisplayList {
     background: Color,
     commands: Vec<DisplayCommand>,
     text_regions: Vec<TextRegion>,
+    table_regions: Vec<TableRegion>,
+}
+
+struct TableRegion {
+    bounds: Rect,
+    sources: Vec<SourceRange>,
 }
 
 impl PageDisplayList {
@@ -259,6 +265,20 @@ impl PageDisplayList {
             .collect()
     }
 
+    /// Resolves table cell source ranges to their complete table-chunk bounds.
+    pub fn source_table_bounds(&self, ranges: &[SourceRange]) -> Vec<Rect> {
+        self.table_regions
+            .iter()
+            .filter(|table| {
+                table
+                    .sources
+                    .iter()
+                    .any(|source| ranges.iter().any(|range| range == source))
+            })
+            .map(|table| table.bounds)
+            .collect()
+    }
+
     pub fn contains_source_anchor(&self, anchor: &SourceAnchor) -> bool {
         self.text_regions
             .iter()
@@ -342,6 +362,47 @@ impl PageDisplayList {
         let transform = Affine::translate((f64::from(offset_x), 0.0));
         for rect in self.source_rects(ranges) {
             scene.fill(Fill::NonZero, transform, color, None, &rect);
+        }
+    }
+
+    /// Paints block-level outlines for table chunks containing any requested source range.
+    pub fn paint_source_table_borders(
+        &self,
+        scene: &mut impl PaintScene,
+        ranges: &[SourceRange],
+        color: Color,
+        offset_x: f32,
+    ) {
+        let transform = Affine::translate((f64::from(offset_x), 0.0));
+        let first = ranges.first();
+        let last = ranges.last();
+        for table in &self.table_regions {
+            if table
+                .sources
+                .iter()
+                .any(|source| ranges.iter().any(|range| range == source))
+            {
+                let left = table.bounds.x0;
+                let top = table.bounds.y0;
+                let right = table.bounds.x1;
+                let bottom = table.bounds.y1;
+                let contains = |range: Option<&SourceRange>| {
+                    range.is_some_and(|range| table.sources.iter().any(|source| source == range))
+                };
+                let mut edges = vec![
+                    Line::new((left, top), (left, bottom)),
+                    Line::new((right, top), (right, bottom)),
+                ];
+                if contains(first) {
+                    edges.push(Line::new((left, top), (right, top)));
+                }
+                if contains(last) {
+                    edges.push(Line::new((left, bottom), (right, bottom)));
+                }
+                for edge in edges {
+                    scene.stroke(&Stroke::new(2.0), transform, color, None, &edge);
+                }
+            }
         }
     }
 
@@ -1035,6 +1096,7 @@ impl DisplayListCompiler {
             .reduce(f32::max);
         let mut commands = Vec::new();
         let mut text_regions = Vec::new();
+        let mut table_regions = Vec::new();
         for item in &page.items {
             match item {
                 PageItem::Text(text) => {
@@ -1044,6 +1106,9 @@ impl DisplayListCompiler {
                     compile_text_commands(&mut commands, text);
                 }
                 PageItem::Table(table) => {
+                    if let Some(region) = table_region(table) {
+                        table_regions.push(region);
+                    }
                     compile_table_commands(&mut commands, &mut text_regions, table);
                 }
                 PageItem::Image(image) => {
@@ -1116,8 +1181,30 @@ impl DisplayListCompiler {
             background: color(page.background),
             commands,
             text_regions,
+            table_regions,
         }
     }
+}
+
+fn table_region(table: &TablePlacement) -> Option<TableRegion> {
+    let bounds = table
+        .cells
+        .iter()
+        .map(|cell| {
+            Rect::new(
+                f64::from(cell.x),
+                f64::from(cell.y),
+                f64::from(cell.x + cell.width),
+                f64::from(cell.y + cell.height),
+            )
+        })
+        .reduce(|current, next| current.union(next))?;
+    let sources = table
+        .cells
+        .iter()
+        .filter_map(|cell| cell.text.as_ref()?.source.clone())
+        .collect();
+    Some(TableRegion { bounds, sources })
 }
 
 fn compile_table_commands(

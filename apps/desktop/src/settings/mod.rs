@@ -198,21 +198,23 @@ impl SettingsFeature {
                 preferences.selection_granularity = granularity;
             }
         }
-        if preferences.spread == self.applied.spread
+        let values_unchanged = preferences.spread == self.applied.spread
             && preferences.reading_mode == self.applied.reading_mode
             && preferences.theme == self.applied.theme
-            && preferences.selection_granularity == self.applied.selection_granularity
-        {
+            && preferences.selection_granularity == self.applied.selection_granularity;
+        if !reader_change_needs_apply(values_unchanged, layout_changed) {
             return Ok(());
         }
-        preferences::save_reader_preferences(&preferences).map_err(|error| {
-            format!(
-                "{}: {error}",
-                self.applied
-                    .language
-                    .text("保存阅读设置失败", "Failed to save reader settings")
-            )
-        })?;
+        if !values_unchanged {
+            preferences::save_reader_preferences(&preferences).map_err(|error| {
+                format!(
+                    "{}: {error}",
+                    self.applied
+                        .language
+                        .text("保存阅读设置失败", "Failed to save reader settings")
+                )
+            })?;
+        }
         self.applied.spread = preferences.spread;
         self.applied.reading_mode = preferences.reading_mode;
         self.applied.theme = preferences.theme;
@@ -297,6 +299,10 @@ impl SettingsFeature {
     }
 }
 
+const fn reader_change_needs_apply(values_unchanged: bool, layout_changed: bool) -> bool {
+    !values_unchanged || layout_changed
+}
+
 fn persist_settings(
     reader_preferences: &ReaderPreferences,
     plugin_settings: &PluginSettings,
@@ -359,4 +365,16 @@ enum UpdateCheckStatus {
     UpToDate,
     Available(String),
     Failed(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reader_change_needs_apply;
+
+    #[test]
+    fn repeated_layout_request_still_reapplies_the_active_reader() {
+        assert!(reader_change_needs_apply(true, true));
+        assert!(!reader_change_needs_apply(true, false));
+        assert!(reader_change_needs_apply(false, false));
+    }
 }
