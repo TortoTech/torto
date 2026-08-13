@@ -24,8 +24,74 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn focus_clicked_unit(&mut self, x: f32, y: f32) {
+        self.ui.focus_actions_visible = false;
+        self.focus_toc_override = None;
         if let Some(index) = self.focus_unit_at_canvas(x, y) {
             self.select_focus_unit(index);
+        }
+    }
+
+    pub(in crate::reader) fn current_focus_unit_is_image(&self) -> bool {
+        self.focus_units
+            .get(self.focus_unit_index)
+            .is_some_and(|unit| unit.is_image)
+    }
+
+    pub(in crate::reader) fn current_focus_note(&self) -> Option<String> {
+        let unit = self.focus_units.get(self.focus_unit_index)?;
+        self.highlights
+            .iter()
+            .find(|highlight| highlight.ranges.as_slice() == std::slice::from_ref(&unit.range))
+            .and_then(|highlight| highlight.note.clone())
+    }
+
+    pub(in crate::reader) fn create_focus_highlight(&mut self, note: Option<String>) {
+        let Some(unit) = self
+            .focus_units
+            .get(self.focus_unit_index)
+            .filter(|unit| !unit.is_image)
+            .cloned()
+        else {
+            return;
+        };
+        let note = note.and_then(|note| {
+            let note = note.trim().to_owned();
+            (!note.is_empty()).then_some(note)
+        });
+        if let Some(index) = self
+            .highlights
+            .iter()
+            .position(|highlight| highlight.ranges.as_slice() == std::slice::from_ref(&unit.range))
+        {
+            let Some(note) = note else {
+                return;
+            };
+            let mut highlight = self.highlights[index].clone();
+            highlight.note = Some(note);
+            match self.highlight_store.update(&highlight) {
+                Ok(true) => {
+                    self.highlights[index] = highlight;
+                    self.annotation_note_draft = None;
+                    self.bump_scene_revision();
+                    self.error = None;
+                }
+                Ok(false) => {
+                    self.error = Some("The annotation no longer exists".into());
+                }
+                Err(error) => self.error = Some(format!("Failed to save annotation: {error}")),
+            }
+            return;
+        }
+        let highlight =
+            StoredHighlight::with_note(self.book_id.clone(), vec![unit.range], unit.text, note);
+        match self.highlight_store.insert(&highlight) {
+            Ok(()) => {
+                self.highlights.insert(0, highlight);
+                self.annotation_note_draft = None;
+                self.bump_scene_revision();
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("Failed to save highlight: {error}")),
         }
     }
 

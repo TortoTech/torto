@@ -1230,6 +1230,22 @@ impl ReaderSession {
         })
     }
 
+    /// Resolves an authored URL fragment to its exact durable source anchor.
+    ///
+    /// Unlike [`Self::position_for_href`], this keeps paragraph-level precision
+    /// when multiple contents entries share one laid-out page.
+    pub fn source_anchor_for_href(&self, href: &PublicationUrl) -> Option<SourceAnchor> {
+        let section_index = self.section_index_for_href(href)?;
+        let fragment = href.fragment()?;
+        self.repository
+            .get(section_index)?
+            .fragments
+            .iter()
+            .flat_map(|content| &content.anchors)
+            .find(|anchor| anchor.fragment == fragment)
+            .map(|anchor| anchor.source.clone())
+    }
+
     /// Navigates to the beginning of a spine section.
     pub fn go_to_section(&mut self, index: usize) -> Result<NavigationResult, ReaderError> {
         self.poll_prefetch()?;
@@ -4233,7 +4249,10 @@ mod tests {
             },
             SectionAnchor {
                 fragment: "second".into(),
-                source: source_range.start,
+                source: SourceAnchor {
+                    text_offset: 1,
+                    ..source_range.start
+                },
             },
         ];
         source_mut.book.table_of_contents = vec![
@@ -4248,6 +4267,7 @@ mod tests {
                 children: Vec::new(),
             },
         ];
+        let second_anchor = source_mut.sections[0].anchors[1].source.clone();
         let mut reader =
             ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
 
@@ -4257,6 +4277,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.snapshot.active_toc_id.as_deref(), Some("0"));
+        assert_eq!(
+            reader
+                .source_anchor_for_href(&PublicationUrl::parse("section-0.xhtml#second").unwrap())
+                .as_ref(),
+            Some(&second_anchor)
+        );
     }
 
     #[test]

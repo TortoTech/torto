@@ -389,6 +389,7 @@ pub(super) struct DesktopReader {
     focus_unit_index: usize,
     focus_target_offset: Option<f32>,
     focus_anchor: Option<SourceAnchor>,
+    focus_toc_override: Option<String>,
     pending_page_turn: Option<PageDirection>,
     settings_requested: bool,
     settings_change_requested: Option<ReaderSettingsChange>,
@@ -447,6 +448,48 @@ struct FocusUnit {
     text: String,
     position: ReaderPosition,
     rect: egui::Rect,
+    is_image: bool,
+}
+
+fn block_source_range(block: &Block) -> Option<&SourceRange> {
+    match block {
+        Block::Text(block) => block.source.as_ref(),
+        Block::Table(table) => table.source.as_ref(),
+        Block::Image(image) => image.source.as_ref(),
+        Block::Separator | Block::PageBreak => None,
+    }
+}
+
+fn focus_anchor_block_index(blocks: &[Block], anchor: Option<&SourceAnchor>) -> Option<usize> {
+    let anchor = anchor?;
+    blocks.iter().position(|block| {
+        block_source_range(block).is_some_and(|range| source_range_contains_anchor(range, anchor))
+    })
+}
+
+fn resolved_focus_unit_index(
+    units: &[FocusUnit],
+    anchor: Option<&SourceAnchor>,
+    first_unit_after_anchor: Option<usize>,
+    current: ReaderPosition,
+) -> usize {
+    anchor
+        .and_then(|anchor| {
+            units
+                .iter()
+                .position(|unit| source_range_contains_anchor(&unit.range, anchor))
+        })
+        .or(first_unit_after_anchor)
+        .or_else(|| units.iter().position(|unit| unit.position == current))
+        .unwrap_or(0)
+}
+
+fn snapshot_position(snapshot: &ReaderSnapshot) -> ReaderPosition {
+    ReaderPosition {
+        section_index: snapshot.location.section_index,
+        segment_index: snapshot.location.segment_index,
+        page_index: snapshot.location.page_index,
+    }
 }
 
 fn source_range_contains_anchor(range: &SourceRange, anchor: &SourceAnchor) -> bool {
@@ -663,9 +706,12 @@ impl DesktopReader {
             self.focus_unit_index = 0;
             return;
         };
+        let focus_block_index =
+            focus_anchor_block_index(&section.blocks, self.focus_anchor.as_ref());
+        let mut first_unit_after_anchor = None;
         let mut units = Vec::new();
-        for block in &section.blocks {
-            let (range, text) = match block {
+        for (block_index, block) in section.blocks.iter().enumerate() {
+            let (range, text, is_image) = match block {
                 Block::Text(block) => {
                     if matches!(block.kind, TextBlockKind::Heading(_)) {
                         continue;
@@ -673,7 +719,7 @@ impl DesktopReader {
                     let Some(range) = block.source.clone() else {
                         continue;
                     };
-                    (range, crate::plugins::text_block_text(block))
+                    (range, crate::plugins::text_block_text(block), false)
                 }
                 Block::Table(table) => {
                     let Some(range) = table.source.clone() else {
@@ -686,7 +732,7 @@ impl DesktopReader {
                         .map(|cell| crate::plugins::text_block_text(&cell.text))
                         .collect::<Vec<_>>()
                         .join(" ");
-                    (range, text)
+                    (range, text, false)
                 }
                 Block::Image(image) => {
                     // Fixed-layout PDF pages are represented as images with a text
@@ -704,7 +750,7 @@ impl DesktopReader {
                     } else {
                         image.alt.clone()
                     };
-                    (range, text)
+                    (range, text, true)
                 }
                 Block::Separator | Block::PageBreak => continue,
             };
@@ -728,34 +774,34 @@ impl DesktopReader {
                     position.get_or_insert(page.position);
                 }
             }
-            if let (Some(rect), Some(position)) = (bounds, position) {
-                units.push(FocusUnit {
-                    range,
-                    text,
-                    position,
-                    rect,
-                });
+            let (Some(rect), Some(position)) = (bounds, position) else {
+                continue;
+            };
+            if first_unit_after_anchor.is_none()
+                && focus_block_index.is_some_and(|target| block_index >= target)
+            {
+                first_unit_after_anchor = Some(units.len());
             }
+            units.push(FocusUnit {
+                range,
+                text,
+                position,
+                rect,
+                is_image,
+            });
         }
-        let current = ReaderPosition {
-            section_index: self.snapshot.location.section_index,
-            segment_index: self.snapshot.location.segment_index,
-            page_index: self.snapshot.location.page_index,
-        };
-        self.focus_unit_index = self
-            .focus_anchor
-            .as_ref()
-            .and_then(|anchor| {
-                units
-                    .iter()
-                    .position(|unit| source_range_contains_anchor(&unit.range, anchor))
-            })
-            .or_else(|| units.iter().position(|unit| unit.position == current))
-            .unwrap_or(0);
+        let current = snapshot_position(&self.snapshot);
+        self.focus_unit_index = resolved_focus_unit_index(
+            &units,
+            self.focus_anchor.as_ref(),
+            first_unit_after_anchor,
+            current,
+        );
         self.focus_anchor = units
             .get(self.focus_unit_index)
             .map(|unit| unit.range.start.clone());
         self.focus_units = units;
+        self.sync_focus_selected_image();
         self.bump_scene_revision();
     }
 
@@ -780,11 +826,13 @@ impl DesktopReader {
         if index == self.focus_unit_index || index >= self.focus_units.len() {
             return;
         }
+        self.focus_toc_override = None;
         self.focus_unit_index = index;
         self.focus_anchor = self
             .focus_units
             .get(index)
             .map(|unit| unit.range.start.clone());
+        self.sync_focus_selected_image();
         if let Some(target) = self
             .scroll_viewport
             .and_then(|viewport| self.focus_unit_target_offset(viewport.size.y))
@@ -809,6 +857,38 @@ impl DesktopReader {
         self.persist_progress();
     }
 
+    fn sync_focus_selected_image(&mut self) {
+        let Some(unit) = self
+            .focus_units
+            .get(self.focus_unit_index)
+            .filter(|unit| unit.is_image)
+            .cloned()
+        else {
+            self.selected_image = None;
+            return;
+        };
+        let Some(layout) = self.scroll_section.as_ref() else {
+            self.selected_image = None;
+            return;
+        };
+        let Some(page_index) = layout
+            .pages
+            .iter()
+            .position(|page| page.position == unit.position)
+        else {
+            self.selected_image = None;
+            return;
+        };
+        let page_y =
+            unit.rect.center().y - layout.page_tops[page_index] + layout.page_origins[page_index];
+        self.selected_image = self
+            .reader
+            .image_at_page(unit.position, unit.rect.center().x, page_y)
+            .ok()
+            .flatten()
+            .and_then(|image| SelectedImage::from_reader_image(&image, true).ok());
+    }
+
     fn scroll_page_coordinates(&self, x: f32, y: f32) -> Option<(ReaderPosition, f32, f32)> {
         let viewport = self.scroll_viewport?;
         let layout = self.scroll_section.as_ref()?;
@@ -826,10 +906,15 @@ impl DesktopReader {
             self.bump_scene_revision();
         }
 
-        let visible_position = self.scroll_section.as_ref().and_then(|layout| {
-            let padding = self.scroll_content_padding(viewport.size.y);
-            layout.first_visible_page((viewport.offset_y - padding).max(0.0))
-        });
+        let visible_position = if self.is_focus_mode() {
+            self.focus_units
+                .get(self.focus_unit_index)
+                .map(|unit| unit.position)
+        } else {
+            self.scroll_section
+                .as_ref()
+                .and_then(|layout| layout.first_visible_page(viewport.offset_y.max(0.0)))
+        };
         let current = ReaderPosition {
             section_index: self.snapshot.location.section_index,
             segment_index: self.snapshot.location.segment_index,
@@ -1409,6 +1494,7 @@ struct ReaderUiState {
     expanded_toc: HashSet<String>,
     last_auto_scrolled_toc: Option<String>,
     focus_chat_minimized: bool,
+    focus_actions_visible: bool,
 }
 
 impl ReaderUiState {
@@ -1652,6 +1738,7 @@ impl DesktopReader {
                 expanded_toc,
                 last_auto_scrolled_toc: None,
                 focus_chat_minimized: false,
+                focus_actions_visible: false,
             },
             plugin_settings,
             language,
@@ -1670,6 +1757,7 @@ impl DesktopReader {
             focus_unit_index: 0,
             focus_target_offset: None,
             focus_anchor: None,
+            focus_toc_override: None,
             pending_page_turn: None,
             settings_requested: false,
             settings_change_requested: None,
@@ -1710,13 +1798,15 @@ mod tests {
     use super::navigation::snapshot_reanchors_focus;
     use super::{
         BookDisplayMetadata, Duration, FOCUS_SCROLL_MAX_DURATION, FOCUS_SCROLL_MIN_DURATION,
-        FollowUp, HashSet, Instant, MOTION_DURATION, Motion, MotionCurve,
+        FocusUnit, FollowUp, HashSet, Instant, MOTION_DURATION, Motion, MotionCurve,
         NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, SidebarTab, SnapshotEffects,
         TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState,
         focus_scroll_duration, focus_unit_container_center_y, focus_unit_screen_center_y,
-        logical_dimension, resolve_book_display_metadata, source_range_contains_anchor,
+        logical_dimension, resolve_book_display_metadata, resolved_focus_unit_index,
+        source_range_contains_anchor,
     };
     use rebook_publication::{SourceAnchor, SourceRange, SpineItemId};
+    use rebook_reader::ReaderPosition;
 
     #[test]
     fn logical_dimension_rejects_invalid_sizes_and_rounds_pixels() {
@@ -1756,6 +1846,45 @@ mod tests {
 
         assert!(source_range_contains_anchor(&range, &at_start));
         assert!(!source_range_contains_anchor(&range, &at_end));
+    }
+
+    #[test]
+    fn heading_toc_anchor_selects_the_first_readable_unit_after_it() {
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let range = |node: &str| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 8,
+            },
+        };
+        let current = ReaderPosition {
+            section_index: 0,
+            segment_index: 0,
+            page_index: 0,
+        };
+        let units = ["previous", "target"].map(|node| FocusUnit {
+            range: range(node),
+            text: node.into(),
+            position: current,
+            rect: egui::Rect::ZERO,
+            is_image: false,
+        });
+        let heading_anchor = SourceAnchor {
+            spine,
+            node: "heading".into(),
+            text_offset: 0,
+        };
+
+        assert_eq!(
+            resolved_focus_unit_index(&units, Some(&heading_anchor), Some(1), current),
+            1
+        );
     }
 
     #[test]
@@ -1891,6 +2020,7 @@ mod tests {
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
             focus_chat_minimized: false,
+            focus_actions_visible: false,
         };
 
         ui.reveal_toolbar(now);
@@ -1927,6 +2057,7 @@ mod tests {
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
             focus_chat_minimized: false,
+            focus_actions_visible: false,
         };
 
         assert!(ui.set_toolbar_hovered(true, now));

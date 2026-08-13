@@ -364,6 +364,7 @@ impl DesktopReader {
             self.floating_sidebar(&ctx, sidebar_progress);
         }
         if self.is_focus_mode() {
+            self.focus_actions_overlay(&ctx, page_rect);
             self.focus_assistant_overlay(&ctx, page_rect);
         }
         self.resize_side_panels(
@@ -374,7 +375,9 @@ impl DesktopReader {
         );
         self.menu(&ctx);
         self.selected_image_overlay(&ctx, page_rect);
-        self.selection_actions(&ctx, page_rect);
+        if !self.is_focus_mode() {
+            self.selection_actions(&ctx, page_rect);
+        }
         self.image_preview_overlay(&ctx);
         self.feedback(&ctx);
         self.pdf_toc_review(&ctx);
@@ -631,12 +634,25 @@ impl DesktopReader {
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
         if self.is_focus_mode()
             && !interaction_blocked
+            && self.ui.focus_actions_visible
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.ui.focus_actions_visible = false;
+            self.annotation_note_draft = None;
+            ctx.memory_mut(egui::Memory::stop_text_input);
+            return;
+        }
+        if self.is_focus_mode()
+            && !interaction_blocked
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
             && self.ui.assistant_panel.is_some()
         {
             self.ui.focus_chat_minimized = true;
             self.close_assistant_panel();
             ctx.memory_mut(egui::Memory::stop_text_input);
+            return;
+        }
+        if self.focus_action_shortcut(ctx, interaction_blocked) {
             return;
         }
         let open_search = !interaction_blocked
@@ -661,9 +677,9 @@ impl DesktopReader {
         }
         if self.is_focus_mode() {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
-                self.attach_current_focus_reference();
                 self.ui.focus_chat_minimized = false;
-                self.open_assistant_panel(AssistantPanel::Chat);
+                self.ui.focus_actions_visible = true;
+                self.cancel_text_selection();
                 return;
             }
             let previous_unit = ctx.input(|input| input.key_pressed(egui::Key::ArrowUp));
@@ -705,6 +721,42 @@ impl DesktopReader {
         if next {
             self.turn_page(PageDirection::Next);
         }
+    }
+
+    fn focus_action_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
+        if !self.is_focus_mode()
+            || interaction_blocked
+            || !self.ui.focus_actions_visible
+            || self.annotation_note_draft.is_some()
+            || ctx.egui_wants_keyboard_input()
+        {
+            return false;
+        }
+        let action = ctx.input_mut(|input| {
+            [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3]
+                .into_iter()
+                .position(|key| input.consume_key(egui::Modifiers::NONE, key))
+        });
+        match action {
+            Some(0) => {
+                self.ui.focus_actions_visible = false;
+                self.attach_current_focus_reference();
+                self.open_assistant_panel(AssistantPanel::Chat);
+            }
+            Some(1) if !self.current_focus_unit_is_image() => {
+                self.ui.focus_actions_visible = false;
+                self.create_focus_highlight(None);
+            }
+            Some(2) if !self.current_focus_unit_is_image() => {
+                self.annotation_note_draft = Some(AnnotationDraft {
+                    note: self.current_focus_note().unwrap_or_default(),
+                    focus_pending: true,
+                });
+            }
+            Some(_) => {}
+            None => return false,
+        }
+        true
     }
 
     fn focus_wheel_interaction(&mut self, response: &egui::Response) {
@@ -1211,6 +1263,100 @@ impl DesktopReader {
         }
     }
 
+    fn focus_actions_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
+        if !self.ui.focus_actions_visible {
+            return;
+        }
+        let viewport = ctx.content_rect();
+        let anchor_y = self
+            .focused_unit_screen_center_y(page_rect)
+            .unwrap_or_else(|| page_rect.center().y);
+        let style = self.reader.style();
+        let content_right = page_rect.left()
+            + reading_content_left(page_rect.width(), &style)
+            + reading_content_width(page_rect.width(), &style);
+        let note_open = self.annotation_note_draft.is_some();
+        let width = if note_open { 338.0 } else { 40.0 };
+        let x = (content_right + 12.0).min((viewport.right() - width - 12.0).max(12.0));
+        let y = if note_open {
+            (anchor_y - 62.0).clamp(
+                viewport.top() + 12.0,
+                (viewport.bottom() - 150.0).max(viewport.top() + 12.0),
+            )
+        } else {
+            (anchor_y - 64.0).clamp(viewport.top() + 12.0, viewport.bottom() - 140.0)
+        };
+        let mut chat = false;
+        let mut highlight = false;
+        let mut open_note = false;
+        let mut save_note = false;
+        let mut cancel_note = false;
+        let can_annotate = !self.current_focus_unit_is_image();
+        let area = egui::Area::new("focus-actions".into())
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::new(x, y))
+            .show(ctx, |ui| {
+                if let Some(draft) = self.annotation_note_draft.as_mut() {
+                    selection_popover_frame(12).show(ui, |ui| {
+                        match annotation_editor(ui, draft, self.language) {
+                            AnnotationEditorAction::None => {}
+                            AnnotationEditorAction::Save => save_note = true,
+                            AnnotationEditorAction::Cancel => cancel_note = true,
+                        }
+                    });
+                } else {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        chat = icon_button(ui, Icon::MessageCircle)
+                            .on_hover_text(self.language.text("聊天（1）", "Chat (1)"))
+                            .clicked();
+                        ui.add_enabled_ui(can_annotate, |ui| {
+                            highlight = icon_button(ui, Icon::Highlighter)
+                                .on_hover_text(self.language.text("高亮（2）", "Highlight (2)"))
+                                .clicked();
+                            open_note = icon_button(ui, Icon::MessageSquarePlus)
+                                .on_hover_text(self.language.text("添加批注（3）", "Add note (3)"))
+                                .clicked();
+                        });
+                    });
+                }
+            });
+        if chat {
+            self.ui.focus_actions_visible = false;
+            self.attach_current_focus_reference();
+            self.open_assistant_panel(AssistantPanel::Chat);
+        } else if highlight {
+            self.ui.focus_actions_visible = false;
+            self.create_focus_highlight(None);
+        } else if open_note {
+            self.annotation_note_draft = Some(AnnotationDraft {
+                note: self.current_focus_note().unwrap_or_default(),
+                focus_pending: true,
+            });
+        } else if save_note {
+            let note = self
+                .annotation_note_draft
+                .as_ref()
+                .map(|draft| draft.note.clone());
+            self.ui.focus_actions_visible = false;
+            self.create_focus_highlight(note);
+        } else if cancel_note {
+            self.annotation_note_draft = None;
+        }
+        let clicked_outside = ctx.input(|input| {
+            input.pointer.any_click()
+                && input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|position| !area.response.rect.contains(position))
+        });
+        if clicked_outside {
+            self.ui.focus_actions_visible = false;
+            self.annotation_note_draft = None;
+            ctx.memory_mut(egui::Memory::stop_text_input);
+        }
+    }
+
     fn focus_assistant_dialog(&mut self, ui: &mut egui::Ui, has_conversation: bool) {
         let busy = self.chat.task.is_pending();
         if has_conversation {
@@ -1375,7 +1521,7 @@ impl DesktopReader {
                 self.toggle_toc(&row.id);
             }
             if navigate && let Some(target) = row.target {
-                self.go_to(&target);
+                self.go_to_toc(&row.id, &target);
                 navigated_row = Some(visible_index);
             }
         }
@@ -2331,7 +2477,9 @@ impl DesktopReader {
                             };
                             self.request_settings_change(ReaderSettingsChange::Theme(theme));
                         }
-                        self.selection_mode_menu(ui);
+                        if !self.is_focus_mode() {
+                            self.selection_mode_menu(ui);
+                        }
                     });
             });
         let clicked_outside = self.ui.overlay == ReaderOverlay::Menu
@@ -2508,13 +2656,13 @@ impl DesktopReader {
         let x = position.x - response.rect.min.x;
         let y = position.y - response.rect.min.y;
         self.image_long_press_interaction(response, x, y);
-        if response.drag_started() {
+        if !self.is_focus_mode() && response.drag_started() {
             self.begin_text_selection(x, y);
         }
-        if response.dragged() {
+        if !self.is_focus_mode() && response.dragged() {
             self.update_text_selection(x, y);
         }
-        if response.drag_stopped() {
+        if !self.is_focus_mode() && response.drag_stopped() {
             // `drag_delta()` is zero on egui's release frame. A
             // `drag_stopped` response has already crossed the drag threshold,
             // so treating it as moved preserves the completed selection.
@@ -2529,6 +2677,11 @@ impl DesktopReader {
                 return;
             }
             if self.try_open_image_preview(&response.ctx, x, y) {
+                return;
+            }
+            if self.is_focus_mode() {
+                self.cancel_text_selection();
+                self.focus_clicked_unit(x, y);
                 return;
             }
             self.finish_text_selection(x, y, false);
@@ -2578,7 +2731,7 @@ impl DesktopReader {
             else {
                 unreachable!("ready long-press state must contain a candidate");
             };
-            match selected_image(&candidate.image, candidate.scroll_mode) {
+            match SelectedImage::from_reader_image(&candidate.image, candidate.scroll_mode) {
                 Ok(image) => {
                     self.cancel_text_selection();
                     self.selected_image = Some(image);
@@ -2754,20 +2907,17 @@ impl DesktopReader {
             return;
         }
 
-        let accent = palette().accent;
-        let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 64);
-        let stroke = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 190);
+        let stroke = palette().accent;
         let painter = ctx
             .layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
                 egui::Id::new("reader-selected-image"),
             ))
             .with_clip_rect(page_rect);
-        painter.rect_filled(bounds, 2.0, fill);
         painter.rect_stroke(
             bounds,
             2.0,
-            egui::Stroke::new(1.0, stroke),
+            egui::Stroke::new(2.0, stroke),
             egui::StrokeKind::Inside,
         );
     }
@@ -3670,33 +3820,41 @@ fn preview_wheel_delta(input: &egui::InputState) -> f32 {
         .sum()
 }
 
-fn selected_image(image: &ReaderImage, scroll_mode: bool) -> Result<SelectedImage, &'static str> {
-    let (Ok(width), Ok(height)) = (usize::try_from(image.width), usize::try_from(image.height))
-    else {
-        return Err("Image dimensions exceed the clipboard limit");
-    };
-    let Some(byte_len) = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-    else {
-        return Err("Image dimensions exceed the clipboard limit");
-    };
-    if width == 0 || height == 0 || image.pixels.len() < byte_len {
-        return Err("Image data is incomplete and cannot be copied");
-    }
-    if image.display_width <= 0.0 || image.display_height <= 0.0 {
-        return Err("Image has invalid display bounds");
-    }
+impl SelectedImage {
+    pub(super) fn from_reader_image(
+        image: &ReaderImage,
+        scroll_mode: bool,
+    ) -> Result<Self, &'static str> {
+        let (Ok(width), Ok(height)) = (usize::try_from(image.width), usize::try_from(image.height))
+        else {
+            return Err("Image dimensions exceed the clipboard limit");
+        };
+        let Some(byte_len) = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            return Err("Image dimensions exceed the clipboard limit");
+        };
+        if width == 0 || height == 0 || image.pixels.len() < byte_len {
+            return Err("Image data is incomplete and cannot be copied");
+        }
+        if image.display_width <= 0.0 || image.display_height <= 0.0 {
+            return Err("Image has invalid display bounds");
+        }
 
-    Ok(SelectedImage {
-        image: egui::ColorImage::from_rgba_unmultiplied([width, height], &image.pixels[..byte_len]),
-        position: image.position,
-        bounds: Rect::from_min_size(
-            Pos2::new(image.x, image.y),
-            Vec2::new(image.display_width, image.display_height),
-        ),
-        scroll_mode,
-    })
+        Ok(Self {
+            image: egui::ColorImage::from_rgba_unmultiplied(
+                [width, height],
+                &image.pixels[..byte_len],
+            ),
+            position: image.position,
+            bounds: Rect::from_min_size(
+                Pos2::new(image.x, image.y),
+                Vec2::new(image.display_width, image.display_height),
+            ),
+            scroll_mode,
+        })
+    }
 }
 
 fn consume_copy_shortcut(input: &mut egui::InputState) -> bool {
@@ -4235,7 +4393,7 @@ mod reference_suggestion_label_tests {
             pixels: std::sync::Arc::from([255, 0, 0, 255, 0, 255, 0, 255]),
         };
 
-        let selected = selected_image(&image, true).expect("valid image");
+        let selected = SelectedImage::from_reader_image(&image, true).expect("valid image");
 
         assert_eq!(selected.image.size, [2, 1]);
         assert_eq!(selected.bounds.min, Pos2::new(24.0, 36.0));

@@ -12,17 +12,39 @@ pub(super) const fn snapshot_reanchors_focus(effects: SnapshotEffects) -> bool {
 }
 
 impl DesktopReader {
-    pub(in crate::reader) fn go_to(&mut self, target: &PublicationUrl) {
+    pub(in crate::reader) fn go_to_toc(&mut self, id: &str, target: &PublicationUrl) {
         let result = self.reader.go_to_href(target);
         match result {
             Ok(result) => {
+                let focus_anchor = self.reader.source_anchor_for_href(target);
                 self.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
+                if self.is_focus_mode() {
+                    self.focus_toc_override = Some(id.to_owned());
+                    if let Some(item) = self.reader.toc_items().iter().find(|item| item.id == id) {
+                        self.snapshot.active_toc_id = Some(item.id.clone());
+                        self.snapshot.active_toc_path.clone_from(&item.ancestors);
+                        if item.has_children {
+                            self.snapshot.active_toc_path.push(item.id.clone());
+                        }
+                    }
+                    self.focus_anchor = focus_anchor.or_else(|| {
+                        self.reader
+                            .current_page()
+                            .leading_source_range()
+                            .map(|range| range.start.clone())
+                    });
+                    self.focus_units.clear();
+                    self.focus_unit_index = 0;
+                    self.focus_target_offset = None;
+                    self.ui.focus_scroll_motion = None;
+                }
             }
             Err(error) => self.error = Some(format!("目录跳转失败：{error}")),
         }
     }
 
     pub(in crate::reader) fn go_to_adjacent_section(&mut self, direction: PageDirection) {
+        self.focus_toc_override = None;
         let current = self.snapshot.location.section_index;
         let target = match direction {
             PageDirection::Previous => current.checked_sub(1),
@@ -82,6 +104,15 @@ impl DesktopReader {
             .expanded_toc
             .extend(snapshot.active_toc_path.iter().cloned());
         self.snapshot = snapshot;
+        if let Some(id) = self.focus_toc_override.as_deref()
+            && let Some(item) = self.reader.toc_items().iter().find(|item| item.id == id)
+        {
+            self.snapshot.active_toc_id = Some(item.id.clone());
+            self.snapshot.active_toc_path.clone_from(&item.ancestors);
+            if item.has_children {
+                self.snapshot.active_toc_path.push(item.id.clone());
+            }
+        }
     }
 
     pub(in crate::reader) fn apply_snapshot(
@@ -89,6 +120,7 @@ impl DesktopReader {
         snapshot: ReaderSnapshot,
         effects: SnapshotEffects,
     ) {
+        self.focus_toc_override = None;
         let previous_section = self.snapshot.location.section_index;
         let target_position = rebook_reader::ReaderPosition {
             section_index: snapshot.location.section_index,
@@ -128,6 +160,7 @@ impl DesktopReader {
             self.scroll_viewport = None;
         }
         self.selection_toolbar_visible = false;
+        self.ui.focus_actions_visible = false;
         self.annotation_note_draft = None;
         self.selection_anchor = None;
         self.selection = None;

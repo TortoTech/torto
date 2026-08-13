@@ -89,8 +89,8 @@ impl ReaderTypography {
         normalize_family(&mut self.serif_font, &defaults.serif_font);
         normalize_family(&mut self.sans_serif_font, &defaults.sans_serif_font);
         normalize_family(&mut self.monospace_font, &defaults.monospace_font);
-        self.minimum_font_size = finite_clamp(self.minimum_font_size, 1.0, 120.0, 8.0);
-        self.font_size = finite_clamp(self.font_size, self.minimum_font_size, 120.0, 16.0);
+        self.minimum_font_size = finite_clamp(self.minimum_font_size, 1.0, 120.0, 12.0);
+        self.font_size = finite_clamp(self.font_size, self.minimum_font_size, 120.0, 20.0);
         self.font_weight = self.font_weight.clamp(100, 900).div_ceil(100) * 100;
     }
 
@@ -167,8 +167,8 @@ impl Default for ReaderTypography {
             serif_font: "Bitter".into(),
             sans_serif_font: "Roboto".into(),
             monospace_font: "Consolas".into(),
-            font_size: 16.0,
-            minimum_font_size: 8.0,
+            font_size: 20.0,
+            minimum_font_size: 12.0,
             font_weight: 400,
         }
     }
@@ -1568,8 +1568,8 @@ mod tests {
         assert_eq!(typography.serif_font, "Bitter");
         assert_eq!(typography.sans_serif_font, "Roboto");
         assert_eq!(typography.monospace_font, "Consolas");
-        assert!((typography.font_size - 16.0).abs() < f32::EPSILON);
-        assert!((typography.minimum_font_size - 8.0).abs() < f32::EPSILON);
+        assert!((typography.font_size - 20.0).abs() < f32::EPSILON);
+        assert!((typography.minimum_font_size - 12.0).abs() < f32::EPSILON);
         assert_eq!(typography.font_weight, 400);
         assert!(typography.serif_stack().contains("\"Bitter\""));
         assert!(typography.serif_stack().contains("\"SimSun\""));
@@ -1600,7 +1600,7 @@ mod tests {
         assert_eq!(typography.serif_font, "Georgia");
         assert_eq!(typography.sans_serif_font, "Roboto");
         assert_eq!(typography.monospace_font, "Consolas");
-        assert!((typography.font_size - 16.0).abs() < f32::EPSILON);
+        assert!((typography.font_size - 20.0).abs() < f32::EPSILON);
         assert!((typography.minimum_font_size - 1.0).abs() < f32::EPSILON);
         assert_eq!(typography.font_weight, 500);
     }

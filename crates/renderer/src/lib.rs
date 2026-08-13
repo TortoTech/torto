@@ -345,20 +345,6 @@ impl PageDisplayList {
         }
     }
 
-    /// Paints translucent marks over source-backed block images.
-    pub fn paint_image_source_ranges(
-        &self,
-        scene: &mut impl PaintScene,
-        ranges: &[SourceRange],
-        color: Color,
-        offset_x: f32,
-    ) {
-        let transform = Affine::translate((f64::from(offset_x), 0.0));
-        for rect in self.image_source_rects(ranges) {
-            scene.fill(Fill::NonZero, transform, color, None, &rect);
-        }
-    }
-
     fn paint_background_with_transform(&self, scene: &mut impl PaintScene, transform: Affine) {
         scene.fill(
             Fill::NonZero,

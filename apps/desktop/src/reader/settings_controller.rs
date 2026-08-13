@@ -139,6 +139,9 @@ impl DesktopReader {
                     );
                     self.close_assistant_panel();
                     self.ui.focus_chat_minimized = false;
+                    self.ui.focus_actions_visible = false;
+                    self.focus_toc_override = None;
+                    self.cancel_text_selection();
                 }
                 self.sync_settings.clone_from(&settings.sync_settings);
                 self.sync_password.clone_from(&settings.sync_password);

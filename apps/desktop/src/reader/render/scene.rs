@@ -210,12 +210,6 @@ impl DesktopReader {
                 TEXT_SELECTION_COLOR,
                 offset_x,
             );
-            page.paint_image_source_ranges(
-                scene,
-                std::slice::from_ref(&unit.range),
-                TEXT_SELECTION_COLOR,
-                offset_x,
-            );
         }
     }
 
