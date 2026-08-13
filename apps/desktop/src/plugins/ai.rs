@@ -614,7 +614,7 @@ async fn translate_block_batch(
             json!({
                 "role": "system",
                 "content": format!(
-                    "你是一名专业图书翻译。请把输入 JSON 对象中的每个值翻译为{target_language}，忠实保留原文语气、专有名词与段落结构。文本中的 <sup>...</sup> 和 <sub>...</sub> 是上标、下标结构标记，必须连同其中的内容原样保留在对应语义位置，不得翻译、删除或拆分这些标记。{fixed_page_hint}只返回一个 JSON 对象，必须保留完全相同的键，每个值只能是对应译文字符串。"
+                    "你是一名专业图书翻译。请把输入 JSON 对象中的每个值翻译为{target_language}，忠实保留原文语气、专有名词与段落结构。每个 JSON 值都是独立正文块：原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时则保持相同类型。文本中的 <sup>...</sup> 和 <sub>...</sub> 是上标、下标结构标记，必须连同其中的内容原样保留在对应语义位置，不得翻译、删除或拆分这些标记。{fixed_page_hint}只返回一个 JSON 对象，必须保留完全相同的键，每个值只能是对应译文字符串。"
                 ),
             }),
             json!({ "role": "user", "content": Value::Object(input.clone()).to_string() }),
@@ -643,7 +643,7 @@ async fn translate_block_batch(
                     .map(|(block, text)| BlockTranslation {
                         block_index: block.block_index,
                         segment_index: block.segment_index,
-                        text,
+                        text: preserve_leading_list_marker(&block.text, &text),
                     })
                     .collect());
             }
@@ -673,6 +673,54 @@ fn translation_batches(
         batches.push(current);
     }
     batches
+}
+
+fn preserve_leading_list_marker(source: &str, translation: &str) -> String {
+    let source_marker = leading_list_marker(source);
+    let translation_marker = leading_list_marker(translation);
+    match (source_marker, translation_marker) {
+        (None, Some((_, end))) => translation[end..].trim_start().to_owned(),
+        (Some((source, _)), Some((translated, end))) if source != translated => {
+            format!("{source} {}", translation[end..].trim_start())
+        }
+        _ => translation.to_owned(),
+    }
+}
+
+fn leading_list_marker(text: &str) -> Option<(&str, usize)> {
+    let trimmed = text.trim_start();
+    let leading_bytes = text.len() - trimmed.len();
+    let symbol = trimmed.chars().next()?;
+    if matches!(symbol, '•' | '·' | '●' | '○' | '▪' | '‣' | '◦' | '∙') {
+        let end = leading_bytes + symbol.len_utf8();
+        return Some((&text[leading_bytes..end], end));
+    }
+    if matches!(symbol, '-' | '*' | '+')
+        && trimmed[symbol.len_utf8()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    {
+        let end = leading_bytes + symbol.len_utf8();
+        return Some((&text[leading_bytes..end], end));
+    }
+    let token_end = trimmed
+        .char_indices()
+        .take_while(|(_, character)| !character.is_whitespace())
+        .map(|(index, character)| index + character.len_utf8())
+        .last()?;
+    let token = &trimmed[..token_end];
+    let body = token
+        .strip_suffix('.')
+        .or_else(|| token.strip_suffix('、'))
+        .or_else(|| token.strip_suffix(')'))
+        .or_else(|| token.strip_suffix('）'))?;
+    (!body.is_empty()
+        && body.chars().count() <= 6
+        && body
+            .chars()
+            .all(|character| character.is_ascii_digit() || character.is_ascii_alphabetic()))
+    .then_some((token, leading_bytes + token_end))
 }
 
 fn parse_translation_object(content: &str, keys: &[String]) -> Result<Vec<String>, String> {
@@ -2571,6 +2619,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, vec!["第一段", "第二段"]);
+    }
+
+    #[test]
+    fn translation_does_not_invent_list_markers_for_plain_blocks() {
+        assert_eq!(
+            preserve_leading_list_marker("In addition, research varies.", "• 此外，研究各不相同。"),
+            "此外，研究各不相同。"
+        );
+        assert_eq!(
+            preserve_leading_list_marker("It is also vital.", "1. 这一点也至关重要。"),
+            "这一点也至关重要。"
+        );
+        assert_eq!(
+            preserve_leading_list_marker("- Original item", "• 原始项目"),
+            "- 原始项目"
+        );
+        assert_eq!(
+            preserve_leading_list_marker("• Level of detail", "• 细节层次"),
+            "• 细节层次"
+        );
     }
 
     #[test]
