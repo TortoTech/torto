@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyrender::{Glyph, NormalizedCoord, PaintScene};
 use kurbo::{Affine, Line, Rect, Stroke, Vec2};
 use parley::editing::{Cursor, Selection};
-use parley::layout::{Affinity, Cluster, ClusterSide};
+use parley::layout::{Affinity, BreakReason, Cluster, ClusterSide};
 use parley::{FontData, Layout, PositionedLayoutItem};
 use peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
 use rebook_layout::{
@@ -575,31 +575,61 @@ impl ShapedTextRegion {
                 // https://github.com/linebender/parley/issues/396
                 if let Some(line) = self.layout.get(line_index) {
                     let line_text = line.text_range();
-                    if selected_text.start <= line_text.start && selected_text.end >= line_text.end
+                    // Synthetic list markers precede `source_text_start` and are
+                    // intentionally not selectable. A source-backed selection that
+                    // starts at the first real character still covers the complete
+                    // visual first line, so ignore the marker-only byte prefix when
+                    // deciding whether the line should receive full-width geometry.
+                    let selectable_line_start = line_text.start.max(self.source_text_start);
+                    if selected_text.start <= selectable_line_start
+                        && selected_text.end >= line_text.end
                     {
-                        let text_advance = line
-                            .runs()
-                            .map(|run| {
-                                run.visual_clusters()
-                                    .map(|cluster| cluster.advance())
-                                    .sum::<f32>()
-                            })
-                            .sum::<f32>();
-                        let inline_box_advance = line
-                            .items()
-                            .filter_map(|item| match item {
-                                PositionedLayoutItem::InlineBox(inline_box) => {
-                                    Some(inline_box.width)
-                                }
-                                PositionedLayoutItem::GlyphRun(_) => None,
-                            })
-                            .sum::<f32>();
                         let visual_start =
                             f64::from(line.metrics().offset + line.metrics().inline_min_coord);
-                        let visual_end =
-                            visual_start + f64::from(text_advance + inline_box_advance);
-                        x0 = x0.min(visual_start.min(visual_end));
-                        x1 = x1.max(visual_start.max(visual_end));
+                        let soft_wrapped = line.break_reason() == BreakReason::Regular;
+                        let visual_end = if soft_wrapped {
+                            // A soft-wrapped line occupies the full paragraph measure,
+                            // even when an unbreakable Latin word leaves visible space at
+                            // its end. Keep the final/explicit line content-sized, but make
+                            // every wrapped line's active highlight share one right edge.
+                            // `inline_max_coord` is already expressed in the line's
+                            // paragraph coordinate space. A hanging indent is carried
+                            // separately by `offset`; adding it here a second time makes
+                            // list highlights protrude past the paragraph's right edge.
+                            f64::from(line.metrics().inline_max_coord)
+                        } else {
+                            let text_advance = line
+                                .runs()
+                                .map(|run| {
+                                    run.visual_clusters()
+                                        .map(|cluster| cluster.advance())
+                                        .sum::<f32>()
+                                })
+                                .sum::<f32>();
+                            let inline_box_advance = line
+                                .items()
+                                .filter_map(|item| match item {
+                                    PositionedLayoutItem::InlineBox(inline_box) => {
+                                        Some(inline_box.width)
+                                    }
+                                    PositionedLayoutItem::GlyphRun(_) => None,
+                                })
+                                .sum::<f32>();
+                            visual_start + f64::from(text_advance + inline_box_advance)
+                        };
+                        if soft_wrapped {
+                            // The first list line may start with a synthetic marker
+                            // before `source_text_start`. Keep Parley's source-backed
+                            // selection start so the marker is not highlighted; only
+                            // extend the right edge to the shared wrapped-line limit.
+                            if line_text.start >= self.source_text_start {
+                                x0 = visual_start.min(visual_end);
+                            }
+                            x1 = visual_start.max(visual_end);
+                        } else {
+                            x0 = x0.min(visual_start.min(visual_end));
+                            x1 = x1.max(visual_start.max(visual_end));
+                        }
                     }
                 }
 
@@ -1517,7 +1547,7 @@ mod tests {
                     .sum::<f32>();
                 (visual_advance > line.metrics().advance + 1.0).then_some((
                     line.metrics().block_min_coord,
-                    line.metrics().offset + line.metrics().inline_min_coord + visual_advance,
+                    line.metrics().offset + line.metrics().inline_max_coord,
                 ))
             })
             .expect("the fixture should contain a justified middle line");
@@ -1564,6 +1594,178 @@ mod tests {
             .expect("the justified line should have selection geometry");
 
         assert!((rect.x1 - f64::from(expected_right + origin_x)).abs() < 0.01);
+    }
+
+    #[test]
+    fn hanging_indent_highlight_aligns_first_and_continuation_line_right_edges() {
+        let text: Arc<str> =
+            "•\u{00a0}alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu".into();
+        let mut font_context = FontContext::new();
+        let mut layout_context = LayoutContext::new();
+        let mut builder =
+            layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
+        builder.push_default(StyleProperty::FontSize(18.0));
+        builder.push_default(StyleProperty::Brush(TextBrush {
+            color: Rgba::BLACK,
+            underline: false,
+        }));
+        let mut layout = builder.build(text.as_ref());
+        layout.set_text_indent(
+            18.0,
+            parley::IndentOptions {
+                hanging: true,
+                ..parley::IndentOptions::default()
+            },
+        );
+        layout.break_all_lines(Some(150.0));
+        layout.align(Alignment::Justify, AlignmentOptions::default());
+        let first = layout.get(0).expect("fixture should have a first line");
+        let continuation = layout.get(1).expect("fixture should wrap");
+        let expected_right = continuation.metrics().inline_max_coord;
+        let first_y = first.metrics().block_min_coord;
+        let continuation_y = continuation.metrics().block_min_coord;
+
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "list-item".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "list-item".into(),
+                text_offset: u64::try_from(text.chars().count()).unwrap(),
+            },
+        };
+        let line_count = layout.len();
+        let page = PageLayout {
+            viewport: LayoutViewport::new(240, 240).unwrap(),
+            background: Rgba::BLACK,
+            items: vec![PageItem::Text(TextPlacement {
+                layout: Arc::new(layout),
+                text: Arc::clone(&text),
+                source_text_start: "•\u{00a0}".len(),
+                lines: 0..line_count,
+                origin_x: 24.0,
+                origin_y: 24.0,
+                source: Some(source),
+                inline_images: Arc::from([]),
+            })],
+        };
+        let fragment = DisplayListCompiler
+            .compile(&page)
+            .selection_fragment(0, "•\u{00a0}".len()..text.len())
+            .unwrap();
+        let first_rect = fragment
+            .rects
+            .iter()
+            .find(|rect| (rect.y0 - f64::from(first_y + 24.0)).abs() < 0.01)
+            .unwrap();
+        let continuation_rect = fragment
+            .rects
+            .iter()
+            .find(|rect| (rect.y0 - f64::from(continuation_y + 24.0)).abs() < 0.01)
+            .unwrap();
+        assert!((first_rect.x1 - f64::from(expected_right + 24.0)).abs() < 0.01);
+        assert!(
+            first_rect.x0 > 24.0,
+            "synthetic list marker must remain outside the source-backed highlight"
+        );
+        assert!((continuation_rect.x1 - f64::from(expected_right + 24.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn wrapped_mixed_text_uses_line_width_while_the_last_line_stays_content_sized() {
+        let text: Arc<str> =
+            "中文 FitText mixed content with several English words and 中文结尾".into();
+        let mut font_context = FontContext::new();
+        let mut layout_context = LayoutContext::new();
+        let mut builder =
+            layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
+        builder.push_default(StyleProperty::FontSize(18.0));
+        builder.push_default(StyleProperty::Brush(TextBrush {
+            color: Rgba::BLACK,
+            underline: false,
+        }));
+        let mut layout = builder.build(text.as_ref());
+        layout.break_all_lines(Some(180.0));
+        layout.align(Alignment::Justify, AlignmentOptions::default());
+        assert!(layout.len() >= 2);
+
+        let first = layout.get(0).unwrap();
+        let last = layout.get(layout.len() - 1).unwrap();
+        assert!(matches!(first.break_reason(), BreakReason::Regular));
+        assert_eq!(last.break_reason(), BreakReason::None);
+        let expected_wrapped_right = first.metrics().offset + first.metrics().inline_max_coord;
+        let last_content_right = last.metrics().offset
+            + last.metrics().inline_min_coord
+            + last
+                .runs()
+                .map(|run| {
+                    run.visual_clusters()
+                        .map(|cluster| cluster.advance())
+                        .sum::<f32>()
+                })
+                .sum::<f32>();
+        let expected_last_limit = last.metrics().inline_max_coord;
+
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "mixed-paragraph".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "mixed-paragraph".into(),
+                text_offset: u64::try_from(text.chars().count()).unwrap(),
+            },
+        };
+        let first_y = first.metrics().block_min_coord;
+        let last_y = last.metrics().block_min_coord;
+        let line_count = layout.len();
+        let origin_x = 24.0;
+        let origin_y = 24.0;
+        let page = PageLayout {
+            viewport: LayoutViewport::new(320, 300).unwrap(),
+            background: Rgba::BLACK,
+            items: vec![PageItem::Text(TextPlacement {
+                layout: Arc::new(layout),
+                text: Arc::clone(&text),
+                source_text_start: 0,
+                lines: 0..line_count,
+                origin_x,
+                origin_y,
+                source: Some(source),
+                inline_images: Arc::from([]),
+            })],
+        };
+
+        let fragment = DisplayListCompiler
+            .compile(&page)
+            .selection_fragment(0, 0..text.len())
+            .unwrap();
+        let wrapped_rect = fragment
+            .rects
+            .iter()
+            .find(|rect| (rect.y0 - f64::from(first_y + origin_y)).abs() < 0.01)
+            .unwrap();
+        let last_rect = fragment
+            .rects
+            .iter()
+            .find(|rect| (rect.y0 - f64::from(last_y + origin_y)).abs() < 0.01)
+            .unwrap();
+
+        assert!(
+            (wrapped_rect.x1 - f64::from(expected_wrapped_right + origin_x)).abs() < 0.01,
+            "wrapped right={} expected={}",
+            wrapped_rect.x1,
+            expected_wrapped_right + origin_x
+        );
+        assert!((last_rect.x1 - f64::from(last_content_right + origin_x)).abs() < 0.01);
+        assert!(last_rect.x1 < f64::from(expected_last_limit + origin_x));
     }
 
     #[test]

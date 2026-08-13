@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use image::ImageError;
 use parley::{
-    Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight,
+    Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight, IndentOptions,
     InlineBox as ParleyInlineBox, InlineBoxKind, Layout, LayoutContext, LineHeight, StyleProperty,
 };
 use rebook_publication::{
@@ -702,13 +702,14 @@ impl LayoutEngine {
         }
 
         let mut layout = builder.build(&text);
+        self.apply_list_indent(
+            &mut layout,
+            block.kind,
+            &text[..source_text_start],
+            typography,
+        );
         layout.break_all_lines(Some(available_width));
-        let alignment = match block.style.align {
-            TextAlignment::Start => Alignment::Start,
-            TextAlignment::Center => Alignment::Center,
-            TextAlignment::End => Alignment::End,
-            TextAlignment::Justify => Alignment::Justify,
-        };
+        let alignment = text_alignment(block.style.align);
         layout.align(alignment, AlignmentOptions::default());
         PreparedText {
             layout: Arc::new(layout),
@@ -726,6 +727,40 @@ impl LayoutEngine {
                 .collect::<Vec<_>>()
                 .into(),
         }
+    }
+
+    fn measure_list_marker_width(
+        &mut self,
+        marker: &str,
+        font_stack: &str,
+        typography: &ReaderTypography,
+    ) -> f32 {
+        let mut builder =
+            self.layout_context
+                .ranged_builder(&mut self.font_context, marker, 1.0, false);
+        builder.push_default(StyleProperty::FontFamily(FontFamily::from(font_stack)));
+        builder.push_default(StyleProperty::FontSize(typography.font_size));
+        builder.push_default(StyleProperty::FontWeight(FontWeight::new(f32::from(
+            typography.font_weight,
+        ))));
+        let mut layout = builder.build(marker);
+        layout.break_all_lines(None);
+        layout.full_width()
+    }
+
+    fn apply_list_indent(
+        &mut self,
+        layout: &mut Layout<TextBrush>,
+        kind: TextBlockKind,
+        marker: &str,
+        typography: &ReaderTypography,
+    ) {
+        if marker.is_empty() {
+            return;
+        }
+        let font_stack = typography.default_stack();
+        let marker_width = self.measure_list_marker_width(marker, &font_stack, typography);
+        apply_list_hanging_indent(layout, kind, marker_width);
     }
 
     fn shape_fixed_page_replacement(
@@ -750,6 +785,34 @@ impl LayoutEngine {
                 .clamp(5.0, style.typography.font_size - 0.5);
             style.typography.font_size = next_size;
         }
+    }
+}
+
+fn apply_list_hanging_indent(
+    layout: &mut Layout<TextBrush>,
+    kind: TextBlockKind,
+    marker_width: f32,
+) {
+    let TextBlockKind::ListItem { .. } = kind else {
+        return;
+    };
+    // Keep wrapped list-item lines aligned with the text after the marker. The
+    // marker remains in the leading area while continuation lines are indented.
+    layout.set_text_indent(
+        marker_width,
+        IndentOptions {
+            hanging: true,
+            ..IndentOptions::default()
+        },
+    );
+}
+
+fn text_alignment(alignment: TextAlignment) -> Alignment {
+    match alignment {
+        TextAlignment::Start => Alignment::Start,
+        TextAlignment::Center => Alignment::Center,
+        TextAlignment::End => Alignment::End,
+        TextAlignment::Justify => Alignment::Justify,
     }
 }
 
@@ -958,8 +1021,8 @@ fn prepare_inline_content(
         TextBlockKind::ListItem {
             ordered: true,
             ordinal,
-        } => format!("{ordinal}. "),
-        TextBlockKind::ListItem { ordered: false, .. } => "• ".to_owned(),
+        } => format!("{ordinal}.\u{00a0}"),
+        TextBlockKind::ListItem { ordered: false, .. } => "•\u{00a0}".to_owned(),
         _ => String::new(),
     };
     if !prefix.is_empty() {
@@ -1674,6 +1737,34 @@ mod tests {
 
         assert_eq!(geometry.visible_pages, 2);
         assert!((geometry.continuation_offset_x - geometry.width).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn wrapped_list_items_use_the_full_marker_advance_as_hanging_indent() {
+        let block = TextBlock {
+            kind: TextBlockKind::ListItem {
+                ordered: false,
+                ordinal: 1,
+            },
+            content: vec![Inline::Text(TextRun {
+                text: "Create hierarchy. Type embodies what you want to say with your design, and it creates and supports your website structure.".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        let mut engine = LayoutEngine::new();
+        let prepared =
+            engine.shape_text_with_min_width(&block, &ReaderStyle::default(), 320.0, 40.0);
+        assert!(prepared.layout.len() > 1);
+        let marker_width = engine.measure_list_marker_width(
+            "•\u{00a0}",
+            &ReaderStyle::default().typography.default_stack(),
+            &ReaderStyle::default().typography,
+        );
+        let continuation_x = prepared.layout.get(1).unwrap().metrics().offset;
+        assert!((continuation_x - marker_width).abs() < 0.01);
     }
     use rebook_publication::{
         Book, FixedPageTextReplacement, FixedPageTextReplacementSegment, FixedPageTextSpan,

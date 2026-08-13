@@ -79,13 +79,13 @@ Parley 会把两端对齐产生的额外空白宽度加入字簇 advance，但 `
 
 ### 当前规避方案
 
-对于被完整选择的行，渲染器根据调整后的字簇和行内盒重新计算实际视觉宽度，并扩展 Parley 返回的选区矩形。首尾部分选择和非两端对齐文本仍沿用 Parley 原始几何。
+对于被完整选择的行，渲染器根据换行原因修正 Parley 返回的选区矩形：普通自动换行直接使用正文行宽，段落末行、显式换行及超长内容产生的紧急换行仍按调整后的字簇和行内盒计算实际文字宽度。首尾部分选择和非两端对齐文本仍沿用 Parley 原始几何。
 
 ### 升级检查
 
 1. 确认上游问题已关闭，并找到修复进入的 Parley 版本。
 2. 升级依赖后临时移除 `selection_rects` 中带上游链接的兼容逻辑。
-3. 运行 `cargo test --locked -p rebook-renderer selection_covers_the_visual_width_of_justified_middle_lines`。
+3. 运行 `cargo test --locked -p rebook-renderer selection_covers_the_visual_width_of_justified_middle_lines` 和 `cargo test --locked -p rebook-renderer wrapped_mixed_text_uses_line_width_while_the_last_line_stays_content_sized`。
 4. 使用包含长英文两端对齐段落的真实 EPUB 检查跨行选择。
 5. 全部通过后删除兼容逻辑，并删除本条记录。
 

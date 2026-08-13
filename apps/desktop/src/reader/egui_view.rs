@@ -655,6 +655,22 @@ impl DesktopReader {
         if self.focus_action_shortcut(ctx, interaction_blocked) {
             return;
         }
+        // Tab is the focus-mode action-menu shortcut, even if a previously visible
+        // TextEdit still owns egui's keyboard focus. Handling it before the generic
+        // keyboard-focus guard avoids intermittent failures after closing an editor.
+        if self.is_focus_mode()
+            && !interaction_blocked
+            && !self.ui.overlay_visible()
+            && self.image_preview.is_none()
+            && self.annotation_note_draft.is_none()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+        {
+            self.ui.focus_chat_minimized = false;
+            self.ui.focus_actions_visible = true;
+            self.cancel_text_selection();
+            ctx.memory_mut(egui::Memory::stop_text_input);
+            return;
+        }
         let open_search = !interaction_blocked
             && !self.ui.overlay_visible()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F));
@@ -662,8 +678,11 @@ impl DesktopReader {
             self.open_search();
             return;
         }
+        let visible_focus_editor = self.is_focus_mode()
+            && (self.ui.assistant_panel.is_some() || self.annotation_note_draft.is_some());
         if interaction_blocked
-            || ctx.egui_wants_keyboard_input()
+            || (ctx.egui_wants_keyboard_input()
+                && (!self.is_focus_mode() || visible_focus_editor || self.ui.sidebar_open))
             || self.ui.overlay_visible()
             || self.image_preview.is_some()
         {
@@ -676,12 +695,6 @@ impl DesktopReader {
             return;
         }
         if self.is_focus_mode() {
-            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
-                self.ui.focus_chat_minimized = false;
-                self.ui.focus_actions_visible = true;
-                self.cancel_text_selection();
-                return;
-            }
             let previous_unit = ctx.input(|input| input.key_pressed(egui::Key::ArrowUp));
             let next_unit = ctx.input(|input| input.key_pressed(egui::Key::ArrowDown));
             let previous_section = ctx.input(|input| input.key_pressed(egui::Key::ArrowLeft));
@@ -728,7 +741,6 @@ impl DesktopReader {
             || interaction_blocked
             || !self.ui.focus_actions_visible
             || self.annotation_note_draft.is_some()
-            || ctx.egui_wants_keyboard_input()
         {
             return false;
         }
