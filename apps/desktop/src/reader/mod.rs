@@ -436,6 +436,7 @@ struct SelectedImage {
 
 struct ScrollSectionLayout {
     section_index: usize,
+    reading_unit_index: usize,
     pages: Vec<ReaderSectionPage>,
     page_tops: Vec<f32>,
     page_origins: Vec<f32>,
@@ -614,11 +615,14 @@ impl ScrollSectionLayout {
     fn new(
         section_index: usize,
         section_count: usize,
+        reading_unit_index: usize,
+        reading_unit_count: usize,
         pages: Vec<ReaderSectionPage>,
         preserve_physical_pages: bool,
     ) -> Self {
-        let has_previous = section_index > 0;
-        let has_next = section_index + 1 < section_count;
+        let has_previous = reading_unit_index > 0 || section_index > 0;
+        let has_next =
+            reading_unit_index + 1 < reading_unit_count || section_index + 1 < section_count;
         let mut cursor = if has_previous {
             SCROLL_PREVIOUS_REGION_HEIGHT
         } else {
@@ -630,19 +634,21 @@ impl ScrollSectionLayout {
         for (index, entry) in pages.iter().enumerate() {
             let logical_height = entry.page.height() as f32;
             let content_top = entry
-                .page
-                .content_top()
+                .visible_top
+                .or_else(|| entry.page.content_top())
                 .unwrap_or(0.0)
                 .clamp(0.0, logical_height);
             let content_bottom = entry
-                .page
-                .content_bottom()
+                .visible_bottom
+                .or_else(|| entry.page.content_bottom())
                 .unwrap_or(logical_height)
                 .clamp(content_top, logical_height);
-            let page_origin = if preserve_physical_pages || index == 0 {
+            let page_origin = if preserve_physical_pages {
                 0.0
-            } else {
+            } else if entry.visible_top.is_some() || index > 0 {
                 content_top
+            } else {
+                0.0
             };
             let page_height = if preserve_physical_pages {
                 logical_height
@@ -674,6 +680,7 @@ impl ScrollSectionLayout {
         });
         Self {
             section_index,
+            reading_unit_index,
             pages,
             page_tops,
             page_origins,
@@ -769,17 +776,21 @@ impl DesktopReader {
         &mut self,
     ) -> Result<Arc<ScrollSectionLayout>, rebook_reader::ReaderError> {
         let section_index = self.snapshot.location.section_index;
+        let reading_unit = self.reader.reading_unit_location();
         if let Some(layout) = &self.scroll_section
             && layout.section_index == section_index
+            && layout.reading_unit_index == reading_unit.index
         {
             return Ok(Arc::clone(layout));
         }
-        let pages = self.reader.current_section_pages()?;
+        let pages = self.reader.current_reading_unit_pages()?;
         let preserve_physical_pages =
             self.format == BookFormat::Pdf && self.pdf_ocr.mode == PdfOcrViewMode::Original;
         let layout = Arc::new(ScrollSectionLayout::new(
             section_index,
             self.reader.section_count(),
+            reading_unit.index,
+            reading_unit.count,
             pages,
             preserve_physical_pages,
         ));
@@ -797,12 +808,19 @@ impl DesktopReader {
             self.focus_unit_index = 0;
             return;
         };
+        let reading_ranges = self
+            .reader
+            .current_reading_unit_source_ranges()
+            .unwrap_or_default();
         let focus_block_index =
             focus_anchor_block_index(&section.blocks, self.focus_anchor.as_ref());
         let mut first_unit_after_anchor = None;
         let mut leading_heading_ranges = Vec::new();
         let mut units = Vec::new();
         for (block_index, block) in section.blocks.iter().enumerate() {
+            if block_source_range(block).is_some_and(|range| !reading_ranges.contains(range)) {
+                continue;
+            }
             let (range, paint_ranges, text, is_image, is_table) = match block {
                 Block::Text(block) => {
                     if matches!(block.kind, TextBlockKind::Heading(_)) {
@@ -961,9 +979,17 @@ impl DesktopReader {
         if self.focus_units.is_empty() {
             return;
         }
+        let at_boundary = match direction {
+            PageDirection::Previous => self.focus_unit_index == 0,
+            PageDirection::Next => self.focus_unit_index + 1 >= self.focus_units.len(),
+        };
+        if at_boundary {
+            self.go_to_adjacent_section(direction);
+            return;
+        }
         let next = match direction {
-            PageDirection::Previous => self.focus_unit_index.saturating_sub(1),
-            PageDirection::Next => (self.focus_unit_index + 1).min(self.focus_units.len() - 1),
+            PageDirection::Previous => self.focus_unit_index - 1,
+            PageDirection::Next => self.focus_unit_index + 1,
         };
         self.select_focus_unit(next);
     }

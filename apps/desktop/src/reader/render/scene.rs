@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use kurbo::Affine;
+use kurbo::{Affine, Rect};
 use peniko::Color;
 use rebook_formats::BookFormat;
 use rebook_reader::ReaderSectionPage;
@@ -99,10 +99,18 @@ impl DesktopReader {
             }
             let layers = self.scroll_page_layers(entry);
             let mut page_scene = Scene::new();
+            let clip = Rect::new(
+                0.0,
+                f64::from(layout.page_origins[index]),
+                f64::from(entry.page.width()),
+                f64::from(layout.page_origins[index] + layout.page_heights[index]),
+            );
+            page_scene.push_clip_layer(peniko::Fill::NonZero, Affine::IDENTITY, &clip);
             page_scene.append(&layers.underlay, None);
             self.paint_page_overlays(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
             page_scene.append(&layers.content, None);
             self.paint_focus_table_border(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
+            page_scene.pop_layer();
             scene.append(
                 &page_scene,
                 Some(Affine::translate((

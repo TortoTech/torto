@@ -12,7 +12,7 @@ use parley::{
 use rebook_publication::{
     Block, BookSource, FixedPageTextLayer, FixedPageTextRect, ImageStyle, Inline, MathRun,
     PublicationError, PublicationUrl, RenditionLayout, Rgba, Section, SourceRange, TableBlock,
-    TextAlignment, TextBlock, TextBlockKind, TextRun, TextStyle,
+    TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -255,6 +255,17 @@ fn quote_font_family(family: &str) -> String {
 pub struct TextBrush {
     pub color: Rgba,
     pub underline: bool,
+    pub baseline: TextBaseline,
+}
+
+impl TextBrush {
+    fn new(color: Rgba, underline: bool, baseline: TextBaseline) -> Self {
+        Self {
+            color,
+            underline,
+            baseline,
+        }
+    }
 }
 
 /// Shared font bytes registered in both the native reader and the Xilem UI.
@@ -656,20 +667,19 @@ impl LayoutEngine {
         builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(
             block.style.line_height,
         )));
-        builder.push_default(StyleProperty::Brush(TextBrush {
-            color: reader_style.foreground,
-            underline: false,
-        }));
+        let default_brush = TextBrush::new(reader_style.foreground, false, TextBaseline::Normal);
+        builder.push_default(StyleProperty::Brush(default_brush));
 
         for span in spans {
             let size = (typography.font_size * span.style.size_scale.clamp(0.5, 3.0))
                 .max(typography.minimum_font_size);
             builder.push(StyleProperty::FontSize(size), span.range.clone());
             builder.push(
-                StyleProperty::Brush(TextBrush {
-                    color: span.style.color,
-                    underline: span.style.underline,
-                }),
+                StyleProperty::Brush(TextBrush::new(
+                    span.style.color,
+                    span.style.underline,
+                    span.style.baseline,
+                )),
                 span.range.clone(),
             );
             if span.style.bold {

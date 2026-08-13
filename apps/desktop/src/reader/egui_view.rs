@@ -487,7 +487,8 @@ impl DesktopReader {
                 }
             }
 
-            if !self.is_focus_mode() && layout.section_index > 0 {
+            if !self.is_focus_mode() && (layout.reading_unit_index > 0 || layout.section_index > 0)
+            {
                 let left = content_rect.left()
                     + scroll_chapter_content_left(
                         &layout,
@@ -503,7 +504,7 @@ impl DesktopReader {
                     .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                         ui.style_mut().spacing.button_padding.x = 0.0;
                         ui.add(
-                            egui::Button::new(self.language.text("上一章", "Previous chapter"))
+                            egui::Button::new(self.language.text("上一小节", "Previous section"))
                                 .frame(false)
                                 .min_size(Vec2::new(0.0, rect.height())),
                         )
@@ -522,7 +523,7 @@ impl DesktopReader {
                 next_clicked = ui
                     .put(
                         rect,
-                        egui::Button::new(self.language.text("下一章", "Next chapter")),
+                        egui::Button::new(self.language.text("下一小节", "Next section")),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked();

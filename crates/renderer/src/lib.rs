@@ -12,7 +12,7 @@ use peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageForm
 use rebook_layout::{
     ImagePlacement, PageItem, PageLayout, TablePlacement, TextBrush, TextPlacement,
 };
-use rebook_publication::{Rgba, SourceAnchor, SourceRange};
+use rebook_publication::{Rgba, SourceAnchor, SourceRange, TextBaseline};
 
 /// Pointer hit inside one retained text placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +277,16 @@ impl PageDisplayList {
             })
             .map(|table| table.bounds)
             .collect()
+    }
+
+    /// Returns the union of text, image, and table geometry belonging to the
+    /// supplied semantic source ranges.
+    pub fn source_content_bounds(&self, ranges: &[SourceRange]) -> Option<Rect> {
+        self.source_rects(ranges)
+            .into_iter()
+            .chain(self.image_source_rects(ranges))
+            .chain(self.source_table_bounds(ranges))
+            .reduce(|bounds, next| bounds.union(next))
     }
 
     pub fn contains_source_anchor(&self, anchor: &SourceAnchor) -> bool {
@@ -1451,6 +1461,11 @@ fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacemen
             };
             let run = glyph_run.run();
             let brush = glyph_run.style().brush;
+            let baseline_offset = match brush.baseline {
+                TextBaseline::Normal => 0.0,
+                TextBaseline::Superscript => -run.font_size() * 0.35,
+                TextBaseline::Subscript => run.font_size() * 0.2,
+            };
             let synthesis = run.synthesis();
             let glyph_transform = synthesis
                 .skew()
@@ -1460,7 +1475,7 @@ fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacemen
                 .map(|glyph| Glyph {
                     id: glyph.id,
                     x: glyph.x,
-                    y: glyph.y,
+                    y: glyph.y + baseline_offset,
                 })
                 .collect::<Vec<_>>()
                 .into();
@@ -1477,7 +1492,8 @@ fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacemen
             if brush.underline {
                 let metrics = run.metrics();
                 let y = f64::from(
-                    glyph_run.baseline() - metrics.underline_offset + metrics.underline_size / 2.0,
+                    glyph_run.baseline() + baseline_offset - metrics.underline_offset
+                        + metrics.underline_size / 2.0,
                 ) + f64::from(text.origin_y);
                 let x = f64::from(glyph_run.offset() + text.origin_x);
                 commands.push(DisplayCommand::Rule(RuleCommand {
@@ -1539,6 +1555,7 @@ mod tests {
         builder.push_default(StyleProperty::Brush(TextBrush {
             color: Rgba::BLACK,
             underline: false,
+            baseline: TextBaseline::Normal,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(240.0));
@@ -1614,6 +1631,7 @@ mod tests {
         builder.push_default(StyleProperty::Brush(TextBrush {
             color: Rgba::BLACK,
             underline: false,
+            baseline: TextBaseline::Normal,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(150.0));
@@ -1695,6 +1713,7 @@ mod tests {
         builder.push_default(StyleProperty::Brush(TextBrush {
             color: Rgba::BLACK,
             underline: false,
+            baseline: TextBaseline::Normal,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.set_text_indent(
@@ -1774,6 +1793,7 @@ mod tests {
         builder.push_default(StyleProperty::Brush(TextBrush {
             color: Rgba::BLACK,
             underline: false,
+            baseline: TextBaseline::Normal,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(180.0));
@@ -1947,6 +1967,7 @@ mod tests {
         builder.push_default(StyleProperty::Brush(TextBrush {
             color: Rgba::BLACK,
             underline: false,
+            baseline: TextBaseline::Normal,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(80.0));

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use rebook_publication::{
     Block, BlockStyle, ImageBlock, ImageLength, ImageStyle, Inline, MathRun, PublicationUrl, Rgba,
     Section, SectionAnchor, SourceAnchor, SourceRange, SpineItem, SpineItemId, TableBlock,
-    TableCell, TableRow, TextAlignment, TextBlock, TextBlockKind, TextRun, TextStyle,
+    TableCell, TableRow, TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 use roxmltree::{Document, Node};
 use thiserror::Error;
@@ -583,6 +583,14 @@ fn collect_inline_node(
         "u" => style.underline = true,
         "small" => style.size_scale *= 0.85,
         "big" => style.size_scale *= 1.2,
+        "sup" => {
+            style.baseline = TextBaseline::Superscript;
+            style.size_scale *= 0.75;
+        }
+        "sub" => {
+            style.baseline = TextBaseline::Subscript;
+            style.size_scale *= 0.75;
+        }
         _ => {}
     }
     styles.apply_text_node(node, &mut style, inherited.size_scale);
@@ -1071,6 +1079,14 @@ fn apply_text_properties(
     if let Some(color) = properties.get("color").and_then(|value| css_color(value)) {
         style.color = color;
     }
+    if let Some(value) = properties.get("vertical-align") {
+        style.baseline = match value.trim().to_ascii_lowercase().as_str() {
+            "super" => TextBaseline::Superscript,
+            "sub" => TextBaseline::Subscript,
+            "baseline" => TextBaseline::Normal,
+            _ => style.baseline,
+        };
+    }
 }
 
 fn insert_declarations(
@@ -1334,6 +1350,51 @@ mod tests {
         assert_eq!(image.style.width, Some(ImageLength::Fraction(0.8)));
         assert_eq!(image.style.max_width, Some(ImageLength::Pixels(420.0)));
         assert_eq!(image.style.max_height, Some(ImageLength::Fraction(0.6)));
+    }
+
+    #[test]
+    fn preserves_superscript_and_subscript_baselines() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+            <head><style>.css-super { vertical-align: super; font-size: 80%; }</style></head>
+            <body><p>read.<a href="notes.xhtml#note-4"><sup>4</sup></a>
+                H<sub>2</sub>O <span class="css-super">5</span></p></body>
+        </html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Text(block)] = section.blocks.as_slice() else {
+            panic!("expected one text block");
+        };
+        let styled = block
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some((run.text.trim(), run.style)),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(styled.iter().any(|(text, style)| {
+            *text == "4"
+                && style.baseline == TextBaseline::Superscript
+                && (style.size_scale - 0.75).abs() < 0.001
+        }));
+        assert!(styled.iter().any(|(text, style)| {
+            *text == "2"
+                && style.baseline == TextBaseline::Subscript
+                && (style.size_scale - 0.75).abs() < 0.001
+        }));
+        assert!(styled.iter().any(|(text, style)| {
+            *text == "5"
+                && style.baseline == TextBaseline::Superscript
+                && (style.size_scale - 0.8).abs() < 0.001
+        }));
     }
 
     #[test]

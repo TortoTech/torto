@@ -45,19 +45,28 @@ impl DesktopReader {
 
     pub(in crate::reader) fn go_to_adjacent_section(&mut self, direction: PageDirection) {
         self.focus_toc_override = None;
-        let current = self.snapshot.location.section_index;
-        let target = match direction {
-            PageDirection::Previous => current.checked_sub(1),
-            PageDirection::Next => {
-                (current + 1 < self.reader.section_count()).then_some(current + 1)
+        match self.reader.go_to_adjacent_reading_unit(direction) {
+            Ok(result) if result.outcome == rebook_reader::NavigationOutcome::Moved => {
+                let focus_anchor = self.reader.current_reading_unit_anchor();
+                self.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
+                if self.is_focus_mode() {
+                    self.focus_anchor = focus_anchor.or_else(|| {
+                        self.reader
+                            .current_page()
+                            .leading_source_range()
+                            .map(|range| range.start.clone())
+                    });
+                }
+                // A unit transition inside one spine section must invalidate the
+                // continuous layout just like a section transition.
+                self.scroll_section = None;
+                self.focus_units.clear();
+                self.focus_unit_index = 0;
+                self.focus_target_offset = None;
+                self.ui.focus_scroll_motion = None;
             }
-        };
-        let Some(target) = target else {
-            return;
-        };
-        match self.reader.go_to_section(target) {
-            Ok(result) => self.apply_snapshot(result.snapshot, SnapshotEffects::navigation()),
-            Err(error) => self.error = Some(format!("章节跳转失败：{error}")),
+            Ok(_) => {}
+            Err(error) => self.error = Some(format!("小节跳转失败：{error}")),
         }
     }
 

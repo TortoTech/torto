@@ -553,6 +553,9 @@ pub struct TextStyle {
     /// Scale relative to the reader's base font size.
     pub size_scale: f32,
     pub color: Rgba,
+    /// Vertical placement relative to the surrounding text baseline.
+    #[serde(default)]
+    pub baseline: TextBaseline,
 }
 
 impl Default for TextStyle {
@@ -563,8 +566,18 @@ impl Default for TextStyle {
             underline: false,
             size_scale: 1.0,
             color: Rgba::BLACK,
+            baseline: TextBaseline::Normal,
         }
     }
+}
+
+/// Semantic baseline placement for inline text such as footnote references.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextBaseline {
+    #[default]
+    Normal,
+    Superscript,
+    Subscript,
 }
 
 /// Text alignment supported by the native layout engine.

@@ -6,10 +6,11 @@ use rebook_publication::{
     Block, BlockStyle, Book, BookSource, FixedPageTextLayer, FixedPageTextRect,
     FixedPageTextReplacement, FixedPageTextReplacementSegment, Inline, PublicationError,
     PublicationUrl, RasterResource, RenditionLayout, Resource, Section, SectionAnchor, SourceRange,
-    TextBlock, TextBlockKind, TextRun, TextStyle,
+    TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 
 use super::TranslationMode;
+#[cfg(test)]
 use super::search::text_block_text;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,7 +206,7 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
     for (block_index, block) in section.blocks.iter().enumerate() {
         match block {
             Block::Text(block) => {
-                let text = text_block_text(block);
+                let text = translation_text(block);
                 if !text.trim().is_empty() {
                     blocks.push(TranslationBlockInput {
                         block_index,
@@ -251,7 +252,7 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
                         .flat_map(|row| &row.cells)
                         .enumerate()
                         .filter_map(|(cell_index, cell)| {
-                            let text = text_block_text(&cell.text);
+                            let text = translation_text(&cell.text);
                             (!text.trim().is_empty()).then_some(TranslationBlockInput {
                                 block_index,
                                 segment_index: Some(cell_index),
@@ -359,7 +360,8 @@ impl BookSource for TranslationBookSource {
                         .unwrap_or_default();
                     match mode {
                         TranslationMode::Replace => {
-                            original.content = replacement_content(translation, style);
+                            original.content =
+                                replacement_content(translation, style, Some(&original.content));
                             update_translated_source(
                                 original.source.as_mut(),
                                 translation,
@@ -371,7 +373,8 @@ impl BookSource for TranslationBookSource {
                             let mut translated = original.clone();
                             let original_margin_after = original.style.margin_after;
                             original.style.margin_after = original_margin_after.min(6.0);
-                            translated.content = replacement_content(translation, style);
+                            translated.content =
+                                replacement_content(translation, style, Some(&original.content));
                             translated.source = None;
                             translated.style.margin_before = 0.0;
                             translated.style.margin_after = original_margin_after;
@@ -474,13 +477,15 @@ fn translated_table(
             })
             .unwrap_or_default();
         if mode == TranslationMode::Replace {
-            cell.text.content = replacement_content(translated, style);
+            let original = cell.text.content.clone();
+            cell.text.content = replacement_content(translated, style, Some(&original));
             update_translated_source(cell.text.source.as_mut(), translated, anchors);
         } else {
+            let original = cell.text.content.clone();
             cell.text.content.push(Inline::Break);
             cell.text
                 .content
-                .extend(replacement_content(translated, style));
+                .extend(replacement_content(translated, style, Some(&original)));
         }
     }
     table
@@ -783,7 +788,7 @@ fn char_slice(text: &str, start: u64, end: u64) -> &str {
 fn translated_fixed_page_block(text: &str, source: Option<SourceRange>) -> TextBlock {
     TextBlock {
         kind: TextBlockKind::Paragraph,
-        content: replacement_content(text, TextStyle::default()),
+        content: replacement_content(text, TextStyle::default(), None),
         style: BlockStyle {
             margin_before: 16.0,
             margin_after: 16.0,
@@ -803,10 +808,9 @@ fn update_translated_source(
     };
     source.end.spine = source.start.spine.clone();
     source.end.node.clone_from(&source.start.node);
-    source.end.text_offset = source
-        .start
-        .text_offset
-        .saturating_add(u64::try_from(translation.chars().count()).unwrap_or(u64::MAX));
+    source.end.text_offset = source.start.text_offset.saturating_add(
+        u64::try_from(translation_visible_char_count(translation)).unwrap_or(u64::MAX),
+    );
     for anchor in anchors {
         if anchor.source.spine == source.start.spine && anchor.source.node == source.start.node {
             anchor.source.text_offset = anchor
@@ -817,21 +821,190 @@ fn update_translated_source(
     }
 }
 
-fn replacement_content(text: &str, style: TextStyle) -> Vec<Inline> {
-    let mut content = Vec::new();
-    for (index, line) in text.split('\n').enumerate() {
-        if index > 0 {
-            content.push(Inline::Break);
+fn translation_text(block: &TextBlock) -> String {
+    let mut text = String::new();
+    for inline in &block.content {
+        match inline {
+            Inline::Text(run) => match run.style.baseline {
+                TextBaseline::Normal => text.push_str(&run.text),
+                TextBaseline::Superscript => {
+                    text.push_str("<sup>");
+                    text.push_str(&run.text);
+                    text.push_str("</sup>");
+                }
+                TextBaseline::Subscript => {
+                    text.push_str("<sub>");
+                    text.push_str(&run.text);
+                    text.push_str("</sub>");
+                }
+            },
+            Inline::Math(run) => {
+                text.push('$');
+                text.push_str(&run.latex);
+                text.push('$');
+            }
+            Inline::Break => text.push('\n'),
         }
-        if !line.is_empty() {
-            content.push(Inline::Text(TextRun {
-                text: line.to_owned(),
-                style,
-                link: None,
-            }));
+    }
+    text
+}
+
+fn translation_visible_char_count(text: &str) -> usize {
+    text.replace("<sup>", "")
+        .replace("</sup>", "")
+        .replace("<sub>", "")
+        .replace("</sub>", "")
+        .chars()
+        .count()
+}
+
+fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>) -> Vec<Inline> {
+    let styled = parse_baseline_markup(text, style)
+        .unwrap_or_else(|| restore_original_baselines(text, style, original.unwrap_or_default()));
+    let mut content = Vec::new();
+    for (text, style) in styled {
+        for (index, line) in text.split('\n').enumerate() {
+            if index > 0 {
+                content.push(Inline::Break);
+            }
+            if !line.is_empty() {
+                content.push(Inline::Text(TextRun {
+                    text: line.to_owned(),
+                    style,
+                    link: None,
+                }));
+            }
         }
     }
     content
+}
+
+fn parse_baseline_markup(text: &str, default_style: TextStyle) -> Option<Vec<(String, TextStyle)>> {
+    let mut rest = text;
+    let mut styled = Vec::new();
+    let mut found = false;
+    while let Some((start, baseline, open, close)) = next_baseline_tag(rest) {
+        if start > 0 {
+            styled.push((rest[..start].to_owned(), default_style));
+        }
+        let value_start = start + open.len();
+        let relative_end = rest[value_start..].find(close)?;
+        let value_end = value_start + relative_end;
+        styled.push((
+            rest[value_start..value_end].to_owned(),
+            baseline_style(default_style, baseline),
+        ));
+        rest = &rest[value_end + close.len()..];
+        found = true;
+    }
+    if !rest.is_empty() {
+        styled.push((rest.to_owned(), default_style));
+    }
+    found.then_some(styled)
+}
+
+fn next_baseline_tag(text: &str) -> Option<(usize, TextBaseline, &'static str, &'static str)> {
+    let superscript = text
+        .find("<sup>")
+        .map(|index| (index, TextBaseline::Superscript, "<sup>", "</sup>"));
+    let subscript = text
+        .find("<sub>")
+        .map(|index| (index, TextBaseline::Subscript, "<sub>", "</sub>"));
+    match (superscript, subscript) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn baseline_style(mut style: TextStyle, baseline: TextBaseline) -> TextStyle {
+    style.baseline = baseline;
+    style.size_scale *= 0.75;
+    style
+}
+
+fn restore_original_baselines(
+    text: &str,
+    default_style: TextStyle,
+    original: &[Inline],
+) -> Vec<(String, TextStyle)> {
+    let original_length = original
+        .iter()
+        .map(|inline| match inline {
+            Inline::Text(run) => run.text.chars().count(),
+            Inline::Break => 1,
+            Inline::Math(_) => 0,
+        })
+        .sum::<usize>()
+        .max(1);
+    let mut original_offset = 0;
+    let markers = original
+        .iter()
+        .filter_map(|inline| match inline {
+            Inline::Text(run) => {
+                let offset = original_offset;
+                original_offset += run.text.chars().count();
+                (run.style.baseline != TextBaseline::Normal && !run.text.is_empty()).then_some((
+                    run.text.as_str(),
+                    run.style,
+                    offset.saturating_mul(1_000) / original_length,
+                ))
+            }
+            Inline::Break => {
+                original_offset += 1;
+                None
+            }
+            Inline::Math(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if markers.is_empty() {
+        return vec![(text.to_owned(), default_style)];
+    }
+
+    let target_length = text.chars().count().max(1);
+    let mut cursor = 0;
+    let mut styled = Vec::new();
+    for (marker, marker_style, relative_offset) in markers {
+        let Some(start) = best_marker_match(text, marker, cursor, relative_offset, target_length)
+        else {
+            continue;
+        };
+        if start > cursor {
+            styled.push((text[cursor..start].to_owned(), default_style));
+        }
+        let end = start + marker.len();
+        styled.push((text[start..end].to_owned(), marker_style));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        styled.push((text[cursor..].to_owned(), default_style));
+    }
+    if styled.is_empty() {
+        vec![(text.to_owned(), default_style)]
+    } else {
+        styled
+    }
+}
+
+fn best_marker_match(
+    text: &str,
+    marker: &str,
+    cursor: usize,
+    relative_offset: usize,
+    target_length: usize,
+) -> Option<usize> {
+    text[cursor..]
+        .match_indices(marker)
+        .map(|(offset, _)| cursor + offset)
+        .min_by(|left, right| {
+            let score = |byte_index: usize| {
+                let char_index = text[..byte_index].chars().count();
+                char_index
+                    .saturating_mul(1_000)
+                    .abs_diff(relative_offset.saturating_mul(target_length))
+            };
+            score(*left).cmp(&score(*right))
+        })
 }
 
 #[cfg(test)]
@@ -977,6 +1150,54 @@ mod tests {
             panic!("expected text block");
         };
         text_block_text(block)
+    }
+
+    #[test]
+    fn translation_preserves_and_restores_baseline_markers() {
+        let superscript = TextStyle {
+            baseline: TextBaseline::Superscript,
+            size_scale: 0.75,
+            ..TextStyle::default()
+        };
+        let original = vec![
+            Inline::Text(TextRun {
+                text: "Meaning".into(),
+                style: TextStyle::default(),
+                link: None,
+            }),
+            Inline::Text(TextRun {
+                text: "4".into(),
+                style: superscript,
+                link: None,
+            }),
+        ];
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: original.clone(),
+            style: BlockStyle::default(),
+            source: None,
+        };
+
+        assert_eq!(translation_text(&block), "Meaning<sup>4</sup>");
+        let marked = replacement_content("含义<sup>4</sup>", TextStyle::default(), Some(&original));
+        assert!(matches!(
+            marked.as_slice(),
+            [Inline::Text(body), Inline::Text(note)]
+                if body.text == "含义"
+                    && note.text == "4"
+                    && note.style.baseline == TextBaseline::Superscript
+        ));
+
+        let cached = replacement_content(
+            "这是正文。4 然而继续。",
+            TextStyle::default(),
+            Some(&original),
+        );
+        assert!(cached.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run)
+                if run.text == "4" && run.style.baseline == TextBaseline::Superscript
+        )));
     }
 
     #[test]
