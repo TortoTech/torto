@@ -1,5 +1,5 @@
 use peniko::Blob;
-use rebook_layout::{LayoutEngine, ReaderTypography, SpreadMode};
+use rebook_layout::{LayoutEngine, ReaderTypesetting, ReaderTypography, SpreadMode};
 use rebook_reader::SelectionGranularity;
 
 use crate::plugins::PluginSettings;
@@ -18,6 +18,7 @@ pub(crate) struct AppliedSettings {
     pub(crate) reading_mode: ReadingMode,
     pub(crate) interface_typography: InterfaceTypography,
     pub(crate) typography: ReaderTypography,
+    pub(crate) typesetting: ReaderTypesetting,
     pub(crate) plugin_settings: PluginSettings,
     pub(crate) language: AppLanguage,
     pub(crate) theme: AppTheme,
@@ -40,6 +41,7 @@ pub(crate) struct SettingsFeature {
     draft_reading_mode: ReadingMode,
     draft_interface_typography: InterfaceTypography,
     draft_typography: ReaderTypography,
+    draft_typesetting: ReaderTypesetting,
     draft_plugin_settings: PluginSettings,
     draft_language: AppLanguage,
     draft_theme: AppTheme,
@@ -85,6 +87,7 @@ impl SettingsFeature {
             reading_mode: preferences.reading_mode,
             interface_typography: preferences.interface_typography,
             typography: preferences.typography,
+            typesetting: preferences.typesetting,
             plugin_settings,
             language: preferences.language,
             theme: preferences.theme,
@@ -98,6 +101,7 @@ impl SettingsFeature {
             draft_reading_mode: applied.reading_mode,
             draft_interface_typography: applied.interface_typography.clone(),
             draft_typography: applied.typography.clone(),
+            draft_typesetting: applied.typesetting.clone(),
             draft_plugin_settings: applied.plugin_settings.clone(),
             draft_language: applied.language,
             draft_theme: applied.theme,
@@ -125,6 +129,7 @@ impl SettingsFeature {
         self.draft_interface_typography
             .clone_from(&self.applied.interface_typography);
         self.draft_typography.clone_from(&self.applied.typography);
+        self.draft_typesetting.clone_from(&self.applied.typesetting);
         self.draft_plugin_settings
             .clone_from(&self.applied.plugin_settings);
         self.draft_language = self.applied.language;
@@ -178,6 +183,7 @@ impl SettingsFeature {
         let mut preferences = ReaderPreferences {
             interface_typography: self.applied.interface_typography.clone(),
             typography: self.applied.typography.clone(),
+            typesetting: self.applied.typesetting.clone(),
             language: self.applied.language,
             spread: self.applied.spread,
             reading_mode: self.applied.reading_mode,
@@ -237,6 +243,8 @@ impl SettingsFeature {
         plugin_settings.normalize();
         let mut typography = self.draft_typography.clone();
         typography.normalize();
+        let mut typesetting = self.draft_typesetting.clone();
+        typesetting.normalize();
         let mut interface_typography = self.draft_interface_typography.clone();
         interface_typography.normalize();
         let mut sync_settings = self.draft_sync_settings.clone();
@@ -246,6 +254,7 @@ impl SettingsFeature {
         let reader_preferences = ReaderPreferences {
             interface_typography: interface_typography.clone(),
             typography: typography.clone(),
+            typesetting: typesetting.clone(),
             language,
             theme,
             spread: self.draft_spread,
@@ -280,6 +289,7 @@ impl SettingsFeature {
             reading_mode: self.draft_reading_mode,
             interface_typography,
             typography,
+            typesetting,
             plugin_settings,
             language,
             theme,

@@ -155,12 +155,14 @@ impl DesktopReader {
             settings.spread
         };
         style.minimum_paragraph_gap = if self.reading_mode == crate::preferences::ReadingMode::Focus
+            && settings.typesetting.mode == rebook_layout::TypesettingMode::Book
         {
             super::FOCUS_MINIMUM_PARAGRAPH_GAP
         } else {
             0.0
         };
         style.typography.clone_from(&settings.typography);
+        style.typesetting.clone_from(&settings.typesetting);
         self.selection_granularity = settings.selection_granularity;
         super::apply_theme_colors(&mut style, settings.theme);
         match self.reader.set_style(style) {

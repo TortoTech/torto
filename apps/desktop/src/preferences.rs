@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
-use rebook_layout::{ReaderTypography, SpreadMode};
+use rebook_layout::{ReaderTypesetting, ReaderTypography, SpreadMode};
 use rebook_reader::SelectionGranularity;
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +58,7 @@ pub(crate) enum AppTheme {
 pub(crate) struct ReaderPreferences {
     pub(crate) interface_typography: InterfaceTypography,
     pub(crate) typography: ReaderTypography,
+    pub(crate) typesetting: ReaderTypesetting,
     pub(crate) language: AppLanguage,
     pub(crate) spread: SpreadMode,
     pub(crate) reading_mode: ReadingMode,
@@ -70,9 +71,10 @@ impl Default for ReaderPreferences {
         Self {
             interface_typography: InterfaceTypography::default(),
             typography: ReaderTypography::default(),
+            typesetting: ReaderTypesetting::unified(),
             language: AppLanguage::default(),
             spread: SpreadMode::Double,
-            reading_mode: ReadingMode::Classic,
+            reading_mode: ReadingMode::Focus,
             theme: AppTheme::default(),
             selection_granularity: SelectionGranularity::Free,
         }
@@ -81,8 +83,8 @@ impl Default for ReaderPreferences {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ReadingMode {
-    #[default]
     Classic,
+    #[default]
     Focus,
 }
 
@@ -121,6 +123,8 @@ struct StoredReaderPreferences {
     interface_typography: InterfaceTypography,
     #[serde(default)]
     typography: ReaderTypography,
+    #[serde(default = "default_typesetting")]
+    typesetting: ReaderTypesetting,
     #[serde(default)]
     language: AppLanguage,
     #[serde(default)]
@@ -133,11 +137,15 @@ struct StoredReaderPreferences {
     selection_granularity: StoredSelectionGranularity,
 }
 
+fn default_typesetting() -> ReaderTypesetting {
+    ReaderTypesetting::unified()
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum StoredReadingMode {
-    #[default]
     Classic,
+    #[default]
     Focus,
 }
 
@@ -285,9 +293,12 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
     interface_typography.normalize();
     let mut typography = stored.typography;
     typography.normalize();
+    let mut typesetting = stored.typesetting;
+    typesetting.normalize();
     Ok(ReaderPreferences {
         interface_typography,
         typography,
+        typesetting,
         language: stored.language,
         spread: stored.spread.into(),
         reading_mode: stored.reading_mode.into(),
@@ -305,10 +316,13 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
     interface_typography.normalize();
     let mut typography = preferences.typography.clone();
     typography.normalize();
+    let mut typesetting = preferences.typesetting.clone();
+    typesetting.normalize();
     let stored = StoredReaderPreferences {
         version: SETTINGS_VERSION,
         interface_typography,
         typography,
+        typesetting,
         language: preferences.language,
         spread: preferences.spread.into(),
         reading_mode: preferences.reading_mode.into(),
@@ -322,7 +336,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rebook_layout::ReaderDefaultFont;
+    use rebook_layout::{ReaderDefaultFont, TypesettingMode};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -345,6 +359,11 @@ mod tests {
                 font_size: 15.0,
             },
             typography,
+            typesetting: ReaderTypesetting {
+                heading_scale: 1.8,
+                paragraph_gap_em: 0.9,
+                ..ReaderTypesetting::unified()
+            },
             language: AppLanguage::English,
             spread: SpreadMode::Single,
             reading_mode: ReadingMode::Focus,
@@ -364,6 +383,9 @@ mod tests {
         assert!((loaded.typography.font_size - 18.0).abs() < f32::EPSILON);
         assert!((loaded.typography.minimum_font_size - 9.0).abs() < f32::EPSILON);
         assert_eq!(loaded.typography.font_weight, 600);
+        assert_eq!(loaded.typesetting.mode, TypesettingMode::Unified);
+        assert!((loaded.typesetting.heading_scale - 1.8).abs() < f32::EPSILON);
+        assert!((loaded.typesetting.paragraph_gap_em - 0.9).abs() < f32::EPSILON);
         assert_eq!(loaded.language, AppLanguage::English);
         assert_eq!(loaded.spread, SpreadMode::Single);
         assert_eq!(loaded.reading_mode, ReadingMode::Focus);
@@ -378,8 +400,9 @@ mod tests {
         let stored: StoredReaderPreferences = serde_json::from_str(json).unwrap();
         assert_eq!(stored.language, AppLanguage::SimplifiedChinese);
         assert_eq!(stored.interface_typography, InterfaceTypography::default());
+        assert_eq!(stored.typesetting.mode, TypesettingMode::Unified);
         assert!(matches!(stored.spread, StoredSpreadMode::Double));
-        assert!(matches!(stored.reading_mode, StoredReadingMode::Classic));
+        assert!(matches!(stored.reading_mode, StoredReadingMode::Focus));
         assert!(matches!(stored.theme, StoredAppTheme::Light));
         assert!(matches!(
             stored.selection_granularity,

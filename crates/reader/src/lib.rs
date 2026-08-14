@@ -577,12 +577,13 @@ impl ReaderSession {
     fn new_unpositioned(
         source: Arc<dyn BookSource>,
         viewport: LayoutViewport,
-        style: ReaderStyle,
+        mut style: ReaderStyle,
         fonts: Arc<[ReaderFontBlob]>,
     ) -> Result<Self, ReaderError> {
         if source.book().sections.is_empty() {
             return Err(ReaderError::EmptyBook);
         }
+        style.writing_system = source.book().metadata.writing_system();
         let toc_items: Arc<[TocViewItem]> = flatten_toc(&source.book().table_of_contents).into();
         let mut section_indices_by_path = HashMap::with_capacity(source.book().sections.len());
         for (index, section) in source.book().sections.iter().enumerate() {
@@ -1676,7 +1677,8 @@ impl ReaderSession {
         Ok(self.snapshot())
     }
 
-    pub fn set_style(&mut self, style: ReaderStyle) -> Result<ReaderSnapshot, ReaderError> {
+    pub fn set_style(&mut self, mut style: ReaderStyle) -> Result<ReaderSnapshot, ReaderError> {
+        style.writing_system = self.source.book().metadata.writing_system();
         if self.style == style {
             return Ok(self.snapshot());
         }
@@ -1709,9 +1711,10 @@ impl ReaderSession {
     /// number or identity of spine sections, such as PDF OCR reflow.
     pub fn refresh_source_with_style_at_href(
         &mut self,
-        style: ReaderStyle,
+        mut style: ReaderStyle,
         target: Option<&PublicationUrl>,
     ) -> Result<ReaderSnapshot, ReaderError> {
+        style.writing_system = self.source.book().metadata.writing_system();
         let fraction = page_fraction(self.current_page, self.current_page_count());
         let visible_source_anchor = target
             .is_none()

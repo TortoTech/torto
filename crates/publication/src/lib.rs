@@ -174,6 +174,32 @@ pub struct Metadata {
     pub layout: RenditionLayout,
 }
 
+impl Metadata {
+    /// Resolves one publication-wide writing-system hint for reader typography.
+    /// Declared BCP 47 metadata wins; the title is only inspected when no
+    /// declared language can be mapped to a supported writing system.
+    pub fn writing_system(&self) -> WritingSystem {
+        self.languages
+            .iter()
+            .find_map(|language| writing_system_from_language_tag(language))
+            .unwrap_or_else(|| writing_system_from_title(&self.title))
+    }
+}
+
+/// Coarse publication-wide writing system used for typography defaults.
+///
+/// This is deliberately a rendering hint rather than normalized metadata: an
+/// inferred title script must not be persisted as the publication language.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WritingSystem {
+    Cjk,
+    Latin,
+    Other,
+    #[default]
+    Unknown,
+}
+
 /// Package-level rendition layout.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -807,9 +833,95 @@ fn is_scheme_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
 }
 
+fn writing_system_from_language_tag(language: &str) -> Option<WritingSystem> {
+    let normalized = language.trim().replace('_', "-").to_ascii_lowercase();
+    let mut subtags = normalized.split('-');
+    let primary = subtags.next()?;
+    if primary.is_empty() || primary == "und" {
+        return None;
+    }
+
+    let remaining = subtags.collect::<Vec<_>>();
+    if remaining
+        .iter()
+        .any(|subtag| matches!(*subtag, "hans" | "hant" | "jpan" | "kore"))
+    {
+        return Some(WritingSystem::Cjk);
+    }
+    if remaining.contains(&"latn") {
+        return Some(WritingSystem::Latin);
+    }
+
+    match primary {
+        "zh" | "ja" | "ko" => Some(WritingSystem::Cjk),
+        "af" | "ca" | "cs" | "cy" | "da" | "de" | "en" | "es" | "et" | "eu" | "fi" | "fr"
+        | "ga" | "gd" | "gl" | "hr" | "hu" | "id" | "is" | "it" | "lt" | "lv" | "ms" | "mt"
+        | "nl" | "no" | "pl" | "pt" | "ro" | "sk" | "sl" | "sq" | "sv" | "sw" | "tr" | "vi" => {
+            Some(WritingSystem::Latin)
+        }
+        "ar" | "be" | "bg" | "el" | "fa" | "he" | "hi" | "mk" | "ru" | "sr" | "th" | "uk"
+        | "ur" => Some(WritingSystem::Other),
+        _ => None,
+    }
+}
+
+fn writing_system_from_title(title: &str) -> WritingSystem {
+    let (mut cjk, mut latin) = (0_u32, 0_u32);
+    for character in title.chars() {
+        if is_cjk_character(character) {
+            cjk += 1;
+        } else if is_latin_character(character) {
+            latin += 1;
+        }
+    }
+
+    let total = cjk + latin;
+    if total < 2 {
+        return WritingSystem::Unknown;
+    }
+    if cjk * 100 >= total * 60 {
+        WritingSystem::Cjk
+    } else if latin * 100 >= total * 60 {
+        WritingSystem::Latin
+    } else {
+        WritingSystem::Unknown
+    }
+}
+
+fn is_cjk_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{1100}'..='\u{11ff}'
+            | '\u{2e80}'..='\u{2fff}'
+            | '\u{3040}'..='\u{30ff}'
+            | '\u{3130}'..='\u{318f}'
+            | '\u{31a0}'..='\u{31ff}'
+            | '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{ac00}'..='\u{d7af}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{20000}'..='\u{2fa1f}'
+    )
+}
+
+fn is_latin_character(character: char) -> bool {
+    character.is_alphabetic()
+        && matches!(
+            character,
+            'A'..='Z'
+                | 'a'..='z'
+                | '\u{00c0}'..='\u{024f}'
+                | '\u{1e00}'..='\u{1eff}'
+                | '\u{ff21}'..='\u{ff3a}'
+                | '\u{ff41}'..='\u{ff5a}'
+        )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LocatorV1, PublicationError, PublicationId, PublicationUrl};
+    use super::{
+        LocatorV1, Metadata, PublicationError, PublicationId, PublicationUrl, WritingSystem,
+    };
 
     #[test]
     fn resolves_and_normalizes_relative_publication_urls() {
@@ -849,5 +961,48 @@ mod tests {
             locator.validate(),
             Err(PublicationError::InvalidProgression(_))
         ));
+    }
+
+    #[test]
+    fn declared_language_takes_priority_over_title_script() {
+        let metadata = Metadata {
+            title: "系统之美".into(),
+            languages: vec!["en-US".into()],
+            ..Metadata::default()
+        };
+
+        assert_eq!(metadata.writing_system(), WritingSystem::Latin);
+    }
+
+    #[test]
+    fn missing_language_falls_back_to_title_only() {
+        let chinese = Metadata {
+            title: "系统之美".into(),
+            authors: vec!["Donella Meadows".into()],
+            ..Metadata::default()
+        };
+        let english = Metadata {
+            title: "Thinking in Systems".into(),
+            authors: vec!["梅多斯".into()],
+            ..Metadata::default()
+        };
+
+        assert_eq!(chinese.writing_system(), WritingSystem::Cjk);
+        assert_eq!(english.writing_system(), WritingSystem::Latin);
+    }
+
+    #[test]
+    fn ambiguous_or_insufficient_title_script_stays_unknown() {
+        let ambiguous = Metadata {
+            title: "AI时代".into(),
+            ..Metadata::default()
+        };
+        let author_only = Metadata {
+            authors: vec!["中文作者".into()],
+            ..Metadata::default()
+        };
+
+        assert_eq!(ambiguous.writing_system(), WritingSystem::Unknown);
+        assert_eq!(author_only.writing_system(), WritingSystem::Unknown);
     }
 }

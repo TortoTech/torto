@@ -1,5 +1,5 @@
 use egui::{Align2, Color32, Response, RichText, Vec2};
-use rebook_layout::{ReaderDefaultFont, SpreadMode};
+use rebook_layout::{ParagraphIndentMode, ReaderDefaultFont, SpreadMode, TypesettingMode};
 
 use super::{SettingsFeature, SettingsTab};
 use crate::plugins::{
@@ -473,6 +473,8 @@ fn font_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         &mut state.draft_typography,
         &state.available_font_families,
     );
+    ui.add_space(12.0);
+    reader_typesetting_settings(ui, language, &mut state.draft_typesetting);
 }
 
 fn interface_font_settings(
@@ -603,6 +605,149 @@ fn reader_font_settings(
                 );
             });
     });
+}
+
+fn reader_typesetting_settings(
+    ui: &mut egui::Ui,
+    language: AppLanguage,
+    typesetting: &mut rebook_layout::ReaderTypesetting,
+) {
+    settings_card(ui, |ui| {
+        ui.label(
+            RichText::new(language.text("统一版式", "Reading layout"))
+                .strong()
+                .color(palette().text),
+        );
+        ui.add_space(12.0);
+        egui::Grid::new("reader-typesetting-settings-grid")
+            .num_columns(2)
+            .spacing([24.0, 16.0])
+            .show(ui, |ui| {
+                settings_row_label(ui, language.text("版式来源", "Layout source"));
+                settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
+                    let unified = typesetting.mode == TypesettingMode::Unified;
+                    if choice_button(ui, language.text("统一版式", "Unified"), unified, 96.0)
+                        .clicked()
+                    {
+                        typesetting.mode = TypesettingMode::Unified;
+                    }
+                    let book = typesetting.mode == TypesettingMode::Book;
+                    if choice_button(ui, language.text("书籍原版", "Book style"), book, 96.0)
+                        .clicked()
+                    {
+                        typesetting.mode = TypesettingMode::Book;
+                    }
+                });
+                ui.end_row();
+            });
+        ui.add_enabled_ui(typesetting.mode == TypesettingMode::Unified, |ui| {
+            unified_typesetting_controls(ui, language, typesetting);
+        });
+        ui.add_space(4.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if secondary_button(ui, language.text("恢复默认", "Reset defaults")).clicked() {
+                *typesetting = rebook_layout::ReaderTypesetting::unified();
+            }
+        });
+    });
+}
+
+fn unified_typesetting_controls(
+    ui: &mut egui::Ui,
+    language: AppLanguage,
+    typesetting: &mut rebook_layout::ReaderTypesetting,
+) {
+    egui::Grid::new("reader-unified-typesetting-controls")
+        .num_columns(2)
+        .spacing([24.0, 16.0])
+        .show(ui, |ui| {
+            settings_slider_row(
+                ui,
+                language.text("一级标题大小", "Heading size"),
+                &mut typesetting.heading_scale,
+                1.1,
+                2.2,
+                0.1,
+                "×",
+            );
+            settings_slider_row(
+                ui,
+                language.text("正文行高", "Body line height"),
+                &mut typesetting.body_line_height,
+                1.2,
+                2.4,
+                0.1,
+                "×",
+            );
+            settings_row_label(ui, language.text("正文首行缩进", "First-line indentation"));
+            settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
+                let automatic = typesetting.paragraph_indent_mode == ParagraphIndentMode::Auto;
+                if choice_button(ui, language.text("自动", "Auto"), automatic, 96.0).clicked() {
+                    typesetting.paragraph_indent_mode = ParagraphIndentMode::Auto;
+                }
+                let custom = typesetting.paragraph_indent_mode == ParagraphIndentMode::Custom;
+                if choice_button(ui, language.text("自定义", "Custom"), custom, 96.0).clicked() {
+                    typesetting.paragraph_indent_mode = ParagraphIndentMode::Custom;
+                }
+            });
+            ui.end_row();
+            if typesetting.paragraph_indent_mode == ParagraphIndentMode::Custom {
+                settings_slider_row(
+                    ui,
+                    language.text("自定义首行缩进", "Custom indentation"),
+                    &mut typesetting.paragraph_indent_em,
+                    0.0,
+                    4.0,
+                    0.1,
+                    " em",
+                );
+            }
+            settings_slider_row(
+                ui,
+                language.text("段落间距", "Paragraph spacing"),
+                &mut typesetting.paragraph_gap_em,
+                0.0,
+                2.0,
+                0.1,
+                " em",
+            );
+            settings_slider_row(
+                ui,
+                language.text("标题与正文间距", "Heading-to-body spacing"),
+                &mut typesetting.heading_body_gap_em,
+                0.2,
+                2.0,
+                0.1,
+                " em",
+            );
+            settings_slider_row(
+                ui,
+                language.text("图片与正文间距", "Image spacing"),
+                &mut typesetting.media_gap_em,
+                0.5,
+                2.0,
+                0.1,
+                " em",
+            );
+            settings_slider_row(
+                ui,
+                language.text("列表缩进", "List indentation"),
+                &mut typesetting.list_indent_em,
+                0.5,
+                3.0,
+                0.1,
+                " em",
+            );
+            settings_slider_row(
+                ui,
+                language.text("表格字号", "Table font size"),
+                &mut typesetting.table_font_scale,
+                0.7,
+                1.2,
+                0.1,
+                "×",
+            );
+        });
 }
 
 fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
@@ -1283,7 +1428,11 @@ fn smooth_numeric_slider(
     ui.painter().text(
         egui::pos2(rect.right(), rect.center().y),
         egui::Align2::RIGHT_CENTER,
-        format!("{next:.0}{suffix}"),
+        if step < 1.0 {
+            format!("{next:.1}{suffix}")
+        } else {
+            format!("{next:.0}{suffix}")
+        },
         egui::TextStyle::Body.resolve(ui.style()),
         palette().text,
     );

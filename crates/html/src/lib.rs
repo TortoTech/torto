@@ -160,7 +160,8 @@ impl ReadingIrParser {
                     style.margin_before = style.margin_before.max(12.0);
                     style.margin_after = style.margin_after.max(12.0);
                 }
-                self.push_text_block(node, TextBlockKind::Paragraph, style)?;
+                let kind = explicit_paragraph_list_kind(node).unwrap_or(TextBlockKind::Paragraph);
+                self.push_text_block(node, kind, style)?;
             }
             "blockquote" => {
                 let mut style = self.styles.block_style(node, BlockStyle::default());
@@ -302,6 +303,11 @@ impl ReadingIrParser {
             &mut collector,
         );
         collector.finish();
+        if node.tag_name().name().eq_ignore_ascii_case("p")
+            && matches!(kind, TextBlockKind::ListItem { .. })
+        {
+            strip_authored_list_marker(&mut collector.content);
+        }
         let text_len = collector
             .content
             .iter()
@@ -663,6 +669,58 @@ fn has_descendant_image(node: Node<'_, '_>) -> bool {
                 "img" | "image"
             )
     })
+}
+
+fn explicit_paragraph_list_kind(node: Node<'_, '_>) -> Option<TextBlockKind> {
+    let marker = node.descendants().find(|descendant| {
+        descendant.is_element()
+            && descendant.tag_name().name().eq_ignore_ascii_case("span")
+            && attribute_local(*descendant, "class").is_some_and(|classes| {
+                classes
+                    .split_ascii_whitespace()
+                    .any(|class| class.eq_ignore_ascii_case("enumerator"))
+            })
+    })?;
+    let marker = marker
+        .descendants()
+        .filter(Node::is_text)
+        .filter_map(|text| text.text())
+        .collect::<String>();
+    is_semantic_bullet(marker.trim()).then_some(TextBlockKind::ListItem {
+        ordered: false,
+        ordinal: 1,
+    })
+}
+
+fn is_semantic_bullet(marker: &str) -> bool {
+    matches!(marker, "•" | "◦" | "▪" | "‣" | "»")
+}
+
+fn is_semantic_bullet_char(marker: char) -> bool {
+    matches!(marker, '•' | '◦' | '▪' | '‣' | '»')
+}
+
+fn strip_authored_list_marker(content: &mut Vec<Inline>) {
+    let Some(marker_index) = content.iter().position(|inline| match inline {
+        Inline::Text(run) => run
+            .text
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(is_semantic_bullet_char),
+        Inline::Math(_) | Inline::Break => false,
+    }) else {
+        return;
+    };
+    let Inline::Text(run) = &mut content[marker_index] else {
+        return;
+    };
+    let trimmed = run.text.trim_start();
+    let marker_len = trimmed.chars().next().map_or(0, char::len_utf8);
+    run.text = trimmed[marker_len..].trim_start().to_owned();
+    if run.text.is_empty() {
+        content.remove(marker_index);
+    }
 }
 
 fn contains_display_math(node: Node<'_, '_>) -> bool {
@@ -1420,6 +1478,41 @@ mod tests {
 
         assert_close(image.style.margin_before, 25.0);
         assert_close(image.style.margin_after, 10.0);
+    }
+
+    #[test]
+    fn explicit_enumerator_paragraph_becomes_a_semantic_list_item() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p class="bullet"><span class="enumerator">•</span> A semantic item</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Text(item)] = section.blocks.as_slice() else {
+            panic!("expected one text block");
+        };
+        assert_eq!(
+            item.kind,
+            TextBlockKind::ListItem {
+                ordered: false,
+                ordinal: 1
+            }
+        );
+        let text = item
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run.text.as_str()),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "A semantic item");
     }
 
     #[test]

@@ -103,6 +103,12 @@ pub(crate) struct ReaderPageTexture {
     pub(crate) size: Vec2,
 }
 
+fn selected_image_layer_id() -> egui::LayerId {
+    // This is a reader-content decoration, not a global overlay. Keeping it in
+    // the middle order lets foreground modals and their backdrops cover it.
+    egui::LayerId::new(egui::Order::Middle, egui::Id::new("reader-selected-image"))
+}
+
 fn constrained_panel_widths(
     viewport_width: f32,
     sidebar_width: f32,
@@ -3220,10 +3226,7 @@ impl DesktopReader {
 
         let stroke = palette().accent;
         let painter = ctx
-            .layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("reader-selected-image"),
-            ))
+            .layer_painter(selected_image_layer_id())
             .with_clip_rect(page_rect);
         painter.rect_stroke(
             bounds,
@@ -4888,5 +4891,10 @@ mod reference_suggestion_label_tests {
         assert_eq!(selected.bounds.min, Pos2::new(24.0, 36.0));
         assert_eq!(selected.bounds.size(), Vec2::new(120.0, 80.0));
         assert!(selected.scroll_mode);
+    }
+
+    #[test]
+    fn selected_image_border_stays_below_foreground_modals() {
+        assert_eq!(selected_image_layer_id().order, egui::Order::Middle);
     }
 }

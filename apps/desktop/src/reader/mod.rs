@@ -217,9 +217,12 @@ pub(super) fn open_reader(
             reader_preferences.spread
         },
         typography: reader_preferences.typography.clone(),
+        typesetting: reader_preferences.typesetting.clone(),
         ..ReaderStyle::default()
     };
-    if reading_mode == ReadingMode::Focus {
+    if reading_mode == ReadingMode::Focus
+        && reader_preferences.typesetting.mode == rebook_layout::TypesettingMode::Book
+    {
         style.minimum_paragraph_gap = FOCUS_MINIMUM_PARAGRAPH_GAP;
     }
     if fixed_page {

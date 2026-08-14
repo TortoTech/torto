@@ -1,5 +1,6 @@
 //! Renderer-independent pagination for normalized reading IR.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
@@ -12,7 +13,8 @@ use parley::{
 use rebook_publication::{
     Block, BookSource, FixedPageDimensions, FixedPageTextLayer, FixedPageTextRect, ImageStyle,
     Inline, MathRun, PublicationError, PublicationUrl, RenditionLayout, Rgba, Section, SourceRange,
-    TableBlock, TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
+    TableBlock, TableCell, TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun,
+    TextStyle, WritingSystem,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -20,7 +22,6 @@ use thiserror::Error;
 const DEFAULT_COLUMN_GAP: f32 = 36.0;
 const IMAGE_BLOCK_GAP: f32 = 14.0;
 const TABLE_BLOCK_GAP: f32 = 14.0;
-const TABLE_CELL_PADDING: f32 = 6.0;
 const MIN_COLUMN_WIDTH: f32 = 360.0;
 const MAX_COLUMN_WIDTH: f32 = 800.0;
 const DEFAULT_TOP_MARGIN: f32 = 0.0;
@@ -46,6 +47,9 @@ impl LayoutViewport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReaderStyle {
     pub typography: ReaderTypography,
+    pub typesetting: ReaderTypesetting,
+    /// Publication-wide writing system used by automatic typography defaults.
+    pub writing_system: WritingSystem,
     pub horizontal_margin: f32,
     pub top_margin: f32,
     pub bottom_margin: f32,
@@ -56,6 +60,88 @@ pub struct ReaderStyle {
     pub spread: SpreadMode,
     pub foreground: Rgba,
     pub background: Rgba,
+}
+
+/// Chooses whether reflowable content follows publication-authored metrics or
+/// the reader's semantic, cross-book typesetting profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TypesettingMode {
+    #[default]
+    Book,
+    Unified,
+}
+
+/// Chooses whether paragraph indentation follows the book language or an
+/// explicit reader value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ParagraphIndentMode {
+    #[default]
+    Auto,
+    Custom,
+}
+
+/// Reader-controlled metrics applied consistently to semantic reading blocks.
+/// Relative values scale with the base reading font so one font-size change
+/// keeps headings, prose, and tables in proportion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReaderTypesetting {
+    pub mode: TypesettingMode,
+    pub heading_scale: f32,
+    pub body_line_height: f32,
+    pub paragraph_indent_mode: ParagraphIndentMode,
+    pub paragraph_indent_em: f32,
+    pub paragraph_gap_em: f32,
+    pub heading_body_gap_em: f32,
+    pub media_gap_em: f32,
+    pub list_indent_em: f32,
+    pub table_font_scale: f32,
+    pub table_line_height: f32,
+    pub table_cell_padding_em: f32,
+}
+
+impl ReaderTypesetting {
+    pub fn unified() -> Self {
+        Self {
+            mode: TypesettingMode::Unified,
+            ..Self::default()
+        }
+    }
+
+    /// Repairs persisted values before they participate in layout cache keys.
+    pub fn normalize(&mut self) {
+        self.heading_scale = finite_clamp(self.heading_scale, 1.1, 2.2, 1.6);
+        self.body_line_height = finite_clamp(self.body_line_height, 1.2, 2.4, 1.72);
+        self.paragraph_indent_em = finite_clamp(self.paragraph_indent_em, 0.0, 4.0, 2.0);
+        self.paragraph_gap_em = finite_clamp(self.paragraph_gap_em, 0.0, 2.0, 0.75);
+        self.heading_body_gap_em = finite_clamp(self.heading_body_gap_em, 0.2, 2.0, 0.7);
+        self.media_gap_em = finite_clamp(self.media_gap_em, 0.5, 2.0, 1.0);
+        self.list_indent_em = finite_clamp(self.list_indent_em, 0.5, 3.0, 1.5);
+        self.table_font_scale = finite_clamp(self.table_font_scale, 0.7, 1.2, 0.9);
+        self.table_line_height = finite_clamp(self.table_line_height, 1.1, 2.0, 1.45);
+        self.table_cell_padding_em = finite_clamp(self.table_cell_padding_em, 0.2, 1.0, 0.35);
+    }
+}
+
+impl Default for ReaderTypesetting {
+    fn default() -> Self {
+        Self {
+            mode: TypesettingMode::Book,
+            heading_scale: 1.6,
+            body_line_height: 1.72,
+            paragraph_indent_mode: ParagraphIndentMode::Auto,
+            paragraph_indent_em: 2.0,
+            paragraph_gap_em: 0.75,
+            heading_body_gap_em: 0.7,
+            media_gap_em: 1.0,
+            list_indent_em: 1.5,
+            table_font_scale: 0.9,
+            table_line_height: 1.45,
+            table_cell_padding_em: 0.35,
+        }
+    }
 }
 
 /// Generic family used for ordinary reading text.
@@ -201,6 +287,8 @@ impl Default for ReaderStyle {
     fn default() -> Self {
         Self {
             typography: ReaderTypography::default(),
+            typesetting: ReaderTypesetting::default(),
+            writing_system: WritingSystem::Unknown,
             horizontal_margin: 44.0,
             top_margin: DEFAULT_TOP_MARGIN,
             bottom_margin: DEFAULT_BOTTOM_MARGIN,
@@ -522,7 +610,13 @@ impl LayoutEngine {
         let center_standalone_image = source.book().metadata.layout
             == RenditionLayout::PrePaginated
             || fragments_are_standalone_cover(fragments, source.book().cover.as_ref());
-        let media_start_offset = dominant_paragraph_start_offset(fragments, content_width);
+        let unified_reflow = reader_style.typesetting.mode == TypesettingMode::Unified
+            && source.book().metadata.layout != RenditionLayout::PrePaginated;
+        let media_start_offset = if unified_reflow {
+            0.0
+        } else {
+            dominant_paragraph_start_offset(fragments, content_width)
+        };
         let mut paginator = Paginator::new(
             viewport,
             reader_style.background,
@@ -536,8 +630,9 @@ impl LayoutEngine {
             for block in *blocks {
                 match block {
                     Block::Text(block) => {
-                        let prepared = self.shape_text(block, reader_style, content_width);
-                        paginator.push_text(&prepared, block)?;
+                        let resolved = resolve_text_block(block, reader_style, TextContext::Flow);
+                        let prepared = self.shape_text(&resolved, reader_style, content_width);
+                        paginator.push_text(&prepared, &resolved)?;
                     }
                     Block::Table(table) => {
                         let prepared = self.shape_table(
@@ -563,9 +658,16 @@ impl LayoutEngine {
                                 pixels: decoded.into_raw().into(),
                             }
                         };
+                        let mut image_style = image.style;
+                        if unified_reflow {
+                            let gap = reader_style.typography.font_size
+                                * reader_style.typesetting.media_gap_em;
+                            image_style.margin_before = gap;
+                            image_style.margin_after = gap;
+                        }
                         let replacements = paginator.push_image(
                             raster,
-                            image.style,
+                            image_style,
                             image.source.clone(),
                             image.text_layer.clone(),
                         );
@@ -632,23 +734,37 @@ impl LayoutEngine {
         if column_count == 0 || row_count == 0 {
             return PreparedTable::default();
         }
-        let column_width = content_width / column_count as f32;
-        let minimum_row_height = reader_style.typography.font_size.mul_add(1.3, 12.0);
+        let table_metrics = resolve_table_metrics(reader_style);
+        let unified = reader_style.typesetting.mode == TypesettingMode::Unified;
+        let equal_column_width = content_width / column_count as f32;
+        let column_widths = if unified {
+            self.adaptive_table_column_widths(
+                &grid_cells,
+                column_count,
+                content_width,
+                reader_style,
+                table_metrics,
+            )
+        } else {
+            vec![equal_column_width; column_count]
+        };
+        let minimum_row_height = (reader_style.typography.font_size * table_metrics.font_scale)
+            .mul_add(table_metrics.line_height, table_metrics.cell_padding * 2.0);
         let mut row_heights = vec![minimum_row_height; row_count];
         let mut cells = Vec::with_capacity(grid_cells.len());
         for (row, row_span, column, column_span, cell) in grid_cells {
-            let mut block = cell.text.clone();
-            if cell.header {
-                for inline in &mut block.content {
-                    if let Inline::Text(run) = inline {
-                        run.style.bold = true;
-                    }
-                }
+            let block = table_cell_text_block(cell);
+            let mut block =
+                resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
+            if unified {
+                block.style.align = TextAlignment::Center;
             }
-            let cell_width = column_width * column_span as f32;
-            let text_width = (cell_width - TABLE_CELL_PADDING * 2.0).max(20.0);
+            let cell_width = column_widths[column..column + column_span]
+                .iter()
+                .sum::<f32>();
+            let text_width = (cell_width - table_metrics.cell_padding * 2.0).max(20.0);
             let text = self.shape_text_with_min_width(&block, reader_style, text_width, 8.0);
-            let required_height = prepared_text_height(&text) + TABLE_CELL_PADDING * 2.0;
+            let required_height = prepared_text_height(&text) + table_metrics.cell_padding * 2.0;
             if row_span == 1 {
                 row_heights[row] = row_heights[row].max(required_height);
             }
@@ -658,7 +774,7 @@ impl LayoutEngine {
                 column,
                 column_span,
                 header: cell.header,
-                source: block.source,
+                source: block.source.clone(),
                 text,
                 required_height,
             });
@@ -675,9 +791,13 @@ impl LayoutEngine {
             }
         }
         PreparedTable {
-            column_width,
+            horizontal_offset: centered_table_offset(unified, content_width, &column_widths),
+            column_widths,
             row_heights,
             cells,
+            cell_padding: table_metrics.cell_padding,
+            center_content: unified,
+            block_gap: table_metrics.block_gap,
             border: Rgba {
                 alpha: 96,
                 ..reader_style.foreground
@@ -689,6 +809,46 @@ impl LayoutEngine {
         }
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "table spans are clamped to 64 and publication rows are bounded by input limits"
+    )]
+    fn adaptive_table_column_widths(
+        &mut self,
+        grid_cells: &[(usize, usize, usize, usize, &TableCell)],
+        column_count: usize,
+        content_width: f32,
+        reader_style: &ReaderStyle,
+        table_metrics: ResolvedTableMetrics,
+    ) -> Vec<f32> {
+        let equal_column_width = content_width / column_count as f32;
+        let minimum_column_width = (reader_style.typography.font_size * 3.0)
+            .min(equal_column_width)
+            .max(1.0);
+        let mut preferred_widths = vec![minimum_column_width; column_count];
+        for (_, _, column, column_span, cell) in grid_cells {
+            let block = table_cell_text_block(cell);
+            let mut block =
+                resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
+            block.style.align = TextAlignment::Center;
+            let unwrapped = self.shape_text_with_min_width(&block, reader_style, 16_384.0, 8.0);
+            let inline_slack = reader_style.typography.font_size * table_metrics.font_scale * 0.5;
+            let preferred = (unwrapped.layout.full_width().ceil()
+                + table_metrics.cell_padding * 2.0
+                + inline_slack)
+                .clamp(minimum_column_width, content_width);
+            let range = *column..(*column + *column_span);
+            let current = preferred_widths[range.clone()].iter().sum::<f32>();
+            if preferred > current {
+                let addition = (preferred - current) / *column_span as f32;
+                for width in &mut preferred_widths[range] {
+                    *width += addition;
+                }
+            }
+        }
+        fit_adaptive_column_widths(&preferred_widths, minimum_column_width, content_width)
+    }
+
     fn shape_text_with_min_width(
         &mut self,
         block: &TextBlock,
@@ -696,11 +856,8 @@ impl LayoutEngine {
         content_width: f32,
         minimum_width: f32,
     ) -> PreparedText {
-        let start_offset = (block.style.indent
-            + block.style.margin_start
-            + content_width * block.style.margin_start_fraction)
-            .clamp(0.0, (content_width - minimum_width).max(0.0));
-        let available_width = (content_width - start_offset).max(minimum_width);
+        let (start_offset, available_width, first_line_indent) =
+            resolve_text_measure(block, content_width, minimum_width);
         let typography = &reader_style.typography;
         let (text, spans, inline_images, source_text_start) = prepare_inline_content(
             block,
@@ -772,6 +929,9 @@ impl LayoutEngine {
         }
 
         let mut layout = builder.build(&text);
+        if first_line_indent.abs() > f32::EPSILON {
+            layout.set_text_indent(first_line_indent, IndentOptions::default());
+        }
         self.apply_list_indent(
             &mut layout,
             block.kind,
@@ -858,15 +1018,180 @@ impl LayoutEngine {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextContext {
+    Flow,
+    Table,
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedTableMetrics {
+    font_scale: f32,
+    line_height: f32,
+    cell_padding: f32,
+    block_gap: f32,
+}
+
+fn resolve_table_metrics(reader_style: &ReaderStyle) -> ResolvedTableMetrics {
+    if reader_style.typesetting.mode == TypesettingMode::Unified {
+        ResolvedTableMetrics {
+            font_scale: reader_style.typesetting.table_font_scale,
+            line_height: reader_style.typesetting.table_line_height,
+            cell_padding: reader_style.typography.font_size
+                * reader_style.typesetting.table_cell_padding_em,
+            block_gap: reader_style.typography.font_size * 0.7,
+        }
+    } else {
+        ResolvedTableMetrics {
+            font_scale: 1.0,
+            line_height: 1.3,
+            cell_padding: 6.0,
+            block_gap: TABLE_BLOCK_GAP,
+        }
+    }
+}
+
+fn table_cell_text_block(cell: &TableCell) -> TextBlock {
+    let mut block = cell.text.clone();
+    if cell.header {
+        for inline in &mut block.content {
+            if let Inline::Text(run) = inline {
+                run.style.bold = true;
+            }
+        }
+    }
+    block
+}
+
+fn centered_table_offset(unified: bool, available_width: f32, column_widths: &[f32]) -> f32 {
+    if unified {
+        ((available_width - column_widths.iter().sum::<f32>()) / 2.0).max(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn resolve_text_block<'a>(
+    block: &'a TextBlock,
+    reader_style: &ReaderStyle,
+    context: TextContext,
+) -> Cow<'a, TextBlock> {
+    if reader_style.typesetting.mode != TypesettingMode::Unified {
+        return Cow::Borrowed(block);
+    }
+
+    let mut resolved = block.clone();
+    let typography = &reader_style.typography;
+    let profile = &reader_style.typesetting;
+    let base_size = typography.font_size;
+    let (scale, line_height, margin_after) = match context {
+        TextContext::Table => (profile.table_font_scale, profile.table_line_height, 0.0),
+        TextContext::Flow => match block.kind {
+            TextBlockKind::Heading(level) => (
+                unified_heading_scale(profile.heading_scale, level),
+                1.3,
+                base_size * profile.heading_body_gap_em,
+            ),
+            TextBlockKind::Preformatted => (0.9, 1.45, base_size * profile.paragraph_gap_em),
+            TextBlockKind::Blockquote => (
+                0.95,
+                profile.body_line_height,
+                base_size * profile.paragraph_gap_em,
+            ),
+            TextBlockKind::Paragraph | TextBlockKind::ListItem { .. } => (
+                1.0,
+                profile.body_line_height,
+                base_size * profile.paragraph_gap_em,
+            ),
+        },
+    };
+
+    resolved.style.align = TextAlignment::Start;
+    resolved.style.margin_before = 0.0;
+    resolved.style.margin_after = margin_after;
+    resolved.style.indent =
+        if context == TextContext::Flow && block.kind == TextBlockKind::Paragraph {
+            base_size * paragraph_indent_em(profile, reader_style.writing_system)
+        } else {
+            0.0
+        };
+    resolved.style.line_height = line_height;
+    match context {
+        TextContext::Table => {
+            resolved.style.margin_start = 0.0;
+            resolved.style.margin_start_fraction = 0.0;
+        }
+        TextContext::Flow => match block.kind {
+            TextBlockKind::ListItem { .. } => {
+                resolved.style.margin_start = base_size * profile.list_indent_em;
+                resolved.style.margin_start_fraction = 0.0;
+            }
+            TextBlockKind::Blockquote => {
+                resolved.style.margin_start = base_size;
+                resolved.style.margin_start_fraction = 0.0;
+            }
+            _ => {
+                resolved.style.margin_start = 0.0;
+                resolved.style.margin_start_fraction = 0.0;
+            }
+        },
+    }
+
+    for inline in &mut resolved.content {
+        match inline {
+            Inline::Text(run) => {
+                run.style.color = Rgba::BLACK;
+                // Unified typesetting starts from a neutral decoration layer.
+                // Semantic/application decorations can opt back in explicitly.
+                run.style.underline = false;
+                run.style.size_scale = if run.style.baseline == TextBaseline::Normal {
+                    scale
+                } else {
+                    scale * 0.75
+                };
+                if matches!(block.kind, TextBlockKind::Heading(_)) {
+                    run.style.bold = true;
+                }
+            }
+            Inline::Math(run) => run.size_scale = scale,
+            Inline::Break => {}
+        }
+    }
+    Cow::Owned(resolved)
+}
+
+fn paragraph_indent_em(profile: &ReaderTypesetting, writing_system: WritingSystem) -> f32 {
+    if profile.paragraph_indent_mode == ParagraphIndentMode::Custom {
+        return profile.paragraph_indent_em;
+    }
+
+    match writing_system {
+        WritingSystem::Cjk => 2.0,
+        WritingSystem::Latin => 1.5,
+        WritingSystem::Other | WritingSystem::Unknown => profile.paragraph_indent_em,
+    }
+}
+
+fn unified_heading_scale(h1_scale: f32, level: u8) -> f32 {
+    let emphasis = (h1_scale - 1.0).max(0.0);
+    1.0 + emphasis
+        * match level {
+            1 => 1.0,
+            2 => 0.72,
+            3 => 0.45,
+            4 => 0.25,
+            5 => 0.12,
+            _ => 0.05,
+        }
+}
+
 fn dominant_paragraph_start_offset(fragments: &[&[Block]], content_width: f32) -> f32 {
     let mut offsets = fragments
         .iter()
         .flat_map(|blocks| blocks.iter())
         .filter_map(|block| match block {
             Block::Text(block) if block.kind == TextBlockKind::Paragraph => Some(
-                (block.style.indent
-                    + block.style.margin_start
-                    + content_width * block.style.margin_start_fraction)
+                (block.style.margin_start + content_width * block.style.margin_start_fraction)
                     .clamp(0.0, (content_width - 40.0).max(0.0)),
             ),
             Block::Text(_)
@@ -1006,9 +1331,13 @@ struct PreparedText {
 }
 
 struct PreparedTable {
-    column_width: f32,
+    horizontal_offset: f32,
+    column_widths: Vec<f32>,
     row_heights: Vec<f32>,
     cells: Vec<PreparedTableCell>,
+    cell_padding: f32,
+    center_content: bool,
+    block_gap: f32,
     border: Rgba,
     header_fill: Rgba,
 }
@@ -1016,9 +1345,13 @@ struct PreparedTable {
 impl Default for PreparedTable {
     fn default() -> Self {
         Self {
-            column_width: 0.0,
+            horizontal_offset: 0.0,
+            column_widths: Vec::new(),
             row_heights: Vec::new(),
             cells: Vec::new(),
+            cell_padding: 6.0,
+            center_content: false,
+            block_gap: TABLE_BLOCK_GAP,
             border: Rgba::BLACK,
             header_fill: Rgba {
                 alpha: 0,
@@ -1051,6 +1384,55 @@ struct PreparedTableCell {
     source: Option<SourceRange>,
     text: PreparedText,
     required_height: f32,
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "table column counts are bounded by the parsed table grid"
+)]
+fn fit_adaptive_column_widths(
+    preferred_widths: &[f32],
+    minimum_width: f32,
+    available_width: f32,
+) -> Vec<f32> {
+    if preferred_widths.is_empty() || available_width <= 0.0 {
+        return Vec::new();
+    }
+    let column_count = preferred_widths.len();
+    let equal_width = available_width / column_count as f32;
+    let minimum_width = minimum_width.min(equal_width).max(1.0);
+    let minimum_total = minimum_width * column_count as f32;
+    if minimum_total >= available_width {
+        return vec![equal_width; column_count];
+    }
+
+    let preferred = preferred_widths
+        .iter()
+        .map(|width| width.max(minimum_width))
+        .collect::<Vec<_>>();
+    let preferred_total = preferred.iter().sum::<f32>();
+    if preferred_total <= available_width {
+        return preferred;
+    }
+    let mut fitted = {
+        let available_flex = available_width - minimum_total;
+        let preferred_flex = preferred
+            .iter()
+            .map(|width| width - minimum_width)
+            .sum::<f32>();
+        preferred
+            .iter()
+            .map(|width| {
+                minimum_width
+                    + available_flex * ((*width - minimum_width) / preferred_flex.max(1.0))
+            })
+            .collect::<Vec<_>>()
+    };
+    let fitted_total = fitted.iter().sum::<f32>();
+    if let Some(last) = fitted.last_mut() {
+        *last += available_width - fitted_total;
+    }
+    fitted
 }
 
 struct PreparedInlineImage {
@@ -1100,6 +1482,22 @@ fn prepared_text_height(prepared: &PreparedText) -> f32 {
         return 0.0;
     };
     (last.metrics().block_max_coord - first.metrics().block_min_coord).max(0.0)
+}
+
+fn resolve_text_measure(
+    block: &TextBlock,
+    content_width: f32,
+    minimum_width: f32,
+) -> (f32, f32, f32) {
+    let paragraph = block.kind == TextBlockKind::Paragraph;
+    let first_line_indent = if paragraph { block.style.indent } else { 0.0 };
+    let block_indent = if paragraph { 0.0 } else { block.style.indent };
+    let start_offset = (block_indent
+        + block.style.margin_start
+        + content_width * block.style.margin_start_fraction)
+        .clamp(0.0, (content_width - minimum_width).max(0.0));
+    let available_width = (content_width - start_offset).max(minimum_width);
+    (start_offset, available_width, first_line_indent)
 }
 
 fn prepare_inline_content(
@@ -1360,10 +1758,10 @@ impl Paginator {
 
     fn push_table(&mut self, table: &PreparedTable) {
         self.previous_block_was_paragraph = false;
-        if table.row_heights.is_empty() || table.column_width <= 0.0 {
+        if table.row_heights.is_empty() || table.column_widths.is_empty() {
             return;
         }
-        self.ensure_minimum_spacing(TABLE_BLOCK_GAP);
+        self.ensure_minimum_spacing(table.block_gap);
         let mut row_start = 0;
         while row_start < table.row_heights.len() {
             let remaining = self.bottom - self.cursor_y;
@@ -1406,7 +1804,7 @@ impl Paginator {
                 self.advance_column();
             }
         }
-        self.add_spacing(TABLE_BLOCK_GAP);
+        self.add_spacing(table.block_gap);
     }
 
     #[allow(
@@ -1434,19 +1832,29 @@ impl Paginator {
                 let local_row = cell.row - row_start;
                 let cell_x = self.column_left()
                     + self.media_start_offset
-                    + table.column_width * cell.column as f32;
+                    + table.horizontal_offset
+                    + table.column_widths[..cell.column].iter().sum::<f32>();
                 let cell_y = table_y + row_offsets[local_row];
-                let cell_width = table.column_width * cell.column_span as f32;
+                let cell_width = table.column_widths[cell.column..cell.column + cell.column_span]
+                    .iter()
+                    .sum::<f32>();
                 let cell_height = row_offsets[local_row + cell.row_span] - row_offsets[local_row];
-                let text = cell.text.layout.get(0).map(|first| TextPlacement {
-                    layout: Arc::clone(&cell.text.layout),
-                    text: Arc::clone(&cell.text.text),
-                    source_text_start: cell.text.source_text_start,
-                    lines: 0..cell.text.layout.len(),
-                    origin_x: cell_x + TABLE_CELL_PADDING + cell.text.start_offset,
-                    origin_y: cell_y + TABLE_CELL_PADDING - first.metrics().block_min_coord,
-                    source: cell.source.clone(),
-                    inline_images: Arc::clone(&cell.text.inline_images),
+                let text = cell.text.layout.get(0).map(|first| {
+                    let top_padding = if table.center_content {
+                        ((cell_height - prepared_text_height(&cell.text)) / 2.0).max(0.0)
+                    } else {
+                        table.cell_padding
+                    };
+                    TextPlacement {
+                        layout: Arc::clone(&cell.text.layout),
+                        text: Arc::clone(&cell.text.text),
+                        source_text_start: cell.text.source_text_start,
+                        lines: 0..cell.text.layout.len(),
+                        origin_x: cell_x + table.cell_padding + cell.text.start_offset,
+                        origin_y: cell_y + top_padding - first.metrics().block_min_coord,
+                        source: cell.source.clone(),
+                        inline_images: Arc::clone(&cell.text.inline_images),
+                    }
                 });
                 TableCellPlacement {
                     x: cell_x,
@@ -1595,7 +2003,11 @@ impl Paginator {
                 .end
                 .checked_sub(1)
                 .and_then(|line| text.layout.get(line))
-                .map(|line| text.origin_y + line.metrics().block_max_coord),
+                .map(|line| {
+                    let metrics = line.metrics();
+                    let line_box_bottom = metrics.block_min_coord + metrics.line_height;
+                    text.origin_y + metrics.block_max_coord.max(line_box_bottom)
+                }),
             PageItem::Image(image) => Some(image.y + image.height),
             PageItem::Table(table) => Some(table.y + table.height),
             PageItem::Separator(separator) => Some(separator.y + 1.0),
@@ -1722,6 +2134,278 @@ pub enum LayoutError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unified_typesetting_replaces_authored_heading_metrics() {
+        let block = TextBlock {
+            kind: TextBlockKind::Heading(2),
+            content: vec![Inline::Text(TextRun {
+                text: "Heading".into(),
+                style: TextStyle {
+                    size_scale: 2.8,
+                    ..TextStyle::default()
+                },
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle {
+                align: TextAlignment::Center,
+                margin_before: 40.0,
+                margin_after: 50.0,
+                indent: 20.0,
+                line_height: 0.8,
+                ..rebook_publication::BlockStyle::default()
+            },
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+        assert_eq!(resolved.style.align, TextAlignment::Start);
+        assert!(resolved.style.margin_before.abs() < 0.001);
+        assert!((resolved.style.margin_after - 14.0).abs() < 0.001);
+        assert!(resolved.style.indent.abs() < 0.001);
+        assert!((resolved.style.line_height - 1.3).abs() < 0.001);
+        let Inline::Text(run) = &resolved.content[0] else {
+            panic!("expected text run");
+        };
+        assert!((run.style.size_scale - 1.432).abs() < 0.001);
+        assert!(run.style.bold);
+    }
+
+    #[test]
+    fn book_typesetting_preserves_authored_metrics() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "Body".into(),
+                style: TextStyle {
+                    size_scale: 1.35,
+                    ..TextStyle::default()
+                },
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle {
+                margin_after: 23.0,
+                line_height: 1.25,
+                ..rebook_publication::BlockStyle::default()
+            },
+            source: None,
+        };
+
+        let resolved = resolve_text_block(&block, &ReaderStyle::default(), TextContext::Flow);
+        assert_eq!(resolved.as_ref(), &block);
+    }
+
+    #[test]
+    fn reader_typesetting_normalizes_persisted_values() {
+        let mut typesetting = ReaderTypesetting {
+            mode: TypesettingMode::Unified,
+            heading_scale: f32::NAN,
+            body_line_height: 9.0,
+            paragraph_indent_mode: ParagraphIndentMode::Custom,
+            paragraph_indent_em: 8.0,
+            paragraph_gap_em: -1.0,
+            heading_body_gap_em: 4.0,
+            media_gap_em: 0.1,
+            list_indent_em: 8.0,
+            table_font_scale: 0.1,
+            table_line_height: f32::INFINITY,
+            table_cell_padding_em: 2.0,
+        };
+        typesetting.normalize();
+        assert!((typesetting.heading_scale - 1.6).abs() < 0.001);
+        assert!((typesetting.body_line_height - 2.4).abs() < 0.001);
+        assert!((typesetting.paragraph_indent_em - 4.0).abs() < 0.001);
+        assert!(typesetting.paragraph_gap_em.abs() < 0.001);
+        assert!((typesetting.heading_body_gap_em - 2.0).abs() < 0.001);
+        assert!((typesetting.media_gap_em - 0.5).abs() < 0.001);
+        assert!((typesetting.list_indent_em - 3.0).abs() < 0.001);
+        assert!((typesetting.table_font_scale - 0.7).abs() < 0.001);
+        assert!((typesetting.table_line_height - 1.45).abs() < 0.001);
+        assert!((typesetting.table_cell_padding_em - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn adaptive_table_widths_preserve_the_available_measure() {
+        let widths = fit_adaptive_column_widths(&[50.0, 200.0], 40.0, 300.0);
+        assert_eq!(widths.len(), 2);
+        assert!(widths[0] < widths[1]);
+        assert!((widths.iter().sum::<f32>() - 250.0).abs() < 0.001);
+        assert!(widths.iter().all(|width| *width >= 40.0));
+    }
+
+    #[test]
+    fn unified_table_keeps_short_cells_on_one_line_when_space_allows() {
+        let cell = |text: &str| TableCell {
+            text: TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            },
+            column_span: 1,
+            row_span: 1,
+            header: false,
+        };
+        let table = TableBlock {
+            rows: vec![
+                TableRow {
+                    cells: vec![cell(""), cell("U.S."), cell("Norway")],
+                },
+                TableRow {
+                    cells: vec![
+                        cell("Introductory course"),
+                        cell("1.7 books"),
+                        cell("2.8 books"),
+                    ],
+                },
+                TableRow {
+                    cells: vec![
+                        cell("Advanced course"),
+                        cell("2.3 books"),
+                        cell("2.8 books"),
+                    ],
+                },
+            ],
+            source: None,
+        };
+        let mut style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        style.typography.font_size = 16.0;
+        style.typesetting.table_font_scale = 0.8;
+
+        let table = LayoutEngine::new().shape_table(&table, &style, 744.0);
+        assert!(table.column_widths.iter().sum::<f32>() < 744.0);
+        assert!(
+            table.cells.iter().all(|cell| cell.text.layout.len() == 1),
+            "short table cells should remain unwrapped"
+        );
+    }
+
+    #[test]
+    fn unified_typesetting_clears_authored_and_link_underlines() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "Linked and underlined".into(),
+                style: TextStyle {
+                    underline: true,
+                    ..TextStyle::default()
+                },
+                link: Some(PublicationUrl::parse("chapter.xhtml#target").unwrap()),
+            })],
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+        let Inline::Text(run) = &resolved.content[0] else {
+            panic!("expected text run");
+        };
+        assert!(!run.style.underline);
+        assert!(run.link.is_some());
+    }
+
+    #[test]
+    fn unified_typesetting_applies_a_consistent_list_indent() {
+        let block = TextBlock {
+            kind: TextBlockKind::ListItem {
+                ordered: false,
+                ordinal: 1,
+            },
+            content: vec![Inline::Text(TextRun {
+                text: "A list item".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle {
+                margin_start: 90.0,
+                margin_start_fraction: 0.2,
+                ..rebook_publication::BlockStyle::default()
+            },
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+        assert!((resolved.style.margin_start - 30.0).abs() < 0.001);
+        assert!(resolved.style.margin_start_fraction.abs() < 0.001);
+    }
+
+    #[test]
+    fn unified_typesetting_applies_first_line_paragraph_indent() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "A sufficiently long paragraph that wraps onto another line so its first-line indentation can be distinguished from continuation lines.".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+        assert!((resolved.style.indent - 40.0).abs() < 0.001);
+
+        let mut engine = LayoutEngine::new();
+        let prepared = engine.shape_text_with_min_width(&resolved, &style, 320.0, 40.0);
+        assert!(prepared.layout.len() > 1);
+        let first_offset = prepared.layout.get(0).unwrap().metrics().offset;
+        let continuation_offset = prepared.layout.get(1).unwrap().metrics().offset;
+        assert!((first_offset - 40.0).abs() < 0.01);
+        assert!(continuation_offset.abs() < 0.01);
+    }
+
+    #[test]
+    fn automatic_paragraph_indent_uses_publication_writing_system() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "Paragraph".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        let mut style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            writing_system: WritingSystem::Cjk,
+            ..ReaderStyle::default()
+        };
+
+        let cjk = resolve_text_block(&block, &style, TextContext::Flow);
+        assert!((cjk.style.indent - 40.0).abs() < 0.001);
+
+        style.writing_system = WritingSystem::Latin;
+        let latin = resolve_text_block(&block, &style, TextContext::Flow);
+        assert!((latin.style.indent - 30.0).abs() < 0.001);
+
+        style.typesetting.paragraph_indent_mode = ParagraphIndentMode::Custom;
+        style.typesetting.paragraph_indent_em = 0.8;
+        let custom = resolve_text_block(&block, &style, TextContext::Flow);
+        assert!((custom.style.indent - 16.0).abs() < 0.001);
+    }
 
     #[test]
     fn reader_typography_matches_readest_defaults_and_builds_cjk_stacks() {
@@ -2049,6 +2733,90 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(formula_count, 1);
+    }
+
+    #[test]
+    fn unified_tables_adapt_columns_wrap_and_center_cell_content() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("adaptive-table-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let cell = |text: &str| TableCell {
+            text: TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            },
+            column_span: 1,
+            row_span: 1,
+            header: false,
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![Block::Table(TableBlock {
+                rows: vec![TableRow {
+                    cells: vec![
+                        cell("ID"),
+                        cell(
+                            "A substantially longer description that must wrap inside its adaptive column.",
+                        ),
+                    ],
+                }],
+                source: None,
+            })],
+            anchors: Vec::new(),
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(420, 360).unwrap(),
+                &style,
+            )
+            .unwrap();
+        let table = layout
+            .pages
+            .iter()
+            .flat_map(|page| &page.items)
+            .find_map(|item| match item {
+                PageItem::Table(table) => Some(table),
+                _ => None,
+            })
+            .expect("table should be laid out");
+        let [short, long] = table.cells.as_slice() else {
+            panic!("expected two cells");
+        };
+        assert!(short.width < long.width);
+        let short_text = short.text.as_ref().expect("short cell should have text");
+        let long_text = long.text.as_ref().expect("long cell should have text");
+        assert!(long_text.layout.len() > 1, "long content should wrap");
+        assert!(
+            short_text
+                .layout
+                .get(0)
+                .is_some_and(|line| line.metrics().offset > 0.0),
+            "short content should be horizontally centered"
+        );
+        assert!(
+            short_text.origin_y > long_text.origin_y,
+            "short content should be vertically centered beside wrapped content"
+        );
     }
 
     #[test]
@@ -2478,7 +3246,11 @@ mod tests {
             panic!("expected text followed by an image");
         };
         let last_line = text.layout.get(text.lines.end - 1).unwrap();
-        let text_bottom = text.origin_y + last_line.metrics().block_max_coord;
+        let metrics = last_line.metrics();
+        let text_bottom = text.origin_y
+            + metrics
+                .block_max_coord
+                .max(metrics.block_min_coord + metrics.line_height);
 
         assert!((image.y - text_bottom - IMAGE_BLOCK_GAP).abs() < 0.001);
     }
