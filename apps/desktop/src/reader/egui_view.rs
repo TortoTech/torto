@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, Pos2, Rect, RichText, TextureId, Vec2};
-use rebook_layout::{ReaderStyle, SpreadMode, reading_content_left, reading_content_width};
+use rebook_layout::{SpreadMode, reading_content_left, reading_content_width};
 use rebook_reader::{PageDirection, ReaderImage, SelectionGranularity};
 
 use super::chat_autocomplete::{
@@ -11,8 +11,8 @@ use super::chat_autocomplete::{
 use super::chat_markdown::ChatMarkdownState;
 use super::{
     AnnotationDraft, AssistantPanel, DesktopReader, GeneratedTocDraft, ImagePointerState,
-    ImagePressCandidate, ReaderOverlay, ScrollSectionLayout, SelectedImage, SidebarTab,
-    focus_unit_screen_center_y,
+    ImagePressCandidate, MOTION_EPSILON, ReaderOverlay, SelectedImage, SidebarTab,
+    focus_unit_screen_center_y, focus_unit_target_offset_for_rect,
 };
 use crate::plugins::{
     BookSearchResult, ChatCommand, ChatRole, PdfOcrViewMode, chat_command_suggestions,
@@ -258,23 +258,6 @@ fn page_image_left(page: &rebook_renderer::PageDisplayList) -> Option<f32> {
         .map(|left| left as f32)
 }
 
-fn scroll_chapter_content_left(
-    layout: &ScrollSectionLayout,
-    align_to_pdf_page: bool,
-    viewport_width: f32,
-    style: &ReaderStyle,
-) -> f32 {
-    if align_to_pdf_page
-        && let Some(left) = layout
-            .pages
-            .first()
-            .and_then(|entry| page_image_left(&entry.page))
-    {
-        return left;
-    }
-    reading_content_left(viewport_width, style)
-}
-
 fn uses_pdf_page_alignment(format: rebook_formats::BookFormat, ocr_mode: PdfOcrViewMode) -> bool {
     format == rebook_formats::BookFormat::Pdf && ocr_mode == PdfOcrViewMode::Original
 }
@@ -419,13 +402,34 @@ impl DesktopReader {
         let rebuild_focus_units = self.is_focus_mode() && self.focus_units.is_empty();
         if rebuild_focus_units {
             self.rebuild_focus_units(&layout);
+            if let Some(direction) = self.pending_reading_unit_entry
+                && !self.focus_units.is_empty()
+            {
+                self.focus_unit_index = match direction {
+                    PageDirection::Previous => self.focus_units.len() - 1,
+                    PageDirection::Next => 0,
+                };
+                self.focus_anchor = self
+                    .focus_units
+                    .get(self.focus_unit_index)
+                    .map(|unit| unit.range.start.clone());
+                self.sync_focus_chat_session();
+                self.sync_focus_selected_image();
+            }
+            // The page texture handed to this UI pass was rendered before the
+            // newly selected focus unit existed. Schedule one more frame so the
+            // rebuilt image underlay and complete paragraph overlay become the
+            // texture that is actually presented, even when no animation follows.
+            ui.ctx().request_repaint();
         }
         let mut scroll_area = egui::ScrollArea::vertical()
             .id_salt("reader-section-scroll")
             .max_height(size.y)
             .auto_shrink([false, false]);
         if self.is_focus_mode() {
-            scroll_area = scroll_area.scroll_source(egui::scroll_area::ScrollSource::NONE);
+            // Focus mode maps wheel and keyboard input to reading-unit navigation,
+            // but the visible scrollbar must remain directly interactive.
+            scroll_area = scroll_area.scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR);
         }
         if rebuild_focus_units || (self.is_focus_mode() && self.scroll_viewport.is_none()) {
             self.focus_target_offset = self.focus_unit_target_offset(size.y);
@@ -438,6 +442,20 @@ impl DesktopReader {
         }
         if self.is_focus_mode() {
             self.scroll_target_position = None;
+            self.pending_reading_unit_entry = None;
+        } else if let Some(direction) = self.pending_reading_unit_entry.take() {
+            self.scroll_target_position = None;
+            self.scroll_target_source = None;
+            let offset = match direction {
+                PageDirection::Previous => layout.content_height,
+                PageDirection::Next => 0.0,
+            };
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+        } else if let Some(target) = self.scroll_target_source.take()
+            && let Some(top) = layout.source_top(&target)
+        {
+            self.scroll_target_position = None;
+            scroll_area = scroll_area.vertical_scroll_offset(top);
         } else if let Some(target) = self.scroll_target_position.take()
             && let Some(top) = layout.page_top(target)
         {
@@ -447,13 +465,14 @@ impl DesktopReader {
         }
 
         let mut page_rect = Rect::NOTHING;
-        let mut previous_clicked = false;
-        let mut next_clicked = false;
-        scroll_area.show_viewport(ui, |ui, viewport| {
+        let keyboard_scroll_delta = std::mem::take(&mut self.pending_keyboard_scroll_delta);
+        let scroll_output = scroll_area.show_viewport(ui, |ui, viewport| {
             ui.set_width(viewport.width());
             let content_padding = self.scroll_content_padding(viewport.height());
             ui.set_height((layout.content_height + content_padding * 2.0).max(viewport.height()));
-            let content_rect = ui.max_rect();
+            if keyboard_scroll_delta.abs() > f32::EPSILON {
+                ui.scroll_with_delta(Vec2::new(0.0, keyboard_scroll_delta));
+            }
             // ScrollArea rounds the moving content origin to physical pixels. Rebuilding
             // the viewport from that rounded origin plus the unrounded logical offset
             // leaks the rounding residue into the page texture position and produces a
@@ -476,65 +495,84 @@ impl DesktopReader {
                 ui.id().with("scroll-reader-viewport"),
                 egui::Sense::click_and_drag(),
             );
-            self.update_scroll_viewport(super::ScrollViewportState {
-                offset_y: viewport.min.y,
-                size: viewport.size(),
-            });
+            self.update_scroll_viewport(
+                ui.ctx(),
+                super::ScrollViewportState {
+                    offset_y: viewport.min.y,
+                    size: viewport.size(),
+                },
+            );
             if self.image_preview.is_none() && !interaction_blocked {
                 self.pointer_interaction(&response);
                 if self.is_focus_mode() {
                     self.focus_wheel_interaction(&response);
+                } else {
+                    self.scroll_boundary_wheel_interaction(&response, interaction_blocked);
                 }
             }
-
-            if !self.is_focus_mode() && (layout.reading_unit_index > 0 || layout.section_index > 0)
-            {
-                let left = content_rect.left()
-                    + scroll_chapter_content_left(
-                        &layout,
-                        uses_pdf_page_alignment(self.format, self.pdf_ocr.mode),
-                        viewport.width(),
-                        &self.reader.style(),
-                    );
-                let rect = Rect::from_min_size(
-                    Pos2::new(left, content_rect.top() + 10.0),
-                    Vec2::new(128.0, 36.0),
-                );
-                previous_clicked = ui
-                    .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                        ui.style_mut().spacing.button_padding.x = 0.0;
-                        ui.add(
-                            egui::Button::new(self.language.text("上一小节", "Previous section"))
-                                .frame(false)
-                                .min_size(Vec2::new(0.0, rect.height())),
-                        )
-                    })
-                    .inner
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked();
-            }
-            if !self.is_focus_mode()
-                && let Some(top) = layout.next_button_top
-            {
-                let rect = Rect::from_center_size(
-                    Pos2::new(content_rect.center().x, content_rect.top() + top + 18.0),
-                    Vec2::new(152.0, 36.0),
-                );
-                next_clicked = ui
-                    .put(
-                        rect,
-                        egui::Button::new(self.language.text("下一小节", "Next section")),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked();
-            }
         });
-        if previous_clicked {
-            self.go_to_adjacent_section(PageDirection::Previous);
-        } else if next_clicked {
-            self.go_to_adjacent_section(PageDirection::Next);
+        if self.is_focus_mode() {
+            self.focus_scrollbar_navigation(ui.ctx(), &scroll_output, size.y);
         }
         page_rect
+    }
+
+    fn focus_scrollbar_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        output: &egui::scroll_area::ScrollAreaOutput<()>,
+        viewport_height: f32,
+    ) {
+        let target_id = output.id.with("focus-scrollbar-target");
+        let (primary_down, primary_clicked, primary_released) = ctx.input(|input| {
+            (
+                input.pointer.primary_down(),
+                input.pointer.primary_clicked(),
+                input.pointer.button_released(egui::PointerButton::Primary),
+            )
+        });
+        let manipulating =
+            output.state.vertical_scroll_bar_interacting() && (primary_down || primary_clicked);
+        if manipulating
+            && let Some(index) = focus_unit_index_for_scroll_offset(
+                self.focus_units.iter().map(|unit| unit.rect),
+                output.state.offset.y,
+                viewport_height,
+            )
+            && let Some(target_offset) = self
+                .focus_units
+                .get(index)
+                .map(|unit| focus_unit_target_offset_for_rect(unit.rect, viewport_height))
+        {
+            // The native scroll bar supplies a continuous offset. Quantize its
+            // state to the nearest focus unit so dragging the handle previews
+            // whole paragraphs instead of leaving the reader between them.
+            let mut state = output.state;
+            state.offset.y = target_offset;
+            state.store(ctx, output.id);
+            self.ui.focus_scroll_motion = None;
+            self.focus_target_offset = None;
+            let changed = self
+                .scroll_viewport
+                .is_none_or(|viewport| (viewport.offset_y - target_offset).abs() > 0.1);
+            self.scroll_viewport = Some(super::ScrollViewportState {
+                offset_y: target_offset,
+                size: output.inner_rect.size(),
+            });
+            if changed {
+                self.bump_scene_revision();
+            }
+            ctx.data_mut(|data| data.insert_temp(target_id, index));
+            ctx.request_repaint();
+        }
+
+        if primary_released {
+            if let Some(index) = ctx.data_mut(|data| data.remove_temp::<usize>(target_id)) {
+                self.select_focus_unit(index);
+            }
+        } else if !primary_down && !primary_clicked {
+            ctx.data_mut(|data| data.remove_temp::<usize>(target_id));
+        }
     }
 
     fn show_side_panels(&mut self, root_ui: &mut egui::Ui) -> (f32, f32) {
@@ -643,15 +681,48 @@ impl DesktopReader {
             ctx.memory_mut(egui::Memory::stop_text_input);
             return;
         }
+        if !interaction_blocked
+            && self.ui.sidebar_open
+            && !self.ui.sidebar_pinned
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.set_sidebar_open(false);
+            ctx.memory_mut(egui::Memory::stop_text_input);
+            return;
+        }
         if self.is_focus_mode()
             && !interaction_blocked
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
             && self.ui.assistant_panel.is_some()
         {
-            self.ui.focus_chat_minimized = true;
             self.close_assistant_panel();
             ctx.memory_mut(egui::Memory::stop_text_input);
             return;
+        }
+        if self.is_focus_mode()
+            && !interaction_blocked
+            && self.ui.assistant_panel.is_some()
+            && self.current_chat_has_data()
+            && !assistant_suggestions_active(
+                &self.chat.input,
+                self.chat.cursor_char_index,
+                &self.chat.references,
+            )
+        {
+            let scroll_delta = ctx.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    -ASSISTANT_KEYBOARD_SCROLL_STEP
+                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    ASSISTANT_KEYBOARD_SCROLL_STEP
+                } else {
+                    0.0
+                }
+            });
+            if scroll_delta != 0.0 {
+                self.chat.pending_keyboard_scroll_delta += scroll_delta;
+                ctx.request_repaint();
+                return;
+            }
         }
         if self.focus_action_shortcut(ctx, interaction_blocked) {
             return;
@@ -663,10 +734,10 @@ impl DesktopReader {
             && !interaction_blocked
             && !self.ui.overlay_visible()
             && self.image_preview.is_none()
+            && self.ui.assistant_panel.is_none()
             && self.annotation_note_draft.is_none()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
         {
-            self.ui.focus_chat_minimized = false;
             self.ui.focus_actions_visible = true;
             self.cancel_text_selection();
             ctx.memory_mut(egui::Memory::stop_text_input);
@@ -695,11 +766,20 @@ impl DesktopReader {
         if self.is_focus_mode() && self.ui.sidebar_open {
             return;
         }
+        self.reading_navigation_shortcuts(ctx);
+    }
+
+    fn reading_navigation_shortcuts(&mut self, ctx: &egui::Context) {
         if self.is_focus_mode() {
-            let previous_unit = ctx.input(|input| input.key_pressed(egui::Key::ArrowUp));
-            let next_unit = ctx.input(|input| input.key_pressed(egui::Key::ArrowDown));
-            let previous_section = ctx.input(|input| input.key_pressed(egui::Key::ArrowLeft));
-            let next_section = ctx.input(|input| input.key_pressed(egui::Key::ArrowRight));
+            let (previous_unit, next_unit, previous_section, next_section) =
+                ctx.input_mut(|input| {
+                    (
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                    )
+                });
             if previous_unit {
                 if !self.scroll_within_tall_focus_unit(PageDirection::Previous) {
                     self.move_focus_unit(PageDirection::Previous);
@@ -716,22 +796,18 @@ impl DesktopReader {
             return;
         }
         if self.is_scroll_mode() {
-            let previous = ctx.input(|input| input.key_pressed(egui::Key::ArrowLeft));
-            let next = ctx.input(|input| input.key_pressed(egui::Key::ArrowRight));
-            if previous {
-                self.go_to_adjacent_section(PageDirection::Previous);
-            } else if next {
-                self.go_to_adjacent_section(PageDirection::Next);
-            }
+            self.scroll_navigation_shortcuts(ctx);
             return;
         }
-        let previous = ctx.input(|input| {
-            input.key_pressed(egui::Key::ArrowLeft) || input.key_pressed(egui::Key::PageUp)
-        });
-        let next = ctx.input(|input| {
-            input.key_pressed(egui::Key::ArrowRight)
-                || input.key_pressed(egui::Key::PageDown)
-                || input.key_pressed(egui::Key::Space)
+        let (previous, next) = ctx.input_mut(|input| {
+            let left = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft);
+            let up = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp);
+            let page_up = input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp);
+            let right = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight);
+            let down = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown);
+            let page_down = input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown);
+            let space = input.consume_key(egui::Modifiers::NONE, egui::Key::Space);
+            (left || up || page_up, right || down || page_down || space)
         });
         if previous {
             self.turn_page(PageDirection::Previous);
@@ -739,6 +815,63 @@ impl DesktopReader {
         if next {
             self.turn_page(PageDirection::Next);
         }
+    }
+
+    fn scroll_navigation_shortcuts(&mut self, ctx: &egui::Context) {
+        let (previous, next, up, down, page_up, page_down) = ctx.input_mut(|input| {
+            (
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown),
+            )
+        });
+        if previous || next {
+            self.go_to_adjacent_section(if previous {
+                PageDirection::Previous
+            } else {
+                PageDirection::Next
+            });
+        } else if up || page_up {
+            self.scroll_with_keyboard(PageDirection::Previous, page_up);
+        } else if down || page_down {
+            self.scroll_with_keyboard(PageDirection::Next, page_down);
+        }
+    }
+
+    fn scroll_with_keyboard(&mut self, direction: PageDirection, page_step: bool) {
+        let at_boundary = match direction {
+            PageDirection::Previous => self
+                .scroll_viewport
+                .is_some_and(|viewport| viewport.offset_y <= MOTION_EPSILON),
+            PageDirection::Next => self
+                .scroll_section
+                .as_ref()
+                .zip(self.scroll_viewport)
+                .is_some_and(|(layout, viewport)| {
+                    let padding = self.scroll_content_padding(viewport.size.y);
+                    let max_offset =
+                        (layout.content_height + padding * 2.0 - viewport.size.y).max(0.0);
+                    viewport.offset_y >= max_offset - MOTION_EPSILON
+                }),
+        };
+        if at_boundary {
+            self.go_to_adjacent_section(direction);
+            return;
+        }
+        let step = self.scroll_viewport.map_or(48.0, |viewport| {
+            if page_step {
+                viewport.size.y * 0.8
+            } else {
+                48.0
+            }
+        });
+        self.pending_keyboard_scroll_delta = match direction {
+            PageDirection::Previous => step,
+            PageDirection::Next => -step,
+        };
     }
 
     fn focus_action_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
@@ -777,7 +910,8 @@ impl DesktopReader {
     }
 
     fn focus_wheel_interaction(&mut self, response: &egui::Response) {
-        if self.ui.sidebar_open {
+        if self.ui.sidebar_open || self.ui.assistant_panel.is_some() && self.current_chat_has_data()
+        {
             self.ui.wheel_accumulator = 0.0;
             return;
         }
@@ -832,6 +966,85 @@ impl DesktopReader {
         if !self.scroll_within_tall_focus_unit(direction) {
             self.move_focus_unit(direction);
         }
+        response.ctx.input_mut(|input| {
+            input.smooth_scroll_delta.y = 0.0;
+        });
+    }
+
+    fn scroll_boundary_wheel_interaction(
+        &mut self,
+        response: &egui::Response,
+        interaction_blocked: bool,
+    ) {
+        let pointer_over_page = response
+            .ctx
+            .pointer_hover_pos()
+            .is_some_and(|position| response.rect.contains(position));
+        if interaction_blocked
+            || !pointer_over_page
+            || self.ui.overlay_visible()
+            || self.ui.sidebar_open && !self.ui.sidebar_pinned
+        {
+            self.ui.wheel_accumulator = 0.0;
+            return;
+        }
+        let delta = response.ctx.input(|input| {
+            input
+                .raw
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                        ..
+                    } if !modifiers.ctrl && !modifiers.command => Some(
+                        delta.y
+                            * match unit {
+                                egui::MouseWheelUnit::Point => 1.0,
+                                egui::MouseWheelUnit::Line => 50.0,
+                                egui::MouseWheelUnit::Page => 240.0,
+                            },
+                    ),
+                    _ => None,
+                })
+                .sum::<f32>()
+        });
+        let Some((layout, viewport)) = self.scroll_section.as_ref().zip(self.scroll_viewport)
+        else {
+            return;
+        };
+        let max_offset = (layout.content_height - viewport.size.y).max(0.0);
+        let direction = if delta > 0.0 && viewport.offset_y <= MOTION_EPSILON {
+            Some(PageDirection::Previous)
+        } else if delta < 0.0 && viewport.offset_y >= max_offset - MOTION_EPSILON {
+            Some(PageDirection::Next)
+        } else {
+            None
+        };
+        let Some(direction) = direction else {
+            self.ui.wheel_accumulator = 0.0;
+            return;
+        };
+        if self.ui.wheel_accumulator.signum() != delta.signum() {
+            self.ui.wheel_accumulator = 0.0;
+        }
+        self.ui.wheel_accumulator += delta;
+        if self.ui.wheel_accumulator.abs() < WHEEL_PAGE_THRESHOLD {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .ui
+            .last_wheel_turn
+            .is_some_and(|last| now.saturating_duration_since(last) < WHEEL_TURN_COOLDOWN)
+        {
+            return;
+        }
+        self.ui.wheel_accumulator = 0.0;
+        self.ui.last_wheel_turn = Some(now);
+        self.go_to_adjacent_section(direction);
         response.ctx.input_mut(|input| {
             input.smooth_scroll_delta.y = 0.0;
         });
@@ -973,14 +1186,13 @@ impl DesktopReader {
                                 {
                                     self.toggle_menu();
                                 }
-                                if icon_button(ui, Icon::MessageCircle)
-                                    .on_hover_text(self.language.text("AI 助手", "AI assistant"))
-                                    .clicked()
+                                if !self.is_focus_mode()
+                                    && icon_button(ui, Icon::MessageCircle)
+                                        .on_hover_text(
+                                            self.language.text("AI 助手", "AI assistant"),
+                                        )
+                                        .clicked()
                                 {
-                                    if self.is_focus_mode() && self.ui.assistant_panel.is_none() {
-                                        self.attach_current_focus_reference();
-                                        self.ui.focus_chat_minimized = false;
-                                    }
                                     self.toggle_assistant_panel(AssistantPanel::Chat);
                                 }
                             },
@@ -988,13 +1200,9 @@ impl DesktopReader {
                     }
                 });
             });
-        paint_toolbar_title(
-            ui,
-            hover_rect,
-            content_left,
-            toolbar_actions_visible,
-            &chapter_title,
-        );
+        if toolbar_actions_visible {
+            paint_toolbar_title(ui, hover_rect, content_left, true, &chapter_title);
+        }
         let hovered = ui.ctx().input(|input| {
             input
                 .pointer
@@ -1192,47 +1400,23 @@ impl DesktopReader {
     }
 
     fn focus_assistant_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
-        if self.ui.assistant_panel.is_none() && !self.ui.focus_chat_minimized {
-            return;
-        }
+        self.sync_focus_chat_session();
         let viewport = ctx.content_rect();
-        let anchor_y = self
-            .focused_unit_screen_center_y(page_rect)
-            .unwrap_or_else(|| page_rect.center().y);
         let style = self.reader.style();
         let content_right = page_rect.left()
             + reading_content_left(page_rect.width(), &style)
             + reading_content_width(page_rect.width(), &style);
+        self.focus_data_indicator_overlays(ctx, page_rect, viewport, content_right);
         if self.ui.assistant_panel.is_none() {
-            egui::Area::new("focus-assistant-minimized".into())
-                .order(egui::Order::Foreground)
-                .fixed_pos(Pos2::new(
-                    (content_right + 12.0).min(viewport.right() - 52.0),
-                    anchor_y - 18.0,
-                ))
-                .show(ctx, |ui| {
-                    let (rect, response) =
-                        ui.allocate_exact_size(Vec2::splat(36.0), egui::Sense::click());
-                    let alpha = if response.hovered() { 0.92 } else { 0.58 };
-                    ui.painter().circle_filled(
-                        rect.center(),
-                        18.0,
-                        palette().accent.gamma_multiply(alpha),
-                    );
-                    paint_icon(ui, rect.shrink(10.0), Icon::MessageCircle, Color32::WHITE);
-                    if response.clicked() {
-                        self.ui.focus_chat_minimized = false;
-                        self.open_assistant_panel(AssistantPanel::Chat);
-                    }
-                });
             return;
         }
 
+        let anchor_y = self
+            .focused_unit_screen_center_y(page_rect)
+            .unwrap_or_else(|| page_rect.center().y);
         let x = content_right + 12.0;
         let width = (viewport.right() - x - 16.0).clamp(120.0, 420.0);
-        let has_conversation = !self.chat.messages.is_empty()
-            || self.chat.task.is_pending()
-            || self.chat.error.is_some();
+        let has_conversation = self.current_chat_has_data() || self.chat.error.is_some();
         let (content_height, frame_margin) = if has_conversation {
             (
                 (viewport.height() * 0.58).clamp(280.0, 520.0),
@@ -1250,24 +1434,13 @@ impl DesktopReader {
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))
             .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(palette().surface)
-                    .stroke(egui::Stroke::new(1.0, palette().border))
-                    .corner_radius(12)
-                    .inner_margin(frame_margin)
-                    .shadow(egui::Shadow {
-                        offset: [0, 5],
-                        blur: 20,
-                        spread: 0,
-                        color: Color32::from_black_alpha(36),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(
-                            width - f32::from(frame_margin.left) - f32::from(frame_margin.right),
-                        );
-                        ui.set_height(content_height);
-                        self.focus_assistant_dialog(ui, has_conversation);
-                    });
+                focus_assistant_frame(frame_margin).show(ui, |ui| {
+                    ui.set_width(
+                        width - f32::from(frame_margin.left) - f32::from(frame_margin.right),
+                    );
+                    ui.set_height(content_height);
+                    self.focus_assistant_dialog(ui, has_conversation);
+                });
             });
         let clicked_outside = ctx.input(|input| {
             input.pointer.any_click()
@@ -1279,6 +1452,85 @@ impl DesktopReader {
         if clicked_outside {
             self.close_assistant_panel();
             ctx.memory_mut(egui::Memory::stop_text_input);
+        }
+    }
+
+    fn focus_data_indicator_overlays(
+        &mut self,
+        ctx: &egui::Context,
+        page_rect: Rect,
+        viewport: Rect,
+        content_right: f32,
+    ) {
+        let mut clicked_chat_index = None;
+        let mut clicked_note = None;
+        for index in 0..self.focus_units.len() {
+            let current_replacement_visible = index == self.focus_unit_index
+                && (self.ui.focus_actions_visible || self.ui.assistant_panel.is_some());
+            if current_replacement_visible {
+                continue;
+            }
+            let has_chat = self.focus_chat_has_data_at(index);
+            let note = self.focus_note_at(index);
+            if !has_chat && note.is_none() {
+                continue;
+            }
+            let Some(anchor_y) = self.focus_unit_screen_center_y_at(index, page_rect) else {
+                continue;
+            };
+            let group_height = if has_chat && note.is_some() {
+                66.0
+            } else {
+                30.0
+            };
+            if anchor_y + group_height / 2.0 < viewport.top()
+                || anchor_y - group_height / 2.0 > viewport.bottom()
+            {
+                continue;
+            }
+            let x = (content_right + 12.0).min(viewport.right() - 44.0);
+            let mut y = anchor_y - group_height / 2.0;
+            if has_chat {
+                let hover_text = self.language.text("打开段落对话", "Open paragraph chat");
+                let clicked = egui::Area::new(egui::Id::new(("focus-chat-indicator", index)))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(Pos2::new(x, y))
+                    .show(ctx, |ui| {
+                        focus_data_indicator(ui, Icon::MessageCircle, hover_text)
+                    })
+                    .inner;
+                if clicked {
+                    clicked_chat_index = Some(index);
+                }
+                y += 36.0;
+            }
+            if let Some(note) = note {
+                let hover_text = self.language.text("查看段落批注", "Open paragraph note");
+                let clicked = egui::Area::new(egui::Id::new(("focus-note-indicator", index)))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(Pos2::new(x, y))
+                    .show(ctx, |ui| {
+                        focus_data_indicator(ui, Icon::MessageSquareText, hover_text)
+                    })
+                    .inner;
+                if clicked {
+                    clicked_note = Some((index, note));
+                }
+            }
+        }
+        if let Some(index) = clicked_chat_index {
+            self.ui.focus_actions_visible = false;
+            self.annotation_note_draft = None;
+            self.select_focus_unit(index);
+            self.open_assistant_panel(AssistantPanel::Chat);
+        } else if let Some((index, note)) = clicked_note {
+            self.close_assistant_panel();
+            self.select_focus_unit(index);
+            self.ui.focus_actions_visible = true;
+            self.annotation_note_draft = Some(AnnotationDraft {
+                note,
+                focus_pending: true,
+            });
         }
     }
 
@@ -1295,16 +1547,17 @@ impl DesktopReader {
             + reading_content_left(page_rect.width(), &style)
             + reading_content_width(page_rect.width(), &style);
         let note_open = self.annotation_note_draft.is_some();
-        let width = if note_open { 338.0 } else { 40.0 };
-        let x = (content_right + 12.0).min((viewport.right() - width - 12.0).max(12.0));
-        let y = if note_open {
-            (anchor_y - 62.0).clamp(
-                viewport.top() + 12.0,
-                (viewport.bottom() - 150.0).max(viewport.top() + 12.0),
-            )
+        let x = if note_open {
+            content_right + 12.0
         } else {
-            (anchor_y - 64.0).clamp(viewport.top() + 12.0, viewport.bottom() - 140.0)
+            (content_right + 12.0).min(viewport.right() - 52.0)
         };
+        let width = if note_open {
+            (viewport.right() - x - 16.0).clamp(120.0, 338.0)
+        } else {
+            40.0
+        };
+        let y = focus_actions_overlay_y(note_open, anchor_y, viewport);
         let mut chat = false;
         let mut highlight = false;
         let mut open_note = false;
@@ -1316,8 +1569,9 @@ impl DesktopReader {
             .fixed_pos(Pos2::new(x, y))
             .show(ctx, |ui| {
                 if let Some(draft) = self.annotation_note_draft.as_mut() {
-                    selection_popover_frame(12).show(ui, |ui| {
-                        match annotation_editor(ui, draft, self.language) {
+                    focus_assistant_frame(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+                        ui.set_width((width - 20.0).max(100.0));
+                        match focus_annotation_editor(ui, draft, self.language) {
                             AnnotationEditorAction::None => {}
                             AnnotationEditorAction::Save => save_note = true,
                             AnnotationEditorAction::Cancel => cancel_note = true,
@@ -1393,8 +1647,12 @@ impl DesktopReader {
     }
 
     fn focused_unit_screen_center_y(&self, page_rect: Rect) -> Option<f32> {
+        self.focus_unit_screen_center_y_at(self.focus_unit_index, page_rect)
+    }
+
+    fn focus_unit_screen_center_y_at(&self, index: usize, page_rect: Rect) -> Option<f32> {
         let viewport = self.scroll_viewport?;
-        let unit = self.focus_units.get(self.focus_unit_index)?;
+        let unit = self.focus_units.get(index)?;
         Some(focus_unit_screen_center_y(
             unit.rect,
             viewport.offset_y,
@@ -2006,12 +2264,7 @@ impl DesktopReader {
             .streaming
             .as_ref()
             .map(|streaming| streaming.content.clone());
-        let keyboard_scroll = assistant_keyboard_scroll_input(
-            ui,
-            &self.chat.input,
-            self.chat.cursor_char_index,
-            &self.chat.references,
-        );
+        let routed_scroll = self.assistant_conversation_scroll_delta(ui);
         let mut clicked_citation = None;
         let scroll_output = egui::ScrollArea::vertical()
             .stick_to_bottom(true)
@@ -2019,8 +2272,8 @@ impl DesktopReader {
             .min_scrolled_height(height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if let Some(delta) = keyboard_scroll.filter(|delta| *delta != 0.0) {
-                    ui.scroll_with_delta(Vec2::new(0.0, -delta));
+                if routed_scroll != 0.0 {
+                    ui.scroll_with_delta(Vec2::new(0.0, routed_scroll));
                 }
                 let content_width =
                     (ui.available_width() - ASSISTANT_SCROLLBAR_GUTTER).max(1.0);
@@ -2097,6 +2350,25 @@ impl DesktopReader {
         if let Some(locator) = clicked_citation {
             self.open_chat_citation(&locator);
         }
+    }
+
+    fn assistant_conversation_scroll_delta(&mut self, ui: &mut egui::Ui) -> f32 {
+        if self.is_focus_mode() && self.ui.assistant_panel.is_some() {
+            let keyboard = std::mem::take(&mut self.chat.pending_keyboard_scroll_delta);
+            let wheel = ui.input_mut(|input| {
+                let delta = input.smooth_scroll_delta.y;
+                input.smooth_scroll_delta.y = 0.0;
+                delta
+            });
+            return wheel - keyboard;
+        }
+        -assistant_keyboard_scroll_input(
+            ui,
+            &self.chat.input,
+            self.chat.cursor_char_index,
+            &self.chat.references,
+        )
+        .unwrap_or_default()
     }
 
     fn assistant_error(&self, ui: &mut egui::Ui) {
@@ -2448,8 +2720,8 @@ impl DesktopReader {
                             mode_button.inner
                         } else {
                             mode_button.inner.on_disabled_hover_text(self.language.text(
-                                "原始 PDF 仅支持经典模式，请先切换到 OCR 版式",
-                                "Original PDF supports Classic mode only; switch to OCR reflow first",
+                                "原始 PDF 不支持专注模式，请先切换到 OCR 版式",
+                                "Original PDF does not support Focus mode; switch to OCR reflow first",
                             ))
                         };
                         if mode_button.clicked()
@@ -3260,10 +3532,7 @@ fn assistant_keyboard_scroll_input(
     cursor_char_index: usize,
     references: &[ChatReference],
 ) -> Option<f32> {
-    let suggestions_active = chat_reference_token(input_text, cursor_char_index, references)
-        .is_some()
-        || !chat_command_suggestions(input_text).is_empty();
-    (!suggestions_active).then(|| {
+    (!assistant_suggestions_active(input_text, cursor_char_index, references)).then(|| {
         ui.input_mut(|input| {
             if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
                 -ASSISTANT_KEYBOARD_SCROLL_STEP
@@ -3274,6 +3543,15 @@ fn assistant_keyboard_scroll_input(
             }
         })
     })
+}
+
+fn assistant_suggestions_active(
+    input_text: &str,
+    cursor_char_index: usize,
+    references: &[ChatReference],
+) -> bool {
+    chat_reference_token(input_text, cursor_char_index, references).is_some()
+        || !chat_command_suggestions(input_text).is_empty()
 }
 
 fn active_suggestion_count(references: &[ChatReference], commands: &[ChatCommand]) -> usize {
@@ -3446,6 +3724,71 @@ fn compact_input_frame() -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(8, 4))
 }
 
+fn focus_assistant_frame(inner_margin: egui::Margin) -> egui::Frame {
+    egui::Frame::new()
+        .fill(palette().surface)
+        .stroke(egui::Stroke::new(1.0, palette().border))
+        .corner_radius(12)
+        .inner_margin(inner_margin)
+        .shadow(egui::Shadow {
+            offset: [0, 5],
+            blur: 20,
+            spread: 0,
+            color: Color32::from_black_alpha(36),
+        })
+}
+
+fn focus_data_indicator(ui: &mut egui::Ui, icon: Icon, hover_text: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
+    let fill = if response.hovered() {
+        palette().accent_soft
+    } else {
+        palette().surface.gamma_multiply(0.94)
+    };
+    ui.painter().circle(
+        rect.center(),
+        15.0,
+        fill,
+        egui::Stroke::new(1.0, palette().border),
+    );
+    paint_icon(
+        ui,
+        rect.shrink(8.0),
+        icon,
+        palette()
+            .accent
+            .gamma_multiply(if response.hovered() { 1.0 } else { 0.72 }),
+    );
+    response.on_hover_text(hover_text).clicked()
+}
+
+fn focus_unit_index_for_scroll_offset(
+    rects: impl IntoIterator<Item = Rect>,
+    offset: f32,
+    viewport_height: f32,
+) -> Option<usize> {
+    rects
+        .into_iter()
+        .enumerate()
+        .map(|(index, rect)| {
+            let target = focus_unit_target_offset_for_rect(rect, viewport_height);
+            (index, (target - offset).abs())
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(index, _)| index)
+}
+
+fn focus_actions_overlay_y(note_open: bool, anchor_y: f32, viewport: Rect) -> f32 {
+    if !note_open {
+        return (anchor_y - 64.0).clamp(viewport.top() + 12.0, viewport.bottom() - 140.0);
+    }
+    let estimated_height = ASSISTANT_INPUT_HEIGHT + 12.0;
+    (anchor_y - estimated_height / 2.0).clamp(
+        viewport.top() + 12.0,
+        (viewport.bottom() - estimated_height - 12.0).max(viewport.top() + 12.0),
+    )
+}
+
 fn search_result_card(
     ui: &mut egui::Ui,
     result: &BookSearchResult,
@@ -3572,6 +3915,82 @@ enum AnnotationEditorAction {
     None,
     Save,
     Cancel,
+}
+
+fn focus_annotation_editor(
+    ui: &mut egui::Ui,
+    draft: &mut AnnotationDraft,
+    language: crate::preferences::AppLanguage,
+) -> AnnotationEditorAction {
+    let input_id = ui.make_persistent_id("focus-annotation-input");
+    let mut action = AnnotationEditorAction::None;
+    let mut input_response = None;
+    ui.spacing_mut().item_spacing.x = 4.0;
+    ui.horizontal(|ui| {
+        let text_width = (ui.available_width() - 38.0).max(48.0);
+        let line_height =
+            ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().extra_text_line_spacing;
+        let visual_rows = if draft.note.is_empty() {
+            1
+        } else {
+            ui.painter()
+                .layout(
+                    draft.note.clone(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    palette().text,
+                    text_width,
+                )
+                .rows
+                .len()
+                .max(1)
+        };
+        let visible_rows = u8::try_from(visual_rows.min(4)).unwrap_or(4);
+        let editor_margin = if visible_rows == 1 {
+            egui::Margin::symmetric(0, 5)
+        } else {
+            egui::Margin::ZERO
+        };
+        let input_height = line_height * f32::from(visible_rows)
+            + f32::from(editor_margin.top)
+            + f32::from(editor_margin.bottom);
+        let output = egui::ScrollArea::vertical()
+            .id_salt("focus-annotation-scroll")
+            .max_width(text_width)
+            .max_height(input_height)
+            .min_scrolled_width(text_width)
+            .min_scrolled_height(input_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(text_width);
+                egui::TextEdit::multiline(&mut draft.note)
+                    .id(input_id)
+                    .desired_width(text_width)
+                    .desired_rows(1)
+                    .frame(egui::Frame::NONE)
+                    .margin(editor_margin)
+                    .text_color(palette().text)
+                    .hint_text(
+                        language.text("写下这一刻的想法", "Write down what you are thinking"),
+                    )
+                    .show(ui)
+            });
+        input_response = Some(output.inner.response.response.clone());
+        ui.add_enabled_ui(!draft.note.trim().is_empty(), |ui| {
+            if icon_button(ui, Icon::MessageSquareText)
+                .on_hover_text(language.text("保存批注", "Save note"))
+                .clicked()
+            {
+                action = AnnotationEditorAction::Save;
+            }
+        });
+    });
+    if draft.focus_pending {
+        input_response
+            .expect("focus annotation input is always rendered")
+            .request_focus();
+        draft.focus_pending = false;
+    }
+    action
 }
 
 fn annotation_editor(
@@ -4060,6 +4479,45 @@ mod reference_suggestion_label_tests {
         capture_clicked_citation(&mut clicked, Some("link://j/3/n4".into()));
 
         assert_eq!(clicked.as_deref(), Some("link://j/3/n4"));
+    }
+
+    #[test]
+    fn focus_annotation_editor_uses_content_height_for_an_empty_draft() {
+        egui::__run_test_ui(|ui| {
+            ui.set_max_height(300.0);
+            let mut draft = AnnotationDraft {
+                note: String::new(),
+                focus_pending: false,
+            };
+            let response = focus_assistant_frame(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+                ui.set_width(318.0);
+                focus_annotation_editor(
+                    ui,
+                    &mut draft,
+                    crate::preferences::AppLanguage::SimplifiedChinese,
+                )
+            });
+
+            assert!(response.response.rect.height() < 72.0);
+        });
+    }
+
+    #[test]
+    fn focus_scrollbar_offset_targets_the_nearest_paragraph() {
+        let rects = [
+            Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(300.0, 80.0)),
+            Rect::from_min_size(Pos2::new(0.0, 320.0), Vec2::new(300.0, 80.0)),
+            Rect::from_min_size(Pos2::new(0.0, 720.0), Vec2::new(300.0, 80.0)),
+        ];
+
+        assert_eq!(
+            focus_unit_index_for_scroll_offset(rects, 300.0, 600.0),
+            Some(1)
+        );
+        assert_eq!(
+            focus_unit_index_for_scroll_offset(rects, 690.0, 600.0),
+            Some(2)
+        );
     }
 
     #[test]

@@ -84,6 +84,11 @@ impl State {
     pub fn velocity(&self) -> Vec2 {
         self.vel
     }
+
+    /// Whether the pointer is currently hovering or dragging the vertical scroll bar.
+    pub fn vertical_scroll_bar_interacting(&self) -> bool {
+        self.scroll_bar_interaction.y
+    }
 }
 
 pub struct ScrollAreaOutput<R> {

@@ -177,6 +177,13 @@ impl BookSource for PdfOcrSourceController {
     ) -> Result<Option<RasterResource>, PublicationError> {
         self.active().raster_resource(href)
     }
+
+    fn fixed_page_dimensions(
+        &self,
+        section_index: usize,
+    ) -> Result<Option<rebook_publication::FixedPageDimensions>, PublicationError> {
+        self.active().fixed_page_dimensions(section_index)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

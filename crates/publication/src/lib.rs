@@ -272,6 +272,14 @@ pub struct RasterResource {
     pub pixels: Arc<[u8]>,
 }
 
+/// Pixel dimensions of a fixed-layout page that can be queried without
+/// decoding or rasterizing the page itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedPageDimensions {
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Format-neutral description returned before individual sections are parsed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Book {
@@ -637,6 +645,14 @@ pub trait BookSource: Send + Sync {
         &self,
         _href: &PublicationUrl,
     ) -> Result<Option<RasterResource>, PublicationError> {
+        Ok(None)
+    }
+    /// Returns the eventual fixed-page raster dimensions without materializing
+    /// its pixels. Sources that cannot provide this cheaply return `None`.
+    fn fixed_page_dimensions(
+        &self,
+        _section_index: usize,
+    ) -> Result<Option<FixedPageDimensions>, PublicationError> {
         Ok(None)
     }
 }

@@ -11,8 +11,9 @@ use rebook_layout::{
     LayoutEngine, LayoutError, LayoutViewport, PageItem, ReaderFontBlob, ReaderStyle,
 };
 use rebook_publication::{
-    Block, Book, BookSource, Inline, LocatorV1, PublicationError, PublicationUrl, Section,
-    SectionAnchor, SourceAnchor, SourceRange, TextBlock, TextRun, TocEntry,
+    Block, Book, BookSource, Inline, LocatorV1, PublicationError, PublicationUrl, RenditionLayout,
+    Section, SectionAnchor, SourceAnchor, SourceRange, TableOfContentsOrigin, TextBlock, TextRun,
+    TocEntry,
 };
 use rebook_renderer::{DisplayListCompiler, PageDisplayList, PageImageHit, PageTextHit};
 use thiserror::Error;
@@ -129,13 +130,16 @@ pub struct ReaderSpread {
 pub struct ReaderSectionPage {
     pub position: ReaderPosition,
     pub page: Arc<PageDisplayList>,
+    /// Whether this page only reserves fixed-page geometry and still needs its
+    /// real raster/display list to be materialized near the viewport.
+    pub placeholder: bool,
     /// Optional top crop in logical page coordinates for semantic reading views.
     pub visible_top: Option<f32>,
     /// Optional bottom crop in logical page coordinates for semantic reading views.
     pub visible_bottom: Option<f32>,
 }
 
-/// Position inside the leaf table-of-contents units of the current spine item.
+/// Position inside the semantic table-of-contents units of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadingUnitLocation {
     pub index: usize,
@@ -218,6 +222,14 @@ struct ReadingUnit {
     start: Option<SourceAnchor>,
 }
 
+/// Semantic reading units for fixed-layout publications. A PDF physical page
+/// is represented by one spine section, so a TOC leaf unit can span several
+/// authored sections without cropping any of those pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixedReadingUnit {
+    section_range: Range<usize>,
+}
+
 struct SectionRepository {
     source: Arc<dyn BookSource>,
     sections: Vec<SectionSlot>,
@@ -287,7 +299,7 @@ impl SectionRepository {
             drop(state);
 
             let layout_boundaries = top_level_toc_fragments_for_section(self.source.book(), index);
-            let reading_boundaries = leaf_toc_boundaries_for_section(self.source.book(), index);
+            let reading_boundaries = semantic_toc_boundaries_for_section(self.source.book(), index);
             let parsed = self
                 .source
                 .parse_section(index)
@@ -518,6 +530,7 @@ pub struct ReaderSession {
     current_segment: usize,
     current_page: usize,
     current_reading_unit: usize,
+    fixed_reading_units: Option<Vec<FixedReadingUnit>>,
 }
 
 impl ReaderSession {
@@ -582,6 +595,8 @@ impl ReaderSession {
             &section_indices_by_path,
             source.book().sections.len(),
         );
+        let fixed_reading_units =
+            build_fixed_reading_units(source.as_ref(), &toc_items, &section_indices_by_path);
         let repository = Arc::new(SectionRepository::new(Arc::clone(&source)));
         let prefetch_worker = PrefetchWorker::spawn(
             Arc::clone(&source),
@@ -609,6 +624,7 @@ impl ReaderSession {
             current_segment: 0,
             current_page: 0,
             current_reading_unit: 0,
+            fixed_reading_units,
         })
     }
 
@@ -835,7 +851,7 @@ impl ReaderSession {
         self.section_pages(self.current_section)
     }
 
-    /// Returns the pages intersecting the active leaf table-of-contents unit.
+    /// Returns the pages intersecting the active semantic table-of-contents unit.
     /// The first and last page carry semantic crop bounds so continuous views do
     /// not expose neighboring units that share those physical pages.
     #[allow(
@@ -843,6 +859,47 @@ impl ReaderSession {
         reason = "renderer page coordinates are viewport-bounded f32 values stored in kurbo f64"
     )]
     pub fn current_reading_unit_pages(&mut self) -> Result<Vec<ReaderSectionPage>, ReaderError> {
+        if let Some(unit) = self
+            .fixed_reading_units
+            .as_ref()
+            .and_then(|units| units.get(self.current_reading_unit))
+            .cloned()
+        {
+            let mut pages = Vec::new();
+            for section_index in unit.section_range {
+                if section_index == self.current_section {
+                    pages.extend(self.section_pages(section_index)?);
+                    continue;
+                }
+                let Some(dimensions) = self.source.fixed_page_dimensions(section_index)? else {
+                    pages.extend(self.section_pages(section_index)?);
+                    continue;
+                };
+                if let Some(cached) = self.cached_fixed_section_pages(section_index) {
+                    pages.extend(cached);
+                } else {
+                    let layout = self.layout_engine.layout_fixed_page_placeholder(
+                        dimensions,
+                        self.viewport,
+                        &self.style,
+                    );
+                    pages.extend(layout.pages.iter().enumerate().map(|(page_index, page)| {
+                        ReaderSectionPage {
+                            position: ReaderPosition {
+                                section_index,
+                                segment_index: 0,
+                                page_index,
+                            },
+                            page: Arc::new(self.display_compiler.compile(page)),
+                            placeholder: true,
+                            visible_top: None,
+                            visible_bottom: None,
+                        }
+                    }));
+                }
+            }
+            return Ok(pages);
+        }
         let section = self.repository.load(self.current_section)?;
         let Some(unit) = section
             .reading_units
@@ -883,8 +940,28 @@ impl ReaderSession {
         Ok(pages)
     }
 
-    /// Durable block ranges belonging to the active leaf TOC unit.
+    /// Durable block ranges belonging to the active semantic TOC unit.
     pub fn current_reading_unit_source_ranges(&mut self) -> Result<Vec<SourceRange>, ReaderError> {
+        if let Some(unit) = self
+            .fixed_reading_units
+            .as_ref()
+            .and_then(|units| units.get(self.current_reading_unit))
+            .cloned()
+        {
+            let mut ranges = Vec::new();
+            for section_index in unit.section_range {
+                let section = self.repository.load(section_index)?;
+                ranges.extend(
+                    section
+                        .fragments
+                        .iter()
+                        .flat_map(|fragment| &fragment.blocks)
+                        .filter_map(block_source)
+                        .cloned(),
+                );
+            }
+            return Ok(ranges);
+        }
         let section = self.repository.load(self.current_section)?;
         let Some(unit) = section
             .reading_units
@@ -902,6 +979,13 @@ impl ReaderSession {
     }
 
     pub fn reading_unit_location(&mut self) -> ReadingUnitLocation {
+        if let Some(units) = &self.fixed_reading_units {
+            let count = units.len().max(1);
+            return ReadingUnitLocation {
+                index: self.current_reading_unit.min(count - 1),
+                count,
+            };
+        }
         let count = self
             .repository
             .load(self.current_section)
@@ -913,6 +997,9 @@ impl ReaderSession {
     }
 
     pub fn current_reading_unit_anchor(&self) -> Option<SourceAnchor> {
+        if self.fixed_reading_units.is_some() {
+            return None;
+        }
         self.repository
             .get(self.current_section)?
             .reading_units
@@ -921,12 +1008,26 @@ impl ReaderSession {
             .clone()
     }
 
-    /// Navigates between leaf TOC units, crossing a spine boundary only after
-    /// the active section's first or last unit.
+    /// Navigates between semantic TOC units, crossing a spine boundary only
+    /// after the active section's first or last unit.
     pub fn go_to_adjacent_reading_unit(
         &mut self,
         direction: PageDirection,
     ) -> Result<NavigationResult, ReaderError> {
+        if let Some(units) = &self.fixed_reading_units {
+            let target = match direction {
+                PageDirection::Previous => self.current_reading_unit.checked_sub(1),
+                PageDirection::Next => (self.current_reading_unit + 1 < units.len())
+                    .then_some(self.current_reading_unit + 1),
+            };
+            let Some(unit_index) = target else {
+                return Ok(self.boundary());
+            };
+            let section_index = units[unit_index].section_range.start;
+            let result = self.go_to_section(section_index)?;
+            self.current_reading_unit = unit_index;
+            return Ok(result);
+        }
         let count = self
             .repository
             .load(self.current_section)?
@@ -989,12 +1090,39 @@ impl ReaderSession {
                             page_index,
                         },
                         page,
+                        placeholder: false,
                         visible_top: None,
                         visible_bottom: None,
                     }),
             );
         }
         Ok(pages)
+    }
+
+    fn cached_fixed_section_pages(&self, section_index: usize) -> Option<Vec<ReaderSectionPage>> {
+        let key = SegmentKey {
+            section_index,
+            segment_index: 0,
+        };
+        let segment = self.cache.get(&key)?;
+        Some(
+            segment
+                .pages
+                .iter()
+                .enumerate()
+                .map(|(page_index, page)| ReaderSectionPage {
+                    position: ReaderPosition {
+                        section_index,
+                        segment_index: 0,
+                        page_index,
+                    },
+                    page: Arc::clone(page),
+                    placeholder: false,
+                    visible_top: None,
+                    visible_bottom: None,
+                })
+                .collect(),
+        )
     }
 
     /// Returns the logical positions currently composed into the fixed-page
@@ -1013,7 +1141,13 @@ impl ReaderSession {
         &mut self,
         position: ReaderPosition,
     ) -> Result<ReaderSnapshot, ReaderError> {
-        if position.section_index != self.current_section {
+        let section_is_visible = position.section_index == self.current_section
+            || self
+                .fixed_reading_units
+                .as_ref()
+                .and_then(|units| units.get(self.current_reading_unit))
+                .is_some_and(|unit| unit.section_range.contains(&position.section_index));
+        if !section_is_visible {
             return Err(ReaderError::SectionOutOfBounds(position.section_index));
         }
         let key = SegmentKey {
@@ -1029,7 +1163,37 @@ impl ReaderSession {
             return Err(ReaderError::PageOutOfBounds(position));
         }
         self.install_position(position);
+        self.sync_reading_unit_to_position();
         Ok(self.snapshot())
+    }
+
+    /// Polls or queues the compiled segment for a fixed-page placeholder
+    /// without ever parsing, laying out, or waiting on the caller thread.
+    pub fn try_materialize_position(
+        &mut self,
+        position: ReaderPosition,
+    ) -> Result<bool, ReaderError> {
+        self.poll_prefetch()?;
+        let section_is_visible = position.section_index == self.current_section
+            || self
+                .fixed_reading_units
+                .as_ref()
+                .and_then(|units| units.get(self.current_reading_unit))
+                .is_some_and(|unit| unit.section_range.contains(&position.section_index));
+        if !section_is_visible {
+            return Err(ReaderError::SectionOutOfBounds(position.section_index));
+        }
+        let key = SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        };
+        if !self.try_ensure_segment(key)? {
+            return Ok(false);
+        }
+        Ok(self
+            .cache
+            .get(&key)
+            .is_some_and(|segment| position.page_index < segment.pages.len()))
     }
 
     pub fn hit_test_page(
@@ -1364,7 +1528,7 @@ impl ReaderSession {
         self.current_section = index;
         self.current_segment = 0;
         self.current_page = 0;
-        self.current_reading_unit = 0;
+        self.sync_reading_unit_to_position();
         self.touch(key);
         Ok(self.moved())
     }
@@ -1406,7 +1570,7 @@ impl ReaderSession {
         }) {
             self.sync_reading_unit_to_anchor(&anchor);
         } else {
-            self.current_reading_unit = 0;
+            self.sync_reading_unit_to_position();
         }
         self.touch(key);
         Ok(self.moved_to_toc_target(href))
@@ -1567,6 +1731,8 @@ impl ReaderSession {
             &section_indices_by_path,
             self.source.book().sections.len(),
         );
+        let fixed_reading_units =
+            build_fixed_reading_units(self.source.as_ref(), &toc_items, &section_indices_by_path);
         let repository = Arc::new(SectionRepository::new(Arc::clone(&self.source)));
         let section_index = target.map_or_else(
             || {
@@ -1625,6 +1791,7 @@ impl ReaderSession {
         self.toc_items = toc_items;
         self.toc_index = toc_index;
         self.section_indices_by_path = section_indices_by_path;
+        self.fixed_reading_units = fixed_reading_units;
         self.prefetch_inflight.clear();
         self.prefetch_failures.clear();
         self.cache.clear();
@@ -2004,6 +2171,13 @@ impl ReaderSession {
     }
 
     fn sync_reading_unit_to_position(&mut self) {
+        if let Some(units) = &self.fixed_reading_units {
+            self.current_reading_unit = units
+                .partition_point(|unit| unit.section_range.start <= self.current_section)
+                .saturating_sub(1)
+                .min(units.len().saturating_sub(1));
+            return;
+        }
         let Ok(section) = self.repository.load(self.current_section) else {
             self.current_reading_unit = 0;
             return;
@@ -2029,6 +2203,19 @@ impl ReaderSession {
     }
 
     fn sync_reading_unit_to_anchor(&mut self, anchor: &SourceAnchor) {
+        if self.fixed_reading_units.is_some() {
+            if let Some(section_index) = self
+                .source
+                .book()
+                .sections
+                .iter()
+                .position(|section| section.id == anchor.spine)
+            {
+                self.current_section = section_index;
+                self.sync_reading_unit_to_position();
+            }
+            return;
+        }
         let Ok(section) = self.repository.load(self.current_section) else {
             self.current_reading_unit = 0;
             return;
@@ -2439,13 +2626,18 @@ fn prepare_section(
         .collect::<Vec<_>>();
     let fragments = fragment_section_blocks(blocks, &boundary_sources);
     let (fragments, resolved_anchors) = resolve_fragment_anchors(fragments, anchors);
+    let reading_units = build_reading_units(&resolved_anchors, reading_boundaries, &fragments);
+    let reading_unit_starts = reading_units
+        .iter()
+        .map(|unit| unit.fragment_range.start)
+        .collect::<HashSet<_>>();
     let (segments, anchor_segments) = build_layout_segments(
         &resolved_anchors,
         layout_boundaries,
         use_layout_boundaries,
+        &reading_unit_starts,
         fragments.len(),
     );
-    let reading_units = build_reading_units(&resolved_anchors, reading_boundaries, &fragments);
 
     PreparedSection {
         fragments,
@@ -2491,18 +2683,47 @@ fn build_reading_units(
         }];
     }
 
-    starts
+    let mut units = starts
         .iter()
         .enumerate()
         .map(|(index, (start_fragment, start))| ReadingUnit {
-            // Front matter before the first leaf anchor belongs to the first unit.
             fragment_range: if index == 0 { 0 } else { *start_fragment }
                 ..starts
                     .get(index + 1)
                     .map_or(fragments.len(), |(next, _)| *next),
             start: start.clone(),
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    // A navigable chapter/parent anchor can precede its first child while only
+    // contributing headings. It is not a useful standalone reading step: fold
+    // it into the following subsection. Images and tables remain activatable,
+    // so illustrated preludes are deliberately kept independent.
+    let mut index = 0;
+    while index + 1 < units.len() {
+        if reading_unit_has_activatable_content(&units[index], fragments) {
+            index += 1;
+            continue;
+        }
+        let start = units[index].fragment_range.start;
+        units[index + 1].fragment_range.start = start;
+        units.remove(index);
+    }
+    units
+}
+
+fn reading_unit_has_activatable_content(unit: &ReadingUnit, fragments: &[ContentFragment]) -> bool {
+    fragments[unit.fragment_range.clone()]
+        .iter()
+        .flat_map(|fragment| &fragment.blocks)
+        .any(|block| match block {
+            Block::Text(text) => {
+                !matches!(text.kind, rebook_publication::TextBlockKind::Heading(_))
+                    && block_text_len(block) > 0
+            }
+            Block::Image(_) | Block::Table(_) => true,
+            Block::Separator | Block::PageBreak => false,
+        })
 }
 
 fn fragment_section_blocks(
@@ -2592,6 +2813,7 @@ fn build_layout_segments(
     resolved_anchors: &[(String, usize)],
     layout_boundaries: &HashSet<String>,
     use_layout_boundaries: bool,
+    reading_unit_starts: &HashSet<usize>,
     fragment_count: usize,
 ) -> (Vec<LayoutSegment>, HashMap<String, usize>) {
     let mut segment_starts = resolved_anchors
@@ -2599,6 +2821,7 @@ fn build_layout_segments(
         .filter(|(fragment, _)| use_layout_boundaries && layout_boundaries.contains(fragment))
         .map(|(_, fragment_index)| *fragment_index)
         .collect::<Vec<_>>();
+    segment_starts.extend(reading_unit_starts.iter().copied());
     segment_starts.push(0);
     segment_starts.sort_unstable();
     segment_starts.dedup();
@@ -2638,11 +2861,13 @@ fn top_level_toc_fragments_for_section(book: &Book, section_index: usize) -> Has
         .collect()
 }
 
-fn leaf_toc_boundaries_for_section(book: &Book, section_index: usize) -> Vec<Option<String>> {
+fn semantic_toc_boundaries_for_section(book: &Book, section_index: usize) -> Vec<Option<String>> {
     fn append(entries: &[TocEntry], path: &str, fragments: &mut Vec<Option<String>>) {
         for entry in entries {
-            if entry.children.is_empty()
-                && let Some(href) = &entry.href
+            // Navigable parents mark chapter preludes. Leaf entries mark the
+            // actual subsection units. Equal anchors are deduplicated below,
+            // so a parent and its first child never create an empty unit.
+            if let Some(href) = &entry.href
                 && href.path() == path
             {
                 let fragment = href.fragment().map(str::to_owned);
@@ -2660,6 +2885,46 @@ fn leaf_toc_boundaries_for_section(book: &Book, section_index: usize) -> Vec<Opt
     let mut fragments = Vec::new();
     append(&book.table_of_contents, section.href.path(), &mut fragments);
     fragments
+}
+
+fn build_fixed_reading_units(
+    source: &dyn BookSource,
+    toc_items: &[TocViewItem],
+    section_indices_by_path: &HashMap<String, usize>,
+) -> Option<Vec<FixedReadingUnit>> {
+    if source.book().metadata.layout != RenditionLayout::PrePaginated {
+        return None;
+    }
+    let section_count = source.book().sections.len();
+    let mut starts = if source.table_of_contents_origin() == TableOfContentsOrigin::Fallback
+        || toc_items.is_empty()
+    {
+        // A mechanical PDF TOC contains one entry per physical page. Preserve
+        // that behavior when no authored/generated semantic outline exists.
+        (0..section_count).collect::<Vec<_>>()
+    } else {
+        toc_items
+            .iter()
+            .filter_map(|item| item.target.as_ref())
+            .filter_map(|target| section_indices_by_path.get(target.path()))
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    starts.push(0);
+    starts.sort_unstable();
+    starts.dedup();
+    Some(
+        starts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, start)| {
+                let end = starts.get(index + 1).copied().unwrap_or(section_count);
+                (*start < end).then_some(FixedReadingUnit {
+                    section_range: *start..end,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn split_text_block(block: TextBlock) -> Vec<TextBlock> {
@@ -3442,9 +3707,10 @@ mod tests {
 
     use rebook_layout::{ReaderDefaultFont, SpreadMode};
     use rebook_publication::{
-        Block, BlockStyle, Inline, Metadata, PublicationId, PublicationUrl, Resource, Section,
-        SectionAnchor, SourceAnchor, SourceRange, SpineItem, SpineItemId, TextBlock, TextBlockKind,
-        TextRun, TextStyle, TocEntry,
+        Block, BlockStyle, FixedPageDimensions, ImageBlock, ImageStyle, Inline, Metadata,
+        PublicationId, PublicationUrl, RasterResource, Resource, Section, SectionAnchor,
+        SourceAnchor, SourceRange, SpineItem, SpineItemId, TextBlock, TextBlockKind, TextRun,
+        TextStyle, TocEntry,
     };
 
     use super::*;
@@ -3454,6 +3720,112 @@ mod tests {
         sections: Vec<Section>,
         parse_counts: Vec<AtomicUsize>,
         background_delay: Duration,
+    }
+
+    struct LazyFixedSource {
+        book: Book,
+        parse_counts: Vec<AtomicUsize>,
+        raster_counts: Vec<AtomicUsize>,
+    }
+
+    impl LazyFixedSource {
+        fn new(section_count: usize) -> Arc<Self> {
+            let sections = (0..section_count)
+                .map(|index| SpineItem {
+                    id: SpineItemId::new(format!("page-{index}")).unwrap(),
+                    href: PublicationUrl::parse(&format!("page-{index}.xhtml")).unwrap(),
+                    media_type: "application/xhtml+xml".into(),
+                    linear: true,
+                    properties: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let first = sections[0].href.clone();
+            Arc::new(Self {
+                book: Book {
+                    id: PublicationId::new("lazy-fixed-reader-test").unwrap(),
+                    metadata: Metadata {
+                        title: "Lazy fixed pages".into(),
+                        authors: Vec::new(),
+                        languages: Vec::new(),
+                        layout: RenditionLayout::PrePaginated,
+                    },
+                    sections,
+                    table_of_contents: vec![TocEntry {
+                        label: "Whole chapter".into(),
+                        href: Some(first),
+                        children: Vec::new(),
+                    }],
+                    cover: None,
+                },
+                parse_counts: (0..section_count).map(|_| AtomicUsize::new(0)).collect(),
+                raster_counts: (0..section_count).map(|_| AtomicUsize::new(0)).collect(),
+            })
+        }
+
+        fn href(index: usize) -> PublicationUrl {
+            PublicationUrl::parse(&format!("images/page-{index}.rgba")).unwrap()
+        }
+    }
+
+    impl BookSource for LazyFixedSource {
+        fn book(&self) -> &Book {
+            &self.book
+        }
+
+        fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+            self.parse_counts[index].fetch_add(1, Ordering::Relaxed);
+            let descriptor = &self.book.sections[index];
+            Ok(Section {
+                id: descriptor.id.clone(),
+                href: descriptor.href.clone(),
+                blocks: vec![Block::Image(ImageBlock {
+                    href: Self::href(index),
+                    alt: format!("Page {}", index + 1),
+                    style: ImageStyle::default(),
+                    source: None,
+                    text_layer: None,
+                })],
+                anchors: Vec::new(),
+            })
+        }
+
+        fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+            Err(PublicationError::ResourceNotFound(href.to_string()))
+        }
+
+        fn raster_resource(
+            &self,
+            href: &PublicationUrl,
+        ) -> Result<Option<RasterResource>, PublicationError> {
+            let index = href
+                .path()
+                .strip_prefix("images/page-")
+                .and_then(|value| value.strip_suffix(".rgba"))
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or_else(|| PublicationError::ResourceNotFound(href.to_string()))?;
+            self.raster_counts[index].fetch_add(1, Ordering::Relaxed);
+            Ok(Some(RasterResource {
+                width: 2,
+                height: 3,
+                pixels: vec![255; 2 * 3 * 4].into(),
+            }))
+        }
+
+        fn fixed_page_dimensions(
+            &self,
+            section_index: usize,
+        ) -> Result<Option<FixedPageDimensions>, PublicationError> {
+            self.book
+                .sections
+                .get(section_index)
+                .ok_or(PublicationError::ResourceNotFound(format!(
+                    "section {section_index}"
+                )))?;
+            Ok(Some(FixedPageDimensions {
+                width: 2,
+                height: 3,
+            }))
+        }
     }
 
     impl CountingSource {
@@ -4804,8 +5176,8 @@ mod tests {
             assert!(result.snapshot.total_progression > previous_progress);
             previous_progress = result.snapshot.total_progression;
             if result.snapshot.active_toc_id.as_deref() == Some("1") {
-                assert_eq!(result.snapshot.location.segment_index, 0);
-                assert!(result.snapshot.location.page_index > 0);
+                assert_eq!(result.snapshot.location.segment_index, 1);
+                assert_eq!(result.snapshot.location.page_index, 0);
                 assert_eq!(source.parse_count(0), 1);
                 return;
             }
@@ -5052,7 +5424,11 @@ mod tests {
     }
 
     #[test]
-    fn reading_units_use_only_leaf_toc_targets() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture mirrors one complete TOC hierarchy"
+    )]
+    fn chapter_prelude_and_leaf_targets_are_independent_reading_units() {
         let mut source = CountingSource::new(&["placeholder".into()]);
         let source_mut = Arc::get_mut(&mut source).unwrap();
         let spine = source_mut.sections[0].id.clone();
@@ -5131,10 +5507,12 @@ mod tests {
             ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
         assert_eq!(
             reader.reading_unit_location(),
-            ReadingUnitLocation { index: 0, count: 2 }
+            ReadingUnitLocation { index: 0, count: 3 }
         );
-        let first_ranges = reader.current_reading_unit_source_ranges().unwrap();
-        assert_eq!(first_ranges.len(), 2, "intro joins the first leaf unit");
+        assert_eq!(reader.location().segment_count, 3);
+        let prelude_ranges = reader.current_reading_unit_source_ranges().unwrap();
+        assert_eq!(prelude_ranges.len(), 1);
+        assert_eq!(prelude_ranges[0].start.node, "intro");
 
         let result = reader
             .go_to_adjacent_reading_unit(PageDirection::Next)
@@ -5142,11 +5520,178 @@ mod tests {
         assert_eq!(result.outcome, NavigationOutcome::Moved);
         assert_eq!(
             reader.reading_unit_location(),
-            ReadingUnitLocation { index: 1, count: 2 }
+            ReadingUnitLocation { index: 1, count: 3 }
         );
-        let second_ranges = reader.current_reading_unit_source_ranges().unwrap();
-        assert_eq!(second_ranges.len(), 1);
-        assert_eq!(second_ranges[0].start.node, "leaf-b");
+        let first_leaf_ranges = reader.current_reading_unit_source_ranges().unwrap();
+        assert_eq!(first_leaf_ranges.len(), 1);
+        assert_eq!(first_leaf_ranges[0].start.node, "leaf-a");
+        assert_eq!(reader.location().segment_index, 1);
+
+        reader
+            .go_to_adjacent_reading_unit(PageDirection::Next)
+            .unwrap();
+        let second_leaf_ranges = reader.current_reading_unit_source_ranges().unwrap();
+        assert_eq!(second_leaf_ranges.len(), 1);
+        assert_eq!(second_leaf_ranges[0].start.node, "leaf-b");
+        assert_eq!(reader.location().segment_index, 2);
+    }
+
+    #[test]
+    fn heading_only_chapter_prelude_joins_the_first_subsection() {
+        let spine = SpineItemId::new("chapter").unwrap();
+        let block = |node: &str, kind: TextBlockKind, text: &str| {
+            Block::Text(TextBlock {
+                kind,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: Some(SourceRange {
+                    start: SourceAnchor {
+                        spine: spine.clone(),
+                        node: node.into(),
+                        text_offset: 0,
+                    },
+                    end: SourceAnchor {
+                        spine: spine.clone(),
+                        node: node.into(),
+                        text_offset: u64::try_from(text.chars().count()).unwrap(),
+                    },
+                }),
+            })
+        };
+        let anchor = |fragment: &str, node: &str| SectionAnchor {
+            fragment: fragment.into(),
+            source: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+        };
+        let fragments = vec![
+            ContentFragment {
+                blocks: vec![block("heading", TextBlockKind::Heading(1), "Prelude")],
+                anchors: vec![anchor("chapter", "heading")],
+            },
+            ContentFragment {
+                blocks: vec![block("body", TextBlockKind::Paragraph, "First subsection")],
+                anchors: vec![anchor("leaf", "body")],
+            },
+        ];
+        let units = build_reading_units(
+            &[("chapter".into(), 0), ("leaf".into(), 1)],
+            &[Some("chapter".into()), Some("leaf".into())],
+            &fragments,
+        );
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].fragment_range, 0..2);
+        assert_eq!(units[0].start.as_ref().unwrap().node, "body");
+    }
+
+    #[test]
+    fn fixed_layout_toc_units_span_complete_physical_pages() {
+        let mut source = CountingSource::new(&[
+            "Chapter title".into(),
+            "Section one page one".into(),
+            "Section one page two".into(),
+            "Next chapter".into(),
+            "Section two".into(),
+        ]);
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        source_mut.book.metadata.layout = RenditionLayout::PrePaginated;
+        let target = |index: usize| source_mut.book.sections[index].href.clone();
+        source_mut.book.table_of_contents = vec![
+            TocEntry {
+                label: "Chapter 1".into(),
+                href: Some(target(0)),
+                children: vec![TocEntry {
+                    label: "Section 1.1".into(),
+                    href: Some(target(1)),
+                    children: Vec::new(),
+                }],
+            },
+            TocEntry {
+                label: "Chapter 2".into(),
+                href: Some(target(3)),
+                children: vec![TocEntry {
+                    label: "Section 2.1".into(),
+                    href: Some(target(4)),
+                    children: Vec::new(),
+                }],
+            },
+        ];
+
+        let mut reader = ReaderSession::open(
+            source,
+            viewport(600, 400),
+            ReaderStyle {
+                spread: SpreadMode::Scroll,
+                ..ReaderStyle::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reader.reading_unit_location(),
+            ReadingUnitLocation { index: 0, count: 4 }
+        );
+        assert_eq!(reader.current_reading_unit_pages().unwrap().len(), 1);
+
+        reader
+            .go_to_adjacent_reading_unit(PageDirection::Next)
+            .unwrap();
+        let pages = reader.current_reading_unit_pages().unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].position.section_index, 1);
+        assert_eq!(pages[1].position.section_index, 2);
+        let snapshot = reader.set_visible_position(pages[1].position).unwrap();
+        assert_eq!(snapshot.location.section_index, 2);
+        assert_eq!(
+            reader.reading_unit_location(),
+            ReadingUnitLocation { index: 1, count: 4 }
+        );
+    }
+
+    #[test]
+    fn fixed_layout_scroll_units_materialize_only_nearby_pages() {
+        let source = LazyFixedSource::new(3);
+        let mut reader = ReaderSession::open(
+            Arc::clone(&source) as Arc<dyn BookSource>,
+            viewport(600, 400),
+            ReaderStyle {
+                spread: SpreadMode::Scroll,
+                ..ReaderStyle::default()
+            },
+        )
+        .unwrap();
+
+        let pages = reader.current_reading_unit_pages().unwrap();
+        assert_eq!(pages.len(), 3);
+        assert!(!pages[0].placeholder);
+        assert!(pages[1].placeholder);
+        assert!(pages[2].placeholder);
+        assert_eq!(source.parse_counts[0].load(Ordering::Relaxed), 1);
+        assert_eq!(source.parse_counts[1].load(Ordering::Relaxed), 0);
+        assert_eq!(source.parse_counts[2].load(Ordering::Relaxed), 0);
+        assert_eq!(source.raster_counts[0].load(Ordering::Relaxed), 1);
+        assert_eq!(source.raster_counts[1].load(Ordering::Relaxed), 0);
+
+        let target = pages[1].position;
+        assert!(!reader.try_materialize_position(target).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !reader.try_materialize_position(target).unwrap() {
+            assert!(Instant::now() < deadline, "background page did not finish");
+            std::thread::yield_now();
+        }
+
+        let pages = reader.current_reading_unit_pages().unwrap();
+        assert!(!pages[1].placeholder);
+        assert!(pages[2].placeholder);
+        assert_eq!(source.parse_counts[1].load(Ordering::Relaxed), 1);
+        assert_eq!(source.raster_counts[1].load(Ordering::Relaxed), 1);
+        assert_eq!(source.parse_counts[2].load(Ordering::Relaxed), 0);
     }
 
     #[test]

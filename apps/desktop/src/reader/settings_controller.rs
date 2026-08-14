@@ -56,13 +56,13 @@ impl DesktopReader {
             return;
         }
         self.reading_mode = crate::preferences::ReadingMode::Classic;
+        self.restore_book_chat_session();
         self.focus_units.clear();
         self.focus_target_offset = None;
         self.ui.focus_scroll_motion = None;
         self.ui.sidebar_pinned = true;
         self.set_sidebar_open(true);
         self.close_assistant_panel();
-        self.ui.focus_chat_minimized = false;
         self.ui.focus_actions_visible = false;
         self.focus_toc_override = None;
         self.cancel_text_selection();
@@ -146,20 +146,6 @@ impl DesktopReader {
         } else {
             settings.reading_mode
         };
-        if settings.reading_mode == crate::preferences::ReadingMode::Focus
-            && reading_mode == crate::preferences::ReadingMode::Classic
-        {
-            self.notice_timer.show(
-                &mut self.notice,
-                language
-                    .text(
-                        "原始 PDF 不支持专注模式，请先切换到 OCR 版式",
-                        "Focus mode requires the OCR reflow view for PDF",
-                    )
-                    .into(),
-                std::time::Instant::now(),
-            );
-        }
         let mode_changed = self.reading_mode != reading_mode;
         self.reading_mode = reading_mode;
         let mut style = self.reader.style();
@@ -182,6 +168,9 @@ impl DesktopReader {
                 self.plugin_settings = plugin_settings;
                 self.language = language;
                 if mode_changed {
+                    if !self.is_focus_mode() {
+                        self.restore_book_chat_session();
+                    }
                     self.focus_units.clear();
                     self.focus_target_offset = None;
                     self.ui.focus_scroll_motion = None;
@@ -191,7 +180,6 @@ impl DesktopReader {
                         self.reading_mode == crate::preferences::ReadingMode::Classic,
                     );
                     self.close_assistant_panel();
-                    self.ui.focus_chat_minimized = false;
                     self.ui.focus_actions_visible = false;
                     self.focus_toc_override = None;
                     self.cancel_text_selection();

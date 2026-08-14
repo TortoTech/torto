@@ -43,13 +43,11 @@ const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const MOTION_EPSILON: f32 = 0.001;
 const SEARCH_MARK_COLOR: Color = Color::from_rgba8(250, 204, 21, 89);
 const ASSISTANT_MARK_COLOR: Color = Color::from_rgba8(245, 158, 11, 56);
-const SCROLL_PAGE_GAP: f32 = 24.0;
-const SCROLL_PREVIOUS_REGION_HEIGHT: f32 = 56.0;
-const SCROLL_NEXT_REGION_HEIGHT: f32 = 88.0;
 const FOCUS_MINIMUM_PARAGRAPH_GAP: f32 = 12.0;
 const FOCUS_TABLE_BOTTOM_MARGIN: f32 = 24.0;
 static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SEMANTIC_TASK_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_CHAT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 mod assistant;
 mod chat_autocomplete;
@@ -197,13 +195,20 @@ pub(super) fn open_reader(
         TranslationBookSource::new(rewrite_source.clone(), plugin_settings.translation_mode)
     });
     let source: Arc<dyn BookSource> = translation_source.clone();
-    let highlight_store = HighlightStore::from_repository(local_store.clone());
-    let highlights = highlight_store.for_book(&book_id);
+    let mut highlight_store = HighlightStore::from_repository(local_store.clone());
+    let mut highlights = highlight_store.for_book(&book_id);
     let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
     let reader_preferences = preferences::load_reader_preferences().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load reader preferences; using defaults");
         ReaderPreferences::default()
     });
+    if reader_preferences.selection_granularity == SelectionGranularity::Paragraph {
+        repair_legacy_translated_paragraph_highlights(
+            rewrite_source.as_ref(),
+            &mut highlights,
+            &mut highlight_store,
+        );
+    }
     let reading_mode = allowed_reading_mode(format, pdf_ocr_mode, reader_preferences.reading_mode);
     let mut style = ReaderStyle {
         spread: if reading_mode == ReadingMode::Focus {
@@ -236,6 +241,9 @@ pub(super) fn open_reader(
         .map(|store| store.load_progress(&book_id))
         .transpose()?
         .flatten();
+    let mut restored_source_range = stored_progress
+        .as_ref()
+        .and_then(|progress| progress.locator.source.clone());
     let progress_ms = progress_started.elapsed().as_secs_f32() * 1_000.0;
     let resumed = stored_progress.is_some();
     let initial_layout_started = Instant::now();
@@ -250,6 +258,7 @@ pub(super) fn open_reader(
             Ok(reader) => reader,
             Err(error) => {
                 tracing::warn!(%error, "failed to open at durable reading locator");
+                restored_source_range = None;
                 ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?
             }
         }
@@ -298,6 +307,7 @@ pub(super) fn open_reader(
             highlight_store,
             highlights,
             progress_store,
+            restored_source_range,
             plugin_settings,
             language: reader_preferences.language,
             reading_mode,
@@ -307,6 +317,87 @@ pub(super) fn open_reader(
             source_path: path.to_path_buf(),
         },
     ))
+}
+
+fn repair_legacy_translated_paragraph_highlights(
+    source: &dyn BookSource,
+    highlights: &mut [StoredHighlight],
+    store: &mut HighlightStore,
+) {
+    for highlight in highlights {
+        let [range] = highlight.ranges.as_slice() else {
+            continue;
+        };
+        let Some(section_index) = source
+            .book()
+            .sections
+            .iter()
+            .position(|item| item.id == range.start.spine)
+        else {
+            continue;
+        };
+        let Ok(section) = source.parse_section(section_index) else {
+            continue;
+        };
+        let Some(repaired) =
+            legacy_translated_paragraph_range(&section.blocks, range, &highlight.quote)
+        else {
+            continue;
+        };
+        highlight.ranges = vec![repaired];
+        if let Err(error) = store.update(highlight) {
+            tracing::warn!(%error, id = %highlight.id, "failed to repair legacy translated highlight");
+        }
+    }
+}
+
+fn legacy_translated_paragraph_range(
+    blocks: &[Block],
+    range: &SourceRange,
+    quote: &str,
+) -> Option<SourceRange> {
+    let matches_range = |source: &&SourceRange| {
+        source.start == range.start
+            && source.start.spine == source.end.spine
+            && source.start.node == source.end.node
+            && range.start.spine == range.end.spine
+            && range.start.node == range.end.node
+    };
+    let (canonical_range, canonical_text) = blocks.iter().find_map(|block| match block {
+        Block::Text(block) => block
+            .source
+            .as_ref()
+            .filter(matches_range)
+            .map(|source| (source, crate::plugins::text_block_text(block))),
+        Block::Table(table) => table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .find_map(|cell| {
+                cell.text
+                    .source
+                    .as_ref()
+                    .filter(matches_range)
+                    .map(|source| (source, crate::plugins::text_block_text(&cell.text)))
+            }),
+        Block::Image(_) | Block::Separator | Block::PageBreak => None,
+    })?;
+    let stored_length = range.end.text_offset.checked_sub(range.start.text_offset)?;
+    let canonical_length = canonical_range
+        .end
+        .text_offset
+        .checked_sub(canonical_range.start.text_offset)?;
+    if stored_length == 0
+        || stored_length >= canonical_length
+        || usize::try_from(stored_length).ok()? != quote.chars().count()
+    {
+        return None;
+    }
+    let canonical_prefix = canonical_text
+        .chars()
+        .take(usize::try_from(stored_length).ok()?)
+        .collect::<String>();
+    (canonical_prefix != quote).then(|| canonical_range.clone())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -374,6 +465,9 @@ pub(super) struct DesktopReader {
     search_navigation_requested: Option<BookSearchResult>,
     semantic_index: SemanticIndexUiState,
     chat: ChatUiState,
+    book_chat: Option<ChatUiState>,
+    focus_chat_sessions: HashMap<String, ChatUiState>,
+    focus_chat_session_key: Option<String>,
     chat_markdown: chat_markdown::ChatMarkdownState,
     translation: TranslationUiState,
     pdf_toc: PdfTocUiState,
@@ -387,12 +481,15 @@ pub(super) struct DesktopReader {
     scroll_section: Option<Arc<ScrollSectionLayout>>,
     scroll_viewport: Option<ScrollViewportState>,
     scroll_target_position: Option<ReaderPosition>,
+    scroll_target_source: Option<SourceRange>,
     focus_units: Vec<FocusUnit>,
     focus_unit_index: usize,
     focus_target_offset: Option<f32>,
     focus_anchor: Option<SourceAnchor>,
     focus_toc_override: Option<String>,
     pending_page_turn: Option<PageDirection>,
+    pending_reading_unit_entry: Option<PageDirection>,
+    pending_keyboard_scroll_delta: f32,
     settings_requested: bool,
     settings_change_requested: Option<ReaderSettingsChange>,
     notice: Option<String>,
@@ -442,7 +539,6 @@ struct ScrollSectionLayout {
     page_origins: Vec<f32>,
     page_heights: Vec<f32>,
     content_height: f32,
-    next_button_top: Option<f32>,
 }
 
 #[derive(Clone)]
@@ -614,20 +710,11 @@ impl ScrollSectionLayout {
     )]
     fn new(
         section_index: usize,
-        section_count: usize,
         reading_unit_index: usize,
-        reading_unit_count: usize,
         pages: Vec<ReaderSectionPage>,
         preserve_physical_pages: bool,
     ) -> Self {
-        let has_previous = reading_unit_index > 0 || section_index > 0;
-        let has_next =
-            reading_unit_index + 1 < reading_unit_count || section_index + 1 < section_count;
-        let mut cursor = if has_previous {
-            SCROLL_PREVIOUS_REGION_HEIGHT
-        } else {
-            0.0
-        };
+        let mut cursor = 0.0;
         let mut page_tops = Vec::with_capacity(pages.len());
         let mut page_origins = Vec::with_capacity(pages.len());
         let mut page_heights = Vec::with_capacity(pages.len());
@@ -643,15 +730,14 @@ impl ScrollSectionLayout {
                 .or_else(|| entry.page.content_bottom())
                 .unwrap_or(logical_height)
                 .clamp(content_top, logical_height);
-            let page_origin = if preserve_physical_pages {
-                0.0
-            } else if entry.visible_top.is_some() || index > 0 {
+            let page_origin = if preserve_physical_pages || entry.visible_top.is_some() || index > 0
+            {
                 content_top
             } else {
                 0.0
             };
             let page_height = if preserve_physical_pages {
-                logical_height
+                content_bottom - content_top
             } else {
                 content_bottom - page_origin
             };
@@ -659,25 +745,7 @@ impl ScrollSectionLayout {
             page_origins.push(page_origin);
             page_heights.push(page_height);
             cursor += page_height;
-            if preserve_physical_pages && index + 1 < pages.len() {
-                cursor += SCROLL_PAGE_GAP;
-            }
         }
-        let chapter_content_bottom = pages
-            .last()
-            .and_then(|entry| {
-                let bottom = entry.page.content_bottom()?;
-                let index = pages.len().checked_sub(1)?;
-                Some(
-                    page_tops[index] + bottom.clamp(0.0, entry.page.height() as f32)
-                        - page_origins[index],
-                )
-            })
-            .unwrap_or(cursor);
-        let next_button_top = has_next.then_some(chapter_content_bottom + SCROLL_PAGE_GAP);
-        let content_height = next_button_top.map_or(cursor, |top| {
-            top + SCROLL_NEXT_REGION_HEIGHT - SCROLL_PAGE_GAP
-        });
         Self {
             section_index,
             reading_unit_index,
@@ -685,8 +753,7 @@ impl ScrollSectionLayout {
             page_tops,
             page_origins,
             page_heights,
-            content_height,
-            next_button_top,
+            content_height: cursor,
         }
     }
 
@@ -716,6 +783,19 @@ impl ScrollSectionLayout {
             .iter()
             .position(|entry| entry.position == position)?;
         Some(self.content_y(index, page_y))
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "display-list coordinates are viewport-bounded f32 values stored in kurbo f64"
+    )]
+    fn source_top(&self, range: &SourceRange) -> Option<f32> {
+        self.pages.iter().enumerate().find_map(|(index, entry)| {
+            entry
+                .page
+                .source_content_bounds(std::slice::from_ref(range))
+                .map(|bounds| self.content_y(index, bounds.y0 as f32))
+        })
     }
 
     fn first_visible_page(&self, offset_y: f32) -> Option<ReaderPosition> {
@@ -777,20 +857,18 @@ impl DesktopReader {
     ) -> Result<Arc<ScrollSectionLayout>, rebook_reader::ReaderError> {
         let section_index = self.snapshot.location.section_index;
         let reading_unit = self.reader.reading_unit_location();
+        let preserve_physical_pages =
+            self.format == BookFormat::Pdf && self.pdf_ocr.mode == PdfOcrViewMode::Original;
         if let Some(layout) = &self.scroll_section
-            && layout.section_index == section_index
+            && (preserve_physical_pages || layout.section_index == section_index)
             && layout.reading_unit_index == reading_unit.index
         {
             return Ok(Arc::clone(layout));
         }
         let pages = self.reader.current_reading_unit_pages()?;
-        let preserve_physical_pages =
-            self.format == BookFormat::Pdf && self.pdf_ocr.mode == PdfOcrViewMode::Original;
         let layout = Arc::new(ScrollSectionLayout::new(
             section_index,
-            self.reader.section_count(),
             reading_unit.index,
-            reading_unit.count,
             pages,
             preserve_physical_pages,
         ));
@@ -916,6 +994,7 @@ impl DesktopReader {
             .get(self.focus_unit_index)
             .map(|unit| unit.range.start.clone());
         self.focus_units = units;
+        self.sync_focus_chat_session();
         self.sync_focus_selected_image();
         self.bump_scene_revision();
     }
@@ -957,6 +1036,17 @@ impl DesktopReader {
         let (top, bottom) = focus_unit_scroll_bounds(unit.rect, viewport.size.y, padding);
         if bottom <= top {
             return false;
+        }
+        if self.ui.focus_scroll_motion.is_some_and(|motion| {
+            motion.is_animating()
+                && match direction {
+                    PageDirection::Previous => motion.target <= top + MOTION_EPSILON,
+                    PageDirection::Next => motion.target >= bottom - MOTION_EPSILON,
+                }
+        }) {
+            // Repeated key events must not cross a block boundary before the
+            // viewport has actually reached the animated edge.
+            return true;
         }
         let current = self
             .ui
@@ -1004,6 +1094,7 @@ impl DesktopReader {
             .focus_units
             .get(index)
             .map(|unit| unit.range.start.clone());
+        self.sync_focus_chat_session();
         self.sync_focus_selected_image();
         if let Some(target) = self
             .scroll_viewport
@@ -1055,7 +1146,7 @@ impl DesktopReader {
         Some((layout.pages[index].position, x, local_y))
     }
 
-    fn update_scroll_viewport(&mut self, viewport: ScrollViewportState) {
+    fn update_scroll_viewport(&mut self, ctx: &egui::Context, viewport: ScrollViewportState) {
         let changed = self.scroll_viewport.is_none_or(|previous| {
             (previous.offset_y - viewport.offset_y).abs() > 0.1 || previous.size != viewport.size
         });
@@ -1064,22 +1155,61 @@ impl DesktopReader {
             self.bump_scene_revision();
         }
 
-        let visible_position = if self.is_focus_mode() {
-            self.focus_units
-                .get(self.focus_unit_index)
-                .map(|unit| unit.position)
+        let (visible_position, placeholder_positions) = if self.is_focus_mode() {
+            (
+                self.focus_units
+                    .get(self.focus_unit_index)
+                    .map(|unit| unit.position),
+                Vec::new(),
+            )
+        } else if let Some(layout) = self.scroll_section.as_ref() {
+            let visible_position = layout.first_visible_page(viewport.offset_y.max(0.0));
+            let placeholders = layout
+                .visible_pages(viewport)
+                .into_iter()
+                .filter(|position| {
+                    layout
+                        .pages
+                        .iter()
+                        .any(|entry| entry.position == *position && entry.placeholder)
+                })
+                .take(2)
+                .collect();
+            (visible_position, placeholders)
         } else {
-            self.scroll_section
-                .as_ref()
-                .and_then(|layout| layout.first_visible_page(viewport.offset_y.max(0.0)))
+            (None, Vec::new())
         };
+        let visible_was_placeholder =
+            visible_position.is_some_and(|position| placeholder_positions.contains(&position));
+        let mut ready_placeholders = Vec::new();
+        let mut materialization_pending = false;
+        for position in placeholder_positions {
+            match self.reader.try_materialize_position(position) {
+                Ok(true) => ready_placeholders.push(position),
+                Ok(false) => materialization_pending = true,
+                Err(error) => {
+                    self.error = Some(format!("加载 PDF 页面失败：{error}"));
+                    break;
+                }
+            }
+        }
+        if !ready_placeholders.is_empty() {
+            self.invalidate_page_scenes();
+        }
+        if materialization_pending {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
         let current = ReaderPosition {
             section_index: self.snapshot.location.section_index,
             segment_index: self.snapshot.location.segment_index,
             page_index: self.snapshot.location.page_index,
         };
+        let visible_is_pending = visible_position.is_some_and(|position| {
+            visible_was_placeholder && !ready_placeholders.contains(&position)
+        });
         if let Some(position) = visible_position
             && position != current
+            && !visible_is_pending
         {
             match self.reader.set_visible_position(position) {
                 Ok(snapshot) => {
@@ -1185,6 +1315,7 @@ struct DesktopReaderResources {
     highlight_store: HighlightStore,
     highlights: Vec<StoredHighlight>,
     progress_store: Option<SyncStore>,
+    restored_source_range: Option<SourceRange>,
     plugin_settings: PluginSettings,
     language: AppLanguage,
     reading_mode: ReadingMode,
@@ -1287,6 +1418,7 @@ struct SearchUiState {
 
 #[derive(Clone)]
 struct ChatTask {
+    session_id: u64,
     source: Arc<dyn BookSource>,
     format: BookFormat,
     kind: ChatRequestKind,
@@ -1301,10 +1433,15 @@ struct ChatTask {
     response_language: String,
 }
 
-pub(crate) type ChatTaskMessage = TaskResult<ChatResponse>;
+pub(crate) struct ChatTaskMessage {
+    pub(crate) id: u64,
+    pub(crate) session_id: u64,
+    pub(crate) result: Result<ChatResponse, String>,
+}
 
 pub(crate) struct ChatStreamMessage {
     pub(crate) id: u64,
+    pub(crate) session_id: u64,
     pub(crate) content: String,
 }
 
@@ -1313,8 +1450,8 @@ struct ChatStreamingState {
     content: String,
 }
 
-#[derive(Default)]
 struct ChatUiState {
+    session_id: u64,
     input: String,
     cursor_char_index: usize,
     suggestion_index: usize,
@@ -1328,6 +1465,38 @@ struct ChatUiState {
     error: Option<String>,
     error_timer: TransientMessageTimer,
     task: TaskSlot<ChatTask>,
+    pending_keyboard_scroll_delta: f32,
+}
+
+impl Default for ChatUiState {
+    fn default() -> Self {
+        Self {
+            session_id: NEXT_CHAT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            input: String::new(),
+            cursor_char_index: 0,
+            suggestion_index: 0,
+            move_cursor_to_end: false,
+            references: Vec::new(),
+            reference_options_location: None,
+            reference_options: Vec::new(),
+            messages: Vec::new(),
+            pending_annotation_actions: Vec::new(),
+            streaming: None,
+            error: None,
+            error_timer: TransientMessageTimer::default(),
+            task: TaskSlot::default(),
+            pending_keyboard_scroll_delta: 0.0,
+        }
+    }
+}
+
+impl ChatUiState {
+    fn has_data(&self) -> bool {
+        !self.messages.is_empty()
+            || self.task.is_pending()
+            || self.streaming.is_some()
+            || !self.pending_annotation_actions.is_empty()
+    }
 }
 
 #[derive(Clone)]
@@ -1668,7 +1837,6 @@ struct ReaderUiState {
     last_wheel_turn: Option<Instant>,
     expanded_toc: HashSet<String>,
     last_auto_scrolled_toc: Option<String>,
-    focus_chat_minimized: bool,
     focus_actions_visible: bool,
 }
 
@@ -1780,6 +1948,7 @@ impl DesktopReader {
             highlight_store,
             highlights,
             progress_store,
+            restored_source_range,
             plugin_settings,
             language,
             reading_mode,
@@ -1800,6 +1969,19 @@ impl DesktopReader {
                 segment_index: snapshot.location.segment_index,
                 page_index: snapshot.location.page_index,
             });
+        let restored_focus_anchor = if reading_mode == ReadingMode::Focus {
+            restored_source_range
+                .as_ref()
+                .map(|range| range.start.clone())
+        } else {
+            None
+        };
+        let scroll_target_source =
+            if reading_mode != ReadingMode::Focus && reader.style().spread == SpreadMode::Scroll {
+                restored_source_range
+            } else {
+                None
+            };
         let mut pdf_ocr = PdfOcrUiState::new(pdf_ocr_available, pdf_ocr_mode);
         let resume_pdf_ocr = format == BookFormat::Pdf
             && plugin_settings.pdf_ocr_enabled
@@ -1885,6 +2067,9 @@ impl DesktopReader {
             search_navigation_requested: None,
             semantic_index,
             chat: ChatUiState::default(),
+            book_chat: None,
+            focus_chat_sessions: HashMap::new(),
+            focus_chat_session_key: None,
             chat_markdown: chat_markdown::ChatMarkdownState::default(),
             translation: TranslationUiState::default(),
             pdf_toc,
@@ -1913,7 +2098,6 @@ impl DesktopReader {
                 last_wheel_turn: None,
                 expanded_toc,
                 last_auto_scrolled_toc: None,
-                focus_chat_minimized: false,
                 focus_actions_visible: false,
             },
             plugin_settings,
@@ -1929,12 +2113,15 @@ impl DesktopReader {
             scroll_section: None,
             scroll_viewport: None,
             scroll_target_position,
+            scroll_target_source,
             focus_units: Vec::new(),
             focus_unit_index: 0,
             focus_target_offset: None,
-            focus_anchor: None,
+            focus_anchor: restored_focus_anchor,
             focus_toc_override: None,
             pending_page_turn: None,
+            pending_reading_unit_entry: None,
+            pending_keyboard_scroll_delta: 0.0,
             settings_requested: false,
             settings_change_requested: None,
             notice: None,
@@ -1975,21 +2162,25 @@ mod tests {
     use super::{
         BookDisplayMetadata, Duration, FOCUS_SCROLL_MAX_DURATION, FOCUS_SCROLL_MIN_DURATION,
         FocusUnit, FollowUp, HashSet, Instant, MOTION_DURATION, Motion, MotionCurve,
-        NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, SidebarTab, SnapshotEffects,
-        TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState,
-        allowed_reading_mode, focus_block_paint_ranges, focus_scroll_duration,
+        NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, ScrollSectionLayout, SidebarTab,
+        SnapshotEffects, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer,
+        TranslationUiState, allowed_reading_mode, focus_block_paint_ranges, focus_scroll_duration,
         focus_unit_container_center_y, focus_unit_geometry_ranges, focus_unit_screen_center_y,
-        focus_unit_scroll_bounds, focus_unit_target_offset_for_rect, logical_dimension,
-        resolve_book_display_metadata, resolved_focus_unit_index, source_range_contains_anchor,
+        focus_unit_scroll_bounds, focus_unit_target_offset_for_rect,
+        legacy_translated_paragraph_range, logical_dimension, resolve_book_display_metadata,
+        resolved_focus_unit_index, source_range_contains_anchor,
     };
     use crate::plugins::PdfOcrViewMode;
     use crate::preferences::ReadingMode;
     use rebook_formats::BookFormat;
+    use rebook_layout::{ImagePlacement, LayoutViewport, PageItem, PageLayout, RasterImage};
     use rebook_publication::{
-        Block, BlockStyle, SourceAnchor, SourceRange, SpineItemId, TableBlock, TableCell, TableRow,
-        TextBlock, TextBlockKind,
+        Block, BlockStyle, Rgba, SourceAnchor, SourceRange, SpineItemId, TableBlock, TableCell,
+        TableRow, TextBlock, TextBlockKind,
     };
-    use rebook_reader::ReaderPosition;
+    use rebook_reader::{ReaderPosition, ReaderSectionPage};
+    use rebook_renderer::DisplayListCompiler;
+    use std::sync::Arc;
 
     #[test]
     fn original_pdf_forces_classic_mode_until_ocr_reflow_is_active() {
@@ -2023,6 +2214,115 @@ mod tests {
         assert_eq!(logical_dimension(0.0), 0);
         assert_eq!(logical_dimension(10.4), 10);
         assert_eq!(logical_dimension(10.6), 11);
+    }
+
+    #[test]
+    fn physical_pdf_scroll_pages_trim_only_the_layout_margins() {
+        let spine = SpineItemId::new("page-1").unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "page-image".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "page-image".into(),
+                text_offset: 1,
+            },
+        };
+        let page = PageLayout {
+            viewport: LayoutViewport::new(400, 500).unwrap(),
+            background: Rgba {
+                red: 255,
+                green: 255,
+                blue: 255,
+                alpha: 255,
+            },
+            items: vec![PageItem::Image(ImagePlacement {
+                image: RasterImage {
+                    width: 2,
+                    height: 2,
+                    pixels: vec![255; 16].into(),
+                },
+                x: 20.0,
+                y: 40.0,
+                width: 360.0,
+                height: 420.0,
+                source: Some(source.clone()),
+                text_layer: None,
+                replacement: None,
+            })],
+        };
+        let entry = ReaderSectionPage {
+            position: ReaderPosition {
+                section_index: 0,
+                segment_index: 0,
+                page_index: 0,
+            },
+            page: Arc::new(DisplayListCompiler.compile(&page)),
+            placeholder: false,
+            visible_top: None,
+            visible_bottom: None,
+        };
+
+        let layout = ScrollSectionLayout::new(0, 0, vec![entry], true);
+
+        assert!((layout.page_origins[0] - 40.0).abs() < f32::EPSILON);
+        assert!((layout.page_heights[0] - 420.0).abs() < f32::EPSILON);
+        assert_eq!(layout.page_at_content_y(0.0), Some((0, 40.0)));
+        assert_eq!(layout.source_top(&source), Some(0.0));
+        assert_eq!(
+            layout.pages[0].page.source_range_nearest_y(40.0),
+            Some(source)
+        );
+    }
+
+    #[test]
+    fn legacy_full_paragraph_translation_range_expands_to_the_canonical_source() {
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let canonical = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "paragraph-1".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: "paragraph-1".into(),
+                text_offset: 224,
+            },
+        };
+        let legacy = SourceRange {
+            start: canonical.start.clone(),
+            end: SourceAnchor {
+                spine,
+                node: "paragraph-1".into(),
+                text_offset: 69,
+            },
+        };
+        let blocks = vec![Block::Text(TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![rebook_publication::Inline::Text(
+                rebook_publication::TextRun {
+                    text: "a".repeat(224),
+                    style: rebook_publication::TextStyle::default(),
+                    link: None,
+                },
+            )],
+            style: BlockStyle::default(),
+            source: Some(canonical.clone()),
+        })];
+        let translated_quote = "译".repeat(69);
+
+        assert_eq!(
+            legacy_translated_paragraph_range(&blocks, &legacy, &translated_quote),
+            Some(canonical)
+        );
+        assert_eq!(
+            legacy_translated_paragraph_range(&blocks, &legacy, &"a".repeat(69)),
+            None
+        );
     }
 
     #[test]
@@ -2330,7 +2630,6 @@ mod tests {
             last_wheel_turn: None,
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
-            focus_chat_minimized: false,
             focus_actions_visible: false,
         };
 
@@ -2367,7 +2666,6 @@ mod tests {
             last_wheel_turn: None,
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
-            focus_chat_minimized: false,
             focus_actions_visible: false,
         };
 

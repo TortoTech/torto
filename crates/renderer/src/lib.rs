@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use anyrender::{Glyph, NormalizedCoord, PaintScene};
-use kurbo::{Affine, Line, Rect, Stroke, Vec2};
+use kurbo::{Affine, BezPath, Line, Rect, Shape, Stroke, Vec2};
 use parley::editing::{Cursor, Selection};
 use parley::layout::{Affinity, BreakReason, Cluster, ClusterSide};
 use parley::{FontData, Layout, PositionedLayoutItem};
@@ -58,6 +58,22 @@ pub struct PageDisplayList {
 struct TableRegion {
     bounds: Rect,
     sources: Vec<SourceRange>,
+}
+
+const HIGHLIGHT_VERTICAL_OVERLAP: f64 = 0.5;
+
+fn source_range_highlight_path(rects: impl IntoIterator<Item = Rect>) -> BezPath {
+    let mut path = BezPath::new();
+    for rect in rects {
+        let rect = Rect::new(
+            rect.x0,
+            rect.y0 - HIGHLIGHT_VERTICAL_OVERLAP,
+            rect.x1,
+            rect.y1 + HIGHLIGHT_VERTICAL_OVERLAP,
+        );
+        path.extend(rect.path_elements(0.0));
+    }
+    path
 }
 
 impl PageDisplayList {
@@ -203,6 +219,39 @@ impl PageDisplayList {
         self.text_regions
             .iter()
             .find_map(TextRegion::visible_source_range)
+    }
+
+    /// Returns the source-backed block nearest a vertical page coordinate.
+    /// Continuous readers use this to persist the paragraph, table, or image at
+    /// the top of the viewport instead of falling back to the page's first block.
+    pub fn source_range_nearest_y(&self, y: f32) -> Option<SourceRange> {
+        let mut nearest: Option<(f32, SourceRange)> = None;
+        let mut consider = |distance: f32, range: SourceRange| {
+            if nearest
+                .as_ref()
+                .is_none_or(|(current, _)| distance < *current)
+            {
+                nearest = Some((distance, range));
+            }
+        };
+        for region in &self.text_regions {
+            if let Some(range) = region.visible_source_range() {
+                consider(region.vertical_distance(y), range);
+            }
+        }
+        for table in &self.table_regions {
+            if let Some(range) = table.sources.first() {
+                consider(vertical_rect_distance(table.bounds, y), range.clone());
+            }
+        }
+        for command in &self.commands {
+            if let DisplayCommand::Image(image) = command
+                && let Some(source) = &image.source
+            {
+                consider(vertical_rect_distance(image.bounds, y), source.clone());
+            }
+        }
+        nearest.map(|(_, range)| range)
     }
 
     /// Hit-tests source-backed text. Exact mode is used when a drag starts;
@@ -370,8 +419,14 @@ impl PageDisplayList {
         offset_x: f32,
     ) {
         let transform = Affine::translate((f64::from(offset_x), 0.0));
-        for rect in self.source_rects(ranges) {
-            scene.fill(Fill::NonZero, transform, color, None, &rect);
+        let path = source_range_highlight_path(self.source_rects(ranges));
+        if !path.is_empty() {
+            // Separate translucent AA rectangles can expose one-pixel conflation
+            // seams at shared line edges in Vello. Paint one slightly-overlapped
+            // non-zero path so adjacent rows are composited exactly once:
+            // https://github.com/linebender/vello/issues/49
+            // https://github.com/linebender/vello/issues/417
+            scene.fill(Fill::NonZero, transform, color, None, &path);
         }
     }
 
@@ -430,6 +485,21 @@ impl PageDisplayList {
         for command in &self.commands {
             command.paint(scene, transform);
         }
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "display-list coordinates are viewport-bounded f32 values stored in kurbo f64"
+)]
+fn vertical_rect_distance(rect: Rect, y: f32) -> f32 {
+    let y = f64::from(y);
+    if y < rect.y0 {
+        (rect.y0 - y) as f32
+    } else if y > rect.y1 {
+        (y - rect.y1) as f32
+    } else {
+        0.0
     }
 }
 
@@ -721,22 +791,23 @@ impl ShapedTextRegion {
             return None;
         }
         let source_start = self.source.start.text_offset;
+        let source_length = self.source.end.text_offset.checked_sub(source_start)?;
+        let source_text = self.text.get(self.source_text_start..)?;
+        let text_length = source_text.chars().count();
+        let start_chars = self
+            .text
+            .get(self.source_text_start..byte_range.start)?
+            .chars()
+            .count();
+        let end_chars = self
+            .text
+            .get(self.source_text_start..byte_range.end)?
+            .chars()
+            .count();
         let start = source_start
-            + u64::try_from(
-                self.text
-                    .get(self.source_text_start..byte_range.start)?
-                    .chars()
-                    .count(),
-            )
-            .ok()?;
+            + scale_text_offset_to_source(start_chars, text_length, source_length, false)?;
         let end = source_start
-            + u64::try_from(
-                self.text
-                    .get(self.source_text_start..byte_range.end)?
-                    .chars()
-                    .count(),
-            )
-            .ok()?;
+            + scale_text_offset_to_source(end_chars, text_length, source_length, true)?;
         Some(SourceRange {
             start: SourceAnchor {
                 spine: self.source.start.spine.clone(),
@@ -775,8 +846,24 @@ impl ShapedTextRegion {
             return None;
         }
         let source_text = self.text.get(self.source_text_start..)?;
-        let start_chars = usize::try_from(start_offset - self.source.start.text_offset).ok()?;
-        let end_chars = usize::try_from(end_offset - self.source.start.text_offset).ok()?;
+        let text_length = source_text.chars().count();
+        let source_length = self
+            .source
+            .end
+            .text_offset
+            .checked_sub(self.source.start.text_offset)?;
+        let start_chars = scale_source_offset_to_text(
+            start_offset - self.source.start.text_offset,
+            source_length,
+            text_length,
+            false,
+        )?;
+        let end_chars = scale_source_offset_to_text(
+            end_offset - self.source.start.text_offset,
+            source_length,
+            text_length,
+            true,
+        )?;
         let start = self.source_text_start + byte_index_for_char_offset(source_text, start_chars);
         let end = self.source_text_start + byte_index_for_char_offset(source_text, end_chars);
         let visible = self.visible_byte_range()?;
@@ -790,6 +877,44 @@ impl ShapedTextRegion {
             .and_then(|range| self.source_range_for_bytes(range))
             .is_some_and(|range| source_range_contains(&range, anchor))
     }
+}
+
+fn scale_text_offset_to_source(
+    offset: usize,
+    text_length: usize,
+    source_length: u64,
+    round_up: bool,
+) -> Option<u64> {
+    if text_length == 0 {
+        return Some(0);
+    }
+    let numerator = u128::try_from(offset).ok()? * u128::from(source_length);
+    let denominator = u128::try_from(text_length).ok()?;
+    let scaled = if round_up {
+        numerator.div_ceil(denominator)
+    } else {
+        numerator / denominator
+    };
+    u64::try_from(scaled).ok()
+}
+
+fn scale_source_offset_to_text(
+    offset: u64,
+    source_length: u64,
+    text_length: usize,
+    round_up: bool,
+) -> Option<usize> {
+    if source_length == 0 {
+        return Some(0);
+    }
+    let numerator = u128::from(offset) * u128::try_from(text_length).ok()?;
+    let denominator = u128::from(source_length);
+    let scaled = if round_up {
+        numerator.div_ceil(denominator)
+    } else {
+        numerator / denominator
+    };
+    usize::try_from(scaled).ok()
 }
 
 struct FixedTextRegion {
@@ -1526,6 +1651,23 @@ mod tests {
     };
 
     #[test]
+    fn multiline_highlight_geometry_overlaps_adjacent_antialiased_edges() {
+        let path = source_range_highlight_path([
+            Rect::new(10.0, 10.0, 80.0, 25.0),
+            Rect::new(10.0, 25.0, 60.0, 40.0),
+        ]);
+
+        assert_eq!(path.bounding_box(), Rect::new(10.0, 9.5, 80.0, 40.5));
+        assert_eq!(
+            path.elements()
+                .iter()
+                .filter(|element| matches!(element, kurbo::PathEl::MoveTo(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn empty_page_still_has_a_background() {
         let page = PageLayout {
             viewport: LayoutViewport::new(320, 240).unwrap(),
@@ -1617,6 +1759,57 @@ mod tests {
         assert_eq!(fragment.quote, "ello");
         assert_eq!(fragment.range, selected_source);
         assert!(!fragment.rects.is_empty());
+    }
+
+    #[test]
+    fn translated_text_maps_selection_offsets_to_the_original_source_span() {
+        let text: Arc<str> = "这是较短的完整译文".into();
+        let mut font_context = FontContext::new();
+        let mut layout_context = LayoutContext::new();
+        let mut builder =
+            layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
+        builder.push_default(StyleProperty::FontSize(18.0));
+        builder.push_default(StyleProperty::Brush(TextBrush {
+            color: Rgba::BLACK,
+            underline: false,
+            baseline: TextBaseline::Normal,
+        }));
+        let mut layout = builder.build(text.as_ref());
+        layout.break_all_lines(Some(240.0));
+        layout.align(Alignment::Start, AlignmentOptions::default());
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "paragraph-1".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "paragraph-1".into(),
+                text_offset: 224,
+            },
+        };
+        let line_count = layout.len();
+        let page = PageLayout {
+            viewport: LayoutViewport::new(320, 240).unwrap(),
+            background: Rgba::BLACK,
+            items: vec![PageItem::Text(TextPlacement {
+                layout: Arc::new(layout),
+                text: Arc::clone(&text),
+                source_text_start: 0,
+                lines: 0..line_count,
+                origin_x: 24.0,
+                origin_y: 24.0,
+                source: Some(source.clone()),
+                inline_images: Arc::from([]),
+            })],
+        };
+        let list = DisplayListCompiler.compile(&page);
+
+        let selection = list.selection_fragment(0, 0..text.len()).unwrap();
+        assert_eq!(selection.range, source);
+        assert!(!list.source_rects(std::slice::from_ref(&source)).is_empty());
     }
 
     #[test]

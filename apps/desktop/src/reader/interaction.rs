@@ -38,11 +38,16 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn current_focus_note(&self) -> Option<String> {
-        let unit = self.focus_units.get(self.focus_unit_index)?;
+        self.focus_note_at(self.focus_unit_index)
+    }
+
+    pub(in crate::reader) fn focus_note_at(&self, index: usize) -> Option<String> {
+        let unit = self.focus_units.get(index)?;
         self.highlights
             .iter()
             .find(|highlight| highlight.ranges.as_slice() == std::slice::from_ref(&unit.range))
             .and_then(|highlight| highlight.note.clone())
+            .filter(|note| !note.trim().is_empty())
     }
 
     pub(in crate::reader) fn create_focus_highlight(&mut self, note: Option<String>) {

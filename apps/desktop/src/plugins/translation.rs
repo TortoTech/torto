@@ -5,8 +5,8 @@ use std::sync::{Arc, RwLock};
 use rebook_publication::{
     Block, BlockStyle, Book, BookSource, FixedPageTextLayer, FixedPageTextRect,
     FixedPageTextReplacement, FixedPageTextReplacementSegment, Inline, PublicationError,
-    PublicationUrl, RasterResource, RenditionLayout, Resource, Section, SectionAnchor, SourceRange,
-    TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
+    PublicationUrl, RasterResource, RenditionLayout, Resource, Section, SourceRange, TextBaseline,
+    TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 
 use super::TranslationMode;
@@ -362,11 +362,6 @@ impl BookSource for TranslationBookSource {
                         TranslationMode::Replace => {
                             original.content =
                                 replacement_content(translation, style, Some(&original.content));
-                            update_translated_source(
-                                original.source.as_mut(),
-                                translation,
-                                &mut section.anchors,
-                            );
                             rendered.push(Block::Text(original));
                         }
                         TranslationMode::Bilingual => {
@@ -384,11 +379,7 @@ impl BookSource for TranslationBookSource {
                     }
                 }
                 Block::Image(mut image) if image.text_layer.is_some() && is_pdf => {
-                    apply_fixed_page_translation(
-                        &mut image,
-                        &translation.segments,
-                        &mut section.anchors,
-                    );
+                    apply_fixed_page_translation(&mut image, &translation.segments);
                     rendered.push(Block::Image(image));
                 }
                 Block::Image(image) if image.text_layer.is_some() => {
@@ -403,12 +394,6 @@ impl BookSource for TranslationBookSource {
                             .flatten(),
                     );
                     if mode == TranslationMode::Replace {
-                        let mut translated = translated;
-                        update_translated_source(
-                            translated.source.as_mut(),
-                            translation,
-                            &mut section.anchors,
-                        );
                         rendered.push(Block::Text(translated));
                     } else {
                         rendered.push(Block::Image(image));
@@ -420,7 +405,6 @@ impl BookSource for TranslationBookSource {
                         table,
                         &translation.segments,
                         mode,
-                        &mut section.anchors,
                     )));
                 }
                 other => rendered.push(other),
@@ -440,6 +424,13 @@ impl BookSource for TranslationBookSource {
     ) -> Result<Option<RasterResource>, PublicationError> {
         self.inner.raster_resource(href)
     }
+
+    fn fixed_page_dimensions(
+        &self,
+        section_index: usize,
+    ) -> Result<Option<rebook_publication::FixedPageDimensions>, PublicationError> {
+        self.inner.fixed_page_dimensions(section_index)
+    }
 }
 
 fn active_translations(
@@ -456,7 +447,6 @@ fn translated_table(
     mut table: rebook_publication::TableBlock,
     translations: &HashMap<usize, String>,
     mode: TranslationMode,
-    anchors: &mut [SectionAnchor],
 ) -> rebook_publication::TableBlock {
     for (cell_index, cell) in table
         .rows
@@ -479,7 +469,6 @@ fn translated_table(
         if mode == TranslationMode::Replace {
             let original = cell.text.content.clone();
             cell.text.content = replacement_content(translated, style, Some(&original));
-            update_translated_source(cell.text.source.as_mut(), translated, anchors);
         } else {
             let original = cell.text.content.clone();
             cell.text.content.push(Inline::Break);
@@ -505,7 +494,6 @@ fn normalized_translation_mode(
 fn apply_fixed_page_translation(
     image: &mut rebook_publication::ImageBlock,
     translations: &HashMap<usize, String>,
-    anchors: &mut [SectionAnchor],
 ) {
     let Some(layer) = image.text_layer.as_mut() else {
         return;
@@ -532,12 +520,6 @@ fn apply_fixed_page_translation(
     if segments.is_empty() {
         return;
     }
-    let translated_page = segments
-        .iter()
-        .map(|segment| segment.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    update_translated_source(image.source.as_mut(), &translated_page, anchors);
     layer.replacement = Some(FixedPageTextReplacement { segments });
 }
 
@@ -798,29 +780,6 @@ fn translated_fixed_page_block(text: &str, source: Option<SourceRange>) -> TextB
     }
 }
 
-fn update_translated_source(
-    source: Option<&mut SourceRange>,
-    translation: &str,
-    anchors: &mut [SectionAnchor],
-) {
-    let Some(source) = source else {
-        return;
-    };
-    source.end.spine = source.start.spine.clone();
-    source.end.node.clone_from(&source.start.node);
-    source.end.text_offset = source.start.text_offset.saturating_add(
-        u64::try_from(translation_visible_char_count(translation)).unwrap_or(u64::MAX),
-    );
-    for anchor in anchors {
-        if anchor.source.spine == source.start.spine && anchor.source.node == source.start.node {
-            anchor.source.text_offset = anchor
-                .source
-                .text_offset
-                .clamp(source.start.text_offset, source.end.text_offset);
-        }
-    }
-}
-
 fn translation_text(block: &TextBlock) -> String {
     let mut text = String::new();
     for inline in &block.content {
@@ -849,18 +808,10 @@ fn translation_text(block: &TextBlock) -> String {
     text
 }
 
-fn translation_visible_char_count(text: &str) -> usize {
-    text.replace("<sup>", "")
-        .replace("</sup>", "")
-        .replace("<sub>", "")
-        .replace("</sub>", "")
-        .chars()
-        .count()
-}
-
 fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>) -> Vec<Inline> {
-    let styled = parse_baseline_markup(text, style)
-        .unwrap_or_else(|| restore_original_baselines(text, style, original.unwrap_or_default()));
+    let text = normalize_translation_spacing(text);
+    let styled = parse_baseline_markup(&text, style)
+        .unwrap_or_else(|| restore_original_baselines(&text, style, original.unwrap_or_default()));
     let mut content = Vec::new();
     for (text, style) in styled {
         for (index, line) in text.split('\n').enumerate() {
@@ -877,6 +828,84 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
         }
     }
     content
+}
+
+fn normalize_translation_spacing(text: &str) -> String {
+    text.split('\n')
+        .map(normalize_translation_line_spacing)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_translation_line_spacing(line: &str) -> String {
+    let mut collapsed = String::with_capacity(line.len());
+    let mut pending_space = false;
+    for character in line.chars() {
+        if character.is_whitespace() {
+            pending_space = !collapsed.is_empty();
+            continue;
+        }
+        if pending_space {
+            collapsed.push(' ');
+            pending_space = false;
+        }
+        collapsed.push(character);
+    }
+
+    let cjk_count = collapsed
+        .chars()
+        .filter(|character| is_cjk(*character))
+        .count();
+    let mut latin_word_count = 0;
+    let mut in_latin_word = false;
+    for character in collapsed.chars() {
+        if character.is_ascii_alphanumeric() {
+            if !in_latin_word {
+                latin_word_count += 1;
+            }
+            in_latin_word = true;
+        } else {
+            in_latin_word = false;
+        }
+    }
+    if cjk_count == 0 || cjk_count < latin_word_count {
+        return collapsed;
+    }
+
+    let characters = collapsed.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(collapsed.len());
+    for (index, character) in characters.iter().copied().enumerate() {
+        if character != ' ' {
+            normalized.push(character);
+            continue;
+        }
+        let previous = characters.get(index.wrapping_sub(1)).copied();
+        let next = characters.get(index + 1).copied();
+        if previous.is_some_and(is_cjk) || next.is_some_and(is_cjk) {
+            continue;
+        }
+        // Parley stretches both regular and non-breaking spaces during
+        // justification. A thin space preserves visible word separation
+        // without becoming a justification slot; the following zero-width
+        // break still permits long embedded phrases to wrap.
+        normalized.push('\u{2009}');
+        normalized.push('\u{200b}');
+    }
+    normalized
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x2E80..=0x2FFF
+            | 0x3040..=0x30FF
+            | 0x31F0..=0x31FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2FA1F
+    )
 }
 
 fn parse_baseline_markup(text: &str, default_style: TextStyle) -> Option<Vec<(String, TextStyle)>> {
@@ -1153,6 +1182,18 @@ mod tests {
     }
 
     #[test]
+    fn translation_spacing_collapses_llm_whitespace_and_protects_latin_phrases() {
+        assert_eq!(
+            normalize_translation_spacing("OER    运动由 Dick      Durbin 提出"),
+            "OER运动由Dick\u{2009}\u{200b}Durbin提出"
+        );
+        assert_eq!(
+            normalize_translation_spacing("A long English sentence keeps normal spaces"),
+            "A long English sentence keeps normal spaces"
+        );
+    }
+
+    #[test]
     fn translation_preserves_and_restores_baseline_markers() {
         let superscript = TextStyle {
             baseline: TextBaseline::Superscript,
@@ -1226,7 +1267,7 @@ mod tests {
         assert!(matches!(&replaced.blocks[0], Block::Text(block) if block.source.is_some()));
         assert!(matches!(
             &replaced.blocks[0],
-            Block::Text(block) if block.source.as_ref().unwrap().end.text_offset == 2
+            Block::Text(block) if block.source.as_ref().unwrap().end.text_offset == 5
         ));
 
         source.set_mode(TranslationMode::Bilingual).unwrap();
@@ -1336,7 +1377,7 @@ mod tests {
         ));
         assert!(matches!(
             &replaced.blocks[0],
-            Block::Image(image) if image.source.as_ref().unwrap().end.text_offset == 6
+            Block::Image(image) if image.source.as_ref().unwrap().end.text_offset == 9
         ));
 
         source.set_mode(TranslationMode::Bilingual).unwrap();

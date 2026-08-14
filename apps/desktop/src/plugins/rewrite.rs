@@ -184,6 +184,13 @@ impl BookSource for RewriteBookSource {
     ) -> Result<Option<RasterResource>, PublicationError> {
         self.inner.raster_resource(href)
     }
+
+    fn fixed_page_dimensions(
+        &self,
+        section_index: usize,
+    ) -> Result<Option<rebook_publication::FixedPageDimensions>, PublicationError> {
+        self.inner.fixed_page_dimensions(section_index)
+    }
 }
 
 fn replacement_content(text: &str, style: TextStyle) -> Vec<Inline> {

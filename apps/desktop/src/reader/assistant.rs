@@ -28,6 +28,7 @@ use super::{
 
 impl DesktopReader {
     pub(super) fn attach_current_focus_reference(&mut self) {
+        self.sync_focus_chat_session();
         let Some(unit) = self.focus_units.get(self.focus_unit_index).cloned() else {
             return;
         };
@@ -143,7 +144,23 @@ impl DesktopReader {
                 let _ = proxy.send_event(UserEvent::ReaderSearch(SearchTaskMessage { id, result }));
             });
         }
+        let mut chat_requests = Vec::new();
         if let Some(request) = self.chat.task.take_pending() {
+            chat_requests.push(request);
+        }
+        if let Some(request) = self
+            .book_chat
+            .as_mut()
+            .and_then(|chat| chat.task.take_pending())
+        {
+            chat_requests.push(request);
+        }
+        for chat in self.focus_chat_sessions.values_mut() {
+            if let Some(request) = chat.task.take_pending() {
+                chat_requests.push(request);
+            }
+        }
+        for request in chat_requests {
             let proxy = proxy.clone();
             crate::diagnostics::log(
                 "chat.task.start",
@@ -163,6 +180,7 @@ impl DesktopReader {
             runtime.spawn(async move {
                 let id = request.id;
                 let payload = request.payload;
+                let session_id = payload.session_id;
                 let result = chat_with_book(
                     payload.source,
                     payload.format,
@@ -178,12 +196,20 @@ impl DesktopReader {
                     payload.response_language,
                     move |content| {
                         let _ = stream_proxy.send_event(UserEvent::ReaderChatStream(
-                            ChatStreamMessage { id, content },
+                            ChatStreamMessage {
+                                id,
+                                session_id,
+                                content,
+                            },
                         ));
                     },
                 )
                 .await;
-                let _ = proxy.send_event(UserEvent::ReaderChat(ChatTaskMessage { id, result }));
+                let _ = proxy.send_event(UserEvent::ReaderChat(ChatTaskMessage {
+                    id,
+                    session_id,
+                    result,
+                }));
             });
         }
         if let Some(request) = self.translation.task.take_pending() {
@@ -918,7 +944,99 @@ impl DesktopReader {
         self.log_diagnostic_snapshot("assistant.toggle.after", None);
     }
 
+    fn focus_chat_key_at(&self, index: usize) -> Option<String> {
+        let range = &self.focus_units.get(index)?.range;
+        Some(format!(
+            "{}\u{1f}{}\u{1f}{}",
+            range.start.spine.as_str(),
+            range.start.node,
+            range.start.text_offset
+        ))
+    }
+
+    fn current_focus_chat_key(&self) -> Option<String> {
+        self.focus_chat_key_at(self.focus_unit_index)
+    }
+
+    pub(super) fn sync_focus_chat_session(&mut self) {
+        if !self.is_focus_mode() {
+            self.restore_book_chat_session();
+            return;
+        }
+        let Some(next_key) = self.current_focus_chat_key() else {
+            return;
+        };
+        if self.focus_chat_session_key.as_deref() == Some(next_key.as_str()) {
+            return;
+        }
+
+        let previous = std::mem::take(&mut self.chat);
+        if let Some(previous_key) = self.focus_chat_session_key.take() {
+            self.focus_chat_sessions.insert(previous_key, previous);
+        } else {
+            self.book_chat = Some(previous);
+        }
+        self.chat = self
+            .focus_chat_sessions
+            .remove(&next_key)
+            .unwrap_or_default();
+        self.focus_chat_session_key = Some(next_key);
+        self.chat.move_cursor_to_end = true;
+        self.chat_markdown = super::chat_markdown::ChatMarkdownState::default();
+
+        if self.ui.assistant_panel.is_some() {
+            self.ui.assistant_panel = None;
+            self.ui.assistant_motion = super::Motion::settled(0.0);
+        }
+    }
+
+    pub(super) fn restore_book_chat_session(&mut self) {
+        let Some(previous_key) = self.focus_chat_session_key.take() else {
+            return;
+        };
+        self.focus_chat_sessions
+            .insert(previous_key, std::mem::take(&mut self.chat));
+        self.chat = self.book_chat.take().unwrap_or_default();
+        self.chat.move_cursor_to_end = true;
+        self.chat_markdown = super::chat_markdown::ChatMarkdownState::default();
+    }
+
+    pub(super) fn current_chat_has_data(&self) -> bool {
+        self.chat.has_data()
+    }
+
+    pub(super) fn focus_chat_has_data_at(&self, index: usize) -> bool {
+        let Some(key) = self.focus_chat_key_at(index) else {
+            return false;
+        };
+        if self.focus_chat_session_key.as_deref() == Some(key.as_str()) {
+            return self.chat.has_data();
+        }
+        self.focus_chat_sessions
+            .get(&key)
+            .is_some_and(super::ChatUiState::has_data)
+    }
+
+    fn chat_state_mut_by_session(&mut self, session_id: u64) -> Option<&mut super::ChatUiState> {
+        if self.chat.session_id == session_id {
+            return Some(&mut self.chat);
+        }
+        if self
+            .book_chat
+            .as_ref()
+            .is_some_and(|chat| chat.session_id == session_id)
+        {
+            return self.book_chat.as_mut();
+        }
+        self.focus_chat_sessions
+            .values_mut()
+            .find(|chat| chat.session_id == session_id)
+    }
+
     pub(super) fn open_assistant_panel(&mut self, panel: AssistantPanel) {
+        if self.is_focus_mode() {
+            self.sync_focus_chat_session();
+        }
         self.ui.assistant_panel = Some(panel);
         self.chat.move_cursor_to_end = true;
         if self.ui.assistant_motion.animate_to(1.0) {
@@ -927,9 +1045,6 @@ impl DesktopReader {
     }
 
     pub(super) fn close_assistant_panel(&mut self) {
-        if self.is_focus_mode() {
-            self.ui.focus_chat_minimized = true;
-        }
         self.log_diagnostic_snapshot("assistant.close.before", None);
         if self.ui.assistant_motion.animate_to(0.0) {
             self.ui.last_motion_tick = Some(std::time::Instant::now());
@@ -1286,6 +1401,7 @@ impl DesktopReader {
         let question_lines = question.lines().count();
         let current = self.chat_reading_context();
         let id = self.chat.task.begin(ChatTask {
+            session_id: self.chat.session_id,
             source: Arc::clone(&self.source),
             format: self.format,
             kind,
@@ -1383,14 +1499,22 @@ impl DesktopReader {
     }
 
     pub(crate) fn complete_chat(&mut self, message: ChatTaskMessage) {
-        if self.chat.task.complete(message.id).is_none() {
+        let Some(chat) = self.chat_state_mut_by_session(message.session_id) else {
+            crate::diagnostics::log(
+                "chat.complete.stale",
+                &[crate::diagnostics::Field::U64("id", message.id)],
+            );
+            return;
+        };
+        if chat.task.complete(message.id).is_none() {
             crate::diagnostics::log(
                 "chat.complete.stale",
                 &[crate::diagnostics::Field::U64("id", message.id)],
             );
             return;
         }
-        self.chat.streaming = None;
+        chat.streaming = None;
+        let session_id = message.session_id;
         match message.result {
             Ok(response) => {
                 log_completed_chat(message.id, &response);
@@ -1414,7 +1538,8 @@ impl DesktopReader {
                                 .find_map(|transaction| {
                                     self.rewrite_source.rollback(transaction).err()
                                 });
-                            self.chat.error = Some(match (self.language, rollback_error) {
+                            let language = self.language;
+                            let message = match (language, rollback_error) {
                                 (
                                     crate::preferences::AppLanguage::SimplifiedChinese,
                                     Some(rollback_error),
@@ -1435,20 +1560,25 @@ impl DesktopReader {
                                 (crate::preferences::AppLanguage::English, None) => {
                                     format!("Failed to apply the content rewrite: {error}")
                                 }
-                            });
+                            };
+                            if let Some(chat) = self.chat_state_mut_by_session(session_id) {
+                                chat.error = Some(message);
+                            }
                             return;
                         }
                     }
                 }
-                self.chat.messages.push(ChatTurn {
-                    role: ChatRole::Assistant,
-                    content: response.content,
-                    display_content: None,
-                });
-                if !response.annotation_actions.is_empty() {
-                    self.chat.pending_annotation_actions = response.annotation_actions;
+                if let Some(chat) = self.chat_state_mut_by_session(session_id) {
+                    chat.messages.push(ChatTurn {
+                        role: ChatRole::Assistant,
+                        content: response.content,
+                        display_content: None,
+                    });
+                    if !response.annotation_actions.is_empty() {
+                        chat.pending_annotation_actions = response.annotation_actions;
+                    }
+                    chat.error = None;
                 }
-                self.chat.error = None;
             }
             Err(error) => {
                 crate::diagnostics::log(
@@ -1458,13 +1588,18 @@ impl DesktopReader {
                         crate::diagnostics::Field::Usize("error_chars", error.chars().count()),
                     ],
                 );
-                self.chat.error = Some(error);
+                if let Some(chat) = self.chat_state_mut_by_session(session_id) {
+                    chat.error = Some(error);
+                }
             }
         }
     }
 
     pub(crate) fn update_chat_stream(&mut self, message: ChatStreamMessage) {
-        let Some(streaming) = self.chat.streaming.as_mut() else {
+        let Some(chat) = self.chat_state_mut_by_session(message.session_id) else {
+            return;
+        };
+        let Some(streaming) = chat.streaming.as_mut() else {
             return;
         };
         if streaming.task_id != message.id {

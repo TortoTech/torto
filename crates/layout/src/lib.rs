@@ -10,9 +10,9 @@ use parley::{
     InlineBox as ParleyInlineBox, InlineBoxKind, Layout, LayoutContext, LineHeight, StyleProperty,
 };
 use rebook_publication::{
-    Block, BookSource, FixedPageTextLayer, FixedPageTextRect, ImageStyle, Inline, MathRun,
-    PublicationError, PublicationUrl, RenditionLayout, Rgba, Section, SourceRange, TableBlock,
-    TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
+    Block, BookSource, FixedPageDimensions, FixedPageTextLayer, FixedPageTextRect, ImageStyle,
+    Inline, MathRun, PublicationError, PublicationUrl, RenditionLayout, Rgba, Section, SourceRange,
+    TableBlock, TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -444,6 +444,60 @@ impl LayoutEngine {
         self.layout_fragments(source, &[blocks], viewport, reader_style)
     }
 
+    /// Builds a fixed-page layout with the exact geometry of the eventual
+    /// raster while retaining only a single white pixel. This lets continuous
+    /// PDF views reserve every physical page without decoding all page images.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "fixed page dimensions are bounded by the PDF raster budget"
+    )]
+    pub fn layout_fixed_page_placeholder(
+        &mut self,
+        dimensions: FixedPageDimensions,
+        viewport: LayoutViewport,
+        reader_style: &ReaderStyle,
+    ) -> SectionLayout {
+        let page_width = viewport.width as f32;
+        let page_height = viewport.height as f32;
+        let geometry = resolve_page_geometry(page_width, page_height, reader_style);
+        let visible_pages = geometry.visible_pages;
+        let continuation_offset_x = geometry.continuation_offset_x;
+        let mut paginator = Paginator::new(
+            viewport,
+            reader_style.background,
+            geometry,
+            true,
+            reader_style.minimum_paragraph_gap,
+        );
+        paginator.push_image(
+            RasterImage {
+                width: dimensions.width.max(1),
+                height: dimensions.height.max(1),
+                pixels: Arc::from([255_u8, 255, 255, 255]),
+            },
+            ImageStyle::default(),
+            None,
+            None,
+        );
+        let mut pages = paginator.finish();
+        for page in &mut pages {
+            for item in &mut page.items {
+                if let PageItem::Image(image) = item {
+                    image.image = RasterImage {
+                        width: 1,
+                        height: 1,
+                        pixels: Arc::from([255_u8, 255, 255, 255]),
+                    };
+                }
+            }
+        }
+        SectionLayout {
+            pages,
+            visible_pages,
+            continuation_offset_x,
+        }
+    }
+
     /// Continuously paginates several stable content fragments as one bounded
     /// layout segment. Fragment boundaries do not commit the partial page; the
     /// caller controls random-access cost by choosing the segment size.
@@ -468,6 +522,7 @@ impl LayoutEngine {
         let center_standalone_image = source.book().metadata.layout
             == RenditionLayout::PrePaginated
             || fragments_are_standalone_cover(fragments, source.book().cover.as_ref());
+        let media_start_offset = dominant_paragraph_start_offset(fragments, content_width);
         let mut paginator = Paginator::new(
             viewport,
             reader_style.background,
@@ -475,6 +530,7 @@ impl LayoutEngine {
             center_standalone_image,
             reader_style.minimum_paragraph_gap,
         );
+        paginator.media_start_offset = media_start_offset;
 
         for blocks in fragments {
             for block in *blocks {
@@ -484,7 +540,11 @@ impl LayoutEngine {
                         paginator.push_text(&prepared, block)?;
                     }
                     Block::Table(table) => {
-                        let prepared = self.shape_table(table, reader_style, content_width);
+                        let prepared = self.shape_table(
+                            table,
+                            reader_style,
+                            (content_width - media_start_offset).max(1.0),
+                        );
                         paginator.push_table(&prepared);
                     }
                     Block::Image(image) => {
@@ -796,6 +856,31 @@ impl LayoutEngine {
             style.typography.font_size = next_size;
         }
     }
+}
+
+fn dominant_paragraph_start_offset(fragments: &[&[Block]], content_width: f32) -> f32 {
+    let mut offsets = fragments
+        .iter()
+        .flat_map(|blocks| blocks.iter())
+        .filter_map(|block| match block {
+            Block::Text(block) if block.kind == TextBlockKind::Paragraph => Some(
+                (block.style.indent
+                    + block.style.margin_start
+                    + content_width * block.style.margin_start_fraction)
+                    .clamp(0.0, (content_width - 40.0).max(0.0)),
+            ),
+            Block::Text(_)
+            | Block::Table(_)
+            | Block::Image(_)
+            | Block::Separator
+            | Block::PageBreak => None,
+        })
+        .collect::<Vec<_>>();
+    if offsets.is_empty() {
+        return 0.0;
+    }
+    offsets.sort_by(f32::total_cmp);
+    offsets[(offsets.len() - 1) / 2]
 }
 
 fn apply_list_hanging_indent(
@@ -1177,6 +1262,7 @@ struct Paginator {
     center_standalone_image: bool,
     minimum_paragraph_gap: f32,
     previous_block_was_paragraph: bool,
+    media_start_offset: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -1211,6 +1297,7 @@ impl Paginator {
             center_standalone_image,
             minimum_paragraph_gap: minimum_paragraph_gap.max(0.0),
             previous_block_was_paragraph: false,
+            media_start_offset: 0.0,
         }
     }
 
@@ -1345,7 +1432,9 @@ impl Paginator {
             .filter(|cell| cell.row >= row_start && cell.row + cell.row_span <= row_end)
             .map(|cell| {
                 let local_row = cell.row - row_start;
-                let cell_x = self.column_left() + table.column_width * cell.column as f32;
+                let cell_x = self.column_left()
+                    + self.media_start_offset
+                    + table.column_width * cell.column as f32;
                 let cell_y = table_y + row_offsets[local_row];
                 let cell_width = table.column_width * cell.column_span as f32;
                 let cell_height = row_offsets[local_row + cell.row_span] - row_offsets[local_row];
@@ -1396,10 +1485,11 @@ impl Paginator {
         let intrinsic_height = image.height.max(1) as f32;
         let aspect_ratio = intrinsic_width / intrinsic_height;
         let content_height = self.bottom - self.top;
+        let media_width = (self.width - self.media_start_offset).max(1.0);
         let requested_height = style.height.map(|height| height.resolve(content_height));
         let requested_width = style
             .width
-            .map(|width| width.resolve(self.width))
+            .map(|width| width.resolve(media_width))
             .or_else(|| requested_height.map(|height| height * aspect_ratio))
             .unwrap_or(intrinsic_width)
             .max(1.0);
@@ -1408,8 +1498,8 @@ impl Paginator {
             .max(1.0);
         let max_width = style
             .max_width
-            .map_or(self.width, |width| width.resolve(self.width))
-            .clamp(1.0, self.width);
+            .map_or(media_width, |width| width.resolve(media_width))
+            .clamp(1.0, media_width);
         let max_height = style
             .max_height
             .map_or(content_height, |height| height.resolve(content_height))
@@ -1423,7 +1513,7 @@ impl Paginator {
         if self.cursor_y + height > self.bottom && self.column_has_content {
             self.advance_column();
         }
-        let x = self.column_left() + (self.width - width) / 2.0;
+        let x = self.column_left() + self.media_start_offset + (media_width - width) / 2.0;
         let replacements = text_layer.as_ref().map_or_else(Vec::new, |layer| {
             let Some(replacement) = layer.replacement.as_ref() else {
                 return Vec::new();
@@ -2070,6 +2160,96 @@ mod tests {
                 .iter()
                 .all(|cell| cell.y + cell.height <= table.y + table.height + 0.1)
         }));
+    }
+
+    #[test]
+    fn block_media_uses_the_dominant_paragraph_measure() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("media-measure-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let paragraph_style = rebook_publication::BlockStyle {
+            margin_start: 32.0,
+            ..rebook_publication::BlockStyle::default()
+        };
+        let text_block = |text: &str| TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: paragraph_style,
+            source: None,
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![
+                Block::Text(text_block("Body paragraph")),
+                Block::Table(TableBlock {
+                    rows: vec![TableRow {
+                        cells: vec![TableCell {
+                            text: text_block("Cell"),
+                            column_span: 1,
+                            row_span: 1,
+                            header: false,
+                        }],
+                    }],
+                    source: None,
+                }),
+                Block::Image(ImageBlock {
+                    href: PublicationUrl::parse("figure.png").unwrap(),
+                    alt: "Figure".into(),
+                    style: ImageStyle {
+                        width: Some(ImageLength::Fraction(1.0)),
+                        ..ImageStyle::default()
+                    },
+                    source: None,
+                    text_layer: None,
+                }),
+            ],
+            anchors: Vec::new(),
+        };
+        let viewport = LayoutViewport::new(600, 500).unwrap();
+        let style = ReaderStyle::default();
+        let geometry = resolve_page_geometry(600.0, 500.0, &style);
+        let layout = LayoutEngine::new()
+            .layout_section(&source, &section, viewport, &style)
+            .unwrap();
+        let items = layout.pages.iter().flat_map(|page| &page.items);
+        let mut text_x = None;
+        let mut table_bounds = None;
+        let mut image_bounds = None;
+        for item in items {
+            match item {
+                PageItem::Text(text) => {
+                    text_x.get_or_insert(text.origin_x);
+                }
+                PageItem::Table(table) => {
+                    let first = table.cells.first().unwrap();
+                    table_bounds = Some((first.x, first.x + first.width));
+                }
+                PageItem::Image(image) => {
+                    image_bounds = Some((image.x, image.x + image.width));
+                }
+                PageItem::Separator(_) => {}
+            }
+        }
+        let expected_left = geometry.left + 32.0;
+        let expected_right = geometry.left + geometry.width;
+        assert!((text_x.unwrap() - expected_left).abs() < 0.001);
+        let (table_left, table_right) = table_bounds.unwrap();
+        assert!((table_left - expected_left).abs() < 0.001);
+        assert!((table_right - expected_right).abs() < 0.001);
+        let (image_left, image_right) = image_bounds.unwrap();
+        assert!((image_left - expected_left).abs() < 0.001);
+        assert!((image_right - expected_right).abs() < 0.001);
     }
 
     #[test]

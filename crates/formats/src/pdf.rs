@@ -16,9 +16,9 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings};
 use kurbo::{Affine, BezPath, Point, Rect, Shape};
 use rebook_publication::{
-    Block, Book, BookSource, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, Metadata,
-    PublicationError, PublicationUrl, RasterResource, RenditionLayout, Resource, Section,
-    SourceAnchor, SourceRange, TableOfContentsOrigin,
+    Block, Book, BookSource, FixedPageDimensions, FixedPageTextLayer, FixedPageTextRect,
+    FixedPageTextSpan, Metadata, PublicationError, PublicationUrl, RasterResource, RenditionLayout,
+    Resource, Section, SourceAnchor, SourceRange, TableOfContentsOrigin,
 };
 use sha2::{Digest, Sha256};
 
@@ -204,9 +204,36 @@ impl BookSource for PdfPublication {
             .ok_or_else(|| PublicationError::ResourceNotFound(href.to_string()))?;
         self.page_raster(page_index).map(Some)
     }
+
+    fn fixed_page_dimensions(
+        &self,
+        section_index: usize,
+    ) -> Result<Option<FixedPageDimensions>, PublicationError> {
+        self.page_raster_dimensions(section_index).map(Some)
+    }
 }
 
 impl PdfPublication {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "hayro uses the same bounded f32-to-u16 conversion when allocating the pixmap"
+    )]
+    fn page_raster_dimensions(
+        &self,
+        page_index: usize,
+    ) -> Result<FixedPageDimensions, PublicationError> {
+        let page = self.pdf.pages().get(page_index).ok_or_else(|| {
+            PublicationError::ResourceNotFound(format!("PDF page {}", page_index + 1))
+        })?;
+        let (width, height) = page.render_dimensions();
+        let scale = (PAGE_MAX_DIMENSION / width.max(height).max(1.0)).min(MAX_RENDER_SCALE);
+        Ok(FixedPageDimensions {
+            width: u32::from((width * scale).floor() as u16),
+            height: u32::from((height * scale).floor() as u16),
+        })
+    }
+
     fn page_text_layer(&self, page_index: usize) -> Result<FixedPageTextLayer, PublicationError> {
         if let Some(layer) = self.lock_cache()?.text_layers.get(&page_index).cloned() {
             return Ok(layer);
@@ -724,7 +751,13 @@ mod tests {
         assert!(page.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         let cached = publication.resource(&image.href).unwrap();
         assert!(Arc::ptr_eq(&page.bytes, &cached.bytes));
+        let dimensions = publication.fixed_page_dimensions(0).unwrap().unwrap();
+        assert!(publication.lock_cache().unwrap().rasters.is_empty());
         let raster = publication.raster_resource(&image.href).unwrap().unwrap();
+        assert_eq!(
+            (dimensions.width, dimensions.height),
+            (raster.width, raster.height)
+        );
         let cached_raster = publication.raster_resource(&image.href).unwrap().unwrap();
         assert!(Arc::ptr_eq(&raster.pixels, &cached_raster.pixels));
         assert_eq!(

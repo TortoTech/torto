@@ -1,5 +1,5 @@
 use rebook_layout::LayoutViewport;
-use rebook_publication::PublicationUrl;
+use rebook_publication::{PublicationUrl, SourceRange};
 use rebook_reader::{PageDirection, ReaderSnapshot};
 
 use super::{
@@ -64,6 +64,7 @@ impl DesktopReader {
                 self.focus_unit_index = 0;
                 self.focus_target_offset = None;
                 self.ui.focus_scroll_motion = None;
+                self.pending_reading_unit_entry = Some(direction);
             }
             Ok(_) => {}
             Err(error) => self.error = Some(format!("小节跳转失败：{error}")),
@@ -168,6 +169,9 @@ impl DesktopReader {
             self.scroll_target_position = None;
             self.scroll_viewport = None;
         }
+        if matches!(effects.scene, SceneChange::Overlays) {
+            self.scroll_target_source = None;
+        }
         self.selection_toolbar_visible = false;
         self.ui.focus_actions_visible = false;
         self.annotation_note_draft = None;
@@ -203,10 +207,40 @@ impl DesktopReader {
         let Some(store) = &self.progress_store else {
             return;
         };
-        let locator = self.reader.current_locator();
+        let mut locator = self.reader.current_locator();
+        if let Some(source) = self.progress_source_range() {
+            locator.source = Some(source);
+        }
         if let Err(error) = store.save_progress(&self.book_id, &locator) {
             tracing::warn!(%error, book_id = %self.book_id, "failed to persist reading progress");
         }
+    }
+
+    fn progress_source_range(&self) -> Option<SourceRange> {
+        if self.is_focus_mode() {
+            return self
+                .focus_units
+                .get(self.focus_unit_index)
+                .map(|unit| unit.range.clone())
+                .or_else(|| {
+                    self.focus_anchor.as_ref().map(|anchor| SourceRange {
+                        start: anchor.clone(),
+                        end: anchor.clone(),
+                    })
+                });
+        }
+        if !self.is_scroll_mode() {
+            return None;
+        }
+        if let Some(source) = &self.scroll_target_source {
+            return Some(source.clone());
+        }
+        let viewport = self.scroll_viewport?;
+        let layout = self.scroll_section.as_ref()?;
+        let (page_index, page_y) = layout.page_at_content_y(viewport.offset_y.max(0.0))?;
+        let page = &layout.pages[page_index].page;
+        page.source_range_nearest_y(page_y)
+            .or_else(|| page.leading_source_range())
     }
 
     pub(in crate::reader) fn progress(&self) -> f64 {
