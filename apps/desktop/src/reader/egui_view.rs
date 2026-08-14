@@ -44,6 +44,9 @@ const ASSISTANT_SELECTION_SCROLL_EDGE: f32 = 36.0;
 const ASSISTANT_SELECTION_SCROLL_MIN_SPEED: f32 = 90.0;
 const ASSISTANT_SELECTION_SCROLL_MAX_SPEED: f32 = 640.0;
 const ASSISTANT_KEYBOARD_SCROLL_STEP: f32 = 64.0;
+const FOCUS_ACTIONS_SHORTCUT: egui::Key = egui::Key::Space;
+const FOCUS_CHAT_SHORTCUT: egui::Key = egui::Key::Tab;
+const FOCUS_TOOL_SHORTCUTS: [egui::Key; 2] = [egui::Key::Num1, egui::Key::Num2];
 const TOOLBAR_HEIGHT: f32 = 48.0;
 const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
 const TOOLBAR_TITLE_SIZE: f32 = 15.0;
@@ -727,20 +730,24 @@ impl DesktopReader {
         if self.focus_action_shortcut(ctx, interaction_blocked) {
             return;
         }
-        // Tab is the focus-mode action-menu shortcut, even if a previously visible
-        // TextEdit still owns egui's keyboard focus. Handling it before the generic
-        // keyboard-focus guard avoids intermittent failures after closing an editor.
-        if self.is_focus_mode()
-            && !interaction_blocked
-            && !self.ui.overlay_visible()
-            && self.image_preview.is_none()
-            && self.ui.assistant_panel.is_none()
-            && self.annotation_note_draft.is_none()
-            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+        // Focus-mode reading shortcuts are handled before the generic keyboard-focus
+        // guard so a stale TextEdit focus cannot intermittently swallow them.
+        if self.focus_body_accepts_shortcuts(interaction_blocked)
+            && ctx
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, FOCUS_ACTIONS_SHORTCUT))
         {
             self.ui.focus_actions_visible = true;
             self.cancel_text_selection();
             ctx.memory_mut(egui::Memory::stop_text_input);
+            return;
+        }
+        if self.focus_body_accepts_shortcuts(interaction_blocked)
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, FOCUS_CHAT_SHORTCUT))
+        {
+            self.ui.focus_actions_visible = false;
+            self.cancel_text_selection();
+            self.attach_current_focus_reference();
+            self.open_assistant_panel(AssistantPanel::Chat);
             return;
         }
         let open_search = !interaction_blocked
@@ -875,29 +882,21 @@ impl DesktopReader {
     }
 
     fn focus_action_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
-        if !self.is_focus_mode()
-            || interaction_blocked
-            || !self.ui.focus_actions_visible
-            || self.annotation_note_draft.is_some()
-        {
+        if !self.focus_body_accepts_shortcuts(interaction_blocked) {
             return false;
         }
         let action = ctx.input_mut(|input| {
-            [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3]
+            FOCUS_TOOL_SHORTCUTS
                 .into_iter()
                 .position(|key| input.consume_key(egui::Modifiers::NONE, key))
         });
         match action {
-            Some(0) => {
-                self.ui.focus_actions_visible = false;
-                self.attach_current_focus_reference();
-                self.open_assistant_panel(AssistantPanel::Chat);
-            }
-            Some(1) if !self.current_focus_unit_is_image() => {
+            Some(0) if !self.current_focus_unit_is_image() => {
                 self.ui.focus_actions_visible = false;
                 self.create_focus_highlight(None);
             }
-            Some(2) if !self.current_focus_unit_is_image() => {
+            Some(1) if !self.current_focus_unit_is_image() => {
+                self.ui.focus_actions_visible = true;
                 self.annotation_note_draft = Some(AnnotationDraft {
                     note: self.current_focus_note().unwrap_or_default(),
                     focus_pending: true,
@@ -907,6 +906,16 @@ impl DesktopReader {
             None => return false,
         }
         true
+    }
+
+    fn focus_body_accepts_shortcuts(&self, interaction_blocked: bool) -> bool {
+        self.is_focus_mode()
+            && !interaction_blocked
+            && !self.ui.overlay_visible()
+            && !self.ui.sidebar_open
+            && self.image_preview.is_none()
+            && self.ui.assistant_panel.is_none()
+            && self.annotation_note_draft.is_none()
     }
 
     fn focus_wheel_interaction(&mut self, response: &egui::Response) {
@@ -1581,14 +1590,14 @@ impl DesktopReader {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
                         chat = icon_button(ui, Icon::MessageCircle)
-                            .on_hover_text(self.language.text("聊天（1）", "Chat (1)"))
+                            .on_hover_text(self.language.text("聊天（Tab）", "Chat (Tab)"))
                             .clicked();
                         ui.add_enabled_ui(can_annotate, |ui| {
                             highlight = icon_button(ui, Icon::Highlighter)
-                                .on_hover_text(self.language.text("高亮（2）", "Highlight (2)"))
+                                .on_hover_text(self.language.text("高亮（1）", "Highlight (1)"))
                                 .clicked();
                             open_note = icon_button(ui, Icon::MessageSquarePlus)
-                                .on_hover_text(self.language.text("添加批注（3）", "Add note (3)"))
+                                .on_hover_text(self.language.text("添加批注（2）", "Add note (2)"))
                                 .clicked();
                         });
                     });
@@ -4518,6 +4527,13 @@ mod reference_suggestion_label_tests {
             focus_unit_index_for_scroll_offset(rects, 690.0, 600.0),
             Some(2)
         );
+    }
+
+    #[test]
+    fn focus_mode_shortcuts_match_the_reader_contract() {
+        assert_eq!(FOCUS_ACTIONS_SHORTCUT, egui::Key::Space);
+        assert_eq!(FOCUS_CHAT_SHORTCUT, egui::Key::Tab);
+        assert_eq!(FOCUS_TOOL_SHORTCUTS, [egui::Key::Num1, egui::Key::Num2]);
     }
 
     #[test]
