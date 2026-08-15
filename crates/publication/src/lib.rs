@@ -376,6 +376,21 @@ pub enum TextBlockKind {
         ordered: bool,
         /// One-based item number when ordered.
         ordinal: u32,
+        /// Zero-based nesting depth within the containing list.
+        #[serde(default)]
+        depth: u8,
+    },
+    /// A term introduced by an HTML definition list.
+    DefinitionTerm {
+        /// Zero-based nesting depth of the containing definition list.
+        #[serde(default)]
+        depth: u8,
+    },
+    /// A description associated with one or more definition terms.
+    DefinitionDescription {
+        /// Zero-based nesting depth of the containing definition list.
+        #[serde(default)]
+        depth: u8,
     },
 }
 

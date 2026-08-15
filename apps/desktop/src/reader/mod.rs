@@ -733,6 +733,12 @@ impl ScrollSectionLayout {
                 .or_else(|| entry.page.content_bottom())
                 .unwrap_or(logical_height)
                 .clamp(content_top, logical_height);
+            let leading_gap =
+                if preserve_physical_pages || entry.visible_top.is_some() || index == 0 {
+                    0.0
+                } else {
+                    entry.page.leading_gap()
+                };
             let page_origin = if preserve_physical_pages || entry.visible_top.is_some() || index > 0
             {
                 content_top
@@ -744,6 +750,12 @@ impl ScrollSectionLayout {
             } else {
                 content_bottom - page_origin
             };
+            if leading_gap > 0.0 {
+                if let Some(previous_height) = page_heights.last_mut() {
+                    *previous_height += leading_gap;
+                }
+                cursor += leading_gap;
+            }
             page_tops.push(cursor);
             page_origins.push(page_origin);
             page_heights.push(page_height);
@@ -1119,6 +1131,11 @@ impl DesktopReader {
             self.selected_image = None;
             return;
         };
+        // The retained Vello image layer can outlive the renderer's transient
+        // image upload when focus moves away and later returns to this page.
+        // The hit-test/preview path reads the current display-list pixels, so
+        // evict only this page and rebuild its underlay on the next frame.
+        self.invalidate_page_scene(unit.position);
         let Some(layout) = self.scroll_section.as_ref() else {
             self.selected_image = None;
             return;
@@ -2242,6 +2259,7 @@ mod tests {
                 blue: 255,
                 alpha: 255,
             },
+            leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
                 image: RasterImage {
                     width: 2,
@@ -2279,6 +2297,49 @@ mod tests {
             layout.pages[0].page.source_range_nearest_y(40.0),
             Some(source)
         );
+    }
+
+    #[test]
+    fn continuous_layout_restores_an_image_gap_lost_at_a_page_break() {
+        let page = |page_index, leading_gap| {
+            let layout = PageLayout {
+                viewport: LayoutViewport::new(400, 500).unwrap(),
+                background: Rgba::BLACK,
+                leading_gap,
+                items: vec![PageItem::Image(ImagePlacement {
+                    image: RasterImage {
+                        width: 2,
+                        height: 2,
+                        pixels: vec![255; 16].into(),
+                    },
+                    x: 20.0,
+                    y: 40.0,
+                    width: 360.0,
+                    height: 100.0,
+                    source: None,
+                    text_layer: None,
+                    replacement: None,
+                })],
+            };
+            ReaderSectionPage {
+                position: ReaderPosition {
+                    section_index: 0,
+                    segment_index: 0,
+                    page_index,
+                },
+                page: Arc::new(DisplayListCompiler.compile(&layout)),
+                placeholder: false,
+                visible_top: None,
+                visible_bottom: None,
+            }
+        };
+        let layout = ScrollSectionLayout::new(0, 0, vec![page(0, 0.0), page(1, 20.0)], false);
+        let first_bottom = layout.content_y(0, 140.0);
+        let second_top = layout.content_y(1, 40.0);
+
+        assert!((second_top - first_bottom - 20.0).abs() < f32::EPSILON);
+        assert!((layout.page_origins[1] - 40.0).abs() < f32::EPSILON);
+        assert!((layout.page_heights[0] - 160.0).abs() < f32::EPSILON);
     }
 
     #[test]

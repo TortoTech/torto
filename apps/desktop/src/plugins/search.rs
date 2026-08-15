@@ -154,6 +154,8 @@ pub(crate) fn text_block_kind(block: &TextBlock) -> &'static str {
         TextBlockKind::Blockquote => "blockquote",
         TextBlockKind::Preformatted => "preformatted",
         TextBlockKind::ListItem { .. } => "list-item",
+        TextBlockKind::DefinitionTerm { .. } => "definition-term",
+        TextBlockKind::DefinitionDescription { .. } => "definition-description",
     }
 }
 

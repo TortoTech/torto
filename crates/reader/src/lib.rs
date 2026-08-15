@@ -3977,6 +3977,7 @@ mod tests {
         DisplayListCompiler.compile(&rebook_layout::PageLayout {
             viewport: viewport(1_200, 700),
             background: rebook_publication::Rgba::BLACK,
+            leading_gap: 0.0,
             items: vec![rebook_layout::PageItem::Image(
                 rebook_layout::ImagePlacement {
                     image: rebook_layout::RasterImage {
@@ -4643,6 +4644,7 @@ mod tests {
             kind: TextBlockKind::ListItem {
                 ordered: true,
                 ordinal: 7,
+                depth: 0,
             },
             content: vec![Inline::Text(TextRun {
                 text: "item ".repeat(FRAGMENT_TEXT_BUDGET),
@@ -4661,7 +4663,8 @@ mod tests {
             parts[0].kind,
             TextBlockKind::ListItem {
                 ordered: true,
-                ordinal: 7
+                ordinal: 7,
+                depth: 0,
             }
         ));
         assert!(

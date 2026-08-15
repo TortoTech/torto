@@ -1,9 +1,10 @@
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use kurbo::{Affine, Rect};
 use peniko::Color;
 use rebook_formats::BookFormat;
-use rebook_reader::ReaderSectionPage;
+use rebook_reader::{ReaderPosition, ReaderSectionPage};
 use rebook_renderer::PageDisplayList;
 use vello::Scene;
 
@@ -35,6 +36,20 @@ pub(crate) struct PageSceneKey {
 pub(crate) struct PageSceneLayers {
     underlay: Arc<Scene>,
     content: Arc<Scene>,
+}
+
+fn evict_page_scene<T>(
+    scenes: &mut HashMap<PageSceneKey, T>,
+    lru: &mut VecDeque<PageSceneKey>,
+    position: ReaderPosition,
+) -> bool {
+    let key = PageSceneKey {
+        section: position.section_index,
+        segment: position.segment_index,
+        page: position.page_index,
+    };
+    lru.retain(|entry| *entry != key);
+    scenes.remove(&key).is_some()
 }
 
 impl DesktopReader {
@@ -278,5 +293,46 @@ impl DesktopReader {
         self.page_scene_lru.clear();
         self.scroll_section = None;
         self.bump_scene_revision();
+    }
+
+    pub(in crate::reader) fn invalidate_page_scene(&mut self, position: ReaderPosition) {
+        evict_page_scene(&mut self.page_scenes, &mut self.page_scene_lru, position);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evicting_a_focus_image_page_removes_only_its_cached_scene() {
+        let image_page = ReaderPosition {
+            section_index: 2,
+            segment_index: 1,
+            page_index: 3,
+        };
+        let text_page = ReaderPosition {
+            page_index: 4,
+            ..image_page
+        };
+        let image_key = PageSceneKey {
+            section: image_page.section_index,
+            segment: image_page.segment_index,
+            page: image_page.page_index,
+        };
+        let text_key = PageSceneKey {
+            section: text_page.section_index,
+            segment: text_page.segment_index,
+            page: text_page.page_index,
+        };
+        let mut scenes = HashMap::from([(image_key, "image"), (text_key, "text")]);
+        let mut lru = VecDeque::from([image_key, text_key]);
+
+        assert!(evict_page_scene(&mut scenes, &mut lru, image_page));
+        assert!(!scenes.contains_key(&image_key));
+        assert_eq!(scenes.get(&text_key), Some(&"text"));
+        assert_eq!(lru, VecDeque::from([text_key]));
+        assert!(!evict_page_scene(&mut scenes, &mut lru, image_page));
+        assert_eq!(lru, VecDeque::from([text_key]));
     }
 }

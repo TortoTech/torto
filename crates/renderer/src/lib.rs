@@ -49,6 +49,7 @@ pub struct PageDisplayList {
     height: u32,
     content_top: Option<f32>,
     content_bottom: Option<f32>,
+    leading_gap: f32,
     background: Color,
     commands: Vec<DisplayCommand>,
     text_regions: Vec<TextRegion>,
@@ -98,6 +99,11 @@ impl PageDisplayList {
     /// final text line or image.
     pub fn content_bottom(&self) -> Option<f32> {
         self.content_bottom
+    }
+
+    /// Semantic spacing removed when the first block was moved to this page.
+    pub fn leading_gap(&self) -> f32 {
+        self.leading_gap
     }
 
     /// Number of retained commands, useful for diagnostics.
@@ -1313,6 +1319,7 @@ impl DisplayListCompiler {
             height: page.viewport.height,
             content_top,
             content_bottom,
+            leading_gap: page.leading_gap.max(0.0),
             background: color(page.background),
             commands,
             text_regions,
@@ -1672,6 +1679,7 @@ mod tests {
         let page = PageLayout {
             viewport: LayoutViewport::new(320, 240).unwrap(),
             background: Rgba::BLACK,
+            leading_gap: 0.0,
             items: Vec::new(),
         };
         let list = DisplayListCompiler.compile(&page);
@@ -1718,6 +1726,7 @@ mod tests {
         let page = PageLayout {
             viewport: LayoutViewport::new(320, 240).unwrap(),
             background: Rgba::BLACK,
+            leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
                 layout: Arc::new(layout),
                 text,
@@ -1794,6 +1803,7 @@ mod tests {
         let page = PageLayout {
             viewport: LayoutViewport::new(320, 240).unwrap(),
             background: Rgba::BLACK,
+            leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
@@ -1869,6 +1879,7 @@ mod tests {
         let page = PageLayout {
             viewport: LayoutViewport::new(320, 240).unwrap(),
             background: Rgba::BLACK,
+            leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
@@ -1941,6 +1952,7 @@ mod tests {
         let page = PageLayout {
             viewport: LayoutViewport::new(240, 240).unwrap(),
             background: Rgba::BLACK,
+            leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
@@ -2031,6 +2043,7 @@ mod tests {
         let page = PageLayout {
             viewport: LayoutViewport::new(320, 300).unwrap(),
             background: Rgba::BLACK,
+            leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
@@ -2101,6 +2114,7 @@ mod tests {
         let page = PageLayout {
             viewport: LayoutViewport::new(200, 200).unwrap(),
             background: Rgba::BLACK,
+            leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
                 image: RasterImage {
                     width: 100,
@@ -2182,6 +2196,7 @@ mod tests {
         let page = PageLayout {
             viewport: LayoutViewport::new(200, 200).unwrap(),
             background: Rgba::BLACK,
+            leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
                 image: RasterImage {
                     width: 100,

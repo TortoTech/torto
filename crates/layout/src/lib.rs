@@ -370,6 +370,10 @@ pub struct SectionLayout {
 pub struct PageLayout {
     pub viewport: LayoutViewport,
     pub background: Rgba,
+    /// Semantic spacing that preceded the first block before pagination moved
+    /// it onto this page. Paginated views discard it at the physical page edge,
+    /// while continuous views can restore it when stitching pages together.
+    pub leading_gap: f32,
     pub items: Vec<PageItem>,
 }
 
@@ -1098,10 +1102,17 @@ fn resolve_text_block<'a>(
                 profile.body_line_height,
                 base_size * profile.paragraph_gap_em,
             ),
-            TextBlockKind::Paragraph | TextBlockKind::ListItem { .. } => (
+            TextBlockKind::Paragraph
+            | TextBlockKind::ListItem { .. }
+            | TextBlockKind::DefinitionDescription { .. } => (
                 1.0,
                 profile.body_line_height,
                 base_size * profile.paragraph_gap_em,
+            ),
+            TextBlockKind::DefinitionTerm { .. } => (
+                1.0,
+                profile.body_line_height,
+                base_size * profile.paragraph_gap_em.min(0.25),
             ),
         },
     };
@@ -1122,8 +1133,18 @@ fn resolve_text_block<'a>(
             resolved.style.margin_start_fraction = 0.0;
         }
         TextContext::Flow => match block.kind {
-            TextBlockKind::ListItem { .. } => {
-                resolved.style.margin_start = base_size * profile.list_indent_em;
+            TextBlockKind::ListItem { depth, .. } => {
+                resolved.style.margin_start =
+                    base_size * profile.list_indent_em * (f32::from(depth) + 1.0);
+                resolved.style.margin_start_fraction = 0.0;
+            }
+            TextBlockKind::DefinitionTerm { depth } => {
+                resolved.style.margin_start = base_size * profile.list_indent_em * f32::from(depth);
+                resolved.style.margin_start_fraction = 0.0;
+            }
+            TextBlockKind::DefinitionDescription { depth } => {
+                resolved.style.margin_start =
+                    base_size * profile.list_indent_em * (f32::from(depth) + 1.0);
                 resolved.style.margin_start_fraction = 0.0;
             }
             TextBlockKind::Blockquote => {
@@ -1149,7 +1170,10 @@ fn resolve_text_block<'a>(
                 } else {
                     scale * 0.75
                 };
-                if matches!(block.kind, TextBlockKind::Heading(_)) {
+                if matches!(
+                    block.kind,
+                    TextBlockKind::Heading(_) | TextBlockKind::DefinitionTerm { .. }
+                ) {
                     run.style.bold = true;
                 }
             }
@@ -1514,6 +1538,7 @@ fn prepare_inline_content(
         TextBlockKind::ListItem {
             ordered: true,
             ordinal,
+            ..
         } => format!("{ordinal}.\u{00a0}"),
         TextBlockKind::ListItem { ordered: false, .. } => "•\u{00a0}".to_owned(),
         _ => String::new(),
@@ -1661,6 +1686,8 @@ struct Paginator {
     minimum_paragraph_gap: f32,
     previous_block_was_paragraph: bool,
     media_start_offset: f32,
+    leading_gap: f32,
+    forced_page_break: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1696,10 +1723,13 @@ impl Paginator {
             minimum_paragraph_gap: minimum_paragraph_gap.max(0.0),
             previous_block_was_paragraph: false,
             media_start_offset: 0.0,
+            leading_gap: 0.0,
+            forced_page_break: false,
         }
     }
 
     fn push_text(&mut self, prepared: &PreparedText, block: &TextBlock) -> Result<(), LayoutError> {
+        self.forced_page_break = false;
         let is_paragraph = matches!(block.kind, TextBlockKind::Paragraph);
         if is_paragraph && self.previous_block_was_paragraph {
             self.ensure_minimum_spacing(self.minimum_paragraph_gap);
@@ -1757,6 +1787,7 @@ impl Paginator {
     }
 
     fn push_table(&mut self, table: &PreparedTable) {
+        self.forced_page_break = false;
         self.previous_block_was_paragraph = false;
         if table.row_heights.is_empty() || table.column_widths.is_empty() {
             return;
@@ -1888,6 +1919,11 @@ impl Paginator {
         source: Option<SourceRange>,
         text_layer: Option<FixedPageTextLayer>,
     ) -> Vec<FixedPageReplacementRequest> {
+        let restore_gap_on_empty_page = !self.column_has_content
+            && self.items.is_empty()
+            && !self.pages.is_empty()
+            && !self.forced_page_break;
+        self.forced_page_break = false;
         self.previous_block_was_paragraph = false;
         let intrinsic_width = image.width.max(1) as f32;
         let intrinsic_height = image.height.max(1) as f32;
@@ -1917,9 +1953,14 @@ impl Paginator {
             .min(1.0);
         let width = requested_width * scale;
         let height = requested_height * scale;
-        self.ensure_minimum_spacing(style.margin_before.max(IMAGE_BLOCK_GAP));
+        let block_gap = style.margin_before.max(IMAGE_BLOCK_GAP);
+        let page_count_before_spacing = self.pages.len();
+        self.ensure_minimum_spacing(block_gap);
         if self.cursor_y + height > self.bottom && self.column_has_content {
             self.advance_column();
+        }
+        if restore_gap_on_empty_page || self.pages.len() > page_count_before_spacing {
+            self.leading_gap = block_gap;
         }
         let x = self.column_left() + self.media_start_offset + (media_width - width) / 2.0;
         let replacements = text_layer.as_ref().map_or_else(Vec::new, |layer| {
@@ -2023,6 +2064,7 @@ impl Paginator {
     }
 
     fn push_separator(&mut self) {
+        self.forced_page_break = false;
         self.previous_block_was_paragraph = false;
         self.add_spacing(12.0);
         if self.cursor_y + 1.0 > self.bottom && self.column_has_content {
@@ -2050,6 +2092,7 @@ impl Paginator {
         if self.column_has_content || !self.items.is_empty() {
             self.advance_column();
         }
+        self.forced_page_break = true;
     }
 
     fn column_left(&self) -> f32 {
@@ -2082,6 +2125,7 @@ impl Paginator {
         self.pages.push(PageLayout {
             viewport: self.viewport,
             background: self.background,
+            leading_gap: std::mem::take(&mut self.leading_gap),
             items: std::mem::take(&mut self.items),
         });
         self.column_has_content = false;
@@ -2094,6 +2138,7 @@ impl Paginator {
             self.pages.push(PageLayout {
                 viewport: self.viewport,
                 background: self.background,
+                leading_gap: 0.0,
                 items: Vec::new(),
             });
         }
@@ -2325,6 +2370,7 @@ mod tests {
             kind: TextBlockKind::ListItem {
                 ordered: false,
                 ordinal: 1,
+                depth: 0,
             },
             content: vec![Inline::Text(TextRun {
                 text: "A list item".into(),
@@ -2346,6 +2392,68 @@ mod tests {
         let resolved = resolve_text_block(&block, &style, TextContext::Flow);
         assert!((resolved.style.margin_start - 30.0).abs() < 0.001);
         assert!(resolved.style.margin_start_fraction.abs() < 0.001);
+    }
+
+    #[test]
+    fn unified_typesetting_increases_indent_for_nested_list_items() {
+        let block = TextBlock {
+            kind: TextBlockKind::ListItem {
+                ordered: false,
+                ordinal: 1,
+                depth: 2,
+            },
+            content: vec![Inline::Text(TextRun {
+                text: "A nested list item".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+        assert!((resolved.style.margin_start - 90.0).abs() < 0.001);
+        assert!(resolved.style.margin_start_fraction.abs() < 0.001);
+    }
+
+    #[test]
+    fn unified_typesetting_distinguishes_definition_terms_and_descriptions() {
+        let text = || {
+            vec![Inline::Text(TextRun {
+                text: "Definition".into(),
+                style: TextStyle::default(),
+                link: None,
+            })]
+        };
+        let term = TextBlock {
+            kind: TextBlockKind::DefinitionTerm { depth: 0 },
+            content: text(),
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        let description = TextBlock {
+            kind: TextBlockKind::DefinitionDescription { depth: 0 },
+            content: text(),
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let resolved_term = resolve_text_block(&term, &style, TextContext::Flow);
+        let resolved_description = resolve_text_block(&description, &style, TextContext::Flow);
+        assert!(resolved_term.style.margin_start.abs() < 0.001);
+        assert!((resolved_description.style.margin_start - 30.0).abs() < 0.001);
+        let Inline::Text(term_text) = &resolved_term.content[0] else {
+            panic!("expected definition term text");
+        };
+        assert!(term_text.style.bold);
     }
 
     #[test]
@@ -2529,6 +2637,7 @@ mod tests {
             kind: TextBlockKind::ListItem {
                 ordered: false,
                 ordinal: 1,
+                depth: 0,
             },
             content: vec![Inline::Text(TextRun {
                 text: "Create hierarchy. Type embodies what you want to say with your design, and it creates and supports your website structure.".into(),
@@ -3347,6 +3456,60 @@ mod tests {
         };
 
         assert!((image.y - page_top).abs() < 0.001);
+        assert!((layout.pages[1].leading_gap - IMAGE_BLOCK_GAP).abs() < 0.001);
+    }
+
+    #[test]
+    fn image_keeps_its_gap_when_previous_block_spacing_already_advanced_the_page() {
+        let image_href = PublicationUrl::parse("images/figure.png").unwrap();
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("image-pre-advanced-page-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![
+                Block::Text(TextBlock {
+                    kind: TextBlockKind::Paragraph,
+                    content: vec![Inline::Text(rebook_publication::TextRun {
+                        text: "Text before a figure.".into(),
+                        style: TextStyle::default(),
+                        link: None,
+                    })],
+                    style: rebook_publication::BlockStyle {
+                        margin_after: 300.0,
+                        ..rebook_publication::BlockStyle::default()
+                    },
+                    source: None,
+                }),
+                Block::Image(ImageBlock {
+                    href: image_href,
+                    alt: "Figure".into(),
+                    style: ImageStyle::default(),
+                    source: None,
+                    text_layer: None,
+                }),
+            ],
+            anchors: Vec::new(),
+        };
+
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(400, 300).unwrap(),
+                &ReaderStyle::default(),
+            )
+            .unwrap();
+
+        assert!(matches!(layout.pages[1].items[0], PageItem::Image(_)));
+        assert!((layout.pages[1].leading_gap - IMAGE_BLOCK_GAP).abs() < 0.001);
     }
 
     #[test]

@@ -58,6 +58,7 @@ struct ReadingIrParser {
     pending_anchors: Vec<String>,
     seen_anchors: HashSet<String>,
     styles: StyleSheet,
+    paragraph_list_indents: Vec<f32>,
 }
 
 impl ReadingIrParser {
@@ -71,6 +72,7 @@ impl ReadingIrParser {
             pending_anchors: Vec::new(),
             seen_anchors: HashSet::new(),
             styles,
+            paragraph_list_indents: Vec::new(),
         }
     }
 
@@ -135,6 +137,9 @@ impl ReadingIrParser {
         if matches!(name.as_str(), "script" | "style" | "head" | "nav") {
             return Ok(());
         }
+        if name != "p" {
+            self.paragraph_list_indents.clear();
+        }
         self.queue_node_anchors(node);
         match name.as_str() {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -160,7 +165,16 @@ impl ReadingIrParser {
                     style.margin_before = style.margin_before.max(12.0);
                     style.margin_after = style.margin_after.max(12.0);
                 }
-                let kind = explicit_paragraph_list_kind(node).unwrap_or(TextBlockKind::Paragraph);
+                let kind = if has_explicit_paragraph_list_marker(node) {
+                    TextBlockKind::ListItem {
+                        ordered: false,
+                        ordinal: 1,
+                        depth: self.paragraph_list_depth(style),
+                    }
+                } else {
+                    self.paragraph_list_indents.clear();
+                    TextBlockKind::Paragraph
+                };
                 self.push_text_block(node, kind, style)?;
             }
             "blockquote" => {
@@ -180,8 +194,11 @@ impl ReadingIrParser {
             }
             "table" => self.parse_table(node),
             name if is_generic_block_container(name) => self.parse_block_container(node)?,
-            "ul" => self.parse_list(node, false)?,
-            "ol" => self.parse_list(node, true)?,
+            "ul" => self.parse_list(node, false, 0)?,
+            "ol" => self.parse_list(node, true, 0)?,
+            "dl" => self.parse_definition_list(node, 0)?,
+            "dt" => self.parse_definition_entry(node, true, 0)?,
+            "dd" => self.parse_definition_entry(node, false, 0)?,
             "img" | "image" => self.push_image(node, None)?,
             "hr" => self.blocks.push(Block::Separator),
             "br" => self.blocks.push(Block::PageBreak),
@@ -190,7 +207,47 @@ impl ReadingIrParser {
         Ok(())
     }
 
-    fn parse_list(&mut self, list: Node<'_, '_>, ordered: bool) -> Result<(), HtmlError> {
+    fn paragraph_list_depth(&mut self, style: BlockStyle) -> u8 {
+        const INDENT_TOLERANCE: f32 = 4.0;
+        const FRACTION_REFERENCE_WIDTH: f32 = 1_000.0;
+
+        let indent = style
+            .margin_start_fraction
+            .mul_add(FRACTION_REFERENCE_WIDTH, style.margin_start);
+        let Some(previous) = self.paragraph_list_indents.last().copied() else {
+            self.paragraph_list_indents.push(indent);
+            return 0;
+        };
+
+        if indent > previous + INDENT_TOLERANCE {
+            self.paragraph_list_indents.push(indent);
+        } else if let Some(level) = self
+            .paragraph_list_indents
+            .iter()
+            .rposition(|known| (indent - *known).abs() <= INDENT_TOLERANCE)
+        {
+            self.paragraph_list_indents.truncate(level + 1);
+        } else if let Some(parent) = self
+            .paragraph_list_indents
+            .iter()
+            .rposition(|known| *known < indent)
+        {
+            self.paragraph_list_indents.truncate(parent + 1);
+            self.paragraph_list_indents.push(indent);
+        } else {
+            self.paragraph_list_indents.clear();
+            self.paragraph_list_indents.push(indent);
+        }
+
+        u8::try_from(self.paragraph_list_indents.len().saturating_sub(1)).unwrap_or(u8::MAX)
+    }
+
+    fn parse_list(
+        &mut self,
+        list: Node<'_, '_>,
+        ordered: bool,
+        depth: u8,
+    ) -> Result<(), HtmlError> {
         let mut ordinal = 1_u32;
         for item in list
             .children()
@@ -198,9 +255,128 @@ impl ReadingIrParser {
         {
             self.queue_node_anchors(item);
             let mut style = self.styles.block_style(item, BlockStyle::default());
-            style.indent += 24.0;
-            self.push_text_block(item, TextBlockKind::ListItem { ordered, ordinal }, style)?;
+            style.indent = 0.0;
+            style.margin_start = style.margin_start.max(24.0 * (f32::from(depth) + 1.0));
+            self.push_structured_item(
+                item,
+                TextBlockKind::ListItem {
+                    ordered,
+                    ordinal,
+                    depth,
+                },
+                style,
+            )?;
+            self.parse_nested_structured_containers(item, depth.saturating_add(1))?;
             ordinal = ordinal.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn parse_definition_list(&mut self, list: Node<'_, '_>, depth: u8) -> Result<(), HtmlError> {
+        for entry in list.children().filter(Node::is_element) {
+            match entry.tag_name().name().to_ascii_lowercase().as_str() {
+                "dt" => self.parse_definition_entry(entry, true, depth)?,
+                "dd" => self.parse_definition_entry(entry, false, depth)?,
+                _ => self.parse_node(entry)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_definition_entry(
+        &mut self,
+        entry: Node<'_, '_>,
+        term: bool,
+        depth: u8,
+    ) -> Result<(), HtmlError> {
+        self.queue_node_anchors(entry);
+        let mut style = self.styles.block_style(entry, BlockStyle::default());
+        style.indent = 0.0;
+        let semantic_indent = 24.0 * (f32::from(depth) + if term { 0.0 } else { 1.0 });
+        style.margin_start = style.margin_start.max(semantic_indent);
+        let kind = if term {
+            TextBlockKind::DefinitionTerm { depth }
+        } else {
+            TextBlockKind::DefinitionDescription { depth }
+        };
+        self.push_structured_item(entry, kind, style)?;
+        self.parse_nested_structured_containers(entry, depth.saturating_add(1))
+    }
+
+    fn parse_nested_structured_containers(
+        &mut self,
+        parent: Node<'_, '_>,
+        depth: u8,
+    ) -> Result<(), HtmlError> {
+        for nested in parent
+            .children()
+            .filter(|child| is_structured_container(*child))
+        {
+            self.queue_node_anchors(nested);
+            match nested.tag_name().name().to_ascii_lowercase().as_str() {
+                "ol" => self.parse_list(nested, true, depth)?,
+                "ul" => self.parse_list(nested, false, depth)?,
+                "dl" => self.parse_definition_list(nested, depth)?,
+                _ => unreachable!("filtered structured container"),
+            }
+        }
+        Ok(())
+    }
+
+    fn push_structured_item(
+        &mut self,
+        node: Node<'_, '_>,
+        kind: TextBlockKind,
+        style: BlockStyle,
+    ) -> Result<(), HtmlError> {
+        for descendant in node.descendants().skip(1).filter(Node::is_element) {
+            if !has_nested_structured_container_ancestor(descendant, node) {
+                self.queue_node_anchors(descendant);
+            }
+        }
+
+        let text_style = self.styles.text_style_for_block(node, kind);
+        let mut collector = InlineCollector::new(false);
+        for child in node.children() {
+            if is_structured_container(child) {
+                continue;
+            }
+            collect_inline_node(
+                child,
+                text_style,
+                None,
+                &self.section_href,
+                &self.styles,
+                &mut collector,
+            );
+        }
+        collector.finish();
+        let has_text = !collector.content.is_empty();
+        self.push_collected_text_block(kind, style, collector);
+
+        let images = node
+            .descendants()
+            .filter(|descendant| {
+                descendant != &node
+                    && descendant.is_element()
+                    && matches!(
+                        descendant.tag_name().name().to_ascii_lowercase().as_str(),
+                        "img" | "image"
+                    )
+                    && !has_nested_structured_container_ancestor(*descendant, node)
+            })
+            .collect::<Vec<_>>();
+        let image_count = images.len();
+        for (index, image) in images.into_iter().enumerate() {
+            let container_style = (!has_text).then_some((
+                if index == 0 { style.margin_before } else { 0.0 },
+                if index + 1 == image_count {
+                    style.margin_after
+                } else {
+                    0.0
+                },
+            ));
+            self.push_image(image, container_style)?;
         }
         Ok(())
     }
@@ -640,10 +816,7 @@ fn is_generic_block_container(name: &str) -> bool {
             | "article"
             | "aside"
             | "center"
-            | "dd"
-            | "dl"
             | "div"
-            | "dt"
             | "figcaption"
             | "figure"
             | "footer"
@@ -652,6 +825,21 @@ fn is_generic_block_container(name: &str) -> bool {
             | "main"
             | "section"
     )
+}
+
+fn is_structured_container(node: Node<'_, '_>) -> bool {
+    node.is_element()
+        && matches!(
+            node.tag_name().name().to_ascii_lowercase().as_str(),
+            "ul" | "ol" | "dl"
+        )
+}
+
+fn has_nested_structured_container_ancestor(node: Node<'_, '_>, root: Node<'_, '_>) -> bool {
+    node.ancestors()
+        .skip(1)
+        .take_while(|ancestor| ancestor != &root)
+        .any(is_structured_container)
 }
 
 fn table_span(node: Node<'_, '_>, name: &str) -> u16 {
@@ -671,7 +859,7 @@ fn has_descendant_image(node: Node<'_, '_>) -> bool {
     })
 }
 
-fn explicit_paragraph_list_kind(node: Node<'_, '_>) -> Option<TextBlockKind> {
+fn has_explicit_paragraph_list_marker(node: Node<'_, '_>) -> bool {
     let marker = node.descendants().find(|descendant| {
         descendant.is_element()
             && descendant.tag_name().name().eq_ignore_ascii_case("span")
@@ -680,16 +868,16 @@ fn explicit_paragraph_list_kind(node: Node<'_, '_>) -> Option<TextBlockKind> {
                     .split_ascii_whitespace()
                     .any(|class| class.eq_ignore_ascii_case("enumerator"))
             })
-    })?;
+    });
+    let Some(marker) = marker else {
+        return false;
+    };
     let marker = marker
         .descendants()
         .filter(Node::is_text)
         .filter_map(|text| text.text())
         .collect::<String>();
-    is_semantic_bullet(marker.trim()).then_some(TextBlockKind::ListItem {
-        ordered: false,
-        ordinal: 1,
-    })
+    is_semantic_bullet(marker.trim())
 }
 
 fn is_semantic_bullet(marker: &str) -> bool {
@@ -762,6 +950,9 @@ fn is_block_boundary(name: &str) -> bool {
         || matches!(
             name,
             "blockquote"
+                | "dd"
+                | "dl"
+                | "dt"
                 | "h1"
                 | "h2"
                 | "h3"
@@ -1501,7 +1692,8 @@ mod tests {
             item.kind,
             TextBlockKind::ListItem {
                 ordered: false,
-                ordinal: 1
+                ordinal: 1,
+                depth: 0,
             }
         );
         let text = item
@@ -1513,6 +1705,116 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(text, "A semantic item");
+    }
+
+    #[test]
+    fn explicit_enumerator_paragraphs_recover_css_indent_hierarchy() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+            <head><style>
+                .bullet { margin-left: 2.5em; }
+                .bulletind { margin-left: 3.9em; }
+                .bulletind1 { margin-left: 5.5em; }
+                .bulletind2 { margin-left: 6.9em; }
+            </style></head><body>
+            <p class="bullet"><span class="enumerator">•</span> Parent</p>
+            <p class="bulletind"><span class="enumerator">•</span> Child</p>
+            <p class="bulletind1"><span class="enumerator">•</span> Grandchild</p>
+            <p class="bulletind2"><span class="enumerator">•</span> Great-grandchild</p>
+            <p class="bulletind"><span class="enumerator">•</span> Second child</p>
+            <p class="bullet"><span class="enumerator">•</span> Second parent</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let depths = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(TextBlock {
+                    kind: TextBlockKind::ListItem { depth, .. },
+                    ..
+                }) => Some(*depth),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(depths, [0, 1, 2, 3, 1, 0]);
+    }
+
+    #[test]
+    fn nested_html_lists_keep_each_item_and_its_depth() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <ul>
+                <li>Parent<ul><li>Child<ol><li>Grandchild</li></ol></li></ul></li>
+                <li>Sibling</li>
+            </ul>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let items = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(
+                    item @ TextBlock {
+                        kind: TextBlockKind::ListItem { .. },
+                        ..
+                    },
+                ) => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let kinds = items.iter().map(|item| item.kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                TextBlockKind::ListItem {
+                    ordered: false,
+                    ordinal: 1,
+                    depth: 0,
+                },
+                TextBlockKind::ListItem {
+                    ordered: false,
+                    ordinal: 1,
+                    depth: 1,
+                },
+                TextBlockKind::ListItem {
+                    ordered: true,
+                    ordinal: 1,
+                    depth: 2,
+                },
+                TextBlockKind::ListItem {
+                    ordered: false,
+                    ordinal: 2,
+                    depth: 0,
+                },
+            ]
+        );
+        let texts = items
+            .iter()
+            .map(|item| {
+                item.content
+                    .iter()
+                    .filter_map(|inline| match inline {
+                        Inline::Text(run) => Some(run.text.as_str()),
+                        Inline::Math(_) | Inline::Break => None,
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["Parent", "Child", "Grandchild", "Sibling"]);
     }
 
     #[test]
@@ -1703,6 +2005,23 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(texts, ["目录", "第一章", "第一节", "第二章"]);
+        let kinds = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(block.kind),
+                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                TextBlockKind::Heading(3),
+                TextBlockKind::DefinitionTerm { depth: 0 },
+                TextBlockKind::DefinitionDescription { depth: 0 },
+                TextBlockKind::DefinitionTerm { depth: 0 },
+            ]
+        );
         let styles = section
             .blocks
             .iter()
@@ -1715,6 +2034,121 @@ mod tests {
         assert_close(styles[1].margin_start_fraction, 0.1);
         assert_close(styles[2].margin_start, 44.0);
         assert_close(styles[2].margin_start_fraction, 0.1);
+    }
+
+    #[test]
+    fn nested_definition_lists_preserve_roles_depth_and_reading_order() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("index").unwrap(),
+            href: PublicationUrl::parse("OPS/index.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <dl>
+                <dt>Markup language</dt>
+                <dd>A notation for documents
+                    <dl>
+                        <dt>Abstract markup</dt>
+                        <dd>Expresses structure</dd>
+                    </dl>
+                </dd>
+                <dt>Media domain</dt>
+                <dd>Controls presentation</dd>
+            </dl>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let entries = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some((
+                    block.kind,
+                    block
+                        .content
+                        .iter()
+                        .filter_map(|inline| match inline {
+                            Inline::Text(run) => Some(run.text.as_str()),
+                            Inline::Math(_) | Inline::Break => None,
+                        })
+                        .collect::<String>(),
+                )),
+                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            [
+                (
+                    TextBlockKind::DefinitionTerm { depth: 0 },
+                    "Markup language".to_owned(),
+                ),
+                (
+                    TextBlockKind::DefinitionDescription { depth: 0 },
+                    "A notation for documents".to_owned(),
+                ),
+                (
+                    TextBlockKind::DefinitionTerm { depth: 1 },
+                    "Abstract markup".to_owned(),
+                ),
+                (
+                    TextBlockKind::DefinitionDescription { depth: 1 },
+                    "Expresses structure".to_owned(),
+                ),
+                (
+                    TextBlockKind::DefinitionTerm { depth: 0 },
+                    "Media domain".to_owned(),
+                ),
+                (
+                    TextBlockKind::DefinitionDescription { depth: 0 },
+                    "Controls presentation".to_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn escaped_list_markup_in_preformatted_code_is_not_parsed_as_a_list() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <pre>&lt;ol&gt;&lt;li&gt;Dogs&lt;/li&gt;&lt;/ol&gt;</pre>
+            <ol><li>Dogs<ol><li>Spot</li></ol></li></ol>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let kinds = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(block.kind),
+                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                TextBlockKind::Preformatted,
+                TextBlockKind::ListItem {
+                    ordered: true,
+                    ordinal: 1,
+                    depth: 0,
+                },
+                TextBlockKind::ListItem {
+                    ordered: true,
+                    ordinal: 1,
+                    depth: 1,
+                },
+            ]
+        );
     }
 
     fn assert_close(actual: f32, expected: f32) {
