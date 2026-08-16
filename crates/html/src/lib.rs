@@ -3,9 +3,10 @@
 use std::collections::{HashMap, HashSet};
 
 use rebook_publication::{
-    Block, BlockStyle, ImageBlock, ImageLength, ImageStyle, Inline, MathRun, PublicationUrl, Rgba,
-    Section, SectionAnchor, SourceAnchor, SourceRange, SpineItem, SpineItemId, TableBlock,
-    TableCell, TableRow, TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
+    Block, BlockStyle, CaptionPosition, FigureBlock, ImageBlock, ImageLength, ImageStyle, Inline,
+    MathRun, PublicationUrl, Rgba, Section, SectionAnchor, SourceAnchor, SourceRange, SpineItem,
+    SpineItemId, TableBlock, TableCell, TableRow, TextAlignment, TextBaseline, TextBlock,
+    TextBlockKind, TextRun, TextStyle,
 };
 use roxmltree::{Document, Node};
 use thiserror::Error;
@@ -36,7 +37,7 @@ pub fn parse_section(
     parser.queue_node_anchors(root);
     parser.parse_children(root)?;
 
-    if parser.blocks.is_empty() {
+    if parser.blocks.is_empty() && !parser.suppressed_content {
         let style = parser.styles.block_style(root, BlockStyle::default());
         parser.push_text_block(root, TextBlockKind::Paragraph, style)?;
     }
@@ -59,6 +60,7 @@ struct ReadingIrParser {
     seen_anchors: HashSet<String>,
     styles: StyleSheet,
     paragraph_list_indents: Vec<f32>,
+    suppressed_content: bool,
 }
 
 impl ReadingIrParser {
@@ -73,6 +75,7 @@ impl ReadingIrParser {
             seen_anchors: HashSet::new(),
             styles,
             paragraph_list_indents: Vec::new(),
+            suppressed_content: false,
         }
     }
 
@@ -134,7 +137,11 @@ impl ReadingIrParser {
 
     fn parse_node(&mut self, node: Node<'_, '_>) -> Result<(), HtmlError> {
         let name = node.tag_name().name().to_ascii_lowercase();
-        if matches!(name.as_str(), "script" | "style" | "head" | "nav") {
+        if matches!(name.as_str(), "script" | "style" | "head") {
+            return Ok(());
+        }
+        if name == "nav" && should_suppress_navigation(node, &self.styles) {
+            self.suppressed_content = true;
             return Ok(());
         }
         if name != "p" {
@@ -193,6 +200,8 @@ impl ReadingIrParser {
                 self.push_text_block(node, TextBlockKind::Preformatted, style)?;
             }
             "table" => self.parse_table(node),
+            "figure" => self.parse_figure(node)?,
+            "nav" => self.parse_block_container(node)?,
             name if is_generic_block_container(name) => self.parse_block_container(node)?,
             "ul" => self.parse_list(node, false, 0)?,
             "ol" => self.parse_list(node, true, 0)?,
@@ -461,6 +470,95 @@ impl ReadingIrParser {
         }
     }
 
+    fn parse_figure(&mut self, figure: Node<'_, '_>) -> Result<(), HtmlError> {
+        let caption_nodes = figure
+            .descendants()
+            .skip(1)
+            .filter(|node| {
+                node.is_element()
+                    && node.tag_name().name().eq_ignore_ascii_case("figcaption")
+                    && !has_named_ancestor(*node, figure, "figure")
+            })
+            .collect::<Vec<_>>();
+        let image_nodes = figure
+            .descendants()
+            .skip(1)
+            .filter(|node| {
+                node.is_element()
+                    && matches!(
+                        node.tag_name().name().to_ascii_lowercase().as_str(),
+                        "img" | "image"
+                    )
+                    && !has_named_ancestor(*node, figure, "figure")
+                    && !has_named_ancestor(*node, figure, "figcaption")
+            })
+            .collect::<Vec<_>>();
+        let unsupported_caption = caption_nodes.iter().any(|caption| {
+            caption.descendants().skip(1).any(|node| {
+                node.is_element()
+                    && matches!(
+                        node.tag_name().name().to_ascii_lowercase().as_str(),
+                        "figure" | "img" | "image" | "table"
+                    )
+            })
+        });
+        if image_nodes.is_empty() || unsupported_caption {
+            return self.parse_block_container(figure);
+        }
+
+        let figure_node = self.allocate_node();
+        let figure_source = self.source_range(&figure_node, 0);
+        self.bind_pending_anchors(&figure_source.start);
+        let caption_position = figure
+            .descendants()
+            .skip(1)
+            .find_map(|node| {
+                if !node.is_element() || has_named_ancestor(node, figure, "figure") {
+                    return None;
+                }
+                match node.tag_name().name().to_ascii_lowercase().as_str() {
+                    "figcaption" => Some(CaptionPosition::Before),
+                    "img" | "image" => Some(CaptionPosition::After),
+                    _ => None,
+                }
+            })
+            .unwrap_or_default();
+
+        let mut images = Vec::with_capacity(image_nodes.len());
+        for image in image_nodes {
+            self.queue_node_anchors(image);
+            self.queue_descendant_anchors(image);
+            let source = images.is_empty().then(|| figure_source.clone());
+            if let Some(image) = self.image_block(image, None, source)? {
+                images.push(image);
+            }
+        }
+        if images.is_empty() {
+            return Ok(());
+        }
+
+        let mut captions = Vec::new();
+        for caption in caption_nodes {
+            self.queue_node_anchors(caption);
+            let block_start = self.blocks.len();
+            self.parse_block_container(caption)?;
+            for block in self.blocks.drain(block_start..) {
+                if let Block::Text(mut caption) = block {
+                    caption.kind = TextBlockKind::Caption;
+                    captions.push(caption);
+                }
+            }
+        }
+        self.blocks.push(Block::Figure(FigureBlock {
+            images,
+            captions,
+            caption_position,
+            style: self.styles.block_style(figure, BlockStyle::default()),
+            source: Some(figure_source),
+        }));
+        Ok(())
+    }
+
     fn push_text_block(
         &mut self,
         node: Node<'_, '_>,
@@ -565,29 +663,42 @@ impl ReadingIrParser {
         node: Node<'_, '_>,
         container_style: Option<(f32, f32)>,
     ) -> Result<(), HtmlError> {
+        if let Some(image) = self.image_block(node, container_style, None)? {
+            self.blocks.push(Block::Image(image));
+        }
+        Ok(())
+    }
+
+    fn image_block(
+        &mut self,
+        node: Node<'_, '_>,
+        container_style: Option<(f32, f32)>,
+        source: Option<SourceRange>,
+    ) -> Result<Option<ImageBlock>, HtmlError> {
         let Some(src) = attribute_local(node, "src")
             .or_else(|| attribute_local(node, "href"))
             .filter(|value| !value.trim().is_empty())
         else {
-            return Ok(());
+            return Ok(None);
         };
         let href = self.section_href.resolve(src)?.resource_url();
-        let node_id = self.allocate_node();
-        let source = self.source_range(&node_id, 0);
+        let source = source.unwrap_or_else(|| {
+            let node_id = self.allocate_node();
+            self.source_range(&node_id, 0)
+        });
         self.bind_pending_anchors(&source.start);
         let mut style = self.styles.image_style(node);
         if let Some((margin_before, margin_after)) = container_style {
             style.margin_before = style.margin_before.max(margin_before);
             style.margin_after = style.margin_after.max(margin_after);
         }
-        self.blocks.push(Block::Image(ImageBlock {
+        Ok(Some(ImageBlock {
             href,
             alt: attribute_local(node, "alt").unwrap_or_default().to_owned(),
             style,
             source: Some(source),
             text_layer: None,
-        }));
-        Ok(())
+        }))
     }
 
     fn queue_descendant_anchors(&mut self, node: Node<'_, '_>) {
@@ -827,12 +938,52 @@ fn is_generic_block_container(name: &str) -> bool {
     )
 }
 
+fn should_suppress_navigation(node: Node<'_, '_>, styles: &StyleSheet) -> bool {
+    let navigation_type_is_metadata = attribute_local(node, "type").is_some_and(|types| {
+        types.split_ascii_whitespace().any(|navigation_type| {
+            matches!(
+                navigation_type.to_ascii_lowercase().as_str(),
+                "landmarks" | "page-list"
+            )
+        })
+    });
+    let role_is_metadata = attribute_local(node, "role").is_some_and(|roles| {
+        roles.split_ascii_whitespace().any(|role| {
+            matches!(
+                role.to_ascii_lowercase().as_str(),
+                "doc-landmarks" | "doc-pagelist"
+            )
+        })
+    });
+    let explicitly_hidden = node.attribute("hidden").is_some()
+        || attribute_local(node, "aria-hidden")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    let properties = styles.cascaded_properties(node);
+    let hidden_by_css = properties
+        .get("display")
+        .is_some_and(|value| value == "none")
+        || properties
+            .get("visibility")
+            .is_some_and(|value| matches!(value.as_str(), "hidden" | "collapse"));
+
+    navigation_type_is_metadata || role_is_metadata || explicitly_hidden || hidden_by_css
+}
+
 fn is_structured_container(node: Node<'_, '_>) -> bool {
     node.is_element()
         && matches!(
             node.tag_name().name().to_ascii_lowercase().as_str(),
             "ul" | "ol" | "dl"
         )
+}
+
+fn has_named_ancestor(node: Node<'_, '_>, root: Node<'_, '_>, name: &str) -> bool {
+    node.ancestors()
+        .skip(1)
+        .take_while(|ancestor| ancestor != &root)
+        .any(|ancestor| {
+            ancestor.is_element() && ancestor.tag_name().name().eq_ignore_ascii_case(name)
+        })
 }
 
 fn has_nested_structured_container_ancestor(node: Node<'_, '_>, root: Node<'_, '_>) -> bool {
@@ -1672,6 +1823,153 @@ mod tests {
     }
 
     #[test]
+    fn parses_figure_image_and_caption_as_one_semantic_block() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <figure id="figure-1" class="image">
+                <img alt="Leaf detail" src="images/leaf.jpg"/>
+                <figcaption><p class="caption"><strong>Figure 1.</strong> New growth.</p></figcaption>
+            </figure>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Figure(figure)] = section.blocks.as_slice() else {
+            panic!("expected one semantic figure block");
+        };
+        assert_eq!(figure.images.len(), 1);
+        assert_eq!(figure.images[0].href.path(), "OPS/images/leaf.jpg");
+        assert_eq!(figure.images[0].alt, "Leaf detail");
+        assert_eq!(figure.captions.len(), 1);
+        assert_eq!(figure.captions[0].kind, TextBlockKind::Caption);
+        assert_eq!(figure.caption_position, CaptionPosition::After);
+        let caption_text = figure.captions[0]
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run.text.as_str()),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .collect::<String>();
+        assert_eq!(caption_text, "Figure 1. New growth.");
+        let Inline::Text(label) = &figure.captions[0].content[0] else {
+            panic!("expected a caption label");
+        };
+        assert!(label.style.bold);
+        assert_eq!(figure.source, figure.images[0].source);
+        assert_eq!(
+            section.anchors[0].source,
+            figure.source.clone().unwrap().start
+        );
+    }
+
+    #[test]
+    fn preserves_caption_before_image_and_captionless_figures() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <figure><figcaption>Before</figcaption><img src="images/a.jpg"/></figure>
+            <figure><img src="images/b.jpg"/></figure>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Figure(before), Block::Figure(captionless)] = section.blocks.as_slice() else {
+            panic!("expected two figure blocks");
+        };
+        assert_eq!(before.caption_position, CaptionPosition::Before);
+        assert_eq!(before.captions.len(), 1);
+        assert!(captionless.captions.is_empty());
+    }
+
+    #[test]
+    fn visible_toc_navigation_preserves_each_authored_block() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("contents").unwrap(),
+            href: PublicationUrl::parse("OPS/toc.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"
+            xmlns:epub="http://www.idpf.org/2007/ops">
+            <head><style>.toc-chap { margin-left: 2em; }</style></head>
+            <body><nav epub:type="toc">
+                <h2>Contents</h2>
+                <p class="toc-part">I. Caring for Your Collection</p>
+                <p class="toc-chap"><strong>1.</strong> The New Plant Collector</p>
+                <p class="toc-chap"><strong>2.</strong> Light: Make It Make Sense</p>
+            </nav></body>
+        </html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        assert_eq!(section.blocks.len(), 4);
+        let block_texts = section
+            .blocks
+            .iter()
+            .map(|block| match block {
+                Block::Text(block) => block
+                    .content
+                    .iter()
+                    .filter_map(|inline| match inline {
+                        Inline::Text(run) => Some(run.text.as_str()),
+                        Inline::Math(_) | Inline::Break => None,
+                    })
+                    .collect::<String>(),
+                _ => panic!("expected only text blocks"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            block_texts,
+            [
+                "Contents",
+                "I. Caring for Your Collection",
+                "1. The New Plant Collector",
+                "2. Light: Make It Make Sense",
+            ]
+        );
+        let Block::Text(first_chapter) = &section.blocks[2] else {
+            panic!("expected a chapter text block");
+        };
+        assert_close(first_chapter.style.margin_start, 32.0);
+        let Inline::Text(number) = &first_chapter.content[0] else {
+            panic!("expected a styled chapter number");
+        };
+        assert!(number.style.bold);
+    }
+
+    #[test]
+    fn navigation_metadata_is_suppressed_without_flattening_fallback() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("navigation").unwrap(),
+            href: PublicationUrl::parse("OPS/nav.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: false,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"
+            xmlns:epub="http://www.idpf.org/2007/ops">
+            <head><style>.hidden { display: none; }</style></head><body>
+                <nav epub:type="landmarks"><ol><li>Guide</li></ol></nav>
+                <nav role="doc-pagelist"><ol><li>1</li></ol></nav>
+                <nav epub:type="toc" class="hidden"><ol><li>Hidden contents</li></ol></nav>
+            </body>
+        </html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        assert!(section.blocks.is_empty());
+    }
+
+    #[test]
     fn explicit_enumerator_paragraph_becomes_a_semantic_list_item() {
         let descriptor = SpineItem {
             id: SpineItemId::new("chapter").unwrap(),
@@ -1901,7 +2199,11 @@ mod tests {
                         })
                         .collect::<String>(),
                 ),
-                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
+                Block::Table(_)
+                | Block::Image(_)
+                | Block::Figure(_)
+                | Block::Separator
+                | Block::PageBreak => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1944,7 +2246,11 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 Block::Image(image) => Some(image.href.path()),
-                Block::Text(_) | Block::Table(_) | Block::Separator | Block::PageBreak => None,
+                Block::Text(_)
+                | Block::Table(_)
+                | Block::Figure(_)
+                | Block::Separator
+                | Block::PageBreak => None,
             })
             .collect::<Vec<_>>();
 
@@ -2000,7 +2306,11 @@ mod tests {
                         })
                         .collect::<String>(),
                 ),
-                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
+                Block::Table(_)
+                | Block::Image(_)
+                | Block::Figure(_)
+                | Block::Separator
+                | Block::PageBreak => None,
             })
             .collect::<Vec<_>>();
 
@@ -2010,7 +2320,11 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 Block::Text(block) => Some(block.kind),
-                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
+                Block::Table(_)
+                | Block::Image(_)
+                | Block::Figure(_)
+                | Block::Separator
+                | Block::PageBreak => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2027,7 +2341,11 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 Block::Text(block) => Some(block.style),
-                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
+                Block::Table(_)
+                | Block::Image(_)
+                | Block::Figure(_)
+                | Block::Separator
+                | Block::PageBreak => None,
             })
             .collect::<Vec<_>>();
         assert_close(styles[1].margin_start, 8.0);
@@ -2075,7 +2393,11 @@ mod tests {
                         })
                         .collect::<String>(),
                 )),
-                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
+                Block::Table(_)
+                | Block::Image(_)
+                | Block::Figure(_)
+                | Block::Separator
+                | Block::PageBreak => None,
             })
             .collect::<Vec<_>>();
 
@@ -2130,7 +2452,11 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 Block::Text(block) => Some(block.kind),
-                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
+                Block::Table(_)
+                | Block::Image(_)
+                | Block::Figure(_)
+                | Block::Separator
+                | Block::PageBreak => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(

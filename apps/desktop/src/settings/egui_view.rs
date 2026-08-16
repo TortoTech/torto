@@ -731,6 +731,24 @@ fn unified_typesetting_controls(
             );
             settings_slider_row(
                 ui,
+                language.text("图注字号", "Caption font size"),
+                &mut typesetting.caption_font_scale,
+                0.7,
+                1.0,
+                0.05,
+                "×",
+            );
+            settings_slider_row(
+                ui,
+                language.text("图片与图注间距", "Image-to-caption spacing"),
+                &mut typesetting.caption_gap_em,
+                0.2,
+                1.0,
+                0.1,
+                " em",
+            );
+            settings_slider_row(
+                ui,
                 language.text("列表缩进", "List indentation"),
                 &mut typesetting.list_indent_em,
                 0.5,

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use rebook_publication::{
-    Block, BlockStyle, Book, BookSource, FixedPageTextLayer, FixedPageTextRect,
+    Block, BlockStyle, Book, BookSource, FigureBlock, FixedPageTextLayer, FixedPageTextRect,
     FixedPageTextReplacement, FixedPageTextReplacementSegment, Inline, PublicationError,
     PublicationUrl, RasterResource, RenditionLayout, Resource, Section, SourceRange, TextBaseline,
     TextBlock, TextBlockKind, TextRun, TextStyle,
@@ -261,6 +261,18 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
                         }),
                 );
             }
+            Block::Figure(figure) => {
+                blocks.extend(figure.captions.iter().enumerate().filter_map(
+                    |(caption_index, caption)| {
+                        let text = translation_text(caption);
+                        (!text.trim().is_empty()).then_some(TranslationBlockInput {
+                            block_index,
+                            segment_index: Some(caption_index),
+                            text,
+                        })
+                    },
+                ));
+            }
             Block::Separator | Block::PageBreak => {}
         }
     }
@@ -291,6 +303,7 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Text(block) => block.source.as_ref(),
         Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
+        Block::Figure(block) => block.source.as_ref(),
         Block::Separator | Block::PageBreak => None,
     }
 }
@@ -306,6 +319,13 @@ fn translation_input_source_range(
             .flat_map(|row| &row.cells)
             .nth(segment_index)
             .and_then(|cell| cell.text.source.as_ref());
+    }
+    if let (Block::Figure(figure), Some(segment_index)) = (block, segment_index) {
+        return figure
+            .captions
+            .get(segment_index)
+            .and_then(|caption| caption.source.as_ref())
+            .or(figure.source.as_ref());
     }
     block_source_range(block)
 }
@@ -407,6 +427,13 @@ impl BookSource for TranslationBookSource {
                         mode,
                     )));
                 }
+                Block::Figure(figure) if !translation.segments.is_empty() => {
+                    rendered.push(Block::Figure(translated_figure(
+                        figure,
+                        &translation.segments,
+                        mode,
+                    )));
+                }
                 other => rendered.push(other),
             }
         }
@@ -478,6 +505,36 @@ fn translated_table(
         }
     }
     table
+}
+
+fn translated_figure(
+    mut figure: FigureBlock,
+    translations: &HashMap<usize, String>,
+    mode: TranslationMode,
+) -> FigureBlock {
+    for (caption_index, caption) in figure.captions.iter_mut().enumerate() {
+        let Some(translated) = translations.get(&caption_index) else {
+            continue;
+        };
+        let style = caption
+            .content
+            .iter()
+            .find_map(|inline| match inline {
+                Inline::Text(run) => Some(run.style),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .unwrap_or_default();
+        let original = caption.content.clone();
+        if mode == TranslationMode::Replace {
+            caption.content = replacement_content(translated, style, Some(&original));
+        } else {
+            caption.content.push(Inline::Break);
+            caption
+                .content
+                .extend(replacement_content(translated, style, Some(&original)));
+        }
+    }
+    figure
 }
 
 fn normalized_translation_mode(
@@ -1039,9 +1096,9 @@ fn best_marker_match(
 #[cfg(test)]
 mod tests {
     use rebook_publication::{
-        BlockStyle, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, ImageBlock,
-        ImageStyle, Metadata, PublicationId, RenditionLayout, SourceAnchor, SourceRange, SpineItem,
-        SpineItemId, TextBlock, TextBlockKind,
+        BlockStyle, FigureBlock, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan,
+        ImageBlock, ImageStyle, Metadata, PublicationId, RenditionLayout, SourceAnchor,
+        SourceRange, SpineItem, SpineItemId, TextBlock, TextBlockKind,
     };
 
     use super::*;
@@ -1340,6 +1397,50 @@ mod tests {
         assert_eq!(
             block_text(&source.parse_section(0).unwrap().blocks[0]),
             "你好"
+        );
+    }
+
+    #[test]
+    fn figure_captions_are_translated_without_detaching_them_from_the_image() {
+        let figure = FigureBlock {
+            images: Vec::new(),
+            captions: vec![TextBlock {
+                kind: TextBlockKind::Caption,
+                content: vec![Inline::Text(TextRun {
+                    text: "Original caption".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: None,
+            }],
+            caption_position: Default::default(),
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let section = Section {
+            id: SpineItemId::new("figure-section").unwrap(),
+            href: PublicationUrl::parse("figure.xhtml").unwrap(),
+            blocks: vec![Block::Figure(figure.clone())],
+            anchors: Vec::new(),
+        };
+        assert_eq!(
+            translatable_blocks(&section, false),
+            vec![TranslationBlockInput {
+                block_index: 0,
+                segment_index: Some(0),
+                text: "Original caption".into(),
+            }]
+        );
+
+        let translations = HashMap::from([(0, "翻译图注".to_owned())]);
+        let replaced = translated_figure(figure.clone(), &translations, TranslationMode::Replace);
+        assert_eq!(text_block_text(&replaced.captions[0]), "翻译图注");
+
+        let bilingual = translated_figure(figure, &translations, TranslationMode::Bilingual);
+        assert_eq!(
+            text_block_text(&bilingual.captions[0]),
+            "Original caption\n翻译图注"
         );
     }
 

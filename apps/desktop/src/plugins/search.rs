@@ -120,7 +120,9 @@ fn search_sections(
                     };
                     (layer.text.clone(), source_range, "image-text".into())
                 }
-                Block::Table(_) | Block::Separator | Block::PageBreak => continue,
+                Block::Figure(_) | Block::Table(_) | Block::Separator | Block::PageBreak => {
+                    continue;
+                }
             };
             for found in matcher.find_iter(&text) {
                 let range = source_range_for_match(source_range, &text, found.start(), found.end());
@@ -156,6 +158,7 @@ pub(crate) fn text_block_kind(block: &TextBlock) -> &'static str {
         TextBlockKind::ListItem { .. } => "list-item",
         TextBlockKind::DefinitionTerm { .. } => "definition-term",
         TextBlockKind::DefinitionDescription { .. } => "definition-description",
+        TextBlockKind::Caption => "caption",
     }
 }
 

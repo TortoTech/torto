@@ -11,10 +11,10 @@ use parley::{
     InlineBox as ParleyInlineBox, InlineBoxKind, Layout, LayoutContext, LineHeight, StyleProperty,
 };
 use rebook_publication::{
-    Block, BookSource, FixedPageDimensions, FixedPageTextLayer, FixedPageTextRect, ImageStyle,
-    Inline, MathRun, PublicationError, PublicationUrl, RenditionLayout, Rgba, Section, SourceRange,
-    TableBlock, TableCell, TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun,
-    TextStyle, WritingSystem,
+    Block, BookSource, CaptionPosition, FixedPageDimensions, FixedPageTextLayer, FixedPageTextRect,
+    ImageBlock, ImageStyle, Inline, MathRun, PublicationError, PublicationUrl, RenditionLayout,
+    Rgba, Section, SourceRange, TableBlock, TableCell, TextAlignment, TextBaseline, TextBlock,
+    TextBlockKind, TextRun, TextStyle, WritingSystem,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -96,6 +96,8 @@ pub struct ReaderTypesetting {
     pub paragraph_gap_em: f32,
     pub heading_body_gap_em: f32,
     pub media_gap_em: f32,
+    pub caption_font_scale: f32,
+    pub caption_gap_em: f32,
     pub list_indent_em: f32,
     pub table_font_scale: f32,
     pub table_line_height: f32,
@@ -118,6 +120,8 @@ impl ReaderTypesetting {
         self.paragraph_gap_em = finite_clamp(self.paragraph_gap_em, 0.0, 2.0, 0.75);
         self.heading_body_gap_em = finite_clamp(self.heading_body_gap_em, 0.2, 2.0, 0.7);
         self.media_gap_em = finite_clamp(self.media_gap_em, 0.5, 2.0, 1.0);
+        self.caption_font_scale = finite_clamp(self.caption_font_scale, 0.7, 1.0, 0.88);
+        self.caption_gap_em = finite_clamp(self.caption_gap_em, 0.2, 1.0, 0.35);
         self.list_indent_em = finite_clamp(self.list_indent_em, 0.5, 3.0, 1.5);
         self.table_font_scale = finite_clamp(self.table_font_scale, 0.7, 1.2, 0.9);
         self.table_line_height = finite_clamp(self.table_line_height, 1.1, 2.0, 1.45);
@@ -136,6 +140,8 @@ impl Default for ReaderTypesetting {
             paragraph_gap_em: 0.75,
             heading_body_gap_em: 0.7,
             media_gap_em: 1.0,
+            caption_font_scale: 0.88,
+            caption_gap_em: 0.35,
             list_indent_em: 1.5,
             table_font_scale: 0.9,
             table_line_height: 1.45,
@@ -647,21 +653,7 @@ impl LayoutEngine {
                         paginator.push_table(&prepared);
                     }
                     Block::Image(image) => {
-                        let raster = if let Some(raster) = source.raster_resource(&image.href)? {
-                            RasterImage {
-                                width: raster.width,
-                                height: raster.height,
-                                pixels: raster.pixels,
-                            }
-                        } else {
-                            let resource = source.resource(&image.href)?;
-                            let decoded = image::load_from_memory(&resource.bytes)?.to_rgba8();
-                            RasterImage {
-                                width: decoded.width(),
-                                height: decoded.height(),
-                                pixels: decoded.into_raw().into(),
-                            }
-                        };
+                        let raster = load_raster_image(source, image)?;
                         let mut image_style = image.style;
                         if unified_reflow {
                             let gap = reader_style.typography.font_size
@@ -680,6 +672,124 @@ impl LayoutEngine {
                                 self.shape_fixed_page_replacement(&replacement, reader_style);
                             paginator.push_fixed_page_replacement(&prepared, replacement)?;
                         }
+                    }
+                    Block::Figure(figure) => {
+                        let authored_outer_gap = figure
+                            .images
+                            .iter()
+                            .map(|image| image.style.margin_before.max(image.style.margin_after))
+                            .fold(0.0, f32::max)
+                            .max(figure.style.margin_before)
+                            .max(figure.style.margin_after);
+                        let mut images = Vec::with_capacity(figure.images.len());
+                        for image in &figure.images {
+                            let mut style = image.style;
+                            // The figure owns its outer spacing. Keeping authored
+                            // margins on each child would double the gap between
+                            // an image and its caption.
+                            style.margin_before = 0.0;
+                            style.margin_after = 0.0;
+                            images.push((load_raster_image(source, image)?, style, image));
+                        }
+                        let captions = figure
+                            .captions
+                            .iter()
+                            .map(|caption| {
+                                let resolved =
+                                    resolve_text_block(caption, reader_style, TextContext::Flow);
+                                let prepared = self.shape_text(
+                                    &resolved,
+                                    reader_style,
+                                    (content_width - media_start_offset).max(1.0),
+                                );
+                                (prepared, resolved)
+                            })
+                            .collect::<Vec<_>>();
+                        let outer_gap = if unified_reflow {
+                            reader_style.typography.font_size
+                                * reader_style.typesetting.media_gap_em
+                        } else {
+                            authored_outer_gap.max(IMAGE_BLOCK_GAP)
+                        };
+                        let caption_gap = if unified_reflow {
+                            reader_style.typography.font_size
+                                * reader_style.typesetting.caption_gap_em
+                        } else {
+                            6.0
+                        };
+                        let image_height = images
+                            .iter()
+                            .map(|(raster, style, _)| {
+                                paginator.image_display_size(raster, *style).1
+                            })
+                            .sum::<f32>();
+                        let caption_height = captions
+                            .iter()
+                            .map(|(prepared, resolved)| {
+                                prepared_text_height(prepared)
+                                    + resolved.style.margin_before.max(0.0)
+                                    + resolved.style.margin_after.max(0.0)
+                            })
+                            .sum::<f32>();
+                        let internal_image_gaps =
+                            caption_gap * images.len().saturating_sub(1) as f32;
+                        let image_caption_gap = if images.is_empty() || captions.is_empty() {
+                            0.0
+                        } else {
+                            caption_gap
+                        };
+                        paginator.prepare_group(
+                            image_height + caption_height + internal_image_gaps + image_caption_gap,
+                            outer_gap,
+                        );
+
+                        let push_images = |paginator: &mut Paginator,
+                                           engine: &mut LayoutEngine|
+                         -> Result<(), LayoutError> {
+                            for (index, (raster, style, image)) in images.iter().enumerate() {
+                                if index > 0 {
+                                    paginator.add_spacing(caption_gap);
+                                }
+                                let replacements = paginator.push_image_with_gaps(
+                                    raster.clone(),
+                                    *style,
+                                    image.source.clone(),
+                                    image.text_layer.clone(),
+                                    0.0,
+                                    0.0,
+                                );
+                                for replacement in replacements {
+                                    let prepared = engine
+                                        .shape_fixed_page_replacement(&replacement, reader_style);
+                                    paginator
+                                        .push_fixed_page_replacement(&prepared, replacement)?;
+                                }
+                            }
+                            Ok(())
+                        };
+                        let push_captions = |paginator: &mut Paginator| -> Result<(), LayoutError> {
+                            for (prepared, resolved) in &captions {
+                                paginator.push_text(prepared, resolved.as_ref())?;
+                            }
+                            Ok(())
+                        };
+                        match figure.caption_position {
+                            CaptionPosition::Before => {
+                                push_captions(&mut paginator)?;
+                                if !captions.is_empty() && !images.is_empty() {
+                                    paginator.add_spacing(caption_gap);
+                                }
+                                push_images(&mut paginator, self)?;
+                            }
+                            CaptionPosition::After => {
+                                push_images(&mut paginator, self)?;
+                                if !captions.is_empty() && !images.is_empty() {
+                                    paginator.add_spacing(caption_gap);
+                                }
+                                push_captions(&mut paginator)?;
+                            }
+                        }
+                        paginator.ensure_minimum_spacing(outer_gap);
                     }
                     Block::Separator => paginator.push_separator(),
                     Block::PageBreak => paginator.force_page(),
@@ -1096,6 +1206,7 @@ fn resolve_text_block<'a>(
                 1.3,
                 base_size * profile.heading_body_gap_em,
             ),
+            TextBlockKind::Caption => (profile.caption_font_scale, 1.4, 0.0),
             TextBlockKind::Preformatted => (0.9, 1.45, base_size * profile.paragraph_gap_em),
             TextBlockKind::Blockquote => (
                 0.95,
@@ -1133,6 +1244,11 @@ fn resolve_text_block<'a>(
             resolved.style.margin_start_fraction = 0.0;
         }
         TextContext::Flow => match block.kind {
+            TextBlockKind::Caption => {
+                resolved.style.align = TextAlignment::Center;
+                resolved.style.margin_start = 0.0;
+                resolved.style.margin_start_fraction = 0.0;
+            }
             TextBlockKind::ListItem { depth, .. } => {
                 resolved.style.margin_start =
                     base_size * profile.list_indent_em * (f32::from(depth) + 1.0);
@@ -1209,6 +1325,26 @@ fn unified_heading_scale(h1_scale: f32, level: u8) -> f32 {
         }
 }
 
+fn load_raster_image(
+    source: &dyn BookSource,
+    image: &ImageBlock,
+) -> Result<RasterImage, LayoutError> {
+    if let Some(raster) = source.raster_resource(&image.href)? {
+        return Ok(RasterImage {
+            width: raster.width,
+            height: raster.height,
+            pixels: raster.pixels,
+        });
+    }
+    let resource = source.resource(&image.href)?;
+    let decoded = image::load_from_memory(&resource.bytes)?.to_rgba8();
+    Ok(RasterImage {
+        width: decoded.width(),
+        height: decoded.height(),
+        pixels: decoded.into_raw().into(),
+    })
+}
+
 fn dominant_paragraph_start_offset(fragments: &[&[Block]], content_width: f32) -> f32 {
     let mut offsets = fragments
         .iter()
@@ -1221,6 +1357,7 @@ fn dominant_paragraph_start_offset(fragments: &[&[Block]], content_width: f32) -
             Block::Text(_)
             | Block::Table(_)
             | Block::Image(_)
+            | Block::Figure(_)
             | Block::Separator
             | Block::PageBreak => None,
         })
@@ -1912,19 +2049,7 @@ impl Paginator {
         clippy::cast_precision_loss,
         reason = "decoded image dimensions are bounded by publication resource limits"
     )]
-    fn push_image(
-        &mut self,
-        image: RasterImage,
-        style: ImageStyle,
-        source: Option<SourceRange>,
-        text_layer: Option<FixedPageTextLayer>,
-    ) -> Vec<FixedPageReplacementRequest> {
-        let restore_gap_on_empty_page = !self.column_has_content
-            && self.items.is_empty()
-            && !self.pages.is_empty()
-            && !self.forced_page_break;
-        self.forced_page_break = false;
-        self.previous_block_was_paragraph = false;
+    fn image_display_size(&self, image: &RasterImage, style: ImageStyle) -> (f32, f32) {
         let intrinsic_width = image.width.max(1) as f32;
         let intrinsic_height = image.height.max(1) as f32;
         let aspect_ratio = intrinsic_width / intrinsic_height;
@@ -1951,9 +2076,56 @@ impl Paginator {
         let scale = (max_width / requested_width)
             .min(max_height / requested_height)
             .min(1.0);
-        let width = requested_width * scale;
-        let height = requested_height * scale;
-        let block_gap = style.margin_before.max(IMAGE_BLOCK_GAP);
+        (requested_width * scale, requested_height * scale)
+    }
+
+    fn prepare_group(&mut self, content_height: f32, outer_gap: f32) {
+        self.ensure_minimum_spacing(outer_gap);
+        let full_height = self.bottom - self.top;
+        if content_height <= full_height
+            && self.cursor_y + content_height > self.bottom
+            && self.column_has_content
+        {
+            self.advance_column();
+            self.leading_gap = outer_gap.max(0.0);
+        }
+    }
+
+    fn push_image(
+        &mut self,
+        image: RasterImage,
+        style: ImageStyle,
+        source: Option<SourceRange>,
+        text_layer: Option<FixedPageTextLayer>,
+    ) -> Vec<FixedPageReplacementRequest> {
+        self.push_image_with_gaps(
+            image,
+            style,
+            source,
+            text_layer,
+            IMAGE_BLOCK_GAP,
+            IMAGE_BLOCK_GAP,
+        )
+    }
+
+    fn push_image_with_gaps(
+        &mut self,
+        image: RasterImage,
+        style: ImageStyle,
+        source: Option<SourceRange>,
+        text_layer: Option<FixedPageTextLayer>,
+        minimum_before: f32,
+        minimum_after: f32,
+    ) -> Vec<FixedPageReplacementRequest> {
+        let restore_gap_on_empty_page = !self.column_has_content
+            && self.items.is_empty()
+            && !self.pages.is_empty()
+            && !self.forced_page_break;
+        self.forced_page_break = false;
+        self.previous_block_was_paragraph = false;
+        let (width, height) = self.image_display_size(&image, style);
+        let media_width = (self.width - self.media_start_offset).max(1.0);
+        let block_gap = style.margin_before.max(minimum_before);
         let page_count_before_spacing = self.pages.len();
         self.ensure_minimum_spacing(block_gap);
         if self.cursor_y + height > self.bottom && self.column_has_content {
@@ -1998,7 +2170,7 @@ impl Paginator {
             replacement: None,
         }));
         self.column_has_content = true;
-        self.cursor_y += height + style.margin_after.max(IMAGE_BLOCK_GAP);
+        self.cursor_y += height + style.margin_after.max(minimum_after);
         replacements
     }
 
@@ -2255,6 +2427,8 @@ mod tests {
             paragraph_gap_em: -1.0,
             heading_body_gap_em: 4.0,
             media_gap_em: 0.1,
+            caption_font_scale: 0.1,
+            caption_gap_em: 4.0,
             list_indent_em: 8.0,
             table_font_scale: 0.1,
             table_line_height: f32::INFINITY,
@@ -2267,6 +2441,8 @@ mod tests {
         assert!(typesetting.paragraph_gap_em.abs() < 0.001);
         assert!((typesetting.heading_body_gap_em - 2.0).abs() < 0.001);
         assert!((typesetting.media_gap_em - 0.5).abs() < 0.001);
+        assert!((typesetting.caption_font_scale - 0.7).abs() < 0.001);
+        assert!((typesetting.caption_gap_em - 1.0).abs() < 0.001);
         assert!((typesetting.list_indent_em - 3.0).abs() < 0.001);
         assert!((typesetting.table_font_scale - 0.7).abs() < 0.001);
         assert!((typesetting.table_line_height - 1.45).abs() < 0.001);
@@ -3362,6 +3538,74 @@ mod tests {
                 .max(metrics.block_min_coord + metrics.line_height);
 
         assert!((image.y - text_bottom - IMAGE_BLOCK_GAP).abs() < 0.001);
+    }
+
+    #[test]
+    fn unified_figure_keeps_image_and_caption_together_with_semantic_spacing() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("figure-caption-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![Block::Figure(rebook_publication::FigureBlock {
+                images: vec![ImageBlock {
+                    href: PublicationUrl::parse("images/figure.png").unwrap(),
+                    alt: "Figure".into(),
+                    style: ImageStyle {
+                        margin_after: 30.0,
+                        ..ImageStyle::default()
+                    },
+                    source: None,
+                    text_layer: None,
+                }],
+                captions: vec![TextBlock {
+                    kind: TextBlockKind::Caption,
+                    content: vec![Inline::Text(TextRun {
+                        text: "A concise figure caption".into(),
+                        style: TextStyle::default(),
+                        link: None,
+                    })],
+                    style: rebook_publication::BlockStyle::default(),
+                    source: None,
+                }],
+                caption_position: CaptionPosition::After,
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            })],
+            anchors: Vec::new(),
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(400, 500).unwrap(),
+                &style,
+            )
+            .unwrap();
+        let [PageItem::Image(image), PageItem::Text(caption)] = layout.pages[0].items.as_slice()
+        else {
+            panic!("expected one grouped image and caption");
+        };
+        let first = caption.layout.get(caption.lines.start).unwrap();
+        let caption_top = caption.origin_y + first.metrics().block_min_coord;
+        let expected_gap = style.typography.font_size * style.typesetting.caption_gap_em;
+        assert!((caption_top - (image.y + image.height) - expected_gap).abs() < 0.01);
+        assert!(
+            first.metrics().offset > 0.0,
+            "a short unified caption should be centered"
+        );
     }
 
     #[test]

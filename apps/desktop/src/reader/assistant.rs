@@ -2030,6 +2030,7 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Text(block) => block.source.as_ref(),
         Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
+        Block::Figure(block) => block.source.as_ref(),
         Block::Separator | Block::PageBreak => None,
     }
 }
@@ -2071,6 +2072,26 @@ fn block_text(block: &Block) -> String {
             .text_layer
             .as_ref()
             .map_or_else(|| block.alt.clone(), |layer| layer.text.clone()),
+        Block::Figure(figure) => {
+            let caption = figure
+                .captions
+                .iter()
+                .map(|caption| block_text(&Block::Text(caption.clone())))
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if caption.is_empty() {
+                figure
+                    .images
+                    .iter()
+                    .map(|image| image.alt.trim())
+                    .filter(|alt| !alt.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            } else {
+                caption
+            }
+        }
         Block::Separator | Block::PageBreak => String::new(),
     }
 }

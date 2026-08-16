@@ -1975,6 +1975,7 @@ impl BookSource for OcrReflowBookSource {
                 if let Ok(page) = self.inner.parse_section(page_index)
                     && let Some(image) = page.blocks.iter().find_map(|block| match block {
                         rebook_publication::Block::Image(image) => Some(image),
+                        rebook_publication::Block::Figure(figure) => figure.images.first(),
                         rebook_publication::Block::Text(_)
                         | rebook_publication::Block::Table(_)
                         | rebook_publication::Block::Separator

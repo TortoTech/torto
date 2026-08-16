@@ -413,6 +413,9 @@ fn extract_chunks(source: &dyn BookSource) -> Result<Vec<SemanticChunk>, String>
                         );
                     }
                 }
+                // Figure/image indexing is intentionally deferred until the
+                // semantic image-embedding contract is stable.
+                Block::Figure(_) => {}
                 Block::Separator | Block::PageBreak => {}
             }
         }

@@ -353,6 +353,8 @@ pub enum Block {
     Table(TableBlock),
     /// Raster or vector image resource.
     Image(ImageBlock),
+    /// One or more authored images and their semantic caption.
+    Figure(FigureBlock),
     /// Thematic separator.
     Separator,
     /// Explicit page boundary requested by the source.
@@ -370,6 +372,8 @@ pub enum TextBlockKind {
     Blockquote,
     /// Preformatted text.
     Preformatted,
+    /// Text semantically attached to an authored figure.
+    Caption,
     /// Ordered or unordered list item.
     ListItem {
         /// Whether numbering should be displayed.
@@ -483,6 +487,31 @@ pub struct ImageBlock {
     /// Optional text geometry for fixed-layout pages such as PDF documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_layer: Option<FixedPageTextLayer>,
+}
+
+/// An authored image figure kept together with its caption.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FigureBlock {
+    /// Images in authored order. The first image is the primary interaction target.
+    pub images: Vec<ImageBlock>,
+    /// Caption paragraphs in authored order.
+    pub captions: Vec<TextBlock>,
+    /// Whether the caption was authored before or after the images.
+    pub caption_position: CaptionPosition,
+    /// Authored outer spacing retained for book-defined typesetting.
+    #[serde(default)]
+    pub style: BlockStyle,
+    /// Stable source anchor for navigation and citation.
+    pub source: Option<SourceRange>,
+}
+
+/// Authored placement of a figure caption relative to its images.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptionPosition {
+    Before,
+    #[default]
+    After,
 }
 
 /// Searchable and selectable text attached to one fixed-layout image page.

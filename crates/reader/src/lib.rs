@@ -2724,7 +2724,7 @@ fn reading_unit_has_activatable_content(unit: &ReadingUnit, fragments: &[Content
                 !matches!(text.kind, rebook_publication::TextBlockKind::Heading(_))
                     && block_text_len(block) > 0
             }
-            Block::Image(_) | Block::Table(_) => true,
+            Block::Image(_) | Block::Figure(_) | Block::Table(_) => true,
             Block::Separator | Block::PageBreak => false,
         })
 }
@@ -3079,6 +3079,11 @@ fn block_text_len(block: &Block) -> usize {
             .flat_map(|row| &row.cells)
             .map(|cell| inline_content_len(&cell.text.content))
             .sum(),
+        Block::Figure(figure) => figure
+            .captions
+            .iter()
+            .map(|caption| inline_content_len(&caption.content))
+            .sum(),
         Block::Image(_) | Block::Separator | Block::PageBreak => 0,
     }
 }
@@ -3111,6 +3116,7 @@ fn block_source(block: &Block) -> Option<&SourceRange> {
         Block::Text(block) => block.source.as_ref(),
         Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
+        Block::Figure(block) => block.source.as_ref(),
         Block::Separator | Block::PageBreak => None,
     }
 }

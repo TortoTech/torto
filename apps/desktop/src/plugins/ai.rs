@@ -2168,6 +2168,27 @@ fn ai_block_content(block: &Block, is_pdf: bool) -> Option<(&SourceRange, String
             (!is_pdf && !image.alt.trim().is_empty())
                 .then(|| (source, image.alt.clone(), "image-alt"))
         }
+        Block::Figure(figure) => {
+            let source = figure.source.as_ref()?;
+            let caption = figure
+                .captions
+                .iter()
+                .map(text_block_text)
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !caption.is_empty() {
+                return Some((source, caption, "figure-caption"));
+            }
+            let alt = figure
+                .images
+                .iter()
+                .map(|image| image.alt.trim())
+                .filter(|alt| !alt.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+            (!is_pdf && !alt.is_empty()).then_some((source, alt, "figure-alt"))
+        }
         Block::Separator | Block::PageBreak => None,
     }
 }
@@ -2364,12 +2385,50 @@ mod tests {
     use std::thread;
 
     use rebook_publication::{
-        BlockStyle, ImageBlock, ImageStyle, Metadata, PublicationError, PublicationId,
-        PublicationUrl, RasterResource, Resource, Section, SourceAnchor, SpineItemId, TextBlock,
-        TextBlockKind, TextRun, TextStyle,
+        BlockStyle, FigureBlock, ImageBlock, ImageStyle, Inline, Metadata, PublicationError,
+        PublicationId, PublicationUrl, RasterResource, Resource, Section, SourceAnchor,
+        SourceRange, SpineItemId, TextBlock, TextBlockKind, TextRun, TextStyle,
     };
 
     use super::*;
+
+    #[test]
+    fn figure_caption_is_exposed_as_source_backed_ai_content() {
+        let spine = SpineItemId::new("chapter").unwrap();
+        let range = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "figure-1".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "figure-1".into(),
+                text_offset: 0,
+            },
+        };
+        let block = Block::Figure(FigureBlock {
+            images: Vec::new(),
+            captions: vec![TextBlock {
+                kind: TextBlockKind::Caption,
+                content: vec![Inline::Text(TextRun {
+                    text: "Figure 3. A useful diagram.".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: None,
+            }],
+            caption_position: Default::default(),
+            style: BlockStyle::default(),
+            source: Some(range.clone()),
+        });
+
+        let (source, text, kind) = ai_block_content(&block, false).unwrap();
+        assert_eq!(source, &range);
+        assert_eq!(text, "Figure 3. A useful diagram.");
+        assert_eq!(kind, "figure-caption");
+    }
 
     struct FixedPageTestSource {
         book: Book,

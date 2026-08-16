@@ -383,6 +383,13 @@ fn legacy_translated_paragraph_range(
                     .filter(matches_range)
                     .map(|source| (source, crate::plugins::text_block_text(&cell.text)))
             }),
+        Block::Figure(figure) => figure.captions.iter().find_map(|caption| {
+            caption
+                .source
+                .as_ref()
+                .filter(matches_range)
+                .map(|source| (source, crate::plugins::text_block_text(caption)))
+        }),
         Block::Image(_) | Block::Separator | Block::PageBreak => None,
     })?;
     let stored_length = range.end.text_offset.checked_sub(range.start.text_offset)?;
@@ -560,6 +567,7 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Text(block) => block.source.as_ref(),
         Block::Table(table) => table.source.as_ref(),
         Block::Image(image) => image.source.as_ref(),
+        Block::Figure(figure) => figure.source.as_ref(),
         Block::Separator | Block::PageBreak => None,
     }
 }
@@ -966,6 +974,36 @@ impl DesktopReader {
                         image.alt.clone()
                     };
                     (range.clone(), vec![range], text, true, false)
+                }
+                Block::Figure(figure) => {
+                    let Some(range) = figure.source.clone() else {
+                        continue;
+                    };
+                    let paint_ranges = focus_block_paint_ranges(block, &range);
+                    let caption = figure
+                        .captions
+                        .iter()
+                        .map(crate::plugins::text_block_text)
+                        .filter(|text| !text.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let text = if caption.is_empty() {
+                        figure
+                            .images
+                            .iter()
+                            .map(|image| image.alt.trim())
+                            .filter(|alt| !alt.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    } else {
+                        caption
+                    };
+                    let text = if text.is_empty() {
+                        self.language.text("图片", "Image").to_owned()
+                    } else {
+                        text
+                    };
+                    (range, paint_ranges, text, true, false)
                 }
                 Block::Separator | Block::PageBreak => continue,
             };
