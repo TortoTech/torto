@@ -61,6 +61,7 @@ mod ui_controller;
 
 use chat_autocomplete::ChatReference;
 pub(crate) use egui_view::{ReaderFramePlan, ReaderPageTexture};
+pub(crate) use render::ReaderScene;
 use render::{PageSceneKey, PageSceneLayers};
 
 // Reader page colors follow the app theme; the light pair matches
@@ -499,6 +500,7 @@ pub(super) struct DesktopReader {
     focus_toc_override: Option<String>,
     pending_page_turn: Option<PageDirection>,
     pending_reading_unit_entry: Option<PageDirection>,
+    pending_focus_wheel_turn: Option<PageDirection>,
     pending_keyboard_scroll_delta: f32,
     settings_requested: bool,
     settings_change_requested: Option<ReaderSettingsChange>,
@@ -1171,8 +1173,8 @@ impl DesktopReader {
         };
         // The retained Vello image layer can outlive the renderer's transient
         // image upload when focus moves away and later returns to this page.
-        // The hit-test/preview path reads the current display-list pixels, so
-        // evict only this page and rebuild its underlay on the next frame.
+        // The GPU renderer also refreshes the underlying image atlas, while this
+        // eviction makes the selected image underlay match the active focus page.
         self.invalidate_page_scene(unit.position);
         let Some(layout) = self.scroll_section.as_ref() else {
             self.selected_image = None;
@@ -2179,6 +2181,7 @@ impl DesktopReader {
             focus_toc_override: None,
             pending_page_turn: None,
             pending_reading_unit_entry: None,
+            pending_focus_wheel_turn: None,
             pending_keyboard_scroll_delta: 0.0,
             settings_requested: false,
             settings_change_requested: None,
@@ -2482,6 +2485,7 @@ mod tests {
                 style: BlockStyle::default(),
                 source: Some(source),
             },
+            authored_alignment: None,
             column_span: 1,
             row_span: 1,
             header: false,

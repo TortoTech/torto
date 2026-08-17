@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.95"
 name = "egui_commonmark_backend"
-version = "0.24.0"
+version = "0.25.0"
 authors = ["Erlend Walstad"]
 build = false
 include = [

@@ -425,7 +425,7 @@ impl ReadingIrParser {
                     text_style.bold = true;
                 }
                 let mut collector = InlineCollector::new(false);
-                collect_inline(
+                collect_table_cell_inline(
                     cell,
                     text_style,
                     None,
@@ -453,6 +453,7 @@ impl ReadingIrParser {
                         style,
                         source: Some(source),
                     },
+                    authored_alignment: self.styles.table_cell_alignment(cell),
                     column_span: table_span(cell, "colspan"),
                     row_span: table_span(cell, "rowspan"),
                     header,
@@ -808,6 +809,21 @@ impl InlineCollector {
         self.last_was_space = true;
     }
 
+    fn push_block_break(&mut self) {
+        if let Some(Inline::Text(run)) = self.content.last_mut() {
+            while run.text.ends_with(' ') {
+                run.text.pop();
+            }
+            if run.text.is_empty() {
+                self.content.pop();
+            }
+        }
+        if self.content.is_empty() || matches!(self.content.last(), Some(Inline::Break)) {
+            return;
+        }
+        self.push_break();
+    }
+
     fn push_math(&mut self, latex: &str, display: bool, size_scale: f32) {
         let latex = latex.trim().to_owned();
         if latex.is_empty() {
@@ -840,8 +856,39 @@ fn collect_inline(
     styles: &StyleSheet,
     collector: &mut InlineCollector,
 ) {
+    collect_inline_with_block_boundaries(node, inherited, link, base, styles, collector, false);
+}
+
+fn collect_table_cell_inline(
+    node: Node<'_, '_>,
+    inherited: TextStyle,
+    link: Option<&PublicationUrl>,
+    base: &PublicationUrl,
+    styles: &StyleSheet,
+    collector: &mut InlineCollector,
+) {
+    collect_inline_with_block_boundaries(node, inherited, link, base, styles, collector, true);
+}
+
+fn collect_inline_with_block_boundaries(
+    node: Node<'_, '_>,
+    inherited: TextStyle,
+    link: Option<&PublicationUrl>,
+    base: &PublicationUrl,
+    styles: &StyleSheet,
+    collector: &mut InlineCollector,
+    preserve_block_boundaries: bool,
+) {
     for child in node.children() {
-        collect_inline_node(child, inherited, link, base, styles, collector);
+        collect_inline_node_with_block_boundaries(
+            child,
+            inherited,
+            link,
+            base,
+            styles,
+            collector,
+            preserve_block_boundaries,
+        );
     }
 }
 
@@ -852,6 +899,20 @@ fn collect_inline_node(
     base: &PublicationUrl,
     styles: &StyleSheet,
     collector: &mut InlineCollector,
+) {
+    collect_inline_node_with_block_boundaries(
+        node, inherited, link, base, styles, collector, false,
+    );
+}
+
+fn collect_inline_node_with_block_boundaries(
+    node: Node<'_, '_>,
+    inherited: TextStyle,
+    link: Option<&PublicationUrl>,
+    base: &PublicationUrl,
+    styles: &StyleSheet,
+    collector: &mut InlineCollector,
+    preserve_block_boundaries: bool,
 ) {
     if node.is_text() {
         collector.push_text(node.text().unwrap_or_default(), inherited, link.cloned());
@@ -867,6 +928,9 @@ fn collect_inline_node(
     }
     if matches!(name.as_str(), "img" | "script" | "style") {
         return;
+    }
+    if preserve_block_boundaries && is_block_boundary(name.as_str()) {
+        collector.push_block_break();
     }
 
     let mut style = inherited;
@@ -907,16 +971,25 @@ fn collect_inline_node(
     }
     if name == "a" {
         let resolved = attribute_local(node, "href").and_then(|href| base.resolve(href).ok());
-        collect_inline(
+        collect_inline_with_block_boundaries(
             node,
             style,
             resolved.as_ref().or(link),
             base,
             styles,
             collector,
+            preserve_block_boundaries,
         );
     } else {
-        collect_inline(node, style, link, base, styles, collector);
+        collect_inline_with_block_boundaries(
+            node,
+            style,
+            link,
+            base,
+            styles,
+            collector,
+            preserve_block_boundaries,
+        );
     }
 }
 
@@ -1222,6 +1295,36 @@ impl StyleSheet {
         style
     }
 
+    fn table_cell_alignment(&self, cell: Node<'_, '_>) -> Option<TextAlignment> {
+        self.inherited_text_alignment(cell).or_else(|| {
+            cell.descendants()
+                .skip(1)
+                .filter(|node| {
+                    node.is_element()
+                        && is_block_boundary(node.tag_name().name().to_ascii_lowercase().as_str())
+                })
+                .find_map(|node| self.declared_text_alignment(node))
+        })
+    }
+
+    fn inherited_text_alignment(&self, node: Node<'_, '_>) -> Option<TextAlignment> {
+        let mut ancestors = node
+            .ancestors()
+            .filter(Node::is_element)
+            .collect::<Vec<_>>();
+        ancestors.reverse();
+        ancestors.into_iter().fold(None, |alignment, ancestor| {
+            self.declared_text_alignment(ancestor).or(alignment)
+        })
+    }
+
+    fn declared_text_alignment(&self, node: Node<'_, '_>) -> Option<TextAlignment> {
+        self.cascaded_properties(node)
+            .get("text-align")
+            .and_then(|value| parse_text_alignment(value))
+            .or_else(|| attribute_local(node, "align").and_then(parse_text_alignment))
+    }
+
     fn text_style_for_block(&self, node: Node<'_, '_>, kind: TextBlockKind) -> TextStyle {
         let mut ancestors = node
             .ancestors()
@@ -1414,13 +1517,11 @@ fn apply_block_properties(
             style.margin_start_fraction += fraction;
         }
     }
-    if let Some(value) = properties.get("text-align") {
-        style.align = match value.as_str() {
-            "center" => TextAlignment::Center,
-            "right" | "end" => TextAlignment::End,
-            "justify" => TextAlignment::Justify,
-            _ => TextAlignment::Start,
-        };
+    if let Some(alignment) = properties
+        .get("text-align")
+        .and_then(|value| parse_text_alignment(value))
+    {
+        style.align = alignment;
     }
     if let Some(value) = properties
         .get("text-indent")
@@ -1448,6 +1549,16 @@ fn apply_block_properties(
         .and_then(|value| css_length(value))
     {
         style.margin_after = value;
+    }
+}
+
+fn parse_text_alignment(value: &str) -> Option<TextAlignment> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "left" | "start" => Some(TextAlignment::Start),
+        "center" => Some(TextAlignment::Center),
+        "right" | "end" => Some(TextAlignment::End),
+        "justify" => Some(TextAlignment::Justify),
+        _ => None,
     }
 }
 
@@ -1750,6 +1861,79 @@ mod tests {
         assert_eq!(image.style.width, Some(ImageLength::Fraction(0.8)));
         assert_eq!(image.style.max_width, Some(ImageLength::Pixels(420.0)));
         assert_eq!(image.style.max_height, Some(ImageLength::Fraction(0.6)));
+    }
+
+    #[test]
+    fn table_cells_record_authored_alignment_and_leave_unspecified_cells_unset() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+            <head><style>
+                .left { text-align: left; }
+                .right { text-align: right; }
+            </style></head>
+            <body><table><tr>
+                <td><p class="left">Left paragraph</p></td>
+                <td class="right">Right cell</td>
+                <td>Default cell</td>
+            </tr></table></body>
+        </html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| None).unwrap();
+        let [Block::Table(table)] = section.blocks.as_slice() else {
+            panic!("expected one table");
+        };
+        let [left, right, default] = table.rows[0].cells.as_slice() else {
+            panic!("expected three cells");
+        };
+
+        assert_eq!(left.authored_alignment, Some(TextAlignment::Start));
+        assert_eq!(right.authored_alignment, Some(TextAlignment::End));
+        assert_eq!(default.authored_alignment, None);
+    }
+
+    #[test]
+    fn table_cells_keep_nested_list_paragraphs_on_separate_lines() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <table><tr><td><div>
+                <p class="bullet">• First item</p>
+                <p class="bullet">• Second item</p>
+                <p class="bullet">• Third item</p>
+            </div></td></tr></table>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| None).unwrap();
+        let [Block::Table(table)] = section.blocks.as_slice() else {
+            panic!("expected one table");
+        };
+        let content = &table.rows[0].cells[0].text.content;
+        let breaks = content
+            .iter()
+            .filter(|inline| matches!(inline, Inline::Break))
+            .count();
+        let lines = content
+            .iter()
+            .map(|inline| match inline {
+                Inline::Text(run) => run.text.as_str(),
+                Inline::Break => "\n",
+                Inline::Math(_) => "",
+            })
+            .collect::<String>();
+
+        assert_eq!(breaks, 2);
+        assert_eq!(lines, "• First item\n• Second item\n• Third item");
     }
 
     #[test]

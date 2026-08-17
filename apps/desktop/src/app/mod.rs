@@ -2,7 +2,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use peniko::Blob;
-use vello::Scene;
 
 use crate::library::LocalLibrary;
 use crate::platform::UserEvent;
@@ -11,7 +10,7 @@ use crate::reader::{
     ChatStreamMessage, ChatTaskMessage, PdfOcrTaskMessage, PdfTocTaskMessage, SearchTaskMessage,
     TocTranslationTaskMessage, TranslationTaskMessage,
 };
-use crate::reader::{DesktopReader, ReaderFramePlan, ReaderPageTexture};
+use crate::reader::{DesktopReader, ReaderFramePlan, ReaderPageTexture, ReaderScene};
 use crate::settings::{SettingsFeature, settings_overlay};
 use crate::shelf::{ShelfFeature, ShelfImportTaskMessage, SyncProgressMessage, SyncTaskMessage};
 
@@ -102,7 +101,7 @@ impl DesktopApp {
         plan
     }
 
-    pub(crate) fn reader_scene(&mut self) -> Option<Arc<Scene>> {
+    pub(crate) fn reader_scene(&mut self) -> Option<ReaderScene> {
         self.reader.as_mut().map(DesktopReader::page_scene)
     }
 

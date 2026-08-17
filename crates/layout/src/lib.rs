@@ -748,7 +748,7 @@ impl LayoutEngine {
                          -> Result<(), LayoutError> {
                             for (index, (raster, style, image)) in images.iter().enumerate() {
                                 if index > 0 {
-                                    paginator.add_spacing(caption_gap);
+                                    paginator.add_semantic_spacing(caption_gap);
                                 }
                                 let replacements = paginator.push_image_with_gaps(
                                     raster.clone(),
@@ -777,14 +777,14 @@ impl LayoutEngine {
                             CaptionPosition::Before => {
                                 push_captions(&mut paginator)?;
                                 if !captions.is_empty() && !images.is_empty() {
-                                    paginator.add_spacing(caption_gap);
+                                    paginator.add_semantic_spacing(caption_gap);
                                 }
                                 push_images(&mut paginator, self)?;
                             }
                             CaptionPosition::After => {
                                 push_images(&mut paginator, self)?;
                                 if !captions.is_empty() && !images.is_empty() {
-                                    paginator.add_spacing(caption_gap);
+                                    paginator.add_semantic_spacing(caption_gap);
                                 }
                                 push_captions(&mut paginator)?;
                             }
@@ -868,11 +868,7 @@ impl LayoutEngine {
         let mut cells = Vec::with_capacity(grid_cells.len());
         for (row, row_span, column, column_span, cell) in grid_cells {
             let block = table_cell_text_block(cell);
-            let mut block =
-                resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
-            if unified {
-                block.style.align = TextAlignment::Center;
-            }
+            let block = resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
             let cell_width = column_widths[column..column + column_span]
                 .iter()
                 .sum::<f32>();
@@ -942,9 +938,7 @@ impl LayoutEngine {
         let mut preferred_widths = vec![minimum_column_width; column_count];
         for (_, _, column, column_span, cell) in grid_cells {
             let block = table_cell_text_block(cell);
-            let mut block =
-                resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
-            block.style.align = TextAlignment::Center;
+            let block = resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
             let unwrapped = self.shape_text_with_min_width(&block, reader_style, 16_384.0, 8.0);
             let inline_slack = reader_style.typography.font_size * table_metrics.font_scale * 0.5;
             let preferred = (unwrapped.layout.full_width().ceil()
@@ -1167,6 +1161,7 @@ fn resolve_table_metrics(reader_style: &ReaderStyle) -> ResolvedTableMetrics {
 
 fn table_cell_text_block(cell: &TableCell) -> TextBlock {
     let mut block = cell.text.clone();
+    block.style.align = cell.authored_alignment.unwrap_or(TextAlignment::Center);
     if cell.header {
         for inline in &mut block.content {
             if let Inline::Text(run) = inline {
@@ -1228,7 +1223,9 @@ fn resolve_text_block<'a>(
         },
     };
 
-    resolved.style.align = TextAlignment::Start;
+    if context == TextContext::Flow {
+        resolved.style.align = TextAlignment::Start;
+    }
     resolved.style.margin_before = 0.0;
     resolved.style.margin_after = margin_after;
     resolved.style.indent =
@@ -1824,6 +1821,7 @@ struct Paginator {
     previous_block_was_paragraph: bool,
     media_start_offset: f32,
     leading_gap: f32,
+    pending_leading_gap: f32,
     forced_page_break: bool,
 }
 
@@ -1861,6 +1859,7 @@ impl Paginator {
             previous_block_was_paragraph: false,
             media_start_offset: 0.0,
             leading_gap: 0.0,
+            pending_leading_gap: 0.0,
             forced_page_break: false,
         }
     }
@@ -1911,6 +1910,7 @@ impl Paginator {
                 source: block.source.clone(),
                 inline_images: Arc::clone(&prepared.inline_images),
             }));
+            self.pending_leading_gap = 0.0;
             self.column_has_content = true;
             self.cursor_y += slice_height;
             line_start = line_end;
@@ -2080,6 +2080,7 @@ impl Paginator {
     }
 
     fn prepare_group(&mut self, content_height: f32, outer_gap: f32) {
+        self.pending_leading_gap = outer_gap.max(0.0);
         self.ensure_minimum_spacing(outer_gap);
         let full_height = self.bottom - self.top;
         if content_height <= full_height
@@ -2087,7 +2088,7 @@ impl Paginator {
             && self.column_has_content
         {
             self.advance_column();
-            self.leading_gap = outer_gap.max(0.0);
+            self.leading_gap = self.leading_gap.max(outer_gap.max(0.0));
         }
     }
 
@@ -2132,7 +2133,7 @@ impl Paginator {
             self.advance_column();
         }
         if restore_gap_on_empty_page || self.pages.len() > page_count_before_spacing {
-            self.leading_gap = block_gap;
+            self.leading_gap = self.leading_gap.max(block_gap);
         }
         let x = self.column_left() + self.media_start_offset + (media_width - width) / 2.0;
         let replacements = text_layer.as_ref().map_or_else(Vec::new, |layer| {
@@ -2169,6 +2170,7 @@ impl Paginator {
             text_layer,
             replacement: None,
         }));
+        self.pending_leading_gap = 0.0;
         self.column_has_content = true;
         self.cursor_y += height + style.margin_after.max(minimum_after);
         replacements
@@ -2225,11 +2227,15 @@ impl Paginator {
             PageItem::Table(table) => Some(table.y + table.height),
             PageItem::Separator(separator) => Some(separator.y + 1.0),
         }) else {
+            if !self.pages.is_empty() && !self.forced_page_break {
+                self.leading_gap = self.leading_gap.max(amount.max(0.0));
+            }
             return;
         };
         let target = content_bottom + amount.max(0.0);
         if target > self.bottom {
             self.advance_column();
+            self.leading_gap = self.leading_gap.max(amount.max(0.0));
         } else {
             self.cursor_y = self.cursor_y.max(target);
         }
@@ -2247,6 +2253,7 @@ impl Paginator {
             y: self.cursor_y,
             width: self.width * 0.5,
         }));
+        self.pending_leading_gap = 0.0;
         self.column_has_content = true;
         self.cursor_y += 13.0;
     }
@@ -2260,7 +2267,16 @@ impl Paginator {
         }
     }
 
+    fn add_semantic_spacing(&mut self, amount: f32) {
+        let page_count = self.pages.len();
+        self.add_spacing(amount);
+        if self.pages.len() > page_count {
+            self.leading_gap = self.leading_gap.max(amount.max(0.0));
+        }
+    }
+
     fn force_page(&mut self) {
+        self.pending_leading_gap = 0.0;
         if self.column_has_content || !self.items.is_empty() {
             self.advance_column();
         }
@@ -2272,7 +2288,9 @@ impl Paginator {
     }
 
     fn advance_column(&mut self) {
+        let pending_leading_gap = self.pending_leading_gap;
         self.commit_page();
+        self.leading_gap = self.leading_gap.max(pending_leading_gap);
     }
 
     fn commit_page(&mut self) {
@@ -2459,6 +2477,61 @@ mod tests {
     }
 
     #[test]
+    fn unified_table_preserves_authored_alignment_and_centers_unspecified_cells() {
+        let cell = |authored_alignment| TableCell {
+            text: TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: "Same content".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            },
+            authored_alignment,
+            column_span: 1,
+            row_span: 1,
+            header: false,
+        };
+        let table = TableBlock {
+            rows: vec![TableRow {
+                cells: vec![cell(None), cell(Some(TextAlignment::Start))],
+            }],
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let table = LayoutEngine::new().shape_table(&table, &style, 500.0);
+        let centered_offset = table.cells[0]
+            .text
+            .layout
+            .get(0)
+            .expect("default cell should contain text")
+            .metrics()
+            .offset;
+        let authored_offset = table.cells[1]
+            .text
+            .layout
+            .get(0)
+            .expect("authored cell should contain text")
+            .metrics()
+            .offset;
+
+        assert!(
+            centered_offset > 0.0,
+            "unspecified cells should be centered"
+        );
+        assert!(
+            authored_offset.abs() < 0.001,
+            "authored left alignment should be preserved"
+        );
+    }
+
+    #[test]
     fn unified_table_keeps_short_cells_on_one_line_when_space_allows() {
         let cell = |text: &str| TableCell {
             text: TextBlock {
@@ -2471,6 +2544,7 @@ mod tests {
                 style: rebook_publication::BlockStyle::default(),
                 source: None,
             },
+            authored_alignment: None,
             column_span: 1,
             row_span: 1,
             header: false,
@@ -3042,6 +3116,7 @@ mod tests {
                 style: rebook_publication::BlockStyle::default(),
                 source: None,
             },
+            authored_alignment: None,
             column_span: 1,
             row_span: 1,
             header: false,
@@ -3130,6 +3205,7 @@ mod tests {
                 style: rebook_publication::BlockStyle::default(),
                 source: None,
             },
+            authored_alignment: None,
             column_span,
             row_span,
             header,
@@ -3152,6 +3228,7 @@ mod tests {
                     style: rebook_publication::BlockStyle::default(),
                     source: None,
                 },
+                authored_alignment: None,
                 column_span: 1,
                 row_span: 1,
                 header: false,
@@ -3249,6 +3326,7 @@ mod tests {
                     rows: vec![TableRow {
                         cells: vec![TableCell {
                             text: text_block("Cell"),
+                            authored_alignment: None,
                             column_span: 1,
                             row_span: 1,
                             header: false,
@@ -3754,6 +3832,85 @@ mod tests {
 
         assert!(matches!(layout.pages[1].items[0], PageItem::Image(_)));
         assert!((layout.pages[1].leading_gap - IMAGE_BLOCK_GAP).abs() < 0.001);
+    }
+
+    #[test]
+    fn oversized_figure_restores_its_outer_gap_after_moving_to_the_next_page() {
+        let viewport = LayoutViewport::new(400, 300).unwrap();
+        let mut paginator = Paginator::new(
+            viewport,
+            Rgba::BLACK,
+            PageGeometry {
+                left: 20.0,
+                top: 40.0,
+                width: 360.0,
+                bottom: 260.0,
+                visible_pages: 1,
+                continuation_offset_x: 0.0,
+            },
+            false,
+            0.0,
+        );
+        paginator.push_separator();
+        paginator.add_spacing(180.0);
+
+        let outer_gap = 20.0;
+        paginator.prepare_group(300.0, outer_gap);
+        paginator.push_image_with_gaps(
+            RasterImage {
+                width: 200,
+                height: 100,
+                pixels: Vec::new().into(),
+            },
+            ImageStyle::default(),
+            None,
+            None,
+            0.0,
+            0.0,
+        );
+
+        let pages = paginator.finish();
+        assert_eq!(pages.len(), 2);
+        assert!((pages[1].leading_gap - outer_gap).abs() < 0.001);
+    }
+
+    #[test]
+    fn semantic_spacing_that_crosses_a_page_is_restored_in_continuous_layout() {
+        let viewport = LayoutViewport::new(400, 300).unwrap();
+        let mut paginator = Paginator::new(
+            viewport,
+            Rgba::BLACK,
+            PageGeometry {
+                left: 20.0,
+                top: 40.0,
+                width: 360.0,
+                bottom: 260.0,
+                visible_pages: 1,
+                continuation_offset_x: 0.0,
+            },
+            false,
+            0.0,
+        );
+        paginator.push_image_with_gaps(
+            RasterImage {
+                width: 200,
+                height: 210,
+                pixels: Vec::new().into(),
+            },
+            ImageStyle::default(),
+            None,
+            None,
+            0.0,
+            0.0,
+        );
+
+        let semantic_gap = 20.0;
+        paginator.add_semantic_spacing(semantic_gap);
+        paginator.push_separator();
+
+        let pages = paginator.finish();
+        assert_eq!(pages.len(), 2);
+        assert!((pages[1].leading_gap - semantic_gap).abs() < 0.001);
     }
 
     #[test]

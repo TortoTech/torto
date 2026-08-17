@@ -215,6 +215,13 @@ impl Link {
     ) {
         let Self { destination, text } = self;
 
+        // Images nested in links consume their own text events. Avoid adding an
+        // empty label, which resets a wrapping layout's cursor and overlaps the
+        // element rendered immediately before it.
+        if text.is_empty() {
+            return;
+        }
+
         let mut layout_job = LayoutJob::default();
         for t in text {
             t.append_to(

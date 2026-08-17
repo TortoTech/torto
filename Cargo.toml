@@ -22,7 +22,7 @@ exclude = [
 resolver = "3"
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -31,19 +31,19 @@ homepage = "https://github.com/TortoTech/torto"
 authors = ["TortoTech"]
 
 [workspace.dependencies]
-anyrender = "0.11.1"
+anyrender = "0.13.0"
 atomicwrites = "0.4.4"
 base64 = "0.22.1"
 bytemuck = "1.25.2"
 bytes = "1.12.1"
 crc32fast = "1.5.0"
 directories = "6.0.0"
-egui = "0.36.0"
-egui_commonmark = { version = "0.24.0", features = ["embedded_image"] }
-egui_commonmark_backend = "0.24.0"
-egui_extras = { version = "0.36.0", features = ["image"] }
-egui-wgpu = { version = "0.36.0", default-features = false }
-egui-winit = { version = "0.36.0", default-features = false, features = ["clipboard", "links"] }
+egui = "0.36.1"
+egui_commonmark = { version = "0.25.0", features = ["embedded_image"] }
+egui_commonmark_backend = "0.25.0"
+egui_extras = { version = "0.36.1", features = ["image"] }
+egui-wgpu = { version = "0.36.1", default-features = false }
+egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard", "links"] }
 encoding_rs = "0.8.35"
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 fontdb = "0.23.0"
@@ -53,7 +53,7 @@ jsonrepair-rs = "0.2.1"
 kurbo = "0.13.1"
 libchm = "0.2.0"
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
-parley = { version = "0.10.0", features = ["complex-scripts"] }
+parley = { version = "0.11.1", features = ["complex-scripts"] }
 peniko = "0.6.1"
 percent-encoding = "2.3.2"
 pollster = "0.4.0"
@@ -80,7 +80,7 @@ tracing = "0.1.44"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "sync", "time"] }
 unicode-segmentation = "1.13.3"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
-vello = { version = "0.9.0", default-features = false, features = ["wgpu"] }
+vello = { version = "0.10.0", default-features = false, features = ["wgpu"] }
 wgpu = { version = "29.0.3", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 winit = "0.30.13"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

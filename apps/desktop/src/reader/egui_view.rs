@@ -285,6 +285,7 @@ impl DesktopReader {
         let ctx = root_ui.ctx().clone();
         let now = Instant::now();
         self.advance_frame(now);
+        self.apply_pending_focus_wheel_turn();
         self.copy_shortcut(&ctx);
         self.keyboard_shortcuts(&ctx, interaction_blocked);
         self.request_frame_repaint(&ctx);
@@ -978,9 +979,14 @@ impl DesktopReader {
         };
         self.ui.wheel_accumulator = 0.0;
         self.ui.last_wheel_turn = Some(now);
-        if !self.scroll_within_tall_focus_unit(direction) {
-            self.move_focus_unit(direction);
-        }
+        // This callback runs after scroll_content has already chosen the current
+        // layout and painted its texture. Applying a cross-unit navigation here
+        // lets the GPU observe the new reading unit before its focus units and
+        // target offset are rebuilt, producing a one-frame flash of the new
+        // section's first image. Defer the turn to the beginning of the next UI
+        // frame, where it follows the same state order as keyboard navigation.
+        self.pending_focus_wheel_turn = Some(direction);
+        response.ctx.request_repaint();
         response.ctx.input_mut(|input| {
             input.smooth_scroll_delta.y = 0.0;
         });

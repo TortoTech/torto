@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use kurbo::{Affine, Rect};
-use peniko::Color;
+use peniko::{Color, ImageData};
 use rebook_formats::BookFormat;
 use rebook_reader::{ReaderPosition, ReaderSectionPage};
 use rebook_renderer::PageDisplayList;
@@ -36,6 +36,13 @@ pub(crate) struct PageSceneKey {
 pub(crate) struct PageSceneLayers {
     underlay: Arc<Scene>,
     content: Arc<Scene>,
+    images: Arc<[ImageData]>,
+}
+
+pub(crate) struct ReaderScene {
+    pub(crate) scene: Arc<Scene>,
+    pub(crate) images: Arc<[ImageData]>,
+    pub(crate) refresh_image_atlas: bool,
 }
 
 fn evict_page_scene<T>(
@@ -53,10 +60,11 @@ fn evict_page_scene<T>(
 }
 
 impl DesktopReader {
-    pub(crate) fn page_scene(&mut self) -> Arc<Scene> {
+    pub(crate) fn page_scene(&mut self) -> ReaderScene {
         if self.is_scroll_mode() {
             return self.scroll_page_scene();
         }
+        let refresh_image_atlas = self.is_focus_mode();
         let layers = self.page_scene_layers();
         let mut scene = Scene::new();
         scene.append(&layers.underlay, None);
@@ -89,23 +97,37 @@ impl DesktopReader {
             }
             Err(error) => self.error = Some(format!("组合双页失败：{error}")),
         }
-        Arc::new(scene)
+        ReaderScene {
+            scene: Arc::new(scene),
+            images: Arc::clone(&layers.images),
+            refresh_image_atlas,
+        }
     }
 
-    fn scroll_page_scene(&mut self) -> Arc<Scene> {
+    fn scroll_page_scene(&mut self) -> ReaderScene {
+        let refresh_image_atlas = self.is_focus_mode();
         let Some(viewport) = self.scroll_viewport else {
-            return Arc::new(Scene::new());
+            return ReaderScene {
+                scene: Arc::new(Scene::new()),
+                images: Arc::from([]),
+                refresh_image_atlas,
+            };
         };
         let layout = match self.current_scroll_layout() {
             Ok(layout) => layout,
             Err(error) => {
                 self.error = Some(format!("生成滑动章节失败：{error}"));
-                return Arc::new(Scene::new());
+                return ReaderScene {
+                    scene: Arc::new(Scene::new()),
+                    images: Arc::from([]),
+                    refresh_image_atlas,
+                };
             }
         };
         let content_padding = self.scroll_content_padding(viewport.size.y);
         let visible_bottom = viewport.offset_y + viewport.size.y;
         let mut scene = Scene::new();
+        let mut images = Vec::new();
         for (index, entry) in layout.pages.iter().enumerate() {
             let top = layout.page_tops[index] + content_padding;
             let bottom = top + layout.page_heights[index];
@@ -113,6 +135,7 @@ impl DesktopReader {
                 continue;
             }
             let layers = self.scroll_page_layers(entry);
+            images.extend(layers.images.iter().cloned());
             let mut page_scene = Scene::new();
             let clip = Rect::new(
                 0.0,
@@ -134,7 +157,11 @@ impl DesktopReader {
                 ))),
             );
         }
-        Arc::new(scene)
+        ReaderScene {
+            scene: Arc::new(scene),
+            images: images.into(),
+            refresh_image_atlas,
+        }
     }
 
     fn scroll_page_layers(&mut self, entry: &ReaderSectionPage) -> Arc<PageSceneLayers> {
@@ -158,6 +185,7 @@ impl DesktopReader {
         let layers = Arc::new(PageSceneLayers {
             underlay: Arc::new(underlay),
             content: Arc::new(content),
+            images: entry.page.image_data().cloned().collect(),
         });
         self.page_scenes.insert(key, Arc::clone(&layers));
         self.touch_page_scene(key);
@@ -185,14 +213,17 @@ impl DesktopReader {
 
         let mut underlay = Scene::new();
         let mut content = Scene::new();
+        let mut images = Vec::new();
         match self.reader.current_spread() {
             Ok(spread) => {
+                images.extend(spread.primary.image_data().cloned());
                 let mut underlay_bridge = VelloScene::new(&mut underlay);
                 spread.primary.paint_background(&mut underlay_bridge);
                 spread
                     .primary
                     .paint_images_at(&mut underlay_bridge, spread.primary_offset_x);
                 if let Some(secondary) = &spread.secondary {
+                    images.extend(secondary.image_data().cloned());
                     secondary.paint_images_at(&mut underlay_bridge, spread.secondary_offset_x);
                 }
 
@@ -207,6 +238,7 @@ impl DesktopReader {
             }
             Err(error) => {
                 self.error = Some(format!("组合双页失败：{error}"));
+                images.extend(self.reader.current_page().image_data().cloned());
                 self.reader
                     .current_page()
                     .paint(&mut VelloScene::new(&mut underlay));
@@ -215,6 +247,7 @@ impl DesktopReader {
         let layers = Arc::new(PageSceneLayers {
             underlay: Arc::new(underlay),
             content: Arc::new(content),
+            images: images.into(),
         });
         self.page_scenes.insert(key, Arc::clone(&layers));
         self.touch_page_scene(key);

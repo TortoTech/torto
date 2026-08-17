@@ -129,6 +129,20 @@ impl PageDisplayList {
             .reduce(|bounds, next| bounds.union(next))
     }
 
+    /// Raster resources referenced by this retained page.
+    ///
+    /// The desktop GPU renderer uses these handles to refresh Vello's image
+    /// atlas before replaying a scene. Cloning an [`ImageData`] is cheap and
+    /// preserves the blob identity encoded into the Vello scene.
+    pub fn image_data(&self) -> impl Iterator<Item = &ImageData> {
+        self.commands.iter().filter_map(|command| match command {
+            DisplayCommand::Image(command) => Some(&command.image.image),
+            DisplayCommand::Glyphs(_) | DisplayCommand::FillRect(_) | DisplayCommand::Rule(_) => {
+                None
+            }
+        })
+    }
+
     /// Returns the top-most retained raster image under the given page coordinate.
     pub fn image_at(&self, x: f32, y: f32) -> Option<PageImageHit> {
         let point = kurbo::Point::new(f64::from(x), f64::from(y));
@@ -2139,6 +2153,10 @@ mod tests {
 
         let list = DisplayListCompiler.compile(&page);
         assert_eq!(list.text_region_count(), 1);
+        let image_data = list.image_data().collect::<Vec<_>>();
+        assert_eq!(image_data.len(), 1);
+        assert_eq!((image_data[0].width, image_data[0].height), (100, 100));
+        assert_eq!(image_data[0].data.len(), 100 * 100 * 4);
         assert_eq!(
             list.image_bounds(),
             Some(Rect::new(50.0, 40.0, 150.0, 140.0))

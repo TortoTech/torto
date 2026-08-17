@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.95"
 name = "egui"
-version = "0.36.0"
+version = "0.36.1"
 authors = ["Emil Ernerfeldt <emil.ernerfeldt@gmail.com>"]
 build = false
 include = [
@@ -102,11 +102,11 @@ version = "0.2.12"
 optional = true
 
 [dependencies.emath]
-version = "0.36.0"
+version = "0.36.1"
 default-features = false
 
 [dependencies.epaint]
-version = "0.36.0"
+version = "0.36.1"
 default-features = false
 
 [dependencies.itertools]

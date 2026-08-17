@@ -1,7 +1,9 @@
 # Local egui_commonmark compatibility patch
 
-This directory vendors `egui_commonmark 0.24.0` from crates.io and updates its egui dependencies
-to `0.36.0`. The published crate still targets egui 0.35, while Torto needs one shared egui version
-across the application and Markdown renderer.
+This directory vendors `egui_commonmark 0.25.0` from crates.io. Upstream 0.25 now supports egui
+0.36 directly; the path copy remains paired with Torto's patched `egui_commonmark_backend`, which
+keeps layout sentinels out of text selection and supplies the reader's strong-text and citation
+presentation.
 
-Remove this compatibility patch after an upstream egui_commonmark release supports egui 0.36.
+Remove this path copy together with the backend patch after the remaining selection and presentation
+customizations can use upstream extension points.

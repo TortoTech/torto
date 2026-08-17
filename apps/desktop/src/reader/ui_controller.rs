@@ -132,6 +132,15 @@ impl DesktopReader {
         self.retry_pending_page_turn();
     }
 
+    pub(in crate::reader) fn apply_pending_focus_wheel_turn(&mut self) {
+        let Some(direction) = self.pending_focus_wheel_turn.take() else {
+            return;
+        };
+        if self.is_focus_mode() && !self.scroll_within_tall_focus_unit(direction) {
+            self.move_focus_unit(direction);
+        }
+    }
+
     pub(in crate::reader) fn next_transient_message_deadline(&self) -> Option<Instant> {
         [
             self.notice_timer.dismiss_at,

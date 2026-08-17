@@ -12,7 +12,7 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::app::DesktopApp;
-use crate::reader::{ReaderFramePlan, ReaderPageTexture};
+use crate::reader::{ReaderFramePlan, ReaderPageTexture, ReaderScene};
 
 struct PageTarget {
     _texture: wgpu::Texture,
@@ -358,15 +358,37 @@ impl GpuState {
 
     fn render_reader_scene(
         &mut self,
-        scene: &Scene,
+        scene: &ReaderScene,
         plan: ReaderFramePlan,
         pixels_per_point: f32,
     ) -> Result<(), String> {
+        // Vello 0.10 can still omit a previously resolved ImageData on subsequent
+        // render_to_texture calls (linebender/vello#1809). Explicitly marking
+        // every image referenced by this scene dirty makes the persistent atlas
+        // re-upload those pixels before the scene is replayed.
+        if scene.refresh_image_atlas {
+            #[cfg(debug_assertions)]
+            if !scene.images.is_empty() {
+                crate::diagnostics::log(
+                    "render.reader_images",
+                    &[
+                        crate::diagnostics::Field::Text("action", "refresh_atlas"),
+                        crate::diagnostics::Field::Usize("count", scene.images.len()),
+                    ],
+                );
+            }
+            for image in scene.images.iter() {
+                self.vello_renderer.mark_override_image_dirty(image);
+            }
+        }
         let Some(target) = self.page_target.as_mut() else {
             return Ok(());
         };
         let mut physical_scene = Scene::new();
-        physical_scene.append(scene, Some(Affine::scale(f64::from(pixels_per_point))));
+        physical_scene.append(
+            &scene.scene,
+            Some(Affine::scale(f64::from(pixels_per_point))),
+        );
         self.vello_renderer
             .render_to_texture(
                 &self.device,

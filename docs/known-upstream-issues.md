@@ -1,14 +1,68 @@
 # 核心依赖已知问题
 
-- 最近更新：2026-08-12
-- 记录范围：已经在 Torto 中复现、确认与上游依赖或 Windows 图形栈交互有关，并需要本地兼容代码的问题
+- 最近更新：2026-08-17
+- 记录范围：已经在 Torto 中复现、确认与上游依赖、Windows 图形栈或渲染帧时序有关，并需要本地兼容代码或长期回归检查的问题
 
 依赖升级时应逐项检查本文。只有在上游修复已经进入当前版本，并且移除本地兼容代码后相关回归测试仍能通过，才删除对应兼容代码和本文条目。
 
+## Vello：重复渲染同一 `ImageData` 时图片只在首次出现
+
+- 影响版本：`vello 0.9.0`、`vello 0.10.0`；0.10 发布说明未包含对应修复
+- 上游状态：截至 2026-08-17 仍为 Open
+- 上游问题：[linebender/vello#1809](https://github.com/linebender/vello/issues/1809)
+- 本地位置：`apps/desktop/src/platform/gpu.rs` 中的 `render_reader_scene`，以及 `apps/desktop/src/reader/render/scene.rs` 中的 `ReaderScene`
+- 回归测试：专注模式图片往返切换仍需人工检查；开发环境可检查 `render.reader_images action=refresh_atlas` 日志
+
+### 表现
+
+在专注模式下从包含图片的段落切换到下一段，再返回原段落时，图片可能不再显示；但点击图片后，放大预览仍能正常显示。这说明图片数据和命中区域仍存在，缺失发生在 Vello 的 GPU 图片缓存重放阶段。
+
+### 原因
+
+Vello 的持久图片图集会缓存 `ImageData` 与 GPU 纹理上传状态。上游 #1809 记录了同一个 `ImageData` 被后续场景再次使用时，没有错误但只在第一次渲染中出现的行为。Torto 的专注模式会复用已解析的图片数据并反复重建当前段落场景，因此能够稳定触发同一类缓存生命周期问题。
+
+### 当前规避方案
+
+`ReaderScene` 同时携带当前场景引用的图片数据以及是否需要刷新图片图集的标记。专注模式重新绘制图片场景时，GPU 层在调用 `render_to_texture` 前对这些图片执行 `mark_override_image_dirty`，强制 Vello 重新上传对应图集内容；普通无图片场景不做额外处理。
+
+### 升级检查
+
+1. 检查 #1809 是否关闭，并确认修复进入的 Vello 版本；不能只根据新版中“释放图片 GPU 资源”的改动判断问题已经解决。
+2. 升级 Vello 后临时移除 `mark_override_image_dirty` 和 `ReaderScene::refresh_image_atlas` 路径。
+3. 在同一张图片上连续执行“下一段 → 上一段”、跨小节往返以及退出后重新进入，确认正文图片和放大预览始终一致。
+4. 检查长时间阅读时的 GPU 内存占用，确认上游修复没有以保留所有图片纹理为代价。
+5. 全部通过后删除本地图片图集刷新兼容逻辑，并删除本条记录。
+
+## Torto/egui：专注模式滚轮跨小节时短暂闪现目标小节首图
+
+- 影响版本：Torto `0.3.2` 开发版的专注模式
+- 上游状态：本地输入处理时序缺陷，不需要等待 egui 或 Vello 上游修复；已于 2026-08-17 在工作区修复
+- 本地位置：`apps/desktop/src/reader/egui_view.rs` 中的 `focus_wheel_interaction`，`apps/desktop/src/reader/ui_controller.rs` 中的 `apply_pending_focus_wheel_turn`
+- 回归测试：目前需要人工检查滚轮与方向键跨小节的一致性
+
+### 表现
+
+使用方向键跨小节时页面定位正常；使用鼠标滚轮从后一小节返回前一小节末尾时，会先短暂显示目标小节的第一张图片，再定位到最后一个可激活单元。例如从 `Appendix: Dealing with Pests` 向上滚回 `Tillandsia` 末尾时，会闪现 `Tillandsia` 的第一张大图。
+
+### 原因
+
+方向键在 `DesktopReader::ui` 开始阶段处理，正文绘制前就完成阅读单元切换、焦点单元重建和末尾定位。鼠标滚轮原本在正文 viewport 的回调尾部直接切换小节，此时旧布局和纹理已经完成绘制；GPU 会先观察到新的阅读单元，但新的焦点单元和目标偏移要到下一帧才重建，因此暴露了一帧目标小节的默认起始位置。
+
+### 当前修复
+
+滚轮达到翻页阈值后不再在 viewport 回调中直接切换，而是记录 `pending_focus_wheel_turn` 并请求下一帧重绘。下一帧在布局和正文绘制之前调用 `apply_pending_focus_wheel_turn`，使滚轮与方向键遵循相同的状态更新顺序，再进入目标小节末尾。
+
+### 回归检查
+
+1. 分别用滚轮和方向键执行“下一小节”和“上一小节”，确认两种输入最终激活同一个单元。
+2. 从后一小节向上滚回包含首图的前一小节末尾，录屏逐帧检查是否仍出现首图闪帧。
+3. 检查高于视口的长段落，确认滚轮仍会先在段落内部滚动，到达边界后才跨单元。
+4. 打开目录、带历史数据的段落聊天框和图片预览，确认滚轮仍只作用于当前前景控件。
+
 ## winit/wgpu/Windows：原生全屏切换及输入期间出现黑帧
 
-- 影响版本：`winit 0.30.13`、`wgpu 29.0.3`，Windows 10/11
-- 上游状态：截至 2026-08-12，尚未找到与“无边框全屏 + IME/文本输入”完全一致的上游 issue；现象涉及 winit 的 Win32 全屏窗口状态、DWM 和 wgpu flip-model surface 的组合行为
+- 影响版本：`winit 0.30.13`、`wgpu 29.0.4`（由清单中的 `29.0.3` 版本要求解析得到），Windows 10/11
+- 上游状态：截至 2026-08-17，尚未找到与“无边框全屏 + IME/文本输入”完全一致的上游 issue；现象涉及 winit 的 Win32 全屏窗口状态、DWM 和 wgpu flip-model surface 的组合行为
 - 相关上游讨论：[rust-windowing/winit#3730](https://github.com/rust-windowing/winit/issues/3730)（Windows 窗口装饰控制）；surface 在 Windows 合成状态变化时的相近问题另见 [gfx-rs/wgpu#5374](https://github.com/gfx-rs/wgpu/issues/5374)
 - 本地位置：`apps/desktop/src/platform/application.rs` 中的 `toggle_fullscreen`、`compositor_fullscreen_bounds`，以及 `apps/desktop/src/platform/gpu.rs` 中的 `acquire_surface_frame` 和 `render`
 - 回归测试：`compositor_fullscreen_overscans_the_monitor_by_one_pixel`；输入与显卡合成行为仍需人工检查
@@ -35,8 +89,8 @@ Windows 不再调用原生 `set_fullscreen`，而是保存原窗口位置、尺�
 
 ## wgpu/Windows：窗口放大时新暴露区域短暂显示黑色
 
-- 影响版本：`wgpu 29.0.3`，Windows 10/11 的 DX12/Vulkan surface
-- 上游状态：截至 2026-08-12 仍为 Open
+- 影响版本：`wgpu 29.0.4`（由清单中的 `29.0.3` 版本要求解析得到），Windows 10/11 的 DX12/Vulkan surface
+- 上游状态：截至 2026-08-17 仍为 Open
 - 上游问题：[gfx-rs/wgpu#5374](https://github.com/gfx-rs/wgpu/issues/5374)；相近历史问题见该 issue 引用的 [#3868](https://github.com/gfx-rs/wgpu/issues/3868)、[#3756](https://github.com/gfx-rs/wgpu/issues/3756) 和 [#1168](https://github.com/gfx-rs/wgpu/issues/1168)
 - 本地位置：`apps/desktop/src/platform/application.rs` 中的 `render_window_state`、`WindowEvent::Resized` 和 `WindowEvent::ScaleFactorChanged`，`apps/desktop/src/platform/gpu.rs` 中的 `resize` 和 `render`，以及 `crates/windows-window-background`
 - 回归测试：surface 尺寸和背景色逻辑由单元测试覆盖；DWM 呈现时序仍需人工检查
@@ -63,8 +117,8 @@ Windows 的 DWM 可以在应用排队的 `RedrawRequested` 得到处理之前，
 
 ## Parley：两端对齐文本的选区宽度不足
 
-- 影响版本：`parley 0.10.0`
-- 上游状态：截至 2026-08-01 仍为 Open
+- 影响版本：`parley 0.11.1`
+- 上游状态：截至 2026-08-17 仍为 Open
 - 上游问题：[linebender/parley#396](https://github.com/linebender/parley/issues/396)
 - 本地位置：`crates/renderer/src/lib.rs` 中的 `ShapedTextRegion::selection_rects`
 - 回归测试：`selection_covers_the_visual_width_of_justified_middle_lines`
@@ -91,8 +145,8 @@ Parley 会把两端对齐产生的额外空白宽度加入字簇 advance，但 `
 
 ## egui/epaint：全局羽化导致紧凑圆角控件出现角线
 
-- 影响版本：`egui 0.36.0`
-- 上游状态：截至 2026-08-05，相关问题仍为 Open；上游尚无与 Torto 紧凑图标按钮完全相同的最小复现
+- 影响版本：`egui 0.36.1`
+- 上游状态：截至 2026-08-17，相关问题仍为 Open；上游尚无与 Torto 紧凑图标按钮完全相同的最小复现
 - 相关上游问题：[emilk/egui#2735](https://github.com/emilk/egui/issues/2735)、[emilk/egui#7424](https://github.com/emilk/egui/issues/7424)
 - 本地位置：`apps/desktop/src/ui/mod.rs` 中的 `configure_tessellation`、`painted_icon_button` 和 `paint_compact_rounded_background`
 - 回归测试：`rounded_controls_keep_pixel_snapping_and_antialiasing`、`compact_rounding_contains_the_feathering_fringe`
@@ -119,8 +173,8 @@ epaint 的羽化由全局 tessellation 选项控制，当前不能针对单个 s
 
 ## egui_commonmark/egui：跨组件多行选区覆盖行首内容
 
-- 影响版本：`egui_commonmark 0.24.0`、`egui 0.36.0`
-- 上游状态：截至 2026-08-05 仍为 Open；`egui_commonmark 0.24.0` 仍以 `egui 0.35` 发布，Torto 暂时在本地适配到 `egui 0.36`
+- 影响版本：`egui_commonmark 0.25.0`、`egui 0.36.1`
+- 上游状态：截至 2026-08-17 仍为 Open；`egui_commonmark 0.25.0` 已正式支持 `egui 0.36`，但多组件选区问题尚未修复
 - 上游问题：[lampsitter/egui_commonmark#80](https://github.com/lampsitter/egui_commonmark/issues/80)；布局限制另见 [emilk/egui#4378](https://github.com/emilk/egui/issues/4378)
 - 本地位置：`third_party/egui_commonmark_backend/src/elements.rs` 中的 `newline`，以及 `apps/desktop/src/reader/chat_markdown.rs` 中的 `show_markdown_table`
 - 回归测试：`markdown_table_row_height_follows_the_tallest_wrapped_cell`；列表选区需人工检查
@@ -147,8 +201,8 @@ egui 的多组件文字选择按各个 `Label` 独立生成选区网格，无法
 
 ## egui：滚动时离屏端点导致跨组件文字选区被清空
 
-- 影响版本：`egui 0.36.0`
-- 上游状态：截至 2026-08-05，上游当前源码仍包含该清理逻辑，尚未找到专门跟踪此行为的 issue
+- 影响版本：`egui 0.36.1`
+- 上游状态：截至 2026-08-17，egui 0.36.1 源码仍包含该清理逻辑，尚未找到专门跟踪此行为的 issue
 - 上游代码：[`LabelSelectionState::on_end_pass`](https://github.com/emilk/egui/blob/0.36.0/crates/egui/src/text_selection/label_text_selection.rs)
 - 本地位置：`third_party/egui/src/widgets/label.rs` 中的 `Label::ui`
 
@@ -162,7 +216,7 @@ egui 的多组件文字选择按各个 `Label` 独立生成选区网格，无法
 
 ### 当前规避方案
 
-本地接管 `egui 0.36.0`：只要仍存在跨标签选区，`Label::ui` 就继续将裁剪区外的可选择标签提交给选区状态。标签和高亮仍受原有 painter 裁剪，不会绘制到滚动视口之外；已完成的选区在松开鼠标后也能保留并复制。
+本地接管 `egui 0.36.1`：只要仍存在跨标签选区，`Label::ui` 就继续将裁剪区外的可选择标签提交给选区状态。标签和高亮仍受原有 painter 裁剪，不会绘制到滚动视口之外；已完成的选区在松开鼠标后也能保留并复制。
 
 ### 升级检查
 
@@ -174,8 +228,8 @@ egui 的多组件文字选择按各个 `Label` 独立生成选区网格，无法
 
 ## egui：`ScrollArea::show_rows` 在列表底部抖动
 
-- 影响版本：`egui 0.36.0`
-- 上游状态：截至 2026-08-05 仍为 Open
+- 影响版本：`egui 0.36.1`
+- 上游状态：截至 2026-08-17 仍为 Open
 - 上游问题：[emilk/egui#1787](https://github.com/emilk/egui/issues/1787)；程序化定位限制另见 [emilk/egui#3268](https://github.com/emilk/egui/issues/3268)
 - 本地位置：`apps/desktop/src/reader/egui_view.rs` 中的 `stable_virtual_row_range` 和 `DesktopReader::toc`
 - 回归测试：`virtual_toc_range_does_not_backfill_rows_at_the_bottom_boundary`
@@ -202,8 +256,8 @@ egui 的多组件文字选择按各个 `Label` 独立生成选区网格，无法
 
 ## egui：合法布局触发控件 ID/矩形变化误报
 
-- 影响版本：`egui 0.36.0`
-- 上游状态：截至 2026-08-05 两项问题仍为 Open
+- 影响版本：`egui 0.36.1`
+- 上游状态：截至 2026-08-17 两项问题仍为 Open
 - 上游问题：[emilk/egui#8343](https://github.com/emilk/egui/issues/8343)、[emilk/egui#8092](https://github.com/emilk/egui/issues/8092)
 - 本地位置：`apps/desktop/src/ui/mod.rs` 中的 `configure`
 
@@ -229,7 +283,7 @@ egui 的调试检查只看到相同屏幕矩形在不同 pass 或帧中对应了
 
 ## egui：显式高度 `TextEdit` 的垂直对齐与感知区域问题
 
-- 影响版本：`egui 0.36.0`
+- 影响版本：`egui 0.36.1`
 - 上游状态：默认顶部对齐仍属于当前 API 行为；相关感知区域 bug 已由上游修复，0.36 另行修复了 hint 文本未遵循水平/垂直对齐的问题
 - 上游问题：[emilk/egui#7433](https://github.com/emilk/egui/issues/7433)、修复 [emilk/egui#7436](https://github.com/emilk/egui/pull/7436)；hint 对齐修复 [emilk/egui#8332](https://github.com/emilk/egui/pull/8332)
 - 本地位置：`apps/desktop/src/reader/egui_view.rs` 中的 `pdf_toc_editor_table`、`centered_assistant_text_edit` 和搜索输入框，以及 `apps/desktop/src/shelf/mod.rs` 中的 `shelf_search_field`

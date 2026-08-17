@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.95"
 name = "egui_commonmark"
-version = "0.24.0"
+version = "0.25.0"
 authors = ["Erlend Walstad"]
 build = false
 include = [
@@ -79,11 +79,11 @@ version = "0.36.0"
 default-features = false
 
 [dependencies.egui_commonmark_backend]
-version = "0.24.0"
+version = "0.25.0"
 default-features = false
 
 [dependencies.egui_commonmark_macros]
-version = "0.24.0"
+version = "0.25.0"
 optional = true
 default-features = false
 
@@ -106,7 +106,7 @@ features = [
 default-features = false
 
 [dev-dependencies.egui_commonmark_macros]
-version = "0.24.0"
+version = "0.25.0"
 default-features = false
 
 [dev-dependencies.image]

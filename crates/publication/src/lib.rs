@@ -432,6 +432,10 @@ pub struct TableRow {
 pub struct TableCell {
     /// Cell content represented by the same selectable text IR used by paragraphs.
     pub text: TextBlock,
+    /// Authored horizontal alignment inherited by the cell or declared by its
+    /// flattened block content. `None` lets the reader apply its table default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_alignment: Option<TextAlignment>,
     /// Number of grid columns occupied by this cell.
     pub column_span: u16,
     /// Number of grid rows occupied by this cell.
