@@ -349,6 +349,8 @@ pub struct SectionAnchor {
 pub enum Block {
     /// Reflowable text content.
     Text(TextBlock),
+    /// Quoted prose and its optional attribution, kept as one semantic unit.
+    Quote(QuoteBlock),
     /// Structured rows and cells from an authored table.
     Table(TableBlock),
     /// Raster or vector image resource.
@@ -361,6 +363,17 @@ pub enum Block {
     PageBreak,
 }
 
+/// A semantic quotation whose source remains attached to the quoted prose.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuoteBlock {
+    /// One or more paragraphs that form the quotation body.
+    pub body: Vec<TextBlock>,
+    /// Optional source, credit, or attribution rendered after the body.
+    pub attribution: Option<TextBlock>,
+    /// Stable range spanning the complete authored quote container.
+    pub source: Option<SourceRange>,
+}
+
 /// Semantic role of a text block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextBlockKind {
@@ -370,6 +383,8 @@ pub enum TextBlockKind {
     Heading(u8),
     /// Quoted prose.
     Blockquote,
+    /// Source or credit attached to quoted prose.
+    QuoteAttribution,
     /// Preformatted text.
     Preformatted,
     /// Text semantically attached to an authored figure.
@@ -383,6 +398,10 @@ pub enum TextBlockKind {
         /// Zero-based nesting depth within the containing list.
         #[serde(default)]
         depth: u8,
+        /// Whether this item owns a visible marker. Some EPUB outlines encode
+        /// nested items as marker-less paragraphs while retaining list depth.
+        #[serde(default = "default_list_marker_visible")]
+        marker_visible: bool,
     },
     /// A term introduced by an HTML definition list.
     DefinitionTerm {
@@ -396,6 +415,10 @@ pub enum TextBlockKind {
         #[serde(default)]
         depth: u8,
     },
+}
+
+const fn default_list_marker_visible() -> bool {
+    true
 }
 
 /// A block of styled inline content.

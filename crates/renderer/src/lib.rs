@@ -4,13 +4,13 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use anyrender::{Glyph, NormalizedCoord, PaintScene};
-use kurbo::{Affine, BezPath, Line, Rect, Shape, Stroke, Vec2};
+use kurbo::{Affine, BezPath, Line, Rect, RoundedRect, Shape, Stroke, Vec2};
 use parley::editing::{Cursor, Selection};
 use parley::layout::{Affinity, BreakReason, Cluster, ClusterSide};
 use parley::{FontData, Layout, PositionedLayoutItem};
 use peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
 use rebook_layout::{
-    ImagePlacement, PageItem, PageLayout, TablePlacement, TextBrush, TextPlacement,
+    ImagePlacement, PageItem, PageLayout, QuotePlacement, TablePlacement, TextBrush, TextPlacement,
 };
 use rebook_publication::{Rgba, SourceAnchor, SourceRange, TextBaseline};
 
@@ -54,9 +54,15 @@ pub struct PageDisplayList {
     commands: Vec<DisplayCommand>,
     text_regions: Vec<TextRegion>,
     table_regions: Vec<TableRegion>,
+    quote_regions: Vec<QuoteRegion>,
 }
 
 struct TableRegion {
+    bounds: Rect,
+    sources: Vec<SourceRange>,
+}
+
+struct QuoteRegion {
     bounds: Rect,
     sources: Vec<SourceRange>,
 }
@@ -124,6 +130,7 @@ impl PageDisplayList {
                 DisplayCommand::Image(command) => Some(command.bounds),
                 DisplayCommand::Glyphs(_)
                 | DisplayCommand::FillRect(_)
+                | DisplayCommand::FillRoundedRect(_)
                 | DisplayCommand::Rule(_) => None,
             })
             .reduce(|bounds, next| bounds.union(next))
@@ -137,9 +144,10 @@ impl PageDisplayList {
     pub fn image_data(&self) -> impl Iterator<Item = &ImageData> {
         self.commands.iter().filter_map(|command| match command {
             DisplayCommand::Image(command) => Some(&command.image.image),
-            DisplayCommand::Glyphs(_) | DisplayCommand::FillRect(_) | DisplayCommand::Rule(_) => {
-                None
-            }
+            DisplayCommand::Glyphs(_)
+            | DisplayCommand::FillRect(_)
+            | DisplayCommand::FillRoundedRect(_)
+            | DisplayCommand::Rule(_) => None,
         })
     }
 
@@ -163,6 +171,7 @@ impl PageDisplayList {
                 DisplayCommand::Glyphs(_)
                 | DisplayCommand::Image(_)
                 | DisplayCommand::FillRect(_)
+                | DisplayCommand::FillRoundedRect(_)
                 | DisplayCommand::Rule(_) => None,
             })
     }
@@ -183,6 +192,7 @@ impl PageDisplayList {
                 DisplayCommand::Glyphs(_)
                 | DisplayCommand::Image(_)
                 | DisplayCommand::FillRect(_)
+                | DisplayCommand::FillRoundedRect(_)
                 | DisplayCommand::Rule(_) => None,
             })
             .collect()
@@ -348,6 +358,20 @@ impl PageDisplayList {
             .collect()
     }
 
+    /// Resolves quote child ranges to their complete semantic card bounds.
+    pub fn source_quote_bounds(&self, ranges: &[SourceRange]) -> Vec<Rect> {
+        self.quote_regions
+            .iter()
+            .filter(|quote| {
+                quote
+                    .sources
+                    .iter()
+                    .any(|source| ranges.iter().any(|range| range == source))
+            })
+            .map(|quote| quote.bounds)
+            .collect()
+    }
+
     /// Returns the union of text, image, and table geometry belonging to the
     /// supplied semantic source ranges.
     pub fn source_content_bounds(&self, ranges: &[SourceRange]) -> Option<Rect> {
@@ -355,6 +379,7 @@ impl PageDisplayList {
             .into_iter()
             .chain(self.image_source_rects(ranges))
             .chain(self.source_table_bounds(ranges))
+            .chain(self.source_quote_bounds(ranges))
             .reduce(|bounds, next| bounds.union(next))
     }
 
@@ -1164,6 +1189,7 @@ enum DisplayCommand {
     Glyphs(GlyphCommand),
     Image(ImageCommand),
     FillRect(FillRectCommand),
+    FillRoundedRect(FillRoundedRectCommand),
     Rule(RuleCommand),
 }
 
@@ -1187,6 +1213,13 @@ impl DisplayCommand {
                 scene.draw_image(command.image.as_ref(), page_transform * command.transform);
             }
             Self::FillRect(command) => scene.fill(
+                Fill::NonZero,
+                page_transform,
+                command.color,
+                None,
+                &command.rect,
+            ),
+            Self::FillRoundedRect(command) => scene.fill(
                 Fill::NonZero,
                 page_transform,
                 command.color,
@@ -1230,6 +1263,11 @@ struct FillRectCommand {
     color: Color,
 }
 
+struct FillRoundedRectCommand {
+    rect: RoundedRect,
+    color: Color,
+}
+
 struct RuleCommand {
     start: (f64, f64),
     end: (f64, f64),
@@ -1252,6 +1290,7 @@ impl DisplayListCompiler {
         let mut commands = Vec::new();
         let mut text_regions = Vec::new();
         let mut table_regions = Vec::new();
+        let mut quote_regions = Vec::new();
         for item in &page.items {
             match item {
                 PageItem::Text(text) => {
@@ -1259,6 +1298,21 @@ impl DisplayListCompiler {
                         text_regions.push(region);
                     }
                     compile_text_commands(&mut commands, text);
+                }
+                PageItem::Quote(quote) => {
+                    let bounds = quote_bounds(quote);
+                    quote_regions.push(QuoteRegion {
+                        bounds,
+                        sources: quote.sources.clone(),
+                    });
+                    commands.push(DisplayCommand::FillRoundedRect(FillRoundedRectCommand {
+                        rect: RoundedRect::from_rect(bounds, 7.0),
+                        color: color(quote.fill),
+                    }));
+                    commands.push(DisplayCommand::FillRect(FillRectCommand {
+                        rect: Rect::new(bounds.x0, bounds.y0, bounds.x0 + 3.0, bounds.y1),
+                        color: color(quote.accent),
+                    }));
                 }
                 PageItem::Table(table) => {
                     if let Some(region) = table_region(table) {
@@ -1338,8 +1392,18 @@ impl DisplayListCompiler {
             commands,
             text_regions,
             table_regions,
+            quote_regions,
         }
     }
+}
+
+fn quote_bounds(quote: &QuotePlacement) -> Rect {
+    Rect::new(
+        f64::from(quote.x),
+        f64::from(quote.y),
+        f64::from(quote.x + quote.width),
+        f64::from(quote.y + quote.height),
+    )
 }
 
 fn table_region(table: &TablePlacement) -> Option<TableRegion> {
@@ -1417,6 +1481,7 @@ fn page_item_top(item: &PageItem) -> Option<f32> {
             .layout
             .get(text.lines.start)
             .map(|line| text.origin_y + line.metrics().block_min_coord),
+        PageItem::Quote(quote) => Some(quote.y),
         PageItem::Image(image) => Some(image.y),
         PageItem::Table(table) => Some(table.y),
         PageItem::Separator(separator) => Some(separator.y),
@@ -1431,6 +1496,7 @@ fn page_item_bottom(item: &PageItem) -> Option<f32> {
             .checked_sub(1)
             .and_then(|line| text.layout.get(line))
             .map(|line| text.origin_y + line.metrics().block_max_coord),
+        PageItem::Quote(quote) => Some(quote.y + quote.height),
         PageItem::Image(image) => Some(image.y + image.height),
         PageItem::Table(table) => Some(table.y + table.height),
         PageItem::Separator(separator) => Some(separator.y + 1.0),

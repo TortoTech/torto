@@ -688,6 +688,18 @@ pub(crate) fn dialog_action_button(ui: &mut Ui, label: &str, primary: bool) -> R
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Destructive action used in modal footers. It deliberately shares the same
+/// geometry as the regular dialog actions while using the theme's error color.
+pub(crate) fn dialog_danger_button(ui: &mut Ui, label: &str) -> Response {
+    let button = egui::Button::new(RichText::new(label).color(Color32::WHITE))
+        .min_size(Vec2::new(68.0, 32.0))
+        .corner_radius(6)
+        .fill(palette().error)
+        .stroke(Stroke::NONE);
+    ui.add(button)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 pub(crate) fn decode_color_image(bytes: &[u8]) -> Result<ColorImage, image::ImageError> {
     let image = image::load_from_memory(bytes)?.to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
@@ -795,13 +807,16 @@ mod tests {
         let ctx = egui::Context::default();
         let mut primary = Rect::NOTHING;
         let mut secondary = Rect::NOTHING;
+        let mut danger = Rect::NOTHING;
         ctx.run_ui(egui::RawInput::default(), |ui| {
             primary = dialog_action_button(ui, "Update", true).rect;
             secondary = dialog_action_button(ui, "Later", false).rect;
+            danger = dialog_danger_button(ui, "Remove").rect;
         })
         .drop_without_applying_deltas();
 
         assert_eq!(primary.size(), Vec2::new(68.0, 32.0));
         assert_eq!(secondary.size(), Vec2::new(68.0, 32.0));
+        assert_eq!(danger.size(), Vec2::new(68.0, 32.0));
     }
 }

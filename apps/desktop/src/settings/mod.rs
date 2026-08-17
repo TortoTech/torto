@@ -362,7 +362,6 @@ enum SettingsTab {
     Ai,
     AiChat,
     Ocr,
-    Semantic,
     Translation,
     Cloud,
     About,

@@ -17,7 +17,8 @@ use crate::sync::{
     format_error_chain, run_sync,
 };
 use crate::ui::{
-    Icon, ToastKind, decode_color_image, icon, icon_button, paint_icon, palette, show_toast,
+    Icon, ToastKind, decode_color_image, dialog_action_button, dialog_danger_button, icon,
+    icon_button, paint_icon, palette, show_toast,
 };
 
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
@@ -82,6 +83,7 @@ pub(crate) struct ShelfFeature {
     language: AppLanguage,
     settings_requested: bool,
     cover_textures: HashMap<String, TextureHandle>,
+    read_activity: HashMap<String, u64>,
 }
 
 struct ShelfState {
@@ -124,15 +126,6 @@ struct ShelfRemoveConfirmation {
 }
 
 impl ShelfFeature {
-    pub(crate) fn book_path(&self, book_id: &str) -> Option<PathBuf> {
-        self.shelf
-            .library
-            .books()
-            .iter()
-            .find(|book| book.id == book_id)
-            .map(|book| book.path.clone())
-    }
-
     pub(crate) fn update_book_metadata(
         &mut self,
         book_id: &str,
@@ -208,7 +201,9 @@ impl ShelfFeature {
             language,
             settings_requested: false,
             cover_textures: HashMap::new(),
+            read_activity: HashMap::new(),
         };
+        feature.refresh_read_activity();
         if can_start_sync {
             feature.start_sync();
         }
@@ -350,7 +345,22 @@ impl ShelfFeature {
         if let Ok(language) = preferences::load_app_language() {
             self.language = language;
         }
+        self.refresh_read_activity();
         self.start_sync();
+    }
+
+    fn refresh_read_activity(&mut self) {
+        let Some(store) = &self.local_store else {
+            self.read_activity.clear();
+            return;
+        };
+        match store.progress_activity_times() {
+            Ok(activity_times) => self.read_activity = activity_times,
+            Err(error) => {
+                tracing::warn!(%error, "failed to load shelf reading activity");
+                self.read_activity.clear();
+            }
+        }
     }
 
     fn start_sync(&mut self) {
@@ -517,6 +527,7 @@ impl ShelfFeature {
         if self.sync.task.complete(message.id).is_none() {
             return;
         }
+        self.refresh_read_activity();
         match message.result {
             Ok(report) => {
                 if let Some(error) = self.sync.import_error.take() {
@@ -636,7 +647,7 @@ impl ShelfFeature {
                 ui.add_space(26.0);
 
                 let query = self.shelf.query.trim().to_lowercase();
-                let books: Vec<LibraryBook> = self
+                let mut books: Vec<LibraryBook> = self
                     .shelf
                     .library
                     .books()
@@ -644,6 +655,7 @@ impl ShelfFeature {
                     .filter(|book| book_matches_query(book, &query))
                     .cloned()
                     .collect();
+                sort_shelf_books(&mut books, &self.read_activity);
                 if books.is_empty() {
                     self.empty_shelf(ui, query.is_empty());
                 } else {
@@ -882,27 +894,71 @@ impl ShelfFeature {
         }
         let confirmation = self.shelf.remove_confirmation.clone();
         if let Some(confirmation) = confirmation {
-            egui::Window::new(self.language.text("移除书籍", "Remove book"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            let mut cancel = false;
+            let mut remove = false;
+            let screen_width = ctx.content_rect().width();
+            let modal_width = (screen_width - 48.0).clamp(280.0, 380.0).min(screen_width);
+            let modal = egui::Modal::new(egui::Id::new("shelf-remove-book-modal"))
+                .backdrop_color(Color32::BLACK.gamma_multiply(0.42))
+                .frame(
+                    egui::Frame::new()
+                        .fill(palette().surface)
+                        .stroke(egui::Stroke::new(1.0, palette().border))
+                        .corner_radius(12)
+                        .inner_margin(egui::Margin::symmetric(22, 18)),
+                )
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "{}\n{}",
-                        self.language
-                            .text("只会移除本地副本。", "Only the local copy will be removed."),
-                        confirmation.title
-                    ));
-                    ui.horizontal(|ui| {
-                        if ui.button(self.language.text("取消", "Cancel")).clicked() {
-                            self.shelf.remove_confirmation = None;
+                    ui.set_width(modal_width);
+                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                    ui.label(
+                        RichText::new(self.language.text("移除书籍", "Remove book"))
+                            .size(crate::ui::scaled_font_size(17.0))
+                            .strong()
+                            .color(palette().text),
+                    );
+                    ui.label(
+                        RichText::new(self.language.text(
+                            "只会移除这台设备上的本地副本，不会删除云端文件。",
+                            "This only removes the local copy from this device. Cloud files are not deleted.",
+                        ))
+                        .size(crate::ui::scaled_font_size(12.0))
+                        .color(palette().muted),
+                    );
+                    ui.add_space(4.0);
+                    egui::Frame::new()
+                        .fill(palette().surface_muted)
+                        .stroke(egui::Stroke::new(1.0, palette().border))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_width((modal_width - 24.0).max(1.0));
+                            ui.label(
+                                RichText::new(&confirmation.title)
+                                    .size(crate::ui::scaled_font_size(13.0))
+                                    .strong()
+                                    .color(palette().text),
+                            );
+                        });
+                    ui.add_space(8.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if dialog_danger_button(ui, self.language.text("移除", "Remove")).clicked()
+                        {
+                            remove = true;
                         }
-                        if ui.button(self.language.text("移除", "Remove")).clicked() {
-                            self.shelf.remove_confirmation = None;
-                            self.remove_book(&confirmation.id);
+                        if dialog_action_button(ui, self.language.text("取消", "Cancel"), false)
+                            .clicked()
+                        {
+                            cancel = true;
                         }
                     });
                 });
+            cancel |= modal.should_close();
+            if remove {
+                self.shelf.remove_confirmation = None;
+                self.remove_book(&confirmation.id);
+            } else if cancel {
+                self.shelf.remove_confirmation = None;
+            }
         }
     }
 
@@ -1039,4 +1095,70 @@ fn book_matches_query(book: &LibraryBook, query: &str) -> bool {
             .authors
             .iter()
             .any(|author| author.to_lowercase().contains(query))
+}
+
+fn sort_shelf_books(books: &mut [LibraryBook], read_activity: &HashMap<String, u64>) {
+    books.sort_by(|left, right| {
+        match (read_activity.get(&left.id), read_activity.get(&right.id)) {
+            (Some(left_read_at), Some(right_read_at)) => right_read_at
+                .cmp(left_read_at)
+                .then_with(|| right.added_at.cmp(&left.added_at)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => right.added_at.cmp(&left.added_at),
+        }
+        .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn book(id: &str, added_at: u64) -> LibraryBook {
+        LibraryBook {
+            id: id.into(),
+            title: id.into(),
+            authors: Vec::new(),
+            file_name: format!("{id}.epub"),
+            path: PathBuf::from(format!("{id}.epub")),
+            cover_bytes: None,
+            added_at,
+        }
+    }
+
+    #[test]
+    fn read_books_are_sorted_by_latest_activity_before_unread_books() {
+        let mut books = vec![
+            book("unread-new", 400),
+            book("read-old", 100),
+            book("read-new", 1),
+        ];
+        let activity = HashMap::from([("read-old".into(), 10), ("read-new".into(), 20)]);
+
+        sort_shelf_books(&mut books, &activity);
+
+        assert_eq!(
+            books
+                .iter()
+                .map(|book| book.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read-new", "read-old", "unread-new"]
+        );
+    }
+
+    #[test]
+    fn unread_books_are_sorted_by_latest_import_time() {
+        let mut books = vec![book("old", 10), book("new", 30), book("middle", 20)];
+
+        sort_shelf_books(&mut books, &HashMap::new());
+
+        assert_eq!(
+            books
+                .iter()
+                .map(|book| book.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new", "middle", "old"]
+        );
+    }
 }

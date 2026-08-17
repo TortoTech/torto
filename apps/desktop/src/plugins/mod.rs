@@ -19,7 +19,6 @@ use std::path::PathBuf;
 use directories::ProjectDirs;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::persistence::write_json_atomic;
 
@@ -44,7 +43,7 @@ pub(crate) use pdf_ocr::{
 pub(crate) use pdf_toc::{PdfMetadataExtraction, extract_pdf_metadata};
 pub use rewrite::RewriteBookSource;
 pub use search::{BookSearchResult, search_book};
-pub(crate) use search::{section_title, text_block_kind, text_block_text};
+pub(crate) use search::{section_title, text_block_text};
 pub use translation::{BlockTranslation, TranslationBlockInput, TranslationBookSource};
 
 const SETTINGS_FILE: &str = "plugins.json";
@@ -147,30 +146,10 @@ pub struct AiProvider {
     pub api_key: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AiModelKind {
-    #[default]
-    Language,
-    Embedding,
-}
-
-impl AiModelKind {
-    pub(crate) const ALL: [Self; 2] = [Self::Language, Self::Embedding];
-
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Language => "LM",
-            Self::Embedding => "Embedding",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiModelConfig {
     pub id: String,
-    pub kind: AiModelKind,
 }
 
 impl Default for AiModelConfig {
@@ -181,10 +160,7 @@ impl Default for AiModelConfig {
 
 impl AiModelConfig {
     pub(crate) fn language(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            kind: AiModelKind::Language,
-        }
+        Self { id: id.into() }
     }
 }
 
@@ -237,9 +213,6 @@ pub struct PluginSettings {
     pub ocr_enabled: bool,
     pub ocr_provider: String,
     pub ocr_model: String,
-    pub semantic_search_enabled: bool,
-    pub embedding_provider: String,
-    pub embedding_model: String,
     pub pdf_ocr_enabled: bool,
     pub pdf_ocr_reflow_enabled: bool,
     pub pdf_ocr_provider: PdfOcrProviderKind,
@@ -275,9 +248,6 @@ impl Default for PluginSettings {
             ocr_enabled: true,
             ocr_provider: DEFAULT_PROVIDER_ID.into(),
             ocr_model: DEFAULT_MODEL.into(),
-            semantic_search_enabled: false,
-            embedding_provider: DEFAULT_PROVIDER_ID.into(),
-            embedding_model: String::new(),
             pdf_ocr_enabled: false,
             pdf_ocr_reflow_enabled: false,
             pdf_ocr_provider: PdfOcrProviderKind::PaddleOcr,
@@ -328,7 +298,6 @@ impl PluginSettings {
             if let Some(provider) = settings.providers.first() {
                 settings.chat_provider.clone_from(&provider.id);
                 settings.ocr_provider.clone_from(&provider.id);
-                settings.embedding_provider.clone_from(&provider.id);
                 settings.translation_provider.clone_from(&provider.id);
             }
             settings.chat_model.clone_from(&value);
@@ -396,25 +365,12 @@ impl PluginSettings {
             &self.providers,
             &mut self.chat_provider,
             &mut self.chat_model,
-            AiModelKind::Language,
         );
-        normalize_selection(
-            &self.providers,
-            &mut self.ocr_provider,
-            &mut self.ocr_model,
-            AiModelKind::Language,
-        );
-        normalize_selection(
-            &self.providers,
-            &mut self.embedding_provider,
-            &mut self.embedding_model,
-            AiModelKind::Embedding,
-        );
+        normalize_selection(&self.providers, &mut self.ocr_provider, &mut self.ocr_model);
         normalize_selection(
             &self.providers,
             &mut self.translation_provider,
             &mut self.translation_model,
-            AiModelKind::Language,
         );
         self.chat_max_tool_steps = self
             .chat_max_tool_steps
@@ -464,25 +420,12 @@ impl PluginSettings {
             &self.providers,
             &mut self.chat_provider,
             &mut self.chat_model,
-            AiModelKind::Language,
         );
-        normalize_selection(
-            &self.providers,
-            &mut self.ocr_provider,
-            &mut self.ocr_model,
-            AiModelKind::Language,
-        );
-        normalize_selection(
-            &self.providers,
-            &mut self.embedding_provider,
-            &mut self.embedding_model,
-            AiModelKind::Embedding,
-        );
+        normalize_selection(&self.providers, &mut self.ocr_provider, &mut self.ocr_model);
         normalize_selection(
             &self.providers,
             &mut self.translation_provider,
             &mut self.translation_model,
-            AiModelKind::Language,
         );
     }
 
@@ -498,68 +441,25 @@ impl PluginSettings {
             &self.providers,
             &mut self.chat_provider,
             &mut self.chat_model,
-            AiModelKind::Language,
         );
-        normalize_selection(
-            &self.providers,
-            &mut self.ocr_provider,
-            &mut self.ocr_model,
-            AiModelKind::Language,
-        );
-        normalize_selection(
-            &self.providers,
-            &mut self.embedding_provider,
-            &mut self.embedding_model,
-            AiModelKind::Embedding,
-        );
+        normalize_selection(&self.providers, &mut self.ocr_provider, &mut self.ocr_model);
         normalize_selection(
             &self.providers,
             &mut self.translation_provider,
             &mut self.translation_model,
-            AiModelKind::Language,
         );
     }
 
     pub fn chat_endpoint(&self) -> Result<(&AiProvider, &str), String> {
-        self.endpoint(
-            &self.chat_provider,
-            &self.chat_model,
-            AiModelKind::Language,
-            "AI Chat",
-        )
+        self.endpoint(&self.chat_provider, &self.chat_model, "AI Chat")
     }
 
     pub fn ocr_endpoint(&self) -> Result<(&AiProvider, &str), String> {
-        self.endpoint(
-            &self.ocr_provider,
-            &self.ocr_model,
-            AiModelKind::Language,
-            "OCR",
-        )
-    }
-
-    pub fn embedding_endpoint(&self) -> Result<(&AiProvider, &AiModelConfig), String> {
-        let (provider, _) = self.endpoint(
-            &self.embedding_provider,
-            &self.embedding_model,
-            AiModelKind::Embedding,
-            "语义搜索",
-        )?;
-        let model = provider
-            .models
-            .iter()
-            .find(|model| model.kind == AiModelKind::Embedding && model.id == self.embedding_model)
-            .ok_or_else(|| "请选择 Embedding 模型".to_owned())?;
-        Ok((provider, model))
+        self.endpoint(&self.ocr_provider, &self.ocr_model, "OCR")
     }
 
     pub fn translation_endpoint(&self) -> Result<(&AiProvider, &str), String> {
-        self.endpoint(
-            &self.translation_provider,
-            &self.translation_model,
-            AiModelKind::Language,
-            "翻译",
-        )
+        self.endpoint(&self.translation_provider, &self.translation_model, "翻译")
     }
 
     pub(crate) fn resolved_target_language(&self, interface_language: &str) -> String {
@@ -575,7 +475,6 @@ impl PluginSettings {
         &'a self,
         provider_id: &str,
         model: &'a str,
-        expected_kind: AiModelKind,
         feature: &str,
     ) -> Result<(&'a AiProvider, &'a str), String> {
         let provider = self
@@ -601,9 +500,10 @@ impl PluginSettings {
         }
         let model = model.trim();
         if model.is_empty()
-            || !provider.models.iter().any(|candidate| {
-                model_supports_feature(candidate, expected_kind) && candidate.id == model
-            })
+            || !provider
+                .models
+                .iter()
+                .any(|candidate| candidate.id == model)
         {
             return Err(format!(
                 "请先在“设置 → {feature}”中选择 {} 下的模型",
@@ -639,7 +539,6 @@ impl PluginSettings {
             }
             self.chat_provider.clone_from(&provider.id);
             self.ocr_provider.clone_from(&provider.id);
-            self.embedding_provider.clone_from(&provider.id);
             self.translation_provider.clone_from(&provider.id);
         }
     }
@@ -738,24 +637,18 @@ fn deserialize_settings(bytes: &[u8]) -> io::Result<PluginSettings> {
             else {
                 continue;
             };
-            if !models.iter().all(serde_json::Value::is_string) {
-                continue;
+            if models.iter().all(serde_json::Value::is_string) {
+                *models = models
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|id| !(provider_id == embedding_provider && *id == embedding_model))
+                    .map(|id| serde_json::json!({ "id": id }))
+                    .collect();
+            } else {
+                models.retain(|model| {
+                    model.get("kind").and_then(serde_json::Value::as_str) != Some("embedding")
+                });
             }
-            *models = models
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(|id| {
-                    let kind = if provider_id == embedding_provider && id == embedding_model {
-                        "embedding"
-                    } else {
-                        "language"
-                    };
-                    json!({
-                        "id": id,
-                        "kind": kind,
-                    })
-                })
-                .collect();
         }
     }
     serde_json::from_value(value).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
@@ -773,7 +666,7 @@ fn normalized_models(models: Vec<AiModelConfig>) -> Vec<AiModelConfig> {
             model.id = model.id.trim().to_owned();
             model
         })
-        .filter(|model| !model.id.is_empty() && seen.insert((model.kind, model.id.clone())))
+        .filter(|model| !model.id.is_empty() && seen.insert(model.id.clone()))
         .collect::<Vec<_>>();
     if models.is_empty() {
         models.push(AiModelConfig::language(DEFAULT_MODEL));
@@ -792,39 +685,27 @@ fn normalize_target_language(value: &str) -> String {
     }
 }
 
-fn normalize_selection(
-    providers: &[AiProvider],
-    provider_id: &mut String,
-    model: &mut String,
-    kind: AiModelKind,
-) {
+fn normalize_selection(providers: &[AiProvider], provider_id: &mut String, model: &mut String) {
     if let Some(provider) = providers
         .iter()
         .find(|provider| provider.id == *provider_id)
         && provider
             .models
             .iter()
-            .any(|candidate| model_supports_feature(candidate, kind) && candidate.id == *model)
+            .any(|candidate| candidate.id == *model)
     {
         return;
     }
-    if let Some((provider, selected)) = providers.iter().find_map(|provider| {
-        provider
-            .models
-            .iter()
-            .find(|candidate| model_supports_feature(candidate, kind))
-            .map(|model| (provider, model))
-    }) {
+    if let Some((provider, selected)) = providers
+        .iter()
+        .find_map(|provider| provider.models.first().map(|model| (provider, model)))
+    {
         provider_id.clone_from(&provider.id);
         model.clone_from(&selected.id);
     } else {
         provider_id.clone_from(&providers[0].id);
         model.clear();
     }
-}
-
-fn model_supports_feature(model: &AiModelConfig, kind: AiModelKind) -> bool {
-    model.kind == kind
 }
 
 fn settings_path() -> io::Result<PathBuf> {
@@ -863,13 +744,42 @@ mod tests {
     }
 
     #[test]
-    fn stored_model_names_are_upgraded_once_to_typed_models() {
+    fn legacy_typed_embedding_settings_are_ignored_and_embedding_models_are_removed() {
         let settings = deserialize_settings(
             br#"{
                 "providers": [{
                     "id": "provider",
                     "name": "Provider",
                     "base_url": "https://example.test/v1",
+                    "models": [
+                        { "id": "chat", "kind": "language" },
+                        { "id": "embed", "kind": "embedding" }
+                    ]
+                }],
+                "chat_provider": "provider",
+                "chat_model": "chat",
+                "semantic_search_enabled": true,
+                "embedding_provider": "provider",
+                "embedding_model": "embed"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings.providers[0].models,
+            vec![AiModelConfig::language("chat")]
+        );
+        let serialized = serde_json::to_string(&settings).unwrap();
+        assert!(!serialized.contains("semantic_search"));
+        assert!(!serialized.contains("embedding"));
+    }
+
+    #[test]
+    fn legacy_string_model_names_drop_the_selected_embedding_model() {
+        let settings = deserialize_settings(
+            br#"{
+                "providers": [{
+                    "id": "provider",
                     "models": ["chat", "embed"]
                 }],
                 "chat_provider": "provider",
@@ -880,8 +790,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(settings.providers[0].models[0].kind, AiModelKind::Language);
-        assert_eq!(settings.providers[0].models[1].kind, AiModelKind::Embedding);
+        assert_eq!(
+            settings.providers[0].models,
+            vec![AiModelConfig::language("chat")]
+        );
     }
 
     #[test]
@@ -942,41 +854,16 @@ mod tests {
         let second = settings.providers[1].id.clone();
         settings.chat_provider.clone_from(&second);
         settings.ocr_provider.clone_from(&second);
-        settings.embedding_provider.clone_from(&second);
         settings.translation_provider = second;
 
         settings.remove_provider(1);
 
         assert_eq!(settings.chat_provider, DEFAULT_PROVIDER_ID);
         assert_eq!(settings.ocr_provider, DEFAULT_PROVIDER_ID);
-        assert_eq!(settings.embedding_provider, DEFAULT_PROVIDER_ID);
         assert_eq!(settings.translation_provider, DEFAULT_PROVIDER_ID);
         assert_eq!(settings.chat_model, DEFAULT_MODEL);
         assert_eq!(settings.ocr_model, DEFAULT_MODEL);
-        assert!(settings.embedding_model.is_empty());
         assert_eq!(settings.translation_model, DEFAULT_MODEL);
-    }
-
-    #[test]
-    fn semantic_search_defaults_off_and_embedding_selection_round_trips() {
-        let mut settings = PluginSettings::default();
-        assert!(!settings.semantic_search_enabled);
-        settings.providers[0].models.push(AiModelConfig {
-            id: "text-embedding-3-small".into(),
-            kind: AiModelKind::Embedding,
-        });
-        settings.providers[0].base_url = "https://api.example.test/v1".into();
-        settings.providers[0].api_key = "secret".into();
-        settings.semantic_search_enabled = true;
-        settings.embedding_model = "text-embedding-3-small".into();
-        settings.normalize();
-
-        let json = serde_json::to_string(&settings).unwrap();
-        let restored: PluginSettings = serde_json::from_str(&json).unwrap();
-        assert!(restored.semantic_search_enabled);
-        assert_eq!(restored.embedding_provider, DEFAULT_PROVIDER_ID);
-        assert_eq!(restored.embedding_model, "text-embedding-3-small");
-        assert!(!json.contains("secret"));
     }
 
     #[test]

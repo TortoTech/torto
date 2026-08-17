@@ -13,7 +13,6 @@ pub(crate) enum UserEvent {
     ShelfSyncProgress(crate::shelf::SyncProgressMessage),
     ShelfSync(crate::shelf::SyncTaskMessage),
     ReaderSearch(crate::reader::SearchTaskMessage),
-    ReaderSemanticIndex(crate::reader::SemanticIndexTaskMessage),
     ReaderChatStream(crate::reader::ChatStreamMessage),
     ReaderChat(crate::reader::ChatTaskMessage),
     ReaderTranslation(crate::reader::TranslationTaskMessage),

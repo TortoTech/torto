@@ -332,9 +332,6 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::ShelfSyncProgress(message) => self.app.update_shelf_sync_progress(message),
             UserEvent::ShelfSync(message) => self.app.complete_shelf_sync(message),
             UserEvent::ReaderSearch(message) => self.app.complete_reader_search(message),
-            UserEvent::ReaderSemanticIndex(message) => {
-                self.app.complete_reader_semantic_index(message);
-            }
             UserEvent::ReaderChatStream(message) => self.app.update_reader_chat_stream(message),
             UserEvent::ReaderChat(message) => self.app.complete_reader_chat(message),
             UserEvent::ReaderTranslation(message) => self.app.complete_reader_translation(message),

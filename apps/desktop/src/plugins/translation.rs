@@ -215,6 +215,23 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
                     });
                 }
             }
+            Block::Quote(quote) => {
+                blocks.extend(
+                    quote
+                        .body
+                        .iter()
+                        .chain(quote.attribution.iter())
+                        .enumerate()
+                        .filter_map(|(segment_index, block)| {
+                            let text = translation_text(block);
+                            (!text.trim().is_empty()).then_some(TranslationBlockInput {
+                                block_index,
+                                segment_index: Some(segment_index),
+                                text,
+                            })
+                        }),
+                );
+            }
             Block::Image(image) if is_pdf => {
                 let Some(layer) = image.text_layer.as_ref() else {
                     continue;
@@ -301,6 +318,7 @@ fn merge_translations(
 fn block_source_range(block: &Block) -> Option<&SourceRange> {
     match block {
         Block::Text(block) => block.source.as_ref(),
+        Block::Quote(block) => block.source.as_ref(),
         Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
         Block::Figure(block) => block.source.as_ref(),
@@ -326,6 +344,15 @@ fn translation_input_source_range(
             .get(segment_index)
             .and_then(|caption| caption.source.as_ref())
             .or(figure.source.as_ref());
+    }
+    if let (Block::Quote(quote), Some(segment_index)) = (block, segment_index) {
+        return quote
+            .body
+            .iter()
+            .chain(quote.attribution.iter())
+            .nth(segment_index)
+            .and_then(|block| block.source.as_ref())
+            .or(quote.source.as_ref());
     }
     block_source_range(block)
 }
@@ -397,6 +424,13 @@ impl BookSource for TranslationBookSource {
                             rendered.push(Block::Text(translated));
                         }
                     }
+                }
+                Block::Quote(quote) if !translation.segments.is_empty() => {
+                    rendered.push(Block::Quote(translated_quote(
+                        quote,
+                        &translation.segments,
+                        mode,
+                    )));
                 }
                 Block::Image(mut image) if image.text_layer.is_some() && is_pdf => {
                     apply_fixed_page_translation(&mut image, &translation.segments);
@@ -505,6 +539,58 @@ fn translated_table(
         }
     }
     table
+}
+
+fn translated_quote(
+    mut quote: rebook_publication::QuoteBlock,
+    translations: &HashMap<usize, String>,
+    mode: TranslationMode,
+) -> rebook_publication::QuoteBlock {
+    let body_len = quote.body.len();
+    quote.body = quote
+        .body
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, block)| translated_quote_text(block, translations.get(&index), mode))
+        .collect();
+    if let Some(attribution) = quote.attribution.take() {
+        let mut translated = translated_quote_text(attribution, translations.get(&body_len), mode);
+        quote.attribution = translated.pop();
+        if !translated.is_empty() {
+            quote.body.extend(translated);
+        }
+    }
+    quote
+}
+
+fn translated_quote_text(
+    mut original: TextBlock,
+    translation: Option<&String>,
+    mode: TranslationMode,
+) -> Vec<TextBlock> {
+    let Some(translation) = translation else {
+        return vec![original];
+    };
+    let style = original
+        .content
+        .iter()
+        .find_map(|inline| match inline {
+            Inline::Text(run) => Some(run.style),
+            Inline::Math(_) | Inline::Break => None,
+        })
+        .unwrap_or_default();
+    if mode == TranslationMode::Replace {
+        original.content = replacement_content(translation, style, Some(&original.content));
+        return vec![original];
+    }
+    let mut translated = original.clone();
+    let original_margin_after = original.style.margin_after;
+    original.style.margin_after = original_margin_after.min(6.0);
+    translated.content = replacement_content(translation, style, Some(&original.content));
+    translated.source = None;
+    translated.style.margin_before = 0.0;
+    translated.style.margin_after = original_margin_after;
+    vec![original, translated]
 }
 
 fn translated_figure(
@@ -1097,7 +1183,7 @@ fn best_marker_match(
 mod tests {
     use rebook_publication::{
         BlockStyle, FigureBlock, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan,
-        ImageBlock, ImageStyle, Metadata, PublicationId, RenditionLayout, SourceAnchor,
+        ImageBlock, ImageStyle, Metadata, PublicationId, QuoteBlock, RenditionLayout, SourceAnchor,
         SourceRange, SpineItem, SpineItemId, TextBlock, TextBlockKind,
     };
 
@@ -1333,6 +1419,35 @@ mod tests {
         assert_eq!(block_text(&bilingual.blocks[0]), "Hello");
         assert_eq!(block_text(&bilingual.blocks[1]), "你好");
         assert!(matches!(&bilingual.blocks[1], Block::Text(block) if block.source.is_none()));
+    }
+
+    #[test]
+    fn quote_translation_preserves_body_and_attribution_roles() {
+        let block = |kind, value: &str| TextBlock {
+            kind,
+            content: vec![Inline::Text(TextRun {
+                text: value.into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let quote = QuoteBlock {
+            body: vec![block(TextBlockKind::Blockquote, "Quoted prose")],
+            attribution: Some(block(TextBlockKind::QuoteAttribution, "The source")),
+            source: None,
+        };
+        let translations = HashMap::from([(0, "引用正文".into()), (1, "引用来源".into())]);
+
+        let translated = translated_quote(quote, &translations, TranslationMode::Replace);
+
+        assert_eq!(translation_text(&translated.body[0]), "引用正文");
+        let attribution = translated
+            .attribution
+            .expect("attribution should remain attached");
+        assert_eq!(attribution.kind, TextBlockKind::QuoteAttribution);
+        assert_eq!(translation_text(&attribution), "引用来源");
     }
 
     #[test]

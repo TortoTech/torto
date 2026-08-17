@@ -26,7 +26,6 @@ use crate::plugins::{
     TranslationBlockInput, TranslationBookSource, has_pending_pdf_ocr_task, load_pdf_ocr_source,
 };
 use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences, ReadingMode};
-use crate::semantic::{SemanticIndexSummary, SemanticSearchScope};
 use crate::settings::ReaderSettingsChange;
 use crate::sync::{SyncSettings, SyncStore};
 
@@ -46,7 +45,6 @@ const ASSISTANT_MARK_COLOR: Color = Color::from_rgba8(245, 158, 11, 56);
 const FOCUS_MINIMUM_PARAGRAPH_GAP: f32 = 12.0;
 const FOCUS_TABLE_BOTTOM_MARGIN: f32 = 24.0;
 static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_SEMANTIC_TASK_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_CHAT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 mod assistant;
@@ -373,6 +371,19 @@ fn legacy_translated_paragraph_range(
             .as_ref()
             .filter(matches_range)
             .map(|source| (source, crate::plugins::text_block_text(block))),
+        Block::Quote(quote) => {
+            quote
+                .body
+                .iter()
+                .chain(quote.attribution.iter())
+                .find_map(|block| {
+                    block
+                        .source
+                        .as_ref()
+                        .filter(matches_range)
+                        .map(|source| (source, crate::plugins::text_block_text(block)))
+                })
+        }
         Block::Table(table) => table
             .rows
             .iter()
@@ -473,8 +484,6 @@ pub(super) struct DesktopReader {
     sync_settings: SyncSettings,
     sync_password: String,
     search: SearchUiState,
-    search_navigation_requested: Option<BookSearchResult>,
-    semantic_index: SemanticIndexUiState,
     chat: ChatUiState,
     book_chat: Option<ChatUiState>,
     focus_chat_sessions: HashMap<String, ChatUiState>,
@@ -567,6 +576,7 @@ struct FocusUnit {
 fn block_source_range(block: &Block) -> Option<&SourceRange> {
     match block {
         Block::Text(block) => block.source.as_ref(),
+        Block::Quote(quote) => quote.source.as_ref(),
         Block::Table(table) => table.source.as_ref(),
         Block::Image(image) => image.source.as_ref(),
         Block::Figure(figure) => figure.source.as_ref(),
@@ -575,6 +585,22 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
 }
 
 fn focus_block_paint_ranges(block: &Block, range: &SourceRange) -> Vec<SourceRange> {
+    if let Block::Quote(quote) = block {
+        let ranges = quote
+            .body
+            .iter()
+            .filter_map(|block| block.source.clone())
+            .chain(
+                quote
+                    .attribution
+                    .iter()
+                    .filter_map(|block| block.source.clone()),
+            )
+            .collect::<Vec<_>>();
+        if !ranges.is_empty() {
+            return ranges;
+        }
+    }
     if let Block::Table(table) = block {
         let cell_ranges = table
             .rows
@@ -621,6 +647,7 @@ fn focus_unit_geometry(
             .into_iter()
             .chain(page.page.image_source_rects(paint_ranges))
             .chain(page.page.source_table_bounds(paint_ranges))
+            .chain(page.page.source_quote_bounds(paint_ranges))
         {
             let rect = egui::Rect::from_min_max(
                 egui::pos2(rect.x0 as f32, layout.content_y(page_index, rect.y0 as f32)),
@@ -636,7 +663,13 @@ fn focus_unit_geometry(
 fn focus_anchor_block_index(blocks: &[Block], anchor: Option<&SourceAnchor>) -> Option<usize> {
     let anchor = anchor?;
     blocks.iter().position(|block| {
-        block_source_range(block).is_some_and(|range| source_range_contains_anchor(range, anchor))
+        let Some(range) = block_source_range(block) else {
+            return false;
+        };
+        source_range_contains_anchor(range, anchor)
+            || focus_block_paint_ranges(block, range)
+                .iter()
+                .any(|range| source_range_contains_anchor(range, anchor))
     })
 }
 
@@ -648,9 +681,13 @@ fn resolved_focus_unit_index(
 ) -> usize {
     anchor
         .and_then(|anchor| {
-            units
-                .iter()
-                .position(|unit| source_range_contains_anchor(&unit.range, anchor))
+            units.iter().position(|unit| {
+                source_range_contains_anchor(&unit.range, anchor)
+                    || unit
+                        .paint_ranges
+                        .iter()
+                        .any(|range| source_range_contains_anchor(range, anchor))
+            })
         })
         .or(first_unit_after_anchor)
         .or_else(|| units.iter().position(|unit| unit.position == current))
@@ -944,6 +981,21 @@ impl DesktopReader {
                         false,
                         false,
                     )
+                }
+                Block::Quote(quote) => {
+                    let Some(range) = quote.source.clone() else {
+                        continue;
+                    };
+                    let paint_ranges = focus_block_paint_ranges(block, &range);
+                    let text = quote
+                        .body
+                        .iter()
+                        .chain(quote.attribution.iter())
+                        .map(crate::plugins::text_block_text)
+                        .filter(|text| !text.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (range, paint_ranges, text, false, false)
                 }
                 Block::Table(table) => {
                     let Some(range) = table.source.clone() else {
@@ -1389,46 +1441,9 @@ struct DesktopReaderResources {
 struct SearchTask {
     source: Arc<dyn BookSource>,
     query: String,
-    mode: SearchMode,
-    scope: SemanticSearchScope,
-    book_id: String,
-    settings: PluginSettings,
 }
 
 pub(crate) type SearchTaskMessage = TaskResult<Vec<BookSearchResult>>;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SearchMode {
-    #[default]
-    Text,
-    Semantic,
-}
-
-#[derive(Clone)]
-struct SemanticIndexTask {
-    source: Arc<dyn BookSource>,
-    settings: PluginSettings,
-    generation: u64,
-}
-
-pub(crate) enum SemanticIndexTaskMessage {
-    Progress {
-        id: u64,
-        generation: u64,
-        completed: usize,
-        total: usize,
-    },
-    Complete {
-        generation: u64,
-        message: TaskResult<SemanticIndexSummary>,
-    },
-}
-
-#[derive(Default)]
-struct SemanticIndexUiState {
-    progress: String,
-    task: TaskSlot<SemanticIndexTask>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusedMarkKind {
@@ -1471,8 +1486,6 @@ struct SearchUiState {
     focus_input: bool,
     results: Vec<BookSearchResult>,
     status: String,
-    mode: SearchMode,
-    scope: SemanticSearchScope,
     task: TaskSlot<SearchTask>,
 }
 
@@ -2083,20 +2096,7 @@ impl DesktopReader {
                 settings: plugin_settings.clone(),
             });
         }
-        let mut semantic_index = SemanticIndexUiState::default();
-        if plugin_settings.semantic_search_enabled {
-            let semantic_source: Arc<dyn BookSource> = rewrite_source.clone();
-            semantic_index.task.begin(SemanticIndexTask {
-                source: semantic_source,
-                settings: plugin_settings.clone(),
-                generation: NEXT_SEMANTIC_TASK_GENERATION.fetch_add(1, Ordering::Relaxed),
-            });
-            semantic_index.progress = language.text("索引中 0%", "Indexing 0%").into();
-        }
-        let mut search = SearchUiState::default();
-        if plugin_settings.semantic_search_enabled {
-            search.mode = SearchMode::Semantic;
-        }
+        let search = SearchUiState::default();
         Self {
             reader,
             source,
@@ -2124,8 +2124,6 @@ impl DesktopReader {
             selected_highlight_id: None,
             focused_mark: None,
             search,
-            search_navigation_requested: None,
-            semantic_index,
             chat: ChatUiState::default(),
             book_chat: None,
             focus_chat_sessions: HashMap::new(),

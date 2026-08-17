@@ -3,7 +3,7 @@ use rebook_layout::{ParagraphIndentMode, ReaderDefaultFont, SpreadMode, Typesett
 
 use super::{SettingsFeature, SettingsTab};
 use crate::plugins::{
-    AiModelConfig, AiModelKind, AiProviderKind, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN,
+    AiModelConfig, AiProviderKind, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN,
     CHAT_TOOL_STEPS_MAX, CHAT_TOOL_STEPS_MIN, PdfOcrProviderKind, PluginSettings,
     TARGET_LANGUAGE_ENGLISH, TARGET_LANGUAGE_INTERFACE, TARGET_LANGUAGE_SIMPLIFIED_CHINESE,
     TranslationMode,
@@ -13,7 +13,6 @@ use crate::sync::CloudProviderKind;
 use crate::ui::{Icon, dialog_action_button, icon_button, navigation_button, palette};
 
 const SETTINGS_SELECT_WIDTH: f32 = 156.0;
-const SETTINGS_MODEL_KIND_WIDTH: f32 = 92.0;
 const SETTINGS_MODEL_SELECT_WIDTH: f32 = 280.0;
 const SETTINGS_FONT_SELECT_WIDTH: f32 = 260.0;
 const SETTINGS_SCROLLBAR_GUTTER: f32 = 14.0;
@@ -128,12 +127,6 @@ fn settings_sidebar(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         (SettingsTab::AiChat, Icon::Bot, "AI 对话", "AI chat"),
         (SettingsTab::Ocr, Icon::ScanText, "OCR", "OCR"),
         (
-            SettingsTab::Semantic,
-            Icon::Search,
-            "语义搜索",
-            "Semantic search",
-        ),
-        (
             SettingsTab::Translation,
             Icon::Languages,
             "翻译",
@@ -174,7 +167,6 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 SettingsTab::Ai => state.draft_language.text("AI 提供商", "AI providers"),
                 SettingsTab::AiChat => state.draft_language.text("AI 对话", "AI chat"),
                 SettingsTab::Ocr => "OCR",
-                SettingsTab::Semantic => state.draft_language.text("语义搜索", "Semantic search"),
                 SettingsTab::Translation => state.draft_language.text("翻译", "Translation"),
                 SettingsTab::Cloud => state.draft_language.text("云盘同步", "Cloud sync"),
                 SettingsTab::About => state.draft_language.text("关于", "About"),
@@ -211,7 +203,6 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 SettingsTab::Ai => ai_provider_settings(ui, state),
                 SettingsTab::AiChat => ai_chat_settings(ui, state),
                 SettingsTab::Ocr => ocr_settings(ui, state),
-                SettingsTab::Semantic => semantic_settings(ui, state),
                 SettingsTab::Translation => translation_settings(ui, state),
                 SettingsTab::Cloud => cloud_settings(ui, state),
                 SettingsTab::About => about_settings(ui, state),
@@ -816,12 +807,6 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     Vec2::new(ui.available_width(), 36.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        ai_model_kind_selector(
-                            ui,
-                            &provider.id,
-                            model_index,
-                            &mut provider.models[model_index],
-                        );
                         let available_width = if can_remove_model {
                             ui.available_width() - 40.0
                         } else {
@@ -852,28 +837,10 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     }
 }
 
-fn ai_model_kind_selector(
-    ui: &mut egui::Ui,
-    provider_id: &str,
-    model_index: usize,
-    model: &mut AiModelConfig,
-) {
-    let mut selected_kind = model.kind;
-    egui::ComboBox::from_id_salt(("ai-model-kind", provider_id, model_index))
-        .width(SETTINGS_MODEL_KIND_WIDTH)
-        .selected_text(selected_kind.label())
-        .show_ui(ui, |ui| {
-            for kind in AiModelKind::ALL {
-                ui.selectable_value(&mut selected_kind, kind, kind.label());
-            }
-        });
-    model.kind = selected_kind;
-}
-
 fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     let language = state.draft_language;
     let settings = &mut state.draft_plugin_settings;
-    let options = configured_model_options(settings, AiModelKind::Language);
+    let options = configured_model_options(settings);
     settings_card(ui, |ui| {
         field_label(ui, language.text("对话模型", "Chat model"));
         configured_model_selector(
@@ -912,7 +879,7 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
 fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     let language = state.draft_language;
     let settings = &mut state.draft_plugin_settings;
-    let options = configured_model_options(settings, AiModelKind::Language);
+    let options = configured_model_options(settings);
     settings_card(ui, |ui| {
         ui.checkbox(
             &mut settings.ocr_enabled,
@@ -1010,32 +977,10 @@ fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     });
 }
 
-fn semantic_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
-    let language = state.draft_language;
-    let settings = &mut state.draft_plugin_settings;
-    let options = configured_model_options(settings, AiModelKind::Embedding);
-    settings_card(ui, |ui| {
-        ui.checkbox(
-            &mut settings.semantic_search_enabled,
-            language.text("启用语义搜索", "Enable semantic search"),
-        );
-        ui.add_space(10.0);
-        field_label(ui, language.text("Embedding 模型", "Embedding model"));
-        configured_model_selector(
-            ui,
-            "embedding-model",
-            &options,
-            &mut settings.embedding_provider,
-            &mut settings.embedding_model,
-            language,
-        );
-    });
-}
-
 fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     let language = state.draft_language;
     let settings = &mut state.draft_plugin_settings;
-    let options = configured_model_options(settings, AiModelKind::Language);
+    let options = configured_model_options(settings);
     settings_card(ui, |ui| {
         field_label(ui, language.text("翻译模型", "Translation model"));
         configured_model_selector(
@@ -1105,7 +1050,7 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     });
 }
 
-fn configured_model_options(settings: &PluginSettings, kind: AiModelKind) -> Vec<ConfiguredModel> {
+fn configured_model_options(settings: &PluginSettings) -> Vec<ConfiguredModel> {
     let mut options = Vec::new();
     for (index, provider) in settings.providers.iter().enumerate() {
         let provider_name = if provider.name.trim().is_empty() {
@@ -1115,7 +1060,7 @@ fn configured_model_options(settings: &PluginSettings, kind: AiModelKind) -> Vec
         };
         for model in &provider.models {
             let id = model.id.trim();
-            if model.kind == kind && !id.is_empty() {
+            if !id.is_empty() {
                 options.push(ConfiguredModel {
                     provider_id: provider.id.clone(),
                     provider_name: provider_name.clone(),

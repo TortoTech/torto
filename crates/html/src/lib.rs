@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use rebook_publication::{
     Block, BlockStyle, CaptionPosition, FigureBlock, ImageBlock, ImageLength, ImageStyle, Inline,
-    MathRun, PublicationUrl, Rgba, Section, SectionAnchor, SourceAnchor, SourceRange, SpineItem,
-    SpineItemId, TableBlock, TableCell, TableRow, TextAlignment, TextBaseline, TextBlock,
-    TextBlockKind, TextRun, TextStyle,
+    MathRun, PublicationUrl, QuoteBlock, Rgba, Section, SectionAnchor, SourceAnchor, SourceRange,
+    SpineItem, SpineItemId, TableBlock, TableCell, TableRow, TextAlignment, TextBaseline,
+    TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 use roxmltree::{Document, Node};
 use thiserror::Error;
@@ -89,6 +89,9 @@ impl ReadingIrParser {
     }
 
     fn parse_block_container(&mut self, container: Node<'_, '_>) -> Result<(), HtmlError> {
+        if self.try_parse_structural_quote(container)? {
+            return Ok(());
+        }
         let mut style = self.styles.block_style(container, BlockStyle::default());
         style.indent = 0.0;
         let text_style = self
@@ -166,29 +169,35 @@ impl ReadingIrParser {
             }
             "p" => {
                 let mut style = self.styles.block_style(node, BlockStyle::default());
-                style.indent = 0.0;
                 if contains_display_math(node) && has_only_math_content(node) {
                     style.align = TextAlignment::Center;
                     style.margin_before = style.margin_before.max(12.0);
                     style.margin_after = style.margin_after.max(12.0);
                 }
-                let kind = if has_explicit_paragraph_list_marker(node) {
+                let has_marker = has_explicit_paragraph_list_marker(node);
+                let markerless_nested_item = !has_marker
+                    && style.indent < -0.5
+                    && self.paragraph_list_indents.first().is_some_and(|root| {
+                        let indent = style
+                            .margin_start_fraction
+                            .mul_add(1_000.0, style.margin_start);
+                        indent > *root + 4.0
+                    });
+                let kind = if has_marker || markerless_nested_item {
                     TextBlockKind::ListItem {
                         ordered: false,
                         ordinal: 1,
                         depth: self.paragraph_list_depth(style),
+                        marker_visible: has_marker,
                     }
                 } else {
                     self.paragraph_list_indents.clear();
                     TextBlockKind::Paragraph
                 };
+                style.indent = 0.0;
                 self.push_text_block(node, kind, style)?;
             }
-            "blockquote" => {
-                let mut style = self.styles.block_style(node, BlockStyle::default());
-                style.indent += 24.0;
-                self.push_text_block(node, TextBlockKind::Blockquote, style)?;
-            }
+            "blockquote" => self.parse_semantic_quote(node)?,
             "pre" => {
                 let style = self.styles.block_style(
                     node,
@@ -213,6 +222,158 @@ impl ReadingIrParser {
             "br" => self.blocks.push(Block::PageBreak),
             _ => self.parse_children(node)?,
         }
+        Ok(())
+    }
+
+    fn try_parse_structural_quote(&mut self, container: Node<'_, '_>) -> Result<bool, HtmlError> {
+        let children = container
+            .children()
+            .filter(Node::is_element)
+            .collect::<Vec<_>>();
+        if children.len() < 2
+            || container.children().any(|child| {
+                child.is_text() && child.text().is_some_and(|text| !text.trim().is_empty())
+            })
+            || children
+                .iter()
+                .any(|child| !is_quote_text_candidate(*child))
+        {
+            return Ok(false);
+        }
+
+        let attribution = *children.last().expect("quote candidates are non-empty");
+        let attribution_style = self.styles.block_style(attribution, BlockStyle::default());
+        if attribution_style.align != TextAlignment::End {
+            return Ok(false);
+        }
+        let body = &children[..children.len() - 1];
+        if body.iter().any(|node| {
+            self.styles.block_style(*node, BlockStyle::default()).align == TextAlignment::End
+        }) {
+            return Ok(false);
+        }
+
+        let attribution_start = effective_start_offset(attribution_style);
+        let body_has_role_style = body.iter().any(|node| {
+            let style = self.styles.block_style(*node, BlockStyle::default());
+            let text_style = self
+                .styles
+                .text_style_for_block(*node, TextBlockKind::Paragraph);
+            text_style.italic || effective_start_offset(style) > attribution_start + 4.0
+        });
+        if !body_has_role_style || !self.styles.has_visual_boundary(container) {
+            return Ok(false);
+        }
+
+        self.parse_quote_nodes(container, body, Some(attribution))?;
+        Ok(true)
+    }
+
+    fn parse_semantic_quote(&mut self, quote: Node<'_, '_>) -> Result<(), HtmlError> {
+        let children = quote
+            .children()
+            .filter(Node::is_element)
+            .filter(|child| {
+                is_quote_text_candidate(*child)
+                    || matches!(
+                        child.tag_name().name().to_ascii_lowercase().as_str(),
+                        "cite" | "footer"
+                    )
+            })
+            .collect::<Vec<_>>();
+        if children.is_empty() {
+            let start = self.blocks.len();
+            let mut style = self.styles.block_style(quote, BlockStyle::default());
+            style.indent += 24.0;
+            self.push_text_block(quote, TextBlockKind::Blockquote, style)?;
+            let mut body = self
+                .blocks
+                .drain(start..)
+                .filter_map(|block| match block {
+                    Block::Text(block) => Some(block),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if let Some(source) = quote_source_range(&body, None) {
+                self.blocks.push(Block::Quote(QuoteBlock {
+                    body: std::mem::take(&mut body),
+                    attribution: None,
+                    source: Some(source),
+                }));
+            }
+            return Ok(());
+        }
+
+        let last = *children.last().expect("semantic quote has children");
+        let last_name = last.tag_name().name().to_ascii_lowercase();
+        let last_is_attribution = matches!(last_name.as_str(), "cite" | "footer")
+            || (children.len() > 1
+                && self.styles.block_style(last, BlockStyle::default()).align
+                    == TextAlignment::End);
+        let (body, attribution) = if last_is_attribution {
+            (&children[..children.len() - 1], Some(last))
+        } else {
+            (children.as_slice(), None)
+        };
+        self.parse_quote_nodes(quote, body, attribution)
+    }
+
+    fn parse_quote_nodes(
+        &mut self,
+        container: Node<'_, '_>,
+        body_nodes: &[Node<'_, '_>],
+        attribution_node: Option<Node<'_, '_>>,
+    ) -> Result<(), HtmlError> {
+        let start = self.blocks.len();
+        for node in body_nodes.iter().copied().chain(attribution_node) {
+            if is_quote_text_candidate(node) {
+                self.parse_node(node)?;
+            } else {
+                let style = self.styles.block_style(node, BlockStyle::default());
+                self.push_text_block(node, TextBlockKind::Paragraph, style)?;
+            }
+        }
+        let mut parsed = self.blocks.drain(start..).collect::<Vec<_>>();
+        let attribution = attribution_node.and_then(|_| match parsed.pop() {
+            Some(Block::Text(mut block)) => {
+                block.kind = TextBlockKind::QuoteAttribution;
+                Some(block)
+            }
+            Some(block) => {
+                self.blocks.push(block);
+                None
+            }
+            None => None,
+        });
+        let semantic_blockquote = container
+            .tag_name()
+            .name()
+            .eq_ignore_ascii_case("blockquote");
+        let mut body = parsed
+            .into_iter()
+            .filter_map(|block| match block {
+                Block::Text(mut block) => {
+                    block.kind = TextBlockKind::Blockquote;
+                    if semantic_blockquote {
+                        block.style.indent += 24.0;
+                    }
+                    Some(block)
+                }
+                block => {
+                    self.blocks.push(block);
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if body.is_empty() {
+            return Ok(());
+        }
+        let source = quote_source_range(&body, attribution.as_ref());
+        self.blocks.push(Block::Quote(QuoteBlock {
+            body: std::mem::take(&mut body),
+            attribution,
+            source,
+        }));
         Ok(())
     }
 
@@ -272,6 +433,7 @@ impl ReadingIrParser {
                     ordered,
                     ordinal,
                     depth,
+                    marker_visible: true,
                 },
                 style,
             )?;
@@ -1011,6 +1173,35 @@ fn is_generic_block_container(name: &str) -> bool {
     )
 }
 
+fn is_quote_text_candidate(node: Node<'_, '_>) -> bool {
+    if !node.is_element()
+        || !is_block_boundary(node.tag_name().name().to_ascii_lowercase().as_str())
+        || node.text().is_none_or(|text| text.trim().is_empty())
+    {
+        return false;
+    }
+    !node.descendants().skip(1).any(|descendant| {
+        descendant.is_element()
+            && is_block_boundary(descendant.tag_name().name().to_ascii_lowercase().as_str())
+    })
+}
+
+fn effective_start_offset(style: BlockStyle) -> f32 {
+    style
+        .margin_start_fraction
+        .mul_add(1_000.0, style.margin_start)
+}
+
+fn quote_source_range(body: &[TextBlock], attribution: Option<&TextBlock>) -> Option<SourceRange> {
+    let start = body.first()?.source.as_ref()?.start.clone();
+    let end = attribution
+        .and_then(|block| block.source.as_ref())
+        .or_else(|| body.last()?.source.as_ref())?
+        .end
+        .clone();
+    Some(SourceRange { start, end })
+}
+
 fn should_suppress_navigation(node: Node<'_, '_>, styles: &StyleSheet) -> bool {
     let navigation_type_is_metadata = attribute_local(node, "type").is_some_and(|types| {
         types.split_ascii_whitespace().any(|navigation_type| {
@@ -1323,6 +1514,46 @@ impl StyleSheet {
             .get("text-align")
             .and_then(|value| parse_text_alignment(value))
             .or_else(|| attribute_local(node, "align").and_then(parse_text_alignment))
+    }
+
+    fn has_visual_boundary(&self, node: Node<'_, '_>) -> bool {
+        let properties = self.cascaded_properties(node);
+        let visible_paint = |value: &str| {
+            let value = value.trim();
+            !value.is_empty()
+                && !matches!(
+                    value,
+                    "none" | "transparent" | "inherit" | "initial" | "unset"
+                )
+                && value != "0"
+        };
+        [
+            "background",
+            "background-color",
+            "border",
+            "border-left",
+            "border-right",
+        ]
+        .into_iter()
+        .any(|name| {
+            properties
+                .get(name)
+                .is_some_and(|value| visible_paint(value))
+        }) || [
+            "padding-left",
+            "padding-right",
+            "padding-top",
+            "padding-bottom",
+            "padding-inline-start",
+            "padding-inline-end",
+        ]
+        .into_iter()
+        .any(|name| {
+            properties
+                .get(name)
+                .and_then(|value| css_length(value))
+                .is_some_and(|value| value > 0.0)
+        })
     }
 
     fn text_style_for_block(&self, node: Node<'_, '_>, kind: TextBlockKind) -> TextStyle {
@@ -2176,6 +2407,7 @@ mod tests {
                 ordered: false,
                 ordinal: 1,
                 depth: 0,
+                marker_visible: true,
             }
         );
         let text = item
@@ -2229,6 +2461,56 @@ mod tests {
     }
 
     #[test]
+    fn css_hanging_paragraph_recovers_a_markerless_nested_list_item() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+            <head><style>
+                .parent { margin-left: 1.2em; text-indent: -1.8em; }
+                .child { margin-left: 4.7em; text-indent: -1.1em; }
+            </style></head><body>
+            <p class="parent"><span class="enumerator">»</span> Parent one</p>
+            <p class="child">Child one without its own marker</p>
+            <p class="child">Child two without its own marker</p>
+            <p class="parent"><span class="enumerator">»</span> Parent two</p>
+            <p class="child">Child three without its own marker</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let items = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(block),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(items.len(), 5);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| match item.kind {
+                    TextBlockKind::ListItem {
+                        depth,
+                        marker_visible,
+                        ..
+                    } => (depth, marker_visible),
+                    _ => panic!("expected a recovered list item"),
+                })
+                .collect::<Vec<_>>(),
+            [(0, true), (1, false), (1, false), (0, true), (1, false)]
+        );
+        assert_close(items[1].style.margin_start, 75.2);
+        assert_close(items[1].style.indent, 0.0);
+    }
+
+    #[test]
     fn nested_html_lists_keep_each_item_and_its_depth() {
         let descriptor = SpineItem {
             id: SpineItemId::new("chapter").unwrap(),
@@ -2266,21 +2548,25 @@ mod tests {
                     ordered: false,
                     ordinal: 1,
                     depth: 0,
+                    marker_visible: true,
                 },
                 TextBlockKind::ListItem {
                     ordered: false,
                     ordinal: 1,
                     depth: 1,
+                    marker_visible: true,
                 },
                 TextBlockKind::ListItem {
                     ordered: true,
                     ordinal: 1,
                     depth: 2,
+                    marker_visible: true,
                 },
                 TextBlockKind::ListItem {
                     ordered: false,
                     ordinal: 2,
                     depth: 0,
+                    marker_visible: true,
                 },
             ]
         );
@@ -2384,6 +2670,7 @@ mod tests {
                         .collect::<String>(),
                 ),
                 Block::Table(_)
+                | Block::Quote(_)
                 | Block::Image(_)
                 | Block::Figure(_)
                 | Block::Separator
@@ -2431,6 +2718,7 @@ mod tests {
             .filter_map(|block| match block {
                 Block::Image(image) => Some(image.href.path()),
                 Block::Text(_)
+                | Block::Quote(_)
                 | Block::Table(_)
                 | Block::Figure(_)
                 | Block::Separator
@@ -2490,7 +2778,8 @@ mod tests {
                         })
                         .collect::<String>(),
                 ),
-                Block::Table(_)
+                Block::Quote(_)
+                | Block::Table(_)
                 | Block::Image(_)
                 | Block::Figure(_)
                 | Block::Separator
@@ -2504,7 +2793,8 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 Block::Text(block) => Some(block.kind),
-                Block::Table(_)
+                Block::Quote(_)
+                | Block::Table(_)
                 | Block::Image(_)
                 | Block::Figure(_)
                 | Block::Separator
@@ -2525,7 +2815,8 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 Block::Text(block) => Some(block.style),
-                Block::Table(_)
+                Block::Quote(_)
+                | Block::Table(_)
                 | Block::Image(_)
                 | Block::Figure(_)
                 | Block::Separator
@@ -2577,7 +2868,8 @@ mod tests {
                         })
                         .collect::<String>(),
                 )),
-                Block::Table(_)
+                Block::Quote(_)
+                | Block::Table(_)
                 | Block::Image(_)
                 | Block::Figure(_)
                 | Block::Separator
@@ -2636,7 +2928,8 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 Block::Text(block) => Some(block.kind),
-                Block::Table(_)
+                Block::Quote(_)
+                | Block::Table(_)
                 | Block::Image(_)
                 | Block::Figure(_)
                 | Block::Separator
@@ -2651,13 +2944,98 @@ mod tests {
                     ordered: true,
                     ordinal: 1,
                     depth: 0,
+                    marker_visible: true,
                 },
                 TextBlockKind::ListItem {
                     ordered: true,
                     ordinal: 1,
                     depth: 1,
+                    marker_visible: true,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn recognizes_structural_quote_without_using_class_or_id_names() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            .arbitrary-wrapper { margin: 1em 0; padding: 5px; background-color: #e7e7e8; }
+            .arbitrary-body { margin: 1em 2em; font-style: italic; }
+            .arbitrary-tail { margin: 0 2em 2em 0; text-align: right; }
+        </style></head><body>
+            <div class="arbitrary-wrapper">
+                <p class="arbitrary-body">Quoted prose with a <a href="#note"><sup>50</sup></a> note.</p>
+                <p class="arbitrary-tail">Diane Mizrachi and Alicia Salaz</p>
+            </div>
+        </body></html>"##;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Quote(quote)] = section.blocks.as_slice() else {
+            panic!("expected one semantic quote block");
+        };
+        assert_eq!(quote.body.len(), 1);
+        assert_eq!(quote.body[0].kind, TextBlockKind::Blockquote);
+        assert_eq!(
+            quote.attribution.as_ref().map(|block| block.kind),
+            Some(TextBlockKind::QuoteAttribution)
+        );
+        assert!(quote.source.is_some());
+    }
+
+    #[test]
+    fn visually_bounded_text_card_without_quote_role_difference_is_not_a_quote() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            .card { padding: 5px; background: #eee; }
+            .tail { text-align: right; }
+        </style></head><body>
+            <div class="card"><p>Ordinary card content.</p><p class="tail">Continue reading</p></div>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        assert_eq!(section.blocks.len(), 2);
+        assert!(
+            section
+                .blocks
+                .iter()
+                .all(|block| matches!(block, Block::Text(_)))
+        );
+    }
+
+    #[test]
+    fn semantic_blockquote_keeps_direct_cite_as_attribution() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <blockquote><p>Quoted prose.</p><cite>The source</cite></blockquote>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Quote(quote)] = section.blocks.as_slice() else {
+            panic!("expected one semantic quote");
+        };
+        assert_eq!(quote.body.len(), 1);
+        assert_eq!(
+            quote.attribution.as_ref().map(|block| block.kind),
+            Some(TextBlockKind::QuoteAttribution)
         );
     }
 

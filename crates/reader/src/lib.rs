@@ -2577,6 +2577,10 @@ fn compile_segment(
                             .source
                             .as_ref()
                             .is_some_and(|range| source_range_contains(range, &anchor.source)),
+                        PageItem::Quote(placement) => placement
+                            .sources
+                            .iter()
+                            .any(|range| source_range_contains(range, &anchor.source)),
                         PageItem::Table(placement) => placement.cells.iter().any(|cell| {
                             cell.text
                                 .as_ref()
@@ -2724,7 +2728,7 @@ fn reading_unit_has_activatable_content(unit: &ReadingUnit, fragments: &[Content
                 !matches!(text.kind, rebook_publication::TextBlockKind::Heading(_))
                     && block_text_len(block) > 0
             }
-            Block::Image(_) | Block::Figure(_) | Block::Table(_) => true,
+            Block::Quote(_) | Block::Image(_) | Block::Figure(_) | Block::Table(_) => true,
             Block::Separator | Block::PageBreak => false,
         })
 }
@@ -3073,6 +3077,12 @@ fn inline_content_len(content: &[Inline]) -> usize {
 fn block_text_len(block: &Block) -> usize {
     match block {
         Block::Text(block) => inline_content_len(&block.content),
+        Block::Quote(quote) => quote
+            .body
+            .iter()
+            .chain(quote.attribution.iter())
+            .map(|block| inline_content_len(&block.content))
+            .sum(),
         Block::Table(table) => table
             .rows
             .iter()
@@ -3114,6 +3124,7 @@ fn append_visible_text_fragments(
 fn block_source(block: &Block) -> Option<&SourceRange> {
     match block {
         Block::Text(block) => block.source.as_ref(),
+        Block::Quote(block) => block.source.as_ref(),
         Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
         Block::Figure(block) => block.source.as_ref(),
@@ -4626,7 +4637,7 @@ mod tests {
             .filter_map(|item| match item {
                 PageItem::Text(placement) => placement.source.as_ref(),
                 PageItem::Image(placement) => placement.source.as_ref(),
-                PageItem::Table(_) | PageItem::Separator(_) => None,
+                PageItem::Quote(_) | PageItem::Table(_) | PageItem::Separator(_) => None,
             })
             .collect::<Vec<_>>();
         assert!(
@@ -4651,6 +4662,7 @@ mod tests {
                 ordered: true,
                 ordinal: 7,
                 depth: 0,
+                marker_visible: true,
             },
             content: vec![Inline::Text(TextRun {
                 text: "item ".repeat(FRAGMENT_TEXT_BUDGET),
@@ -4671,6 +4683,7 @@ mod tests {
                 ordered: true,
                 ordinal: 7,
                 depth: 0,
+                marker_visible: true,
             }
         ));
         assert!(

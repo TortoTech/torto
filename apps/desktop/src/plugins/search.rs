@@ -8,18 +8,12 @@ const DEFAULT_CONTEXT_CHARS: usize = 72;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BookSearchResult {
-    pub book_id: String,
-    pub book_title: String,
     pub section_index: usize,
     pub section_title: String,
     pub excerpt: String,
     pub matched_text: String,
     pub block_kind: String,
     pub range: SourceRange,
-    pub similarity: Option<f32>,
-    pub is_image: bool,
-    pub image_href: Option<String>,
-    pub image_preview: Option<Vec<u8>>,
 }
 
 pub fn search_book(
@@ -58,9 +52,6 @@ fn search_sections(
         .build()
         .map_err(|error| format!("搜索表达式无效：{error}"))?;
     let mut results = Vec::new();
-    let book_id = source.book().id.to_string();
-    let book_title = source.book().metadata.title.clone();
-
     for section_index in sections {
         let section = source
             .parse_section(section_index)
@@ -77,8 +68,6 @@ fn search_sections(
                         let range =
                             source_range_for_match(source_range, &text, found.start(), found.end());
                         results.push(BookSearchResult {
-                            book_id: book_id.clone(),
-                            book_title: book_title.clone(),
                             section_index,
                             section_title: section_title.clone(),
                             excerpt: excerpt(
@@ -90,10 +79,6 @@ fn search_sections(
                             matched_text: found.as_str().to_owned(),
                             block_kind: "table-cell".into(),
                             range,
-                            similarity: None,
-                            is_image: false,
-                            image_href: None,
-                            image_preview: None,
                         });
                         if results.len() >= max_results {
                             return Ok(results);
@@ -113,6 +98,38 @@ fn search_sections(
                         text_block_kind(block).to_owned(),
                     )
                 }
+                Block::Quote(quote) => {
+                    for child in quote.body.iter().chain(quote.attribution.iter()) {
+                        let Some(source_range) = &child.source else {
+                            continue;
+                        };
+                        let text = text_block_text(child);
+                        for found in matcher.find_iter(&text) {
+                            results.push(BookSearchResult {
+                                section_index,
+                                section_title: section_title.clone(),
+                                excerpt: excerpt(
+                                    &text,
+                                    found.start(),
+                                    found.end(),
+                                    DEFAULT_CONTEXT_CHARS,
+                                ),
+                                matched_text: found.as_str().to_owned(),
+                                block_kind: text_block_kind(child).to_owned(),
+                                range: source_range_for_match(
+                                    source_range,
+                                    &text,
+                                    found.start(),
+                                    found.end(),
+                                ),
+                            });
+                            if results.len() >= max_results {
+                                return Ok(results);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 Block::Image(image) => {
                     let (Some(layer), Some(source_range)) = (&image.text_layer, &image.source)
                     else {
@@ -127,18 +144,12 @@ fn search_sections(
             for found in matcher.find_iter(&text) {
                 let range = source_range_for_match(source_range, &text, found.start(), found.end());
                 results.push(BookSearchResult {
-                    book_id: book_id.clone(),
-                    book_title: book_title.clone(),
                     section_index,
                     section_title: section_title.clone(),
                     excerpt: excerpt(&text, found.start(), found.end(), DEFAULT_CONTEXT_CHARS),
                     matched_text: found.as_str().to_owned(),
                     block_kind: block_kind.clone(),
                     range,
-                    similarity: None,
-                    is_image: false,
-                    image_href: None,
-                    image_preview: None,
                 });
                 if results.len() >= max_results {
                     return Ok(results);
@@ -154,6 +165,7 @@ pub(crate) fn text_block_kind(block: &TextBlock) -> &'static str {
         TextBlockKind::Paragraph => "paragraph",
         TextBlockKind::Heading(_) => "heading",
         TextBlockKind::Blockquote => "blockquote",
+        TextBlockKind::QuoteAttribution => "quote-attribution",
         TextBlockKind::Preformatted => "preformatted",
         TextBlockKind::ListItem { .. } => "list-item",
         TextBlockKind::DefinitionTerm { .. } => "definition-term",

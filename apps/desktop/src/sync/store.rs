@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -237,6 +237,21 @@ impl SyncStore {
                 })
             })
             .transpose()
+    }
+
+    pub(crate) fn progress_activity_times(&self) -> SyncResult<HashMap<String, u64>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT book_id, updated_hlc FROM progress")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut activity_times = HashMap::new();
+        for row in rows {
+            let (book_id, updated_at) = row?;
+            let updated_at: HybridTimestamp = serde_json::from_str(&updated_at)?;
+            activity_times.insert(book_id, updated_at.wall_time_ms);
+        }
+        Ok(activity_times)
     }
 
     pub(crate) fn progress_state(&self, book_id: &str) -> SyncResult<Option<ProgressState>> {
@@ -608,6 +623,24 @@ mod tests {
                 .total_progression,
             Some(0.2)
         );
+        cleanup(&store);
+    }
+
+    #[test]
+    fn progress_activity_times_include_every_book_with_reading_progress() {
+        let store = test_store("progress-activity-times");
+        store
+            .save_progress("first", &locator("first", 0.2))
+            .unwrap();
+        store
+            .save_progress("second", &locator("second", 0.6))
+            .unwrap();
+
+        let activity_times = store.progress_activity_times().unwrap();
+
+        assert_eq!(activity_times.len(), 2);
+        assert!(activity_times.contains_key("first"));
+        assert!(activity_times.contains_key("second"));
         cleanup(&store);
     }
 
