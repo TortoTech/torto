@@ -25,7 +25,9 @@ use crate::plugins::{
     ChatTurn, PdfOcrSourceController, PdfOcrViewMode, PluginSettings, RewriteBookSource,
     TranslationBlockInput, TranslationBookSource, has_pending_pdf_ocr_task, load_pdf_ocr_source,
 };
-use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences, ReadingMode};
+use crate::preferences::{
+    self, AppLanguage, AppTheme, ReaderPreferences, ReadingMode, ShortcutPreferences,
+};
 use crate::settings::ReaderSettingsChange;
 use crate::sync::{SyncSettings, SyncStore};
 
@@ -314,6 +316,7 @@ pub(super) fn open_reader(
             language: reader_preferences.language,
             reading_mode,
             selection_granularity: reader_preferences.selection_granularity,
+            shortcuts: reader_preferences.shortcuts,
             sync_settings,
             sync_password,
             source_path: path.to_path_buf(),
@@ -481,6 +484,7 @@ pub(super) struct DesktopReader {
     plugin_settings: PluginSettings,
     language: AppLanguage,
     reading_mode: ReadingMode,
+    shortcuts: ShortcutPreferences,
     sync_settings: SyncSettings,
     sync_password: String,
     search: SearchUiState,
@@ -1432,6 +1436,7 @@ struct DesktopReaderResources {
     language: AppLanguage,
     reading_mode: ReadingMode,
     selection_granularity: SelectionGranularity,
+    shortcuts: ShortcutPreferences,
     sync_settings: SyncSettings,
     sync_password: String,
     source_path: PathBuf,
@@ -2026,6 +2031,7 @@ impl DesktopReader {
             language,
             reading_mode,
             selection_granularity,
+            shortcuts,
             sync_settings,
             sync_password,
             source_path,
@@ -2161,6 +2167,7 @@ impl DesktopReader {
             plugin_settings,
             language,
             reading_mode,
+            shortcuts,
             sync_settings,
             sync_password,
             canvas_size: None,

@@ -5,6 +5,7 @@ use rebook_reader::SelectionGranularity;
 use crate::plugins::PluginSettings;
 use crate::preferences::{
     self, AppLanguage, AppTheme, InterfaceTypography, ReaderPreferences, ReadingMode,
+    ShortcutPreferences,
 };
 use crate::sync::SyncSettings;
 
@@ -23,6 +24,7 @@ pub(crate) struct AppliedSettings {
     pub(crate) language: AppLanguage,
     pub(crate) theme: AppTheme,
     pub(crate) selection_granularity: SelectionGranularity,
+    pub(crate) shortcuts: ShortcutPreferences,
     pub(crate) sync_settings: SyncSettings,
     pub(crate) sync_password: String,
 }
@@ -45,6 +47,7 @@ pub(crate) struct SettingsFeature {
     draft_plugin_settings: PluginSettings,
     draft_language: AppLanguage,
     draft_theme: AppTheme,
+    draft_shortcuts: ShortcutPreferences,
     draft_sync_settings: SyncSettings,
     draft_sync_password: String,
     available_font_families: Vec<String>,
@@ -53,6 +56,7 @@ pub(crate) struct SettingsFeature {
     revision: u64,
     error: Option<String>,
     open: bool,
+    capturing_shortcut: Option<ShortcutAction>,
     #[cfg(target_os = "windows")]
     update_check_requested: bool,
     #[cfg(target_os = "windows")]
@@ -92,11 +96,12 @@ impl SettingsFeature {
             language: preferences.language,
             theme: preferences.theme,
             selection_granularity: preferences.selection_granularity,
+            shortcuts: preferences.shortcuts,
             sync_settings,
             sync_password,
         };
         Self {
-            settings_tab: SettingsTab::Reading,
+            settings_tab: SettingsTab::System,
             draft_spread: applied.spread,
             draft_reading_mode: applied.reading_mode,
             draft_interface_typography: applied.interface_typography.clone(),
@@ -105,6 +110,7 @@ impl SettingsFeature {
             draft_plugin_settings: applied.plugin_settings.clone(),
             draft_language: applied.language,
             draft_theme: applied.theme,
+            draft_shortcuts: applied.shortcuts.clone(),
             draft_sync_settings: applied.sync_settings.clone(),
             draft_sync_password: applied.sync_password.clone(),
             available_font_families,
@@ -113,6 +119,7 @@ impl SettingsFeature {
             revision: 0,
             error: None,
             open: false,
+            capturing_shortcut: None,
             #[cfg(target_os = "windows")]
             update_check_requested: false,
             #[cfg(target_os = "windows")]
@@ -123,7 +130,7 @@ impl SettingsFeature {
     }
 
     pub(crate) fn open(&mut self) {
-        self.settings_tab = SettingsTab::Reading;
+        self.settings_tab = SettingsTab::System;
         self.draft_spread = self.applied.spread;
         self.draft_reading_mode = self.applied.reading_mode;
         self.draft_interface_typography
@@ -134,11 +141,13 @@ impl SettingsFeature {
             .clone_from(&self.applied.plugin_settings);
         self.draft_language = self.applied.language;
         self.draft_theme = self.applied.theme;
+        self.draft_shortcuts.clone_from(&self.applied.shortcuts);
         self.draft_sync_settings
             .clone_from(&self.applied.sync_settings);
         self.draft_sync_password
             .clone_from(&self.applied.sync_password);
         self.error = None;
+        self.capturing_shortcut = None;
         self.open = true;
     }
 
@@ -189,6 +198,7 @@ impl SettingsFeature {
             reading_mode: self.applied.reading_mode,
             theme: self.applied.theme,
             selection_granularity: self.applied.selection_granularity,
+            shortcuts: self.applied.shortcuts.clone(),
         };
         let layout_changed = matches!(
             change,
@@ -235,6 +245,7 @@ impl SettingsFeature {
     }
 
     fn close_overlay(&mut self) {
+        self.capturing_shortcut = None;
         self.open = false;
     }
 
@@ -251,6 +262,17 @@ impl SettingsFeature {
         sync_settings.normalize();
         let language = self.draft_language;
         let theme = self.draft_theme;
+        if self.draft_shortcuts.has_conflicts() {
+            self.error = Some(
+                language
+                    .text(
+                        "快捷键存在重复，请修改后再保存",
+                        "Some shortcuts conflict. Change them before saving.",
+                    )
+                    .into(),
+            );
+            return;
+        }
         let reader_preferences = ReaderPreferences {
             interface_typography: interface_typography.clone(),
             typography: typography.clone(),
@@ -260,6 +282,7 @@ impl SettingsFeature {
             spread: self.draft_spread,
             reading_mode: self.draft_reading_mode,
             selection_granularity: self.applied.selection_granularity,
+            shortcuts: self.draft_shortcuts.clone(),
         };
         if sync_settings.enabled
             && let Err(error) = sync_settings.validate()
@@ -294,6 +317,7 @@ impl SettingsFeature {
             language,
             theme,
             selection_granularity: self.applied.selection_granularity,
+            shortcuts: self.draft_shortcuts.clone(),
             sync_settings,
             sync_password,
         };
@@ -357,14 +381,49 @@ fn persist_settings(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SettingsTab {
     #[default]
-    Reading,
-    Font,
+    System,
+    Typography,
     Ai,
     AiChat,
     Ocr,
     Translation,
+    Shortcuts,
     Cloud,
     About,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShortcutAction {
+    ToggleLeftSidebar,
+    ToggleRightSidebar,
+    FocusActions,
+    FocusChat,
+    FocusHighlight,
+    FocusNote,
+}
+
+impl ShortcutAction {
+    fn binding(self, shortcuts: &ShortcutPreferences) -> egui::KeyboardShortcut {
+        match self {
+            Self::ToggleLeftSidebar => shortcuts.toggle_left_sidebar,
+            Self::ToggleRightSidebar => shortcuts.toggle_right_sidebar,
+            Self::FocusActions => shortcuts.focus_actions,
+            Self::FocusChat => shortcuts.focus_chat,
+            Self::FocusHighlight => shortcuts.focus_highlight,
+            Self::FocusNote => shortcuts.focus_note,
+        }
+    }
+
+    fn set_binding(self, shortcuts: &mut ShortcutPreferences, binding: egui::KeyboardShortcut) {
+        match self {
+            Self::ToggleLeftSidebar => shortcuts.toggle_left_sidebar = binding,
+            Self::ToggleRightSidebar => shortcuts.toggle_right_sidebar = binding,
+            Self::FocusActions => shortcuts.focus_actions = binding,
+            Self::FocusChat => shortcuts.focus_chat = binding,
+            Self::FocusHighlight => shortcuts.focus_highlight = binding,
+            Self::FocusNote => shortcuts.focus_note = binding,
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]

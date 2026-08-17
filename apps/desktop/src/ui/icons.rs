@@ -23,6 +23,7 @@ pub(crate) enum Icon {
     ExternalLink,
     Highlighter,
     Info,
+    Keyboard,
     Languages,
     Library,
     ListTree,
@@ -53,7 +54,7 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 38] = [
+    const ALL: [Self; 39] = [
         Self::AlertCircle,
         Self::BookOpen,
         Self::Bot,
@@ -66,6 +67,7 @@ impl Icon {
         Self::ExternalLink,
         Self::Highlighter,
         Self::Info,
+        Self::Keyboard,
         Self::Languages,
         Self::Library,
         Self::ListTree,
@@ -108,6 +110,7 @@ impl Icon {
             Self::ExternalLink => asset!("external-link"),
             Self::Highlighter => asset!("highlighter"),
             Self::Info => asset!("info"),
+            Self::Keyboard => asset!("keyboard"),
             Self::Languages => asset!("languages"),
             Self::Library => asset!("library"),
             Self::ListTree => asset!("list-tree"),

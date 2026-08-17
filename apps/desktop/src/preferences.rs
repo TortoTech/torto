@@ -64,6 +64,7 @@ pub(crate) struct ReaderPreferences {
     pub(crate) reading_mode: ReadingMode,
     pub(crate) theme: AppTheme,
     pub(crate) selection_granularity: SelectionGranularity,
+    pub(crate) shortcuts: ShortcutPreferences,
 }
 
 impl Default for ReaderPreferences {
@@ -77,6 +78,7 @@ impl Default for ReaderPreferences {
             reading_mode: ReadingMode::Focus,
             theme: AppTheme::default(),
             selection_granularity: SelectionGranularity::Free,
+            shortcuts: ShortcutPreferences::default(),
         }
     }
 }
@@ -86,6 +88,76 @@ pub(crate) enum ReadingMode {
     Classic,
     #[default]
     Focus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ShortcutPreferences {
+    #[serde(default = "default_toggle_left_sidebar_shortcut")]
+    pub(crate) toggle_left_sidebar: egui::KeyboardShortcut,
+    #[serde(default = "default_toggle_right_sidebar_shortcut")]
+    pub(crate) toggle_right_sidebar: egui::KeyboardShortcut,
+    #[serde(default = "default_focus_actions_shortcut")]
+    pub(crate) focus_actions: egui::KeyboardShortcut,
+    #[serde(default = "default_focus_chat_shortcut")]
+    pub(crate) focus_chat: egui::KeyboardShortcut,
+    #[serde(default = "default_focus_highlight_shortcut")]
+    pub(crate) focus_highlight: egui::KeyboardShortcut,
+    #[serde(default = "default_focus_note_shortcut")]
+    pub(crate) focus_note: egui::KeyboardShortcut,
+}
+
+impl ShortcutPreferences {
+    pub(crate) fn has_conflicts(&self) -> bool {
+        let bindings = [
+            self.toggle_left_sidebar,
+            self.toggle_right_sidebar,
+            self.focus_actions,
+            self.focus_chat,
+            self.focus_highlight,
+            self.focus_note,
+        ];
+        bindings
+            .iter()
+            .enumerate()
+            .any(|(index, binding)| bindings[index + 1..].contains(binding))
+    }
+}
+
+impl Default for ShortcutPreferences {
+    fn default() -> Self {
+        Self {
+            toggle_left_sidebar: default_toggle_left_sidebar_shortcut(),
+            toggle_right_sidebar: default_toggle_right_sidebar_shortcut(),
+            focus_actions: default_focus_actions_shortcut(),
+            focus_chat: default_focus_chat_shortcut(),
+            focus_highlight: default_focus_highlight_shortcut(),
+            focus_note: default_focus_note_shortcut(),
+        }
+    }
+}
+
+const fn default_toggle_left_sidebar_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::B)
+}
+
+const fn default_toggle_right_sidebar_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::E)
+}
+
+const fn default_focus_actions_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Space)
+}
+
+const fn default_focus_chat_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Tab)
+}
+
+const fn default_focus_highlight_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num1)
+}
+
+const fn default_focus_note_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num2)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -135,6 +207,8 @@ struct StoredReaderPreferences {
     reading_mode: StoredReadingMode,
     #[serde(default)]
     selection_granularity: StoredSelectionGranularity,
+    #[serde(default)]
+    shortcuts: ShortcutPreferences,
 }
 
 fn default_typesetting() -> ReaderTypesetting {
@@ -304,6 +378,7 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
         reading_mode: stored.reading_mode.into(),
         theme: stored.theme.into(),
         selection_granularity: stored.selection_granularity.into(),
+        shortcuts: stored.shortcuts,
     })
 }
 
@@ -328,6 +403,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
         reading_mode: preferences.reading_mode.into(),
         theme: preferences.theme.into(),
         selection_granularity: preferences.selection_granularity.into(),
+        shortcuts: preferences.shortcuts.clone(),
     };
     write_json_atomic(path, &stored)?;
     Ok(())
@@ -369,6 +445,13 @@ mod tests {
             reading_mode: ReadingMode::Focus,
             theme: AppTheme::Dark,
             selection_granularity: SelectionGranularity::Sentence,
+            shortcuts: ShortcutPreferences {
+                toggle_left_sidebar: egui::KeyboardShortcut::new(
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    egui::Key::L,
+                ),
+                ..ShortcutPreferences::default()
+            },
         };
         save_to(&path, &preferences).unwrap();
         let loaded = load_from(path.clone()).unwrap();
@@ -391,6 +474,13 @@ mod tests {
         assert_eq!(loaded.reading_mode, ReadingMode::Focus);
         assert_eq!(loaded.theme, AppTheme::Dark);
         assert_eq!(loaded.selection_granularity, SelectionGranularity::Sentence);
+        assert_eq!(
+            loaded.shortcuts.toggle_left_sidebar,
+            egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::L
+            )
+        );
         fs::remove_file(path).unwrap();
     }
 
@@ -408,6 +498,24 @@ mod tests {
             stored.selection_granularity,
             StoredSelectionGranularity::Free
         ));
+        assert_eq!(stored.shortcuts, ShortcutPreferences::default());
+    }
+
+    #[test]
+    fn shortcut_defaults_match_the_reader_contract_and_detect_conflicts() {
+        let mut shortcuts = ShortcutPreferences::default();
+        assert_eq!(
+            shortcuts.toggle_left_sidebar,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::B)
+        );
+        assert_eq!(
+            shortcuts.toggle_right_sidebar,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::E)
+        );
+        assert!(!shortcuts.has_conflicts());
+
+        shortcuts.focus_note = shortcuts.focus_highlight;
+        assert!(shortcuts.has_conflicts());
     }
 
     #[test]

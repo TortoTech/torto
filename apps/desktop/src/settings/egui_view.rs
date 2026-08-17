@@ -1,7 +1,7 @@
 use egui::{Align2, Color32, Response, RichText, Vec2};
 use rebook_layout::{ParagraphIndentMode, ReaderDefaultFont, SpreadMode, TypesettingMode};
 
-use super::{SettingsFeature, SettingsTab};
+use super::{SettingsFeature, SettingsTab, ShortcutAction};
 use crate::plugins::{
     AiModelConfig, AiProviderKind, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN,
     CHAT_TOOL_STEPS_MAX, CHAT_TOOL_STEPS_MIN, PdfOcrProviderKind, PluginSettings,
@@ -121,8 +121,19 @@ fn settings_sidebar(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     );
     ui.add_space(18.0);
     for (tab, glyph, zh, en) in [
-        (SettingsTab::Reading, Icon::BookOpen, "阅读", "Reading"),
-        (SettingsTab::Font, Icon::Type, "字体", "Font"),
+        (SettingsTab::System, Icon::Settings, "系统", "System"),
+        (
+            SettingsTab::Typography,
+            Icon::BookOpen,
+            "排版",
+            "Typography",
+        ),
+        (
+            SettingsTab::Shortcuts,
+            Icon::Keyboard,
+            "快捷键",
+            "Shortcuts",
+        ),
         (SettingsTab::Ai, Icon::Server, "AI 提供商", "AI providers"),
         (SettingsTab::AiChat, Icon::Bot, "AI 对话", "AI chat"),
         (SettingsTab::Ocr, Icon::ScanText, "OCR", "OCR"),
@@ -138,6 +149,7 @@ fn settings_sidebar(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         let selected = state.settings_tab == tab;
         if navigation_button(ui, glyph, state.draft_language.text(zh, en), selected).clicked() {
             state.settings_tab = tab;
+            state.capturing_shortcut = None;
         }
         ui.add_space(3.0);
     }
@@ -162,8 +174,9 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             let title = match state.settings_tab {
-                SettingsTab::Reading => state.draft_language.text("阅读设置", "Reading"),
-                SettingsTab::Font => state.draft_language.text("字体", "Font"),
+                SettingsTab::System => state.draft_language.text("系统", "System"),
+                SettingsTab::Typography => state.draft_language.text("排版", "Typography"),
+                SettingsTab::Shortcuts => state.draft_language.text("快捷键", "Shortcuts"),
                 SettingsTab::Ai => state.draft_language.text("AI 提供商", "AI providers"),
                 SettingsTab::AiChat => state.draft_language.text("AI 对话", "AI chat"),
                 SettingsTab::Ocr => "OCR",
@@ -198,8 +211,9 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             ui.set_width(content_width);
             ui.add_space(12.0);
             ui.vertical(|ui| match state.settings_tab {
-                SettingsTab::Reading => reading_settings(ui, state),
-                SettingsTab::Font => font_settings(ui, state),
+                SettingsTab::System => system_settings(ui, state),
+                SettingsTab::Typography => typography_settings(ui, state),
+                SettingsTab::Shortcuts => shortcut_settings(ui, state),
                 SettingsTab::Ai => ai_provider_settings(ui, state),
                 SettingsTab::AiChat => ai_chat_settings(ui, state),
                 SettingsTab::Ocr => ocr_settings(ui, state),
@@ -238,6 +252,188 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             }
         },
     );
+}
+
+fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
+    capture_shortcut_input(ui, state);
+    let language = state.draft_language;
+    shortcut_group(
+        ui,
+        state,
+        "layout-shortcuts-grid",
+        language.text("布局", "Layout"),
+        &[
+            (
+                ShortcutAction::ToggleLeftSidebar,
+                language.text("切换左侧边栏", "Toggle left sidebar"),
+            ),
+            (
+                ShortcutAction::ToggleRightSidebar,
+                language.text("切换右侧边栏", "Toggle right sidebar"),
+            ),
+        ],
+    );
+    ui.add_space(12.0);
+    shortcut_group(
+        ui,
+        state,
+        "focus-shortcuts-grid",
+        language.text("专注模式", "Focus mode"),
+        &[
+            (
+                ShortcutAction::FocusActions,
+                language.text("呼出工具栏", "Show action toolbar"),
+            ),
+            (
+                ShortcutAction::FocusChat,
+                language.text("激活 AI 输入框", "Focus AI input"),
+            ),
+            (
+                ShortcutAction::FocusHighlight,
+                language.text("高亮当前段落", "Highlight current paragraph"),
+            ),
+            (
+                ShortcutAction::FocusNote,
+                language.text("呼出批注输入框", "Open note input"),
+            ),
+        ],
+    );
+    ui.add_space(12.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if secondary_button(ui, language.text("恢复默认", "Restore defaults")).clicked() {
+            state.draft_shortcuts = crate::preferences::ShortcutPreferences::default();
+            state.capturing_shortcut = None;
+            state.error = None;
+        }
+    });
+    if state.draft_shortcuts.has_conflicts() {
+        ui.add_space(8.0);
+        ui.colored_label(
+            palette().error,
+            language.text(
+                "快捷键存在重复，请重新设置冲突项",
+                "Some shortcuts conflict. Reassign the conflicting actions.",
+            ),
+        );
+    }
+}
+
+fn shortcut_group(
+    ui: &mut egui::Ui,
+    state: &mut SettingsFeature,
+    grid_id: &'static str,
+    title: &str,
+    actions: &[(ShortcutAction, &str)],
+) {
+    settings_card(ui, |ui| {
+        ui.label(
+            RichText::new(title)
+                .strong()
+                .size(crate::ui::scaled_font_size(14.0))
+                .color(palette().text),
+        );
+        ui.add_space(4.0);
+        egui::Grid::new(grid_id)
+            .num_columns(2)
+            .spacing([24.0, 12.0])
+            .show(ui, |ui| {
+                for &(action, label) in actions {
+                    settings_row_label(ui, label);
+                    settings_row_control_sized(ui, 180.0, |ui| {
+                        shortcut_binding_button(ui, state, action);
+                    });
+                    ui.end_row();
+                }
+            });
+    });
+}
+
+fn shortcut_binding_button(ui: &mut egui::Ui, state: &mut SettingsFeature, action: ShortcutAction) {
+    let capturing = state.capturing_shortcut == Some(action);
+    let label = if capturing {
+        state
+            .draft_language
+            .text("请按快捷键…", "Press shortcut…")
+            .into()
+    } else {
+        ui.ctx()
+            .format_shortcut(&action.binding(&state.draft_shortcuts))
+    };
+    let response = ui
+        .add_sized(
+            [180.0, 32.0],
+            egui::Button::new(RichText::new(label).color(if capturing {
+                palette().surface
+            } else {
+                palette().text
+            }))
+            .fill(if capturing {
+                palette().accent
+            } else {
+                palette().surface_muted
+            })
+            .stroke(egui::Stroke::new(
+                1.0,
+                if capturing {
+                    palette().accent
+                } else {
+                    palette().border
+                },
+            ))
+            .corner_radius(6),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked() {
+        state.capturing_shortcut = if capturing { None } else { Some(action) };
+    }
+}
+
+fn capture_shortcut_input(ui: &mut egui::Ui, state: &mut SettingsFeature) {
+    let Some(action) = state.capturing_shortcut else {
+        return;
+    };
+    let captured = ui.input_mut(|input| {
+        let captured = input.events.iter().find_map(|event| {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } = event
+            else {
+                return None;
+            };
+            Some((*key, *modifiers))
+        });
+        if let Some((key, modifiers)) = captured {
+            input.consume_key(modifiers, key);
+        }
+        captured
+    });
+    let Some((key, modifiers)) = captured else {
+        return;
+    };
+    if key == egui::Key::Escape {
+        state.capturing_shortcut = None;
+        return;
+    }
+    action.set_binding(
+        &mut state.draft_shortcuts,
+        egui::KeyboardShortcut::new(canonical_shortcut_modifiers(modifiers), key),
+    );
+    state.capturing_shortcut = None;
+    state.error = None;
+}
+
+fn canonical_shortcut_modifiers(modifiers: egui::Modifiers) -> egui::Modifiers {
+    egui::Modifiers {
+        alt: modifiers.alt,
+        ctrl: modifiers.ctrl,
+        shift: modifiers.shift,
+        mac_cmd: modifiers.mac_cmd,
+        command: modifiers.command && !modifiers.ctrl && !modifiers.mac_cmd,
+    }
 }
 
 fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
@@ -338,74 +534,12 @@ fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     clippy::too_many_lines,
     reason = "reader preferences are rendered as one cohesive settings grid"
 )]
-fn reading_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
+fn system_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     settings_card(ui, |ui| {
-        egui::Grid::new("reading-settings-grid")
+        egui::Grid::new("system-settings-grid")
             .num_columns(2)
             .spacing([24.0, 16.0])
             .show(ui, |ui| {
-                settings_row_label(ui, state.draft_language.text("阅读模式", "Reading mode"));
-                settings_row_control_sized(ui, 250.0, |ui| {
-                    let classic = state.draft_reading_mode == ReadingMode::Classic;
-                    if choice_button(
-                        ui,
-                        state.draft_language.text("经典", "Classic"),
-                        classic,
-                        72.0,
-                    )
-                    .clicked()
-                    {
-                        state.draft_reading_mode = ReadingMode::Classic;
-                    }
-                    let focus = state.draft_reading_mode == ReadingMode::Focus;
-                    if choice_button(ui, state.draft_language.text("专注", "Focus"), focus, 72.0)
-                        .clicked()
-                    {
-                        state.draft_reading_mode = ReadingMode::Focus;
-                    }
-                });
-                ui.end_row();
-
-                if state.draft_reading_mode == ReadingMode::Classic {
-                    settings_row_label(ui, state.draft_language.text("分页模式", "Page layout"));
-                    settings_row_control_sized(ui, 250.0, |ui| {
-                        let single = state.draft_spread == SpreadMode::Single;
-                        if choice_button(
-                            ui,
-                            state.draft_language.text("单页", "Single"),
-                            single,
-                            72.0,
-                        )
-                        .clicked()
-                        {
-                            state.draft_spread = SpreadMode::Single;
-                        }
-                        let double = state.draft_spread == SpreadMode::Double;
-                        if choice_button(
-                            ui,
-                            state.draft_language.text("双页", "Double"),
-                            double,
-                            72.0,
-                        )
-                        .clicked()
-                        {
-                            state.draft_spread = SpreadMode::Double;
-                        }
-                        let scroll = state.draft_spread == SpreadMode::Scroll;
-                        if choice_button(
-                            ui,
-                            state.draft_language.text("滑动", "Scroll"),
-                            scroll,
-                            72.0,
-                        )
-                        .clicked()
-                        {
-                            state.draft_spread = SpreadMode::Scroll;
-                        }
-                    });
-                    ui.end_row();
-                }
-
                 settings_row_label(ui, state.draft_language.text("主题", "Theme"));
                 settings_row_control_sized(ui, 250.0, |ui| {
                     let light = state.draft_theme == AppTheme::Light;
@@ -445,57 +579,18 @@ fn reading_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         });
                 });
                 ui.end_row();
-            });
-    });
-}
 
-fn font_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
-    let language = state.draft_language;
-    interface_font_settings(
-        ui,
-        language,
-        &mut state.draft_interface_typography,
-        &state.available_interface_font_families,
-    );
-    ui.add_space(12.0);
-    reader_font_settings(
-        ui,
-        language,
-        &mut state.draft_typography,
-        &state.available_font_families,
-    );
-    ui.add_space(12.0);
-    reader_typesetting_settings(ui, language, &mut state.draft_typesetting);
-}
-
-fn interface_font_settings(
-    ui: &mut egui::Ui,
-    language: AppLanguage,
-    interface_typography: &mut crate::preferences::InterfaceTypography,
-    interface_font_families: &[String],
-) {
-    settings_card(ui, |ui| {
-        ui.label(
-            RichText::new(language.text("界面与 AI 对话", "Interface and AI chat"))
-                .strong()
-                .color(palette().text),
-        );
-        ui.add_space(12.0);
-        egui::Grid::new("interface-font-settings-grid")
-            .num_columns(2)
-            .spacing([24.0, 16.0])
-            .show(ui, |ui| {
                 font_family_row(
                     ui,
-                    language.text("界面字体", "Interface font"),
+                    state.draft_language.text("界面字体", "Interface font"),
                     "settings-interface-font",
-                    &mut interface_typography.font_family,
-                    interface_font_families,
+                    &mut state.draft_interface_typography.font_family,
+                    &state.available_interface_font_families,
                 );
                 settings_slider_row(
                     ui,
-                    language.text("界面字号", "Interface font size"),
-                    &mut interface_typography.font_size,
+                    state.draft_language.text("界面字号", "Interface font size"),
+                    &mut state.draft_interface_typography.font_size,
                     10.0,
                     24.0,
                     1.0,
@@ -505,9 +600,25 @@ fn interface_font_settings(
     });
 }
 
+fn typography_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
+    let language = state.draft_language;
+    reader_font_settings(
+        ui,
+        language,
+        &mut state.draft_reading_mode,
+        &mut state.draft_spread,
+        &mut state.draft_typography,
+        &state.available_font_families,
+    );
+    ui.add_space(12.0);
+    reader_typesetting_settings(ui, language, &mut state.draft_typesetting);
+}
+
 fn reader_font_settings(
     ui: &mut egui::Ui,
     language: AppLanguage,
+    reading_mode: &mut ReadingMode,
+    spread: &mut SpreadMode,
     typography: &mut rebook_layout::ReaderTypography,
     font_families: &[String],
 ) {
@@ -522,6 +633,45 @@ fn reader_font_settings(
             .num_columns(2)
             .spacing([24.0, 16.0])
             .show(ui, |ui| {
+                settings_row_label(ui, language.text("阅读模式", "Reading mode"));
+                settings_row_control_sized(ui, 250.0, |ui| {
+                    let classic = *reading_mode == ReadingMode::Classic;
+                    if choice_button(ui, language.text("经典", "Classic"), classic, 72.0).clicked()
+                    {
+                        *reading_mode = ReadingMode::Classic;
+                    }
+                    let focus = *reading_mode == ReadingMode::Focus;
+                    if choice_button(ui, language.text("专注", "Focus"), focus, 72.0).clicked() {
+                        *reading_mode = ReadingMode::Focus;
+                    }
+                });
+                ui.end_row();
+
+                if *reading_mode == ReadingMode::Classic {
+                    settings_row_label(ui, language.text("分页模式", "Page layout"));
+                    settings_row_control_sized(ui, 250.0, |ui| {
+                        let single = *spread == SpreadMode::Single;
+                        if choice_button(ui, language.text("单页", "Single"), single, 72.0)
+                            .clicked()
+                        {
+                            *spread = SpreadMode::Single;
+                        }
+                        let double = *spread == SpreadMode::Double;
+                        if choice_button(ui, language.text("双页", "Double"), double, 72.0)
+                            .clicked()
+                        {
+                            *spread = SpreadMode::Double;
+                        }
+                        let scroll = *spread == SpreadMode::Scroll;
+                        if choice_button(ui, language.text("滑动", "Scroll"), scroll, 72.0)
+                            .clicked()
+                        {
+                            *spread = SpreadMode::Scroll;
+                        }
+                    });
+                    ui.end_row();
+                }
+
                 settings_row_label(ui, language.text("默认字体", "Default font"));
                 settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
                     let serif = typography.default_font == ReaderDefaultFont::Serif;
@@ -1475,5 +1625,25 @@ mod tests {
             assert!((fixed.rect.width() - 72.0).abs() < 0.01);
             assert!((fixed.rect.height() - 32.0).abs() < 0.01);
         });
+    }
+
+    #[test]
+    fn captured_shortcuts_drop_the_cross_platform_command_alias() {
+        assert_eq!(
+            canonical_shortcut_modifiers(egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            }),
+            egui::Modifiers::CTRL
+        );
+        assert_eq!(
+            canonical_shortcut_modifiers(egui::Modifiers {
+                mac_cmd: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            }),
+            egui::Modifiers::MAC_CMD
+        );
     }
 }

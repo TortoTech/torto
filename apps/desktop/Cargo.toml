@@ -38,7 +38,7 @@ base64.workspace = true
 bytemuck.workspace = true
 bytes.workspace = true
 directories.workspace = true
-egui.workspace = true
+egui = { workspace = true, features = ["serde"] }
 egui_commonmark.workspace = true
 egui_commonmark_backend.workspace = true
 egui_extras.workspace = true

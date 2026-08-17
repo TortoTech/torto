@@ -672,32 +672,12 @@ impl ShelfFeature {
 
     fn shelf_header(&mut self, ui: &mut egui::Ui) {
         let book_count = self.shelf.library.books().len();
+        let search_hint = shelf_search_hint(self.language, book_count);
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), 44.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.add(icon(Icon::BookOpen).size(23.0).color(palette().accent));
-                ui.label(
-                    RichText::new(self.language.text("书架", "Library"))
-                        .size(crate::ui::scaled_font_size(22.0))
-                        .strong()
-                        .color(palette().text),
-                );
-                ui.label(
-                    RichText::new(match self.language {
-                        AppLanguage::SimplifiedChinese => format!("{book_count} 本"),
-                        AppLanguage::English => format!("{book_count} books"),
-                    })
-                    .size(crate::ui::scaled_font_size(12.0))
-                    .color(palette().muted),
-                );
-                ui.add_space(22.0);
-                shelf_search_field(
-                    ui,
-                    &mut self.shelf.query,
-                    self.language
-                        .text("搜索书名或作者", "Search title or author"),
-                );
+                shelf_search_field(ui, &mut self.shelf.query, &search_hint);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, Icon::Settings)
                         .on_hover_text(self.language.text("设置", "Settings"))
@@ -1097,6 +1077,16 @@ fn book_matches_query(book: &LibraryBook, query: &str) -> bool {
             .any(|author| author.to_lowercase().contains(query))
 }
 
+fn shelf_search_hint(language: AppLanguage, book_count: usize) -> String {
+    match language {
+        AppLanguage::SimplifiedChinese => {
+            format!("从{book_count}本书籍中搜索书名或作者")
+        }
+        AppLanguage::English if book_count == 1 => "Search title or author in 1 book".into(),
+        AppLanguage::English => format!("Search titles or authors in {book_count} books"),
+    }
+}
+
 fn sort_shelf_books(books: &mut [LibraryBook], read_activity: &HashMap<String, u64>) {
     books.sort_by(|left, right| {
         match (read_activity.get(&left.id), read_activity.get(&right.id)) {
@@ -1159,6 +1149,22 @@ mod tests {
                 .map(|book| book.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["new", "middle", "old"]
+        );
+    }
+
+    #[test]
+    fn shelf_search_hint_includes_the_library_book_count() {
+        assert_eq!(
+            shelf_search_hint(AppLanguage::SimplifiedChinese, 27),
+            "从27本书籍中搜索书名或作者"
+        );
+        assert_eq!(
+            shelf_search_hint(AppLanguage::English, 1),
+            "Search title or author in 1 book"
+        );
+        assert_eq!(
+            shelf_search_hint(AppLanguage::English, 27),
+            "Search titles or authors in 27 books"
         );
     }
 }

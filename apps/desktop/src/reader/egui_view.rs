@@ -44,9 +44,6 @@ const ASSISTANT_SELECTION_SCROLL_EDGE: f32 = 36.0;
 const ASSISTANT_SELECTION_SCROLL_MIN_SPEED: f32 = 90.0;
 const ASSISTANT_SELECTION_SCROLL_MAX_SPEED: f32 = 640.0;
 const ASSISTANT_KEYBOARD_SCROLL_STEP: f32 = 64.0;
-const FOCUS_ACTIONS_SHORTCUT: egui::Key = egui::Key::Space;
-const FOCUS_CHAT_SHORTCUT: egui::Key = egui::Key::Tab;
-const FOCUS_TOOL_SHORTCUTS: [egui::Key; 2] = [egui::Key::Num1, egui::Key::Num2];
 const TOOLBAR_HEIGHT: f32 = 48.0;
 const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
 const TOOLBAR_TITLE_SIZE: f32 = 15.0;
@@ -734,14 +731,16 @@ impl DesktopReader {
                 return;
             }
         }
+        if self.layout_shortcut(ctx, interaction_blocked) {
+            return;
+        }
         if self.focus_action_shortcut(ctx, interaction_blocked) {
             return;
         }
         // Focus-mode reading shortcuts are handled before the generic keyboard-focus
         // guard so a stale TextEdit focus cannot intermittently swallow them.
         if self.focus_body_accepts_shortcuts(interaction_blocked)
-            && ctx
-                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, FOCUS_ACTIONS_SHORTCUT))
+            && ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_actions))
         {
             self.ui.focus_actions_visible = true;
             self.cancel_text_selection();
@@ -749,7 +748,7 @@ impl DesktopReader {
             return;
         }
         if self.focus_body_accepts_shortcuts(interaction_blocked)
-            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, FOCUS_CHAT_SHORTCUT))
+            && ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_chat))
         {
             self.ui.focus_actions_visible = false;
             self.cancel_text_selection();
@@ -781,6 +780,38 @@ impl DesktopReader {
             return;
         }
         self.reading_navigation_shortcuts(ctx);
+    }
+
+    fn layout_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
+        if interaction_blocked
+            || self.ui.overlay_visible()
+            || self.image_preview.is_some()
+            || self.annotation_note_draft.is_some()
+            || ctx.text_edit_focused()
+        {
+            return false;
+        }
+        let action = ctx.input_mut(|input| {
+            if input.consume_shortcut(&self.shortcuts.toggle_left_sidebar) {
+                Some(0)
+            } else if input.consume_shortcut(&self.shortcuts.toggle_right_sidebar) {
+                Some(1)
+            } else {
+                None
+            }
+        });
+        match action {
+            Some(0) => self.set_sidebar_open(!self.ui.sidebar_open),
+            Some(1) => {
+                if self.is_focus_mode() && self.ui.assistant_motion.target <= 0.5 {
+                    self.attach_current_focus_reference();
+                }
+                self.toggle_assistant_panel(AssistantPanel::Chat);
+            }
+            Some(_) => unreachable!(),
+            None => return false,
+        }
+        true
     }
 
     fn reading_navigation_shortcuts(&mut self, ctx: &egui::Context) {
@@ -893,9 +924,13 @@ impl DesktopReader {
             return false;
         }
         let action = ctx.input_mut(|input| {
-            FOCUS_TOOL_SHORTCUTS
-                .into_iter()
-                .position(|key| input.consume_key(egui::Modifiers::NONE, key))
+            if input.consume_shortcut(&self.shortcuts.focus_highlight) {
+                Some(0)
+            } else if input.consume_shortcut(&self.shortcuts.focus_note) {
+                Some(1)
+            } else {
+                None
+            }
         });
         match action {
             Some(0) if !self.current_focus_unit_is_image() => {
@@ -1585,6 +1620,24 @@ impl DesktopReader {
         let mut save_note = false;
         let mut cancel_note = false;
         let can_annotate = !self.current_focus_unit_is_image();
+        let chat_hover = shortcut_tooltip(
+            self.language,
+            "聊天",
+            "Chat",
+            &ctx.format_shortcut(&self.shortcuts.focus_chat),
+        );
+        let highlight_hover = shortcut_tooltip(
+            self.language,
+            "高亮",
+            "Highlight",
+            &ctx.format_shortcut(&self.shortcuts.focus_highlight),
+        );
+        let note_hover = shortcut_tooltip(
+            self.language,
+            "添加批注",
+            "Add note",
+            &ctx.format_shortcut(&self.shortcuts.focus_note),
+        );
         let area = egui::Area::new("focus-actions".into())
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))
@@ -1602,14 +1655,14 @@ impl DesktopReader {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
                         chat = icon_button(ui, Icon::MessageCircle)
-                            .on_hover_text(self.language.text("聊天（Tab）", "Chat (Tab)"))
+                            .on_hover_text(&chat_hover)
                             .clicked();
                         ui.add_enabled_ui(can_annotate, |ui| {
                             highlight = icon_button(ui, Icon::Highlighter)
-                                .on_hover_text(self.language.text("高亮（1）", "Highlight (1)"))
+                                .on_hover_text(&highlight_hover)
                                 .clicked();
                             open_note = icon_button(ui, Icon::MessageSquarePlus)
-                                .on_hover_text(self.language.text("添加批注（2）", "Add note (2)"))
+                                .on_hover_text(&note_hover)
                                 .clicked();
                         });
                     });
@@ -4241,6 +4294,18 @@ fn consume_copy_event(events: &mut Vec<egui::Event>) -> bool {
     true
 }
 
+fn shortcut_tooltip(
+    language: AppLanguage,
+    simplified_chinese: &str,
+    english: &str,
+    shortcut: &str,
+) -> String {
+    match language {
+        AppLanguage::SimplifiedChinese => format!("{simplified_chinese}（{shortcut}）"),
+        AppLanguage::English => format!("{english} ({shortcut})"),
+    }
+}
+
 struct ImagePreviewInteraction {
     close: bool,
     reset: bool,
@@ -4456,9 +4521,23 @@ mod reference_suggestion_label_tests {
 
     #[test]
     fn focus_mode_shortcuts_match_the_reader_contract() {
-        assert_eq!(FOCUS_ACTIONS_SHORTCUT, egui::Key::Space);
-        assert_eq!(FOCUS_CHAT_SHORTCUT, egui::Key::Tab);
-        assert_eq!(FOCUS_TOOL_SHORTCUTS, [egui::Key::Num1, egui::Key::Num2]);
+        let shortcuts = crate::preferences::ShortcutPreferences::default();
+        assert_eq!(
+            shortcuts.focus_actions,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Space)
+        );
+        assert_eq!(
+            shortcuts.focus_chat,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Tab)
+        );
+        assert_eq!(
+            shortcuts.focus_highlight,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num1)
+        );
+        assert_eq!(
+            shortcuts.focus_note,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num2)
+        );
     }
 
     #[test]

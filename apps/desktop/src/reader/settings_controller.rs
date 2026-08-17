@@ -148,6 +148,7 @@ impl DesktopReader {
             Ok(snapshot) => {
                 self.plugin_settings = plugin_settings;
                 self.language = language;
+                self.shortcuts.clone_from(&settings.shortcuts);
                 if mode_changed {
                     if !self.is_focus_mode() {
                         self.restore_book_chat_session();
