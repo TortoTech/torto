@@ -731,6 +731,9 @@ impl DesktopReader {
                 return;
             }
         }
+        if self.operation_shortcut(ctx, interaction_blocked) {
+            return;
+        }
         if self.layout_shortcut(ctx, interaction_blocked) {
             return;
         }
@@ -780,6 +783,33 @@ impl DesktopReader {
             return;
         }
         self.reading_navigation_shortcuts(ctx);
+    }
+
+    fn operation_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
+        if interaction_blocked
+            || self.ui.overlay_visible()
+            || self.image_preview.is_some()
+            || self.annotation_note_draft.is_some()
+            || ctx.text_edit_focused()
+        {
+            return false;
+        }
+        let action = ctx.input_mut(|input| {
+            if input.consume_shortcut(&self.shortcuts.toggle_translation) {
+                Some(0)
+            } else if input.consume_shortcut(&self.shortcuts.return_to_shelf) {
+                Some(1)
+            } else {
+                None
+            }
+        });
+        match action {
+            Some(0) => self.toggle_translation(),
+            Some(1) => self.request_exit(),
+            Some(_) => unreachable!(),
+            None => return false,
+        }
+        true
     }
 
     fn layout_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
@@ -2025,13 +2055,14 @@ impl DesktopReader {
                     self.language
                         .text("编辑 AI 目录", "Edit generated contents"),
                 );
-                let entry_count = match self.language {
+                let entry_count = match self.language.resolved() {
                     crate::preferences::AppLanguage::SimplifiedChinese => {
                         format!("{} 个条目", draft.entries.len())
                     }
                     crate::preferences::AppLanguage::English => {
                         format!("{} entries", draft.entries.len())
                     }
+                    crate::preferences::AppLanguage::System => unreachable!(),
                 };
                 ui.label(
                     RichText::new(format!(
@@ -2223,7 +2254,7 @@ impl DesktopReader {
             |ui| {
                 ui.add(icon(Icon::MessageCircle).color(palette().muted));
                 ui.label(
-                    RichText::new(self.language.text("AI 对话", "AI chat"))
+                    RichText::new(self.language.text("对话", "Chat"))
                         .size(crate::ui::scaled_font_size(14.0))
                         .strong()
                         .color(palette().text),
@@ -2399,13 +2430,14 @@ impl DesktopReader {
             .inner_margin(9)
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new(match self.language {
+                    RichText::new(match self.language.resolved() {
                         crate::preferences::AppLanguage::SimplifiedChinese => {
                             format!("AI 请求执行 {count} 项批注操作")
                         }
                         crate::preferences::AppLanguage::English => {
                             format!("AI requested {count} annotation action(s)")
                         }
+                        crate::preferences::AppLanguage::System => unreachable!(),
                     })
                     .size(crate::ui::scaled_font_size(12.0))
                     .color(palette().text),
@@ -2756,25 +2788,30 @@ impl DesktopReader {
                             };
                             self.request_settings_change(ReaderSettingsChange::Spread(spread));
                         }
-                        let dark_mode = crate::ui::theme() == AppTheme::Dark;
+                        let theme = crate::ui::theme_preference();
                         if navigation_button(
                             ui,
-                            if dark_mode { Icon::Moon } else { Icon::Sun },
-                            if dark_mode {
-                                self.language.text("黑夜模式", "Dark mode")
-                            } else {
-                                self.language.text("浅色模式", "Light mode")
+                            match theme {
+                                AppTheme::System => Icon::Monitor,
+                                AppTheme::Light => Icon::Sun,
+                                AppTheme::Dark => Icon::Moon,
+                            },
+                            match theme {
+                                AppTheme::System => {
+                                    self.language.text("跟随系统", "Follow system")
+                                }
+                                AppTheme::Light => {
+                                    self.language.text("浅色模式", "Light mode")
+                                }
+                                AppTheme::Dark => {
+                                    self.language.text("黑夜模式", "Dark mode")
+                                }
                             },
                             false,
                         )
                         .clicked()
                         {
-                            let theme = if dark_mode {
-                                AppTheme::Light
-                            } else {
-                                AppTheme::Dark
-                            };
-                            self.request_settings_change(ReaderSettingsChange::Theme(theme));
+                            self.request_settings_change(ReaderSettingsChange::Theme(theme.next()));
                         }
                         if !self.is_focus_mode() {
                             self.selection_mode_menu(ui);
@@ -3608,11 +3645,11 @@ fn chat_reference_chips(
     removed
 }
 
-const fn chat_reference_kind_label(
+fn chat_reference_kind_label(
     language: crate::preferences::AppLanguage,
     kind: ChatReferenceKind,
 ) -> &'static str {
-    match (language, kind) {
+    match (language.resolved(), kind) {
         (crate::preferences::AppLanguage::SimplifiedChinese, ChatReferenceKind::Book) => "全文",
         (crate::preferences::AppLanguage::SimplifiedChinese, ChatReferenceKind::Section) => "章节",
         (crate::preferences::AppLanguage::SimplifiedChinese, ChatReferenceKind::Paragraph) => {
@@ -3621,6 +3658,7 @@ const fn chat_reference_kind_label(
         (crate::preferences::AppLanguage::English, ChatReferenceKind::Book) => "Book",
         (crate::preferences::AppLanguage::English, ChatReferenceKind::Section) => "Chapter",
         (crate::preferences::AppLanguage::English, ChatReferenceKind::Paragraph) => "Paragraph",
+        (crate::preferences::AppLanguage::System, _) => unreachable!(),
     }
 }
 
@@ -3687,9 +3725,10 @@ fn chat_reference_suggestion_label(
     if reference.kind != ChatReferenceKind::Book {
         return format!("{kind}  {}", reference.label);
     }
-    let fallback = match language {
+    let fallback = match language.resolved() {
         crate::preferences::AppLanguage::SimplifiedChinese => "整本书",
         crate::preferences::AppLanguage::English => "Entire book",
+        crate::preferences::AppLanguage::System => unreachable!(),
     };
     if reference.description == fallback {
         kind.to_owned()
@@ -4300,9 +4339,10 @@ fn shortcut_tooltip(
     english: &str,
     shortcut: &str,
 ) -> String {
-    match language {
+    match language.resolved() {
         AppLanguage::SimplifiedChinese => format!("{simplified_chinese}（{shortcut}）"),
         AppLanguage::English => format!("{english} ({shortcut})"),
+        AppLanguage::System => unreachable!(),
     }
 }
 

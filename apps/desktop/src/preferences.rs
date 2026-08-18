@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use directories::ProjectDirs;
 use rebook_layout::{ReaderTypesetting, ReaderTypography, SpreadMode};
@@ -19,6 +20,8 @@ pub type PreferencesResult<T> = Result<T, Box<dyn std::error::Error>>;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum AppLanguage {
     #[default]
+    #[serde(rename = "system")]
+    System,
     #[serde(rename = "zh-CN")]
     SimplifiedChinese,
     #[serde(rename = "en")]
@@ -26,32 +29,71 @@ pub(crate) enum AppLanguage {
 }
 
 impl AppLanguage {
-    pub(crate) const fn text(
+    pub(crate) fn text(
         self,
         simplified_chinese: &'static str,
         english: &'static str,
     ) -> &'static str {
-        match self {
+        match self.resolved() {
+            Self::System => unreachable!("resolved language cannot be system"),
             Self::SimplifiedChinese => simplified_chinese,
             Self::English => english,
         }
     }
 
-    pub(crate) const fn translation_target(self) -> &'static str {
-        match self {
+    pub(crate) fn translation_target(self) -> &'static str {
+        match self.resolved() {
+            Self::System => unreachable!("resolved language cannot be system"),
             Self::SimplifiedChinese => "简体中文",
             Self::English => "English",
         }
+    }
+
+    pub(crate) fn system_translation_target() -> &'static str {
+        SYSTEM_LANGUAGE.translation_target()
+    }
+
+    pub(crate) fn resolved(self) -> Self {
+        match self {
+            Self::System => *SYSTEM_LANGUAGE,
+            language => language,
+        }
+    }
+}
+
+static SYSTEM_LANGUAGE: LazyLock<AppLanguage> = LazyLock::new(|| {
+    sys_locale::get_locale()
+        .as_deref()
+        .map_or(AppLanguage::English, language_from_system_locale)
+});
+
+fn language_from_system_locale(locale: &str) -> AppLanguage {
+    if locale.trim().to_ascii_lowercase().starts_with("zh") {
+        AppLanguage::SimplifiedChinese
+    } else {
+        AppLanguage::English
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum AppTheme {
     #[default]
+    #[serde(rename = "system")]
+    System,
     #[serde(rename = "light")]
     Light,
     #[serde(rename = "dark")]
     Dark,
+}
+
+impl AppTheme {
+    pub(crate) const fn next(self) -> Self {
+        match self {
+            Self::System => Self::Light,
+            Self::Light => Self::Dark,
+            Self::Dark => Self::System,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -74,7 +116,7 @@ impl Default for ReaderPreferences {
             typography: ReaderTypography::default(),
             typesetting: ReaderTypesetting::unified(),
             language: AppLanguage::default(),
-            spread: SpreadMode::Double,
+            spread: SpreadMode::Single,
             reading_mode: ReadingMode::Focus,
             theme: AppTheme::default(),
             selection_granularity: SelectionGranularity::Free,
@@ -92,10 +134,16 @@ pub(crate) enum ReadingMode {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ShortcutPreferences {
+    #[serde(default = "default_fullscreen_shortcut")]
+    pub(crate) fullscreen: egui::KeyboardShortcut,
     #[serde(default = "default_toggle_left_sidebar_shortcut")]
     pub(crate) toggle_left_sidebar: egui::KeyboardShortcut,
     #[serde(default = "default_toggle_right_sidebar_shortcut")]
     pub(crate) toggle_right_sidebar: egui::KeyboardShortcut,
+    #[serde(default = "default_toggle_translation_shortcut")]
+    pub(crate) toggle_translation: egui::KeyboardShortcut,
+    #[serde(default = "default_return_to_shelf_shortcut")]
+    pub(crate) return_to_shelf: egui::KeyboardShortcut,
     #[serde(default = "default_focus_actions_shortcut")]
     pub(crate) focus_actions: egui::KeyboardShortcut,
     #[serde(default = "default_focus_chat_shortcut")]
@@ -108,26 +156,58 @@ pub(crate) struct ShortcutPreferences {
 
 impl ShortcutPreferences {
     pub(crate) fn has_conflicts(&self) -> bool {
-        let bindings = [
-            self.toggle_left_sidebar,
-            self.toggle_right_sidebar,
-            self.focus_actions,
-            self.focus_chat,
-            self.focus_highlight,
-            self.focus_note,
-        ];
+        let bindings = self.bindings();
         bindings
             .iter()
             .enumerate()
             .any(|(index, binding)| bindings[index + 1..].contains(binding))
     }
+
+    pub(crate) fn has_oversized_chords(&self) -> bool {
+        self.bindings()
+            .into_iter()
+            .any(|binding| shortcut_chord_key_count(binding.modifiers) > MAX_SHORTCUT_KEYS)
+    }
+
+    fn bindings(&self) -> [egui::KeyboardShortcut; 9] {
+        [
+            self.fullscreen,
+            self.toggle_left_sidebar,
+            self.toggle_right_sidebar,
+            self.toggle_translation,
+            self.return_to_shelf,
+            self.focus_actions,
+            self.focus_chat,
+            self.focus_highlight,
+            self.focus_note,
+        ]
+    }
+}
+
+pub(crate) const MAX_SHORTCUT_KEYS: usize = 3;
+
+pub(crate) fn shortcut_chord_key_count(modifiers: egui::Modifiers) -> usize {
+    let command_alias = modifiers.command && !modifiers.ctrl && !modifiers.mac_cmd;
+    1 + [
+        modifiers.alt,
+        modifiers.ctrl,
+        modifiers.shift,
+        modifiers.mac_cmd,
+        command_alias,
+    ]
+    .into_iter()
+    .filter(|enabled| *enabled)
+    .count()
 }
 
 impl Default for ShortcutPreferences {
     fn default() -> Self {
         Self {
+            fullscreen: default_fullscreen_shortcut(),
             toggle_left_sidebar: default_toggle_left_sidebar_shortcut(),
             toggle_right_sidebar: default_toggle_right_sidebar_shortcut(),
+            toggle_translation: default_toggle_translation_shortcut(),
+            return_to_shelf: default_return_to_shelf_shortcut(),
             focus_actions: default_focus_actions_shortcut(),
             focus_chat: default_focus_chat_shortcut(),
             focus_highlight: default_focus_highlight_shortcut(),
@@ -136,12 +216,24 @@ impl Default for ShortcutPreferences {
     }
 }
 
+const fn default_fullscreen_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::F11)
+}
+
 const fn default_toggle_left_sidebar_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::B)
 }
 
 const fn default_toggle_right_sidebar_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::E)
+}
+
+const fn default_toggle_translation_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::T)
+}
+
+const fn default_return_to_shelf_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Q)
 }
 
 const fn default_focus_actions_shortcut() -> egui::KeyboardShortcut {
@@ -244,8 +336,8 @@ impl From<ReadingMode> for StoredReadingMode {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum StoredSpreadMode {
-    Single,
     #[default]
+    Single,
     Double,
     Scroll,
 }
@@ -264,6 +356,7 @@ enum StoredSelectionGranularity {
 #[serde(rename_all = "lowercase")]
 enum StoredAppTheme {
     #[default]
+    System,
     Light,
     Dark,
     Glass,
@@ -272,6 +365,7 @@ enum StoredAppTheme {
 impl From<StoredAppTheme> for AppTheme {
     fn from(value: StoredAppTheme) -> Self {
         match value {
+            StoredAppTheme::System => Self::System,
             StoredAppTheme::Light | StoredAppTheme::Glass => Self::Light,
             StoredAppTheme::Dark => Self::Dark,
         }
@@ -281,6 +375,7 @@ impl From<StoredAppTheme> for AppTheme {
 impl From<AppTheme> for StoredAppTheme {
     fn from(value: AppTheme) -> Self {
         match value {
+            AppTheme::System => Self::System,
             AppTheme::Light => Self::Light,
             AppTheme::Dark => Self::Dark,
         }
@@ -330,7 +425,7 @@ impl From<SpreadMode> for StoredSpreadMode {
 }
 
 const fn default_spread() -> StoredSpreadMode {
-    StoredSpreadMode::Double
+    StoredSpreadMode::Single
 }
 
 pub(crate) fn load_reader_preferences() -> PreferencesResult<ReaderPreferences> {
@@ -485,15 +580,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_preferences_default_to_simplified_chinese() {
+    fn preferences_without_a_language_follow_the_system() {
         let json = r#"{"version":1}"#;
         let stored: StoredReaderPreferences = serde_json::from_str(json).unwrap();
-        assert_eq!(stored.language, AppLanguage::SimplifiedChinese);
+        assert_eq!(stored.language, AppLanguage::System);
         assert_eq!(stored.interface_typography, InterfaceTypography::default());
         assert_eq!(stored.typesetting.mode, TypesettingMode::Unified);
-        assert!(matches!(stored.spread, StoredSpreadMode::Double));
+        assert!(matches!(stored.spread, StoredSpreadMode::Single));
         assert!(matches!(stored.reading_mode, StoredReadingMode::Focus));
-        assert!(matches!(stored.theme, StoredAppTheme::Light));
+        assert!(matches!(stored.theme, StoredAppTheme::System));
         assert!(matches!(
             stored.selection_granularity,
             StoredSelectionGranularity::Free
@@ -502,8 +597,26 @@ mod tests {
     }
 
     #[test]
+    fn system_locale_is_resolved_to_a_supported_interface_language() {
+        assert_eq!(
+            language_from_system_locale("zh-CN"),
+            AppLanguage::SimplifiedChinese
+        );
+        assert_eq!(
+            language_from_system_locale("zh-TW"),
+            AppLanguage::SimplifiedChinese
+        );
+        assert_eq!(language_from_system_locale("en-US"), AppLanguage::English);
+        assert_eq!(AppLanguage::default(), AppLanguage::System);
+    }
+
+    #[test]
     fn shortcut_defaults_match_the_reader_contract_and_detect_conflicts() {
         let mut shortcuts = ShortcutPreferences::default();
+        assert_eq!(
+            shortcuts.fullscreen,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::F11)
+        );
         assert_eq!(
             shortcuts.toggle_left_sidebar,
             egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::B)
@@ -512,10 +625,25 @@ mod tests {
             shortcuts.toggle_right_sidebar,
             egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::E)
         );
+        assert_eq!(
+            shortcuts.toggle_translation,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::T)
+        );
+        assert_eq!(
+            shortcuts.return_to_shelf,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Q)
+        );
         assert!(!shortcuts.has_conflicts());
 
         shortcuts.focus_note = shortcuts.focus_highlight;
         assert!(shortcuts.has_conflicts());
+
+        shortcuts.focus_note = egui::KeyboardShortcut::new(
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT | egui::Modifiers::ALT,
+            egui::Key::N,
+        );
+        assert_eq!(shortcut_chord_key_count(shortcuts.focus_note.modifiers), 4);
+        assert!(shortcuts.has_oversized_chords());
     }
 
     #[test]
@@ -524,6 +652,13 @@ mod tests {
         let stored: StoredReaderPreferences = serde_json::from_str(json).unwrap();
 
         assert_eq!(AppTheme::from(stored.theme), AppTheme::Light);
+    }
+
+    #[test]
+    fn app_theme_cycles_through_system_light_and_dark() {
+        assert_eq!(AppTheme::System.next(), AppTheme::Light);
+        assert_eq!(AppTheme::Light.next(), AppTheme::Dark);
+        assert_eq!(AppTheme::Dark.next(), AppTheme::System);
     }
 
     #[test]

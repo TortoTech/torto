@@ -12,6 +12,7 @@ pub(crate) enum UserEvent {
     ShelfImport(crate::shelf::ShelfImportTaskMessage),
     ShelfSyncProgress(crate::shelf::SyncProgressMessage),
     ShelfSync(crate::shelf::SyncTaskMessage),
+    SettingsProviderModels(crate::settings::ProviderModelsMessage),
     ReaderSearch(crate::reader::SearchTaskMessage),
     ReaderChatStream(crate::reader::ChatStreamMessage),
     ReaderChat(crate::reader::ChatTaskMessage),

@@ -51,7 +51,7 @@ impl DesktopReader {
             &node,
             0,
             &unit.text,
-            self.language == crate::preferences::AppLanguage::English,
+            self.language.resolved() == crate::preferences::AppLanguage::English,
         );
         self.chat.references.push(ChatReference { id, ..reference });
         self.chat.move_cursor_to_end = true;
@@ -701,13 +701,14 @@ impl DesktopReader {
                         .text("没有找到匹配内容", "No matches found")
                         .into()
                 } else {
-                    match self.language {
+                    match self.language.resolved() {
                         crate::preferences::AppLanguage::SimplifiedChinese => {
                             format!("找到 {} 处结果", results.len())
                         }
                         crate::preferences::AppLanguage::English => {
                             format!("Found {} matches", results.len())
                         }
+                        crate::preferences::AppLanguage::System => unreachable!(),
                     }
                 };
                 self.search.results = results;
@@ -897,7 +898,7 @@ impl DesktopReader {
                 let prompt = build_chat_prompt_with_references(
                     &prompt,
                     &references,
-                    self.language == crate::preferences::AppLanguage::English,
+                    self.language.resolved() == crate::preferences::AppLanguage::English,
                 );
                 self.chat.input.clear();
                 self.chat.cursor_char_index = 0;
@@ -918,7 +919,7 @@ impl DesktopReader {
                 let prompt = build_chat_prompt_with_references(
                     &raw,
                     &references,
-                    self.language == crate::preferences::AppLanguage::English,
+                    self.language.resolved() == crate::preferences::AppLanguage::English,
                 );
                 self.chat.input.clear();
                 self.chat.cursor_char_index = 0;
@@ -996,7 +997,7 @@ impl DesktopReader {
             return;
         }
         let section_index = location.0;
-        let english = self.language == crate::preferences::AppLanguage::English;
+        let english = self.language.resolved() == crate::preferences::AppLanguage::English;
         let book_title = self.source.book().metadata.title.trim().to_owned();
         let mut options = vec![ChatReference {
             id: "book:full-text".into(),
@@ -1076,14 +1077,15 @@ impl DesktopReader {
             return;
         };
         let selected_text = selection.text.trim();
-        let english = self.language == crate::preferences::AppLanguage::English;
-        let question = match self.language {
+        let english = self.language.resolved() == crate::preferences::AppLanguage::English;
+        let question = match self.language.resolved() {
             crate::preferences::AppLanguage::SimplifiedChinese => format!(
                 "请结合所引用的原文语境解释选中的内容。说明它的直接含义、在本段中的作用，以及理解它所需的背景；不要脱离原文进行无依据推测。\n\n选中文字：\n{selected_text}"
             ),
             crate::preferences::AppLanguage::English => format!(
                 "Explain the selected text using the referenced source context. Cover its direct meaning, its role in the passage, and any background needed to understand it. Do not speculate beyond the source.\n\nSelected text:\n{selected_text}"
             ),
+            crate::preferences::AppLanguage::System => unreachable!(),
         };
         let references = selection_reference(
             self.source.as_ref(),
@@ -1349,7 +1351,7 @@ impl DesktopReader {
                                     self.rewrite_source.rollback(transaction).err()
                                 });
                             let language = self.language;
-                            let message = match (language, rollback_error) {
+                            let message = match (language.resolved(), rollback_error) {
                                 (
                                     crate::preferences::AppLanguage::SimplifiedChinese,
                                     Some(rollback_error),
@@ -1370,6 +1372,7 @@ impl DesktopReader {
                                 (crate::preferences::AppLanguage::English, None) => {
                                     format!("Failed to apply the content rewrite: {error}")
                                 }
+                                (crate::preferences::AppLanguage::System, _) => unreachable!(),
                             };
                             if let Some(chat) = self.chat_state_mut_by_session(session_id) {
                                 chat.error = Some(message);
@@ -1554,8 +1557,8 @@ impl DesktopReader {
         };
         self.translation.clear_error();
         let mut settings = self.plugin_settings.clone();
-        settings.target_language =
-            settings.resolved_target_language(self.language.translation_target());
+        settings.target_language = settings
+            .resolved_target_language(crate::preferences::AppLanguage::system_translation_target());
         self.translation.task.begin(TranslationTask {
             section_index,
             settings,
@@ -1589,8 +1592,8 @@ impl DesktopReader {
             return;
         }
         let mut settings = self.plugin_settings.clone();
-        settings.target_language =
-            settings.resolved_target_language(self.language.translation_target());
+        settings.target_language = settings
+            .resolved_target_language(crate::preferences::AppLanguage::system_translation_target());
         self.translation.toc_task.begin(TocTranslationTask {
             toc_ids,
             settings,

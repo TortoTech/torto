@@ -59,7 +59,7 @@ pub(crate) const CHAT_TOOL_STEPS_MIN: u16 = 1;
 pub(crate) const CHAT_TOOL_STEPS_MAX: u16 = 24;
 pub(crate) const CHAT_HISTORY_TURNS_MIN: u16 = 1;
 pub(crate) const CHAT_HISTORY_TURNS_MAX: u16 = 50;
-pub(crate) const TARGET_LANGUAGE_INTERFACE: &str = "interface";
+pub(crate) const TARGET_LANGUAGE_SYSTEM: &str = "system";
 pub(crate) const TARGET_LANGUAGE_SIMPLIFIED_CHINESE: &str = "zh-CN";
 pub(crate) const TARGET_LANGUAGE_ENGLISH: &str = "en";
 pub(crate) const PADDLE_OCR_JOBS_URL: &str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs";
@@ -167,8 +167,8 @@ impl AiModelConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TranslationMode {
-    Replace,
     #[default]
+    Replace,
     Bilingual,
 }
 
@@ -257,8 +257,8 @@ impl Default for PluginSettings {
             mineru_token: String::new(),
             translation_provider: DEFAULT_PROVIDER_ID.into(),
             translation_model: DEFAULT_MODEL.into(),
-            target_language: TARGET_LANGUAGE_INTERFACE.into(),
-            translation_mode: TranslationMode::Bilingual,
+            target_language: TARGET_LANGUAGE_SYSTEM.into(),
+            translation_mode: TranslationMode::Replace,
             translate_toc: true,
             chat_tool_defaults_version: CHAT_TOOL_DEFAULTS_VERSION,
             ocr_selection_defaults_version: 0,
@@ -429,27 +429,6 @@ impl PluginSettings {
         );
     }
 
-    pub fn remove_model(&mut self, provider_index: usize, model_index: usize) {
-        let Some(provider) = self.providers.get_mut(provider_index) else {
-            return;
-        };
-        if provider.models.len() <= 1 || model_index >= provider.models.len() {
-            return;
-        }
-        provider.models.remove(model_index);
-        normalize_selection(
-            &self.providers,
-            &mut self.chat_provider,
-            &mut self.chat_model,
-        );
-        normalize_selection(&self.providers, &mut self.ocr_provider, &mut self.ocr_model);
-        normalize_selection(
-            &self.providers,
-            &mut self.translation_provider,
-            &mut self.translation_model,
-        );
-    }
-
     pub fn chat_endpoint(&self) -> Result<(&AiProvider, &str), String> {
         self.endpoint(&self.chat_provider, &self.chat_model, "AI Chat")
     }
@@ -462,9 +441,9 @@ impl PluginSettings {
         self.endpoint(&self.translation_provider, &self.translation_model, "翻译")
     }
 
-    pub(crate) fn resolved_target_language(&self, interface_language: &str) -> String {
+    pub(crate) fn resolved_target_language(&self, system_language: &str) -> String {
         match self.target_language.as_str() {
-            TARGET_LANGUAGE_INTERFACE => interface_language.to_owned(),
+            TARGET_LANGUAGE_SYSTEM => system_language.to_owned(),
             TARGET_LANGUAGE_SIMPLIFIED_CHINESE => "简体中文".into(),
             TARGET_LANGUAGE_ENGLISH => "English".into(),
             custom => custom.to_owned(),
@@ -676,7 +655,7 @@ fn normalized_models(models: Vec<AiModelConfig>) -> Vec<AiModelConfig> {
 
 fn normalize_target_language(value: &str) -> String {
     match value.trim() {
-        "" | TARGET_LANGUAGE_INTERFACE => TARGET_LANGUAGE_INTERFACE.into(),
+        "" | "interface" | TARGET_LANGUAGE_SYSTEM => TARGET_LANGUAGE_SYSTEM.into(),
         "简体中文" | TARGET_LANGUAGE_SIMPLIFIED_CHINESE => {
             TARGET_LANGUAGE_SIMPLIFIED_CHINESE.into()
         }
@@ -822,6 +801,10 @@ mod tests {
 
     #[test]
     fn translation_mode_round_trips_through_settings_json() {
+        assert_eq!(
+            PluginSettings::default().translation_mode,
+            TranslationMode::Replace
+        );
         let settings = PluginSettings {
             translation_mode: TranslationMode::Replace,
             ..PluginSettings::default()
@@ -833,10 +816,20 @@ mod tests {
     }
 
     #[test]
-    fn translation_target_defaults_to_interface_language_and_migrates_labels() {
+    fn translation_target_defaults_to_system_language_and_migrates_labels() {
         let settings = PluginSettings::default();
-        assert_eq!(settings.target_language, TARGET_LANGUAGE_INTERFACE);
+        assert_eq!(settings.target_language, TARGET_LANGUAGE_SYSTEM);
         assert_eq!(settings.resolved_target_language("English"), "English");
+
+        let mut old_interface_default = PluginSettings {
+            target_language: "interface".into(),
+            ..PluginSettings::default()
+        };
+        old_interface_default.normalize();
+        assert_eq!(
+            old_interface_default.target_language,
+            TARGET_LANGUAGE_SYSTEM
+        );
 
         let mut legacy = PluginSettings {
             target_language: "简体中文".into(),

@@ -10,6 +10,7 @@ use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight, IndentOptions,
     InlineBox as ParleyInlineBox, InlineBoxKind, Layout, LayoutContext, LineHeight, StyleProperty,
 };
+use read_fonts::{FontRef, TableProvider as _};
 use rebook_publication::{
     Block, BookSource, CaptionPosition, FixedPageDimensions, FixedPageTextLayer, FixedPageTextRect,
     ImageBlock, ImageStyle, Inline, MathRun, PublicationError, PublicationUrl, RenditionLayout,
@@ -181,6 +182,9 @@ impl ReaderTypography {
     pub fn normalize(&mut self) {
         let defaults = Self::default();
         normalize_family(&mut self.default_cjk_font, &defaults.default_cjk_font);
+        if self.default_cjk_font.eq_ignore_ascii_case("LXGW WenKai") {
+            self.default_cjk_font = "LXGW WenKai GB Screen".into();
+        }
         normalize_family(&mut self.serif_font, &defaults.serif_font);
         normalize_family(&mut self.sans_serif_font, &defaults.sans_serif_font);
         normalize_family(&mut self.monospace_font, &defaults.monospace_font);
@@ -204,7 +208,6 @@ impl ReaderTypography {
                 self.serif_font.as_str(),
                 self.default_cjk_font.as_str(),
                 "LXGW WenKai GB Screen",
-                "LXGW WenKai",
                 "Noto Serif SC",
                 "Source Han Serif SC",
                 "Songti SC",
@@ -223,7 +226,6 @@ impl ReaderTypography {
                 self.sans_serif_font.as_str(),
                 self.default_cjk_font.as_str(),
                 "LXGW WenKai GB Screen",
-                "LXGW WenKai",
                 "Noto Sans SC",
                 "Source Han Sans SC",
                 "PingFang SC",
@@ -240,14 +242,8 @@ impl ReaderTypography {
         font_stack(
             [
                 self.monospace_font.as_str(),
-                "Fira Code",
-                "Consolas",
                 self.default_cjk_font.as_str(),
                 "LXGW WenKai GB Screen",
-                "LXGW WenKai",
-                "SFMono-Regular",
-                "Menlo",
-                "Courier New",
             ],
             "monospace",
         )
@@ -345,6 +341,42 @@ fn font_stack<'a>(families: impl IntoIterator<Item = &'a str>, generic: &str) ->
 
 fn quote_font_family(family: &str) -> String {
     format!("\"{}\"", family.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReaderFontClassification {
+    serif: bool,
+    sans_serif: bool,
+    monospace: bool,
+}
+
+fn classify_reader_font(panose: Option<&[u8]>, fixed_pitch: bool) -> ReaderFontClassification {
+    let Some(panose) = panose.filter(|panose| panose.len() >= 4) else {
+        return ReaderFontClassification {
+            monospace: fixed_pitch,
+            ..ReaderFontClassification::default()
+        };
+    };
+    let monospace = fixed_pitch || panose[0] == 2 && panose[3] == 9;
+    if monospace || panose[0] != 2 {
+        return ReaderFontClassification {
+            monospace,
+            ..ReaderFontClassification::default()
+        };
+    }
+    ReaderFontClassification {
+        serif: matches!(panose[1], 2..=10),
+        sans_serif: matches!(panose[1], 11..=15),
+        monospace: false,
+    }
+}
+
+fn supports_common_chinese(charmap: &parley::fontique::Charmap<'_>) -> bool {
+    const COMMON_CHINESE_PROBE: &str =
+        "中文字体阅读书籍测试国家学习时间这样问题繁體國學時門風龍臺灣";
+    COMMON_CHINESE_PROBE
+        .chars()
+        .all(|character| charmap.map(character).is_some())
 }
 
 /// Brush carried through Parley without coupling layout to a paint backend.
@@ -499,6 +531,39 @@ pub struct LayoutEngine {
     svg_options: resvg::usvg::Options<'static>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReaderFontFamilies {
+    pub all: Vec<String>,
+    pub serif: Vec<String>,
+    pub sans_serif: Vec<String>,
+    pub monospace: Vec<String>,
+    pub chinese: Vec<String>,
+}
+
+impl ReaderFontFamilies {
+    pub fn include_configured(&mut self, typography: &ReaderTypography) {
+        include_available_family(&self.all, &mut self.serif, &typography.serif_font);
+        include_available_family(&self.all, &mut self.sans_serif, &typography.sans_serif_font);
+        include_available_family(&self.all, &mut self.monospace, &typography.monospace_font);
+    }
+}
+
+fn include_available_family(all: &[String], category: &mut Vec<String>, family: &str) {
+    let Some(available) = all
+        .iter()
+        .find(|available| available.eq_ignore_ascii_case(family))
+    else {
+        return;
+    };
+    if !category
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(available))
+    {
+        category.push(available.clone());
+        category.sort_by_key(|family| family.to_lowercase());
+    }
+}
+
 impl Default for LayoutEngine {
     fn default() -> Self {
         Self::new()
@@ -533,6 +598,51 @@ impl LayoutEngine {
             .collect::<Vec<_>>();
         families.sort_by_key(|family| family.to_lowercase());
         families.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        families
+    }
+
+    pub fn available_reader_font_families(&mut self) -> ReaderFontFamilies {
+        let all = self.available_font_families();
+        let mut families = ReaderFontFamilies {
+            all,
+            ..ReaderFontFamilies::default()
+        };
+        for family_name in &families.all {
+            let font_info = self
+                .font_context
+                .collection
+                .family_by_name(family_name)
+                .and_then(|family| family.default_font().cloned());
+            let Some(font_info) = font_info else {
+                continue;
+            };
+            let Some(data) = font_info.load(None) else {
+                continue;
+            };
+            if font_info
+                .charmap_index()
+                .charmap(data.as_ref())
+                .is_some_and(|charmap| supports_common_chinese(&charmap))
+            {
+                families.chinese.push(family_name.clone());
+            }
+            let Ok(font) = FontRef::from_index(data.as_ref(), font_info.index()) else {
+                continue;
+            };
+            let fixed_pitch = font
+                .post()
+                .ok()
+                .is_some_and(|post| post.is_fixed_pitch() != 0);
+            let panose = font.os2().ok().map(|os2| os2.panose_10());
+            let classification = classify_reader_font(panose, fixed_pitch);
+            if classification.monospace {
+                families.monospace.push(family_name.clone());
+            } else if classification.serif {
+                families.serif.push(family_name.clone());
+            } else if classification.sans_serif {
+                families.sans_serif.push(family_name.clone());
+            }
+        }
         families
     }
 
@@ -2007,6 +2117,16 @@ impl Paginator {
         }
     }
 
+    fn pending_quote_padding(&self) -> f32 {
+        self.active_quote.as_ref().map_or(0.0, |active| {
+            if active.decoration_index.is_none() {
+                QUOTE_VERTICAL_PADDING
+            } else {
+                0.0
+            }
+        })
+    }
+
     fn update_quote_decoration(&mut self) {
         let Some(index) = self
             .active_quote
@@ -2056,7 +2176,6 @@ impl Paginator {
         self.add_preserved_spacing(block.style.margin_before);
         let mut line_start = 0;
         while line_start < prepared.layout.len() {
-            self.ensure_quote_decoration();
             let first = prepared
                 .layout
                 .get(line_start)
@@ -2070,7 +2189,7 @@ impl Paginator {
                     .get(line_end)
                     .ok_or(LayoutError::InvalidLayout)?;
                 let candidate_height = line.metrics().block_max_coord - first_top;
-                let remaining = self.bottom - self.cursor_y;
+                let remaining = self.bottom - self.cursor_y - self.pending_quote_padding();
                 if candidate_height > remaining && line_end > line_start {
                     break;
                 }
@@ -2084,6 +2203,10 @@ impl Paginator {
             if line_end == line_start {
                 continue;
             }
+            // Do not start a quote decoration until its first text line fits on
+            // this column. Otherwise a page boundary can retain an orphaned
+            // accent bar above the actual quotation.
+            self.ensure_quote_decoration();
             self.items.push(PageItem::Text(TextPlacement {
                 layout: Arc::clone(&prepared.layout),
                 text: Arc::clone(&prepared.text),
@@ -3056,7 +3179,11 @@ mod tests {
                 .contains("\"Microsoft YaHei\"")
         );
         assert!(typography.sans_serif_stack().ends_with("sans-serif"));
-        assert!(typography.monospace_stack().ends_with("monospace"));
+        assert_eq!(
+            typography.monospace_stack(),
+            "\"Consolas\", \"LXGW WenKai GB Screen\", monospace"
+        );
+        assert!(!typography.monospace_stack().contains("Fira Code"));
     }
 
     #[test]
@@ -3079,6 +3206,30 @@ mod tests {
         assert!((typography.font_size - 20.0).abs() < f32::EPSILON);
         assert!((typography.minimum_font_size - 1.0).abs() < f32::EPSILON);
         assert_eq!(typography.font_weight, 500);
+
+        typography.default_cjk_font = "LXGW WenKai".into();
+        typography.normalize();
+        assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
+    }
+
+    #[test]
+    fn reader_font_classification_uses_panose_and_fixed_pitch_metadata() {
+        let serif = classify_reader_font(Some(&[2, 2, 5, 3, 0, 0, 0, 0, 0, 0]), false);
+        assert!(serif.serif);
+        assert!(!serif.sans_serif);
+        assert!(!serif.monospace);
+
+        let sans = classify_reader_font(Some(&[2, 11, 5, 3, 0, 0, 0, 0, 0, 0]), false);
+        assert!(!sans.serif);
+        assert!(sans.sans_serif);
+        assert!(!sans.monospace);
+
+        let monospace = classify_reader_font(Some(&[2, 11, 5, 9, 0, 0, 0, 0, 0, 0]), false);
+        assert!(!monospace.serif);
+        assert!(!monospace.sans_serif);
+        assert!(monospace.monospace);
+
+        assert!(classify_reader_font(None, true).monospace);
     }
 
     #[test]
@@ -4624,7 +4775,7 @@ mod tests {
             end: attribution_range.end.clone(),
         };
         let section = Section {
-            id: spine,
+            id: spine.clone(),
             href: PublicationUrl::parse("chapter.xhtml").unwrap(),
             blocks: vec![Block::Quote(QuoteBlock {
                 body: vec![text(
@@ -4691,5 +4842,102 @@ mod tests {
                 .is_some_and(|line| line.metrics().offset > 0.0),
             "attribution should align to the inline end"
         );
+    }
+
+    #[test]
+    fn unified_quote_never_leaves_an_orphaned_accent_bar_at_a_page_boundary() {
+        let spine = SpineItemId::new("chapter").unwrap();
+        let range = |node: &str, length: u64| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: length,
+            },
+        };
+        let text = |kind, value: String, source| TextBlock {
+            kind,
+            content: vec![Inline::Text(TextRun {
+                text: value,
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle::default(),
+            source: Some(source),
+        };
+        let section = Section {
+            id: spine.clone(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![
+                Block::Text(text(
+                    TextBlockKind::Paragraph,
+                    "A preceding paragraph fills the page before the quotation. ".repeat(18),
+                    range("preceding", 1_026),
+                )),
+                Block::Quote(QuoteBlock {
+                    body: vec![text(
+                        TextBlockKind::Blockquote,
+                        "The quotation must begin together with its accent bar.".into(),
+                        range("quote-body", 55),
+                    )],
+                    attribution: Some(text(
+                        TextBlockKind::QuoteAttribution,
+                        "The source".into(),
+                        range("quote-source", 10),
+                    )),
+                    source: None,
+                }),
+            ],
+            anchors: Vec::new(),
+        };
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("quote-boundary-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        for height in (220..=420).step_by(8) {
+            let layout = LayoutEngine::new()
+                .layout_section(
+                    &source,
+                    &section,
+                    LayoutViewport::new(420, height).unwrap(),
+                    &style,
+                )
+                .unwrap();
+            for page in &layout.pages {
+                if !page
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, PageItem::Quote(_)))
+                {
+                    continue;
+                }
+                let has_quote_text = page.items.iter().any(|item| {
+                    let PageItem::Text(text) = item else {
+                        return false;
+                    };
+                    text.source.as_ref().is_some_and(|source| {
+                        matches!(source.start.node.as_str(), "quote-body" | "quote-source")
+                    })
+                });
+                assert!(
+                    has_quote_text,
+                    "viewport height {height} produced a quote decoration without quote text"
+                );
+            }
+        }
     }
 }

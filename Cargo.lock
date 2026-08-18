@@ -3847,6 +3847,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sys-locale",
  "tokio",
  "tracing",
  "uuid",
@@ -3904,6 +3905,7 @@ version = "0.3.3"
 dependencies = [
  "image",
  "parley",
+ "read-fonts 0.41.0",
  "rebook-math",
  "rebook-publication",
  "resvg",

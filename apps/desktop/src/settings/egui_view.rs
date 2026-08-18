@@ -1,16 +1,21 @@
 use egui::{Align2, Color32, Response, RichText, Vec2};
-use rebook_layout::{ParagraphIndentMode, ReaderDefaultFont, SpreadMode, TypesettingMode};
+use rebook_layout::{ReaderDefaultFont, SpreadMode, TypesettingMode};
 
-use super::{SettingsFeature, SettingsTab, ShortcutAction};
+use super::{ProviderModelsRequest, SettingsFeature, SettingsTab, ShortcutAction};
 use crate::plugins::{
     AiModelConfig, AiProviderKind, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN,
     CHAT_TOOL_STEPS_MAX, CHAT_TOOL_STEPS_MIN, PdfOcrProviderKind, PluginSettings,
-    TARGET_LANGUAGE_ENGLISH, TARGET_LANGUAGE_INTERFACE, TARGET_LANGUAGE_SIMPLIFIED_CHINESE,
+    TARGET_LANGUAGE_ENGLISH, TARGET_LANGUAGE_SIMPLIFIED_CHINESE, TARGET_LANGUAGE_SYSTEM,
     TranslationMode,
 };
-use crate::preferences::{AppLanguage, AppTheme, ReadingMode};
+use crate::preferences::{
+    AppLanguage, AppTheme, MAX_SHORTCUT_KEYS, ReadingMode, SYSTEM_INTERFACE_FONT,
+    shortcut_chord_key_count,
+};
 use crate::sync::CloudProviderKind;
-use crate::ui::{Icon, dialog_action_button, icon_button, navigation_button, palette};
+use crate::ui::{
+    Icon, icon, icon_button, navigation_button, paint_icon, palette, small_icon_button,
+};
 
 const SETTINGS_SELECT_WIDTH: f32 = 156.0;
 const SETTINGS_MODEL_SELECT_WIDTH: f32 = 280.0;
@@ -65,42 +70,46 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
             ui.style_mut().visuals.widgets.open.expansion = 0.0;
             let sidebar_width = 144.0_f32.min(modal_size.x * 0.32);
             let content_width = (modal_size.x - sidebar_width).max(1.0);
-            ui.horizontal(|ui| {
-                egui::Frame::new()
-                    .fill(palette().background)
-                    .corner_radius(egui::CornerRadius {
-                        nw: 12,
-                        ne: 0,
-                        sw: 12,
-                        se: 0,
-                    })
-                    .inner_margin(egui::Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-                        ui.set_width((sidebar_width - 28.0).max(1.0));
-                        ui.set_height((modal_size.y - 28.0).max(1.0));
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            settings_sidebar(ui, state);
+            ui.allocate_ui_with_layout(
+                modal_size,
+                egui::Layout::left_to_right(egui::Align::Min),
+                |ui| {
+                    egui::Frame::new()
+                        .fill(palette().background)
+                        .corner_radius(egui::CornerRadius {
+                            nw: 12,
+                            ne: 0,
+                            sw: 12,
+                            se: 0,
+                        })
+                        .inner_margin(egui::Margin::same(14))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                            ui.set_width((sidebar_width - 28.0).max(1.0));
+                            ui.set_height((modal_size.y - 28.0).max(1.0));
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                settings_sidebar(ui, state);
+                            });
                         });
-                    });
-                egui::Frame::new()
-                    .fill(palette().surface)
-                    .corner_radius(egui::CornerRadius {
-                        nw: 0,
-                        ne: 12,
-                        sw: 0,
-                        se: 12,
-                    })
-                    .inner_margin(egui::Margin::symmetric(20, 16))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-                        ui.set_width((content_width - 40.0).max(1.0));
-                        ui.set_height((modal_size.y - 32.0).max(1.0));
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            settings_content(ui, state);
+                    egui::Frame::new()
+                        .fill(palette().surface)
+                        .corner_radius(egui::CornerRadius {
+                            nw: 0,
+                            ne: 12,
+                            sw: 0,
+                            se: 12,
+                        })
+                        .inner_margin(egui::Margin::symmetric(20, 16))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                            ui.set_width((content_width - 40.0).max(1.0));
+                            ui.set_height((modal_size.y - 32.0).max(1.0));
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                settings_content(ui, state);
+                            });
                         });
-                    });
-            });
+                },
+            );
         });
     ctx.layer_painter(response.response.layer_id).rect_stroke(
         response.response.rect,
@@ -109,7 +118,7 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
         egui::StrokeKind::Inside,
     );
     if response.should_close() {
-        state.close_overlay();
+        state.close_and_apply();
     }
 }
 
@@ -135,15 +144,15 @@ fn settings_sidebar(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             "Shortcuts",
         ),
         (SettingsTab::Ai, Icon::Server, "AI 提供商", "AI providers"),
-        (SettingsTab::AiChat, Icon::Bot, "AI 对话", "AI chat"),
-        (SettingsTab::Ocr, Icon::ScanText, "OCR", "OCR"),
+        (SettingsTab::AiChat, Icon::Bot, "对话", "Chat"),
         (
             SettingsTab::Translation,
             Icon::Languages,
             "翻译",
             "Translation",
         ),
-        (SettingsTab::Cloud, Icon::Cloud, "云盘", "Cloud"),
+        (SettingsTab::Ocr, Icon::ScanText, "PDF OCR", "PDF OCR"),
+        (SettingsTab::Cloud, Icon::Cloud, "云同步", "Cloud sync"),
         (SettingsTab::About, Icon::Info, "关于", "About"),
     ] {
         let selected = state.settings_tab == tab;
@@ -157,16 +166,14 @@ fn settings_sidebar(ui: &mut egui::Ui, state: &mut SettingsFeature) {
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the settings shell keeps its tab routing and footer actions together"
+    reason = "the settings shell keeps its tab routing and content together"
 )]
 fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     const HEADER_HEIGHT: f32 = 42.0;
-    const FOOTER_HEIGHT: f32 = 48.0;
     const SEPARATOR_HEIGHT: f32 = 1.0;
 
     let available = ui.available_size();
-    let body_height =
-        (available.y - HEADER_HEIGHT - FOOTER_HEIGHT - SEPARATOR_HEIGHT * 2.0).max(120.0);
+    let body_height = (available.y - HEADER_HEIGHT - SEPARATOR_HEIGHT).max(120.0);
     ui.spacing_mut().item_spacing.y = 0.0;
 
     ui.allocate_ui_with_layout(
@@ -178,10 +185,10 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 SettingsTab::Typography => state.draft_language.text("排版", "Typography"),
                 SettingsTab::Shortcuts => state.draft_language.text("快捷键", "Shortcuts"),
                 SettingsTab::Ai => state.draft_language.text("AI 提供商", "AI providers"),
-                SettingsTab::AiChat => state.draft_language.text("AI 对话", "AI chat"),
-                SettingsTab::Ocr => "OCR",
+                SettingsTab::AiChat => state.draft_language.text("对话", "Chat"),
+                SettingsTab::Ocr => "PDF OCR",
                 SettingsTab::Translation => state.draft_language.text("翻译", "Translation"),
-                SettingsTab::Cloud => state.draft_language.text("云盘同步", "Cloud sync"),
+                SettingsTab::Cloud => state.draft_language.text("云同步", "Cloud sync"),
                 SettingsTab::About => state.draft_language.text("关于", "About"),
             };
             ui.heading(
@@ -194,7 +201,7 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     .on_hover_text(state.draft_language.text("关闭", "Close"))
                     .clicked()
                 {
-                    state.close_overlay();
+                    state.close_and_apply();
                 }
             });
         },
@@ -227,31 +234,6 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             }
             ui.add_space(12.0);
         });
-    ui.separator();
-    ui.allocate_ui_with_layout(
-        Vec2::new(available.x, FOOTER_HEIGHT),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            if state.settings_tab == SettingsTab::About {
-                if dialog_action_button(ui, state.draft_language.text("关闭", "Close"), false)
-                    .clicked()
-                {
-                    state.close_overlay();
-                }
-            } else {
-                if dialog_action_button(ui, state.draft_language.text("保存", "Save"), true)
-                    .clicked()
-                {
-                    state.apply_settings();
-                }
-                if dialog_action_button(ui, state.draft_language.text("取消", "Cancel"), false)
-                    .clicked()
-                {
-                    state.close_overlay();
-                }
-            }
-        },
-    );
 }
 
 fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
@@ -264,12 +246,33 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         language.text("布局", "Layout"),
         &[
             (
+                ShortcutAction::Fullscreen,
+                language.text("全屏", "Fullscreen"),
+            ),
+            (
                 ShortcutAction::ToggleLeftSidebar,
-                language.text("切换左侧边栏", "Toggle left sidebar"),
+                language.text("切换左侧栏", "Toggle left sidebar"),
             ),
             (
                 ShortcutAction::ToggleRightSidebar,
-                language.text("切换右侧边栏", "Toggle right sidebar"),
+                language.text("切换对话框", "Toggle chat panel"),
+            ),
+        ],
+    );
+    ui.add_space(12.0);
+    shortcut_group(
+        ui,
+        state,
+        "operation-shortcuts-grid",
+        language.text("操作", "Actions"),
+        &[
+            (
+                ShortcutAction::ToggleTranslation,
+                language.text("翻译开关", "Toggle translation"),
+            ),
+            (
+                ShortcutAction::ReturnToShelf,
+                language.text("返回书架", "Back to library"),
             ),
         ],
     );
@@ -282,19 +285,19 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         &[
             (
                 ShortcutAction::FocusActions,
-                language.text("呼出工具栏", "Show action toolbar"),
+                language.text("唤起工具栏", "Open action toolbar"),
             ),
             (
                 ShortcutAction::FocusChat,
-                language.text("激活 AI 输入框", "Focus AI input"),
+                language.text("唤起对话框", "Open chat panel"),
             ),
             (
                 ShortcutAction::FocusHighlight,
-                language.text("高亮当前段落", "Highlight current paragraph"),
+                language.text("高亮段落", "Highlight paragraph"),
             ),
             (
                 ShortcutAction::FocusNote,
-                language.text("呼出批注输入框", "Open note input"),
+                language.text("唤起批注框", "Open note panel"),
             ),
         ],
     );
@@ -316,6 +319,16 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             ),
         );
     }
+    if state.draft_shortcuts.has_oversized_chords() {
+        ui.add_space(8.0);
+        ui.colored_label(
+            palette().error,
+            language.text(
+                "快捷键最多支持三个按键",
+                "Shortcuts support up to three keys.",
+            ),
+        );
+    }
 }
 
 fn shortcut_group(
@@ -326,12 +339,7 @@ fn shortcut_group(
     actions: &[(ShortcutAction, &str)],
 ) {
     settings_card(ui, |ui| {
-        ui.label(
-            RichText::new(title)
-                .strong()
-                .size(crate::ui::scaled_font_size(14.0))
-                .color(palette().text),
-        );
+        settings_module_label(ui, title);
         ui.add_space(4.0);
         egui::Grid::new(grid_id)
             .num_columns(2)
@@ -351,10 +359,8 @@ fn shortcut_group(
 fn shortcut_binding_button(ui: &mut egui::Ui, state: &mut SettingsFeature, action: ShortcutAction) {
     let capturing = state.capturing_shortcut == Some(action);
     let label = if capturing {
-        state
-            .draft_language
-            .text("请按快捷键…", "Press shortcut…")
-            .into()
+        let modifiers = ui.input(|input| canonical_shortcut_modifiers(input.modifiers));
+        shortcut_capture_label(ui.ctx(), state.draft_language, modifiers)
     } else {
         ui.ctx()
             .format_shortcut(&action.binding(&state.draft_shortcuts))
@@ -385,6 +391,23 @@ fn shortcut_binding_button(ui: &mut egui::Ui, state: &mut SettingsFeature, actio
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.clicked() {
         state.capturing_shortcut = if capturing { None } else { Some(action) };
+        state.error = None;
+    }
+}
+
+fn shortcut_capture_label(
+    ctx: &egui::Context,
+    language: AppLanguage,
+    modifiers: egui::Modifiers,
+) -> String {
+    if shortcut_chord_key_count(modifiers) > MAX_SHORTCUT_KEYS {
+        return language.text("最多支持三个按键", "Up to three keys").into();
+    }
+    let modifiers = ctx.format_modifiers(modifiers);
+    if modifiers.is_empty() {
+        language.text("请按快捷键…", "Press shortcut…").into()
+    } else {
+        format!("{modifiers}+…")
     }
 }
 
@@ -404,6 +427,9 @@ fn capture_shortcut_input(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             else {
                 return None;
             };
+            if is_shortcut_modifier_key(*key) {
+                return None;
+            }
             Some((*key, *modifiers))
         });
         if let Some((key, modifiers)) = captured {
@@ -418,12 +444,39 @@ fn capture_shortcut_input(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         state.capturing_shortcut = None;
         return;
     }
+    let modifiers = canonical_shortcut_modifiers(modifiers);
+    if shortcut_chord_key_count(modifiers) > MAX_SHORTCUT_KEYS {
+        state.error = Some(
+            state
+                .draft_language
+                .text(
+                    "快捷键最多支持三个按键",
+                    "Shortcuts support up to three keys.",
+                )
+                .into(),
+        );
+        return;
+    }
     action.set_binding(
         &mut state.draft_shortcuts,
-        egui::KeyboardShortcut::new(canonical_shortcut_modifiers(modifiers), key),
+        egui::KeyboardShortcut::new(modifiers, key),
     );
     state.capturing_shortcut = None;
     state.error = None;
+}
+
+fn is_shortcut_modifier_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::ShiftLeft
+            | egui::Key::ShiftRight
+            | egui::Key::ControlLeft
+            | egui::Key::ControlRight
+            | egui::Key::AltLeft
+            | egui::Key::AltRight
+            | egui::Key::SuperLeft
+            | egui::Key::SuperRight
+    )
 }
 
 fn canonical_shortcut_modifiers(modifiers: egui::Modifiers) -> egui::Modifiers {
@@ -541,31 +594,47 @@ fn system_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             .spacing([24.0, 16.0])
             .show(ui, |ui| {
                 settings_row_label(ui, state.draft_language.text("主题", "Theme"));
-                settings_row_control_sized(ui, 250.0, |ui| {
-                    let light = state.draft_theme == AppTheme::Light;
-                    if choice_button(ui, state.draft_language.text("浅色", "Light"), light, 72.0)
+                settings_row_control_sized(ui, 330.0, |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    for (theme, glyph) in [
+                        (AppTheme::System, Icon::Monitor),
+                        (AppTheme::Light, Icon::Sun),
+                        (AppTheme::Dark, Icon::Moon),
+                    ] {
+                        if choice_icon_button(
+                            ui,
+                            glyph,
+                            theme_label(state.draft_language, theme),
+                            state.draft_theme == theme,
+                        )
                         .clicked()
-                    {
-                        state.draft_theme = AppTheme::Light;
-                    }
-                    let dark = state.draft_theme == AppTheme::Dark;
-                    if choice_button(ui, state.draft_language.text("深色", "Dark"), dark, 72.0)
-                        .clicked()
-                    {
-                        state.draft_theme = AppTheme::Dark;
+                        {
+                            state.draft_theme = theme;
+                            crate::ui::set_theme(ui.ctx(), theme);
+                            crate::ui::apply_visuals(ui.ctx(), &crate::ui::palette());
+                            ui.ctx().request_repaint();
+                        }
                     }
                 });
                 ui.end_row();
 
                 settings_row_label(ui, state.draft_language.text("界面语言", "Language"));
-                settings_row_control_sized(ui, SETTINGS_SELECT_WIDTH, |ui| {
+                settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
+                    let follow_system_label =
+                        state.draft_language.text("跟随系统", "Follow system");
                     egui::ComboBox::from_id_salt("settings-language")
-                        .width(SETTINGS_SELECT_WIDTH)
+                        .width(SETTINGS_FONT_SELECT_WIDTH)
                         .selected_text(match state.draft_language {
+                            AppLanguage::System => follow_system_label,
                             AppLanguage::SimplifiedChinese => "简体中文",
                             AppLanguage::English => "English",
                         })
                         .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut state.draft_language,
+                                AppLanguage::System,
+                                follow_system_label,
+                            );
                             ui.selectable_value(
                                 &mut state.draft_language,
                                 AppLanguage::SimplifiedChinese,
@@ -586,6 +655,7 @@ fn system_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     "settings-interface-font",
                     &mut state.draft_interface_typography.font_family,
                     &state.available_interface_font_families,
+                    Some(state.draft_language),
                 );
                 settings_slider_row(
                     ui,
@@ -608,10 +678,9 @@ fn typography_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         &mut state.draft_reading_mode,
         &mut state.draft_spread,
         &mut state.draft_typography,
-        &state.available_font_families,
+        &mut state.draft_typesetting,
+        &state.available_reader_font_families,
     );
-    ui.add_space(12.0);
-    reader_typesetting_settings(ui, language, &mut state.draft_typesetting);
 }
 
 fn reader_font_settings(
@@ -620,70 +689,71 @@ fn reader_font_settings(
     reading_mode: &mut ReadingMode,
     spread: &mut SpreadMode,
     typography: &mut rebook_layout::ReaderTypography,
-    font_families: &[String],
+    typesetting: &mut rebook_layout::ReaderTypesetting,
+    font_families: &rebook_layout::ReaderFontFamilies,
 ) {
     settings_card(ui, |ui| {
-        ui.label(
-            RichText::new(language.text("阅读正文", "Reading content"))
-                .strong()
-                .color(palette().text),
-        );
-        ui.add_space(12.0);
-        egui::Grid::new("font-settings-grid")
+        egui::Grid::new("typography-settings-grid")
             .num_columns(2)
             .spacing([24.0, 16.0])
             .show(ui, |ui| {
-                settings_row_label(ui, language.text("阅读模式", "Reading mode"));
+                settings_row_label(ui, language.text("界面布局", "Interface layout"));
                 settings_row_control_sized(ui, 250.0, |ui| {
+                    let focus = *reading_mode == ReadingMode::Focus;
+                    if choice_button(ui, language.text("专注模式", "Focus mode"), focus).clicked()
+                    {
+                        *reading_mode = ReadingMode::Focus;
+                    }
                     let classic = *reading_mode == ReadingMode::Classic;
-                    if choice_button(ui, language.text("经典", "Classic"), classic, 72.0).clicked()
+                    if choice_button(ui, language.text("经典模式", "Classic mode"), classic)
+                        .clicked()
                     {
                         *reading_mode = ReadingMode::Classic;
-                    }
-                    let focus = *reading_mode == ReadingMode::Focus;
-                    if choice_button(ui, language.text("专注", "Focus"), focus, 72.0).clicked() {
-                        *reading_mode = ReadingMode::Focus;
                     }
                 });
                 ui.end_row();
 
                 if *reading_mode == ReadingMode::Classic {
-                    settings_row_label(ui, language.text("分页模式", "Page layout"));
-                    settings_row_control_sized(ui, 250.0, |ui| {
+                    settings_row_label(ui, language.text("正文布局", "Content layout"));
+                    settings_row_control_sized(ui, 300.0, |ui| {
                         let single = *spread == SpreadMode::Single;
-                        if choice_button(ui, language.text("单页", "Single"), single, 72.0)
+                        if choice_button(ui, language.text("单栏", "Single column"), single)
                             .clicked()
                         {
                             *spread = SpreadMode::Single;
                         }
                         let double = *spread == SpreadMode::Double;
-                        if choice_button(ui, language.text("双页", "Double"), double, 72.0)
-                            .clicked()
+                        if choice_button(ui, language.text("双栏", "Two columns"), double).clicked()
                         {
                             *spread = SpreadMode::Double;
                         }
                         let scroll = *spread == SpreadMode::Scroll;
-                        if choice_button(ui, language.text("滑动", "Scroll"), scroll, 72.0)
-                            .clicked()
-                        {
+                        if choice_button(ui, language.text("滑动", "Scroll"), scroll).clicked() {
                             *spread = SpreadMode::Scroll;
                         }
                     });
                     ui.end_row();
                 }
 
-                settings_row_label(ui, language.text("默认字体", "Default font"));
+                settings_row_label(ui, language.text("正文样式", "Content style"));
                 settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
-                    let serif = typography.default_font == ReaderDefaultFont::Serif;
-                    if choice_button(ui, language.text("衬线", "Serif"), serif, 72.0).clicked() {
-                        typography.default_font = ReaderDefaultFont::Serif;
-                    }
-                    let sans_serif = typography.default_font == ReaderDefaultFont::SansSerif;
-                    if choice_button(ui, language.text("无衬线", "Sans serif"), sans_serif, 72.0)
+                    let unified = typesetting.mode == TypesettingMode::Unified;
+                    if choice_button(ui, language.text("统一覆盖", "Unified override"), unified)
                         .clicked()
                     {
-                        typography.default_font = ReaderDefaultFont::SansSerif;
+                        typesetting.mode = TypesettingMode::Unified;
                     }
+                    let book = typesetting.mode == TypesettingMode::Book;
+                    if choice_button(ui, language.text("跟随书籍", "Follow book"), book).clicked()
+                    {
+                        typesetting.mode = TypesettingMode::Book;
+                    }
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("默认字体", "Default font"));
+                settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
+                    default_font_selector(ui, language, typography, font_families);
                 });
                 ui.end_row();
 
@@ -692,28 +762,16 @@ fn reader_font_settings(
                     language.text("中文字体", "CJK font"),
                     "settings-cjk-font",
                     &mut typography.default_cjk_font,
-                    font_families,
+                    &font_families.chinese,
+                    None,
                 );
                 font_family_row(
                     ui,
-                    language.text("衬线字体", "Serif font"),
-                    "settings-serif-font",
-                    &mut typography.serif_font,
-                    font_families,
-                );
-                font_family_row(
-                    ui,
-                    language.text("无衬线字体", "Sans-serif font"),
-                    "settings-sans-font",
-                    &mut typography.sans_serif_font,
-                    font_families,
-                );
-                font_family_row(
-                    ui,
-                    language.text("等宽字体", "Monospace font"),
+                    language.text("代码字体", "Code font"),
                     "settings-monospace-font",
                     &mut typography.monospace_font,
-                    font_families,
+                    &font_families.monospace,
+                    None,
                 );
 
                 settings_slider_row(
@@ -748,243 +806,230 @@ fn reader_font_settings(
     });
 }
 
-fn reader_typesetting_settings(
-    ui: &mut egui::Ui,
-    language: AppLanguage,
-    typesetting: &mut rebook_layout::ReaderTypesetting,
-) {
-    settings_card(ui, |ui| {
-        ui.label(
-            RichText::new(language.text("统一版式", "Reading layout"))
-                .strong()
-                .color(palette().text),
-        );
-        ui.add_space(12.0);
-        egui::Grid::new("reader-typesetting-settings-grid")
-            .num_columns(2)
-            .spacing([24.0, 16.0])
-            .show(ui, |ui| {
-                settings_row_label(ui, language.text("版式来源", "Layout source"));
-                settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
-                    let unified = typesetting.mode == TypesettingMode::Unified;
-                    if choice_button(ui, language.text("统一版式", "Unified"), unified, 96.0)
-                        .clicked()
-                    {
-                        typesetting.mode = TypesettingMode::Unified;
-                    }
-                    let book = typesetting.mode == TypesettingMode::Book;
-                    if choice_button(ui, language.text("书籍原版", "Book style"), book, 96.0)
-                        .clicked()
-                    {
-                        typesetting.mode = TypesettingMode::Book;
-                    }
-                });
-                ui.end_row();
-            });
-        ui.add_enabled_ui(typesetting.mode == TypesettingMode::Unified, |ui| {
-            unified_typesetting_controls(ui, language, typesetting);
-        });
-        ui.add_space(4.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if secondary_button(ui, language.text("恢复默认", "Reset defaults")).clicked() {
-                *typesetting = rebook_layout::ReaderTypesetting::unified();
-            }
-        });
-    });
-}
-
-fn unified_typesetting_controls(
-    ui: &mut egui::Ui,
-    language: AppLanguage,
-    typesetting: &mut rebook_layout::ReaderTypesetting,
-) {
-    egui::Grid::new("reader-unified-typesetting-controls")
-        .num_columns(2)
-        .spacing([24.0, 16.0])
-        .show(ui, |ui| {
-            settings_slider_row(
-                ui,
-                language.text("一级标题大小", "Heading size"),
-                &mut typesetting.heading_scale,
-                1.1,
-                2.2,
-                0.1,
-                "×",
-            );
-            settings_slider_row(
-                ui,
-                language.text("正文行高", "Body line height"),
-                &mut typesetting.body_line_height,
-                1.2,
-                2.4,
-                0.1,
-                "×",
-            );
-            settings_row_label(ui, language.text("正文首行缩进", "First-line indentation"));
-            settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
-                let automatic = typesetting.paragraph_indent_mode == ParagraphIndentMode::Auto;
-                if choice_button(ui, language.text("自动", "Auto"), automatic, 96.0).clicked() {
-                    typesetting.paragraph_indent_mode = ParagraphIndentMode::Auto;
-                }
-                let custom = typesetting.paragraph_indent_mode == ParagraphIndentMode::Custom;
-                if choice_button(ui, language.text("自定义", "Custom"), custom, 96.0).clicked() {
-                    typesetting.paragraph_indent_mode = ParagraphIndentMode::Custom;
-                }
-            });
-            ui.end_row();
-            if typesetting.paragraph_indent_mode == ParagraphIndentMode::Custom {
-                settings_slider_row(
-                    ui,
-                    language.text("自定义首行缩进", "Custom indentation"),
-                    &mut typesetting.paragraph_indent_em,
-                    0.0,
-                    4.0,
-                    0.1,
-                    " em",
-                );
-            }
-            settings_slider_row(
-                ui,
-                language.text("段落间距", "Paragraph spacing"),
-                &mut typesetting.paragraph_gap_em,
-                0.0,
-                2.0,
-                0.1,
-                " em",
-            );
-            settings_slider_row(
-                ui,
-                language.text("标题与正文间距", "Heading-to-body spacing"),
-                &mut typesetting.heading_body_gap_em,
-                0.2,
-                2.0,
-                0.1,
-                " em",
-            );
-            settings_slider_row(
-                ui,
-                language.text("图片与正文间距", "Image spacing"),
-                &mut typesetting.media_gap_em,
-                0.5,
-                2.0,
-                0.1,
-                " em",
-            );
-            settings_slider_row(
-                ui,
-                language.text("图注字号", "Caption font size"),
-                &mut typesetting.caption_font_scale,
-                0.7,
-                1.0,
-                0.05,
-                "×",
-            );
-            settings_slider_row(
-                ui,
-                language.text("图片与图注间距", "Image-to-caption spacing"),
-                &mut typesetting.caption_gap_em,
-                0.2,
-                1.0,
-                0.1,
-                " em",
-            );
-            settings_slider_row(
-                ui,
-                language.text("列表缩进", "List indentation"),
-                &mut typesetting.list_indent_em,
-                0.5,
-                3.0,
-                0.1,
-                " em",
-            );
-            settings_slider_row(
-                ui,
-                language.text("表格字号", "Table font size"),
-                &mut typesetting.table_font_scale,
-                0.7,
-                1.2,
-                0.1,
-                "×",
-            );
-        });
-}
-
+#[allow(
+    clippy::too_many_lines,
+    reason = "the provider card keeps its dependent connection and model controls together"
+)]
 fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     let language = state.draft_language;
-    let settings = &mut state.draft_plugin_settings;
     let mut remove_provider = None;
-    let mut remove_model = None;
-    let can_remove_provider = settings.providers.len() > 1;
-    for index in 0..settings.providers.len() {
+    let can_remove_provider = state.draft_plugin_settings.providers.len() > 1;
+    for index in 0..state.draft_plugin_settings.providers.len() {
+        let provider_id = state.draft_plugin_settings.providers[index].id.clone();
+        let fetched_models = state.provider_models_cache.get(&provider_id).cloned();
+        let fetch_error = state.provider_models_errors.get(&provider_id).cloned();
+        let loading = state.provider_models_loading.as_deref() == Some(&provider_id);
+        let mut provider_changed = false;
+        let mut refresh_requested = false;
         settings_card(ui, |ui| {
-            let provider = &mut settings.providers[index];
-            field_label(ui, language.text("提供商", "Provider"));
-            let mut selected_kind = provider.kind;
-            egui::ComboBox::from_id_salt(("ai-provider-kind", &provider.id))
-                .width(SETTINGS_SELECT_WIDTH)
-                .selected_text(selected_kind.label())
-                .show_ui(ui, |ui| {
-                    for kind in AiProviderKind::ALL {
-                        ui.selectable_value(&mut selected_kind, kind, kind.label());
-                    }
-                });
-            if selected_kind != provider.kind {
-                provider.select_kind(selected_kind);
-            }
-            ui.horizontal(|ui| {
-                field_label(ui, language.text("名称", "Name"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if can_remove_provider
-                        && icon_button(ui, Icon::Trash2)
-                            .on_hover_text(language.text("删除服务", "Remove provider"))
-                            .clicked()
-                    {
-                        remove_provider = Some(index);
-                    }
-                });
-            });
-            text_field(ui, &mut provider.name, false);
-            if provider.kind == AiProviderKind::Custom {
-                field_label(ui, "Base URL");
-                text_field(ui, &mut provider.base_url, false);
-            }
-            field_label(ui, "API Key");
-            text_field(ui, &mut provider.api_key, true);
-            field_label(ui, language.text("模型", "Models"));
-            for model_index in 0..provider.models.len() {
-                let can_remove_model = provider.models.len() > 1;
-                ui.allocate_ui_with_layout(
-                    Vec2::new(ui.available_width(), 36.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        let available_width = if can_remove_model {
-                            ui.available_width() - 40.0
-                        } else {
-                            ui.available_width()
-                        };
-                        let width = available_width.clamp(96.0, 520.0);
-                        text_field_sized(ui, &mut provider.models[model_index].id, false, width);
-                        if can_remove_model && icon_button(ui, Icon::Minus).clicked() {
-                            remove_model = Some((index, model_index));
+            let provider = &mut state.draft_plugin_settings.providers[index];
+            egui::Grid::new(("ai-provider-settings-grid", &provider.id))
+                .num_columns(2)
+                .spacing([24.0, 16.0])
+                .show(ui, |ui| {
+                    settings_row_label(ui, language.text("提供商", "Provider"));
+                    settings_row_control_sized(ui, 360.0, |ui| {
+                        let mut selected_kind = provider.kind;
+                        egui::ComboBox::from_id_salt(("ai-provider-kind", &provider.id))
+                            .width(SETTINGS_SELECT_WIDTH)
+                            .selected_text(ai_provider_kind_label(language, selected_kind))
+                            .show_ui(ui, |ui| {
+                                for kind in AiProviderKind::ALL {
+                                    ui.selectable_value(
+                                        &mut selected_kind,
+                                        kind,
+                                        ai_provider_kind_label(language, kind),
+                                    );
+                                }
+                            });
+                        field_label(
+                            ui,
+                            language.text("仅支持 OpenAI 兼容协议", "OpenAI-compatible APIs only"),
+                        );
+                        if selected_kind != provider.kind {
+                            provider.select_kind(selected_kind);
+                            provider_changed = true;
                         }
-                    },
-                );
-            }
-            if secondary_button(ui, language.text("添加模型", "Add model")).clicked() {
-                provider.models.push(AiModelConfig::language(String::new()));
-            }
+                    });
+                    ui.end_row();
+
+                    settings_row_label(ui, language.text("名称", "Name"));
+                    settings_row_control_sized(ui, 324.0, |ui| {
+                        text_field_sized(
+                            ui,
+                            &mut provider.name,
+                            false,
+                            SETTINGS_MODEL_SELECT_WIDTH,
+                        );
+                        if can_remove_provider
+                            && icon_button(ui, Icon::Trash2)
+                                .on_hover_text(language.text("删除服务", "Remove provider"))
+                                .clicked()
+                        {
+                            remove_provider = Some(index);
+                        }
+                    });
+                    ui.end_row();
+
+                    if provider.kind == AiProviderKind::Custom {
+                        settings_row_label(ui, language.text("接口地址", "Base URL"));
+                        settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                            if text_field_sized_with_hint(
+                                ui,
+                                &mut provider.base_url,
+                                false,
+                                SETTINGS_MODEL_SELECT_WIDTH,
+                                "https://api.openai.com/v1",
+                            )
+                            .changed()
+                            {
+                                provider_changed = true;
+                            }
+                        });
+                        ui.end_row();
+                    }
+
+                    settings_row_label(ui, "API Key");
+                    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                        if text_field_sized(
+                            ui,
+                            &mut provider.api_key,
+                            true,
+                            SETTINGS_MODEL_SELECT_WIDTH,
+                        )
+                        .changed()
+                        {
+                            provider_changed = true;
+                        }
+                    });
+                    ui.end_row();
+
+                    settings_row_label(ui, language.text("模型", "Models"));
+                    settings_row_control_sized(ui, 392.0, |ui| {
+                        refresh_requested = provider_models_selector(
+                            ui,
+                            &provider.id,
+                            &mut provider.models,
+                            fetched_models.as_deref(),
+                            loading,
+                            fetch_error.as_deref(),
+                            language,
+                        );
+                    });
+                    ui.end_row();
+                });
         });
+        if provider_changed {
+            state.invalidate_provider_models(&provider_id);
+        }
+        let provider = state.draft_plugin_settings.providers[index].clone();
+        let needs_initial_fetch = !state.provider_models_cache.contains_key(&provider.id)
+            && !state.provider_models_errors.contains_key(&provider.id)
+            && !state.provider_models_task.is_pending()
+            && !provider_changed
+            && !provider.base_url.trim().is_empty();
+        if refresh_requested || needs_initial_fetch {
+            state.request_provider_models(ProviderModelsRequest {
+                provider_id: provider.id,
+                base_url: provider.base_url,
+                api_key: provider.api_key,
+            });
+        }
         ui.add_space(8.0);
     }
-    if let Some((provider, model)) = remove_model {
-        settings.remove_model(provider, model);
-    }
     if let Some(index) = remove_provider {
-        settings.remove_provider(index);
+        if let Some(provider) = state.draft_plugin_settings.providers.get(index) {
+            state.provider_models_cache.remove(&provider.id);
+            state.provider_models_errors.remove(&provider.id);
+            if state.provider_models_loading.as_deref() == Some(&provider.id) {
+                state.provider_models_task.cancel();
+                state.provider_models_loading = None;
+            }
+        }
+        state.draft_plugin_settings.remove_provider(index);
     }
     if secondary_button(ui, language.text("添加提供商", "Add provider")).clicked() {
-        settings.add_provider();
+        state.draft_plugin_settings.add_provider();
     }
+}
+
+fn provider_models_selector(
+    ui: &mut egui::Ui,
+    provider_id: &str,
+    selected_models: &mut Vec<AiModelConfig>,
+    fetched_models: Option<&[String]>,
+    loading: bool,
+    error: Option<&str>,
+    language: AppLanguage,
+) -> bool {
+    let selected_text = match selected_models.as_slice() {
+        [] => language.text("请选择模型", "Select models").into(),
+        [model] => model.id.clone(),
+        models => format!(
+            "{} {} {}",
+            language.text("已选择", "Selected"),
+            models.len(),
+            language.text("个模型", "models")
+        ),
+    };
+    let mut options = std::collections::BTreeSet::new();
+    if let Some(models) = fetched_models {
+        options.extend(models.iter().cloned());
+    }
+    options.extend(
+        selected_models
+            .iter()
+            .map(|model| model.id.trim().to_owned())
+            .filter(|model| !model.is_empty()),
+    );
+    egui::ComboBox::from_id_salt(("ai-provider-models", provider_id))
+        .width(SETTINGS_MODEL_SELECT_WIDTH)
+        .truncate()
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            ui.set_min_width(SETTINGS_MODEL_SELECT_WIDTH);
+            if loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak(language.text("正在获取模型…", "Loading models…"));
+                });
+            } else if let Some(error) = error {
+                ui.colored_label(palette().error, error);
+            } else if fetched_models.is_some_and(<[String]>::is_empty) {
+                ui.weak(language.text("接口未返回可用模型", "The API returned no models"));
+            }
+            if (loading || error.is_some() || fetched_models.is_some_and(<[String]>::is_empty))
+                && !options.is_empty()
+            {
+                ui.separator();
+            }
+            for model in options {
+                let selected = selected_models
+                    .iter()
+                    .any(|candidate| candidate.id == model);
+                let response = ui
+                    .selectable_label(selected, &model)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if response.clicked() {
+                    if selected {
+                        if selected_models.len() > 1 {
+                            selected_models.retain(|candidate| candidate.id != model);
+                        }
+                    } else {
+                        selected_models.push(AiModelConfig::language(model));
+                    }
+                }
+            }
+        });
+    let refresh_requested = secondary_button(ui, language.text("刷新", "Refresh")).clicked();
+    if loading {
+        ui.spinner();
+    } else if let Some(error) = error {
+        ui.add(icon(Icon::AlertCircle).size(16.0).color(palette().error))
+            .on_hover_text(error);
+    }
+    refresh_requested
 }
 
 fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
@@ -992,20 +1037,23 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     let settings = &mut state.draft_plugin_settings;
     let options = configured_model_options(settings);
     settings_card(ui, |ui| {
-        field_label(ui, language.text("对话模型", "Chat model"));
-        configured_model_selector(
-            ui,
-            "chat-model",
-            &options,
-            &mut settings.chat_provider,
-            &mut settings.chat_model,
-            language,
-        );
-        ui.add_space(10.0);
-        egui::Grid::new("ai-chat-limits-grid")
+        egui::Grid::new("ai-chat-settings-grid")
             .num_columns(2)
             .spacing([24.0, 16.0])
             .show(ui, |ui| {
+                settings_row_label(ui, language.text("对话模型", "Chat model"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    configured_model_selector(
+                        ui,
+                        "chat-model",
+                        &options,
+                        &mut settings.chat_provider,
+                        &mut settings.chat_model,
+                        language,
+                    );
+                });
+                ui.end_row();
+
                 settings_u16_slider_row(
                     ui,
                     language.text("工具调用轮数", "Tool call steps"),
@@ -1031,99 +1079,147 @@ fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     let settings = &mut state.draft_plugin_settings;
     let options = configured_model_options(settings);
     settings_card(ui, |ui| {
-        ui.checkbox(
-            &mut settings.ocr_enabled,
-            language.text("启用元数据提取", "Enable metadata extraction"),
-        );
-        ui.add_space(8.0);
-        field_label(ui, language.text("视觉识别模型", "Vision model"));
-        configured_model_selector(
-            ui,
-            "ocr-model",
-            &options,
-            &mut settings.ocr_provider,
-            &mut settings.ocr_model,
-            language,
-        );
+        egui::Grid::new("metadata-ocr-settings-grid")
+            .num_columns(2)
+            .spacing([24.0, 16.0])
+            .show(ui, |ui| {
+                settings_module_row_label(ui, language.text("元数据识别", "Metadata recognition"));
+                settings_row_control_sized(ui, 260.0, |ui| {
+                    toggle_switch(ui, &mut settings.ocr_enabled);
+                    field_label(
+                        ui,
+                        language.text(
+                            "识别目录、作者、书名",
+                            "Recognize contents, author, and title",
+                        ),
+                    );
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("识别模型", "Recognition model"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    configured_model_selector(
+                        ui,
+                        "ocr-model",
+                        &options,
+                        &mut settings.ocr_provider,
+                        &mut settings.ocr_model,
+                        language,
+                    );
+                });
+                ui.end_row();
+            });
     });
     ui.add_space(12.0);
     settings_card(ui, |ui| {
-        ui.checkbox(
-            &mut settings.pdf_ocr_enabled,
-            language.text("启用 PDF 正文 OCR", "Enable PDF document OCR"),
-        );
-        ui.add_enabled_ui(settings.pdf_ocr_enabled, |ui| {
-            ui.checkbox(
-                &mut settings.pdf_ocr_reflow_enabled,
-                language.text("启用内容重排", "Enable content reflow"),
-            );
-        });
-        ui.add_space(8.0);
-        field_label(ui, language.text("OCR 服务", "OCR provider"));
-        ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), 28.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                egui::ComboBox::from_id_salt("pdf-ocr-provider")
-                    .width(SETTINGS_MODEL_SELECT_WIDTH)
-                    .selected_text(settings.pdf_ocr_provider.label())
-                    .show_ui(ui, |ui| {
-                        for provider in PdfOcrProviderKind::ALL {
-                            ui.selectable_value(
-                                &mut settings.pdf_ocr_provider,
-                                provider,
-                                provider.label(),
-                            );
+        egui::Grid::new("pdf-ocr-settings-grid")
+            .num_columns(2)
+            .spacing([24.0, 16.0])
+            .show(ui, |ui| {
+                settings_module_row_label(ui, language.text("正文识别", "Document recognition"));
+                settings_row_control_sized(ui, 44.0, |ui| {
+                    toggle_switch(ui, &mut settings.pdf_ocr_enabled);
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("提供商", "Provider"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    egui::ComboBox::from_id_salt("pdf-ocr-provider")
+                        .width(SETTINGS_MODEL_SELECT_WIDTH)
+                        .selected_text(settings.pdf_ocr_provider.label())
+                        .show_ui(ui, |ui| {
+                            for provider in PdfOcrProviderKind::ALL {
+                                ui.selectable_value(
+                                    &mut settings.pdf_ocr_provider,
+                                    provider,
+                                    provider.label(),
+                                );
+                            }
+                        });
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("识别模型", "Recognition model"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    match settings.pdf_ocr_provider {
+                        PdfOcrProviderKind::PaddleOcr => {
+                            egui::ComboBox::from_id_salt("paddle-ocr-model")
+                                .width(SETTINGS_MODEL_SELECT_WIDTH)
+                                .selected_text(&settings.paddle_ocr_model)
+                                .show_ui(ui, |ui| {
+                                    for model in [
+                                        "PaddleOCR-VL-1.6",
+                                        "PaddleOCR-VL-1.5",
+                                        "PaddleOCR-VL",
+                                        "PP-StructureV3",
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut settings.paddle_ocr_model,
+                                            model.to_owned(),
+                                            model,
+                                        );
+                                    }
+                                });
                         }
-                    });
-                provider_credential_button(
+                        PdfOcrProviderKind::MinerU => {
+                            egui::ComboBox::from_id_salt("mineru-ocr-model")
+                                .width(SETTINGS_MODEL_SELECT_WIDTH)
+                                .selected_text(&settings.mineru_model)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut settings.mineru_model,
+                                        "vlm".into(),
+                                        "VLM",
+                                    );
+                                    ui.selectable_value(
+                                        &mut settings.mineru_model,
+                                        "pipeline".into(),
+                                        "Pipeline",
+                                    );
+                                });
+                        }
+                    }
+                });
+                ui.end_row();
+
+                settings_row_label(
                     ui,
-                    settings.pdf_ocr_provider.credential_url(),
-                    language.text("获取 API Token", "Get API token"),
+                    match settings.pdf_ocr_provider {
+                        PdfOcrProviderKind::PaddleOcr => "Access Token",
+                        PdfOcrProviderKind::MinerU => "API Token",
+                    },
                 );
-            },
-        );
-        ui.add_space(8.0);
-        match settings.pdf_ocr_provider {
-            PdfOcrProviderKind::PaddleOcr => {
-                field_label(ui, language.text("识别模型", "Recognition model"));
-                egui::ComboBox::from_id_salt("paddle-ocr-model")
-                    .width(SETTINGS_MODEL_SELECT_WIDTH)
-                    .selected_text(&settings.paddle_ocr_model)
-                    .show_ui(ui, |ui| {
-                        for model in [
-                            "PaddleOCR-VL-1.6",
-                            "PaddleOCR-VL-1.5",
-                            "PaddleOCR-VL",
-                            "PP-StructureV3",
-                        ] {
-                            ui.selectable_value(
-                                &mut settings.paddle_ocr_model,
-                                model.to_owned(),
-                                model,
-                            );
-                        }
+                settings_row_control_sized(ui, 324.0, |ui| {
+                    match settings.pdf_ocr_provider {
+                        PdfOcrProviderKind::PaddleOcr => text_field_sized(
+                            ui,
+                            &mut settings.paddle_ocr_token,
+                            true,
+                            SETTINGS_MODEL_SELECT_WIDTH,
+                        ),
+                        PdfOcrProviderKind::MinerU => text_field_sized(
+                            ui,
+                            &mut settings.mineru_token,
+                            true,
+                            SETTINGS_MODEL_SELECT_WIDTH,
+                        ),
+                    };
+                    provider_credential_button(
+                        ui,
+                        settings.pdf_ocr_provider.credential_url(),
+                        language.text("访问提供商官网获取", "Visit the provider website"),
+                    );
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("流式版式", "Reflow layout"));
+                settings_row_control_sized(ui, 44.0, |ui| {
+                    ui.add_enabled_ui(settings.pdf_ocr_enabled, |ui| {
+                        toggle_switch(ui, &mut settings.pdf_ocr_reflow_enabled);
                     });
-                field_label(ui, "Access Token");
-                text_field(ui, &mut settings.paddle_ocr_token, true);
-            }
-            PdfOcrProviderKind::MinerU => {
-                field_label(ui, language.text("识别模型", "Recognition model"));
-                egui::ComboBox::from_id_salt("mineru-ocr-model")
-                    .width(SETTINGS_MODEL_SELECT_WIDTH)
-                    .selected_text(&settings.mineru_model)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut settings.mineru_model, "vlm".into(), "VLM");
-                        ui.selectable_value(
-                            &mut settings.mineru_model,
-                            "pipeline".into(),
-                            "Pipeline",
-                        );
-                    });
-                field_label(ui, "API Token");
-                text_field(ui, &mut settings.mineru_token, true);
-            }
-        }
+                });
+                ui.end_row();
+            });
     });
 }
 
@@ -1132,70 +1228,68 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     let settings = &mut state.draft_plugin_settings;
     let options = configured_model_options(settings);
     settings_card(ui, |ui| {
-        field_label(ui, language.text("翻译模型", "Translation model"));
-        configured_model_selector(
-            ui,
-            "translation-model",
-            &options,
-            &mut settings.translation_provider,
-            &mut settings.translation_model,
-            language,
-        );
-        field_label(ui, language.text("翻译目录", "Translate table of contents"));
-        ui.horizontal(|ui| {
-            if choice_button(
-                ui,
-                language.text("开启", "On"),
-                settings.translate_toc,
-                72.0,
-            )
-            .clicked()
-            {
-                settings.translate_toc = true;
-            }
-            if choice_button(
-                ui,
-                language.text("关闭", "Off"),
-                !settings.translate_toc,
-                72.0,
-            )
-            .clicked()
-            {
-                settings.translate_toc = false;
-            }
-        });
-        field_label(ui, language.text("显示模式", "Display mode"));
-        ui.horizontal(|ui| {
-            let bilingual = settings.translation_mode == TranslationMode::Bilingual;
-            if choice_button(ui, language.text("双语", "Bilingual"), bilingual, 72.0).clicked() {
-                settings.translation_mode = TranslationMode::Bilingual;
-            }
-            let replace = settings.translation_mode == TranslationMode::Replace;
-            if choice_button(ui, language.text("替换", "Replace"), replace, 72.0).clicked() {
-                settings.translation_mode = TranslationMode::Replace;
-            }
-        });
-        field_label(ui, language.text("目标语言", "Target language"));
-        let selected_language = target_language_label(&settings.target_language, language);
-        egui::ComboBox::from_id_salt("translation-target")
-            .width(SETTINGS_SELECT_WIDTH)
-            .selected_text(selected_language)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut settings.target_language,
-                    TARGET_LANGUAGE_INTERFACE.into(),
-                    language.text("跟随界面", "Interface language"),
-                );
-                ui.selectable_value(
-                    &mut settings.target_language,
-                    TARGET_LANGUAGE_SIMPLIFIED_CHINESE.into(),
-                    "简体中文",
-                );
-                ui.selectable_value(
-                    &mut settings.target_language,
-                    TARGET_LANGUAGE_ENGLISH.into(),
-                    "English",
-                );
+        egui::Grid::new("translation-settings-grid")
+            .num_columns(2)
+            .spacing([24.0, 16.0])
+            .show(ui, |ui| {
+                settings_row_label(ui, language.text("翻译模型", "Translation model"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    configured_model_selector(
+                        ui,
+                        "translation-model",
+                        &options,
+                        &mut settings.translation_provider,
+                        &mut settings.translation_model,
+                        language,
+                    );
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("翻译为", "Translate to"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    let selected_language =
+                        target_language_label(&settings.target_language, language);
+                    egui::ComboBox::from_id_salt("translation-target")
+                        .width(SETTINGS_MODEL_SELECT_WIDTH)
+                        .selected_text(selected_language)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut settings.target_language,
+                                TARGET_LANGUAGE_SYSTEM.into(),
+                                language.text("跟随系统", "Follow system"),
+                            );
+                            ui.selectable_value(
+                                &mut settings.target_language,
+                                TARGET_LANGUAGE_SIMPLIFIED_CHINESE.into(),
+                                "简体中文",
+                            );
+                            ui.selectable_value(
+                                &mut settings.target_language,
+                                TARGET_LANGUAGE_ENGLISH.into(),
+                                "English",
+                            );
+                        });
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("显示原文", "Show original text"));
+                settings_row_control_sized(ui, 44.0, |ui| {
+                    let mut show_original = settings.translation_mode == TranslationMode::Bilingual;
+                    if toggle_switch(ui, &mut show_original).changed() {
+                        settings.translation_mode = if show_original {
+                            TranslationMode::Bilingual
+                        } else {
+                            TranslationMode::Replace
+                        };
+                    }
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("翻译目录", "Translate table of contents"));
+                settings_row_control_sized(ui, 44.0, |ui| {
+                    toggle_switch(ui, &mut settings.translate_toc);
+                });
+                ui.end_row();
             });
     });
 }
@@ -1281,17 +1375,101 @@ fn configured_model_selector(
         });
 }
 
+fn default_font_selector(
+    ui: &mut egui::Ui,
+    language: AppLanguage,
+    typography: &mut rebook_layout::ReaderTypography,
+    font_families: &rebook_layout::ReaderFontFamilies,
+) {
+    let (category, family) = match typography.default_font {
+        ReaderDefaultFont::Serif => (language.text("衬线", "Serif"), &typography.serif_font),
+        ReaderDefaultFont::SansSerif => (
+            language.text("无衬线", "Sans serif"),
+            &typography.sans_serif_font,
+        ),
+    };
+    let selected_text = format!("{category} · {family}");
+    egui::ComboBox::from_id_salt("settings-default-font")
+        .width(SETTINGS_FONT_SELECT_WIDTH)
+        .truncate()
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            ui.set_min_width(SETTINGS_FONT_SELECT_WIDTH);
+            default_font_category(
+                ui,
+                "settings-default-serif-fonts",
+                language.text("衬线", "Serif"),
+                ReaderDefaultFont::Serif,
+                typography,
+                &font_families.serif,
+                language,
+            );
+            default_font_category(
+                ui,
+                "settings-default-sans-serif-fonts",
+                language.text("无衬线", "Sans serif"),
+                ReaderDefaultFont::SansSerif,
+                typography,
+                &font_families.sans_serif,
+                language,
+            );
+        });
+}
+
+fn default_font_category(
+    ui: &mut egui::Ui,
+    id_salt: &'static str,
+    label: &str,
+    category: ReaderDefaultFont,
+    typography: &mut rebook_layout::ReaderTypography,
+    font_families: &[String],
+    language: AppLanguage,
+) {
+    let current_category = typography.default_font == category;
+    egui::CollapsingHeader::new(label)
+        .id_salt(id_salt)
+        .default_open(current_category)
+        .show(ui, |ui| {
+            if font_families.is_empty() {
+                ui.weak(language.text("没有可用字体", "No available fonts"));
+                return;
+            }
+            for family in font_families {
+                let selected_family = match category {
+                    ReaderDefaultFont::Serif => &typography.serif_font,
+                    ReaderDefaultFont::SansSerif => &typography.sans_serif_font,
+                };
+                let selected = current_category && selected_family == family;
+                if ui
+                    .selectable_label(selected, family)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    typography.default_font = category;
+                    match category {
+                        ReaderDefaultFont::Serif => typography.serif_font.clone_from(family),
+                        ReaderDefaultFont::SansSerif => {
+                            typography.sans_serif_font.clone_from(family);
+                        }
+                    }
+                    ui.close();
+                }
+            }
+        });
+}
+
 fn font_family_selector(
     ui: &mut egui::Ui,
     id_salt: &'static str,
     selected: &mut String,
     font_families: &[String],
+    language: Option<AppLanguage>,
 ) {
     let popup_state_id = ui.make_persistent_id((id_salt, "popup-was-open"));
     let was_open = ui
         .ctx()
         .data(|data| data.get_temp::<bool>(popup_state_id).unwrap_or(false));
-    let selected_text = selected.clone();
+    let selected_text = font_family_label(selected, language);
     let response = egui::ComboBox::from_id_salt(id_salt)
         .width(SETTINGS_FONT_SELECT_WIDTH)
         .truncate()
@@ -1299,7 +1477,11 @@ fn font_family_selector(
         .show_ui(ui, |ui| {
             for family in font_families {
                 let is_selected = *selected == *family;
-                let response = ui.selectable_value(selected, family.clone(), family);
+                let response = ui.selectable_value(
+                    selected,
+                    family.clone(),
+                    font_family_label(family, language),
+                );
                 if !was_open && is_selected {
                     response.scroll_to_me(Some(egui::Align::Center));
                 }
@@ -1310,9 +1492,90 @@ fn font_family_selector(
         .data_mut(|data| data.insert_temp(popup_state_id, is_open));
 }
 
-fn choice_button(ui: &mut egui::Ui, text: &str, selected: bool, width: f32) -> Response {
+fn font_family_label(family: &str, language: Option<AppLanguage>) -> String {
+    if family == SYSTEM_INTERFACE_FONT
+        && language.is_some_and(|language| language.resolved() == AppLanguage::SimplifiedChinese)
+    {
+        "跟随系统".into()
+    } else {
+        family.into()
+    }
+}
+
+fn choice_button(ui: &mut egui::Ui, text: &str, selected: bool) -> Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.into(), font, palette().text);
+    let text_width = galley.mesh_bounds.width();
+    let width = choice_button_width(text_width, false);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), egui::Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let (fill, stroke, color) = choice_button_visuals(&response, selected);
+    if ui.is_rect_visible(rect) {
+        ui.painter()
+            .rect(rect, 6.0, fill, stroke, egui::StrokeKind::Inside);
+        paint_centered_button_content(ui, rect, None, galley, color);
+    }
+    response
+}
+
+fn toggle_switch(ui: &mut egui::Ui, value: &mut bool) -> Response {
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(42.0, 24.0), egui::Sense::click());
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let progress = ui.ctx().animate_bool_with_time(response.id, *value, 0.14);
+    if ui.is_rect_visible(rect) {
+        let enabled = ui.is_enabled();
+        let track = if *value {
+            palette().accent
+        } else if response.hovered() && enabled {
+            palette().hovered_stroke
+        } else {
+            palette().border
+        };
+        let track = if enabled {
+            track
+        } else {
+            track.gamma_multiply(0.55)
+        };
+        ui.painter().rect_filled(rect, rect.height() / 2.0, track);
+        let knob_radius = 9.0;
+        let knob_x = egui::lerp(
+            (rect.left() + 3.0 + knob_radius)..=(rect.right() - 3.0 - knob_radius),
+            progress,
+        );
+        ui.painter().circle_filled(
+            egui::pos2(knob_x, rect.center().y),
+            knob_radius,
+            Color32::WHITE.gamma_multiply(if enabled { 1.0 } else { 0.72 }),
+        );
+    }
+    response
+}
+
+fn choice_icon_button(ui: &mut egui::Ui, glyph: Icon, text: &str, selected: bool) -> Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.into(), font, palette().text);
+    let text_width = galley.mesh_bounds.width();
+    let width = choice_button_width(text_width, true);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let (fill, stroke, color) = choice_button_visuals(&response, selected);
+    if ui.is_rect_visible(rect) {
+        ui.painter()
+            .rect(rect, 6.0, fill, stroke, egui::StrokeKind::Inside);
+        paint_centered_button_content(ui, rect, Some(glyph), galley, color);
+    }
+    response
+}
+
+fn choice_button_visuals(response: &Response, selected: bool) -> (Color32, egui::Stroke, Color32) {
     let fill = if selected {
         palette().accent_soft
     } else if response.hovered() || response.is_pointer_button_down_on() {
@@ -1325,73 +1588,149 @@ fn choice_button(ui: &mut egui::Ui, text: &str, selected: bool, width: f32) -> R
     } else {
         egui::Stroke::new(1.0, palette().border)
     };
-    let text_color = if selected {
+    let color = if selected {
         palette().accent
     } else {
         palette().text
     };
-    if ui.is_rect_visible(rect) {
-        ui.painter()
-            .rect(rect, 6.0, fill, stroke, egui::StrokeKind::Inside);
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            text,
-            egui::TextStyle::Button.resolve(ui.style()),
-            text_color,
+    (fill, stroke, color)
+}
+
+fn choice_button_width(text_width: f32, with_icon: bool) -> f32 {
+    const HORIZONTAL_PADDING: f32 = 14.0;
+    const ICON_SIZE: f32 = 14.0;
+    const ICON_GAP: f32 = 6.0;
+    let content_width = text_width + if with_icon { ICON_SIZE + ICON_GAP } else { 0.0 };
+    (content_width + HORIZONTAL_PADDING * 2.0).max(if with_icon { 72.0 } else { 56.0 })
+}
+
+fn paint_centered_button_content(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    glyph: Option<Icon>,
+    galley: std::sync::Arc<egui::Galley>,
+    color: Color32,
+) {
+    const ICON_SIZE: f32 = 14.0;
+    const ICON_GAP: f32 = 6.0;
+    let icon_advance = if glyph.is_some() {
+        ICON_SIZE + ICON_GAP
+    } else {
+        0.0
+    };
+    let content_width = icon_advance + galley.mesh_bounds.width();
+    let content_left = rect.center().x - content_width / 2.0;
+    if let Some(glyph) = glyph {
+        paint_icon(
+            ui,
+            egui::Rect::from_center_size(
+                egui::pos2(content_left + ICON_SIZE / 2.0, rect.center().y),
+                Vec2::splat(ICON_SIZE),
+            ),
+            glyph,
+            color,
         );
     }
-    response
+    let text_visual_left = content_left + icon_advance;
+    let origin = egui::pos2(
+        text_visual_left - galley.mesh_bounds.min.x,
+        rect.center().y - galley.mesh_bounds.center().y,
+    );
+    ui.painter()
+        .galley_with_override_text_color(origin, galley, color);
 }
 
 fn cloud_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     let language = state.draft_language;
     let settings = &mut state.draft_sync_settings;
     settings_card(ui, |ui| {
-        ui.checkbox(
-            &mut settings.enabled,
-            language.text("启用 WebDAV 同步", "Enable WebDAV sync"),
-        );
-        ui.add_space(8.0);
-        field_label(ui, language.text("云盘提供商", "Cloud provider"));
-        let mut selected_provider = settings.provider;
-        ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), 28.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                egui::ComboBox::from_id_salt("cloud-provider")
-                    .width(SETTINGS_SELECT_WIDTH)
-                    .selected_text(selected_provider.label())
-                    .show_ui(ui, |ui| {
-                        for provider in CloudProviderKind::ALL {
-                            ui.selectable_value(&mut selected_provider, provider, provider.label());
-                        }
+        egui::Grid::new("cloud-settings-grid")
+            .num_columns(2)
+            .spacing([24.0, 16.0])
+            .show(ui, |ui| {
+                settings_module_row_label(ui, language.text("WebDAV 同步", "WebDAV sync"));
+                settings_row_control_sized(ui, 44.0, |ui| {
+                    toggle_switch(ui, &mut settings.enabled);
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("提供商", "Provider"));
+                settings_row_control_sized(ui, 324.0, |ui| {
+                    let mut selected_provider = settings.provider;
+                    egui::ComboBox::from_id_salt("cloud-provider")
+                        .width(SETTINGS_MODEL_SELECT_WIDTH)
+                        .selected_text(cloud_provider_kind_label(language, selected_provider))
+                        .show_ui(ui, |ui| {
+                            for provider in CloudProviderKind::ALL {
+                                ui.selectable_value(
+                                    &mut selected_provider,
+                                    provider,
+                                    cloud_provider_kind_label(language, provider),
+                                );
+                            }
+                        });
+                    provider_credential_button(
+                        ui,
+                        selected_provider.credential_url(),
+                        language.text("访问帮助文档", "Open help documentation"),
+                    );
+                    if selected_provider != settings.provider {
+                        settings.select_provider(selected_provider);
+                    }
+                });
+                ui.end_row();
+
+                if settings.provider == CloudProviderKind::Custom {
+                    settings_row_label(ui, language.text("接口地址", "Base URL"));
+                    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                        text_field_sized(
+                            ui,
+                            &mut settings.base_url,
+                            false,
+                            SETTINGS_MODEL_SELECT_WIDTH,
+                        );
                     });
-                provider_credential_button(
-                    ui,
-                    selected_provider.credential_url(),
-                    language.text("获取连接凭据", "Get connection credentials"),
-                );
-            },
-        );
-        if selected_provider != settings.provider {
-            settings.select_provider(selected_provider);
-        }
-        if settings.provider == CloudProviderKind::Custom {
-            field_label(ui, "WebDAV URL");
-            text_field(ui, &mut settings.base_url, false);
-        }
-        field_label(ui, language.text("用户名", "Username"));
-        text_field(ui, &mut settings.username, false);
-        field_label(ui, language.text("密码", "Password"));
-        text_field(ui, &mut state.draft_sync_password, true);
-        field_label(ui, language.text("设备名称", "Device name"));
-        text_field(ui, &mut settings.device_name, false);
+                    ui.end_row();
+                }
+
+                settings_row_label(ui, language.text("用户名", "Username"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    text_field_sized(
+                        ui,
+                        &mut settings.username,
+                        false,
+                        SETTINGS_MODEL_SELECT_WIDTH,
+                    );
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("密码", "Password"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    text_field_sized(
+                        ui,
+                        &mut state.draft_sync_password,
+                        true,
+                        SETTINGS_MODEL_SELECT_WIDTH,
+                    );
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("设备名称", "Device name"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    text_field_sized(
+                        ui,
+                        &mut settings.device_name,
+                        false,
+                        SETTINGS_MODEL_SELECT_WIDTH,
+                    );
+                });
+                ui.end_row();
+            });
     });
 }
 
 fn provider_credential_button(ui: &mut egui::Ui, url: &str, tooltip: &str) {
-    if icon_button(ui, Icon::ExternalLink)
+    if small_icon_button(ui, Icon::ExternalLink)
         .on_hover_text(tooltip)
         .clicked()
     {
@@ -1401,10 +1740,34 @@ fn provider_credential_button(ui: &mut egui::Ui, url: &str, tooltip: &str) {
 
 fn target_language_label(value: &str, language: AppLanguage) -> String {
     match value {
-        TARGET_LANGUAGE_INTERFACE => language.text("跟随界面", "Interface language").into(),
+        TARGET_LANGUAGE_SYSTEM => language.text("跟随系统", "Follow system").into(),
         TARGET_LANGUAGE_SIMPLIFIED_CHINESE => "简体中文".into(),
         TARGET_LANGUAGE_ENGLISH => "English".into(),
         _ => value.into(),
+    }
+}
+
+fn theme_label(language: AppLanguage, theme: AppTheme) -> &'static str {
+    match theme {
+        AppTheme::System => language.text("跟随系统", "Follow system"),
+        AppTheme::Light => language.text("浅色模式", "Light"),
+        AppTheme::Dark => language.text("深色模式", "Dark"),
+    }
+}
+
+fn ai_provider_kind_label(language: AppLanguage, kind: AiProviderKind) -> &'static str {
+    if language.resolved() == AppLanguage::SimplifiedChinese && kind == AiProviderKind::Custom {
+        "自定义"
+    } else {
+        kind.label()
+    }
+}
+
+fn cloud_provider_kind_label(language: AppLanguage, kind: CloudProviderKind) -> &'static str {
+    if language.resolved() == AppLanguage::SimplifiedChinese && kind == CloudProviderKind::Custom {
+        "自定义"
+    } else {
+        kind.label()
     }
 }
 
@@ -1414,6 +1777,35 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
             .size(crate::ui::scaled_font_size(12.0))
             .color(palette().muted),
     );
+}
+
+fn settings_module_label(ui: &mut egui::Ui, text: &str) {
+    const SYNTHETIC_BOLD_OFFSET: f32 = 0.45;
+    let color = palette().text;
+    let font = egui::FontId::proportional(crate::ui::scaled_font_size(14.0));
+    let galley = ui.painter().layout_no_wrap(text.into(), font, color);
+    let desired_size = Vec2::new(
+        galley.mesh_bounds.width() + SYNTHETIC_BOLD_OFFSET,
+        galley.size().y,
+    );
+    let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let origin = egui::pos2(
+            rect.left() - galley.mesh_bounds.min.x,
+            rect.center().y - galley.mesh_bounds.center().y,
+        );
+        ui.painter()
+            .galley_with_override_text_color(origin, galley.clone(), color);
+        ui.painter().galley_with_override_text_color(
+            origin + egui::vec2(SYNTHETIC_BOLD_OFFSET, 0.0),
+            galley,
+            color,
+        );
+    }
+}
+
+fn settings_module_row_label(ui: &mut egui::Ui, text: &str) {
+    settings_row_control(ui, |ui| settings_module_label(ui, text));
 }
 
 fn settings_row_label(ui: &mut egui::Ui, text: &str) {
@@ -1438,10 +1830,11 @@ fn font_family_row(
     id_salt: &'static str,
     selected: &mut String,
     font_families: &[String],
+    language: Option<AppLanguage>,
 ) {
     settings_row_label(ui, label);
     settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
-        font_family_selector(ui, id_salt, selected, font_families);
+        font_family_selector(ui, id_salt, selected, font_families, language);
     });
     ui.end_row();
 }
@@ -1567,15 +1960,21 @@ fn settings_card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
-fn text_field(ui: &mut egui::Ui, value: &mut String, password: bool) -> Response {
-    let width = ui.available_width().clamp(180.0, 520.0);
-    text_field_sized(ui, value, password, width)
+fn text_field_sized(ui: &mut egui::Ui, value: &mut String, password: bool, width: f32) -> Response {
+    text_field_sized_with_hint(ui, value, password, width, "")
 }
 
-fn text_field_sized(ui: &mut egui::Ui, value: &mut String, password: bool, width: f32) -> Response {
+fn text_field_sized_with_hint(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    password: bool,
+    width: f32,
+    hint: &str,
+) -> Response {
     ui.add_sized(
         [width, 36.0],
         egui::TextEdit::singleline(value)
+            .hint_text(hint)
             .password(password)
             .vertical_align(egui::Align::Center)
             .margin(egui::Margin::symmetric(10, 0)),
@@ -1583,31 +1982,44 @@ fn text_field_sized(ui: &mut egui::Ui, value: &mut String, password: bool, width
 }
 
 fn secondary_button(ui: &mut egui::Ui, text: &str) -> Response {
-    ui.add(
-        egui::Button::new(RichText::new(text).color(palette().accent))
-            .min_size(Vec2::new(0.0, 32.0))
-            .fill(crate::ui::palette().accent_soft)
-            .stroke(egui::Stroke::new(
-                1.0,
-                palette().accent.gamma_multiply(0.22),
-            ))
-            .corner_radius(6),
-    )
-    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    secondary_button_with_width(ui, text, None)
 }
 
 fn secondary_button_sized(ui: &mut egui::Ui, text: &str, width: f32) -> Response {
-    ui.add_sized(
-        [width, 32.0],
-        egui::Button::new(RichText::new(text).color(palette().accent))
-            .fill(crate::ui::palette().accent_soft)
-            .stroke(egui::Stroke::new(
-                1.0,
-                palette().accent.gamma_multiply(0.22),
-            ))
-            .corner_radius(6),
-    )
-    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    secondary_button_with_width(ui, text, Some(width))
+}
+
+fn secondary_button_with_width(
+    ui: &mut egui::Ui,
+    text: &str,
+    fixed_width: Option<f32>,
+) -> Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.into(), font, palette().accent);
+    let text_width = galley.mesh_bounds.width();
+    let width = fixed_width.unwrap_or_else(|| (text_width + 28.0).max(56.0));
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let fill = if response.is_pointer_button_down_on() {
+        palette().accent_soft.gamma_multiply(0.82)
+    } else if response.hovered() {
+        palette().accent_soft.gamma_multiply(0.92)
+    } else {
+        palette().accent_soft
+    };
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect(
+            rect,
+            6.0,
+            fill,
+            egui::Stroke::new(1.0, palette().accent.gamma_multiply(0.22)),
+            egui::StrokeKind::Inside,
+        );
+        paint_centered_button_content(ui, rect, None, galley, palette().accent);
+    }
+    response
 }
 
 #[cfg(test)]
@@ -1628,6 +2040,63 @@ mod tests {
     }
 
     #[test]
+    fn toggle_switch_uses_compact_pill_geometry() {
+        egui::__run_test_ui(|ui| {
+            let mut enabled = false;
+            let response = toggle_switch(ui, &mut enabled);
+            assert!((response.rect.width() - 42.0).abs() < 0.01);
+            assert!((response.rect.height() - 24.0).abs() < 0.01);
+            assert!(!enabled);
+        });
+    }
+
+    #[test]
+    fn custom_provider_labels_are_localized_only_for_chinese_ui() {
+        assert_eq!(
+            ai_provider_kind_label(AppLanguage::SimplifiedChinese, AiProviderKind::Custom),
+            "自定义"
+        );
+        assert_eq!(
+            cloud_provider_kind_label(AppLanguage::SimplifiedChinese, CloudProviderKind::Custom),
+            "自定义"
+        );
+        assert_eq!(
+            ai_provider_kind_label(AppLanguage::English, AiProviderKind::Custom),
+            "Custom"
+        );
+        assert_eq!(
+            cloud_provider_kind_label(AppLanguage::English, CloudProviderKind::Custom),
+            "Custom"
+        );
+    }
+
+    #[test]
+    fn system_interface_font_label_is_localized_without_changing_its_value() {
+        assert_eq!(
+            font_family_label(SYSTEM_INTERFACE_FONT, Some(AppLanguage::SimplifiedChinese)),
+            "跟随系统"
+        );
+        assert_eq!(
+            font_family_label(SYSTEM_INTERFACE_FONT, Some(AppLanguage::English)),
+            SYSTEM_INTERFACE_FONT
+        );
+        assert_eq!(
+            font_family_label(SYSTEM_INTERFACE_FONT, Some(AppLanguage::System)),
+            AppLanguage::System.text("跟随系统", SYSTEM_INTERFACE_FONT)
+        );
+        assert_eq!(font_family_label("Arial", None), "Arial");
+    }
+
+    #[test]
+    fn choice_buttons_use_content_width_with_uniform_horizontal_padding() {
+        let short_text = 28.0;
+        let long_text = 56.0;
+        assert!((choice_button_width(long_text, false) - long_text - 28.0).abs() < 0.01);
+        assert!(choice_button_width(long_text, false) > choice_button_width(short_text, false));
+        assert!(choice_button_width(long_text, true) > choice_button_width(long_text, false));
+    }
+
+    #[test]
     fn captured_shortcuts_drop_the_cross_platform_command_alias() {
         assert_eq!(
             canonical_shortcut_modifiers(egui::Modifiers {
@@ -1645,5 +2114,53 @@ mod tests {
             }),
             egui::Modifiers::MAC_CMD
         );
+    }
+
+    #[test]
+    fn shortcut_capture_waits_for_the_primary_key_in_a_chord() {
+        for modifier in [
+            egui::Key::ShiftLeft,
+            egui::Key::ShiftRight,
+            egui::Key::ControlLeft,
+            egui::Key::ControlRight,
+            egui::Key::AltLeft,
+            egui::Key::AltRight,
+            egui::Key::SuperLeft,
+            egui::Key::SuperRight,
+        ] {
+            assert!(is_shortcut_modifier_key(modifier));
+        }
+        assert!(!is_shortcut_modifier_key(egui::Key::B));
+        assert!(!is_shortcut_modifier_key(egui::Key::F11));
+    }
+
+    #[test]
+    fn shortcut_capture_label_previews_held_modifiers() {
+        egui::__run_test_ui(|ui| {
+            assert_eq!(
+                shortcut_capture_label(
+                    ui.ctx(),
+                    AppLanguage::SimplifiedChinese,
+                    egui::Modifiers::NONE,
+                ),
+                "请按快捷键…"
+            );
+            let preview = shortcut_capture_label(
+                ui.ctx(),
+                AppLanguage::SimplifiedChinese,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            );
+            assert!(preview.contains("Ctrl"));
+            assert!(preview.contains("Shift"));
+            assert!(preview.ends_with('…'));
+            assert_eq!(
+                shortcut_capture_label(
+                    ui.ctx(),
+                    AppLanguage::SimplifiedChinese,
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT | egui::Modifiers::ALT,
+                ),
+                "最多支持三个按键"
+            );
+        });
     }
 }

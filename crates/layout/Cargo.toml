@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 image.workspace = true
 parley.workspace = true
+read-fonts.workspace = true
 rebook-math = { path = "../math" }
 rebook-publication = { path = "../publication" }
 resvg.workspace = true

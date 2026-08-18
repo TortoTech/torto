@@ -78,9 +78,7 @@ impl DesktopReader {
             != plugin_settings.translation_provider
             || self.plugin_settings.translation_model != plugin_settings.translation_model
             || self.plugin_settings.target_language != plugin_settings.target_language
-            || self.plugin_settings.providers != plugin_settings.providers
-            || (self.language != language
-                && plugin_settings.target_language == crate::plugins::TARGET_LANGUAGE_INTERFACE);
+            || self.plugin_settings.providers != plugin_settings.providers;
         let toc_translation_setting_changed =
             self.plugin_settings.translate_toc != plugin_settings.translate_toc;
         let old_ocr_provider = self
@@ -143,7 +141,7 @@ impl DesktopReader {
         style.typography.clone_from(&settings.typography);
         style.typesetting.clone_from(&settings.typesetting);
         self.selection_granularity = settings.selection_granularity;
-        super::apply_theme_colors(&mut style, settings.theme);
+        super::apply_theme_colors(&mut style, crate::ui::theme());
         match self.reader.set_style(style) {
             Ok(snapshot) => {
                 self.plugin_settings = plugin_settings;

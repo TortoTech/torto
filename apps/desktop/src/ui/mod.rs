@@ -3,7 +3,7 @@ mod icons;
 mod svg_loader;
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use egui::emath::GuiRounding;
 use egui::{
@@ -127,31 +127,59 @@ impl Palette {
 }
 
 static DARK_THEME: AtomicBool = AtomicBool::new(false);
+static THEME_PREFERENCE: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn set_theme(ctx: &egui::Context, theme: AppTheme) {
-    DARK_THEME.store(theme == AppTheme::Dark, Ordering::Relaxed);
-    ctx.set_theme(egui_theme(theme));
+    THEME_PREFERENCE.store(theme_preference_value(theme), Ordering::Relaxed);
+    ctx.set_theme(egui_theme_preference(theme));
+    sync_resolved_theme(ctx);
 }
 
-const fn egui_theme(theme: AppTheme) -> egui::Theme {
+const fn egui_theme_preference(theme: AppTheme) -> egui::ThemePreference {
     match theme {
-        AppTheme::Dark => egui::Theme::Dark,
-        AppTheme::Light => egui::Theme::Light,
+        AppTheme::System => egui::ThemePreference::System,
+        AppTheme::Dark => egui::ThemePreference::Dark,
+        AppTheme::Light => egui::ThemePreference::Light,
     }
 }
 
-pub(crate) fn theme() -> AppTheme {
+const fn theme_preference_value(theme: AppTheme) -> u8 {
+    match theme {
+        AppTheme::System => 0,
+        AppTheme::Light => 1,
+        AppTheme::Dark => 2,
+    }
+}
+
+pub(crate) fn theme_preference() -> AppTheme {
+    match THEME_PREFERENCE.load(Ordering::Relaxed) {
+        1 => AppTheme::Light,
+        2 => AppTheme::Dark,
+        _ => AppTheme::System,
+    }
+}
+
+pub(crate) fn sync_system_theme(ctx: &egui::Context, preference: AppTheme) -> bool {
+    preference == AppTheme::System && sync_resolved_theme(ctx)
+}
+
+fn sync_resolved_theme(ctx: &egui::Context) -> bool {
+    let dark = ctx.theme() == egui::Theme::Dark;
+    DARK_THEME.swap(dark, Ordering::Relaxed) != dark
+}
+
+pub(crate) fn theme() -> egui::Theme {
     if DARK_THEME.load(Ordering::Relaxed) {
-        AppTheme::Dark
+        egui::Theme::Dark
     } else {
-        AppTheme::Light
+        egui::Theme::Light
     }
 }
 
 pub(crate) fn palette() -> Palette {
     match theme() {
-        AppTheme::Light => Palette::light(),
-        AppTheme::Dark => Palette::dark(),
+        egui::Theme::Light => Palette::light(),
+        egui::Theme::Dark => Palette::dark(),
     }
 }
 
@@ -712,8 +740,18 @@ mod tests {
 
     #[test]
     fn app_themes_select_the_matching_egui_theme() {
-        assert_eq!(egui_theme(AppTheme::Light), egui::Theme::Light);
-        assert_eq!(egui_theme(AppTheme::Dark), egui::Theme::Dark);
+        assert_eq!(
+            egui_theme_preference(AppTheme::System),
+            egui::ThemePreference::System
+        );
+        assert_eq!(
+            egui_theme_preference(AppTheme::Light),
+            egui::ThemePreference::Light
+        );
+        assert_eq!(
+            egui_theme_preference(AppTheme::Dark),
+            egui::ThemePreference::Dark
+        );
     }
 
     #[test]
@@ -733,6 +771,26 @@ mod tests {
             egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark)
         )));
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn system_theme_preference_tracks_runtime_system_theme_changes() {
+        let ctx = egui::Context::default();
+        let mut dark_input = egui::RawInput::default();
+        dark_input.system_theme = Some(egui::Theme::Dark);
+        let mut output = ctx.run_ui(dark_input, |_| {});
+        output.textures_delta.clear();
+
+        set_theme(&ctx, AppTheme::System);
+        assert_eq!(theme_preference(), AppTheme::System);
+        assert_eq!(theme(), egui::Theme::Dark);
+
+        let mut light_input = egui::RawInput::default();
+        light_input.system_theme = Some(egui::Theme::Light);
+        let mut output = ctx.run_ui(light_input, |_| {});
+        output.textures_delta.clear();
+        assert!(sync_system_theme(&ctx, AppTheme::System));
+        assert_eq!(theme(), egui::Theme::Light);
     }
 
     #[test]

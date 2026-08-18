@@ -21,6 +21,7 @@ pub(crate) struct DesktopApp {
     applied_settings_revision: u64,
     pending_reader_notice: Option<String>,
     pending_reader_error: Option<String>,
+    fullscreen_toggle_requested: bool,
     #[cfg(target_os = "windows")]
     updater: crate::updater::WindowsUpdater,
 }
@@ -35,6 +36,7 @@ impl DesktopApp {
             applied_settings_revision: 0,
             pending_reader_notice: None,
             pending_reader_error: None,
+            fullscreen_toggle_requested: false,
             #[cfg(target_os = "windows")]
             updater: crate::updater::WindowsUpdater::new(),
         }
@@ -83,6 +85,11 @@ impl DesktopApp {
             reader.report_settings_error(error);
         }
         settings_overlay(ui.ctx(), &mut self.settings);
+        if ui.ctx().input_mut(|input| {
+            input.consume_shortcut(&self.settings.applied().shortcuts.fullscreen)
+        }) {
+            self.fullscreen_toggle_requested = true;
+        }
         #[cfg(target_os = "windows")]
         {
             if self.settings.take_update_check_request() {
@@ -98,6 +105,10 @@ impl DesktopApp {
         plan
     }
 
+    pub(crate) fn take_fullscreen_toggle_request(&mut self) -> bool {
+        std::mem::take(&mut self.fullscreen_toggle_requested)
+    }
+
     pub(crate) fn reader_scene(&mut self) -> Option<ReaderScene> {
         self.reader.as_mut().map(DesktopReader::page_scene)
     }
@@ -108,6 +119,7 @@ impl DesktopApp {
         proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     ) {
         self.shelf.spawn_pending_tasks(runtime, proxy);
+        self.settings.spawn_pending_tasks(runtime, proxy);
         #[cfg(target_os = "windows")]
         self.updater.spawn_pending_tasks(runtime, proxy);
         if let Some(reader) = self.reader.as_mut() {
@@ -125,6 +137,13 @@ impl DesktopApp {
 
     pub(crate) fn complete_shelf_import(&mut self, message: ShelfImportTaskMessage) {
         self.shelf.complete_import(message);
+    }
+
+    pub(crate) fn complete_settings_provider_models(
+        &mut self,
+        message: crate::settings::ProviderModelsMessage,
+    ) {
+        self.settings.complete_provider_models(message);
     }
 
     #[cfg(target_os = "windows")]
@@ -272,16 +291,18 @@ impl DesktopApp {
 
     fn apply_settings_if_changed(&mut self, ctx: &egui::Context) {
         let revision = self.settings.revision();
-        if revision == self.applied_settings_revision {
+        let revision_changed = revision != self.applied_settings_revision;
+        let applied = self.settings.applied().clone();
+        if revision_changed {
+            crate::ui::apply_interface_typography(ctx, &applied.interface_typography);
+            crate::ui::set_theme(ctx, applied.theme);
+        }
+        let resolved_theme_changed = crate::ui::sync_system_theme(ctx, applied.theme);
+        if !revision_changed && !resolved_theme_changed {
             return;
         }
-        let applied = self.settings.applied().clone();
-        crate::ui::apply_interface_typography(ctx, &applied.interface_typography);
-        if applied.theme != crate::ui::theme() {
-            crate::ui::set_theme(ctx, applied.theme);
-            crate::ui::apply_visuals(ctx, &crate::ui::palette());
-            ctx.request_repaint();
-        }
+        crate::ui::apply_visuals(ctx, &crate::ui::palette());
+        ctx.request_repaint();
         self.shelf.apply_global_settings(&applied);
         if let Some(reader) = self.reader.as_mut() {
             reader.apply_global_settings(&applied);

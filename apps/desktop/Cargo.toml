@@ -70,6 +70,7 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sys-locale.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 uuid.workspace = true

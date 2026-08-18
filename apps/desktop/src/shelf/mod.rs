@@ -28,9 +28,10 @@ const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const SHELF_TOAST_TOP_OFFSET: f32 = 84.0;
 const SHELF_SCROLLBAR_GUTTER: f32 = 16.0;
 const CARD_WIDTH: f32 = 180.0;
-const CARD_HEIGHT: f32 = 336.0;
+const CARD_HEIGHT: f32 = 280.0;
 const COVER_WIDTH: f32 = 160.0;
 const COVER_HEIGHT: f32 = 228.0;
+const SHELF_TITLE_BOLD_OFFSET: f32 = 0.45;
 
 fn sync_progress_text(
     language: AppLanguage,
@@ -262,7 +263,11 @@ impl ShelfFeature {
         match self.shelf.library.import_files(paths) {
             Ok(summary) => {
                 self.cover_textures.clear();
-                let message = match (self.language, summary.imported, summary.duplicates) {
+                let message = match (
+                    self.language.resolved(),
+                    summary.imported,
+                    summary.duplicates,
+                ) {
                     (AppLanguage::SimplifiedChinese, 0, duplicate) => {
                         format!("所选的 {duplicate} 本书已在书架中")
                     }
@@ -279,6 +284,7 @@ impl ShelfFeature {
                     (AppLanguage::English, imported, duplicate) => {
                         format!("Imported {imported} books and skipped {duplicate} duplicates")
                     }
+                    (AppLanguage::System, _, _) => unreachable!(),
                 };
                 self.show_notice(message);
             }
@@ -754,29 +760,22 @@ impl ShelfFeature {
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
         let texture = self.cover_texture(ui.ctx(), book);
         let painter = ui.painter();
-        painter.rect_filled(
-            rect,
-            10.0,
-            if response.hovered() {
-                palette().accent_soft.gamma_multiply(0.42)
-            } else {
-                palette().surface
-            },
-        );
+        if response.hovered() {
+            painter.rect_filled(rect, 10.0, palette().accent_soft.gamma_multiply(0.42));
+        }
         let cover_rect = egui::Rect::from_min_size(
             rect.min + Vec2::splat(10.0),
             Vec2::new(COVER_WIDTH, COVER_HEIGHT),
         );
-        painter.rect_filled(cover_rect, 6.0, palette().surface);
         if let Some(texture) = texture {
-            let image_rect = contain_rect(cover_rect, texture.size_vec2());
-            painter.image(
-                texture.id(),
-                image_rect,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            egui::Image::new(&texture)
+                .uv(cover_uv_rect(cover_rect.size(), texture.size_vec2()))
+                .fit_to_exact_size(cover_rect.size())
+                .corner_radius(6)
+                .show_loading_spinner(false)
+                .paint_at(ui, cover_rect);
         } else {
+            painter.rect_filled(cover_rect, 6.0, palette().surface_muted);
             paint_icon(
                 ui,
                 egui::Rect::from_center_size(cover_rect.center(), Vec2::splat(24.0)),
@@ -787,34 +786,21 @@ impl ShelfFeature {
 
         let title_rect = egui::Rect::from_min_size(
             egui::pos2(rect.left() + 12.0, cover_rect.bottom() + 12.0),
-            Vec2::new(CARD_WIDTH - 24.0, 42.0),
+            Vec2::new(CARD_WIDTH - 24.0, 20.0),
         );
-        let title = painter.layout_job(two_line_card_text_job(
+        let title = painter.layout_job(single_line_card_text_job(
             book.title.clone(),
-            egui::FontId::proportional(crate::ui::scaled_font_size(14.0)),
+            egui::FontId::proportional(crate::ui::scaled_font_size(12.0)),
             palette().text,
-            title_rect.width(),
+            title_rect.width() - SHELF_TITLE_BOLD_OFFSET,
         ));
-        painter
-            .with_clip_rect(title_rect)
-            .galley(title_rect.min, title, palette().text);
-
-        let authors = book.authors.join(" / ");
-        if !authors.is_empty() {
-            let author_rect = egui::Rect::from_min_size(
-                egui::pos2(rect.left() + 12.0, title_rect.bottom() + 4.0),
-                Vec2::new(CARD_WIDTH - 24.0, 34.0),
-            );
-            let author = painter.layout_job(two_line_card_text_job(
-                authors,
-                egui::FontId::proportional(crate::ui::scaled_font_size(12.0)),
-                palette().muted,
-                author_rect.width(),
-            ));
-            painter
-                .with_clip_rect(author_rect)
-                .galley(author_rect.min, author, palette().muted);
-        }
+        let title_painter = painter.with_clip_rect(title_rect);
+        title_painter.galley(title_rect.min, title.clone(), palette().text);
+        title_painter.galley(
+            title_rect.min + egui::vec2(SHELF_TITLE_BOLD_OFFSET, 0.0),
+            title,
+            palette().text,
+        );
 
         if response.clicked() {
             self.open_book(&book.path);
@@ -984,14 +970,15 @@ impl ShelfFeature {
     }
 }
 
-fn two_line_card_text_job(
+fn single_line_card_text_job(
     text: String,
     font_id: egui::FontId,
     color: Color32,
     max_width: f32,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::simple(text, font_id, color, max_width);
-    job.wrap.max_rows = 2;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
     job
 }
 
@@ -1055,17 +1042,32 @@ fn shelf_import_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     response
 }
 
-fn contain_rect(bounds: egui::Rect, image_size: Vec2) -> egui::Rect {
-    if image_size.x <= 0.0
+fn cover_uv_rect(bounds_size: Vec2, image_size: Vec2) -> egui::Rect {
+    let full = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+    if bounds_size.x <= 0.0
+        || bounds_size.y <= 0.0
+        || !bounds_size.x.is_finite()
+        || !bounds_size.y.is_finite()
+        || image_size.x <= 0.0
         || image_size.y <= 0.0
         || !image_size.x.is_finite()
         || !image_size.y.is_finite()
     {
-        return bounds;
+        return full;
     }
-    let scale = (bounds.width() / image_size.x).min(bounds.height() / image_size.y);
-    let size = image_size * scale;
-    egui::Rect::from_center_size(bounds.center(), size)
+    let bounds_aspect = bounds_size.x / bounds_size.y;
+    let image_aspect = image_size.x / image_size.y;
+    if image_aspect > bounds_aspect {
+        let visible_width = bounds_aspect / image_aspect;
+        let inset = (1.0 - visible_width) / 2.0;
+        egui::Rect::from_min_max(egui::pos2(inset, 0.0), egui::pos2(1.0 - inset, 1.0))
+    } else if image_aspect < bounds_aspect {
+        let visible_height = image_aspect / bounds_aspect;
+        let inset = (1.0 - visible_height) / 2.0;
+        egui::Rect::from_min_max(egui::pos2(0.0, inset), egui::pos2(1.0, 1.0 - inset))
+    } else {
+        full
+    }
 }
 
 fn book_matches_query(book: &LibraryBook, query: &str) -> bool {
@@ -1078,12 +1080,13 @@ fn book_matches_query(book: &LibraryBook, query: &str) -> bool {
 }
 
 fn shelf_search_hint(language: AppLanguage, book_count: usize) -> String {
-    match language {
+    match language.resolved() {
         AppLanguage::SimplifiedChinese => {
             format!("从{book_count}本书籍中搜索书名或作者")
         }
         AppLanguage::English if book_count == 1 => "Search title or author in 1 book".into(),
         AppLanguage::English => format!("Search titles or authors in {book_count} books"),
+        AppLanguage::System => unreachable!(),
     }
 }
 
@@ -1115,6 +1118,32 @@ mod tests {
             cover_bytes: None,
             added_at,
         }
+    }
+
+    #[test]
+    fn cover_uv_uses_a_centered_object_fit_cover_crop() {
+        let wide = cover_uv_rect(Vec2::new(2.0, 3.0), Vec2::new(2.0, 1.0));
+        assert!((wide.center().x - 0.5).abs() < f32::EPSILON);
+        assert!((wide.width() - 1.0 / 3.0).abs() < 0.001);
+        assert!((wide.height() - 1.0).abs() < f32::EPSILON);
+
+        let tall = cover_uv_rect(Vec2::new(2.0, 3.0), Vec2::new(1.0, 3.0));
+        assert!((tall.center().y - 0.5).abs() < f32::EPSILON);
+        assert!((tall.width() - 1.0).abs() < f32::EPSILON);
+        assert!((tall.height() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn shelf_titles_use_the_same_single_line_truncation_contract_as_egui_labels() {
+        let job = single_line_card_text_job(
+            "A title that is much wider than the shelf card".into(),
+            egui::FontId::proportional(12.0),
+            Color32::WHITE,
+            120.0,
+        );
+        assert_eq!(job.wrap.max_rows, 1);
+        assert!(job.wrap.break_anywhere);
+        assert_eq!(job.wrap.max_width, 120.0);
     }
 
     #[test]

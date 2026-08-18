@@ -6,7 +6,6 @@ const BITTER_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Bitter-wght.
 const BITTER_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Bitter-Italic-wght.ttf");
 const ROBOTO_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Roboto-wdth-wght.ttf");
 const ROBOTO_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Roboto-Italic-wdth-wght.ttf");
-const FIRA_CODE: &[u8] = include_bytes!("../../../assets/fonts/FiraCode-wght.ttf");
 pub(crate) fn cjk_font_bytes() -> &'static [u8] {
     rebook_formats::cjk_fallback_font_bytes()
 }
@@ -17,7 +16,6 @@ pub fn embedded_reader_fonts() -> Arc<[Blob<u8>]> {
         font_blob(BITTER_ITALIC),
         font_blob(ROBOTO_REGULAR),
         font_blob(ROBOTO_ITALIC),
-        font_blob(FIRA_CODE),
         font_blob(cjk_font_bytes()),
     ]
     .into()
@@ -35,7 +33,7 @@ mod tests {
     #[test]
     fn embedded_font_assets_are_non_empty() {
         let fonts = embedded_reader_fonts();
-        assert_eq!(fonts.len(), 6);
+        assert_eq!(fonts.len(), 5);
         assert!(fonts.iter().all(|font| !font.is_empty()));
     }
 
@@ -43,13 +41,27 @@ mod tests {
     fn embedded_fonts_register_with_reader_family_names() {
         let fonts = embedded_reader_fonts();
         let mut engine = LayoutEngine::with_fonts(fonts.iter().cloned());
-        let families = engine.available_font_families();
+        let mut families = engine.available_reader_font_families();
+        families.include_configured(&rebook_layout::ReaderTypography::default());
 
-        for expected in ["Bitter", "Roboto", "Fira Code", "LXGW WenKai"] {
+        for expected in ["Bitter", "Roboto", "LXGW WenKai GB Screen"] {
             assert!(
-                families.iter().any(|family| family == expected),
-                "missing embedded font family {expected:?}; registered: {families:?}"
+                families.all.iter().any(|family| family == expected),
+                "missing embedded font family {expected:?}; registered: {:?}",
+                families.all
             );
         }
+        assert!(families.serif.iter().any(|family| family == "Bitter"));
+        assert!(families.sans_serif.iter().any(|family| family == "Roboto"));
+        assert!(
+            families
+                .chinese
+                .iter()
+                .any(|family| family == "LXGW WenKai GB Screen")
+        );
+        assert!(!families.chinese.iter().any(|family| family == "Bitter"));
+        assert!(!families.chinese.iter().any(|family| family == "Roboto"));
+        #[cfg(target_os = "windows")]
+        assert!(families.monospace.iter().any(|family| family == "Consolas"));
     }
 }

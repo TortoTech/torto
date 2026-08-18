@@ -445,9 +445,10 @@ fn localized_release_notes(markdown: &str, language: AppLanguage) -> &str {
         return markdown;
     };
 
-    let localized = match language {
+    let localized = match language.resolved() {
         AppLanguage::SimplifiedChinese => chinese.trim(),
         AppLanguage::English => english.trim(),
+        AppLanguage::System => unreachable!(),
     };
     if localized.is_empty() {
         markdown

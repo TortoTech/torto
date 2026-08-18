@@ -58,6 +58,7 @@ percent-encoding = "2.3.2"
 pollster = "0.4.0"
 pulldown-cmark = "0.13.0"
 quick-xml = { version = "0.41.0", features = ["encoding", "escape-html"] }
+read-fonts = "0.41.0"
 ratex-layout = "0.1.14"
 ratex-parser = "0.1.14"
 ratex-svg = { version = "0.1.14", features = ["embed-fonts"] }
@@ -72,6 +73,7 @@ scraper = { version = "0.27.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
+sys-locale = "0.3.2"
 thiserror = "2.0.19"
 tracing = "0.1.44"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "sync", "time"] }

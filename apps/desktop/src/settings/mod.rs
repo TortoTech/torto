@@ -1,5 +1,9 @@
+use std::collections::HashMap;
+
 use peniko::Blob;
-use rebook_layout::{LayoutEngine, ReaderTypesetting, ReaderTypography, SpreadMode};
+use rebook_layout::{
+    LayoutEngine, ReaderFontFamilies, ReaderTypesetting, ReaderTypography, SpreadMode,
+};
 use rebook_reader::SelectionGranularity;
 
 use crate::plugins::PluginSettings;
@@ -8,12 +12,16 @@ use crate::preferences::{
     ShortcutPreferences,
 };
 use crate::sync::SyncSettings;
+use crate::{async_task::TaskSlot, platform::UserEvent};
 
 mod egui_view;
+mod provider_models;
 
 pub(crate) use egui_view::settings_overlay;
+pub(crate) use provider_models::ProviderModelsMessage;
+use provider_models::{ProviderModelsRequest, fetch_provider_models};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct AppliedSettings {
     pub(crate) spread: SpreadMode,
     pub(crate) reading_mode: ReadingMode,
@@ -50,13 +58,17 @@ pub(crate) struct SettingsFeature {
     draft_shortcuts: ShortcutPreferences,
     draft_sync_settings: SyncSettings,
     draft_sync_password: String,
-    available_font_families: Vec<String>,
+    available_reader_font_families: ReaderFontFamilies,
     available_interface_font_families: Vec<String>,
     applied: AppliedSettings,
     revision: u64,
     error: Option<String>,
     open: bool,
     capturing_shortcut: Option<ShortcutAction>,
+    provider_models_task: TaskSlot<ProviderModelsRequest>,
+    provider_models_cache: HashMap<String, Vec<String>>,
+    provider_models_errors: HashMap<String, String>,
+    provider_models_loading: Option<String>,
     #[cfg(target_os = "windows")]
     update_check_requested: bool,
     #[cfg(target_os = "windows")]
@@ -83,8 +95,9 @@ impl SettingsFeature {
             tracing::warn!(%error, "failed to load WebDAV credential");
             String::new()
         });
-        let available_font_families =
-            LayoutEngine::with_fonts(reader_fonts.iter().cloned()).available_font_families();
+        let mut available_reader_font_families =
+            LayoutEngine::with_fonts(reader_fonts.iter().cloned()).available_reader_font_families();
+        available_reader_font_families.include_configured(&preferences.typography);
         let available_interface_font_families = crate::ui::available_interface_font_families();
         let applied = AppliedSettings {
             spread: preferences.spread,
@@ -113,13 +126,17 @@ impl SettingsFeature {
             draft_shortcuts: applied.shortcuts.clone(),
             draft_sync_settings: applied.sync_settings.clone(),
             draft_sync_password: applied.sync_password.clone(),
-            available_font_families,
+            available_reader_font_families,
             available_interface_font_families,
             applied,
             revision: 0,
             error: None,
             open: false,
             capturing_shortcut: None,
+            provider_models_task: TaskSlot::default(),
+            provider_models_cache: HashMap::new(),
+            provider_models_errors: HashMap::new(),
+            provider_models_loading: None,
             #[cfg(target_os = "windows")]
             update_check_requested: false,
             #[cfg(target_os = "windows")]
@@ -157,6 +174,59 @@ impl SettingsFeature {
 
     pub(crate) fn applied(&self) -> &AppliedSettings {
         &self.applied
+    }
+
+    pub(crate) fn spawn_pending_tasks(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    ) {
+        let Some(request) = self.provider_models_task.take_pending() else {
+            return;
+        };
+        let proxy = proxy.clone();
+        runtime.spawn(async move {
+            let result = fetch_provider_models(&request.payload).await;
+            let _ = proxy.send_event(UserEvent::SettingsProviderModels(ProviderModelsMessage {
+                id: request.id,
+                result,
+            }));
+        });
+    }
+
+    pub(crate) fn complete_provider_models(&mut self, message: ProviderModelsMessage) {
+        let Some(request) = self.provider_models_task.complete(message.id) else {
+            return;
+        };
+        if self.provider_models_loading.as_deref() == Some(&request.provider_id) {
+            self.provider_models_loading = None;
+        }
+        match message.result {
+            Ok(models) => {
+                self.provider_models_errors.remove(&request.provider_id);
+                self.provider_models_cache
+                    .insert(request.provider_id, models);
+            }
+            Err(error) => {
+                self.provider_models_errors
+                    .insert(request.provider_id, error);
+            }
+        }
+    }
+
+    fn request_provider_models(&mut self, request: ProviderModelsRequest) {
+        self.provider_models_errors.remove(&request.provider_id);
+        self.provider_models_loading = Some(request.provider_id.clone());
+        self.provider_models_task.begin(request);
+    }
+
+    fn invalidate_provider_models(&mut self, provider_id: &str) {
+        self.provider_models_cache.remove(provider_id);
+        self.provider_models_errors.remove(provider_id);
+        if self.provider_models_loading.as_deref() == Some(provider_id) {
+            self.provider_models_task.cancel();
+            self.provider_models_loading = None;
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -249,6 +319,35 @@ impl SettingsFeature {
         self.open = false;
     }
 
+    fn close_and_apply(&mut self) {
+        if !settings_close_needs_apply(&self.draft_settings(), &self.applied) {
+            self.close_overlay();
+        } else {
+            self.apply_settings();
+        }
+    }
+
+    fn draft_settings(&self) -> AppliedSettings {
+        AppliedSettings {
+            spread: self.draft_spread,
+            reading_mode: self.draft_reading_mode,
+            interface_typography: self.draft_interface_typography.clone(),
+            typography: self.draft_typography.clone(),
+            typesetting: self.draft_typesetting.clone(),
+            plugin_settings: self.draft_plugin_settings.clone(),
+            language: self.draft_language,
+            theme: self.draft_theme,
+            selection_granularity: self.applied.selection_granularity,
+            shortcuts: self.draft_shortcuts.clone(),
+            sync_settings: self.draft_sync_settings.clone(),
+            sync_password: if self.draft_sync_password.is_empty() {
+                self.applied.sync_password.clone()
+            } else {
+                self.draft_sync_password.clone()
+            },
+        }
+    }
+
     fn apply_settings(&mut self) {
         let mut plugin_settings = self.draft_plugin_settings.clone();
         plugin_settings.normalize();
@@ -268,6 +367,17 @@ impl SettingsFeature {
                     .text(
                         "快捷键存在重复，请修改后再保存",
                         "Some shortcuts conflict. Change them before saving.",
+                    )
+                    .into(),
+            );
+            return;
+        }
+        if self.draft_shortcuts.has_oversized_chords() {
+            self.error = Some(
+                language
+                    .text(
+                        "快捷键最多支持三个按键",
+                        "Shortcuts support up to three keys.",
                     )
                     .into(),
             );
@@ -293,21 +403,12 @@ impl SettingsFeature {
             ));
             return;
         }
-        if let Err(error) = persist_settings(
-            &reader_preferences,
-            &plugin_settings,
-            &sync_settings,
-            &self.draft_sync_password,
-        ) {
-            self.error = Some(error);
-            return;
-        }
         let sync_password = if self.draft_sync_password.is_empty() {
             self.applied.sync_password.clone()
         } else {
             self.draft_sync_password.clone()
         };
-        self.applied = AppliedSettings {
+        let next_applied = AppliedSettings {
             spread: self.draft_spread,
             reading_mode: self.draft_reading_mode,
             interface_typography,
@@ -321,6 +422,20 @@ impl SettingsFeature {
             sync_settings,
             sync_password,
         };
+        if next_applied == self.applied {
+            self.close_overlay();
+            return;
+        }
+        if let Err(error) = persist_settings(
+            &reader_preferences,
+            &next_applied.plugin_settings,
+            &next_applied.sync_settings,
+            &self.draft_sync_password,
+        ) {
+            self.error = Some(error);
+            return;
+        }
+        self.applied = next_applied;
         self.draft_sync_password
             .clone_from(&self.applied.sync_password);
         self.error = None;
@@ -335,6 +450,10 @@ impl SettingsFeature {
 
 const fn reader_change_needs_apply(values_unchanged: bool, layout_changed: bool) -> bool {
     !values_unchanged || layout_changed
+}
+
+fn settings_close_needs_apply(draft: &AppliedSettings, applied: &AppliedSettings) -> bool {
+    draft != applied
 }
 
 fn persist_settings(
@@ -394,8 +513,11 @@ enum SettingsTab {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShortcutAction {
+    Fullscreen,
     ToggleLeftSidebar,
     ToggleRightSidebar,
+    ToggleTranslation,
+    ReturnToShelf,
     FocusActions,
     FocusChat,
     FocusHighlight,
@@ -405,8 +527,11 @@ enum ShortcutAction {
 impl ShortcutAction {
     fn binding(self, shortcuts: &ShortcutPreferences) -> egui::KeyboardShortcut {
         match self {
+            Self::Fullscreen => shortcuts.fullscreen,
             Self::ToggleLeftSidebar => shortcuts.toggle_left_sidebar,
             Self::ToggleRightSidebar => shortcuts.toggle_right_sidebar,
+            Self::ToggleTranslation => shortcuts.toggle_translation,
+            Self::ReturnToShelf => shortcuts.return_to_shelf,
             Self::FocusActions => shortcuts.focus_actions,
             Self::FocusChat => shortcuts.focus_chat,
             Self::FocusHighlight => shortcuts.focus_highlight,
@@ -416,8 +541,11 @@ impl ShortcutAction {
 
     fn set_binding(self, shortcuts: &mut ShortcutPreferences, binding: egui::KeyboardShortcut) {
         match self {
+            Self::Fullscreen => shortcuts.fullscreen = binding,
             Self::ToggleLeftSidebar => shortcuts.toggle_left_sidebar = binding,
             Self::ToggleRightSidebar => shortcuts.toggle_right_sidebar = binding,
+            Self::ToggleTranslation => shortcuts.toggle_translation = binding,
+            Self::ReturnToShelf => shortcuts.return_to_shelf = binding,
             Self::FocusActions => shortcuts.focus_actions = binding,
             Self::FocusChat => shortcuts.focus_chat = binding,
             Self::FocusHighlight => shortcuts.focus_highlight = binding,
@@ -437,12 +565,40 @@ enum UpdateCheckStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::reader_change_needs_apply;
+    use super::*;
 
     #[test]
     fn repeated_layout_request_still_reapplies_the_active_reader() {
         assert!(reader_change_needs_apply(true, true));
         assert!(!reader_change_needs_apply(true, false));
         assert!(reader_change_needs_apply(false, false));
+    }
+
+    #[test]
+    fn closing_settings_applies_only_changed_drafts() {
+        let preferences = ReaderPreferences::default();
+        let applied = AppliedSettings {
+            spread: preferences.spread,
+            reading_mode: preferences.reading_mode,
+            interface_typography: preferences.interface_typography,
+            typography: preferences.typography,
+            typesetting: preferences.typesetting,
+            plugin_settings: PluginSettings::default(),
+            language: preferences.language,
+            theme: preferences.theme,
+            selection_granularity: preferences.selection_granularity,
+            shortcuts: preferences.shortcuts,
+            sync_settings: SyncSettings::new_device(),
+            sync_password: String::new(),
+        };
+        assert!(!settings_close_needs_apply(&applied, &applied));
+
+        let mut changed = applied.clone();
+        changed.theme = match applied.theme {
+            AppTheme::System => AppTheme::Light,
+            AppTheme::Light => AppTheme::Dark,
+            AppTheme::Dark => AppTheme::System,
+        };
+        assert!(settings_close_needs_apply(&changed, &applied));
     }
 }

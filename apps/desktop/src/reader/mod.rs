@@ -25,9 +25,7 @@ use crate::plugins::{
     ChatTurn, PdfOcrSourceController, PdfOcrViewMode, PluginSettings, RewriteBookSource,
     TranslationBlockInput, TranslationBookSource, has_pending_pdf_ocr_task, load_pdf_ocr_source,
 };
-use crate::preferences::{
-    self, AppLanguage, AppTheme, ReaderPreferences, ReadingMode, ShortcutPreferences,
-};
+use crate::preferences::{self, AppLanguage, ReaderPreferences, ReadingMode, ShortcutPreferences};
 use crate::settings::ReaderSettingsChange;
 use crate::sync::{SyncSettings, SyncStore};
 
@@ -66,9 +64,9 @@ use render::{PageSceneKey, PageSceneLayers};
 
 // Reader page colors follow the app theme; the light pair matches
 // ReaderStyle::default so existing books keep their warm paper look.
-fn apply_theme_colors(style: &mut ReaderStyle, theme: AppTheme) {
+fn apply_theme_colors(style: &mut ReaderStyle, theme: egui::Theme) {
     match theme {
-        AppTheme::Light => {
+        egui::Theme::Light => {
             style.foreground = Rgba::BLACK;
             style.background = Rgba {
                 red: 250,
@@ -77,7 +75,7 @@ fn apply_theme_colors(style: &mut ReaderStyle, theme: AppTheme) {
                 alpha: 255,
             };
         }
-        AppTheme::Dark => {
+        egui::Theme::Dark => {
             style.foreground = Rgba {
                 red: 210,
                 green: 207,
@@ -229,7 +227,7 @@ pub(super) fn open_reader(
     if fixed_page {
         style.column_gap = 0.0;
     }
-    apply_theme_colors(&mut style, reader_preferences.theme);
+    apply_theme_colors(&mut style, crate::ui::theme());
     let sync_settings = SyncSettings::load_default().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load WebDAV settings; using defaults");
         SyncSettings::new_device()

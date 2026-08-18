@@ -3,9 +3,8 @@ use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, StartCause, WindowEvent};
+use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
 #[cfg(target_os = "windows")]
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(not(target_os = "windows"))]
@@ -62,10 +61,6 @@ fn clear_color() -> wgpu::Color {
 fn native_background_color() -> [u8; 3] {
     let background = crate::ui::palette().background;
     [background.r(), background.g(), background.b()]
-}
-
-fn is_fullscreen_toggle(state: ElementState, repeat: bool, logical_key: &Key) -> bool {
-    state == ElementState::Pressed && !repeat && logical_key == &NamedKey::F11
 }
 
 fn toggle_fullscreen(state: &mut WindowState) {
@@ -137,10 +132,11 @@ fn compositor_fullscreen_bounds(
     )
 }
 
-const fn native_window_theme(theme: AppTheme) -> Theme {
+const fn native_window_theme(theme: AppTheme) -> Option<Theme> {
     match theme {
-        AppTheme::Light => Theme::Light,
-        AppTheme::Dark => Theme::Dark,
+        AppTheme::System => None,
+        AppTheme::Light => Some(Theme::Light),
+        AppTheme::Dark => Some(Theme::Dark),
     }
 }
 
@@ -234,7 +230,7 @@ impl ApplicationHandler<UserEvent> for Application {
         let attributes = Window::default_attributes()
             .with_title("Torto")
             .with_window_icon(app_icon())
-            .with_theme(Some(native_window_theme(self.app.theme())))
+            .with_theme(native_window_theme(self.app.theme()))
             .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
             .with_min_inner_size(LogicalSize::new(720_u32, 520_u32));
         #[cfg(target_os = "windows")]
@@ -331,6 +327,9 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::ShelfImport(message) => self.app.complete_shelf_import(message),
             UserEvent::ShelfSyncProgress(message) => self.app.update_shelf_sync_progress(message),
             UserEvent::ShelfSync(message) => self.app.complete_shelf_sync(message),
+            UserEvent::SettingsProviderModels(message) => {
+                self.app.complete_settings_provider_models(message);
+            }
             UserEvent::ReaderSearch(message) => self.app.complete_reader_search(message),
             UserEvent::ReaderChatStream(message) => self.app.update_reader_chat_stream(message),
             UserEvent::ReaderChat(message) => self.app.complete_reader_chat(message),
@@ -364,11 +363,6 @@ impl ApplicationHandler<UserEvent> for Application {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::KeyboardInput { event, .. }
-                if is_fullscreen_toggle(event.state, event.repeat, &event.logical_key) =>
-            {
-                toggle_fullscreen(state);
-            }
             WindowEvent::Focused(focused) => {
                 let size = state.window.inner_size();
                 crate::diagnostics::log(
@@ -429,6 +423,9 @@ impl ApplicationHandler<UserEvent> for Application {
                     state.gpu.set_clear_color(clear_color());
                     #[cfg(target_os = "windows")]
                     state.native_background.set_color(native_background_color());
+                    if self.app.take_fullscreen_toggle_request() {
+                        toggle_fullscreen(state);
+                    }
                     self.app.spawn_pending_tasks(&self.runtime, &self.proxy);
                     #[cfg(target_os = "windows")]
                     if let Some(request) = self.app.take_update_install_request() {
@@ -466,20 +463,6 @@ impl ApplicationHandler<UserEvent> for Application {
 mod tests {
     use super::*;
 
-    #[test]
-    fn f11_press_toggles_fullscreen_once() {
-        let f11 = Key::Named(NamedKey::F11);
-
-        assert!(is_fullscreen_toggle(ElementState::Pressed, false, &f11));
-        assert!(!is_fullscreen_toggle(ElementState::Released, false, &f11));
-        assert!(!is_fullscreen_toggle(ElementState::Pressed, true, &f11));
-        assert!(!is_fullscreen_toggle(
-            ElementState::Pressed,
-            false,
-            &Key::Named(NamedKey::F10),
-        ));
-    }
-
     #[cfg(target_os = "windows")]
     #[test]
     fn compositor_fullscreen_overscans_the_monitor_by_one_pixel() {
@@ -497,8 +480,9 @@ mod tests {
 
     #[test]
     fn initial_window_theme_matches_the_app_theme() {
-        assert_eq!(native_window_theme(AppTheme::Light), Theme::Light);
-        assert_eq!(native_window_theme(AppTheme::Dark), Theme::Dark);
+        assert_eq!(native_window_theme(AppTheme::System), None);
+        assert_eq!(native_window_theme(AppTheme::Light), Some(Theme::Light));
+        assert_eq!(native_window_theme(AppTheme::Dark), Some(Theme::Dark));
     }
 
     #[test]

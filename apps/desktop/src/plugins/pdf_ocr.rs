@@ -435,7 +435,7 @@ where
     F: FnMut(String) + Send,
 {
     if !settings.pdf_ocr_enabled {
-        return Err("请先在“设置 → OCR”中启用 PDF 正文 OCR".into());
+        return Err("请先在“设置 → OCR”中启用正文识别".into());
     }
     progress("正在上传 PDF…".into());
     let client = Client::builder()

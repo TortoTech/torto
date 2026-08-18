@@ -31,7 +31,7 @@ const PAGE_CACHE_CAPACITY: usize = 6;
 const PAGE_MAX_DIMENSION: f32 = 2_048.0;
 const COVER_MAX_DIMENSION: f32 = 384.0;
 const MAX_RENDER_SCALE: f32 = 2.0;
-static CJK_FALLBACK_FONT: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKai-Regular.ttf");
+static CJK_FALLBACK_FONT: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKaiGBScreen.ttf");
 
 pub fn cjk_fallback_font_bytes() -> &'static [u8] {
     CJK_FALLBACK_FONT
