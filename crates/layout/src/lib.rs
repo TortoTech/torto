@@ -772,7 +772,53 @@ impl LayoutEngine {
                         paginator.push_text(&prepared, &resolved)?;
                     }
                     Block::Quote(quote) => {
+                        let quote_width = if unified_reflow {
+                            (content_width - QUOTE_HORIZONTAL_PADDING * 2.0).max(40.0)
+                        } else {
+                            content_width
+                        };
+                        let mut prepared_body = Vec::with_capacity(quote.body.len());
+                        for body in &quote.body {
+                            let resolved =
+                                resolve_text_block(body, reader_style, TextContext::Flow);
+                            let mut prepared =
+                                self.shape_text(&resolved, reader_style, quote_width);
+                            if unified_reflow {
+                                prepared.start_offset += QUOTE_HORIZONTAL_PADDING;
+                            }
+                            prepared_body.push((prepared, resolved));
+                        }
+                        let prepared_attribution = quote.attribution.as_ref().map(|attribution| {
+                            let resolved =
+                                resolve_text_block(attribution, reader_style, TextContext::Flow);
+                            let mut prepared =
+                                self.shape_text(&resolved, reader_style, quote_width);
+                            if unified_reflow {
+                                prepared.start_offset += QUOTE_HORIZONTAL_PADDING;
+                            }
+                            (prepared, resolved)
+                        });
                         if unified_reflow {
+                            let content_height = prepared_body
+                                .iter()
+                                .map(|(prepared, resolved)| {
+                                    prepared_flow_height(prepared)
+                                        + resolved.style.margin_before.max(0.0)
+                                        + resolved.style.margin_after.max(0.0)
+                                })
+                                .chain(prepared_attribution.iter().map(|(prepared, resolved)| {
+                                    prepared_flow_height(prepared)
+                                        + resolved.style.margin_before.max(0.0)
+                                        + resolved.style.margin_after.max(0.0)
+                                }))
+                                .sum::<f32>();
+                            // Keep a short quote card intact. The leading outer
+                            // gap and both internal paddings must fit before its
+                            // trailing attribution; the final outer gap may flow
+                            // naturally after the completed card.
+                            paginator.keep_together_if_fits(
+                                content_height + QUOTE_VERTICAL_PADDING * 3.0,
+                            );
                             let sources = quote
                                 .body
                                 .iter()
@@ -786,30 +832,11 @@ impl LayoutEngine {
                                 .collect();
                             paginator.begin_quote(sources, reader_style.foreground);
                         }
-                        let quote_width = if unified_reflow {
-                            (content_width - QUOTE_HORIZONTAL_PADDING * 2.0).max(40.0)
-                        } else {
-                            content_width
-                        };
-                        for body in &quote.body {
-                            let resolved =
-                                resolve_text_block(body, reader_style, TextContext::Flow);
-                            let mut prepared =
-                                self.shape_text(&resolved, reader_style, quote_width);
-                            if unified_reflow {
-                                prepared.start_offset += QUOTE_HORIZONTAL_PADDING;
-                            }
-                            paginator.push_text(&prepared, &resolved)?;
+                        for (prepared, resolved) in &prepared_body {
+                            paginator.push_text(prepared, resolved.as_ref())?;
                         }
-                        if let Some(attribution) = &quote.attribution {
-                            let resolved =
-                                resolve_text_block(attribution, reader_style, TextContext::Flow);
-                            let mut prepared =
-                                self.shape_text(&resolved, reader_style, quote_width);
-                            if unified_reflow {
-                                prepared.start_offset += QUOTE_HORIZONTAL_PADDING;
-                            }
-                            paginator.push_text(&prepared, &resolved)?;
+                        if let Some((prepared, resolved)) = &prepared_attribution {
+                            paginator.push_text(prepared, resolved.as_ref())?;
                         }
                         if unified_reflow {
                             paginator.end_quote();
@@ -1829,6 +1856,18 @@ fn prepared_text_height(prepared: &PreparedText) -> f32 {
     (last.metrics().block_max_coord - first.metrics().block_min_coord).max(0.0)
 }
 
+fn prepared_flow_height(prepared: &PreparedText) -> f32 {
+    let Some(first) = prepared.layout.get(0) else {
+        return 0.0;
+    };
+    let Some(last) = prepared.layout.get(prepared.layout.len().saturating_sub(1)) else {
+        return 0.0;
+    };
+    let metrics = last.metrics();
+    let line_box_bottom = metrics.block_min_coord + metrics.line_height;
+    (metrics.block_max_coord.max(line_box_bottom) - first.metrics().block_min_coord).max(0.0)
+}
+
 fn resolve_text_measure(
     block: &TextBlock,
     content_width: f32,
@@ -2404,6 +2443,17 @@ impl Paginator {
         {
             self.advance_column();
             self.leading_gap = self.leading_gap.max(outer_gap.max(0.0));
+        }
+    }
+
+    fn keep_together_if_fits(&mut self, content_height: f32) {
+        let content_height = content_height.max(0.0);
+        let full_height = self.bottom - self.top;
+        if content_height <= full_height
+            && self.cursor_y + content_height > self.bottom
+            && self.column_has_content
+        {
+            self.advance_column();
         }
     }
 
@@ -4842,6 +4892,93 @@ mod tests {
                 .is_some_and(|line| line.metrics().offset > 0.0),
             "attribution should align to the inline end"
         );
+    }
+
+    #[test]
+    fn unified_short_quote_keeps_its_attribution_on_the_same_page() {
+        let spine = SpineItemId::new("chapter").unwrap();
+        let range = |node: &str, length: u64| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: length,
+            },
+        };
+        let text = |kind, value: &str, source| TextBlock {
+            kind,
+            content: vec![Inline::Text(TextRun {
+                text: value.into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle::default(),
+            source: Some(source),
+        };
+        // Nine separators leave enough room for the quote body but not its
+        // attribution. The complete short quote should move as one unit.
+        let mut blocks = vec![Block::Separator; 9];
+        blocks.push(Block::Quote(QuoteBlock {
+            body: vec![text(
+                TextBlockKind::Blockquote,
+                "Reading entails intense mental activity; thoughtful readers pause and reflect.",
+                range("quote-body", 79),
+            )],
+            attribution: Some(text(
+                TextBlockKind::QuoteAttribution,
+                "Mortimer Adler",
+                range("quote-source", 14),
+            )),
+            source: None,
+        }));
+        let section = Section {
+            id: spine,
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks,
+            anchors: Vec::new(),
+        };
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("quote-keep-together-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(420, 360).unwrap(),
+                &style,
+            )
+            .unwrap();
+        let page_for = |node: &str| {
+            layout.pages.iter().position(|page| {
+                page.items.iter().any(|item| {
+                    let PageItem::Text(text) = item else {
+                        return false;
+                    };
+                    text.source
+                        .as_ref()
+                        .is_some_and(|source| source.start.node == node)
+                })
+            })
+        };
+        let body_page = page_for("quote-body").expect("quote body should be laid out");
+        let source_page = page_for("quote-source").expect("quote attribution should be laid out");
+        assert_eq!(body_page, source_page);
+        assert!(body_page > 0, "awkward remainder should move the quote");
     }
 
     #[test]

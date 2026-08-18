@@ -237,7 +237,11 @@ impl ApplicationHandler<UserEvent> for Application {
         let attributes = {
             use winit::platform::windows::WindowAttributesExtWindows as _;
 
-            attributes.with_taskbar_icon(app_icon())
+            // Windows can display unspecified client pixels as soon as a visible
+            // HWND is created, while adapter/device initialization still takes
+            // place. Install the themed native background and prepare the GPU
+            // before exposing the window to DWM.
+            attributes.with_taskbar_icon(app_icon()).with_visible(false)
         };
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
@@ -292,8 +296,7 @@ impl ApplicationHandler<UserEvent> for Application {
         };
         let mut gpu = gpu;
         gpu.set_clear_color(clear_color());
-        window.request_redraw();
-        self.window = Some(WindowState {
+        let state = WindowState {
             window,
             #[cfg(target_os = "windows")]
             native_background,
@@ -301,7 +304,32 @@ impl ApplicationHandler<UserEvent> for Application {
             egui_state,
             #[cfg(target_os = "windows")]
             windowed_placement: None,
-        });
+        };
+        #[cfg(target_os = "windows")]
+        let state = {
+            let mut state = state;
+            state.window.set_visible(true);
+            let size = state.window.inner_size();
+            crate::diagnostics::log(
+                "window.startup_reveal",
+                &[
+                    crate::diagnostics::Field::U64("width", u64::from(size.width)),
+                    crate::diagnostics::Field::U64("height", u64::from(size.height)),
+                ],
+            );
+            // Present synchronously in the same handler that reveals the HWND.
+            // The queued redraw covers drivers that initially report the surface
+            // as occluded during the visibility transition.
+            Self::render_window_state(&mut state, &mut self.app, &self.egui_ctx);
+            state.window.request_redraw();
+            state
+        };
+        #[cfg(not(target_os = "windows"))]
+        let state = {
+            state.window.request_redraw();
+            state
+        };
+        self.window = Some(state);
     }
 
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {

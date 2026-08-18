@@ -1389,36 +1389,55 @@ fn default_font_selector(
         ),
     };
     let selected_text = format!("{category} · {family}");
-    egui::ComboBox::from_id_salt("settings-default-font")
-        .width(SETTINGS_FONT_SELECT_WIDTH)
-        .truncate()
-        .selected_text(selected_text)
-        .show_ui(ui, |ui| {
-            ui.set_min_width(SETTINGS_FONT_SELECT_WIDTH);
-            default_font_category(
-                ui,
-                "settings-default-serif-fonts",
-                language.text("衬线", "Serif"),
-                ReaderDefaultFont::Serif,
-                typography,
-                &font_families.serif,
-                language,
-            );
-            default_font_category(
-                ui,
-                "settings-default-sans-serif-fonts",
-                language.text("无衬线", "Sans serif"),
-                ReaderDefaultFont::SansSerif,
-                typography,
-                &font_families.sans_serif,
-                language,
-            );
-        });
+    let arrow_id = ui.make_persistent_id("settings-default-font-arrow");
+    let arrow_size = 14.0;
+    let button = egui::Button::new((
+        selected_text,
+        egui::Atom::grow(),
+        egui::Atom::custom(arrow_id, Vec2::splat(arrow_size)),
+    ))
+    .min_size(Vec2::new(SETTINGS_FONT_SELECT_WIDTH, 0.0))
+    .truncate()
+    .corner_radius(6);
+    let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+        ui.set_min_width(SETTINGS_SELECT_WIDTH);
+        default_font_submenu(
+            ui,
+            language.text("衬线", "Serif"),
+            ReaderDefaultFont::Serif,
+            typography,
+            &font_families.serif,
+            language,
+        );
+        default_font_submenu(
+            ui,
+            language.text("无衬线", "Sans serif"),
+            ReaderDefaultFont::SansSerif,
+            typography,
+            &font_families.sans_serif,
+            language,
+        );
+    });
+    if ui.is_rect_visible(response.rect) {
+        let padding = ui.spacing().button_padding;
+        let arrow_rect = egui::Rect::from_center_size(
+            egui::pos2(
+                response.rect.right() - padding.x - arrow_size / 2.0,
+                response.rect.center().y,
+            ),
+            Vec2::splat(arrow_size),
+        );
+        paint_icon(
+            ui,
+            arrow_rect,
+            Icon::ChevronDown,
+            ui.style().interact(&response).fg_stroke.color,
+        );
+    }
 }
 
-fn default_font_category(
+fn default_font_submenu(
     ui: &mut egui::Ui,
-    id_salt: &'static str,
     label: &str,
     category: ReaderDefaultFont,
     typography: &mut rebook_layout::ReaderTypography,
@@ -1426,36 +1445,51 @@ fn default_font_category(
     language: AppLanguage,
 ) {
     let current_category = typography.default_font == category;
-    egui::CollapsingHeader::new(label)
-        .id_salt(id_salt)
-        .default_open(current_category)
-        .show(ui, |ui| {
-            if font_families.is_empty() {
-                ui.weak(language.text("没有可用字体", "No available fonts"));
-                return;
-            }
-            for family in font_families {
-                let selected_family = match category {
-                    ReaderDefaultFont::Serif => &typography.serif_font,
-                    ReaderDefaultFont::SansSerif => &typography.sans_serif_font,
-                };
-                let selected = current_category && selected_family == family;
-                if ui
-                    .selectable_label(selected, family)
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    typography.default_font = category;
-                    match category {
-                        ReaderDefaultFont::Serif => typography.serif_font.clone_from(family),
-                        ReaderDefaultFont::SansSerif => {
-                            typography.sans_serif_font.clone_from(family);
-                        }
-                    }
-                    ui.close();
+    let label = RichText::new(label).color(if current_category {
+        palette().accent
+    } else {
+        palette().text
+    });
+    ui.menu_button(label, |ui| {
+        ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
+                if font_families.is_empty() {
+                    ui.weak(language.text("没有可用字体", "No available fonts"));
+                    return;
                 }
-            }
-        });
+                for family in font_families {
+                    let selected_family = match category {
+                        ReaderDefaultFont::Serif => &typography.serif_font,
+                        ReaderDefaultFont::SansSerif => &typography.sans_serif_font,
+                    };
+                    let selected = current_category && selected_family == family;
+                    let row_width = ui.available_width();
+                    if ui
+                        .add(
+                            egui::Button::selectable(selected, family)
+                                .min_size(Vec2::new(row_width, 0.0))
+                                .truncate(),
+                        )
+                        .on_hover_text(family)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        typography.default_font = category;
+                        match category {
+                            ReaderDefaultFont::Serif => typography.serif_font.clone_from(family),
+                            ReaderDefaultFont::SansSerif => {
+                                typography.sans_serif_font.clone_from(family);
+                            }
+                        }
+                        ui.close();
+                    }
+                }
+            });
+    });
 }
 
 fn font_family_selector(
@@ -2047,6 +2081,27 @@ mod tests {
             assert!((response.rect.width() - 42.0).abs() < 0.01);
             assert!((response.rect.height() - 24.0).abs() < 0.01);
             assert!(!enabled);
+        });
+    }
+
+    #[test]
+    fn default_font_menu_button_matches_native_select_height() {
+        egui::__run_test_ui(|ui| {
+            let native = egui::ComboBox::from_id_salt("native-select-height")
+                .width(SETTINGS_FONT_SELECT_WIDTH)
+                .selected_text("Serif · Bitter")
+                .show_ui(ui, |_| {})
+                .response;
+            let arrow_id = ui.make_persistent_id("test-default-font-arrow");
+            let button = egui::Button::new((
+                "Serif · Bitter",
+                egui::Atom::grow(),
+                egui::Atom::custom(arrow_id, Vec2::splat(14.0)),
+            ))
+            .min_size(Vec2::new(SETTINGS_FONT_SELECT_WIDTH, 0.0));
+            let (menu, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |_| {});
+
+            assert!((menu.rect.height() - native.rect.height()).abs() < 0.01);
         });
     }
 

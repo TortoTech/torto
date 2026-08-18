@@ -136,10 +136,30 @@ impl GpuState {
         loop {
             match self.surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(frame) => return Ok(Some(frame)),
+                wgpu::CurrentSurfaceTexture::Suboptimal(frame) if !recovery_attempted => {
+                    crate::diagnostics::log(
+                        "render.surface",
+                        &[crate::diagnostics::Field::Text(
+                            "status",
+                            "suboptimal_recovering",
+                        )],
+                    );
+                    // A suboptimal frame can still target the old DXGI swapchain
+                    // extent after Windows has already resized the client area.
+                    // Merely requesting another redraw is insufficient because
+                    // `resize` sees the desired dimensions in `surface_config`
+                    // and skips an otherwise-identical configure call forever.
+                    drop(frame);
+                    self.surface.configure(&self.device, &self.surface_config);
+                    recovery_attempted = true;
+                }
                 wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                     crate::diagnostics::log(
                         "render.surface",
-                        &[crate::diagnostics::Field::Text("status", "suboptimal")],
+                        &[crate::diagnostics::Field::Text(
+                            "status",
+                            "suboptimal_deferred",
+                        )],
                     );
                     window.request_redraw();
                     return Ok(Some(frame));
