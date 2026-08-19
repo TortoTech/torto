@@ -436,10 +436,7 @@ impl PageDisplayList {
     pub fn paint_images_at(&self, scene: &mut impl PaintScene, offset_x: f32) {
         let transform = Affine::translate((f64::from(offset_x), 0.0));
         for command in &self.commands {
-            if matches!(
-                command,
-                DisplayCommand::Image(_) | DisplayCommand::FillRect(_)
-            ) {
+            if command.paints_below_source_overlays() {
                 command.paint(scene, transform);
             }
         }
@@ -1194,6 +1191,13 @@ enum DisplayCommand {
 }
 
 impl DisplayCommand {
+    fn paints_below_source_overlays(&self) -> bool {
+        matches!(
+            self,
+            Self::Image(_) | Self::FillRect(_) | Self::FillRoundedRect(_)
+        )
+    }
+
     fn paint(&self, scene: &mut impl PaintScene, page_transform: Affine) {
         match self {
             Self::Glyphs(command) => scene.draw_glyphs(
@@ -1305,12 +1309,23 @@ impl DisplayListCompiler {
                         bounds,
                         sources: quote.sources.clone(),
                     });
+                    if quote.fill.alpha > 0 {
+                        commands.push(DisplayCommand::FillRoundedRect(FillRoundedRectCommand {
+                            rect: RoundedRect::from_rect(bounds, 7.0),
+                            color: color(quote.fill),
+                        }));
+                    }
+                    let accent_inset = 8.0_f64.min(bounds.height() * 0.2);
                     commands.push(DisplayCommand::FillRoundedRect(FillRoundedRectCommand {
-                        rect: RoundedRect::from_rect(bounds, 7.0),
-                        color: color(quote.fill),
-                    }));
-                    commands.push(DisplayCommand::FillRect(FillRectCommand {
-                        rect: Rect::new(bounds.x0, bounds.y0, bounds.x0 + 3.0, bounds.y1),
+                        rect: RoundedRect::from_rect(
+                            Rect::new(
+                                bounds.x0 + 6.0,
+                                bounds.y0 + accent_inset,
+                                bounds.x0 + 10.0,
+                                bounds.y1 - accent_inset,
+                            ),
+                            2.0,
+                        ),
                         color: color(quote.accent),
                     }));
                 }
@@ -1729,9 +1744,55 @@ mod tests {
     use parley::{Alignment, AlignmentOptions, FontContext, LayoutContext, StyleProperty};
     use rebook_layout::{
         FixedPageTextReplacementPlacement, FixedPageTextReplacementSegmentPlacement,
-        ImagePlacement, LayoutViewport, PageItem, PageLayout, RasterImage, TextBrush,
-        TextPlacement,
+        ImagePlacement, LayoutViewport, PageItem, PageLayout, QuotePlacement, RasterImage,
+        TextBrush, TextPlacement,
     };
+
+    #[test]
+    fn rounded_quote_decorations_are_painted_below_source_overlays() {
+        let page = PageLayout {
+            viewport: LayoutViewport::new(200, 200).unwrap(),
+            background: Rgba {
+                red: 255,
+                green: 255,
+                blue: 255,
+                alpha: 255,
+            },
+            leading_gap: 0.0,
+            items: vec![PageItem::Quote(QuotePlacement {
+                x: 20.0,
+                y: 30.0,
+                width: 160.0,
+                height: 80.0,
+                continued_before: false,
+                continued_after: false,
+                fill: Rgba {
+                    alpha: 0,
+                    ..Rgba::BLACK
+                },
+                accent: Rgba {
+                    red: 0xD1,
+                    green: 0xD7,
+                    blue: 0xDE,
+                    alpha: 255,
+                },
+                sources: Vec::new(),
+            })],
+        };
+
+        let list = DisplayListCompiler.compile(&page);
+        let quote_decorations = list
+            .commands
+            .iter()
+            .filter(|command| matches!(command, DisplayCommand::FillRoundedRect(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(quote_decorations.len(), 1);
+        assert!(
+            quote_decorations
+                .iter()
+                .all(|command| command.paints_below_source_overlays())
+        );
+    }
     use rebook_publication::{
         FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, SourceAnchor, SourceRange,
         SpineItemId,

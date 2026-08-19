@@ -20,7 +20,6 @@ use rebook_publication::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const QUOTE_HORIZONTAL_PADDING: f32 = 16.0;
 const QUOTE_VERTICAL_PADDING: f32 = 12.0;
 
 const DEFAULT_COLUMN_GAP: f32 = 36.0;
@@ -772,19 +771,37 @@ impl LayoutEngine {
                         paginator.push_text(&prepared, &resolved)?;
                     }
                     Block::Quote(quote) => {
+                        let quote_horizontal_padding = if unified_reflow {
+                            reader_style.typography.font_size
+                                * paragraph_indent_em(
+                                    &reader_style.typesetting,
+                                    reader_style.writing_system,
+                                )
+                        } else {
+                            0.0
+                        };
                         let quote_width = if unified_reflow {
-                            (content_width - QUOTE_HORIZONTAL_PADDING * 2.0).max(40.0)
+                            (content_width - quote_horizontal_padding * 2.0).max(40.0)
                         } else {
                             content_width
                         };
                         let mut prepared_body = Vec::with_capacity(quote.body.len());
-                        for body in &quote.body {
-                            let resolved =
+                        for (index, body) in quote.body.iter().enumerate() {
+                            let mut resolved =
                                 resolve_text_block(body, reader_style, TextContext::Flow);
+                            if unified_reflow
+                                && quote.attribution.is_none()
+                                && index + 1 == quote.body.len()
+                            {
+                                // The card already owns its bottom padding. Keeping the unified
+                                // paragraph gap after the final body paragraph would make a quote
+                                // without an attribution visibly bottom-heavy.
+                                resolved.to_mut().style.margin_after = 0.0;
+                            }
                             let mut prepared =
                                 self.shape_text(&resolved, reader_style, quote_width);
                             if unified_reflow {
-                                prepared.start_offset += QUOTE_HORIZONTAL_PADDING;
+                                prepared.start_offset += quote_horizontal_padding;
                             }
                             prepared_body.push((prepared, resolved));
                         }
@@ -794,7 +811,7 @@ impl LayoutEngine {
                             let mut prepared =
                                 self.shape_text(&resolved, reader_style, quote_width);
                             if unified_reflow {
-                                prepared.start_offset += QUOTE_HORIZONTAL_PADDING;
+                                prepared.start_offset += quote_horizontal_padding;
                             }
                             (prepared, resolved)
                         });
@@ -830,7 +847,10 @@ impl LayoutEngine {
                                         .filter_map(|block| block.source.clone()),
                                 )
                                 .collect();
-                            paginator.begin_quote(sources, reader_style.foreground);
+                            let outer_gap = (reader_style.typography.font_size
+                                * reader_style.typesetting.paragraph_gap_em)
+                                .max(QUOTE_VERTICAL_PADDING);
+                            paginator.begin_quote(sources, reader_style.foreground, outer_gap);
                         }
                         for (prepared, resolved) in &prepared_body {
                             paginator.push_text(prepared, resolved.as_ref())?;
@@ -893,14 +913,12 @@ impl LayoutEngine {
                             .captions
                             .iter()
                             .map(|caption| {
-                                let resolved =
-                                    resolve_text_block(caption, reader_style, TextContext::Flow);
-                                let prepared = self.shape_text(
-                                    &resolved,
+                                self.shape_figure_caption(
+                                    caption,
                                     reader_style,
                                     (content_width - media_start_offset).max(1.0),
-                                );
-                                (prepared, resolved)
+                                    unified_reflow,
+                                )
                             })
                             .collect::<Vec<_>>();
                         let outer_gap = if unified_reflow {
@@ -1009,6 +1027,22 @@ impl LayoutEngine {
         content_width: f32,
     ) -> PreparedText {
         self.shape_text_with_min_width(block, reader_style, content_width, 40.0)
+    }
+
+    fn shape_figure_caption<'a>(
+        &mut self,
+        caption: &'a TextBlock,
+        reader_style: &ReaderStyle,
+        content_width: f32,
+        unified_reflow: bool,
+    ) -> (PreparedText, Cow<'a, TextBlock>) {
+        let mut resolved = resolve_text_block(caption, reader_style, TextContext::Flow);
+        let mut prepared = self.shape_text(&resolved, reader_style, content_width);
+        if unified_reflow && prepared.layout.len() > 1 {
+            resolved.to_mut().style.align = TextAlignment::Start;
+            prepared = self.shape_text(&resolved, reader_style, content_width);
+        }
+        (prepared, resolved)
     }
 
     #[allow(
@@ -1499,7 +1533,11 @@ fn resolve_text_block<'a>(
                     // authored block-level italic heading into focus mode.
                     run.style.italic = false;
                 }
-                if matches!(block.kind, TextBlockKind::Blockquote) {
+                if matches!(
+                    block.kind,
+                    TextBlockKind::Blockquote | TextBlockKind::QuoteAttribution
+                ) {
+                    run.style.bold = false;
                     run.style.italic = false;
                 }
             }
@@ -2064,6 +2102,7 @@ struct ActiveQuote {
     sources: Vec<SourceRange>,
     fill: Rgba,
     accent: Rgba,
+    outer_gap: f32,
     decoration_index: Option<usize>,
     has_started: bool,
 }
@@ -2108,19 +2147,22 @@ impl Paginator {
         }
     }
 
-    fn begin_quote(&mut self, sources: Vec<SourceRange>, foreground: Rgba) {
+    fn begin_quote(&mut self, sources: Vec<SourceRange>, foreground: Rgba, outer_gap: f32) {
         self.previous_block_was_paragraph = false;
-        self.add_preserved_spacing(QUOTE_VERTICAL_PADDING);
+        self.ensure_minimum_spacing(outer_gap);
         self.active_quote = Some(ActiveQuote {
             sources,
             fill: Rgba {
-                alpha: 18,
+                alpha: 0,
                 ..foreground
             },
             accent: Rgba {
-                alpha: 176,
-                ..foreground
+                red: 0xD1,
+                green: 0xD7,
+                blue: 0xDE,
+                alpha: 255,
             },
+            outer_gap,
             decoration_index: None,
             has_started: false,
         });
@@ -2183,6 +2225,10 @@ impl Paginator {
         if self.active_quote.is_none() {
             return;
         }
+        let outer_gap = self
+            .active_quote
+            .as_ref()
+            .map_or(QUOTE_VERTICAL_PADDING, |active| active.outer_gap);
         let decoration_index = self
             .active_quote
             .as_ref()
@@ -2203,7 +2249,7 @@ impl Paginator {
         }
         self.active_quote = None;
         self.previous_block_was_paragraph = false;
-        self.add_preserved_spacing(QUOTE_VERTICAL_PADDING);
+        self.add_preserved_spacing(outer_gap);
     }
 
     fn push_text(&mut self, prepared: &PreparedText, block: &TextBlock) -> Result<(), LayoutError> {
@@ -3020,6 +3066,38 @@ mod tests {
         };
         assert!(!run.style.underline);
         assert!(run.link.is_some());
+    }
+
+    #[test]
+    fn unified_quotes_clear_authored_bold_and_italic_styles() {
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        for kind in [TextBlockKind::Blockquote, TextBlockKind::QuoteAttribution] {
+            let block = TextBlock {
+                kind,
+                content: vec![Inline::Text(TextRun {
+                    text: "Authored emphasis".into(),
+                    style: TextStyle {
+                        bold: true,
+                        italic: true,
+                        ..TextStyle::default()
+                    },
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            };
+
+            let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+            let Inline::Text(run) = &resolved.content[0] else {
+                panic!("expected text run");
+            };
+            assert!(!run.style.bold);
+            assert!(!run.style.italic);
+        }
     }
 
     #[test]
@@ -4263,6 +4341,50 @@ mod tests {
     }
 
     #[test]
+    fn unified_figure_captions_center_one_line_and_left_align_multiple_lines() {
+        let caption = |text: &str| TextBlock {
+            kind: TextBlockKind::Caption,
+            content: vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let mut engine = LayoutEngine::new();
+
+        let short = caption("Figure 1. A leaf.");
+        let (short, _) = engine.shape_figure_caption(&short, &style, 320.0, true);
+        assert_eq!(short.layout.len(), 1);
+        assert!(
+            short
+                .layout
+                .get(0)
+                .is_some_and(|line| line.metrics().offset > 0.0),
+            "single-line caption should be centered"
+        );
+
+        let long = caption(
+            "Figure 2. A deliberately long caption that wraps across several lines at this width.",
+        );
+        let (long, _) = engine.shape_figure_caption(&long, &style, 180.0, true);
+        assert!(long.layout.len() > 1);
+        assert!(
+            (0..long.layout.len()).all(|index| long.layout.get(index).is_some_and(|line| line
+                .metrics()
+                .offset
+                .abs()
+                < 0.01)),
+            "multi-line caption should be left aligned"
+        );
+    }
+
+    #[test]
     fn authored_image_margin_larger_than_the_default_gap_is_preserved() {
         let viewport = LayoutViewport::new(400, 500).unwrap();
         let mut paginator = Paginator::new(
@@ -4883,7 +5005,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(texts.len(), 2);
         assert_eq!(quote.sources.len(), 2);
-        assert!(texts[0].origin_x >= quote.x + QUOTE_HORIZONTAL_PADDING);
+        let expected_quote_padding = style.typography.font_size
+            * paragraph_indent_em(&style.typesetting, style.writing_system);
+        assert!(texts[0].origin_x >= quote.x + expected_quote_padding);
         assert!(quote.height > QUOTE_VERTICAL_PADDING * 2.0);
         assert!(
             texts[1]
@@ -4891,6 +5015,141 @@ mod tests {
                 .get(0)
                 .is_some_and(|line| line.metrics().offset > 0.0),
             "attribution should align to the inline end"
+        );
+
+        let solo_range = range("quote-without-source", 26);
+        let solo_section = Section {
+            id: spine.clone(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![Block::Quote(QuoteBlock {
+                body: vec![text(
+                    TextBlockKind::Blockquote,
+                    "A quotation without a source.",
+                    solo_range.clone(),
+                )],
+                attribution: None,
+                source: Some(solo_range),
+            })],
+            anchors: Vec::new(),
+        };
+        let solo_layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &solo_section,
+                LayoutViewport::new(420, 360).unwrap(),
+                &style,
+            )
+            .unwrap();
+        let solo_page = &solo_layout.pages[0];
+        let solo_quote = solo_page
+            .items
+            .iter()
+            .find_map(|item| match item {
+                PageItem::Quote(quote) => Some(quote),
+                _ => None,
+            })
+            .expect("source-free quote card should be positioned");
+        let solo_text = solo_page
+            .items
+            .iter()
+            .find_map(|item| match item {
+                PageItem::Text(text) => Some(text),
+                _ => None,
+            })
+            .expect("source-free quote body should be positioned");
+        let last_line = solo_text
+            .lines
+            .end
+            .checked_sub(1)
+            .and_then(|index| solo_text.layout.get(index))
+            .expect("source-free quote should have a visible line");
+        let metrics = last_line.metrics();
+        let text_bottom = solo_text.origin_y
+            + metrics
+                .block_max_coord
+                .max(metrics.block_min_coord + metrics.line_height);
+        let bottom_padding = solo_quote.y + solo_quote.height - text_bottom;
+        assert!(
+            (bottom_padding - QUOTE_VERTICAL_PADDING).abs() < 0.01,
+            "source-free quote should have one bottom padding, got {bottom_padding}"
+        );
+
+        let before_range = range("before-quote", 13);
+        let balanced_quote_range = range("balanced-quote", 17);
+        let after_range = range("after-quote", 12);
+        let balanced_section = Section {
+            id: solo_section.id.clone(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![
+                Block::Text(text(
+                    TextBlockKind::Paragraph,
+                    "Before quote.",
+                    before_range,
+                )),
+                Block::Quote(QuoteBlock {
+                    body: vec![text(
+                        TextBlockKind::Blockquote,
+                        "Balanced quotation.",
+                        balanced_quote_range.clone(),
+                    )],
+                    attribution: None,
+                    source: Some(balanced_quote_range),
+                }),
+                Block::Text(text(TextBlockKind::Paragraph, "After quote.", after_range)),
+            ],
+            anchors: Vec::new(),
+        };
+        let balanced_layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &balanced_section,
+                LayoutViewport::new(420, 360).unwrap(),
+                &style,
+            )
+            .unwrap();
+        let balanced_page = &balanced_layout.pages[0];
+        let balanced_quote = balanced_page
+            .items
+            .iter()
+            .find_map(|item| match item {
+                PageItem::Quote(quote) => Some(quote),
+                _ => None,
+            })
+            .expect("balanced quote card should be positioned");
+        let balanced_texts = balanced_page
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                PageItem::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(balanced_texts.len(), 3);
+        let text_top = |text: &TextPlacement| {
+            let first = text
+                .layout
+                .get(text.lines.start)
+                .expect("text placement should have a first line");
+            text.origin_y + first.metrics().block_min_coord
+        };
+        let text_bottom = |text: &TextPlacement| {
+            let last = text
+                .lines
+                .end
+                .checked_sub(1)
+                .and_then(|index| text.layout.get(index))
+                .expect("text placement should have a last line");
+            let metrics = last.metrics();
+            text.origin_y
+                + metrics
+                    .block_max_coord
+                    .max(metrics.block_min_coord + metrics.line_height)
+        };
+        let margin_before = balanced_quote.y - text_bottom(balanced_texts[0]);
+        let margin_after = text_top(balanced_texts[2]) - (balanced_quote.y + balanced_quote.height);
+        assert!(
+            (margin_before - margin_after).abs() < 0.01,
+            "quote margins should be symmetric, got {margin_before} before and {margin_after} after"
         );
     }
 

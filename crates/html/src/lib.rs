@@ -168,34 +168,38 @@ impl ReadingIrParser {
                 self.push_text_block(node, TextBlockKind::Heading(level), style)?;
             }
             "p" => {
-                let mut style = self.styles.block_style(node, BlockStyle::default());
-                if contains_display_math(node) && has_only_math_content(node) {
-                    style.align = TextAlignment::Center;
-                    style.margin_before = style.margin_before.max(12.0);
-                    style.margin_after = style.margin_after.max(12.0);
-                }
-                let has_marker = has_explicit_paragraph_list_marker(node);
-                let markerless_nested_item = !has_marker
-                    && style.indent < -0.5
-                    && self.paragraph_list_indents.first().is_some_and(|root| {
-                        let indent = style
-                            .margin_start_fraction
-                            .mul_add(1_000.0, style.margin_start);
-                        indent > *root + 4.0
-                    });
-                let kind = if has_marker || markerless_nested_item {
-                    TextBlockKind::ListItem {
-                        ordered: false,
-                        ordinal: 1,
-                        depth: self.paragraph_list_depth(style),
-                        marker_visible: has_marker,
-                    }
+                if has_quote_semantic_word(node) && self.styles.has_standalone_quote_layout(node) {
+                    self.parse_standalone_quote(node)?;
                 } else {
-                    self.paragraph_list_indents.clear();
-                    TextBlockKind::Paragraph
-                };
-                style.indent = 0.0;
-                self.push_text_block(node, kind, style)?;
+                    let mut style = self.styles.block_style(node, BlockStyle::default());
+                    if contains_display_math(node) && has_only_math_content(node) {
+                        style.align = TextAlignment::Center;
+                        style.margin_before = style.margin_before.max(12.0);
+                        style.margin_after = style.margin_after.max(12.0);
+                    }
+                    let has_marker = has_explicit_paragraph_list_marker(node);
+                    let markerless_nested_item = !has_marker
+                        && style.indent < -0.5
+                        && self.paragraph_list_indents.first().is_some_and(|root| {
+                            let indent = style
+                                .margin_start_fraction
+                                .mul_add(1_000.0, style.margin_start);
+                            indent > *root + 4.0
+                        });
+                    let kind = if has_marker || markerless_nested_item {
+                        TextBlockKind::ListItem {
+                            ordered: false,
+                            ordinal: 1,
+                            depth: self.paragraph_list_depth(style),
+                            marker_visible: has_marker,
+                        }
+                    } else {
+                        self.paragraph_list_indents.clear();
+                        TextBlockKind::Paragraph
+                    };
+                    style.indent = 0.0;
+                    self.push_text_block(node, kind, style)?;
+                }
             }
             "blockquote" => self.parse_semantic_quote(node)?,
             "pre" => {
@@ -318,6 +322,28 @@ impl ReadingIrParser {
         self.parse_quote_nodes(quote, body, attribution)
     }
 
+    fn parse_standalone_quote(&mut self, node: Node<'_, '_>) -> Result<(), HtmlError> {
+        let start = self.blocks.len();
+        let style = self.styles.block_style(node, BlockStyle::default());
+        self.push_text_block(node, TextBlockKind::Blockquote, style)?;
+        let mut body = self
+            .blocks
+            .drain(start..)
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(block),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(source) = quote_source_range(&body, None) {
+            self.blocks.push(Block::Quote(QuoteBlock {
+                body: std::mem::take(&mut body),
+                attribution: None,
+                source: Some(source),
+            }));
+        }
+        Ok(())
+    }
+
     fn parse_quote_nodes(
         &mut self,
         container: Node<'_, '_>,
@@ -326,12 +352,13 @@ impl ReadingIrParser {
     ) -> Result<(), HtmlError> {
         let start = self.blocks.len();
         for node in body_nodes.iter().copied().chain(attribution_node) {
-            if is_quote_text_candidate(node) {
-                self.parse_node(node)?;
-            } else {
-                let style = self.styles.block_style(node, BlockStyle::default());
-                self.push_text_block(node, TextBlockKind::Paragraph, style)?;
-            }
+            // The enclosing structure has already established the quote roles. Parsing the
+            // child through `parse_node` would run standalone quote detection again and turn a
+            // class such as `prosequote1` into a nested Quote, which drops its sibling source
+            // when the outer quote collects text blocks.
+            self.queue_node_anchors(node);
+            let style = self.styles.block_style(node, BlockStyle::default());
+            self.push_text_block(node, TextBlockKind::Paragraph, style)?;
         }
         let mut parsed = self.blocks.drain(start..).collect::<Vec<_>>();
         let attribution = attribution_node.and_then(|_| match parsed.pop() {
@@ -1186,6 +1213,14 @@ fn is_quote_text_candidate(node: Node<'_, '_>) -> bool {
     })
 }
 
+fn has_quote_semantic_word(node: Node<'_, '_>) -> bool {
+    attribute_local(node, "class").is_some_and(|classes| {
+        classes
+            .split_ascii_whitespace()
+            .any(|class| class.to_ascii_lowercase().contains("quote"))
+    })
+}
+
 fn effective_start_offset(style: BlockStyle) -> f32 {
     style
         .margin_start_fraction
@@ -1556,6 +1591,52 @@ impl StyleSheet {
         })
     }
 
+    fn has_standalone_quote_layout(&self, node: Node<'_, '_>) -> bool {
+        const REFERENCE_WIDTH: f32 = 1_000.0;
+        const MIN_HORIZONTAL_INSET: f32 = 4.0;
+        const MIN_VERTICAL_SPACING: f32 = 0.5;
+
+        let properties = self.cascaded_properties(node);
+        let horizontal = |logical: &str, physical: &str| {
+            properties
+                .get(logical)
+                .or_else(|| properties.get(physical))
+                .and_then(|value| css_horizontal_length(value))
+                .map(|(pixels, fraction)| fraction.mul_add(REFERENCE_WIDTH, pixels))
+                .unwrap_or(0.0)
+        };
+        let vertical = |logical: &str, physical: &str| {
+            properties
+                .get(logical)
+                .or_else(|| properties.get(physical))
+                .and_then(|value| css_length(value))
+                .filter(|value| value.is_finite())
+                .unwrap_or(0.0)
+        };
+
+        let start = horizontal("margin-inline-start", "margin-left")
+            + horizontal("padding-inline-start", "padding-left");
+        let end = horizontal("margin-inline-end", "margin-right")
+            + horizontal("padding-inline-end", "padding-right");
+        let symmetry_tolerance = 4.0_f32.max(start.max(end) * 0.25);
+        let first_line_indent = properties
+            .get("text-indent")
+            .and_then(|value| css_horizontal_length(value))
+            .map(|(pixels, fraction)| fraction.mul_add(REFERENCE_WIDTH, pixels))
+            .unwrap_or(0.0);
+        let before = vertical("margin-block-start", "margin-top")
+            + vertical("padding-block-start", "padding-top");
+        let after = vertical("margin-block-end", "margin-bottom")
+            + vertical("padding-block-end", "padding-bottom");
+
+        start >= MIN_HORIZONTAL_INSET
+            && end >= MIN_HORIZONTAL_INSET
+            && (start - end).abs() <= symmetry_tolerance
+            && first_line_indent.abs() <= 0.5
+            && before > MIN_VERTICAL_SPACING
+            && after > MIN_VERTICAL_SPACING
+    }
+
     fn text_style_for_block(&self, node: Node<'_, '_>, kind: TextBlockKind) -> TextStyle {
         let mut ancestors = node
             .ancestors()
@@ -1837,14 +1918,35 @@ fn insert_declarations(
 ) {
     for (name, value) in declarations {
         if name == "margin" {
-            if let Some((top, _, bottom, left)) = box_sides(&value) {
+            if let Some((top, right, bottom, left)) = box_sides(&value) {
                 properties.insert("margin-top".into(), top.to_owned());
+                properties.insert("margin-right".into(), right.to_owned());
                 properties.insert("margin-bottom".into(), bottom.to_owned());
                 properties.insert("margin-left".into(), left.to_owned());
             }
         } else if name == "padding" {
-            if let Some((_, _, _, left)) = box_sides(&value) {
+            if let Some((top, right, bottom, left)) = box_sides(&value) {
+                properties.insert("padding-top".into(), top.to_owned());
+                properties.insert("padding-right".into(), right.to_owned());
+                properties.insert("padding-bottom".into(), bottom.to_owned());
                 properties.insert("padding-left".into(), left.to_owned());
+            }
+        } else if matches!(
+            name.as_str(),
+            "margin-inline" | "padding-inline" | "margin-block" | "padding-block"
+        ) {
+            if let Some((start, end)) = axis_sides(&value) {
+                let axis = name
+                    .strip_prefix("margin-")
+                    .or_else(|| name.strip_prefix("padding-"))
+                    .expect("matched box-axis property");
+                let prefix = if name.starts_with("margin-") {
+                    "margin"
+                } else {
+                    "padding"
+                };
+                properties.insert(format!("{prefix}-{axis}-start"), start.to_owned());
+                properties.insert(format!("{prefix}-{axis}-end"), end.to_owned());
             }
         } else {
             properties.insert(name, value);
@@ -1900,6 +2002,15 @@ fn box_sides(value: &str) -> Option<(&str, &str, &str, &str)> {
         [vertical, horizontal] => Some((vertical, horizontal, vertical, horizontal)),
         [top, horizontal, bottom] => Some((top, horizontal, bottom, horizontal)),
         [top, right, bottom, left] => Some((top, right, bottom, left)),
+        _ => None,
+    }
+}
+
+fn axis_sides(value: &str) -> Option<(&str, &str)> {
+    let values = value.split_ascii_whitespace().collect::<Vec<_>>();
+    match values.as_slice() {
+        [both] => Some((both, both)),
+        [start, end] => Some((start, end)),
         _ => None,
     }
 }
@@ -2987,6 +3098,97 @@ mod tests {
             Some(TextBlockKind::QuoteAttribution)
         );
         assert!(quote.source.is_some());
+    }
+
+    #[test]
+    fn recognizes_a_standalone_paragraph_with_the_quote_semantic_word() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            .prosequote { margin: 1em 2em; text-indent: 0; }
+        </style></head><body>
+            <p class="prosequote">A standalone quotation without an attribution.</p>
+            <p>Ordinary prose after the quotation.</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Quote(quote), Block::Text(paragraph)] = section.blocks.as_slice() else {
+            panic!("expected one quote followed by ordinary prose");
+        };
+        assert_eq!(quote.body.len(), 1);
+        assert_eq!(quote.body[0].kind, TextBlockKind::Blockquote);
+        assert!(quote.attribution.is_none());
+        assert_eq!(paragraph.kind, TextBlockKind::Paragraph);
+    }
+
+    #[test]
+    fn structural_quote_keeps_source_when_body_class_contains_quote() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            .box { margin: 1em 0; padding: 5px; background: #eee; }
+            .prosequote1 { margin: 1em 2em; text-indent: 0; font-style: italic; }
+            .source { margin: 0 2em 1em 0; text-align: right; }
+        </style></head><body>
+            <div class="box">
+                <p class="prosequote1">Quoted prose.</p>
+                <p class="source">Quotation source</p>
+            </div>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Quote(quote)] = section.blocks.as_slice() else {
+            panic!("expected one quote with an attribution");
+        };
+        assert_eq!(quote.body.len(), 1);
+        assert_eq!(quote.body[0].kind, TextBlockKind::Blockquote);
+        let attribution = quote
+            .attribution
+            .as_ref()
+            .expect("quote source should be preserved");
+        assert_eq!(attribution.kind, TextBlockKind::QuoteAttribution);
+        assert!(attribution.content.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run) if run.text.contains("Quotation source")
+        )));
+    }
+
+    #[test]
+    fn quote_semantic_word_without_quote_layout_remains_a_paragraph() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            .quote-status { margin: 1em 0; text-indent: 0; }
+            .quote-aside { margin: 1em 0 1em 2em; text-indent: 0; }
+        </style></head><body>
+            <p class="quote-status">A status message about quotations.</p>
+            <p class="quote-aside">An asymmetrically indented aside.</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        assert_eq!(section.blocks.len(), 2);
+        assert!(section.blocks.iter().all(|block| matches!(
+            block,
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                ..
+            })
+        )));
     }
 
     #[test]
