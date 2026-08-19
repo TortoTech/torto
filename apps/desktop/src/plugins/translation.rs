@@ -290,7 +290,7 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
                     },
                 ));
             }
-            Block::Separator | Block::PageBreak => {}
+            Block::Separator | Block::LineBreak | Block::PageBreak => {}
         }
     }
     blocks
@@ -322,7 +322,7 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
         Block::Figure(block) => block.source.as_ref(),
-        Block::Separator | Block::PageBreak => None,
+        Block::Separator | Block::LineBreak | Block::PageBreak => None,
     }
 }
 
@@ -927,19 +927,7 @@ fn translation_text(block: &TextBlock) -> String {
     let mut text = String::new();
     for inline in &block.content {
         match inline {
-            Inline::Text(run) => match run.style.baseline {
-                TextBaseline::Normal => text.push_str(&run.text),
-                TextBaseline::Superscript => {
-                    text.push_str("<sup>");
-                    text.push_str(&run.text);
-                    text.push_str("</sup>");
-                }
-                TextBaseline::Subscript => {
-                    text.push_str("<sub>");
-                    text.push_str(&run.text);
-                    text.push_str("</sub>");
-                }
-            },
+            Inline::Text(run) => push_translation_style_markup(&mut text, run),
             Inline::Math(run) => {
                 text.push('$');
                 text.push_str(&run.latex);
@@ -951,10 +939,43 @@ fn translation_text(block: &TextBlock) -> String {
     text
 }
 
+fn push_translation_style_markup(output: &mut String, run: &TextRun) {
+    let mut closing = Vec::new();
+    if run.style.bold {
+        output.push_str("<strong>");
+        closing.push("</strong>");
+    }
+    if run.style.italic {
+        output.push_str("<em>");
+        closing.push("</em>");
+    }
+    if run.style.underline {
+        output.push_str("<u>");
+        closing.push("</u>");
+    }
+    match run.style.baseline {
+        TextBaseline::Normal => {}
+        TextBaseline::Superscript => {
+            output.push_str("<sup>");
+            closing.push("</sup>");
+        }
+        TextBaseline::Subscript => {
+            output.push_str("<sub>");
+            closing.push("</sub>");
+        }
+    }
+    output.push_str(&run.text);
+    for close in closing.into_iter().rev() {
+        output.push_str(close);
+    }
+}
+
 fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>) -> Vec<Inline> {
     let text = normalize_translation_spacing(text);
-    let styled = parse_baseline_markup(&text, style)
-        .unwrap_or_else(|| restore_original_baselines(&text, style, original.unwrap_or_default()));
+    let original = original.unwrap_or_default();
+    let style = neutral_translation_style(style, original);
+    let styled = parse_inline_style_markup(&text, style)
+        .unwrap_or_else(|| restore_original_baselines(&text, style, original));
     let mut content = Vec::new();
     for (text, style) in styled {
         for (index, line) in text.split('\n').enumerate() {
@@ -971,6 +992,21 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
         }
     }
     content
+}
+
+fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextStyle {
+    let mut style = original
+        .iter()
+        .find_map(|inline| match inline {
+            Inline::Text(run) if run.style.baseline == TextBaseline::Normal => Some(run.style),
+            Inline::Text(_) | Inline::Math(_) | Inline::Break => None,
+        })
+        .unwrap_or(fallback);
+    style.bold = false;
+    style.italic = false;
+    style.underline = false;
+    style.baseline = TextBaseline::Normal;
+    style
 }
 
 fn normalize_translation_spacing(text: &str) -> String {
@@ -995,6 +1031,7 @@ fn normalize_translation_line_spacing(line: &str) -> String {
         collapsed.push(character);
     }
 
+    let collapsed = compact_baseline_markup_spacing(collapsed);
     let cjk_count = collapsed
         .chars()
         .filter(|character| is_cjk(*character))
@@ -1037,6 +1074,20 @@ fn normalize_translation_line_spacing(line: &str) -> String {
     normalized
 }
 
+fn compact_baseline_markup_spacing(mut text: String) -> String {
+    for (spaced, compact) in [
+        (" <sup>", "<sup>"),
+        (" <sub>", "<sub>"),
+        ("<sup> ", "<sup>"),
+        ("<sub> ", "<sub>"),
+        (" </sup>", "</sup>"),
+        (" </sub>", "</sub>"),
+    ] {
+        text = text.replace(spaced, compact);
+    }
+    text
+}
+
 fn is_cjk(character: char) -> bool {
     matches!(
         character as u32,
@@ -1051,42 +1102,84 @@ fn is_cjk(character: char) -> bool {
     )
 }
 
-fn parse_baseline_markup(text: &str, default_style: TextStyle) -> Option<Vec<(String, TextStyle)>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TranslationStyleTag {
+    Bold,
+    Italic,
+    Underline,
+    Superscript,
+    Subscript,
+}
+
+fn parse_inline_style_markup(
+    text: &str,
+    default_style: TextStyle,
+) -> Option<Vec<(String, TextStyle)>> {
     let mut rest = text;
     let mut styled = Vec::new();
+    let mut stack = Vec::new();
+    let mut style = default_style;
     let mut found = false;
-    while let Some((start, baseline, open, close)) = next_baseline_tag(rest) {
+    while let Some((start, tag, opening, token)) = next_translation_style_tag(rest) {
         if start > 0 {
-            styled.push((rest[..start].to_owned(), default_style));
+            styled.push((rest[..start].to_owned(), style));
         }
-        let value_start = start + open.len();
-        let relative_end = rest[value_start..].find(close)?;
-        let value_end = value_start + relative_end;
-        styled.push((
-            rest[value_start..value_end].to_owned(),
-            baseline_style(default_style, baseline),
-        ));
-        rest = &rest[value_end + close.len()..];
+        rest = &rest[start + token.len()..];
+        if opening {
+            stack.push((tag, style));
+            style = apply_translation_style_tag(style, tag);
+        } else {
+            let (open_tag, previous) = stack.pop()?;
+            if open_tag != tag {
+                return None;
+            }
+            style = previous;
+        }
         found = true;
     }
     if !rest.is_empty() {
-        styled.push((rest.to_owned(), default_style));
+        styled.push((rest.to_owned(), style));
     }
-    found.then_some(styled)
+    (found && stack.is_empty()).then_some(styled)
 }
 
-fn next_baseline_tag(text: &str) -> Option<(usize, TextBaseline, &'static str, &'static str)> {
-    let superscript = text
-        .find("<sup>")
-        .map(|index| (index, TextBaseline::Superscript, "<sup>", "</sup>"));
-    let subscript = text
-        .find("<sub>")
-        .map(|index| (index, TextBaseline::Subscript, "<sub>", "</sub>"));
-    match (superscript, subscript) {
-        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
+fn next_translation_style_tag(
+    text: &str,
+) -> Option<(usize, TranslationStyleTag, bool, &'static str)> {
+    [
+        ("<strong>", TranslationStyleTag::Bold, true),
+        ("</strong>", TranslationStyleTag::Bold, false),
+        ("<b>", TranslationStyleTag::Bold, true),
+        ("</b>", TranslationStyleTag::Bold, false),
+        ("<em>", TranslationStyleTag::Italic, true),
+        ("</em>", TranslationStyleTag::Italic, false),
+        ("<i>", TranslationStyleTag::Italic, true),
+        ("</i>", TranslationStyleTag::Italic, false),
+        ("<u>", TranslationStyleTag::Underline, true),
+        ("</u>", TranslationStyleTag::Underline, false),
+        ("<sup>", TranslationStyleTag::Superscript, true),
+        ("</sup>", TranslationStyleTag::Superscript, false),
+        ("<sub>", TranslationStyleTag::Subscript, true),
+        ("</sub>", TranslationStyleTag::Subscript, false),
+    ]
+    .into_iter()
+    .filter_map(|(token, tag, opening)| text.find(token).map(|index| (index, tag, opening, token)))
+    .min_by_key(|(index, _, opening, _)| (*index, !*opening))
+}
+
+fn apply_translation_style_tag(mut style: TextStyle, tag: TranslationStyleTag) -> TextStyle {
+    match tag {
+        TranslationStyleTag::Bold => style.bold = true,
+        TranslationStyleTag::Italic => style.italic = true,
+        TranslationStyleTag::Underline => style.underline = true,
+        TranslationStyleTag::Superscript => {
+            style = baseline_style(style, TextBaseline::Superscript);
+        }
+        TranslationStyleTag::Subscript => {
+            style = baseline_style(style, TextBaseline::Subscript);
+        }
     }
+    style
 }
 
 fn baseline_style(mut style: TextStyle, baseline: TextBaseline) -> TextStyle {
@@ -1142,7 +1235,12 @@ fn restore_original_baselines(
             continue;
         };
         if start > cursor {
-            styled.push((text[cursor..start].to_owned(), default_style));
+            let prefix = text[cursor..start].trim_end_matches(|character: char| {
+                character.is_whitespace() || character == '\u{200b}'
+            });
+            if !prefix.is_empty() {
+                styled.push((prefix.to_owned(), default_style));
+            }
         }
         let end = start + marker.len();
         styled.push((text[start..end].to_owned(), marker_style));
@@ -1334,6 +1432,18 @@ mod tests {
             normalize_translation_spacing("A long English sentence keeps normal spaces"),
             "A long English sentence keeps normal spaces"
         );
+        assert_eq!(
+            normalize_translation_spacing("主要优势。   <sup> 19 </sup>"),
+            "主要优势。<sup>19</sup>"
+        );
+        assert_eq!(
+            normalize_translation_spacing("word <sup>19</sup> next"),
+            "word<sup>19</sup> next"
+        );
+        assert_eq!(
+            normalize_translation_spacing("H <sub> 2 </sub> O"),
+            "H<sub>2</sub> O"
+        );
     }
 
     #[test]
@@ -1382,6 +1492,94 @@ mod tests {
             Inline::Text(run)
                 if run.text == "4" && run.style.baseline == TextBaseline::Superscript
         )));
+
+        let spaced_cache =
+            replacement_content("这是主要优势。 4", TextStyle::default(), Some(&original));
+        let rendered = spaced_cache
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run.text.as_str()),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .collect::<String>();
+        assert_eq!(rendered, "这是主要优势。4");
+        assert!(spaced_cache.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run)
+                if run.text == "4" && run.style.baseline == TextBaseline::Superscript
+        )));
+    }
+
+    #[test]
+    fn translation_scopes_bold_and_italic_to_the_corresponding_text() {
+        let emphasized = TextStyle {
+            bold: true,
+            italic: true,
+            ..TextStyle::default()
+        };
+        let superscript = TextStyle {
+            baseline: TextBaseline::Superscript,
+            size_scale: 0.75,
+            ..TextStyle::default()
+        };
+        let original = vec![
+            Inline::Text(TextRun {
+                text: "Look at this sentence".into(),
+                style: emphasized,
+                link: None,
+            }),
+            Inline::Text(TextRun {
+                text: ". The rest is normal.".into(),
+                style: TextStyle::default(),
+                link: None,
+            }),
+            Inline::Text(TextRun {
+                text: "54".into(),
+                style: superscript,
+                link: None,
+            }),
+        ];
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: original.clone(),
+            style: BlockStyle::default(),
+            source: None,
+        };
+        assert_eq!(
+            translation_text(&block),
+            "<strong><em>Look at this sentence</em></strong>. The rest is normal.<sup>54</sup>"
+        );
+
+        let translated = replacement_content(
+            "<strong><em>看看这个句子</em></strong>。其余内容正常。<sup>54</sup>",
+            emphasized,
+            Some(&original),
+        );
+        assert!(translated.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run)
+                if run.text == "看看这个句子" && run.style.bold && run.style.italic
+        )));
+        assert!(translated.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run)
+                if run.text == "。其余内容正常。" && !run.style.bold && !run.style.italic
+        )));
+        assert!(translated.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run)
+                if run.text == "54" && run.style.baseline == TextBaseline::Superscript
+        )));
+
+        let cached = replacement_content(
+            "看看这个句子。其余内容正常。<sup>54</sup>",
+            emphasized,
+            Some(&original),
+        );
+        assert!(cached.iter().all(|inline| match inline {
+            Inline::Text(run) => !run.style.bold && !run.style.italic,
+            Inline::Math(_) | Inline::Break => true,
+        }));
     }
 
     #[test]

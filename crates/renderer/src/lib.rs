@@ -42,6 +42,14 @@ pub struct PageImageHit {
     pub pixels: Arc<[u8]>,
 }
 
+/// Paint style for connecting one semantic quote across continuously stitched pages.
+#[derive(Clone, Copy)]
+pub struct PageQuoteBridge {
+    pub x: f32,
+    pub width: f32,
+    pub color: Color,
+}
+
 /// Retained drawing commands for one page. No parsing, shaping, or pagination
 /// occurs while this list is replayed.
 pub struct PageDisplayList {
@@ -65,6 +73,11 @@ struct TableRegion {
 struct QuoteRegion {
     bounds: Rect,
     sources: Vec<SourceRange>,
+    continued_before: bool,
+    continued_after: bool,
+    accent_x: f32,
+    accent_width: f32,
+    accent: Color,
 }
 
 const HIGHLIGHT_VERTICAL_OVERLAP: f64 = 0.5;
@@ -370,6 +383,32 @@ impl PageDisplayList {
             })
             .map(|quote| quote.bounds)
             .collect()
+    }
+
+    /// Returns the accent style when this page and `next` are consecutive
+    /// slices of the same semantic quotation.
+    pub fn quote_bridge_to(&self, next: &Self) -> Option<PageQuoteBridge> {
+        let trailing = self
+            .quote_regions
+            .iter()
+            .rev()
+            .find(|quote| quote.continued_after)?;
+        let leading = next
+            .quote_regions
+            .iter()
+            .find(|quote| quote.continued_before)?;
+        if trailing.sources.is_empty()
+            || trailing.sources != leading.sources
+            || (trailing.accent_x - leading.accent_x).abs() > 0.5
+            || (trailing.accent_width - leading.accent_width).abs() > 0.5
+        {
+            return None;
+        }
+        Some(PageQuoteBridge {
+            x: trailing.accent_x,
+            width: trailing.accent_width,
+            color: trailing.accent,
+        })
     }
 
     /// Returns the union of text, image, and table geometry belonging to the
@@ -1308,6 +1347,11 @@ impl DisplayListCompiler {
                     quote_regions.push(QuoteRegion {
                         bounds,
                         sources: quote.sources.clone(),
+                        continued_before: quote.continued_before,
+                        continued_after: quote.continued_after,
+                        accent_x: quote.x + 6.0,
+                        accent_width: 4.0,
+                        accent: color(quote.accent),
                     });
                     if quote.fill.alpha > 0 {
                         commands.push(DisplayCommand::FillRoundedRect(FillRoundedRectCommand {
@@ -1316,14 +1360,19 @@ impl DisplayListCompiler {
                         }));
                     }
                     let accent_inset = 8.0_f64.min(bounds.height() * 0.2);
+                    let accent_top = if quote.continued_before {
+                        bounds.y0
+                    } else {
+                        bounds.y0 + accent_inset
+                    };
+                    let accent_bottom = if quote.continued_after {
+                        bounds.y1
+                    } else {
+                        bounds.y1 - accent_inset
+                    };
                     commands.push(DisplayCommand::FillRoundedRect(FillRoundedRectCommand {
                         rect: RoundedRect::from_rect(
-                            Rect::new(
-                                bounds.x0 + 6.0,
-                                bounds.y0 + accent_inset,
-                                bounds.x0 + 10.0,
-                                bounds.y1 - accent_inset,
-                            ),
+                            Rect::new(bounds.x0 + 6.0, accent_top, bounds.x0 + 10.0, accent_bottom),
                             2.0,
                         ),
                         color: color(quote.accent),
@@ -1496,7 +1545,7 @@ fn page_item_top(item: &PageItem) -> Option<f32> {
             .layout
             .get(text.lines.start)
             .map(|line| text.origin_y + line.metrics().block_min_coord),
-        PageItem::Quote(quote) => Some(quote.y),
+        PageItem::Quote(quote) => (!quote.continued_before).then_some(quote.y),
         PageItem::Image(image) => Some(image.y),
         PageItem::Table(table) => Some(table.y),
         PageItem::Separator(separator) => Some(separator.y),
@@ -1511,7 +1560,7 @@ fn page_item_bottom(item: &PageItem) -> Option<f32> {
             .checked_sub(1)
             .and_then(|line| text.layout.get(line))
             .map(|line| text.origin_y + line.metrics().block_max_coord),
-        PageItem::Quote(quote) => Some(quote.y + quote.height),
+        PageItem::Quote(quote) => (!quote.continued_after).then_some(quote.y + quote.height),
         PageItem::Image(image) => Some(image.y + image.height),
         PageItem::Table(table) => Some(table.y + table.height),
         PageItem::Separator(separator) => Some(separator.y + 1.0),
@@ -1688,10 +1737,14 @@ fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacemen
             };
             let run = glyph_run.run();
             let brush = glyph_run.style().brush;
-            let baseline_offset = match brush.baseline {
-                TextBaseline::Normal => 0.0,
-                TextBaseline::Superscript => -run.font_size() * 0.35,
-                TextBaseline::Subscript => run.font_size() * 0.2,
+            let baseline_offset = text_baseline_offset(brush.baseline, run.font_size());
+            let inline_optical_offset = match brush.baseline {
+                TextBaseline::Superscript => superscript_optical_offset(
+                    text.text.as_ref(),
+                    run.text_range().start,
+                    run.font_size(),
+                ),
+                TextBaseline::Normal | TextBaseline::Subscript => 0.0,
             };
             let synthesis = run.synthesis();
             let glyph_transform = synthesis
@@ -1701,7 +1754,7 @@ fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacemen
                 .positioned_glyphs()
                 .map(|glyph| Glyph {
                     id: glyph.id,
-                    x: glyph.x,
+                    x: glyph.x + inline_optical_offset,
                     y: glyph.y + baseline_offset,
                 })
                 .collect::<Vec<_>>()
@@ -1734,6 +1787,49 @@ fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacemen
     }
 }
 
+fn text_baseline_offset(baseline: TextBaseline, font_size: f32) -> f32 {
+    match baseline {
+        TextBaseline::Normal => 0.0,
+        // The publication layer already scales superscripts to 75%. Raising the
+        // reduced glyph by only 35% left it visually close to the normal baseline.
+        TextBaseline::Superscript => -font_size * 0.55,
+        TextBaseline::Subscript => font_size * 0.2,
+    }
+}
+
+fn superscript_optical_offset(text: &str, text_start: usize, font_size: f32) -> f32 {
+    let previous = text
+        .get(..text_start)
+        .and_then(|prefix| prefix.chars().next_back());
+    if previous.is_some_and(is_cjk_terminal_punctuation) {
+        // CJK punctuation occupies a full em even though its visible mark is much
+        // narrower. A following superscript often uses a fallback Latin font, so
+        // cross-font kerning cannot close that optical gap for us.
+        -font_size * 0.28
+    } else {
+        0.0
+    }
+}
+
+fn is_cjk_terminal_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '。' | '！'
+            | '？'
+            | '；'
+            | '：'
+            | '，'
+            | '、'
+            | '》'
+            | '〉'
+            | '」'
+            | '』'
+            | '】'
+            | '”'
+            | '’'
+    )
+}
+
 fn color(value: Rgba) -> Color {
     Color::from_rgba8(value.red, value.green, value.blue, value.alpha)
 }
@@ -1745,7 +1841,7 @@ mod tests {
     use rebook_layout::{
         FixedPageTextReplacementPlacement, FixedPageTextReplacementSegmentPlacement,
         ImagePlacement, LayoutViewport, PageItem, PageLayout, QuotePlacement, RasterImage,
-        TextBrush, TextPlacement,
+        SeparatorPlacement, TextBrush, TextPlacement,
     };
 
     #[test]
@@ -1793,10 +1889,121 @@ mod tests {
                 .all(|command| command.paints_below_source_overlays())
         );
     }
+
+    #[test]
+    fn continued_quote_segments_trim_page_padding_and_join_the_accent() {
+        let page = PageLayout {
+            viewport: LayoutViewport::new(200, 200).unwrap(),
+            background: Rgba::BLACK,
+            leading_gap: 0.0,
+            items: vec![
+                PageItem::Quote(QuotePlacement {
+                    x: 20.0,
+                    y: 10.0,
+                    width: 160.0,
+                    height: 180.0,
+                    continued_before: true,
+                    continued_after: true,
+                    fill: Rgba {
+                        alpha: 0,
+                        ..Rgba::BLACK
+                    },
+                    accent: Rgba::BLACK,
+                    sources: Vec::new(),
+                }),
+                PageItem::Separator(SeparatorPlacement {
+                    x: 40.0,
+                    y: 50.0,
+                    width: 80.0,
+                }),
+            ],
+        };
+
+        let list = DisplayListCompiler.compile(&page);
+        assert_eq!(list.content_top(), Some(50.0));
+        assert_eq!(list.content_bottom(), Some(51.0));
+        let accent = list
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                DisplayCommand::FillRoundedRect(command) => Some(command.rect.bounding_box()),
+                _ => None,
+            })
+            .expect("continued quote should paint an accent");
+        assert_eq!(accent.y0, 10.0);
+        assert_eq!(accent.y1, 190.0);
+    }
+
+    #[test]
+    fn matching_quote_continuations_expose_a_scroll_bridge() {
+        let spine = SpineItemId::new("chapter").unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "quote".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "quote".into(),
+                text_offset: 20,
+            },
+        };
+        let page = |continued_before, continued_after| {
+            DisplayListCompiler.compile(&PageLayout {
+                viewport: LayoutViewport::new(200, 200).unwrap(),
+                background: Rgba::BLACK,
+                leading_gap: 0.0,
+                items: vec![PageItem::Quote(QuotePlacement {
+                    x: 20.0,
+                    y: 10.0,
+                    width: 160.0,
+                    height: 180.0,
+                    continued_before,
+                    continued_after,
+                    fill: Rgba {
+                        alpha: 0,
+                        ..Rgba::BLACK
+                    },
+                    accent: Rgba::BLACK,
+                    sources: vec![source.clone()],
+                })],
+            })
+        };
+
+        let first = page(false, true);
+        let second = page(true, false);
+        let bridge = first
+            .quote_bridge_to(&second)
+            .expect("matching continuation slices should expose their accent style");
+        assert_eq!(bridge.x, 26.0);
+        assert_eq!(bridge.width, 4.0);
+    }
     use rebook_publication::{
         FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, SourceAnchor, SourceRange,
         SpineItemId,
     };
+
+    #[test]
+    fn superscript_uses_a_readable_high_baseline() {
+        assert_eq!(text_baseline_offset(TextBaseline::Normal, 15.0), 0.0);
+        assert_eq!(text_baseline_offset(TextBaseline::Superscript, 15.0), -8.25);
+        assert_eq!(text_baseline_offset(TextBaseline::Subscript, 15.0), 3.0);
+    }
+
+    #[test]
+    fn superscript_only_tightens_after_cjk_terminal_punctuation() {
+        let chinese = "优势。19";
+        let marker_start = chinese.find('1').unwrap();
+        assert_eq!(
+            superscript_optical_offset(chinese, marker_start, 15.0),
+            -4.2
+        );
+
+        let english = "advantage.19";
+        let marker_start = english.find('1').unwrap();
+        assert_eq!(superscript_optical_offset(english, marker_start, 15.0), 0.0);
+    }
 
     #[test]
     fn multiline_highlight_geometry_overlaps_adjacent_antialiased_edges() {

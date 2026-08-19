@@ -359,6 +359,8 @@ pub enum Block {
     Figure(FigureBlock),
     /// Thematic separator.
     Separator,
+    /// Authored standalone line break between block elements.
+    LineBreak,
     /// Explicit page boundary requested by the source.
     PageBreak,
 }
@@ -701,6 +703,10 @@ pub struct BlockStyle {
     pub align: TextAlignment,
     pub margin_before: f32,
     pub margin_after: f32,
+    /// A structural line break follows this block. Layout engines should retain
+    /// one additional blank line even when normalizing authored paragraph gaps.
+    #[serde(default)]
+    pub hard_break_after: bool,
     /// Flattened CSS margin/padding on the inline-start edge, in pixels.
     #[serde(default)]
     pub margin_start: f32,
@@ -717,6 +723,7 @@ impl Default for BlockStyle {
             align: TextAlignment::Start,
             margin_before: 0.0,
             margin_after: 16.0,
+            hard_break_after: false,
             margin_start: 0.0,
             margin_start_fraction: 0.0,
             indent: 0.0,

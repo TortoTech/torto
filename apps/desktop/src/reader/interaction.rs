@@ -1,7 +1,10 @@
 use crate::highlights::StoredHighlight;
 use rebook_reader::{NavigationAttempt, NavigationOutcome, PageDirection, SelectionGranularity};
 
-use super::{DesktopReader, FollowUp, MarkRetention, ProgressChange, SidebarTab, SnapshotEffects};
+use super::{
+    DesktopReader, FollowUp, MarkRetention, ProgressChange, SidebarTab, SnapshotEffects,
+    focus_unit_contains_source_range, focus_unit_matches_highlight_ranges,
+};
 
 impl DesktopReader {
     fn focus_unit_at_canvas(&mut self, x: f32, y: f32) -> Option<usize> {
@@ -15,12 +18,9 @@ impl DesktopReader {
             .ok()
             .flatten()?;
         let range = selection.ranges.first()?;
-        self.focus_units.iter().position(|unit| {
-            unit.range.start.spine == range.start.spine
-                && unit.range.start.node == range.start.node
-                && unit.range.start.text_offset < range.end.text_offset
-                && range.start.text_offset < unit.range.end.text_offset
-        })
+        self.focus_units
+            .iter()
+            .position(|unit| focus_unit_contains_source_range(unit, range))
     }
 
     pub(in crate::reader) fn focus_clicked_unit(&mut self, x: f32, y: f32) {
@@ -45,7 +45,7 @@ impl DesktopReader {
         let unit = self.focus_units.get(index)?;
         self.highlights
             .iter()
-            .find(|highlight| highlight.ranges.as_slice() == std::slice::from_ref(&unit.range))
+            .find(|highlight| focus_unit_matches_highlight_ranges(unit, &highlight.ranges))
             .and_then(|highlight| highlight.note.clone())
             .filter(|note| !note.trim().is_empty())
     }
@@ -66,7 +66,7 @@ impl DesktopReader {
         if let Some(index) = self
             .highlights
             .iter()
-            .position(|highlight| highlight.ranges.as_slice() == std::slice::from_ref(&unit.range))
+            .position(|highlight| focus_unit_matches_highlight_ranges(&unit, &highlight.ranges))
         {
             let Some(note) = note else {
                 return;
@@ -88,7 +88,7 @@ impl DesktopReader {
             return;
         }
         let highlight =
-            StoredHighlight::with_note(self.book_id.clone(), vec![unit.range], unit.text, note);
+            StoredHighlight::with_note(self.book_id.clone(), unit.paint_ranges, unit.text, note);
         match self.highlight_store.insert(&highlight) {
             Ok(()) => {
                 self.highlights.insert(0, highlight);

@@ -1008,6 +1008,10 @@ impl LayoutEngine {
                         paginator.ensure_minimum_spacing(outer_gap);
                     }
                     Block::Separator => paginator.push_separator(),
+                    Block::LineBreak => paginator.ensure_minimum_spacing(
+                        reader_style.typography.font_size
+                            * reader_style.typesetting.body_line_height,
+                    ),
                     Block::PageBreak => paginator.force_page(),
                 }
             }
@@ -1418,6 +1422,12 @@ fn resolve_text_block<'a>(
     context: TextContext,
 ) -> Cow<'a, TextBlock> {
     if reader_style.typesetting.mode != TypesettingMode::Unified {
+        if block.style.hard_break_after {
+            let mut resolved = block.clone();
+            resolved.style.margin_after +=
+                reader_style.typography.font_size * resolved.style.line_height.max(1.0);
+            return Cow::Owned(resolved);
+        }
         return Cow::Borrowed(block);
     }
 
@@ -1455,6 +1465,12 @@ fn resolve_text_block<'a>(
             ),
         },
     };
+    let margin_after = margin_after
+        + if block.style.hard_break_after {
+            base_size * line_height
+        } else {
+            0.0
+        };
 
     if context == TextContext::Flow {
         resolved.style.align = TextAlignment::Start;
@@ -1608,6 +1624,7 @@ fn dominant_paragraph_start_offset(fragments: &[&[Block]], content_width: f32) -
             | Block::Image(_)
             | Block::Figure(_)
             | Block::Separator
+            | Block::LineBreak
             | Block::PageBreak => None,
         })
         .collect::<Vec<_>>();
@@ -1653,7 +1670,7 @@ fn fragments_are_standalone_cover(fragments: &[&[Block]], cover: Option<&Publica
     let mut visible_blocks = fragments
         .iter()
         .flat_map(|blocks| blocks.iter())
-        .filter(|block| !matches!(block, Block::PageBreak));
+        .filter(|block| !matches!(block, Block::LineBreak | Block::PageBreak));
     matches!(visible_blocks.next(), Some(Block::Image(image)) if &image.href == cover)
         && visible_blocks.next().is_none()
 }
@@ -2889,6 +2906,51 @@ mod tests {
     }
 
     #[test]
+    fn structural_break_after_survives_unified_and_book_typesetting() {
+        let normal = TextBlock {
+            kind: TextBlockKind::Blockquote,
+            content: vec![Inline::Text(TextRun {
+                text: "First stanza".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle {
+                margin_after: 6.0,
+                line_height: 1.3,
+                ..rebook_publication::BlockStyle::default()
+            },
+            source: None,
+        };
+        let mut separated = normal.clone();
+        separated.style.hard_break_after = true;
+        let mut style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let normal_unified = resolve_text_block(&normal, &style, TextContext::Flow);
+        let separated_unified = resolve_text_block(&separated, &style, TextContext::Flow);
+        assert!(
+            (separated_unified.style.margin_after
+                - normal_unified.style.margin_after
+                - style.typography.font_size * style.typesetting.body_line_height)
+                .abs()
+                < 0.001
+        );
+
+        style.typesetting.mode = TypesettingMode::Book;
+        let normal_book = resolve_text_block(&normal, &style, TextContext::Flow);
+        let separated_book = resolve_text_block(&separated, &style, TextContext::Flow);
+        assert!(
+            (separated_book.style.margin_after
+                - normal_book.style.margin_after
+                - style.typography.font_size * separated.style.line_height)
+                .abs()
+                < 0.001
+        );
+    }
+
+    #[test]
     fn reader_typesetting_normalizes_persisted_values() {
         let mut typesetting = ReaderTypesetting {
             mode: TypesettingMode::Unified,
@@ -3531,6 +3593,62 @@ mod tests {
             )
             .unwrap();
         assert!(layout.pages.len() > 1);
+    }
+
+    #[test]
+    fn standalone_line_break_adds_spacing_without_forcing_a_page() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("line-break-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let paragraph = |text: &str| {
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            })
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![paragraph("Before"), Block::LineBreak, paragraph("After")],
+            anchors: Vec::new(),
+        };
+        let mut style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        style.spread = SpreadMode::Scroll;
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(600, 400).unwrap(),
+                &style,
+            )
+            .unwrap();
+
+        assert_eq!(layout.pages.len(), 1);
+        let text_origins = layout.pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                PageItem::Text(text) => Some(text.origin_y),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text_origins.len(), 2);
+        assert!(text_origins[1] - text_origins[0] > style.typography.font_size * 2.0);
     }
 
     #[test]

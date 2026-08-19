@@ -137,7 +137,11 @@ fn search_sections(
                     };
                     (layer.text.clone(), source_range, "image-text".into())
                 }
-                Block::Figure(_) | Block::Table(_) | Block::Separator | Block::PageBreak => {
+                Block::Figure(_)
+                | Block::Table(_)
+                | Block::Separator
+                | Block::LineBreak
+                | Block::PageBreak => {
                     continue;
                 }
             };

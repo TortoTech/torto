@@ -15,6 +15,7 @@ use rebook_reader::{
     PageDirection, ReaderPosition, ReaderSectionPage, ReaderSelection, ReaderSession,
     ReaderSnapshot, ReaderTextHit, SelectionGranularity,
 };
+use rebook_renderer::PageQuoteBridge;
 
 use crate::async_task::{TaskResult, TaskSlot};
 use crate::generated_toc::GeneratedTocDraft;
@@ -403,7 +404,7 @@ fn legacy_translated_paragraph_range(
                 .filter(matches_range)
                 .map(|source| (source, crate::plugins::text_block_text(caption)))
         }),
-        Block::Image(_) | Block::Separator | Block::PageBreak => None,
+        Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => None,
     })?;
     let stored_length = range.end.text_offset.checked_sub(range.start.text_offset)?;
     let canonical_length = canonical_range
@@ -561,7 +562,15 @@ struct ScrollSectionLayout {
     page_tops: Vec<f32>,
     page_origins: Vec<f32>,
     page_heights: Vec<f32>,
+    quote_bridges: Vec<ScrollQuoteBridge>,
     content_height: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ScrollQuoteBridge {
+    top: f32,
+    bottom: f32,
+    style: PageQuoteBridge,
 }
 
 #[derive(Clone)]
@@ -575,6 +584,40 @@ struct FocusUnit {
     is_table: bool,
 }
 
+fn merge_focus_list_descendant(root: &mut FocusUnit, descendant: FocusUnit) {
+    root.range.end = descendant.range.end;
+    root.paint_ranges.extend(descendant.paint_ranges);
+    if !descendant.text.trim().is_empty() {
+        if !root.text.is_empty() {
+            root.text.push('\n');
+        }
+        root.text.push_str(&descendant.text);
+    }
+    root.rect = root.rect.union(descendant.rect);
+}
+
+fn focus_list_descendant_root(active_root: Option<(usize, u8)>, depth: u8) -> Option<usize> {
+    active_root.and_then(|(root_index, root_depth)| (depth > root_depth).then_some(root_index))
+}
+
+fn focus_unit_matches_highlight_ranges(unit: &FocusUnit, ranges: &[SourceRange]) -> bool {
+    ranges == unit.paint_ranges
+        || (ranges.len() == 1
+            && unit
+                .paint_ranges
+                .first()
+                .is_some_and(|root| root == &ranges[0]))
+}
+
+fn focus_unit_contains_source_range(unit: &FocusUnit, range: &SourceRange) -> bool {
+    unit.paint_ranges.iter().any(|paint_range| {
+        paint_range.start.spine == range.start.spine
+            && paint_range.start.node == range.start.node
+            && paint_range.start.text_offset < range.end.text_offset
+            && range.start.text_offset < paint_range.end.text_offset
+    })
+}
+
 fn block_source_range(block: &Block) -> Option<&SourceRange> {
     match block {
         Block::Text(block) => block.source.as_ref(),
@@ -582,7 +625,7 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Table(table) => table.source.as_ref(),
         Block::Image(image) => image.source.as_ref(),
         Block::Figure(figure) => figure.source.as_ref(),
-        Block::Separator | Block::PageBreak => None,
+        Block::Separator | Block::LineBreak | Block::PageBreak => None,
     }
 }
 
@@ -770,6 +813,7 @@ impl ScrollSectionLayout {
         let mut page_tops = Vec::with_capacity(pages.len());
         let mut page_origins = Vec::with_capacity(pages.len());
         let mut page_heights = Vec::with_capacity(pages.len());
+        let mut quote_bridges = Vec::new();
         for (index, entry) in pages.iter().enumerate() {
             let logical_height = entry.page.height() as f32;
             let content_top = entry
@@ -800,6 +844,15 @@ impl ScrollSectionLayout {
                 content_bottom - page_origin
             };
             if leading_gap > 0.0 {
+                if let Some(previous) = index.checked_sub(1).and_then(|index| pages.get(index))
+                    && let Some(style) = previous.page.quote_bridge_to(&entry.page)
+                {
+                    quote_bridges.push(ScrollQuoteBridge {
+                        top: cursor,
+                        bottom: cursor + leading_gap,
+                        style,
+                    });
+                }
                 if let Some(previous_height) = page_heights.last_mut() {
                     *previous_height += leading_gap;
                 }
@@ -817,6 +870,7 @@ impl ScrollSectionLayout {
             page_tops,
             page_origins,
             page_heights,
+            quote_bridges,
             content_height: cursor,
         }
     }
@@ -958,14 +1012,17 @@ impl DesktopReader {
             focus_anchor_block_index(&section.blocks, self.focus_anchor.as_ref());
         let mut first_unit_after_anchor = None;
         let mut leading_heading_ranges = Vec::new();
-        let mut units = Vec::new();
+        let mut units: Vec<FocusUnit> = Vec::new();
+        let mut active_list_root: Option<(usize, u8)> = None;
         for (block_index, block) in section.blocks.iter().enumerate() {
             if block_source_range(block).is_some_and(|range| !reading_ranges.contains(range)) {
+                active_list_root = None;
                 continue;
             }
-            let (range, paint_ranges, text, is_image, is_table) = match block {
+            let (range, paint_ranges, text, is_image, is_table, list_depth) = match block {
                 Block::Text(block) => {
                     if matches!(block.kind, TextBlockKind::Heading(_)) {
+                        active_list_root = None;
                         if units.is_empty()
                             && let Some(range) = block.source.clone()
                         {
@@ -974,7 +1031,13 @@ impl DesktopReader {
                         continue;
                     }
                     let Some(range) = block.source.clone() else {
+                        // Bilingual translation companions have no canonical
+                        // source range and must not split an authored list tree.
                         continue;
+                    };
+                    let list_depth = match block.kind {
+                        TextBlockKind::ListItem { depth, .. } => Some(depth),
+                        _ => None,
                     };
                     (
                         range.clone(),
@@ -982,6 +1045,7 @@ impl DesktopReader {
                         crate::plugins::text_block_text(block),
                         false,
                         false,
+                        list_depth,
                     )
                 }
                 Block::Quote(quote) => {
@@ -997,7 +1061,7 @@ impl DesktopReader {
                         .filter(|text| !text.trim().is_empty())
                         .collect::<Vec<_>>()
                         .join(" ");
-                    (range, paint_ranges, text, false, false)
+                    (range, paint_ranges, text, false, false, None)
                 }
                 Block::Table(table) => {
                     let Some(range) = table.source.clone() else {
@@ -1011,7 +1075,7 @@ impl DesktopReader {
                         .map(|cell| crate::plugins::text_block_text(&cell.text))
                         .collect::<Vec<_>>()
                         .join(" ");
-                    (range, paint_ranges, text, false, true)
+                    (range, paint_ranges, text, false, true, None)
                 }
                 Block::Image(image) => {
                     // Fixed-layout PDF pages are represented as images with a text
@@ -1019,6 +1083,7 @@ impl DesktopReader {
                     // source-backed image without a text layer is an authored block
                     // image and should occupy one step in focus navigation.
                     if image.text_layer.is_some() {
+                        active_list_root = None;
                         continue;
                     }
                     let Some(range) = image.source.clone() else {
@@ -1029,7 +1094,7 @@ impl DesktopReader {
                     } else {
                         image.alt.clone()
                     };
-                    (range.clone(), vec![range], text, true, false)
+                    (range.clone(), vec![range], text, true, false, None)
                 }
                 Block::Figure(figure) => {
                     let Some(range) = figure.source.clone() else {
@@ -1059,11 +1124,17 @@ impl DesktopReader {
                     } else {
                         text
                     };
-                    (range, paint_ranges, text, true, false)
+                    (range, paint_ranges, text, true, false, None)
                 }
-                Block::Separator | Block::PageBreak => continue,
+                Block::Separator | Block::LineBreak | Block::PageBreak => {
+                    active_list_root = None;
+                    continue;
+                }
             };
             if text.trim().is_empty() {
+                if list_depth.is_none_or(|depth| depth == 0) {
+                    active_list_root = None;
+                }
                 continue;
             }
             let geometry_ranges = focus_unit_geometry_ranges(
@@ -1077,12 +1148,9 @@ impl DesktopReader {
             if is_table {
                 rect.max.y += FOCUS_TABLE_BOTTOM_MARGIN;
             }
-            if first_unit_after_anchor.is_none()
-                && focus_block_index.is_some_and(|target| block_index >= target)
-            {
-                first_unit_after_anchor = Some(units.len());
-            }
-            units.push(FocusUnit {
+            let target_reached = first_unit_after_anchor.is_none()
+                && focus_block_index.is_some_and(|target| block_index >= target);
+            let unit = FocusUnit {
                 range,
                 paint_ranges,
                 text,
@@ -1090,7 +1158,30 @@ impl DesktopReader {
                 rect,
                 is_image,
                 is_table,
-            });
+            };
+            if let Some(depth) = list_depth {
+                if let Some(root_index) = focus_list_descendant_root(active_list_root, depth)
+                    && units[root_index].range.start.spine == unit.range.start.spine
+                {
+                    if target_reached {
+                        first_unit_after_anchor = Some(root_index);
+                    }
+                    merge_focus_list_descendant(&mut units[root_index], unit);
+                    continue;
+                }
+                let root_index = units.len();
+                if target_reached {
+                    first_unit_after_anchor = Some(root_index);
+                }
+                units.push(unit);
+                active_list_root = Some((root_index, depth));
+            } else {
+                active_list_root = None;
+                if target_reached {
+                    first_unit_after_anchor = Some(units.len());
+                }
+                units.push(unit);
+            }
         }
         let current = snapshot_position(&self.snapshot);
         self.focus_unit_index = resolved_focus_unit_index(
@@ -2228,16 +2319,21 @@ mod tests {
         FocusUnit, FollowUp, HashSet, Instant, MOTION_DURATION, Motion, MotionCurve,
         NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, ScrollSectionLayout, SidebarTab,
         SnapshotEffects, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer,
-        TranslationUiState, allowed_reading_mode, focus_block_paint_ranges, focus_scroll_duration,
-        focus_unit_container_center_y, focus_unit_geometry_ranges, focus_unit_screen_center_y,
-        focus_unit_scroll_bounds, focus_unit_target_offset_for_rect,
-        legacy_translated_paragraph_range, logical_dimension, resolve_book_display_metadata,
-        resolved_focus_unit_index, source_range_contains_anchor,
+        TranslationUiState, allowed_reading_mode, focus_block_paint_ranges,
+        focus_list_descendant_root, focus_scroll_duration, focus_unit_container_center_y,
+        focus_unit_contains_source_range, focus_unit_geometry_ranges,
+        focus_unit_matches_highlight_ranges, focus_unit_screen_center_y, focus_unit_scroll_bounds,
+        focus_unit_target_offset_for_rect, legacy_translated_paragraph_range, logical_dimension,
+        merge_focus_list_descendant, resolve_book_display_metadata, resolved_focus_unit_index,
+        source_range_contains_anchor,
     };
     use crate::plugins::PdfOcrViewMode;
     use crate::preferences::ReadingMode;
     use rebook_formats::BookFormat;
-    use rebook_layout::{ImagePlacement, LayoutViewport, PageItem, PageLayout, RasterImage};
+    use rebook_layout::{
+        ImagePlacement, LayoutViewport, PageItem, PageLayout, QuotePlacement, RasterImage,
+        SeparatorPlacement,
+    };
     use rebook_publication::{
         Block, BlockStyle, Rgba, SourceAnchor, SourceRange, SpineItemId, TableBlock, TableCell,
         TableRow, TextBlock, TextBlockKind,
@@ -2384,6 +2480,76 @@ mod tests {
         assert!((second_top - first_bottom - 20.0).abs() < f32::EPSILON);
         assert!((layout.page_origins[1] - 40.0).abs() < f32::EPSILON);
         assert!((layout.page_heights[0] - 160.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn continuous_layout_bridges_quote_accents_across_preserved_page_gaps() {
+        let spine = SpineItemId::new("chapter").unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "poem".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "poem".into(),
+                text_offset: 100,
+            },
+        };
+        let page = |page_index, leading_gap, continued_before, continued_after| {
+            let layout = PageLayout {
+                viewport: LayoutViewport::new(400, 200).unwrap(),
+                background: Rgba::BLACK,
+                leading_gap,
+                items: vec![
+                    PageItem::Quote(QuotePlacement {
+                        x: 20.0,
+                        y: 10.0,
+                        width: 360.0,
+                        height: 180.0,
+                        continued_before,
+                        continued_after,
+                        fill: Rgba {
+                            alpha: 0,
+                            ..Rgba::BLACK
+                        },
+                        accent: Rgba::BLACK,
+                        sources: vec![source.clone()],
+                    }),
+                    PageItem::Separator(SeparatorPlacement {
+                        x: 40.0,
+                        y: 50.0,
+                        width: 80.0,
+                    }),
+                ],
+            };
+            ReaderSectionPage {
+                position: ReaderPosition {
+                    section_index: 0,
+                    segment_index: 0,
+                    page_index,
+                },
+                page: Arc::new(DisplayListCompiler.compile(&layout)),
+                placeholder: false,
+                visible_top: None,
+                visible_bottom: None,
+            }
+        };
+        let layout = ScrollSectionLayout::new(
+            0,
+            0,
+            vec![page(0, 0.0, false, true), page(1, 20.0, true, false)],
+            false,
+        );
+
+        let [bridge] = layout.quote_bridges.as_slice() else {
+            panic!("matching quote continuations should bridge their preserved page gap");
+        };
+        assert!((bridge.top - 51.0).abs() < f32::EPSILON);
+        assert!((bridge.bottom - 71.0).abs() < f32::EPSILON);
+        assert!((bridge.style.x - 26.0).abs() < f32::EPSILON);
+        assert!((bridge.style.width - 4.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -2540,6 +2706,66 @@ mod tests {
             ),
             vec![table_cell]
         );
+    }
+
+    #[test]
+    fn nested_list_descendants_merge_into_the_nearest_visible_root_unit() {
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let range = |node: &str| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 8,
+            },
+        };
+        let position = ReaderPosition {
+            section_index: 0,
+            segment_index: 0,
+            page_index: 0,
+        };
+        let unit = |node: &str, text: &str, y: f32| FocusUnit {
+            range: range(node),
+            paint_ranges: vec![range(node)],
+            text: text.into(),
+            position,
+            rect: egui::Rect::from_min_size(egui::pos2(20.0, y), egui::vec2(400.0, 40.0)),
+            is_image: false,
+            is_table: false,
+        };
+
+        assert_eq!(focus_list_descendant_root(Some((0, 0)), 1), Some(0));
+        assert_eq!(focus_list_descendant_root(Some((0, 0)), 2), Some(0));
+        assert_eq!(focus_list_descendant_root(Some((0, 0)), 0), None);
+        assert_eq!(focus_list_descendant_root(Some((0, 1)), 1), None);
+
+        let mut root = unit("root", "语音与写作：文化转型", 100.0);
+        let child_range = range("child");
+        merge_focus_list_descendant(&mut root, unit("child", "口头文化与书面文化", 160.0));
+        merge_focus_list_descendant(&mut root, unit("grandchild", "从学术辩论到书面考试", 220.0));
+
+        assert_eq!(root.paint_ranges.len(), 3);
+        assert_eq!(root.range.start.node, "root");
+        assert_eq!(root.range.end.node, "grandchild");
+        assert_eq!(
+            root.text,
+            "语音与写作：文化转型\n口头文化与书面文化\n从学术辩论到书面考试"
+        );
+        assert_eq!(root.rect.top(), 100.0);
+        assert_eq!(root.rect.bottom(), 260.0);
+        assert!(focus_unit_contains_source_range(&root, &child_range));
+        assert!(focus_unit_matches_highlight_ranges(
+            &root,
+            &root.paint_ranges
+        ));
+        assert!(focus_unit_matches_highlight_ranges(
+            &root,
+            std::slice::from_ref(&root.paint_ranges[0])
+        ));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use kurbo::{Affine, Rect};
-use peniko::{Color, ImageData};
+use peniko::{Color, Fill, ImageData};
 use rebook_formats::BookFormat;
 use rebook_reader::{ReaderPosition, ReaderSectionPage};
 use rebook_renderer::PageDisplayList;
@@ -155,6 +155,25 @@ impl DesktopReader {
                     0.0,
                     f64::from(top - viewport.offset_y - layout.page_origins[index]),
                 ))),
+            );
+        }
+        for bridge in &layout.quote_bridges {
+            let top = bridge.top + content_padding - viewport.offset_y;
+            let bottom = bridge.bottom + content_padding - viewport.offset_y;
+            if bottom < 0.0 || top > viewport.size.y {
+                continue;
+            }
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                bridge.style.color,
+                None,
+                &Rect::new(
+                    f64::from(bridge.style.x),
+                    f64::from(top - 0.5),
+                    f64::from(bridge.style.x + bridge.style.width),
+                    f64::from(bottom + 0.5),
+                ),
             );
         }
         ReaderScene {

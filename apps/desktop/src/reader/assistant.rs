@@ -1845,7 +1845,7 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
         Block::Figure(block) => block.source.as_ref(),
-        Block::Separator | Block::PageBreak => None,
+        Block::Separator | Block::LineBreak | Block::PageBreak => None,
     }
 }
 
@@ -1913,7 +1913,7 @@ fn block_text(block: &Block) -> String {
                 caption
             }
         }
-        Block::Separator | Block::PageBreak => String::new(),
+        Block::Separator | Block::LineBreak | Block::PageBreak => String::new(),
     }
 }
 

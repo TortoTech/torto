@@ -610,7 +610,7 @@ async fn translate_block_batch(
             json!({
                 "role": "system",
                 "content": format!(
-                    "你是一名专业图书翻译。请把输入 JSON 对象中的每个值翻译为{target_language}，忠实保留原文语气、专有名词与段落结构。每个 JSON 值都是独立正文块：原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时则保持相同类型。文本中的 <sup>...</sup> 和 <sub>...</sub> 是上标、下标结构标记，必须连同其中的内容原样保留在对应语义位置，不得翻译、删除或拆分这些标记。{fixed_page_hint}只返回一个 JSON 对象，必须保留完全相同的键，每个值只能是对应译文字符串。"
+                    "你是一名专业图书翻译。请把输入 JSON 对象中的每个值翻译为{target_language}，忠实保留原文语气、专有名词与段落结构。每个 JSON 值都是独立正文块：原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时则保持相同类型。文本中的 <strong>、<em>、<u>、<sup>、<sub> 及其闭合标签是行内结构标记：必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。{fixed_page_hint}只返回一个 JSON 对象，必须保留完全相同的键，每个值只能是对应译文字符串。"
                 ),
             }),
             json!({ "role": "user", "content": Value::Object(input.clone()).to_string() }),
@@ -2124,7 +2124,7 @@ fn ai_block_content(block: &Block, is_pdf: bool) -> Option<(&SourceRange, String
                 .join("; ");
             (!is_pdf && !alt.is_empty()).then_some((source, alt, "figure-alt"))
         }
-        Block::Separator | Block::PageBreak => None,
+        Block::Separator | Block::LineBreak | Block::PageBreak => None,
     }
 }
 

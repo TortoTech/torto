@@ -1980,6 +1980,7 @@ impl BookSource for OcrReflowBookSource {
                         | rebook_publication::Block::Quote(_)
                         | rebook_publication::Block::Table(_)
                         | rebook_publication::Block::Separator
+                        | rebook_publication::Block::LineBreak
                         | rebook_publication::Block::PageBreak => None,
                     })
                 {
