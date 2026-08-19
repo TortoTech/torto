@@ -582,6 +582,8 @@ struct FocusUnit {
     rect: egui::Rect,
     is_image: bool,
     is_table: bool,
+    rectangular_activation: bool,
+    rectangular_activation_rect: Option<egui::Rect>,
 }
 
 fn merge_focus_list_descendant(root: &mut FocusUnit, descendant: FocusUnit) {
@@ -703,6 +705,28 @@ fn focus_unit_geometry(
         }
     }
     bounds.zip(position)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "renderer page coordinates are GPU-bounded and egui geometry uses f32"
+)]
+fn focus_block_activation_geometry(
+    layout: &ScrollSectionLayout,
+    paint_ranges: &[SourceRange],
+) -> Option<egui::Rect> {
+    layout
+        .pages
+        .iter()
+        .enumerate()
+        .filter_map(|(page_index, page)| {
+            let rect = page.page.source_block_bounds(paint_ranges)?;
+            Some(egui::Rect::from_min_max(
+                egui::pos2(rect.x0 as f32, layout.content_y(page_index, rect.y0 as f32)),
+                egui::pos2(rect.x1 as f32, layout.content_y(page_index, rect.y1 as f32)),
+            ))
+        })
+        .reduce(|bounds, next| bounds.union(next))
 }
 
 fn focus_anchor_block_index(blocks: &[Block], anchor: Option<&SourceAnchor>) -> Option<usize> {
@@ -1019,118 +1043,120 @@ impl DesktopReader {
                 active_list_root = None;
                 continue;
             }
-            let (range, paint_ranges, text, is_image, is_table, list_depth) = match block {
-                Block::Text(block) => {
-                    if matches!(block.kind, TextBlockKind::Heading(_)) {
-                        active_list_root = None;
-                        if units.is_empty()
-                            && let Some(range) = block.source.clone()
-                        {
-                            leading_heading_ranges.push(range);
+            let (range, paint_ranges, text, is_image, is_table, rectangular_activation, list_depth) =
+                match block {
+                    Block::Text(block) => {
+                        if matches!(block.kind, TextBlockKind::Heading(_)) {
+                            active_list_root = None;
+                            if units.is_empty()
+                                && let Some(range) = block.source.clone()
+                            {
+                                leading_heading_ranges.push(range);
+                            }
+                            continue;
                         }
-                        continue;
+                        let Some(range) = block.source.clone() else {
+                            // Bilingual translation companions have no canonical
+                            // source range and must not split an authored list tree.
+                            continue;
+                        };
+                        let list_depth = match block.kind {
+                            TextBlockKind::ListItem { depth, .. } => Some(depth),
+                            _ => None,
+                        };
+                        (
+                            range.clone(),
+                            vec![range],
+                            crate::plugins::text_block_text(block),
+                            false,
+                            false,
+                            block.kind == TextBlockKind::Preformatted,
+                            list_depth,
+                        )
                     }
-                    let Some(range) = block.source.clone() else {
-                        // Bilingual translation companions have no canonical
-                        // source range and must not split an authored list tree.
-                        continue;
-                    };
-                    let list_depth = match block.kind {
-                        TextBlockKind::ListItem { depth, .. } => Some(depth),
-                        _ => None,
-                    };
-                    (
-                        range.clone(),
-                        vec![range],
-                        crate::plugins::text_block_text(block),
-                        false,
-                        false,
-                        list_depth,
-                    )
-                }
-                Block::Quote(quote) => {
-                    let Some(range) = quote.source.clone() else {
-                        continue;
-                    };
-                    let paint_ranges = focus_block_paint_ranges(block, &range);
-                    let text = quote
-                        .body
-                        .iter()
-                        .chain(quote.attribution.iter())
-                        .map(crate::plugins::text_block_text)
-                        .filter(|text| !text.trim().is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    (range, paint_ranges, text, false, false, None)
-                }
-                Block::Table(table) => {
-                    let Some(range) = table.source.clone() else {
-                        continue;
-                    };
-                    let paint_ranges = focus_block_paint_ranges(block, &range);
-                    let text = table
-                        .rows
-                        .iter()
-                        .flat_map(|row| &row.cells)
-                        .map(|cell| crate::plugins::text_block_text(&cell.text))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    (range, paint_ranges, text, false, true, None)
-                }
-                Block::Image(image) => {
-                    // Fixed-layout PDF pages are represented as images with a text
-                    // layer; their paragraphs already supply the focus units. A
-                    // source-backed image without a text layer is an authored block
-                    // image and should occupy one step in focus navigation.
-                    if image.text_layer.is_some() {
+                    Block::Quote(quote) => {
+                        let Some(range) = quote.source.clone() else {
+                            continue;
+                        };
+                        let paint_ranges = focus_block_paint_ranges(block, &range);
+                        let text = quote
+                            .body
+                            .iter()
+                            .chain(quote.attribution.iter())
+                            .map(crate::plugins::text_block_text)
+                            .filter(|text| !text.trim().is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        (range, paint_ranges, text, false, false, true, None)
+                    }
+                    Block::Table(table) => {
+                        let Some(range) = table.source.clone() else {
+                            continue;
+                        };
+                        let paint_ranges = focus_block_paint_ranges(block, &range);
+                        let text = table
+                            .rows
+                            .iter()
+                            .flat_map(|row| &row.cells)
+                            .map(|cell| crate::plugins::text_block_text(&cell.text))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        (range, paint_ranges, text, false, true, false, None)
+                    }
+                    Block::Image(image) => {
+                        // Fixed-layout PDF pages are represented as images with a text
+                        // layer; their paragraphs already supply the focus units. A
+                        // source-backed image without a text layer is an authored block
+                        // image and should occupy one step in focus navigation.
+                        if image.text_layer.is_some() {
+                            active_list_root = None;
+                            continue;
+                        }
+                        let Some(range) = image.source.clone() else {
+                            continue;
+                        };
+                        let text = if image.alt.trim().is_empty() {
+                            self.language.text("图片", "Image").to_owned()
+                        } else {
+                            image.alt.clone()
+                        };
+                        (range.clone(), vec![range], text, true, false, false, None)
+                    }
+                    Block::Figure(figure) => {
+                        let Some(range) = figure.source.clone() else {
+                            continue;
+                        };
+                        let paint_ranges = focus_block_paint_ranges(block, &range);
+                        let caption = figure
+                            .captions
+                            .iter()
+                            .map(crate::plugins::text_block_text)
+                            .filter(|text| !text.trim().is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let text = if caption.is_empty() {
+                            figure
+                                .images
+                                .iter()
+                                .map(|image| image.alt.trim())
+                                .filter(|alt| !alt.is_empty())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        } else {
+                            caption
+                        };
+                        let text = if text.is_empty() {
+                            self.language.text("图片", "Image").to_owned()
+                        } else {
+                            text
+                        };
+                        (range, paint_ranges, text, true, false, false, None)
+                    }
+                    Block::Separator | Block::LineBreak | Block::PageBreak => {
                         active_list_root = None;
                         continue;
                     }
-                    let Some(range) = image.source.clone() else {
-                        continue;
-                    };
-                    let text = if image.alt.trim().is_empty() {
-                        self.language.text("图片", "Image").to_owned()
-                    } else {
-                        image.alt.clone()
-                    };
-                    (range.clone(), vec![range], text, true, false, None)
-                }
-                Block::Figure(figure) => {
-                    let Some(range) = figure.source.clone() else {
-                        continue;
-                    };
-                    let paint_ranges = focus_block_paint_ranges(block, &range);
-                    let caption = figure
-                        .captions
-                        .iter()
-                        .map(crate::plugins::text_block_text)
-                        .filter(|text| !text.trim().is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let text = if caption.is_empty() {
-                        figure
-                            .images
-                            .iter()
-                            .map(|image| image.alt.trim())
-                            .filter(|alt| !alt.is_empty())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    } else {
-                        caption
-                    };
-                    let text = if text.is_empty() {
-                        self.language.text("图片", "Image").to_owned()
-                    } else {
-                        text
-                    };
-                    (range, paint_ranges, text, true, false, None)
-                }
-                Block::Separator | Block::LineBreak | Block::PageBreak => {
-                    active_list_root = None;
-                    continue;
-                }
-            };
+                };
             if text.trim().is_empty() {
                 if list_depth.is_none_or(|depth| depth == 0) {
                     active_list_root = None;
@@ -1145,6 +1171,9 @@ impl DesktopReader {
             let Some((mut rect, position)) = focus_unit_geometry(layout, &geometry_ranges) else {
                 continue;
             };
+            let rectangular_activation_rect = rectangular_activation
+                .then(|| focus_block_activation_geometry(layout, &paint_ranges))
+                .flatten();
             if is_table {
                 rect.max.y += FOCUS_TABLE_BOTTOM_MARGIN;
             }
@@ -1158,6 +1187,8 @@ impl DesktopReader {
                 rect,
                 is_image,
                 is_table,
+                rectangular_activation,
+                rectangular_activation_rect,
             };
             if let Some(depth) = list_depth {
                 if let Some(root_index) = focus_list_descendant_root(active_list_root, depth)
@@ -2736,6 +2767,8 @@ mod tests {
             rect: egui::Rect::from_min_size(egui::pos2(20.0, y), egui::vec2(400.0, 40.0)),
             is_image: false,
             is_table: false,
+            rectangular_activation: false,
+            rectangular_activation_rect: None,
         };
 
         assert_eq!(focus_list_descendant_root(Some((0, 0)), 1), Some(0));
@@ -2796,6 +2829,8 @@ mod tests {
             rect: egui::Rect::ZERO,
             is_image: false,
             is_table: false,
+            rectangular_activation: false,
+            rectangular_activation_rect: None,
         });
         let heading_anchor = SourceAnchor {
             spine,

@@ -164,14 +164,17 @@ impl ReadingIrParser {
         container: Node<'_, '_>,
         siblings: &[Node<'_, '_>],
     ) -> Result<Option<usize>, HtmlError> {
-        const MIN_BODY_BLOCKS: usize = 2;
-        const MAX_BODY_BLOCKS: usize = 64;
+        const MIN_ATTRIBUTED_BODY_BLOCKS: usize = 1;
+        const MIN_UNATTRIBUTED_BODY_BLOCKS: usize = 2;
 
         let mut body = Vec::new();
         let mut reference_layout = None;
         let mut reference_text_style = None;
         let mut reference_tag = None::<String>;
         let mut stanza_break_after = Vec::new();
+        let mut pending_stanza_break = None;
+        let mut body_has_distinct_typography = false;
+        let mut last_body_consumed = 0;
 
         for (index, node) in siblings.iter().copied().enumerate() {
             if node.is_text() {
@@ -184,10 +187,7 @@ impl ReadingIrParser {
                 continue;
             }
             if node.tag_name().name().eq_ignore_ascii_case("br") && !body.is_empty() {
-                let previous = body.len() - 1;
-                if stanza_break_after.last().copied() != Some(previous) {
-                    stanza_break_after.push(previous);
-                }
+                pending_stanza_break = Some(body.len() - 1);
                 continue;
             }
             if !is_quote_text_candidate(node) {
@@ -196,7 +196,7 @@ impl ReadingIrParser {
 
             let block_style = self.styles.block_style(node, BlockStyle::default());
             if block_style.align == TextAlignment::End {
-                if body.len() < MIN_BODY_BLOCKS
+                if body.len() < MIN_ATTRIBUTED_BODY_BLOCKS
                     || !self.styles.has_sibling_quote_attribution_role(
                         node,
                         reference_layout.expect("quote body layout exists"),
@@ -204,6 +204,11 @@ impl ReadingIrParser {
                     )
                 {
                     break;
+                }
+                if let Some(previous) = pending_stanza_break.take()
+                    && stanza_break_after.last().copied() != Some(previous)
+                {
+                    stanza_break_after.push(previous);
                 }
                 self.parse_quote_nodes_with_stanza_breaks(
                     container,
@@ -221,24 +226,29 @@ impl ReadingIrParser {
                 .styles
                 .text_style_for_block(node, TextBlockKind::Paragraph);
             let tag = node.tag_name().name().to_ascii_lowercase();
-            if let (Some(reference_layout), Some(reference_text_style), Some(reference_tag)) = (
-                reference_layout,
-                reference_text_style,
-                reference_tag.as_ref(),
-            ) && (tag != *reference_tag
-                || !layout.compatible_with(reference_layout)
-                || !quote_text_styles_match(text_style, reference_text_style))
+            if let (Some(reference_layout), Some(reference_tag)) =
+                (reference_layout, reference_tag.as_ref())
+                && (tag != *reference_tag || !layout.compatible_with(reference_layout))
             {
                 break;
             }
 
+            if let Some(previous) = pending_stanza_break.take()
+                && stanza_break_after.last().copied() != Some(previous)
+            {
+                stanza_break_after.push(previous);
+            }
             reference_layout.get_or_insert(layout);
             reference_text_style.get_or_insert(text_style);
             reference_tag.get_or_insert(tag);
+            body_has_distinct_typography |= self.styles.has_distinct_quote_typography(node);
             body.push(node);
-            if body.len() >= MAX_BODY_BLOCKS {
-                break;
-            }
+            last_body_consumed = index + 1;
+        }
+
+        if body.len() >= MIN_UNATTRIBUTED_BODY_BLOCKS && body_has_distinct_typography {
+            self.parse_quote_nodes_with_stanza_breaks(container, &body, None, &stanza_break_after)?;
+            return Ok(Some(last_body_consumed));
         }
 
         Ok(None)
@@ -274,7 +284,10 @@ impl ReadingIrParser {
                 self.push_text_block(node, TextBlockKind::Heading(level), style)?;
             }
             "p" => {
-                if has_quote_semantic_word(node) && self.styles.has_standalone_quote_layout(node) {
+                if self.styles.has_standalone_quote_layout(node)
+                    && (has_quote_semantic_word(node)
+                        || self.styles.has_distinct_quote_typography(node))
+                {
                     self.parse_standalone_quote(node)?;
                 } else {
                     let mut style = self.styles.block_style(node, BlockStyle::default());
@@ -1553,7 +1566,6 @@ struct QuoteLayoutMetrics {
     end: f32,
     before: f32,
     after: f32,
-    first_line_indent: f32,
 }
 
 impl QuoteLayoutMetrics {
@@ -1570,14 +1582,7 @@ impl QuoteLayoutMetrics {
             4.0_f32.max(self.start.max(self.end).max(other.start).max(other.end) * 0.25);
         (self.start - other.start).abs() <= horizontal_tolerance
             && (self.end - other.end).abs() <= horizontal_tolerance
-            && (self.first_line_indent - other.first_line_indent).abs() <= 4.0
     }
-}
-
-fn quote_text_styles_match(left: TextStyle, right: TextStyle) -> bool {
-    left.bold == right.bold
-        && left.italic == right.italic
-        && (left.size_scale - right.size_scale).abs() <= 0.05
 }
 
 #[derive(Default)]
@@ -1775,11 +1780,6 @@ impl StyleSheet {
             + horizontal("padding-inline-start", "padding-left");
         let end = horizontal("margin-inline-end", "margin-right")
             + horizontal("padding-inline-end", "padding-right");
-        let first_line_indent = properties
-            .get("text-indent")
-            .and_then(|value| css_horizontal_length(value))
-            .map(|(pixels, fraction)| fraction.mul_add(REFERENCE_WIDTH, pixels))
-            .unwrap_or(0.0);
         let before = vertical("margin-block-start", "margin-top")
             + vertical("padding-block-start", "padding-top");
         let after = vertical("margin-block-end", "margin-bottom")
@@ -1790,7 +1790,6 @@ impl StyleSheet {
             end,
             before,
             after,
-            first_line_indent,
         }
     }
 
@@ -1817,11 +1816,33 @@ impl StyleSheet {
             || attribution_layout.end + 4.0 < body_layout.end
     }
 
+    fn has_distinct_quote_typography(&self, node: Node<'_, '_>) -> bool {
+        let properties = self.cascaded_properties(node);
+        let parent_properties = node
+            .parent()
+            .filter(Node::is_element)
+            .map(|parent| self.cascaded_properties(parent));
+        let differs_from_parent = |name: &str| {
+            properties.get(name).is_some_and(|value| {
+                let value = value.trim();
+                !value.is_empty()
+                    && !matches!(value, "inherit" | "initial" | "unset" | "normal")
+                    && parent_properties
+                        .as_ref()
+                        .and_then(|parent| parent.get(name))
+                        .is_none_or(|parent| parent.trim() != value)
+            })
+        };
+        differs_from_parent("font-family")
+            || differs_from_parent("font-style")
+            || differs_from_parent("font-weight")
+            || self.declared_text_alignment(node) == Some(TextAlignment::Center)
+    }
+
     fn has_standalone_quote_layout(&self, node: Node<'_, '_>) -> bool {
         const MIN_VERTICAL_SPACING: f32 = 0.5;
         let layout = self.quote_layout_metrics(node);
         layout.has_symmetric_inset()
-            && layout.first_line_indent.abs() <= 0.5
             && layout.before > MIN_VERTICAL_SPACING
             && layout.after > MIN_VERTICAL_SPACING
     }
@@ -3385,6 +3406,110 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn recognizes_attributed_unattributed_and_mixed_style_quotes_by_structure() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            .verse-body { font-family: KaiTi, serif; margin: 4pt 2em; text-indent: 2em; }
+            .center-line { font-family: KaiTi, serif; margin: 4pt 2em; text-align: center; font-weight: bold; }
+            .credit { margin: 0.8em 0 5pt; text-align: right; font-size: 0.83em; }
+            .isolated { font-family: KaiTi, serif; margin: 4pt 2em; text-indent: 4em; }
+        </style></head><body><div>
+            <p class="verse-body">A single quoted paragraph.</p>
+            <p class="credit">The source</p>
+            <p>Ordinary prose between quotations.</p>
+            <p class="verse-body">First verse line.</p>
+            <p class="center-line">Centered refrain.</p>
+            <br/>
+            <p class="verse-body">Last verse line.</p>
+            <p>Ordinary prose after the verse.</p>
+            <p class="isolated">An isolated quotation without a source.</p>
+            <p>Final ordinary prose.</p>
+        </div></body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let quotes = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Quote(quote) => Some(quote),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(quotes.len(), 3);
+        assert_eq!(quotes[0].body.len(), 1);
+        assert!(quotes[0].attribution.is_some());
+        assert_eq!(quotes[1].body.len(), 3);
+        assert!(quotes[1].attribution.is_none());
+        assert!(quotes[1].body[1].style.hard_break_after);
+        assert_eq!(quotes[2].body.len(), 1);
+        assert!(quotes[2].attribution.is_none());
+    }
+
+    #[test]
+    fn repeated_inset_prose_without_quote_typography_remains_prose() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            .indented { margin: 1em 2em; }
+        </style></head><body>
+            <p class="indented">First ordinary inset paragraph.</p>
+            <p class="indented">Second ordinary inset paragraph.</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        assert_eq!(section.blocks.len(), 2);
+        assert!(section.blocks.iter().all(|block| matches!(
+            block,
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn long_unattributed_quote_is_not_split_by_an_internal_block_limit() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let paragraphs = (1..=80)
+            .map(|index| format!(r#"<p class="source-text">Quoted block {index}</p>"#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+                .source-text {{ font-family: KaiTi, serif; margin: 4pt 2em; text-indent: 2em; }}
+            </style></head><body><div>{paragraphs}<p>Ordinary prose.</p></div></body></html>"#
+        );
+
+        let section = parse_section(&xml, &descriptor, |_| unreachable!()).unwrap();
+        let quotes = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Quote(quote) => Some(quote),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].body.len(), 80);
     }
 
     #[test]

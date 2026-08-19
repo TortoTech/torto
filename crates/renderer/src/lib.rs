@@ -385,6 +385,52 @@ impl PageDisplayList {
             .collect()
     }
 
+    /// Resolves a semantic quote or preformatted text range to one rectangular
+    /// block suitable for focus-mode activation painting.
+    pub fn source_block_bounds(&self, ranges: &[SourceRange]) -> Option<Rect> {
+        let quote = self.source_quote_bounds(ranges);
+        if !quote.is_empty() {
+            return quote.into_iter().reduce(|bounds, next| bounds.union(next));
+        }
+        self.text_regions
+            .iter()
+            .filter_map(|region| {
+                ranges
+                    .iter()
+                    .find_map(|range| region.block_bounds_for_source(range))
+            })
+            .reduce(|bounds, next| bounds.union(next))
+            .map(|bounds| {
+                Rect::new(
+                    bounds.x0 - 8.0,
+                    bounds.y0 - 6.0,
+                    bounds.x1 + 8.0,
+                    bounds.y1 + 6.0,
+                )
+            })
+    }
+
+    /// Paints one opaque rounded-rectangle activation fill below page text.
+    pub fn paint_source_block_background(
+        &self,
+        scene: &mut impl PaintScene,
+        ranges: &[SourceRange],
+        color: Color,
+        offset_x: f32,
+    ) {
+        let Some(bounds) = self.source_block_bounds(ranges) else {
+            return;
+        };
+        let background = RoundedRect::from_rect(bounds, 7.0);
+        scene.fill(
+            Fill::NonZero,
+            Affine::translate((f64::from(offset_x), 0.0)),
+            color,
+            None,
+            &background,
+        );
+    }
+
     /// Returns the accent style when this page and `next` are consecutive
     /// slices of the same semantic quotation.
     pub fn quote_bridge_to(&self, next: &Self) -> Option<PageQuoteBridge> {
@@ -667,6 +713,17 @@ impl TextRegion {
         }
     }
 
+    fn block_bounds_for_source(&self, range: &SourceRange) -> Option<Rect> {
+        let byte_range = self.byte_range_for_source(range)?;
+        match self {
+            Self::Shaped(region) => region.block_bounds(),
+            Self::Fixed(region) => region
+                .selection_rects(byte_range)
+                .into_iter()
+                .reduce(|bounds, next| bounds.union(next)),
+        }
+    }
+
     fn contains_source_anchor(&self, anchor: &SourceAnchor) -> bool {
         match self {
             Self::Shaped(region) => region.contains_source_anchor(anchor),
@@ -682,6 +739,7 @@ struct ShapedTextRegion {
     lines: Range<usize>,
     origin_x: f32,
     origin_y: f32,
+    available_width: f32,
     source: SourceRange,
 }
 
@@ -700,6 +758,16 @@ impl ShapedTextRegion {
         Some((
             first.metrics().block_min_coord + self.origin_y,
             last.metrics().block_max_coord + self.origin_y,
+        ))
+    }
+
+    fn block_bounds(&self) -> Option<Rect> {
+        let (top, bottom) = self.vertical_bounds()?;
+        Some(Rect::new(
+            f64::from(self.origin_x),
+            f64::from(top),
+            f64::from(self.origin_x + self.available_width),
+            f64::from(bottom),
         ))
     }
 
@@ -1639,6 +1707,7 @@ fn text_region(text: &TextPlacement) -> Option<TextRegion> {
         lines: text.lines.clone(),
         origin_x: text.origin_x,
         origin_y: text.origin_y,
+        available_width: text.available_width,
         source: text.source.clone()?,
     }))
 }
@@ -1973,6 +2042,10 @@ mod tests {
 
         let first = page(false, true);
         let second = page(true, false);
+        assert_eq!(
+            first.source_block_bounds(std::slice::from_ref(&source)),
+            Some(Rect::new(20.0, 10.0, 180.0, 190.0))
+        );
         let bridge = first
             .quote_bridge_to(&second)
             .expect("matching continuation slices should expose their accent style");
@@ -2082,7 +2155,8 @@ mod tests {
                 lines: 0..1,
                 origin_x: 24.0,
                 origin_y: 24.0,
-                source: Some(source),
+                available_width: 240.0,
+                source: Some(source.clone()),
                 inline_images: Arc::from([]),
             })],
         };
@@ -2091,6 +2165,20 @@ mod tests {
             list.content_bottom()
                 .is_some_and(|bottom| bottom > 24.0 && bottom < 80.0),
             "text content should end near its shaped line rather than the 240px page boundary"
+        );
+        let text_bounds = list
+            .source_rects(std::slice::from_ref(&source))
+            .into_iter()
+            .reduce(|bounds, next| bounds.union(next))
+            .unwrap();
+        assert_eq!(
+            list.source_block_bounds(std::slice::from_ref(&source)),
+            Some(Rect::new(
+                16.0,
+                text_bounds.y0 - 6.0,
+                272.0,
+                text_bounds.y1 + 6.0,
+            ))
         );
         let selected_source = SourceRange {
             start: SourceAnchor {
@@ -2159,6 +2247,7 @@ mod tests {
                 lines: 0..line_count,
                 origin_x: 24.0,
                 origin_y: 24.0,
+                available_width: 240.0,
                 source: Some(source.clone()),
                 inline_images: Arc::from([]),
             })],
@@ -2235,6 +2324,7 @@ mod tests {
                 lines: 0..line_count,
                 origin_x,
                 origin_y,
+                available_width: 240.0,
                 source: Some(source),
                 inline_images: Arc::from([]),
             })],
@@ -2308,6 +2398,7 @@ mod tests {
                 lines: 0..line_count,
                 origin_x: 24.0,
                 origin_y: 24.0,
+                available_width: 180.0,
                 source: Some(source),
                 inline_images: Arc::from([]),
             })],
@@ -2399,6 +2490,7 @@ mod tests {
                 lines: 0..line_count,
                 origin_x,
                 origin_y,
+                available_width: 240.0,
                 source: Some(source),
                 inline_images: Arc::from([]),
             })],
@@ -2576,6 +2668,7 @@ mod tests {
                             lines: 0..line_count,
                             origin_x: 64.0,
                             origin_y: 64.0,
+                            available_width: 76.0,
                             source: Some(source.clone()),
                             inline_images: Arc::from([]),
                         },

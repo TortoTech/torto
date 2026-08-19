@@ -22,6 +22,14 @@ use thiserror::Error;
 
 const QUOTE_VERTICAL_PADDING: f32 = 12.0;
 
+/// Shared accent used by semantic quote decorations and block activation fills.
+pub const QUOTE_ACCENT_COLOR: Rgba = Rgba {
+    red: 0xD1,
+    green: 0xD7,
+    blue: 0xDE,
+    alpha: 255,
+};
+
 const DEFAULT_COLUMN_GAP: f32 = 36.0;
 const IMAGE_BLOCK_GAP: f32 = 14.0;
 const TABLE_BLOCK_GAP: f32 = 14.0;
@@ -452,6 +460,8 @@ pub struct TextPlacement {
     pub lines: Range<usize>,
     pub origin_x: f32,
     pub origin_y: f32,
+    /// Full horizontal measure available to this shaped block.
+    pub available_width: f32,
     pub source: Option<SourceRange>,
     /// Formula rasters positioned by Parley inline boxes in this text layout.
     pub inline_images: Arc<[InlineImage]>,
@@ -1290,6 +1300,7 @@ impl LayoutEngine {
             text: text.into(),
             source_text_start,
             start_offset,
+            available_width,
             inline_images: inline_images
                 .into_iter()
                 .map(|image| InlineImage {
@@ -1472,17 +1483,22 @@ fn resolve_text_block<'a>(
             0.0
         };
 
-    if context == TextContext::Flow {
+    if context == TextContext::Flow && block.kind != TextBlockKind::Blockquote {
         resolved.style.align = TextAlignment::Start;
     }
     resolved.style.margin_before = 0.0;
     resolved.style.margin_after = margin_after;
-    resolved.style.indent =
-        if context == TextContext::Flow && block.kind == TextBlockKind::Paragraph {
-            base_size * paragraph_indent_em(profile, reader_style.writing_system)
-        } else {
-            0.0
-        };
+    resolved.style.indent = if context == TextContext::Flow {
+        match block.kind {
+            TextBlockKind::Paragraph => {
+                base_size * paragraph_indent_em(profile, reader_style.writing_system)
+            }
+            TextBlockKind::Blockquote => block.style.indent,
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
     resolved.style.line_height = line_height;
     match context {
         TextContext::Table => {
@@ -1754,6 +1770,7 @@ struct PreparedText {
     text: Arc<str>,
     source_text_start: usize,
     start_offset: f32,
+    available_width: f32,
     inline_images: Arc<[InlineImage]>,
 }
 
@@ -1928,9 +1945,20 @@ fn resolve_text_measure(
     content_width: f32,
     minimum_width: f32,
 ) -> (f32, f32, f32) {
-    let paragraph = block.kind == TextBlockKind::Paragraph;
-    let first_line_indent = if paragraph { block.style.indent } else { 0.0 };
-    let block_indent = if paragraph { 0.0 } else { block.style.indent };
+    let first_line_indented = matches!(
+        block.kind,
+        TextBlockKind::Paragraph | TextBlockKind::Blockquote
+    );
+    let first_line_indent = if first_line_indented {
+        block.style.indent
+    } else {
+        0.0
+    };
+    let block_indent = if first_line_indented {
+        0.0
+    } else {
+        block.style.indent
+    };
     let start_offset = (block_indent
         + block.style.margin_start
         + content_width * block.style.margin_start_fraction)
@@ -2173,12 +2201,7 @@ impl Paginator {
                 alpha: 0,
                 ..foreground
             },
-            accent: Rgba {
-                red: 0xD1,
-                green: 0xD7,
-                blue: 0xDE,
-                alpha: 255,
-            },
+            accent: QUOTE_ACCENT_COLOR,
             outer_gap,
             decoration_index: None,
             has_started: false,
@@ -2316,6 +2339,7 @@ impl Paginator {
                 lines: line_start..line_end,
                 origin_x: self.column_left() + prepared.start_offset,
                 origin_y: self.cursor_y - first_top,
+                available_width: prepared.available_width,
                 source: block.source.clone(),
                 inline_images: Arc::clone(&prepared.inline_images),
             }));
@@ -2436,6 +2460,7 @@ impl Paginator {
                         lines: 0..cell.text.layout.len(),
                         origin_x: cell_x + table.cell_padding + cell.text.start_offset,
                         origin_y: cell_y + top_padding - first.metrics().block_min_coord,
+                        available_width: cell.text.available_width,
                         source: cell.source.clone(),
                         inline_images: Arc::clone(&cell.text.inline_images),
                     }
@@ -2629,6 +2654,7 @@ impl Paginator {
                 lines: 0..prepared.layout.len(),
                 origin_x: request.rect.x + padding,
                 origin_y: request.rect.y + padding - first.metrics().block_min_coord,
+                available_width: prepared.available_width,
                 source: request.source,
                 inline_images: Arc::clone(&prepared.inline_images),
             },
@@ -3160,6 +3186,37 @@ mod tests {
             assert!(!run.style.bold);
             assert!(!run.style.italic);
         }
+    }
+
+    #[test]
+    fn unified_quotes_preserve_authored_alignment_and_first_line_indent() {
+        let block = TextBlock {
+            kind: TextBlockKind::Blockquote,
+            content: vec![Inline::Text(TextRun {
+                text: "Centered and indented quotation".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle {
+                align: TextAlignment::Center,
+                margin_start: 60.0,
+                indent: 32.0,
+                ..rebook_publication::BlockStyle::default()
+            },
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+        assert_eq!(resolved.style.align, TextAlignment::Center);
+        assert!((resolved.style.indent - 32.0).abs() < 0.001);
+        assert!(resolved.style.margin_start.abs() < 0.001);
+        let (start_offset, _, first_line_indent) = resolve_text_measure(&resolved, 320.0, 40.0);
+        assert!(start_offset.abs() < 0.001);
+        assert!((first_line_indent - 32.0).abs() < 0.001);
     }
 
     #[test]

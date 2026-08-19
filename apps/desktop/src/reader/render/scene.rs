@@ -1,9 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use kurbo::{Affine, Rect};
+use kurbo::{Affine, Rect, RoundedRect};
 use peniko::{Color, Fill, ImageData};
 use rebook_formats::BookFormat;
+use rebook_layout::QUOTE_ACCENT_COLOR;
 use rebook_reader::{ReaderPosition, ReaderSectionPage};
 use rebook_renderer::PageDisplayList;
 use vello::Scene;
@@ -19,6 +20,15 @@ const TEXT_SELECTION_COLOR: Color = Color::from_rgba8(68, 137, 103, 72);
 fn focus_block_border_color() -> Color {
     let accent = crate::ui::palette().accent;
     Color::from_rgba8(accent.r(), accent.g(), accent.b(), accent.a())
+}
+
+fn focus_block_activation_color() -> Color {
+    Color::from_rgba8(
+        QUOTE_ACCENT_COLOR.red,
+        QUOTE_ACCENT_COLOR.green,
+        QUOTE_ACCENT_COLOR.blue,
+        QUOTE_ACCENT_COLOR.alpha,
+    )
 }
 
 pub(in crate::reader) fn text_selection_fill() -> egui::Color32 {
@@ -127,6 +137,29 @@ impl DesktopReader {
         let content_padding = self.scroll_content_padding(viewport.size.y);
         let visible_bottom = viewport.offset_y + viewport.size.y;
         let mut scene = Scene::new();
+        if self.is_focus_mode()
+            && let Some(rect) = self
+                .focus_units
+                .get(self.focus_unit_index)
+                .and_then(|unit| unit.rectangular_activation_rect)
+        {
+            let background = RoundedRect::from_rect(
+                Rect::new(
+                    f64::from(rect.left()),
+                    f64::from(rect.top() + content_padding - viewport.offset_y),
+                    f64::from(rect.right()),
+                    f64::from(rect.bottom() + content_padding - viewport.offset_y),
+                ),
+                7.0,
+            );
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                focus_block_activation_color(),
+                None,
+                &background,
+            );
+        }
         let mut images = Vec::new();
         for (index, entry) in layout.pages.iter().enumerate() {
             let top = layout.page_tops[index] + content_padding;
@@ -291,6 +324,20 @@ impl DesktopReader {
         scene: &mut VelloScene<'_>,
         offset_x: f32,
     ) {
+        let focus_unit = self
+            .is_focus_mode()
+            .then(|| self.focus_units.get(self.focus_unit_index))
+            .flatten();
+        if let Some(unit) =
+            focus_unit.filter(|unit| unit.rectangular_activation && !self.is_scroll_mode())
+        {
+            page.paint_source_block_background(
+                scene,
+                &unit.paint_ranges,
+                focus_block_activation_color(),
+                offset_x,
+            );
+        }
         for highlight in &self.highlights {
             page.paint_source_ranges(scene, &highlight.ranges, ANNOTATION_MARK_COLOR, offset_x);
         }
@@ -300,9 +347,9 @@ impl DesktopReader {
         if let Some(selection) = &self.selection {
             page.paint_source_ranges(scene, &selection.ranges, TEXT_SELECTION_COLOR, offset_x);
         }
-        if self.is_focus_mode()
-            && let Some(unit) = self.focus_units.get(self.focus_unit_index)
+        if let Some(unit) = focus_unit
             && !unit.is_table
+            && !unit.rectangular_activation
         {
             page.paint_source_ranges(scene, &unit.paint_ranges, TEXT_SELECTION_COLOR, offset_x);
         }
