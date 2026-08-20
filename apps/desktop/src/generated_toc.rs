@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::persistence::{write_bytes_atomic, write_json_atomic};
 
 const GENERATED_TOC_VERSION: u8 = 1;
-const PAGE_MAPPING_REVISION: u8 = 1;
+const PAGE_MAPPING_REVISION: u8 = 2;
 const GENERATED_TOC_DIRECTORY: &str = "generated-toc";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,9 +131,12 @@ pub(crate) fn load(book_id: &str) -> io::Result<Option<GeneratedTocDraft>> {
 
 pub(crate) fn load_source(source: Arc<dyn BookSource>) -> io::Result<Arc<dyn BookSource>> {
     let book_id = source.book().id.to_string();
-    let Some(draft) = load(&book_id)? else {
+    let Some(mut draft) = load(&book_id)? else {
         return Ok(source);
     };
+    if crate::plugins::correct_generated_toc_pages_from_ocr(&book_id, &mut draft.entries)? {
+        save(&book_id, &draft)?;
+    }
     let entries = draft.entries;
     if entries.is_empty()
         || entries.iter().any(|entry| {
@@ -168,19 +171,50 @@ fn generated_toc_path(book_id: &str) -> io::Result<PathBuf> {
 
 fn normalize_entries(mut entries: Vec<GeneratedTocEntry>) -> Vec<GeneratedTocEntry> {
     entries.retain(|entry| !entry.title.trim().is_empty() && entry.physical_page > 0);
-    let mut previous_depth = 0;
-    for (index, entry) in entries.iter_mut().enumerate() {
+    for entry in &mut entries {
         entry.title = entry.title.trim().to_owned();
         entry.printed_page = entry.printed_page.trim().to_owned();
         entry.confidence = entry.confidence.clamp(0.0, 1.0);
+    }
+    entries.sort_by(|left, right| {
+        left.physical_page
+            .cmp(&right.physical_page)
+            .then_with(|| left.depth.cmp(&right.depth))
+            .then_with(|| {
+                toc_title_starts_with_number(&left.title)
+                    .cmp(&toc_title_starts_with_number(&right.title))
+            })
+    });
+    let mut previous_depth = 0;
+    let mut previous_page = 0;
+    let mut previous_title_was_numbered = false;
+    for (index, entry) in entries.iter_mut().enumerate() {
+        let title_is_numbered = toc_title_starts_with_number(&entry.title);
         entry.depth = if index == 0 {
             0
+        } else if entry.depth == 0
+            && previous_depth == 0
+            && entry.physical_page == previous_page
+            && !previous_title_was_numbered
+            && title_is_numbered
+        {
+            1
         } else {
             entry.depth.min(previous_depth + 1)
         };
         previous_depth = entry.depth;
+        previous_page = entry.physical_page;
+        previous_title_was_numbered = title_is_numbered;
     }
     entries
+}
+
+fn toc_title_starts_with_number(title: &str) -> bool {
+    title
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit() || ('０'..='９').contains(&character))
 }
 
 fn nested_toc(
@@ -300,5 +334,42 @@ mod tests {
         assert_eq!(entries[1].depth, 1);
         assert_eq!(entries[0].title, "Chapter");
         assert!((entries[0].confidence - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn generated_entries_are_sorted_by_page_with_parent_before_same_page_chapter() {
+        let entry = |depth, title: &str, printed_page: &str, physical_page| GeneratedTocEntry {
+            depth,
+            title: title.into(),
+            printed_page: printed_page.into(),
+            physical_page,
+            confidence: 0.9,
+        };
+        let entries = normalize_entries(vec![
+            entry(0, "1 书籍的过去、现在和未来", "6", 10),
+            entry(1, "2 一本书的诞生", "13", 17),
+            entry(1, "致谢", "253", 257),
+            entry(0, "书是什么？", "6", 10),
+            entry(0, "书籍设计师的画板", "30", 34),
+        ]);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.depth, entry.title.as_str(), entry.physical_page))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "书是什么？", 10),
+                (1, "1 书籍的过去、现在和未来", 10),
+                (1, "2 一本书的诞生", 17),
+                (0, "书籍设计师的画板", 34),
+                (1, "致谢", 257),
+            ]
+        );
+        assert!(
+            entries
+                .windows(2)
+                .all(|pair| pair[0].physical_page <= pair[1].physical_page)
+        );
     }
 }

@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use anyrender::{Glyph, NormalizedCoord, PaintScene};
-use kurbo::{Affine, BezPath, Line, Rect, RoundedRect, Shape, Stroke, Vec2};
+use kurbo::{Affine, BezPath, Circle, Line, Rect, RoundedRect, Shape, Stroke, Vec2};
 use parley::editing::{Cursor, Selection};
 use parley::layout::{Affinity, BreakReason, Cluster, ClusterSide};
 use parley::{FontData, Layout, PositionedLayoutItem};
@@ -63,6 +63,7 @@ pub struct PageDisplayList {
     text_regions: Vec<TextRegion>,
     table_regions: Vec<TableRegion>,
     quote_regions: Vec<QuoteRegion>,
+    footnote_regions: Vec<FootnoteRegion>,
 }
 
 struct TableRegion {
@@ -78,6 +79,11 @@ struct QuoteRegion {
     accent_x: f32,
     accent_width: f32,
     accent: Color,
+}
+
+struct FootnoteRegion {
+    bounds: Rect,
+    source: SourceRange,
 }
 
 const HIGHLIGHT_VERTICAL_OVERLAP: f64 = 0.5;
@@ -554,6 +560,40 @@ impl PageDisplayList {
             // https://github.com/linebender/vello/issues/49
             // https://github.com/linebender/vello/issues/417
             scene.fill(Fill::NonZero, transform, color, None, &path);
+        }
+    }
+
+    /// Paints compact focus-mode footnote icons for the active source ranges.
+    pub fn paint_footnote_icons(
+        &self,
+        scene: &mut impl PaintScene,
+        ranges: &[SourceRange],
+        color: Color,
+        offset_x: f32,
+    ) {
+        let transform = Affine::translate((f64::from(offset_x), 0.0));
+        for footnote in &self.footnote_regions {
+            if !ranges.iter().any(|range| range == &footnote.source) {
+                continue;
+            }
+            let bounds = footnote.bounds;
+            let circle = Circle::new(bounds.center(), bounds.width().min(bounds.height()) * 0.5);
+            scene.stroke(&Stroke::new(1.15), transform, color, None, &circle);
+            let center_x = bounds.center().x;
+            let dot = Rect::new(
+                center_x - 0.7,
+                bounds.y0 + 2.0,
+                center_x + 0.7,
+                bounds.y0 + 3.4,
+            );
+            scene.fill(Fill::NonZero, transform, color, None, &dot);
+            scene.stroke(
+                &Stroke::new(1.2),
+                transform,
+                color,
+                None,
+                &Line::new((center_x, bounds.y0 + 5.0), (center_x, bounds.y1 - 2.0)),
+            );
         }
     }
 
@@ -1402,13 +1442,14 @@ impl DisplayListCompiler {
         let mut text_regions = Vec::new();
         let mut table_regions = Vec::new();
         let mut quote_regions = Vec::new();
+        let mut footnote_regions = Vec::new();
         for item in &page.items {
             match item {
                 PageItem::Text(text) => {
                     if let Some(region) = text_region(text) {
                         text_regions.push(region);
                     }
-                    compile_text_commands(&mut commands, text);
+                    compile_text_commands(&mut commands, &mut footnote_regions, text);
                 }
                 PageItem::Quote(quote) => {
                     let bounds = quote_bounds(quote);
@@ -1450,7 +1491,12 @@ impl DisplayListCompiler {
                     if let Some(region) = table_region(table) {
                         table_regions.push(region);
                     }
-                    compile_table_commands(&mut commands, &mut text_regions, table);
+                    compile_table_commands(
+                        &mut commands,
+                        &mut text_regions,
+                        &mut footnote_regions,
+                        table,
+                    );
                 }
                 PageItem::Image(image) => {
                     let data = ImageData {
@@ -1494,7 +1540,11 @@ impl DisplayListCompiler {
                             if let Some(region) = text_region(&segment.text) {
                                 text_regions.push(region);
                             }
-                            compile_text_commands(&mut commands, &segment.text);
+                            compile_text_commands(
+                                &mut commands,
+                                &mut footnote_regions,
+                                &segment.text,
+                            );
                         }
                     } else if let Some(region) = fixed_text_region(image) {
                         text_regions.push(region);
@@ -1525,6 +1575,7 @@ impl DisplayListCompiler {
             text_regions,
             table_regions,
             quote_regions,
+            footnote_regions,
         }
     }
 }
@@ -1562,6 +1613,7 @@ fn table_region(table: &TablePlacement) -> Option<TableRegion> {
 fn compile_table_commands(
     commands: &mut Vec<DisplayCommand>,
     text_regions: &mut Vec<TextRegion>,
+    footnote_regions: &mut Vec<FootnoteRegion>,
     table: &TablePlacement,
 ) {
     for cell in &table.cells {
@@ -1582,7 +1634,7 @@ fn compile_table_commands(
             if let Some(region) = text_region(text) {
                 text_regions.push(region);
             }
-            compile_text_commands(commands, text);
+            compile_text_commands(commands, footnote_regions, text);
         }
     }
     for cell in &table.cells {
@@ -1753,7 +1805,11 @@ fn fixed_text_region(image: &ImagePlacement) -> Option<TextRegion> {
     })
 }
 
-fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacement) {
+fn compile_text_commands(
+    commands: &mut Vec<DisplayCommand>,
+    footnote_regions: &mut Vec<FootnoteRegion>,
+    text: &TextPlacement,
+) {
     let transform = Affine::translate((f64::from(text.origin_x), f64::from(text.origin_y)));
     for line in text
         .layout
@@ -1806,15 +1862,28 @@ fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacemen
             };
             let run = glyph_run.run();
             let brush = glyph_run.style().brush;
-            let baseline_offset = text_baseline_offset(brush.baseline, run.font_size());
-            let inline_optical_offset = match brush.baseline {
-                TextBaseline::Superscript => superscript_optical_offset(
-                    text.text.as_ref(),
-                    run.text_range().start,
-                    run.font_size(),
-                ),
-                TextBaseline::Normal | TextBaseline::Subscript => 0.0,
+            let baseline_offset = match brush.baseline {
+                TextBaseline::Normal => 0.0,
+                TextBaseline::Superscript => -run.font_size() * 0.35,
+                TextBaseline::Subscript => run.font_size() * 0.2,
             };
+            if brush.footnote_reference {
+                if let Some(source) = text.source.clone() {
+                    let size = (run.font_size() * 0.78).clamp(8.0, 12.0);
+                    let center_x = text.origin_x + glyph_run.offset() + glyph_run.advance() / 2.0;
+                    let baseline = text.origin_y + glyph_run.baseline() + baseline_offset;
+                    footnote_regions.push(FootnoteRegion {
+                        bounds: Rect::new(
+                            f64::from(center_x - size / 2.0),
+                            f64::from(baseline - size * 0.88),
+                            f64::from(center_x + size / 2.0),
+                            f64::from(baseline + size * 0.12),
+                        ),
+                        source,
+                    });
+                }
+                continue;
+            }
             let synthesis = run.synthesis();
             let glyph_transform = synthesis
                 .skew()
@@ -1823,7 +1892,7 @@ fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacemen
                 .positioned_glyphs()
                 .map(|glyph| Glyph {
                     id: glyph.id,
-                    x: glyph.x + inline_optical_offset,
+                    x: glyph.x,
                     y: glyph.y + baseline_offset,
                 })
                 .collect::<Vec<_>>()
@@ -1854,49 +1923,6 @@ fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacemen
             }
         }
     }
-}
-
-fn text_baseline_offset(baseline: TextBaseline, font_size: f32) -> f32 {
-    match baseline {
-        TextBaseline::Normal => 0.0,
-        // The publication layer already scales superscripts to 75%. Raising the
-        // reduced glyph by only 35% left it visually close to the normal baseline.
-        TextBaseline::Superscript => -font_size * 0.55,
-        TextBaseline::Subscript => font_size * 0.2,
-    }
-}
-
-fn superscript_optical_offset(text: &str, text_start: usize, font_size: f32) -> f32 {
-    let previous = text
-        .get(..text_start)
-        .and_then(|prefix| prefix.chars().next_back());
-    if previous.is_some_and(is_cjk_terminal_punctuation) {
-        // CJK punctuation occupies a full em even though its visible mark is much
-        // narrower. A following superscript often uses a fallback Latin font, so
-        // cross-font kerning cannot close that optical gap for us.
-        -font_size * 0.28
-    } else {
-        0.0
-    }
-}
-
-fn is_cjk_terminal_punctuation(character: char) -> bool {
-    matches!(
-        character,
-        '。' | '！'
-            | '？'
-            | '；'
-            | '：'
-            | '，'
-            | '、'
-            | '》'
-            | '〉'
-            | '」'
-            | '』'
-            | '】'
-            | '”'
-            | '’'
-    )
 }
 
 fn color(value: Rgba) -> Color {
@@ -2058,27 +2084,6 @@ mod tests {
     };
 
     #[test]
-    fn superscript_uses_a_readable_high_baseline() {
-        assert_eq!(text_baseline_offset(TextBaseline::Normal, 15.0), 0.0);
-        assert_eq!(text_baseline_offset(TextBaseline::Superscript, 15.0), -8.25);
-        assert_eq!(text_baseline_offset(TextBaseline::Subscript, 15.0), 3.0);
-    }
-
-    #[test]
-    fn superscript_only_tightens_after_cjk_terminal_punctuation() {
-        let chinese = "优势。19";
-        let marker_start = chinese.find('1').unwrap();
-        assert_eq!(
-            superscript_optical_offset(chinese, marker_start, 15.0),
-            -4.2
-        );
-
-        let english = "advantage.19";
-        let marker_start = english.find('1').unwrap();
-        assert_eq!(superscript_optical_offset(english, marker_start, 15.0), 0.0);
-    }
-
-    #[test]
     fn multiline_highlight_geometry_overlaps_adjacent_antialiased_edges() {
         let path = source_range_highlight_path([
             Rect::new(10.0, 10.0, 80.0, 25.0),
@@ -2112,6 +2117,75 @@ mod tests {
     }
 
     #[test]
+    fn footnote_reference_keeps_its_layout_slot_but_omits_the_original_glyph() {
+        let text: Arc<str> = "A1".into();
+        let mut font_context = FontContext::new();
+        let mut layout_context = LayoutContext::new();
+        let mut builder =
+            layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
+        builder.push_default(StyleProperty::FontSize(18.0));
+        builder.push_default(StyleProperty::Brush(TextBrush {
+            color: Rgba::BLACK,
+            underline: false,
+            baseline: TextBaseline::Normal,
+            footnote_reference: false,
+        }));
+        builder.push(
+            StyleProperty::Brush(TextBrush {
+                color: Rgba::BLACK,
+                underline: false,
+                baseline: TextBaseline::Superscript,
+                footnote_reference: true,
+            }),
+            1..2,
+        );
+        let mut layout = builder.build(text.as_ref());
+        layout.break_all_lines(Some(240.0));
+        layout.align(Alignment::Start, AlignmentOptions::default());
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: SpineItemId::new("chapter-1").unwrap(),
+                node: "paragraph-1".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: SpineItemId::new("chapter-1").unwrap(),
+                node: "paragraph-1".into(),
+                text_offset: 2,
+            },
+        };
+        let page = PageLayout {
+            viewport: LayoutViewport::new(320, 240).unwrap(),
+            background: Rgba::BLACK,
+            leading_gap: 0.0,
+            items: vec![PageItem::Text(TextPlacement {
+                layout: Arc::new(layout),
+                text,
+                source_text_start: 0,
+                lines: 0..1,
+                origin_x: 24.0,
+                origin_y: 24.0,
+                available_width: 240.0,
+                source: Some(source.clone()),
+                inline_images: Arc::from([]),
+            })],
+        };
+
+        let list = DisplayListCompiler.compile(&page);
+        assert_eq!(list.footnote_regions.len(), 1);
+        assert_eq!(list.footnote_regions[0].source, source);
+        let painted_glyphs = list
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                DisplayCommand::Glyphs(command) => Some(command.glyphs.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(painted_glyphs, 1);
+    }
+
+    #[test]
     #[allow(
         clippy::cast_possible_truncation,
         reason = "the test uses small, bounded logical page coordinates"
@@ -2127,6 +2201,7 @@ mod tests {
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
+            footnote_reference: false,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(240.0));
@@ -2218,6 +2293,7 @@ mod tests {
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
+            footnote_reference: false,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(240.0));
@@ -2272,6 +2348,7 @@ mod tests {
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
+            footnote_reference: false,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(150.0));
@@ -2356,6 +2433,7 @@ mod tests {
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
+            footnote_reference: false,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.set_text_indent(
@@ -2438,6 +2516,7 @@ mod tests {
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
+            footnote_reference: false,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(180.0));
@@ -2619,6 +2698,7 @@ mod tests {
             color: Rgba::BLACK,
             underline: false,
             baseline: TextBaseline::Normal,
+            footnote_reference: false,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(80.0));

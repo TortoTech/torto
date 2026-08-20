@@ -19,6 +19,10 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn set_sidebar_open(&mut self, open: bool) {
+        if open {
+            self.ui.focus_footnotes_visible = false;
+            self.ui.focus_footnote_scroll_delta = 0.0;
+        }
         self.ui.sidebar_open = open;
         if self
             .ui
@@ -46,6 +50,10 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn set_overlay(&mut self, overlay: ReaderOverlay) {
+        if overlay != ReaderOverlay::None {
+            self.ui.focus_footnotes_visible = false;
+            self.ui.focus_footnote_scroll_delta = 0.0;
+        }
         let was_menu_open = self.ui.overlay == ReaderOverlay::Menu;
         self.ui.overlay = overlay;
         let menu_changed = self

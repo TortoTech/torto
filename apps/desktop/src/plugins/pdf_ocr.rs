@@ -26,6 +26,7 @@ use tokio::sync::watch;
 use zip::ZipArchive;
 
 use super::{MINERU_API_URL, PADDLE_OCR_JOBS_URL, PdfOcrProviderKind, PluginSettings};
+use crate::generated_toc::GeneratedTocEntry;
 use crate::persistence::write_bytes_atomic;
 use crate::persistence::write_json_atomic;
 
@@ -1862,12 +1863,16 @@ fn build_continuous_reflow_sections(
         }
     }
     let mut toc_anchors = vec![Vec::new(); page_count];
+    let heading_keys = pages
+        .iter()
+        .map(|page| markdown_heading_keys(&page.markdown))
+        .collect::<Vec<_>>();
     let mut next_anchor = 0;
     remap_reflow_toc(
         &mut book.table_of_contents,
         &page_indices,
         &page_targets,
-        pages,
+        &heading_keys,
         &mut toc_anchors,
         &mut next_anchor,
     )?;
@@ -1898,7 +1903,7 @@ fn remap_reflow_toc(
     entries: &mut [TocEntry],
     page_indices: &HashMap<String, usize>,
     page_targets: &[PublicationUrl],
-    pages: &[StoredOcrPage],
+    heading_keys: &[Vec<String>],
     toc_anchors: &mut [Vec<OcrTocAnchor>],
     next_anchor: &mut usize,
 ) -> io::Result<()> {
@@ -1910,17 +1915,29 @@ fn remap_reflow_toc(
             .copied()
             && let Some(page_target) = page_targets.get(page_index)
         {
-            let target = if pages
-                .get(page_index)
-                .is_some_and(|page| markdown_has_matching_heading(&page.markdown, &entry.label))
-            {
+            let descendant_labels = toc_descendant_heading_keys(&entry.children);
+            let first_child_page = entry
+                .children
+                .first()
+                .and_then(|child| child.href.as_ref())
+                .and_then(|href| page_indices.get(href.path()))
+                .copied();
+            let heading_page = find_matching_heading_page(
+                heading_keys,
+                page_index,
+                &entry.label,
+                &descendant_labels,
+                &[],
+                first_child_page,
+            );
+            let target = if let Some(heading_page) = heading_page {
                 let fragment = format!("ocr-toc-{}", *next_anchor);
                 *next_anchor += 1;
-                toc_anchors[page_index].push(OcrTocAnchor {
+                toc_anchors[heading_page].push(OcrTocAnchor {
                     fragment: fragment.clone(),
                     label: entry.label.clone(),
                 });
-                page_target
+                page_targets[heading_page]
                     .resource_url()
                     .resolve(&format!("#{fragment}"))
                     .map_err(publication_io_error)?
@@ -1933,12 +1950,70 @@ fn remap_reflow_toc(
             &mut entry.children,
             page_indices,
             page_targets,
-            pages,
+            heading_keys,
             toc_anchors,
             next_anchor,
         )?;
     }
     Ok(())
+}
+
+fn toc_descendant_heading_keys(entries: &[TocEntry]) -> Vec<String> {
+    let mut labels = Vec::new();
+    for entry in entries {
+        let label = normalize_toc_heading(&entry.label);
+        if !label.is_empty() {
+            labels.push(label);
+        }
+        labels.extend(toc_descendant_heading_keys(&entry.children));
+    }
+    labels
+}
+
+fn find_matching_heading_page(
+    heading_keys: &[Vec<String>],
+    preferred_page: usize,
+    label: &str,
+    descendant_labels: &[String],
+    excluded_pages: &[bool],
+    maximum_page: Option<usize>,
+) -> Option<usize> {
+    const SEARCH_RADIUS: usize = 12;
+
+    if heading_keys.is_empty() || preferred_page >= heading_keys.len() {
+        return None;
+    }
+    let label = normalize_toc_heading(label);
+    if label.is_empty() {
+        return None;
+    }
+    let start = preferred_page.saturating_sub(SEARCH_RADIUS);
+    let end = preferred_page
+        .saturating_add(SEARCH_RADIUS)
+        .min(heading_keys.len() - 1);
+    (start..=end)
+        .filter(|page| !excluded_pages.get(*page).copied().unwrap_or(false))
+        .filter(|page| maximum_page.is_none_or(|maximum| *page <= maximum))
+        .filter(|page| {
+            heading_keys[*page]
+                .iter()
+                .any(|heading| normalized_toc_headings_match(heading, &label))
+        })
+        .min_by_key(|page| {
+            let descendant_matches = descendant_labels
+                .iter()
+                .filter(|descendant| {
+                    heading_keys[*page]
+                        .iter()
+                        .any(|heading| normalized_toc_headings_match(heading, descendant))
+                })
+                .count();
+            (
+                descendant_matches,
+                page.abs_diff(preferred_page),
+                usize::from(*page < preferred_page),
+            )
+        })
 }
 
 fn publication_io_error(error: PublicationError) -> io::Error {
@@ -2131,7 +2206,7 @@ fn markdown_to_html_with_toc_anchors(markdown: &str, anchors: &[OcrTocAnchor]) -
     output
 }
 
-fn markdown_has_matching_heading(markdown: &str, label: &str) -> bool {
+fn markdown_heading_keys(markdown: &str) -> Vec<String> {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -2139,6 +2214,7 @@ fn markdown_has_matching_heading(markdown: &str, label: &str) -> bool {
         | Options::ENABLE_MATH;
     let normalized = normalize_ocr_math_delimiters(markdown);
     let events = Parser::new_ext(&normalized, options).collect::<Vec<_>>();
+    let mut headings = Vec::new();
     let mut cursor = 0;
     while cursor < events.len() {
         if matches!(events[cursor], Event::Start(Tag::Heading { .. })) {
@@ -2153,29 +2229,172 @@ fn markdown_has_matching_heading(markdown: &str, label: &str) -> bool {
                 }
                 cursor += 1;
             }
-            if toc_heading_matches(&heading, label) {
-                return true;
+            let heading = normalize_toc_heading(&heading);
+            if !heading.is_empty() {
+                headings.push(heading);
             }
         }
         cursor += 1;
     }
-    false
+    headings
 }
 
 fn toc_heading_matches(heading: &str, label: &str) -> bool {
     let heading = normalize_toc_heading(heading);
     let label = normalize_toc_heading(label);
+    normalized_toc_headings_match(&heading, &label)
+}
+
+fn normalized_toc_headings_match(heading: &str, label: &str) -> bool {
     heading == label
-        || (heading.len().min(label.len()) >= 4
+        || (heading.chars().count().min(label.chars().count()) >= 4
             && (heading.contains(&label) || label.contains(&heading)))
 }
 
 fn normalize_toc_heading(value: &str) -> String {
-    value
+    let normalized = value
         .chars()
         .flat_map(char::to_lowercase)
         .filter(|character| character.is_alphanumeric())
-        .collect()
+        .collect::<String>();
+    let prefix_bytes = normalized
+        .char_indices()
+        .take_while(|(_, character)| {
+            character.is_ascii_digit() || ('０'..='９').contains(character)
+        })
+        .map(|(index, character)| index + character.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let without_numeric_prefix = &normalized[prefix_bytes..];
+    if prefix_bytes > 0 && !without_numeric_prefix.is_empty() {
+        without_numeric_prefix.to_owned()
+    } else {
+        normalized
+    }
+}
+
+pub(crate) fn correct_generated_toc_pages_from_ocr(
+    book_id: &str,
+    entries: &mut [GeneratedTocEntry],
+) -> io::Result<bool> {
+    let Some(document) = load_document(book_id)? else {
+        return Ok(false);
+    };
+    Ok(correct_generated_toc_entries_from_pages(
+        entries,
+        &document.pages,
+    ))
+}
+
+fn correct_generated_toc_entries_from_pages(
+    entries: &mut [GeneratedTocEntry],
+    pages: &[StoredOcrPage],
+) -> bool {
+    if pages.is_empty() {
+        return false;
+    }
+    let headings = pages
+        .iter()
+        .map(|page| markdown_heading_keys(&page.markdown))
+        .collect::<Vec<_>>();
+    let toc_labels = entries
+        .iter()
+        .map(|entry| normalize_toc_heading(&entry.title))
+        .filter(|label| !label.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let toc_like_pages = headings
+        .iter()
+        .map(|page_headings| {
+            toc_labels
+                .iter()
+                .filter(|label| {
+                    page_headings
+                        .iter()
+                        .any(|heading| normalized_toc_headings_match(heading, label))
+                })
+                .count()
+                >= 3
+        })
+        .collect::<Vec<_>>();
+
+    let descendant_labels = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            entries[index + 1..]
+                .iter()
+                .take_while(|candidate| candidate.depth > entry.depth)
+                .map(|candidate| normalize_toc_heading(&candidate.title))
+                .filter(|label| !label.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let direct_matches = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let first_child_page = entries
+                .get(index + 1)
+                .filter(|candidate| candidate.depth > entry.depth)
+                .and_then(|candidate| candidate.physical_page.checked_sub(1));
+            entry.physical_page.checked_sub(1).and_then(|current_page| {
+                find_matching_heading_page(
+                    &headings,
+                    current_page,
+                    &entry.title,
+                    &descendant_labels[index],
+                    &toc_like_pages,
+                    first_child_page,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut matched = 0;
+    let mut delta_counts = HashMap::<isize, usize>::new();
+    for (entry, candidate) in entries.iter().zip(&direct_matches) {
+        let Some(current_page) = entry.physical_page.checked_sub(1) else {
+            continue;
+        };
+        let Some(candidate) = *candidate else {
+            continue;
+        };
+        let (Ok(candidate), Ok(current_page)) =
+            (isize::try_from(candidate), isize::try_from(current_page))
+        else {
+            continue;
+        };
+        matched += 1;
+        *delta_counts.entry(candidate - current_page).or_default() += 1;
+    }
+    let common_delta = delta_counts
+        .into_iter()
+        .max_by_key(|(delta, support)| (*support, std::cmp::Reverse(delta.abs())))
+        .filter(|(_, support)| *support >= 2 && *support * 2 >= matched)
+        .map(|(delta, _)| delta);
+
+    let mut changed = false;
+    let mut previous_page = 1;
+    for (entry, direct_match) in entries.iter_mut().zip(direct_matches) {
+        let fallback_page = common_delta.and_then(|delta| {
+            isize::try_from(entry.physical_page)
+                .ok()
+                .and_then(|page| page.checked_add(delta))
+                .and_then(|page| usize::try_from(page).ok())
+                .filter(|page| (1..=pages.len()).contains(page))
+        });
+        let corrected_page = direct_match
+            .and_then(|page| page.checked_add(1))
+            .or(fallback_page)
+            .unwrap_or(entry.physical_page)
+            .clamp(previous_page, pages.len());
+        changed |= corrected_page != entry.physical_page;
+        entry.physical_page = corrected_page;
+        previous_page = corrected_page;
+    }
+    changed
 }
 
 fn normalize_ocr_math_delimiters(markdown: &str) -> String {
@@ -2585,6 +2804,129 @@ mod tests {
         assert_eq!(document.pages[0].markdown, "legacy OCR text");
     }
 
+    #[test]
+    fn generated_toc_uses_repeated_ocr_heading_offset_instead_of_toc_mentions() {
+        let mut pages = vec![StoredOcrPage::default(); 40];
+        pages[6].markdown =
+            "## 1 书籍的过去、现在和未来\n\n## 2 一本书的诞生\n\n## 3 设计方法".into();
+        pages[9].markdown = "## 书籍的过去、现在和未来".into();
+        pages[16].markdown = "## 一本书的诞生".into();
+        pages[26].markdown = "## 设计方法".into();
+        let entry = |title: &str, printed_page: usize| GeneratedTocEntry {
+            depth: 0,
+            title: title.into(),
+            printed_page: printed_page.to_string(),
+            physical_page: printed_page,
+            confidence: 0.9,
+        };
+        let mut entries = vec![
+            entry("1 书籍的过去、现在和未来", 6),
+            entry("2 一本书的诞生", 13),
+            entry("3 设计方法", 23),
+        ];
+
+        assert!(correct_generated_toc_entries_from_pages(
+            &mut entries,
+            &pages
+        ));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.physical_page)
+                .collect::<Vec<_>>(),
+            vec![10, 17, 27]
+        );
+    }
+
+    #[test]
+    fn generated_toc_prefers_a_parent_heading_before_its_child_heading_page() {
+        let mut pages = vec![StoredOcrPage::default(); 48];
+        pages[32].markdown = "## Ⅱ The book designer's palette 书籍设计师的画板".into();
+        pages[33].markdown = "## 书籍设计师的画板\n\n## 版式\n\n正文".into();
+        let entry = |depth, title: &str| GeneratedTocEntry {
+            depth,
+            title: title.into(),
+            printed_page: "30".into(),
+            physical_page: 34,
+            confidence: 0.9,
+        };
+        let mut entries = vec![entry(0, "书籍设计师的画板"), entry(1, "4 版式")];
+
+        assert!(correct_generated_toc_entries_from_pages(
+            &mut entries,
+            &pages
+        ));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.physical_page)
+                .collect::<Vec<_>>(),
+            vec![33, 34]
+        );
+    }
+
+    #[test]
+    fn generated_toc_does_not_move_a_parent_after_its_first_child() {
+        let mut pages = vec![StoredOcrPage::default(); 260];
+        pages[243].markdown = "## 文稿格式".into();
+        pages[252].markdown = "## 延伸阅读".into();
+        pages[253].markdown = "## 附录".into();
+        let entry = |depth, title: &str, physical_page: usize| GeneratedTocEntry {
+            depth,
+            title: title.into(),
+            printed_page: physical_page.to_string(),
+            physical_page,
+            confidence: 0.9,
+        };
+        let mut entries = vec![
+            entry(0, "附录", 244),
+            entry(1, "文稿格式", 244),
+            entry(1, "延伸阅读", 253),
+        ];
+
+        assert!(!correct_generated_toc_entries_from_pages(
+            &mut entries,
+            &pages
+        ));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.physical_page)
+                .collect::<Vec<_>>(),
+            vec![244, 244, 253]
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnoses the latest local PDF OCR/generated TOC cache"]
+    fn diagnose_latest_cached_generated_toc_correction() {
+        let project = ProjectDirs::from("com", "Rebook", "Rebook").unwrap();
+        let root = project.data_local_dir().join(PDF_OCR_DIRECTORY);
+        let latest = std::env::var("TORTO_DIAG_BOOK_ID").ok().unwrap_or_else(|| {
+            fs::read_dir(root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let path = entry.path().join(DOCUMENT_FILE);
+                    let modified = fs::metadata(&path).ok()?.modified().ok()?;
+                    Some((modified, entry.file_name().to_string_lossy().into_owned()))
+                })
+                .max_by_key(|(modified, _)| *modified)
+                .unwrap()
+                .1
+        });
+        let mut draft = crate::generated_toc::load(&latest).unwrap().unwrap();
+        let changed = correct_generated_toc_pages_from_ocr(&latest, &mut draft.entries).unwrap();
+        println!(
+            "book={latest} changed={changed} pages={:?}",
+            draft
+                .entries
+                .iter()
+                .map(|entry| entry.physical_page)
+                .collect::<Vec<_>>()
+        );
+    }
+
     struct StubBookSource {
         book: Book,
     }
@@ -2933,6 +3275,77 @@ mod tests {
                 .as_ref()
                 .map(PublicationUrl::path),
             Some("Text/ocr-reflow-2.xhtml")
+        );
+    }
+
+    #[test]
+    fn content_reflow_targets_parent_and_child_headings_instead_of_empty_section_starts() {
+        let id = rebook_publication::PublicationId::new("continuous-ocr-anchor-test").unwrap();
+        let page = |number: usize| SpineItem {
+            id: SpineItemId::new(format!("page-{number}")).unwrap(),
+            href: PublicationUrl::parse(&format!("Text/section-{number}.xhtml")).unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let source: Arc<dyn BookSource> = Arc::new(StubBookSource {
+            book: Book {
+                id,
+                metadata: rebook_publication::Metadata {
+                    layout: RenditionLayout::PrePaginated,
+                    ..rebook_publication::Metadata::default()
+                },
+                cover: None,
+                sections: vec![page(1), page(2), page(3)],
+                table_of_contents: vec![TocEntry {
+                    label: "Part".into(),
+                    href: Some(PublicationUrl::parse("Text/section-2.xhtml").unwrap()),
+                    children: vec![TocEntry {
+                        label: "1 Chapter".into(),
+                        href: Some(PublicationUrl::parse("Text/section-2.xhtml").unwrap()),
+                        children: Vec::new(),
+                    }],
+                }],
+            },
+        });
+        let reflow = OcrReflowBookSource::new(
+            source,
+            StoredPdfOcrDocument {
+                version: PDF_OCR_VERSION,
+                book_id: "continuous-ocr-anchor-test".into(),
+                provider: PdfOcrProviderKind::PaddleOcr,
+                model: "test".into(),
+                view_mode: PdfOcrViewMode::Reflow,
+                pages: ["## Part", "## Part\n\n## Chapter\n\n正文", "后续正文"]
+                    .into_iter()
+                    .map(|markdown| StoredOcrPage {
+                        markdown: markdown.into(),
+                    })
+                    .collect(),
+                resources: Vec::new(),
+                page_roles: Vec::new(),
+            },
+            true,
+        )
+        .unwrap();
+
+        let parent = &reflow.book().table_of_contents[0];
+        let child = &parent.children[0];
+        assert_eq!(
+            parent.href.as_ref().map(PublicationUrl::path),
+            Some("Text/ocr-reflow-1.xhtml")
+        );
+        assert_eq!(
+            parent.href.as_ref().and_then(PublicationUrl::fragment),
+            Some("ocr-toc-0")
+        );
+        assert_eq!(
+            child.href.as_ref().map(PublicationUrl::path),
+            Some("Text/ocr-reflow-2.xhtml")
+        );
+        assert_eq!(
+            child.href.as_ref().and_then(PublicationUrl::fragment),
+            Some("ocr-toc-1")
         );
     }
 

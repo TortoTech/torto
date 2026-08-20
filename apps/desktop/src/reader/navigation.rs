@@ -13,6 +13,8 @@ pub(super) const fn snapshot_reanchors_focus(effects: SnapshotEffects) -> bool {
 
 impl DesktopReader {
     pub(in crate::reader) fn go_to_toc(&mut self, id: &str, target: &PublicationUrl) {
+        self.ui.focus_footnotes_visible = false;
+        self.ui.focus_footnote_scroll_delta = 0.0;
         let result = self.reader.go_to_href(target);
         match result {
             Ok(result) => {
@@ -44,6 +46,8 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn go_to_adjacent_section(&mut self, direction: PageDirection) {
+        self.ui.focus_footnotes_visible = false;
+        self.ui.focus_footnote_scroll_delta = 0.0;
         self.focus_toc_override = None;
         match self.reader.go_to_adjacent_reading_unit(direction) {
             Ok(result) if result.outcome == rebook_reader::NavigationOutcome::Moved => {

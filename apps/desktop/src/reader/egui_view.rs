@@ -20,9 +20,9 @@ use crate::plugins::{
 use crate::preferences::{AppLanguage, AppTheme};
 use crate::settings::ReaderSettingsChange;
 use crate::ui::{
-    Icon, ToastKind, decode_color_image, dialog_action_button, icon, icon_button,
-    navigation_button, navigation_text_button, paint_icon, palette, selectable_icon_button,
-    show_toast, small_icon_button,
+    Icon, ToastKind, decode_color_image, dialog_action_button, footnote_link_color, icon,
+    icon_button, navigation_button, navigation_text_button, paint_icon, palette,
+    selectable_icon_button, show_toast, small_icon_button,
 };
 
 pub(super) const SIDEBAR_WIDTH: f32 = 256.0;
@@ -356,6 +356,7 @@ impl DesktopReader {
         if self.is_focus_mode() {
             self.focus_actions_overlay(&ctx, page_rect);
             self.focus_assistant_overlay(&ctx, page_rect);
+            self.focus_footnote_overlay(&ctx, page_rect);
         }
         self.resize_side_panels(
             &ctx,
@@ -679,6 +680,13 @@ impl DesktopReader {
 
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
         if self.is_focus_mode()
+            && self.ui.focus_footnotes_visible
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.close_focus_footnotes();
+            return;
+        }
+        if self.is_focus_mode()
             && !interaction_blocked
             && self.ui.focus_actions_visible
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
@@ -695,6 +703,25 @@ impl DesktopReader {
         {
             self.set_sidebar_open(false);
             ctx.memory_mut(egui::Memory::stop_text_input);
+            return;
+        }
+        if self.focus_footnote_shortcut(ctx, interaction_blocked) {
+            return;
+        }
+        if self.ui.focus_footnotes_visible {
+            let scroll_delta = ctx.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    -ASSISTANT_KEYBOARD_SCROLL_STEP
+                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    ASSISTANT_KEYBOARD_SCROLL_STEP
+                } else {
+                    0.0
+                }
+            });
+            if scroll_delta != 0.0 {
+                self.ui.focus_footnote_scroll_delta += scroll_delta;
+                ctx.request_repaint();
+            }
             return;
         }
         if self.is_focus_mode()
@@ -783,6 +810,43 @@ impl DesktopReader {
             return;
         }
         self.reading_navigation_shortcuts(ctx);
+    }
+
+    fn focus_footnote_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
+        if !self.is_focus_mode()
+            || !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::AltLeft))
+        {
+            return false;
+        }
+        if self.ui.focus_footnotes_visible {
+            self.close_focus_footnotes();
+            return true;
+        }
+        let can_open = !interaction_blocked
+            && !self.ui.overlay_visible()
+            && !self.ui.sidebar_open
+            && self.image_preview.is_none()
+            && self.ui.assistant_panel.is_none()
+            && self.annotation_note_draft.is_none()
+            && !ctx.text_edit_focused()
+            && self
+                .focus_units
+                .get(self.focus_unit_index)
+                .is_some_and(|unit| !unit.footnotes.is_empty());
+        if can_open {
+            self.ui.focus_footnotes_visible = true;
+            self.ui.focus_footnote_scroll_delta = 0.0;
+            self.ui.focus_actions_visible = false;
+            self.cancel_text_selection();
+            ctx.memory_mut(egui::Memory::stop_text_input);
+            ctx.request_repaint();
+        }
+        true
+    }
+
+    fn close_focus_footnotes(&mut self) {
+        self.ui.focus_footnotes_visible = false;
+        self.ui.focus_footnote_scroll_delta = 0.0;
     }
 
     fn operation_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
@@ -988,10 +1052,13 @@ impl DesktopReader {
             && self.image_preview.is_none()
             && self.ui.assistant_panel.is_none()
             && self.annotation_note_draft.is_none()
+            && !self.ui.focus_footnotes_visible
     }
 
     fn focus_wheel_interaction(&mut self, response: &egui::Response) {
-        if self.ui.sidebar_open || self.ui.assistant_panel.is_some() && self.current_chat_has_data()
+        if self.ui.focus_footnotes_visible
+            || self.ui.sidebar_open
+            || self.ui.assistant_panel.is_some() && self.current_chat_has_data()
         {
             self.ui.wheel_accumulator = 0.0;
             return;
@@ -1541,6 +1608,104 @@ impl DesktopReader {
         }
     }
 
+    fn focus_footnote_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
+        if !self.ui.focus_footnotes_visible {
+            return;
+        }
+        let footnotes = self
+            .focus_units
+            .get(self.focus_unit_index)
+            .map(|unit| unit.footnotes.clone())
+            .unwrap_or_default();
+        if footnotes.is_empty() {
+            self.close_focus_footnotes();
+            return;
+        }
+
+        let viewport = ctx.content_rect();
+        let style = self.reader.style();
+        let content_right = page_rect.left()
+            + reading_content_left(page_rect.width(), &style)
+            + reading_content_width(page_rect.width(), &style);
+        let preferred_x = content_right + 12.0;
+        let maximum_width = 360.0_f32.min((viewport.width() - 32.0).max(1.0));
+        let minimum_width = 180.0_f32.min(maximum_width);
+        let available_right = viewport.right() - preferred_x - 16.0;
+        let width = available_right.clamp(minimum_width, maximum_width);
+        let x = if available_right >= minimum_width {
+            preferred_x
+        } else {
+            (viewport.right() - width - 16.0).max(viewport.left() + 16.0)
+        };
+        let characters_per_line = ((width - 48.0) / 7.5).max(12.0);
+        let estimated_lines = footnotes
+            .iter()
+            .map(|footnote| {
+                (footnote.text.chars().count() as f32 / characters_per_line)
+                    .ceil()
+                    .max(1.0)
+            })
+            .sum::<f32>();
+        let maximum_body_height = (viewport.height() * 0.52).clamp(160.0, 380.0);
+        let estimated_body_height = (estimated_lines * 21.0
+            + footnotes.len().saturating_sub(1) as f32 * 10.0)
+            .clamp(19.0, maximum_body_height);
+        let panel_height = estimated_body_height + 24.0;
+        let anchor_y = self
+            .focused_unit_screen_center_y(page_rect)
+            .unwrap_or_else(|| page_rect.center().y);
+        let y = (anchor_y - panel_height / 2.0).clamp(
+            viewport.top() + 16.0,
+            (viewport.bottom() - panel_height - 16.0).max(viewport.top() + 16.0),
+        );
+        let keyboard_scroll = std::mem::take(&mut self.ui.focus_footnote_scroll_delta);
+
+        egui::Area::new("focus-footnotes".into())
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::new(x, y))
+            .show(ctx, |ui| {
+                focus_assistant_frame(egui::Margin::same(12)).show(ui, |ui| {
+                    ui.set_width((width - 24.0).max(1.0));
+                    let wheel_scroll = ui.input_mut(|input| {
+                        let delta = input.smooth_scroll_delta.y;
+                        input.smooth_scroll_delta.y = 0.0;
+                        delta
+                    });
+                    let routed_scroll = wheel_scroll - keyboard_scroll;
+                    ui.horizontal_top(|ui| {
+                        ui.add(icon(Icon::Info).size(19.0).color(footnote_link_color()));
+                        let content_width = ui.available_width().max(1.0);
+                        ui.vertical(|ui| {
+                            ui.set_width(content_width);
+                            egui::ScrollArea::vertical()
+                                .id_salt("focus-footnotes-scroll")
+                                .max_height(maximum_body_height)
+                                .min_scrolled_height(0.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    if routed_scroll.abs() > f32::EPSILON {
+                                        ui.scroll_with_delta(Vec2::new(0.0, routed_scroll));
+                                    }
+                                    ui.set_width((ui.available_width() - 8.0).max(1.0));
+                                    ui.spacing_mut().item_spacing.y = 9.0;
+                                    for (index, footnote) in footnotes.iter().enumerate() {
+                                        if index > 0 {
+                                            ui.separator();
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&footnote.text).color(palette().text),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                });
+                        });
+                    });
+                });
+            });
+    }
+
     fn focus_data_indicator_overlays(
         &mut self,
         ctx: &egui::Context,
@@ -1552,7 +1717,9 @@ impl DesktopReader {
         let mut clicked_note = None;
         for index in 0..self.focus_units.len() {
             let current_replacement_visible = index == self.focus_unit_index
-                && (self.ui.focus_actions_visible || self.ui.assistant_panel.is_some());
+                && (self.ui.focus_actions_visible
+                    || self.ui.focus_footnotes_visible
+                    || self.ui.assistant_panel.is_some());
             if current_replacement_visible {
                 continue;
             }
@@ -3148,6 +3315,7 @@ impl DesktopReader {
             egui::TextureOptions::LINEAR,
         );
         self.cancel_text_selection();
+        self.close_focus_footnotes();
         self.selected_image = None;
         self.image_pointer_state = ImagePointerState::Idle;
         self.image_preview = Some(super::ImagePreview {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use kurbo::{Affine, Rect, RoundedRect};
 use peniko::{Color, Fill, ImageData};
 use rebook_formats::BookFormat;
-use rebook_layout::QUOTE_ACCENT_COLOR;
+use rebook_layout::quote_accent_color;
 use rebook_reader::{ReaderPosition, ReaderSectionPage};
 use rebook_renderer::PageDisplayList;
 use vello::Scene;
@@ -23,12 +23,13 @@ fn focus_block_border_color() -> Color {
 }
 
 fn focus_block_activation_color() -> Color {
-    Color::from_rgba8(
-        QUOTE_ACCENT_COLOR.red,
-        QUOTE_ACCENT_COLOR.green,
-        QUOTE_ACCENT_COLOR.blue,
-        QUOTE_ACCENT_COLOR.alpha,
-    )
+    let accent = quote_accent_color(crate::ui::palette().dark);
+    Color::from_rgba8(accent.red, accent.green, accent.blue, accent.alpha)
+}
+
+fn focus_footnote_icon_color() -> Color {
+    let color = crate::ui::footnote_link_color();
+    Color::from_rgba8(color.r(), color.g(), color.b(), color.a())
 }
 
 pub(in crate::reader) fn text_selection_fill() -> egui::Color32 {
@@ -335,6 +336,14 @@ impl DesktopReader {
                 scene,
                 &unit.paint_ranges,
                 focus_block_activation_color(),
+                offset_x,
+            );
+        }
+        if let Some(unit) = focus_unit {
+            page.paint_footnote_icons(
+                scene,
+                &unit.paint_ranges,
+                focus_footnote_icon_color(),
                 offset_x,
             );
         }

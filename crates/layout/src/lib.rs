@@ -22,13 +22,40 @@ use thiserror::Error;
 
 const QUOTE_VERTICAL_PADDING: f32 = 12.0;
 
-/// Shared accent used by semantic quote decorations and block activation fills.
-pub const QUOTE_ACCENT_COLOR: Rgba = Rgba {
-    red: 0xD1,
-    green: 0xD7,
-    blue: 0xDE,
+/// Shared light-theme accent used by semantic quote decorations and block activation fills.
+pub const LIGHT_QUOTE_ACCENT_COLOR: Rgba = Rgba {
+    red: 0xDC,
+    green: 0xE2,
+    blue: 0xE8,
     alpha: 255,
 };
+
+/// Dark-theme quote accent keeps light reader text legible on an active quote block.
+pub const DARK_QUOTE_ACCENT_COLOR: Rgba = Rgba {
+    red: 0x43,
+    green: 0x48,
+    blue: 0x4E,
+    alpha: 255,
+};
+
+/// Returns the quote accent that matches the active reader theme.
+#[must_use]
+pub const fn quote_accent_color(dark: bool) -> Rgba {
+    if dark {
+        DARK_QUOTE_ACCENT_COLOR
+    } else {
+        LIGHT_QUOTE_ACCENT_COLOR
+    }
+}
+
+fn quote_accent_for_foreground(foreground: Rgba) -> Rgba {
+    // Reader foregrounds are dark on light pages and light on dark pages.
+    // Integer Rec. 709 weights avoid float comparisons in this hot layout path.
+    let luminance = u32::from(foreground.red) * 54
+        + u32::from(foreground.green) * 183
+        + u32::from(foreground.blue) * 19;
+    quote_accent_color(luminance > 128 * 256)
+}
 
 const DEFAULT_COLUMN_GAP: f32 = 36.0;
 const IMAGE_BLOCK_GAP: f32 = 14.0;
@@ -69,6 +96,8 @@ pub struct ReaderStyle {
     /// preserves the publication-authored margins exactly.
     pub minimum_paragraph_gap: f32,
     pub spread: SpreadMode,
+    /// Replaces linked superscript markers with focus-mode footnote icon slots.
+    pub focus_footnote_icons: bool,
     pub foreground: Rgba,
     pub background: Rgba,
 }
@@ -307,6 +336,7 @@ impl Default for ReaderStyle {
             column_gap: DEFAULT_COLUMN_GAP,
             minimum_paragraph_gap: 0.0,
             spread: SpreadMode::Double,
+            focus_footnote_icons: false,
             foreground: Rgba::BLACK,
             background: Rgba {
                 red: 250,
@@ -392,14 +422,16 @@ pub struct TextBrush {
     pub color: Rgba,
     pub underline: bool,
     pub baseline: TextBaseline,
+    pub footnote_reference: bool,
 }
 
 impl TextBrush {
-    fn new(color: Rgba, underline: bool, baseline: TextBaseline) -> Self {
+    fn new(color: Rgba, underline: bool, baseline: TextBaseline, footnote_reference: bool) -> Self {
         Self {
             color,
             underline,
             baseline,
+            footnote_reference,
         }
     }
 }
@@ -1219,6 +1251,7 @@ impl LayoutEngine {
             typography,
             available_width,
             &self.svg_options,
+            reader_style.focus_footnote_icons,
         );
         let font_stack = if block.kind == TextBlockKind::Preformatted {
             typography.monospace_stack()
@@ -1238,7 +1271,8 @@ impl LayoutEngine {
         builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(
             block.style.line_height,
         )));
-        let default_brush = TextBrush::new(reader_style.foreground, false, TextBaseline::Normal);
+        let default_brush =
+            TextBrush::new(reader_style.foreground, false, TextBaseline::Normal, false);
         builder.push_default(StyleProperty::Brush(default_brush));
 
         for span in spans {
@@ -1250,6 +1284,7 @@ impl LayoutEngine {
                     span.style.color,
                     span.style.underline,
                     span.style.baseline,
+                    span.footnote_reference,
                 )),
                 span.range.clone(),
             );
@@ -1763,6 +1798,7 @@ pub fn reading_content_width(page_width: f32, reader_style: &ReaderStyle) -> f32
 struct StyledRange {
     range: Range<usize>,
     style: TextStyle,
+    footnote_reference: bool,
 }
 
 struct PreparedText {
@@ -1973,6 +2009,7 @@ fn prepare_inline_content(
     typography: &ReaderTypography,
     available_width: f32,
     svg_options: &resvg::usvg::Options<'_>,
+    focus_footnote_icons: bool,
 ) -> (String, Vec<StyledRange>, Vec<PreparedInlineImage>, usize) {
     let mut text = String::new();
     let mut spans = Vec::new();
@@ -1987,6 +2024,7 @@ fn prepare_inline_content(
                 color: fallback_color,
                 ..TextStyle::default()
             },
+            footnote_reference: false,
         });
     }
     let source_text_start = text.len();
@@ -2003,6 +2041,12 @@ fn prepare_inline_content(
                 spans.push(StyledRange {
                     range: start..text.len(),
                     style,
+                    footnote_reference: focus_footnote_icons
+                        && run
+                            .link
+                            .as_ref()
+                            .is_some_and(|target| target.fragment().is_some())
+                        && run.style.baseline == TextBaseline::Superscript,
                 });
             }
             Inline::Math(run) => {
@@ -2033,6 +2077,7 @@ fn prepare_inline_content(
                             color: fallback_color,
                             ..TextStyle::default()
                         },
+                        footnote_reference: false,
                     });
                 }
             }
@@ -2201,7 +2246,7 @@ impl Paginator {
                 alpha: 0,
                 ..foreground
             },
-            accent: QUOTE_ACCENT_COLOR,
+            accent: quote_accent_for_foreground(foreground),
             outer_gap,
             decoration_index: None,
             has_started: false,
@@ -2864,6 +2909,82 @@ pub enum LayoutError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_footnote_icons_only_mark_linked_superscripts() {
+        let linked_superscript = TextRun {
+            text: "1".into(),
+            style: TextStyle {
+                baseline: TextBaseline::Superscript,
+                ..TextStyle::default()
+            },
+            link: Some(rebook_publication::PublicationUrl::parse("notes.xhtml#note-1").unwrap()),
+        };
+        let unlinked_superscript = TextRun {
+            text: "2".into(),
+            style: linked_superscript.style,
+            link: None,
+        };
+        let linked_baseline_text = TextRun {
+            text: "3".into(),
+            style: TextStyle::default(),
+            link: linked_superscript.link.clone(),
+        };
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(linked_superscript),
+                Inline::Text(unlinked_superscript),
+                Inline::Text(linked_baseline_text),
+            ],
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        let svg_options = resvg::usvg::Options::default();
+
+        let (_, spans, _, _) = prepare_inline_content(
+            &block,
+            Rgba::BLACK,
+            &ReaderTypography::default(),
+            320.0,
+            &svg_options,
+            true,
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.footnote_reference)
+                .collect::<Vec<_>>(),
+            [true, false, false]
+        );
+
+        let (_, disabled_spans, _, _) = prepare_inline_content(
+            &block,
+            Rgba::BLACK,
+            &ReaderTypography::default(),
+            320.0,
+            &svg_options,
+            false,
+        );
+        assert!(disabled_spans.iter().all(|span| !span.footnote_reference));
+    }
+
+    #[test]
+    fn quote_accent_tracks_the_reader_foreground_theme() {
+        assert_eq!(
+            quote_accent_for_foreground(Rgba::BLACK),
+            LIGHT_QUOTE_ACCENT_COLOR
+        );
+        assert_eq!(
+            quote_accent_for_foreground(Rgba {
+                red: 232,
+                green: 230,
+                blue: 225,
+                alpha: 255,
+            }),
+            DARK_QUOTE_ACCENT_COLOR
+        );
+    }
 
     #[test]
     fn unified_typesetting_replaces_authored_heading_metrics() {

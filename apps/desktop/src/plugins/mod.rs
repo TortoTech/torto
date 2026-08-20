@@ -36,9 +36,9 @@ pub use commands::{
 };
 pub(crate) use pdf_ocr::{
     PDF_PAGE_ANCHOR_PREFIX, PdfOcrPageRole, PdfOcrPageRoleAssignment, PdfOcrSourceController,
-    PdfOcrSyncData, PdfOcrViewMode, export_pdf_ocr_sync_data, has_pending_pdf_ocr_task,
-    import_pdf_ocr_sync_data, load_pdf_ocr_source, recognize_pdf, save_pdf_ocr_page_roles,
-    set_pdf_ocr_view_mode,
+    PdfOcrSyncData, PdfOcrViewMode, correct_generated_toc_pages_from_ocr, export_pdf_ocr_sync_data,
+    has_pending_pdf_ocr_task, import_pdf_ocr_sync_data, load_pdf_ocr_source, recognize_pdf,
+    save_pdf_ocr_page_roles, set_pdf_ocr_view_mode,
 };
 pub(crate) use pdf_toc::{PdfMetadataExtraction, extract_pdf_metadata};
 pub use rewrite::RewriteBookSource;

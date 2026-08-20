@@ -8,8 +8,8 @@ use peniko::{Blob, Color};
 use rebook_formats::{BookFormat, open_file_for_reading as open_publication_file_for_reading};
 use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
 use rebook_publication::{
-    Block, BookSource, RenditionLayout, Rgba, SourceAnchor, SourceRange, TableOfContentsOrigin,
-    TextBlockKind,
+    Block, BookSource, Inline, PublicationUrl, RenditionLayout, Rgba, SourceAnchor, SourceRange,
+    TableOfContentsOrigin, TextBaseline, TextBlock, TextBlockKind,
 };
 use rebook_reader::{
     PageDirection, ReaderPosition, ReaderSectionPage, ReaderSelection, ReaderSession,
@@ -216,6 +216,7 @@ pub(super) fn open_reader(
         } else {
             reader_preferences.spread
         },
+        focus_footnote_icons: reading_mode == ReadingMode::Focus,
         typography: reader_preferences.typography.clone(),
         typesetting: reader_preferences.typesetting.clone(),
         ..ReaderStyle::default()
@@ -584,6 +585,12 @@ struct FocusUnit {
     is_table: bool,
     rectangular_activation: bool,
     rectangular_activation_rect: Option<egui::Rect>,
+    footnotes: Vec<FocusFootnote>,
+}
+
+#[derive(Clone)]
+struct FocusFootnote {
+    text: String,
 }
 
 fn merge_focus_list_descendant(root: &mut FocusUnit, descendant: FocusUnit) {
@@ -596,6 +603,7 @@ fn merge_focus_list_descendant(root: &mut FocusUnit, descendant: FocusUnit) {
         root.text.push_str(&descendant.text);
     }
     root.rect = root.rect.union(descendant.rect);
+    root.footnotes.extend(descendant.footnotes);
 }
 
 fn focus_list_descendant_root(active_root: Option<(usize, u8)>, depth: u8) -> Option<usize> {
@@ -628,6 +636,77 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Image(image) => image.source.as_ref(),
         Block::Figure(figure) => figure.source.as_ref(),
         Block::Separator | Block::LineBreak | Block::PageBreak => None,
+    }
+}
+
+fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, PublicationUrl)> {
+    block
+        .content
+        .iter()
+        .filter_map(|inline| {
+            let Inline::Text(run) = inline else {
+                return None;
+            };
+            (run.style.baseline == TextBaseline::Superscript)
+                .then(|| run.link.clone())
+                .flatten()
+                .filter(|target| target.fragment().is_some())
+                .map(|target| (run.text.trim().to_owned(), target))
+        })
+        .filter(|(marker, _)| !marker.is_empty())
+        .collect()
+}
+
+fn block_footnote_references(block: &Block) -> Vec<(String, PublicationUrl)> {
+    match block {
+        Block::Text(block) => text_block_footnote_references(block),
+        Block::Quote(quote) => quote
+            .body
+            .iter()
+            .chain(quote.attribution.iter())
+            .flat_map(text_block_footnote_references)
+            .collect(),
+        Block::Table(table) => table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .flat_map(|cell| text_block_footnote_references(&cell.text))
+            .collect(),
+        Block::Figure(figure) => figure
+            .captions
+            .iter()
+            .flat_map(text_block_footnote_references)
+            .collect(),
+        Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => Vec::new(),
+    }
+}
+
+fn block_focus_text(block: &Block) -> String {
+    match block {
+        Block::Text(block) => crate::plugins::text_block_text(block),
+        Block::Quote(quote) => quote
+            .body
+            .iter()
+            .chain(quote.attribution.iter())
+            .map(crate::plugins::text_block_text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        Block::Table(table) => table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .map(|cell| crate::plugins::text_block_text(&cell.text))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Block::Image(image) => image.alt.clone(),
+        Block::Figure(figure) => figure
+            .captions
+            .iter()
+            .map(crate::plugins::text_block_text)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Block::Separator | Block::LineBreak | Block::PageBreak => String::new(),
     }
 }
 
@@ -1018,6 +1097,61 @@ impl DesktopReader {
         Ok(layout)
     }
 
+    fn resolve_focus_footnotes(&self, block: &Block) -> Vec<FocusFootnote> {
+        let mut seen = HashSet::new();
+        block_footnote_references(block)
+            .into_iter()
+            .filter(|(_, target)| seen.insert(target.to_string()))
+            .map(|(marker, target)| FocusFootnote {
+                text: self
+                    .focus_footnote_text(&target, &marker)
+                    .unwrap_or_else(|| {
+                        self.language
+                            .text("未能读取脚注内容", "Footnote content is unavailable")
+                            .to_owned()
+                    }),
+            })
+            .collect()
+    }
+
+    fn focus_footnote_text(&self, target: &PublicationUrl, marker: &str) -> Option<String> {
+        let section_index = self
+            .source
+            .book()
+            .sections
+            .iter()
+            .position(|section| section.href.path() == target.path())?;
+        let section = self.source.parse_section(section_index).ok()?;
+        let fragment = target.fragment()?;
+        let anchor = section
+            .anchors
+            .iter()
+            .find(|anchor| anchor.fragment == fragment)?
+            .source
+            .clone();
+        let block = section.blocks.iter().find(|block| {
+            block_source_range(block)
+                .is_some_and(|range| source_range_contains_anchor(range, &anchor))
+                || block_source_range(block).is_some_and(|range| {
+                    focus_block_paint_ranges(block, range)
+                        .iter()
+                        .any(|range| source_range_contains_anchor(range, &anchor))
+                })
+        })?;
+        let text = block_focus_text(block);
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let without_marker = text.strip_prefix(marker.trim()).map_or(text, |rest| {
+            rest.trim_start_matches(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '.' | '．' | '、' | ')' | '）' | ']' | '】')
+            })
+        });
+        Some(without_marker.to_owned())
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "focus-unit construction keeps semantic, paint, and geometry ranges synchronized"
@@ -1163,6 +1297,7 @@ impl DesktopReader {
                 }
                 continue;
             }
+            let footnotes = self.resolve_focus_footnotes(block);
             let geometry_ranges = focus_unit_geometry_ranges(
                 units.is_empty(),
                 &leading_heading_ranges,
@@ -1189,6 +1324,7 @@ impl DesktopReader {
                 is_table,
                 rectangular_activation,
                 rectangular_activation_rect,
+                footnotes,
             };
             if let Some(depth) = list_depth {
                 if let Some(root_index) = focus_list_descendant_root(active_list_root, depth)
@@ -1319,6 +1455,8 @@ impl DesktopReader {
         if index == self.focus_unit_index || index >= self.focus_units.len() {
             return;
         }
+        self.ui.focus_footnotes_visible = false;
+        self.ui.focus_footnote_scroll_delta = 0.0;
         self.focus_toc_override = None;
         self.focus_unit_index = index;
         self.focus_anchor = self
@@ -2036,6 +2174,8 @@ struct ReaderUiState {
     expanded_toc: HashSet<String>,
     last_auto_scrolled_toc: Option<String>,
     focus_actions_visible: bool,
+    focus_footnotes_visible: bool,
+    focus_footnote_scroll_delta: f32,
 }
 
 impl ReaderUiState {
@@ -2283,6 +2423,8 @@ impl DesktopReader {
                 expanded_toc,
                 last_auto_scrolled_toc: None,
                 focus_actions_visible: false,
+                focus_footnotes_visible: false,
+                focus_footnote_scroll_delta: 0.0,
             },
             plugin_settings,
             language,
@@ -2324,8 +2466,41 @@ impl DesktopReader {
 }
 
 fn needs_generated_toc(source: &dyn BookSource) -> bool {
-    source.book().table_of_contents.is_empty()
+    let entries = &source.book().table_of_contents;
+    entries.is_empty()
         || source.table_of_contents_origin() == TableOfContentsOrigin::Fallback
+        || (source.table_of_contents_origin() == TableOfContentsOrigin::Embedded
+            && embedded_toc_is_page_index(entries))
+}
+
+fn embedded_toc_is_page_index(entries: &[rebook_publication::TocEntry]) -> bool {
+    fn visit(entries: &[rebook_publication::TocEntry], total: &mut usize, page_labels: &mut usize) {
+        for entry in entries {
+            *total += 1;
+            if toc_label_is_only_a_page_number(&entry.label) {
+                *page_labels += 1;
+            }
+            visit(&entry.children, total, page_labels);
+        }
+    }
+
+    let mut total = 0;
+    let mut page_labels = 0;
+    visit(entries, &mut total, &mut page_labels);
+    total >= 4 && page_labels * 3 >= total * 2
+}
+
+fn toc_label_is_only_a_page_number(label: &str) -> bool {
+    let label = label.trim();
+    !label.is_empty()
+        && label.chars().all(|character| {
+            character.is_ascii_digit()
+                || ('０'..='９').contains(&character)
+                || matches!(
+                    character.to_ascii_lowercase(),
+                    'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'
+                )
+        })
 }
 
 #[derive(Default)]
@@ -2347,16 +2522,16 @@ mod tests {
     use super::navigation::snapshot_reanchors_focus;
     use super::{
         BookDisplayMetadata, Duration, FOCUS_SCROLL_MAX_DURATION, FOCUS_SCROLL_MIN_DURATION,
-        FocusUnit, FollowUp, HashSet, Instant, MOTION_DURATION, Motion, MotionCurve,
+        FocusFootnote, FocusUnit, FollowUp, HashSet, Instant, MOTION_DURATION, Motion, MotionCurve,
         NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, ScrollSectionLayout, SidebarTab,
         SnapshotEffects, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer,
-        TranslationUiState, allowed_reading_mode, focus_block_paint_ranges,
-        focus_list_descendant_root, focus_scroll_duration, focus_unit_container_center_y,
-        focus_unit_contains_source_range, focus_unit_geometry_ranges,
-        focus_unit_matches_highlight_ranges, focus_unit_screen_center_y, focus_unit_scroll_bounds,
-        focus_unit_target_offset_for_rect, legacy_translated_paragraph_range, logical_dimension,
-        merge_focus_list_descendant, resolve_book_display_metadata, resolved_focus_unit_index,
-        source_range_contains_anchor,
+        TranslationUiState, allowed_reading_mode, embedded_toc_is_page_index,
+        focus_block_paint_ranges, focus_list_descendant_root, focus_scroll_duration,
+        focus_unit_container_center_y, focus_unit_contains_source_range,
+        focus_unit_geometry_ranges, focus_unit_matches_highlight_ranges,
+        focus_unit_screen_center_y, focus_unit_scroll_bounds, focus_unit_target_offset_for_rect,
+        legacy_translated_paragraph_range, logical_dimension, merge_focus_list_descendant,
+        resolve_book_display_metadata, resolved_focus_unit_index, source_range_contains_anchor,
     };
     use crate::plugins::PdfOcrViewMode;
     use crate::preferences::ReadingMode;
@@ -2367,11 +2542,37 @@ mod tests {
     };
     use rebook_publication::{
         Block, BlockStyle, Rgba, SourceAnchor, SourceRange, SpineItemId, TableBlock, TableCell,
-        TableRow, TextBlock, TextBlockKind,
+        TableRow, TextBlock, TextBlockKind, TocEntry,
     };
     use rebook_reader::{ReaderPosition, ReaderSectionPage};
     use rebook_renderer::DisplayListCompiler;
     use std::sync::Arc;
+
+    fn toc_entry(label: &str, children: Vec<TocEntry>) -> TocEntry {
+        TocEntry {
+            label: label.into(),
+            href: None,
+            children,
+        }
+    }
+
+    #[test]
+    fn embedded_page_number_bookmarks_require_a_generated_pdf_toc() {
+        let mut entries = vec![
+            toc_entry("书名", Vec::new()),
+            toc_entry("版权", Vec::new()),
+            toc_entry("目录", Vec::new()),
+        ];
+        entries.extend((1..=12).map(|page| toc_entry(&page.to_string(), Vec::new())));
+
+        assert!(embedded_toc_is_page_index(&entries));
+        assert!(!embedded_toc_is_page_index(&[
+            toc_entry("第一章 书是什么？", Vec::new()),
+            toc_entry("第二章 一本书的诞生", Vec::new()),
+            toc_entry("第三章 设计方法", Vec::new()),
+            toc_entry("附录", Vec::new()),
+        ]));
+    }
 
     #[test]
     fn original_pdf_forces_classic_mode_until_ocr_reflow_is_active() {
@@ -2769,6 +2970,7 @@ mod tests {
             is_table: false,
             rectangular_activation: false,
             rectangular_activation_rect: None,
+            footnotes: Vec::new(),
         };
 
         assert_eq!(focus_list_descendant_root(Some((0, 0)), 1), Some(0));
@@ -2778,7 +2980,11 @@ mod tests {
 
         let mut root = unit("root", "语音与写作：文化转型", 100.0);
         let child_range = range("child");
-        merge_focus_list_descendant(&mut root, unit("child", "口头文化与书面文化", 160.0));
+        let mut child = unit("child", "口头文化与书面文化", 160.0);
+        child.footnotes.push(FocusFootnote {
+            text: "列表子项脚注".into(),
+        });
+        merge_focus_list_descendant(&mut root, child);
         merge_focus_list_descendant(&mut root, unit("grandchild", "从学术辩论到书面考试", 220.0));
 
         assert_eq!(root.paint_ranges.len(), 3);
@@ -2790,6 +2996,8 @@ mod tests {
         );
         assert_eq!(root.rect.top(), 100.0);
         assert_eq!(root.rect.bottom(), 260.0);
+        assert_eq!(root.footnotes.len(), 1);
+        assert_eq!(root.footnotes[0].text, "列表子项脚注");
         assert!(focus_unit_contains_source_range(&root, &child_range));
         assert!(focus_unit_matches_highlight_ranges(
             &root,
@@ -2831,6 +3039,7 @@ mod tests {
             is_table: false,
             rectangular_activation: false,
             rectangular_activation_rect: None,
+            footnotes: Vec::new(),
         });
         let heading_anchor = SourceAnchor {
             spine,
@@ -3001,6 +3210,8 @@ mod tests {
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
             focus_actions_visible: false,
+            focus_footnotes_visible: false,
+            focus_footnote_scroll_delta: 0.0,
         };
 
         ui.reveal_toolbar(now);
@@ -3037,6 +3248,8 @@ mod tests {
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
             focus_actions_visible: false,
+            focus_footnotes_visible: false,
+            focus_footnote_scroll_delta: 0.0,
         };
 
         assert!(ui.set_toolbar_hovered(true, now));

@@ -986,12 +986,32 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
                 content.push(Inline::Text(TextRun {
                     text: line.to_owned(),
                     style,
-                    link: None,
+                    link: translated_footnote_link(line, style, original),
                 }));
             }
         }
     }
     content
+}
+
+fn translated_footnote_link(
+    translated_marker: &str,
+    style: TextStyle,
+    original: &[Inline],
+) -> Option<PublicationUrl> {
+    if style.baseline != TextBaseline::Superscript {
+        return None;
+    }
+    let translated_marker = translated_marker.trim();
+    original.iter().find_map(|inline| {
+        let Inline::Text(run) = inline else {
+            return None;
+        };
+        (run.style.baseline == TextBaseline::Superscript && run.text.trim() == translated_marker)
+            .then(|| run.link.clone())
+            .flatten()
+            .filter(|target| target.fragment().is_some())
+    })
 }
 
 fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextStyle {
@@ -1448,6 +1468,7 @@ mod tests {
 
     #[test]
     fn translation_preserves_and_restores_baseline_markers() {
+        let footnote_target = PublicationUrl::parse("notes.xhtml#note-4").unwrap();
         let superscript = TextStyle {
             baseline: TextBaseline::Superscript,
             size_scale: 0.75,
@@ -1462,7 +1483,7 @@ mod tests {
             Inline::Text(TextRun {
                 text: "4".into(),
                 style: superscript,
-                link: None,
+                link: Some(footnote_target.clone()),
             }),
         ];
         let block = TextBlock {
@@ -1480,6 +1501,7 @@ mod tests {
                 if body.text == "含义"
                     && note.text == "4"
                     && note.style.baseline == TextBaseline::Superscript
+                    && note.link.as_ref() == Some(&footnote_target)
         ));
 
         let cached = replacement_content(
@@ -1490,7 +1512,9 @@ mod tests {
         assert!(cached.iter().any(|inline| matches!(
             inline,
             Inline::Text(run)
-                if run.text == "4" && run.style.baseline == TextBaseline::Superscript
+                if run.text == "4"
+                    && run.style.baseline == TextBaseline::Superscript
+                    && run.link.as_ref() == Some(&footnote_target)
         )));
 
         let spaced_cache =
@@ -1506,7 +1530,9 @@ mod tests {
         assert!(spaced_cache.iter().any(|inline| matches!(
             inline,
             Inline::Text(run)
-                if run.text == "4" && run.style.baseline == TextBaseline::Superscript
+                if run.text == "4"
+                    && run.style.baseline == TextBaseline::Superscript
+                    && run.link.as_ref() == Some(&footnote_target)
         )));
     }
 

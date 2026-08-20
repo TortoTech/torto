@@ -183,6 +183,14 @@ pub(crate) fn palette() -> Palette {
     }
 }
 
+pub(crate) fn footnote_link_color() -> Color32 {
+    if palette().dark {
+        Color32::from_rgb(96, 165, 250)
+    } else {
+        Color32::from_rgb(37, 99, 235)
+    }
+}
+
 pub(crate) fn configure(
     ctx: &egui::Context,
     interface_typography: &InterfaceTypography,

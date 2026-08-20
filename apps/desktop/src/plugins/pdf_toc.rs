@@ -58,6 +58,14 @@ fn scanned_page_role(kind: &str) -> Option<PdfOcrPageRole> {
     }
 }
 
+fn page_role_is_plausible(role: PdfOcrPageRole, physical_page: usize, page_count: usize) -> bool {
+    match role {
+        PdfOcrPageRole::Cover => physical_page == 1,
+        PdfOcrPageRole::TitlePage => physical_page <= SCAN_PAGE_LIMIT.min(page_count),
+        PdfOcrPageRole::BackCover => physical_page > page_count.saturating_sub(SCAN_BATCH_SIZE),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ExtractionResponse {
     #[serde(default)]
@@ -351,6 +359,7 @@ where
             page_roles,
         });
     }
+    let offset_mapped_entries = entries.clone();
     let mut heading_verified = apply_restarted_page_sequences(&mut entries, &anchors);
     heading_verified.extend(apply_scanned_heading_anchors(
         &mut entries,
@@ -372,6 +381,13 @@ where
         // inferred mapping remains usable if a model request or page render
         // fails, so do not discard an otherwise valid TOC.
         tracing::warn!(%error, "failed to refine generated PDF TOC pages");
+    }
+    if !toc_page_mapping_is_plausible(&entries) {
+        tracing::warn!(
+            entries = entries.len(),
+            "discarding a degenerate visual PDF TOC page correction"
+        );
+        entries = offset_mapped_entries;
     }
     on_progress(format!("已生成 {} 个目录条目", entries.len()));
     Ok(PdfMetadataExtraction {
@@ -427,6 +443,7 @@ where
         scan_ranges.push((back_start, page_count));
     }
     for (batch_start, batch_end) in scan_ranges {
+        let tail_only = page_count > scan_limit && batch_start >= scan_limit;
         let page_indices = (batch_start..batch_end).collect::<Vec<_>>();
         let page_mapping = page_indices
             .iter()
@@ -444,10 +461,15 @@ where
         } else {
             "{\"p\":[{\"i\":0,\"k\":\"toc|cover|title_page|back_cover|other\",\"n\":\"printed page number or empty\",\"h\":\"section heading or empty\"}]}"
         };
+        let classification_instruction = if tail_only {
+            "These slots are from the end of the PDF. Classify k as back_cover only for the exterior rear cover; otherwise classify it as other. Return empty n and h."
+        } else {
+            "Classify k as toc for a printed table-of-contents page listing multiple headings with page numbers; cover only for the exterior front cover on PDF page 1; title_page for a formal interior title page or half-title page; otherwise other. Do not classify an opening page as back_cover. A copyright page is other. Use each special role only when visually supported. For h, return the full visible heading only when that page starts a chapter, preface, acknowledgements, introduction, appendix, or other navigable section; otherwise return an empty string. Do not use running headers or incidental mentions as h."
+        };
         let content = vec![
             json!({
                 "type": "text",
-                "text": format!("The image is a 2-column contact sheet in row-major slot order. Slot-to-PDF-page mapping: {page_mapping}. Inspect every slot. Classify k as toc for a printed table-of-contents page listing multiple headings with page numbers; cover for the exterior front cover; title_page for a formal interior title page or half-title page; back_cover for the exterior rear cover; otherwise other. A copyright page is other. Use each special role only when visually supported. For h, return the full visible heading only when that page starts a chapter, preface, acknowledgements, introduction, appendix, or other navigable section; otherwise return an empty string. Do not use running headers or incidental mentions as h.{metadata_instruction} Return compact JSON only: {response_shape}. Include exactly one p item for every slot. Do not infer n when it is not visibly printed."),
+                "text": format!("The image is a 2-column contact sheet in row-major slot order. Slot-to-PDF-page mapping: {page_mapping}. Inspect every slot. {classification_instruction}{metadata_instruction} Return compact JSON only: {response_shape}. Include exactly one p item for every slot. Do not infer n when it is not visibly printed."),
             }),
             json!({
                 "type": "image_url",
@@ -497,23 +519,32 @@ where
                 continue;
             }
             let physical_page = batch_start + page.i + 1;
-            if page.k.eq_ignore_ascii_case("toc") {
+            let is_toc = page.k.eq_ignore_ascii_case("toc");
+            if is_toc {
                 toc_pages.push(physical_page);
             }
-            if let Some(role) = scanned_page_role(&page.k) {
-                page_roles.push(PdfOcrPageRoleAssignment {
-                    physical_page,
-                    role,
-                });
+            let role = scanned_page_role(&page.k);
+            if let Some(role) = role {
+                if page_role_is_plausible(role, physical_page, page_count) {
+                    page_roles.push(PdfOcrPageRoleAssignment {
+                        physical_page,
+                        role,
+                    });
+                }
             }
-            if !page.n.trim().is_empty() {
+            // A TOC page contains many printed page numbers and headings. It is
+            // not a valid anchor for either value even when the vision model
+            // redundantly fills n/h beside k=toc. The same applies to covers
+            // and title pages.
+            let can_anchor_content = !is_toc && role.is_none();
+            if can_anchor_content && !page.n.trim().is_empty() {
                 anchors.push(PageNumberAnchor {
                     physical_page,
                     printed_page: page.n,
                 });
             }
             let title = page.h.trim();
-            if !title.is_empty() {
+            if can_anchor_content && !title.is_empty() {
                 heading_anchors.push(PageHeadingAnchor {
                     physical_page,
                     title: title.to_owned(),
@@ -912,6 +943,18 @@ fn apply_consistent_top_level_page_correction(
     }
 }
 
+fn toc_page_mapping_is_plausible(entries: &[GeneratedTocEntry]) -> bool {
+    let top_level_pages = entries
+        .iter()
+        .filter_map(|entry| (entry.depth == 0).then_some(entry.physical_page))
+        .collect::<Vec<_>>();
+    if top_level_pages.len() < 4 {
+        return true;
+    }
+    let distinct_pages = top_level_pages.iter().copied().collect::<HashSet<_>>();
+    distinct_pages.len() >= 3 && top_level_pages.windows(2).all(|pages| pages[0] <= pages[1])
+}
+
 fn shift_top_level_group(
     entries: &mut [GeneratedTocEntry],
     top_level: &[usize],
@@ -1020,8 +1063,9 @@ mod tests {
         MetadataResponse, PageHeadingAnchor, PageNumberAnchor, ScanResponse,
         apply_consistent_top_level_page_correction, apply_restarted_page_sequences,
         apply_scanned_heading_anchors, generate_pdf_toc, infer_page_offset,
-        is_retryable_vision_response_error, parse_arabic_page_number, render_page_data_url,
-        request_vision_json, scanned_page_role, verification_candidate_pages,
+        is_retryable_vision_response_error, page_role_is_plausible, parse_arabic_page_number,
+        render_page_data_url, request_vision_json, scanned_page_role,
+        toc_page_mapping_is_plausible, verification_candidate_pages,
     };
     use crate::plugins::PdfOcrPageRole;
 
@@ -1038,6 +1082,45 @@ mod tests {
         );
         assert_eq!(scanned_page_role("toc"), None);
         assert_eq!(scanned_page_role("other"), None);
+    }
+
+    #[test]
+    fn special_page_roles_are_restricted_to_plausible_pdf_regions() {
+        assert!(page_role_is_plausible(PdfOcrPageRole::Cover, 1, 258));
+        assert!(!page_role_is_plausible(PdfOcrPageRole::Cover, 2, 258));
+        assert!(page_role_is_plausible(PdfOcrPageRole::TitlePage, 8, 258));
+        assert!(!page_role_is_plausible(PdfOcrPageRole::TitlePage, 21, 258));
+        assert!(!page_role_is_plausible(PdfOcrPageRole::BackCover, 8, 258));
+        assert!(page_role_is_plausible(PdfOcrPageRole::BackCover, 258, 258));
+    }
+
+    #[test]
+    fn degenerate_top_level_page_mapping_is_rejected() {
+        let entry = |physical_page: usize| super::GeneratedTocEntry {
+            depth: 0,
+            title: format!("Chapter {physical_page}"),
+            printed_page: physical_page.to_string(),
+            physical_page,
+            confidence: 0.9,
+        };
+        assert!(!toc_page_mapping_is_plausible(&[
+            entry(2),
+            entry(2),
+            entry(2),
+            entry(2),
+        ]));
+        assert!(toc_page_mapping_is_plausible(&[
+            entry(10),
+            entry(17),
+            entry(27),
+            entry(34),
+        ]));
+        assert!(!toc_page_mapping_is_plausible(&[
+            entry(10),
+            entry(27),
+            entry(17),
+            entry(34),
+        ]));
     }
 
     #[test]

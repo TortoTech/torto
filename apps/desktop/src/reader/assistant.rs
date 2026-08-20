@@ -315,9 +315,10 @@ impl DesktopReader {
             && self.plugin_settings.ocr_enabled
             && self.plugin_settings.ocr_endpoint().is_ok()
         {
+            let need_toc = super::needs_generated_toc(self.source.as_ref());
             self.pdf_toc.progress = self
                 .language
-                .text("正在识别 PDF 特殊页面…", "Identifying special PDF pages…")
+                .text("正在准备 PDF 信息识别…", "Preparing PDF recognition…")
                 .into();
             self.pdf_toc.task.begin(PdfTocTask {
                 source: self.pdf_ocr_controller.as_ref().map_or_else(
@@ -325,9 +326,9 @@ impl DesktopReader {
                     |controller| controller.original_source(),
                 ),
                 book_id: self.book_id.clone(),
-                need_toc: false,
+                need_toc,
                 need_page_roles: true,
-                missing: super::PdfMetadataMissing::default(),
+                missing: self.pdf_metadata_missing,
                 settings: self.plugin_settings.clone(),
             });
         }
@@ -481,7 +482,7 @@ impl DesktopReader {
             PdfTocTaskMessage::Complete(message) => {
                 let request = self.pdf_toc.task.complete(message.id)?;
                 self.pdf_toc.progress.clear();
-                match message.result {
+                let update = match message.result {
                     Ok(extraction) => self.apply_pdf_metadata_extraction(&request, extraction),
                     Err(error) => {
                         let prefix = if request.need_toc && !request.missing.any() {
@@ -494,9 +495,19 @@ impl DesktopReader {
                         self.show_error(format!("{prefix}：{error}"));
                         None
                     }
+                };
+                if self.pdf_metadata_work_was_omitted(&request) {
+                    self.start_pdf_metadata_extraction();
                 }
+                update
             }
         }
+    }
+
+    fn pdf_metadata_work_was_omitted(&self, request: &super::PdfTocTask) -> bool {
+        (!request.need_toc && super::needs_generated_toc(self.source.as_ref()))
+            || (self.pdf_metadata_missing.title && !request.missing.title)
+            || (self.pdf_metadata_missing.authors && !request.missing.authors)
     }
 
     fn apply_pdf_metadata_extraction(
@@ -845,6 +856,8 @@ impl DesktopReader {
     }
 
     pub(super) fn open_assistant_panel(&mut self, panel: AssistantPanel) {
+        self.ui.focus_footnotes_visible = false;
+        self.ui.focus_footnote_scroll_delta = 0.0;
         if self.is_focus_mode() {
             self.sync_focus_chat_session();
         }

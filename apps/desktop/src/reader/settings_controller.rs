@@ -131,6 +131,7 @@ impl DesktopReader {
         } else {
             settings.spread
         };
+        style.focus_footnote_icons = self.reading_mode == crate::preferences::ReadingMode::Focus;
         style.minimum_paragraph_gap = if self.reading_mode == crate::preferences::ReadingMode::Focus
             && settings.typesetting.mode == rebook_layout::TypesettingMode::Book
         {
@@ -148,6 +149,8 @@ impl DesktopReader {
                 self.language = language;
                 self.shortcuts.clone_from(&settings.shortcuts);
                 if mode_changed {
+                    self.ui.focus_footnotes_visible = false;
+                    self.ui.focus_footnote_scroll_delta = 0.0;
                     if !self.is_focus_mode() {
                         self.restore_book_chat_session();
                     }
