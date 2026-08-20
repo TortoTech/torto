@@ -814,7 +814,7 @@ impl DesktopReader {
 
     fn focus_footnote_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
         if !self.is_focus_mode()
-            || !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::AltLeft))
+            || !ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_footnotes))
         {
             return false;
         }
@@ -4766,6 +4766,10 @@ mod reference_suggestion_label_tests {
         assert_eq!(
             shortcuts.focus_note,
             egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num2)
+        );
+        assert_eq!(
+            shortcuts.focus_footnotes,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::AltLeft)
         );
     }
 

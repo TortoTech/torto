@@ -299,6 +299,10 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 ShortcutAction::FocusNote,
                 language.text("唤起批注框", "Open note panel"),
             ),
+            (
+                ShortcutAction::FocusFootnotes,
+                language.text("脚注开关", "Toggle footnotes"),
+            ),
         ],
     );
     ui.add_space(12.0);
@@ -427,7 +431,7 @@ fn capture_shortcut_input(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             else {
                 return None;
             };
-            if is_shortcut_modifier_key(*key) {
+            if should_ignore_shortcut_capture_key(action, *key) {
                 return None;
             }
             Some((*key, *modifiers))
@@ -444,7 +448,11 @@ fn capture_shortcut_input(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         state.capturing_shortcut = None;
         return;
     }
-    let modifiers = canonical_shortcut_modifiers(modifiers);
+    let modifiers = if action == ShortcutAction::FocusFootnotes && key == egui::Key::AltLeft {
+        egui::Modifiers::NONE
+    } else {
+        canonical_shortcut_modifiers(modifiers)
+    };
     if shortcut_chord_key_count(modifiers) > MAX_SHORTCUT_KEYS {
         state.error = Some(
             state
@@ -477,6 +485,11 @@ fn is_shortcut_modifier_key(key: egui::Key) -> bool {
             | egui::Key::SuperLeft
             | egui::Key::SuperRight
     )
+}
+
+fn should_ignore_shortcut_capture_key(action: ShortcutAction, key: egui::Key) -> bool {
+    is_shortcut_modifier_key(key)
+        && !(action == ShortcutAction::FocusFootnotes && key == egui::Key::AltLeft)
 }
 
 fn canonical_shortcut_modifiers(modifiers: egui::Modifiers) -> egui::Modifiers {
@@ -2187,6 +2200,14 @@ mod tests {
         }
         assert!(!is_shortcut_modifier_key(egui::Key::B));
         assert!(!is_shortcut_modifier_key(egui::Key::F11));
+        assert!(!should_ignore_shortcut_capture_key(
+            ShortcutAction::FocusFootnotes,
+            egui::Key::AltLeft,
+        ));
+        assert!(should_ignore_shortcut_capture_key(
+            ShortcutAction::FocusNote,
+            egui::Key::AltLeft,
+        ));
     }
 
     #[test]

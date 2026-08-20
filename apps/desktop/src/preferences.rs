@@ -152,6 +152,8 @@ pub(crate) struct ShortcutPreferences {
     pub(crate) focus_highlight: egui::KeyboardShortcut,
     #[serde(default = "default_focus_note_shortcut")]
     pub(crate) focus_note: egui::KeyboardShortcut,
+    #[serde(default = "default_focus_footnotes_shortcut")]
+    pub(crate) focus_footnotes: egui::KeyboardShortcut,
 }
 
 impl ShortcutPreferences {
@@ -169,7 +171,7 @@ impl ShortcutPreferences {
             .any(|binding| shortcut_chord_key_count(binding.modifiers) > MAX_SHORTCUT_KEYS)
     }
 
-    fn bindings(&self) -> [egui::KeyboardShortcut; 9] {
+    fn bindings(&self) -> [egui::KeyboardShortcut; 10] {
         [
             self.fullscreen,
             self.toggle_left_sidebar,
@@ -180,6 +182,7 @@ impl ShortcutPreferences {
             self.focus_chat,
             self.focus_highlight,
             self.focus_note,
+            self.focus_footnotes,
         ]
     }
 }
@@ -212,6 +215,7 @@ impl Default for ShortcutPreferences {
             focus_chat: default_focus_chat_shortcut(),
             focus_highlight: default_focus_highlight_shortcut(),
             focus_note: default_focus_note_shortcut(),
+            focus_footnotes: default_focus_footnotes_shortcut(),
         }
     }
 }
@@ -250,6 +254,10 @@ const fn default_focus_highlight_shortcut() -> egui::KeyboardShortcut {
 
 const fn default_focus_note_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num2)
+}
+
+const fn default_focus_footnotes_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::AltLeft)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -632,6 +640,10 @@ mod tests {
         assert_eq!(
             shortcuts.return_to_shelf,
             egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Q)
+        );
+        assert_eq!(
+            shortcuts.focus_footnotes,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::AltLeft)
         );
         assert!(!shortcuts.has_conflicts());
 
