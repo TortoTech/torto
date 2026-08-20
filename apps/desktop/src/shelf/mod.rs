@@ -1092,15 +1092,20 @@ fn shelf_search_hint(language: AppLanguage, book_count: usize) -> String {
 
 fn sort_shelf_books(books: &mut [LibraryBook], read_activity: &HashMap<String, u64>) {
     books.sort_by(|left, right| {
-        match (read_activity.get(&left.id), read_activity.get(&right.id)) {
-            (Some(left_read_at), Some(right_read_at)) => right_read_at
-                .cmp(left_read_at)
-                .then_with(|| right.added_at.cmp(&left.added_at)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => right.added_at.cmp(&left.added_at),
-        }
-        .then_with(|| left.id.cmp(&right.id))
+        let left_activity = read_activity
+            .get(&left.id)
+            .copied()
+            .unwrap_or_default()
+            .max(left.added_at);
+        let right_activity = read_activity
+            .get(&right.id)
+            .copied()
+            .unwrap_or_default()
+            .max(right.added_at);
+        right_activity
+            .cmp(&left_activity)
+            .then_with(|| right.added_at.cmp(&left.added_at))
+            .then_with(|| left.id.cmp(&right.id))
     });
 }
 
@@ -1147,13 +1152,16 @@ mod tests {
     }
 
     #[test]
-    fn read_books_are_sorted_by_latest_activity_before_unread_books() {
+    fn books_are_sorted_by_the_latest_import_or_reading_activity() {
         let mut books = vec![
-            book("unread-new", 400),
-            book("read-old", 100),
-            book("read-new", 1),
+            book("newly-imported", 400),
+            book("recently-read", 100),
+            book("older-activity", 200),
         ];
-        let activity = HashMap::from([("read-old".into(), 10), ("read-new".into(), 20)]);
+        let activity = HashMap::from([
+            ("recently-read".into(), 500),
+            ("older-activity".into(), 250),
+        ]);
 
         sort_shelf_books(&mut books, &activity);
 
@@ -1162,7 +1170,23 @@ mod tests {
                 .iter()
                 .map(|book| book.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["read-new", "read-old", "unread-new"]
+            vec!["recently-read", "newly-imported", "older-activity"]
+        );
+    }
+
+    #[test]
+    fn a_newer_unread_import_precedes_an_older_reading_activity() {
+        let mut books = vec![book("read", 100), book("unread", 400)];
+        let activity = HashMap::from([("read".into(), 300)]);
+
+        sort_shelf_books(&mut books, &activity);
+
+        assert_eq!(
+            books
+                .iter()
+                .map(|book| book.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unread", "read"]
         );
     }
 

@@ -1637,20 +1637,41 @@ impl DesktopReader {
         } else {
             (viewport.right() - width - 16.0).max(viewport.left() + 16.0)
         };
-        let characters_per_line = ((width - 48.0) / 7.5).max(12.0);
-        let estimated_lines = footnotes
-            .iter()
-            .map(|footnote| {
-                (footnote.text.chars().count() as f32 / characters_per_line)
-                    .ceil()
-                    .max(1.0)
-            })
-            .sum::<f32>();
         let maximum_body_height = (viewport.height() * 0.52).clamp(160.0, 380.0);
-        let estimated_body_height = (estimated_lines * 21.0
-            + footnotes.len().saturating_sub(1) as f32 * 10.0)
-            .clamp(19.0, maximum_body_height);
-        let panel_height = estimated_body_height + 24.0;
+        let frame_horizontal_margin = 24.0;
+        let leading_icon_width = 19.0;
+        let scrollbar_reserve = 8.0;
+        let style = ctx.style_of(crate::ui::theme());
+        let text_width = (width
+            - frame_horizontal_margin
+            - leading_icon_width
+            - style.spacing.item_spacing.x
+            - scrollbar_reserve)
+            .max(1.0);
+        let body_font = egui::TextStyle::Body.resolve(style.as_ref());
+        let text_color = palette().text;
+        let measured_text_height = ctx.fonts_mut(|fonts| {
+            footnotes
+                .iter()
+                .map(|footnote| {
+                    fonts
+                        .layout(
+                            footnote.text.clone(),
+                            body_font.clone(),
+                            text_color,
+                            text_width,
+                        )
+                        .size()
+                        .y
+                })
+                .sum::<f32>()
+        });
+        // Each additional item has one separator plus the vertical spacing on
+        // both sides. The small safety inset covers fractional glyph metrics.
+        let separator_height = footnotes.len().saturating_sub(1) as f32 * 19.0;
+        let measured_body_height = (measured_text_height + separator_height + 2.0)
+            .clamp(body_font.size.max(19.0), maximum_body_height);
+        let panel_height = measured_body_height + 24.0;
         let anchor_y = self
             .focused_unit_screen_center_y(page_rect)
             .unwrap_or_else(|| page_rect.center().y);
@@ -1680,7 +1701,7 @@ impl DesktopReader {
                             egui::ScrollArea::vertical()
                                 .id_salt("focus-footnotes-scroll")
                                 .max_height(maximum_body_height)
-                                .min_scrolled_height(0.0)
+                                .min_scrolled_height(measured_body_height)
                                 .auto_shrink([false, true])
                                 .show(ui, |ui| {
                                     if routed_scroll.abs() > f32::EPSILON {

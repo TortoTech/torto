@@ -651,7 +651,7 @@ impl Default for Rgba {
     }
 }
 
-/// Renderer-independent inline style subset.
+/// Renderer-independent inline presentation and semantic subset.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
     pub bold: bool,
@@ -663,6 +663,9 @@ pub struct TextStyle {
     /// Vertical placement relative to the surrounding text baseline.
     #[serde(default)]
     pub baseline: TextBaseline,
+    /// Semantic role of the surrounding link, when this run is linked.
+    #[serde(default)]
+    pub link_role: LinkRole,
 }
 
 impl Default for TextStyle {
@@ -674,8 +677,21 @@ impl Default for TextStyle {
             size_scale: 1.0,
             color: Rgba::BLACK,
             baseline: TextBaseline::Normal,
+            link_role: LinkRole::Normal,
         }
     }
+}
+
+/// Semantic role carried by an inline publication link.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkRole {
+    /// An ordinary hyperlink or cross-reference.
+    #[default]
+    Normal,
+    /// A reference from authored prose to a footnote definition.
+    FootnoteReference,
+    /// A return link from a footnote definition to its prose reference.
+    FootnoteBacklink,
 }
 
 /// Semantic baseline placement for inline text such as footnote references.

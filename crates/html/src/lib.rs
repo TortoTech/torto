@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use rebook_publication::{
     Block, BlockStyle, CaptionPosition, FigureBlock, ImageBlock, ImageLength, ImageStyle, Inline,
-    MathRun, PublicationUrl, QuoteBlock, Rgba, Section, SectionAnchor, SourceAnchor, SourceRange,
-    SpineItem, SpineItemId, TableBlock, TableCell, TableRow, TextAlignment, TextBaseline,
-    TextBlock, TextBlockKind, TextRun, TextStyle,
+    LinkRole, MathRun, PublicationUrl, QuoteBlock, Rgba, Section, SectionAnchor, SourceAnchor,
+    SourceRange, SpineItem, SpineItemId, TableBlock, TableCell, TableRow, TextAlignment,
+    TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 use roxmltree::{Document, Node};
 use thiserror::Error;
@@ -17,6 +17,148 @@ pub enum HtmlError {
     InvalidDocument { resource: String, message: String },
     #[error(transparent)]
     Publication(#[from] rebook_publication::PublicationError),
+}
+
+fn classify_footnote_links(
+    document: &Document<'_>,
+    base: &PublicationUrl,
+) -> HashMap<usize, LinkRole> {
+    let anchors = document
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name().eq_ignore_ascii_case("a"))
+        .collect::<Vec<_>>();
+    let mut roles = anchors
+        .iter()
+        .filter_map(|node| explicit_link_role(*node).map(|role| (node.range().start, role)))
+        .collect::<HashMap<_, _>>();
+    let by_fragment = anchors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            anchor_fragment(*node).map(|fragment| (fragment.to_owned(), index))
+        })
+        .collect::<HashMap<_, _>>();
+    let targets = anchors
+        .iter()
+        .map(|node| attribute_local(*node, "href").and_then(|href| base.resolve(href).ok()))
+        .collect::<Vec<_>>();
+
+    for (index, node) in anchors.iter().copied().enumerate() {
+        let Some(source_fragment) = anchor_fragment(node) else {
+            continue;
+        };
+        let Some(target) = targets[index].as_ref() else {
+            continue;
+        };
+        if target.path() != base.path() {
+            continue;
+        }
+        let Some(target_fragment) = target.fragment() else {
+            continue;
+        };
+        let Some(&counterpart_index) = by_fragment.get(target_fragment) else {
+            continue;
+        };
+        if index >= counterpart_index {
+            continue;
+        }
+        let counterpart = anchors[counterpart_index];
+        let Some(counterpart_target) = targets[counterpart_index].as_ref() else {
+            continue;
+        };
+        if counterpart_target.path() != base.path()
+            || counterpart_target.fragment() != Some(source_fragment)
+            || !matching_footnote_markers(node, counterpart)
+        {
+            continue;
+        }
+
+        let node_has_prose_before = link_has_preceding_block_text(node);
+        let counterpart_has_prose_before = link_has_preceding_block_text(counterpart);
+        let (reference, backlink) = match (node_has_prose_before, counterpart_has_prose_before) {
+            (true, false) => (node, counterpart),
+            (false, true) => (counterpart, node),
+            _ if node.range().start <= counterpart.range().start => (node, counterpart),
+            _ => (counterpart, node),
+        };
+        roles
+            .entry(reference.range().start)
+            .or_insert(LinkRole::FootnoteReference);
+        roles
+            .entry(backlink.range().start)
+            .or_insert(LinkRole::FootnoteBacklink);
+    }
+    roles
+}
+
+fn explicit_link_role(node: Node<'_, '_>) -> Option<LinkRole> {
+    let tokens = [
+        attribute_local(node, "type"),
+        attribute_local(node, "role"),
+        attribute_local(node, "rel"),
+    ];
+    for token in tokens
+        .into_iter()
+        .flatten()
+        .flat_map(str::split_ascii_whitespace)
+    {
+        match token.to_ascii_lowercase().as_str() {
+            "noteref" | "doc-noteref" => return Some(LinkRole::FootnoteReference),
+            "backlink" | "doc-backlink" => return Some(LinkRole::FootnoteBacklink),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn anchor_fragment<'a>(node: Node<'a, '_>) -> Option<&'a str> {
+    attribute_local(node, "id")
+        .or_else(|| attribute_local(node, "name"))
+        .map(str::trim)
+        .filter(|fragment| !fragment.is_empty())
+}
+
+fn matching_footnote_markers(left: Node<'_, '_>, right: Node<'_, '_>) -> bool {
+    let marker = |node: Node<'_, '_>| {
+        let text = node
+            .descendants()
+            .filter(Node::is_text)
+            .filter_map(|text| text.text())
+            .collect::<String>();
+        normalize_footnote_marker(&text)
+    };
+    marker(left)
+        .zip(marker(right))
+        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(&right))
+}
+
+fn normalize_footnote_marker(marker: &str) -> Option<String> {
+    let marker = marker.trim();
+    let marker = marker
+        .trim_start_matches(['[', '(', '（', '【'])
+        .trim_end_matches([']', ')', '）', '】'])
+        .trim();
+    let compact = !marker.is_empty()
+        && marker.chars().count() <= 8
+        && marker.chars().all(|character| {
+            character.is_alphanumeric() || matches!(character, '*' | '†' | '‡' | '§')
+        });
+    compact.then(|| marker.to_owned())
+}
+
+fn link_has_preceding_block_text(link: Node<'_, '_>) -> bool {
+    let Some(block) = link.ancestors().skip(1).find(|ancestor| {
+        ancestor.is_element()
+            && is_block_boundary(ancestor.tag_name().name().to_ascii_lowercase().as_str())
+    }) else {
+        return false;
+    };
+    block
+        .descendants()
+        .take_while(|descendant| descendant.range().start < link.range().start)
+        .filter(Node::is_text)
+        .filter_map(|text| text.text())
+        .any(|text| !text.trim().is_empty())
 }
 
 pub fn parse_section(
@@ -33,7 +175,13 @@ pub fn parse_section(
         .descendants()
         .find(|node| node.is_element() && node.tag_name().name() == "body")
         .unwrap_or_else(|| document.root_element());
-    let mut parser = ReadingIrParser::new(descriptor.id.clone(), descriptor.href.clone(), styles);
+    let footnote_links = classify_footnote_links(&document, &descriptor.href);
+    let mut parser = ReadingIrParser::new(
+        descriptor.id.clone(),
+        descriptor.href.clone(),
+        styles,
+        footnote_links,
+    );
     parser.queue_node_anchors(root);
     parser.parse_children(root)?;
 
@@ -59,12 +207,18 @@ struct ReadingIrParser {
     pending_anchors: Vec<String>,
     seen_anchors: HashSet<String>,
     styles: StyleSheet,
+    footnote_links: HashMap<usize, LinkRole>,
     paragraph_list_indents: Vec<f32>,
     suppressed_content: bool,
 }
 
 impl ReadingIrParser {
-    fn new(section_id: SpineItemId, section_href: PublicationUrl, styles: StyleSheet) -> Self {
+    fn new(
+        section_id: SpineItemId,
+        section_href: PublicationUrl,
+        styles: StyleSheet,
+        footnote_links: HashMap<usize, LinkRole>,
+    ) -> Self {
         Self {
             section_id,
             section_href,
@@ -74,6 +228,7 @@ impl ReadingIrParser {
             pending_anchors: Vec::new(),
             seen_anchors: HashSet::new(),
             styles,
+            footnote_links,
             paragraph_list_indents: Vec::new(),
             suppressed_content: false,
         }
@@ -149,8 +304,7 @@ impl ReadingIrParser {
                 child,
                 text_style,
                 None,
-                &self.section_href,
-                &self.styles,
+                &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links),
                 &mut collector,
             );
             index += 1;
@@ -677,8 +831,7 @@ impl ReadingIrParser {
                 child,
                 text_style,
                 None,
-                &self.section_href,
-                &self.styles,
+                &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links),
                 &mut collector,
             );
         }
@@ -752,8 +905,11 @@ impl ReadingIrParser {
                     cell,
                     text_style,
                     None,
-                    &self.section_href,
-                    &self.styles,
+                    &InlineParseContext::new(
+                        &self.section_href,
+                        &self.styles,
+                        &self.footnote_links,
+                    ),
                     &mut collector,
                 );
                 collector.finish();
@@ -896,8 +1052,7 @@ impl ReadingIrParser {
             node,
             self.styles.text_style_for_block(node, kind),
             None,
-            &self.section_href,
-            &self.styles,
+            &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links),
             &mut collector,
         );
         collector.finish();
@@ -1171,34 +1326,51 @@ impl InlineCollector {
     }
 }
 
+struct InlineParseContext<'a> {
+    base: &'a PublicationUrl,
+    styles: &'a StyleSheet,
+    footnote_links: &'a HashMap<usize, LinkRole>,
+}
+
+impl<'a> InlineParseContext<'a> {
+    const fn new(
+        base: &'a PublicationUrl,
+        styles: &'a StyleSheet,
+        footnote_links: &'a HashMap<usize, LinkRole>,
+    ) -> Self {
+        Self {
+            base,
+            styles,
+            footnote_links,
+        }
+    }
+}
+
 fn collect_inline(
     node: Node<'_, '_>,
     inherited: TextStyle,
     link: Option<&PublicationUrl>,
-    base: &PublicationUrl,
-    styles: &StyleSheet,
+    context: &InlineParseContext<'_>,
     collector: &mut InlineCollector,
 ) {
-    collect_inline_with_block_boundaries(node, inherited, link, base, styles, collector, false);
+    collect_inline_with_block_boundaries(node, inherited, link, context, collector, false);
 }
 
 fn collect_table_cell_inline(
     node: Node<'_, '_>,
     inherited: TextStyle,
     link: Option<&PublicationUrl>,
-    base: &PublicationUrl,
-    styles: &StyleSheet,
+    context: &InlineParseContext<'_>,
     collector: &mut InlineCollector,
 ) {
-    collect_inline_with_block_boundaries(node, inherited, link, base, styles, collector, true);
+    collect_inline_with_block_boundaries(node, inherited, link, context, collector, true);
 }
 
 fn collect_inline_with_block_boundaries(
     node: Node<'_, '_>,
     inherited: TextStyle,
     link: Option<&PublicationUrl>,
-    base: &PublicationUrl,
-    styles: &StyleSheet,
+    context: &InlineParseContext<'_>,
     collector: &mut InlineCollector,
     preserve_block_boundaries: bool,
 ) {
@@ -1207,8 +1379,7 @@ fn collect_inline_with_block_boundaries(
             child,
             inherited,
             link,
-            base,
-            styles,
+            context,
             collector,
             preserve_block_boundaries,
         );
@@ -1219,21 +1390,17 @@ fn collect_inline_node(
     node: Node<'_, '_>,
     inherited: TextStyle,
     link: Option<&PublicationUrl>,
-    base: &PublicationUrl,
-    styles: &StyleSheet,
+    context: &InlineParseContext<'_>,
     collector: &mut InlineCollector,
 ) {
-    collect_inline_node_with_block_boundaries(
-        node, inherited, link, base, styles, collector, false,
-    );
+    collect_inline_node_with_block_boundaries(node, inherited, link, context, collector, false);
 }
 
 fn collect_inline_node_with_block_boundaries(
     node: Node<'_, '_>,
     inherited: TextStyle,
     link: Option<&PublicationUrl>,
-    base: &PublicationUrl,
-    styles: &StyleSheet,
+    context: &InlineParseContext<'_>,
     collector: &mut InlineCollector,
     preserve_block_boundaries: bool,
 ) {
@@ -1273,7 +1440,9 @@ fn collect_inline_node_with_block_boundaries(
         }
         _ => {}
     }
-    styles.apply_text_node(node, &mut style, inherited.size_scale);
+    context
+        .styles
+        .apply_text_node(node, &mut style, inherited.size_scale);
     if name == "span" {
         let classes = attribute_local(node, "class").unwrap_or_default();
         let is_math = classes
@@ -1293,13 +1462,18 @@ fn collect_inline_node_with_block_boundaries(
         }
     }
     if name == "a" {
-        let resolved = attribute_local(node, "href").and_then(|href| base.resolve(href).ok());
+        let resolved =
+            attribute_local(node, "href").and_then(|href| context.base.resolve(href).ok());
+        style.link_role = context
+            .footnote_links
+            .get(&node.range().start)
+            .copied()
+            .unwrap_or_default();
         collect_inline_with_block_boundaries(
             node,
             style,
             resolved.as_ref().or(link),
-            base,
-            styles,
+            context,
             collector,
             preserve_block_boundaries,
         );
@@ -1308,8 +1482,7 @@ fn collect_inline_node_with_block_boundaries(
             node,
             style,
             link,
-            base,
-            styles,
+            context,
             collector,
             preserve_block_boundaries,
         );
@@ -2531,6 +2704,92 @@ mod tests {
                 && style.baseline == TextBaseline::Superscript
                 && (style.size_scale - 0.8).abs() < 0.001
         }));
+    }
+
+    #[test]
+    fn classifies_explicit_epub_footnote_links_without_superscript() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html xmlns="http://www.w3.org/1999/xhtml"
+            xmlns:epub="http://www.idpf.org/2007/ops"><body>
+            <p>Body<a id="ref-1" href="#note-1" epub:type="noteref">[1]</a></p>
+            <aside epub:type="footnote"><p><a id="note-1" href="#ref-1"
+                role="doc-backlink">[1]</a>Definition</p></aside>
+        </body></html>"##;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let runs = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(&block.content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(runs.iter().any(|run| {
+            run.text == "[1]"
+                && run.style.baseline == TextBaseline::Normal
+                && run.style.link_role == LinkRole::FootnoteReference
+        }));
+        assert!(runs.iter().any(|run| {
+            run.text == "[1]"
+                && run.style.baseline == TextBaseline::Normal
+                && run.style.link_role == LinkRole::FootnoteBacklink
+        }));
+    }
+
+    #[test]
+    fn classifies_legacy_reciprocal_bracketed_footnotes() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p>Authored prose.<a id="q0d3" href="#h0d3">【3】</a></p>
+            <p><a id="h0d3" href="#q0d3">【3】</a>Footnote definition.</p>
+            <p>Ordinary <a href="#section">[section]</a> link.</p>
+            <h2 id="section">Section</h2>
+        </body></html>"##;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let runs = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(&block.content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(runs.iter().any(|run| {
+            run.text == "【3】" && run.style.link_role == LinkRole::FootnoteReference
+        }));
+        assert!(runs.iter().any(|run| {
+            run.text == "【3】" && run.style.link_role == LinkRole::FootnoteBacklink
+        }));
+        assert!(
+            runs.iter()
+                .any(|run| { run.text == "[section]" && run.style.link_role == LinkRole::Normal })
+        );
     }
 
     #[test]

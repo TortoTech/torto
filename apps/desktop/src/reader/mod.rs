@@ -8,8 +8,8 @@ use peniko::{Blob, Color};
 use rebook_formats::{BookFormat, open_file_for_reading as open_publication_file_for_reading};
 use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
 use rebook_publication::{
-    Block, BookSource, Inline, PublicationUrl, RenditionLayout, Rgba, SourceAnchor, SourceRange,
-    TableOfContentsOrigin, TextBaseline, TextBlock, TextBlockKind,
+    Block, BookSource, Inline, LinkRole, PublicationUrl, RenditionLayout, Rgba, SourceAnchor,
+    SourceRange, TableOfContentsOrigin, TextBaseline, TextBlock, TextBlockKind,
 };
 use rebook_reader::{
     PageDirection, ReaderPosition, ReaderSectionPage, ReaderSelection, ReaderSession,
@@ -647,7 +647,8 @@ fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, Publication
             let Inline::Text(run) = inline else {
                 return None;
             };
-            (run.style.baseline == TextBaseline::Superscript)
+            (run.style.link_role == LinkRole::FootnoteReference
+                || run.style.baseline == TextBaseline::Superscript)
                 .then(|| run.link.clone())
                 .flatten()
                 .filter(|target| target.fragment().is_some())
@@ -655,6 +656,33 @@ fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, Publication
         })
         .filter(|(marker, _)| !marker.is_empty())
         .collect()
+}
+
+fn text_block_has_link_role(block: &TextBlock, role: LinkRole) -> bool {
+    block.content.iter().any(|inline| {
+        matches!(inline, Inline::Text(run) if run.link.is_some() && run.style.link_role == role)
+    })
+}
+
+fn block_is_footnote_definition(block: &Block) -> bool {
+    match block {
+        Block::Text(block) => text_block_has_link_role(block, LinkRole::FootnoteBacklink),
+        Block::Quote(quote) => quote
+            .body
+            .iter()
+            .chain(quote.attribution.iter())
+            .any(|block| text_block_has_link_role(block, LinkRole::FootnoteBacklink)),
+        Block::Table(table) => table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .any(|cell| text_block_has_link_role(&cell.text, LinkRole::FootnoteBacklink)),
+        Block::Figure(figure) => figure
+            .captions
+            .iter()
+            .any(|caption| text_block_has_link_role(caption, LinkRole::FootnoteBacklink)),
+        Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => false,
+    }
 }
 
 fn block_footnote_references(block: &Block) -> Vec<(String, PublicationUrl)> {
@@ -1174,6 +1202,10 @@ impl DesktopReader {
         let mut active_list_root: Option<(usize, u8)> = None;
         for (block_index, block) in section.blocks.iter().enumerate() {
             if block_source_range(block).is_some_and(|range| !reading_ranges.contains(range)) {
+                active_list_root = None;
+                continue;
+            }
+            if block_is_footnote_definition(block) {
                 active_list_root = None;
                 continue;
             }
@@ -2525,13 +2557,14 @@ mod tests {
         FocusFootnote, FocusUnit, FollowUp, HashSet, Instant, MOTION_DURATION, Motion, MotionCurve,
         NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, ScrollSectionLayout, SidebarTab,
         SnapshotEffects, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer,
-        TranslationUiState, allowed_reading_mode, embedded_toc_is_page_index,
-        focus_block_paint_ranges, focus_list_descendant_root, focus_scroll_duration,
-        focus_unit_container_center_y, focus_unit_contains_source_range,
+        TranslationUiState, allowed_reading_mode, block_is_footnote_definition,
+        embedded_toc_is_page_index, focus_block_paint_ranges, focus_list_descendant_root,
+        focus_scroll_duration, focus_unit_container_center_y, focus_unit_contains_source_range,
         focus_unit_geometry_ranges, focus_unit_matches_highlight_ranges,
         focus_unit_screen_center_y, focus_unit_scroll_bounds, focus_unit_target_offset_for_rect,
         legacy_translated_paragraph_range, logical_dimension, merge_focus_list_descendant,
         resolve_book_display_metadata, resolved_focus_unit_index, source_range_contains_anchor,
+        text_block_footnote_references,
     };
     use crate::plugins::PdfOcrViewMode;
     use crate::preferences::ReadingMode;
@@ -2541,8 +2574,9 @@ mod tests {
         SeparatorPlacement,
     };
     use rebook_publication::{
-        Block, BlockStyle, Rgba, SourceAnchor, SourceRange, SpineItemId, TableBlock, TableCell,
-        TableRow, TextBlock, TextBlockKind, TocEntry,
+        Block, BlockStyle, Inline, LinkRole, PublicationUrl, Rgba, SourceAnchor, SourceRange,
+        SpineItemId, TableBlock, TableCell, TableRow, TextBlock, TextBlockKind, TextRun, TextStyle,
+        TocEntry,
     };
     use rebook_reader::{ReaderPosition, ReaderSectionPage};
     use rebook_renderer::DisplayListCompiler;
@@ -2554,6 +2588,46 @@ mod tests {
             href: None,
             children,
         }
+    }
+
+    #[test]
+    fn semantic_baseline_footnotes_resolve_and_definitions_are_skipped() {
+        let target = PublicationUrl::parse("chapter.xhtml#note-3").unwrap();
+        let reference = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "【3】".into(),
+                style: TextStyle {
+                    link_role: LinkRole::FootnoteReference,
+                    ..TextStyle::default()
+                },
+                link: Some(target),
+            })],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        assert_eq!(
+            text_block_footnote_references(&reference)
+                .into_iter()
+                .map(|(marker, _)| marker)
+                .collect::<Vec<_>>(),
+            ["【3】"]
+        );
+
+        let definition = Block::Text(TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "【3】".into(),
+                style: TextStyle {
+                    link_role: LinkRole::FootnoteBacklink,
+                    ..TextStyle::default()
+                },
+                link: Some(PublicationUrl::parse("chapter.xhtml#ref-3").unwrap()),
+            })],
+            style: BlockStyle::default(),
+            source: None,
+        });
+        assert!(block_is_footnote_definition(&definition));
     }
 
     #[test]

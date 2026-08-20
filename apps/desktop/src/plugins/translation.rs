@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 
 use rebook_publication::{
     Block, BlockStyle, Book, BookSource, FigureBlock, FixedPageTextLayer, FixedPageTextRect,
-    FixedPageTextReplacement, FixedPageTextReplacementSegment, Inline, PublicationError,
+    FixedPageTextReplacement, FixedPageTextReplacementSegment, Inline, LinkRole, PublicationError,
     PublicationUrl, RasterResource, RenditionLayout, Resource, Section, SourceRange, TextBaseline,
     TextBlock, TextBlockKind, TextRun, TextStyle,
 };
@@ -941,6 +941,17 @@ fn translation_text(block: &TextBlock) -> String {
 
 fn push_translation_style_markup(output: &mut String, run: &TextRun) {
     let mut closing = Vec::new();
+    match run.style.link_role {
+        LinkRole::Normal => {}
+        LinkRole::FootnoteReference => {
+            output.push_str("<noteref>");
+            closing.push("</noteref>");
+        }
+        LinkRole::FootnoteBacklink => {
+            output.push_str("<noteback>");
+            closing.push("</noteback>");
+        }
+    }
     if run.style.bold {
         output.push_str("<strong>");
         closing.push("</strong>");
@@ -999,7 +1010,7 @@ fn translated_footnote_link(
     style: TextStyle,
     original: &[Inline],
 ) -> Option<PublicationUrl> {
-    if style.baseline != TextBaseline::Superscript {
+    if style.link_role == LinkRole::Normal && style.baseline != TextBaseline::Superscript {
         return None;
     }
     let translated_marker = translated_marker.trim();
@@ -1007,7 +1018,10 @@ fn translated_footnote_link(
         let Inline::Text(run) = inline else {
             return None;
         };
-        (run.style.baseline == TextBaseline::Superscript && run.text.trim() == translated_marker)
+        ((run.style.link_role == style.link_role && run.style.link_role != LinkRole::Normal
+            || style.link_role == LinkRole::Normal
+                && run.style.baseline == TextBaseline::Superscript)
+            && run.text.trim() == translated_marker)
             .then(|| run.link.clone())
             .flatten()
             .filter(|target| target.fragment().is_some())
@@ -1026,6 +1040,7 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
     style.italic = false;
     style.underline = false;
     style.baseline = TextBaseline::Normal;
+    style.link_role = LinkRole::Normal;
     style
 }
 
@@ -1129,6 +1144,8 @@ enum TranslationStyleTag {
     Underline,
     Superscript,
     Subscript,
+    FootnoteReference,
+    FootnoteBacklink,
 }
 
 fn parse_inline_style_markup(
@@ -1181,6 +1198,10 @@ fn next_translation_style_tag(
         ("</sup>", TranslationStyleTag::Superscript, false),
         ("<sub>", TranslationStyleTag::Subscript, true),
         ("</sub>", TranslationStyleTag::Subscript, false),
+        ("<noteref>", TranslationStyleTag::FootnoteReference, true),
+        ("</noteref>", TranslationStyleTag::FootnoteReference, false),
+        ("<noteback>", TranslationStyleTag::FootnoteBacklink, true),
+        ("</noteback>", TranslationStyleTag::FootnoteBacklink, false),
     ]
     .into_iter()
     .filter_map(|(token, tag, opening)| text.find(token).map(|index| (index, tag, opening, token)))
@@ -1197,6 +1218,12 @@ fn apply_translation_style_tag(mut style: TextStyle, tag: TranslationStyleTag) -
         }
         TranslationStyleTag::Subscript => {
             style = baseline_style(style, TextBaseline::Subscript);
+        }
+        TranslationStyleTag::FootnoteReference => {
+            style.link_role = LinkRole::FootnoteReference;
+        }
+        TranslationStyleTag::FootnoteBacklink => {
+            style.link_role = LinkRole::FootnoteBacklink;
         }
     }
     style
@@ -1229,11 +1256,14 @@ fn restore_original_baselines(
             Inline::Text(run) => {
                 let offset = original_offset;
                 original_offset += run.text.chars().count();
-                (run.style.baseline != TextBaseline::Normal && !run.text.is_empty()).then_some((
-                    run.text.as_str(),
-                    run.style,
-                    offset.saturating_mul(1_000) / original_length,
-                ))
+                (run.style.baseline != TextBaseline::Normal
+                    || run.style.link_role != LinkRole::Normal)
+                    .then_some((
+                        run.text.as_str(),
+                        run.style,
+                        offset.saturating_mul(1_000) / original_length,
+                    ))
+                    .filter(|_| !run.text.is_empty())
             }
             Inline::Break => {
                 original_offset += 1;
@@ -1533,6 +1563,47 @@ mod tests {
                 if run.text == "4"
                     && run.style.baseline == TextBaseline::Superscript
                     && run.link.as_ref() == Some(&footnote_target)
+        )));
+    }
+
+    #[test]
+    fn translation_preserves_semantic_baseline_footnote_links() {
+        let target = PublicationUrl::parse("chapter.xhtml#note-3").unwrap();
+        let original = vec![
+            Inline::Text(TextRun {
+                text: "Meaning".into(),
+                style: TextStyle::default(),
+                link: None,
+            }),
+            Inline::Text(TextRun {
+                text: "【3】".into(),
+                style: TextStyle {
+                    link_role: LinkRole::FootnoteReference,
+                    ..TextStyle::default()
+                },
+                link: Some(target.clone()),
+            }),
+        ];
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: original.clone(),
+            style: BlockStyle::default(),
+            source: None,
+        };
+
+        assert_eq!(translation_text(&block), "Meaning<noteref>【3】</noteref>");
+        let translated = replacement_content(
+            "含义<noteref>【3】</noteref>",
+            TextStyle::default(),
+            Some(&original),
+        );
+        assert!(translated.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run)
+                if run.text == "【3】"
+                    && run.style.link_role == LinkRole::FootnoteReference
+                    && run.style.baseline == TextBaseline::Normal
+                    && run.link.as_ref() == Some(&target)
         )));
     }
 

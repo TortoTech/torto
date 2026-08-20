@@ -13,9 +13,9 @@ use parley::{
 use read_fonts::{FontRef, TableProvider as _};
 use rebook_publication::{
     Block, BookSource, CaptionPosition, FixedPageDimensions, FixedPageTextLayer, FixedPageTextRect,
-    ImageBlock, ImageStyle, Inline, MathRun, PublicationError, PublicationUrl, RenditionLayout,
-    Rgba, Section, SourceRange, TableBlock, TableCell, TextAlignment, TextBaseline, TextBlock,
-    TextBlockKind, TextRun, TextStyle, WritingSystem,
+    ImageBlock, ImageStyle, Inline, LinkRole, MathRun, PublicationError, PublicationUrl,
+    RenditionLayout, Rgba, Section, SourceRange, TableBlock, TableCell, TextAlignment,
+    TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle, WritingSystem,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -423,15 +423,26 @@ pub struct TextBrush {
     pub underline: bool,
     pub baseline: TextBaseline,
     pub footnote_reference: bool,
+    /// Stable identifier for all glyph runs produced by one semantic footnote marker.
+    ///
+    /// Font fallback can split a marker such as `【3】` into several glyph runs. The
+    /// renderer uses this identifier to collapse those runs back into one icon.
+    pub footnote_reference_group: u32,
 }
 
 impl TextBrush {
-    fn new(color: Rgba, underline: bool, baseline: TextBaseline, footnote_reference: bool) -> Self {
+    fn new(
+        color: Rgba,
+        underline: bool,
+        baseline: TextBaseline,
+        footnote_reference_group: u32,
+    ) -> Self {
         Self {
             color,
             underline,
             baseline,
-            footnote_reference,
+            footnote_reference: footnote_reference_group != 0,
+            footnote_reference_group,
         }
     }
 }
@@ -1271,8 +1282,7 @@ impl LayoutEngine {
         builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(
             block.style.line_height,
         )));
-        let default_brush =
-            TextBrush::new(reader_style.foreground, false, TextBaseline::Normal, false);
+        let default_brush = TextBrush::new(reader_style.foreground, false, TextBaseline::Normal, 0);
         builder.push_default(StyleProperty::Brush(default_brush));
 
         for span in spans {
@@ -1284,7 +1294,7 @@ impl LayoutEngine {
                     span.style.color,
                     span.style.underline,
                     span.style.baseline,
-                    span.footnote_reference,
+                    span.footnote_reference_group,
                 )),
                 span.range.clone(),
             );
@@ -1798,7 +1808,7 @@ pub fn reading_content_width(page_width: f32, reader_style: &ReaderStyle) -> f32
 struct StyledRange {
     range: Range<usize>,
     style: TextStyle,
-    footnote_reference: bool,
+    footnote_reference_group: u32,
 }
 
 struct PreparedText {
@@ -2014,6 +2024,7 @@ fn prepare_inline_content(
     let mut text = String::new();
     let mut spans = Vec::new();
     let mut inline_images = Vec::new();
+    let mut next_footnote_reference_group = 1_u32;
     let prefix = list_marker_prefix(block.kind);
     if !prefix.is_empty() {
         let start = text.len();
@@ -2024,7 +2035,7 @@ fn prepare_inline_content(
                 color: fallback_color,
                 ..TextStyle::default()
             },
-            footnote_reference: false,
+            footnote_reference_group: 0,
         });
     }
     let source_text_start = text.len();
@@ -2033,20 +2044,33 @@ fn prepare_inline_content(
         match inline {
             Inline::Text(run) => {
                 let start = text.len();
-                text.push_str(&run.text);
                 let mut style = run.style;
                 if style.color == Rgba::BLACK {
                     style.color = fallback_color;
                 }
+                let footnote_reference = focus_footnote_icons
+                    && run
+                        .link
+                        .as_ref()
+                        .is_some_and(|target| target.fragment().is_some())
+                    && (run.style.link_role == LinkRole::FootnoteReference
+                        || run.style.baseline == TextBaseline::Superscript);
+                if footnote_reference {
+                    text.push_str(&footnote_icon_placeholder(&run.text));
+                } else {
+                    text.push_str(&run.text);
+                }
+                let footnote_reference_group = if footnote_reference {
+                    let group = next_footnote_reference_group;
+                    next_footnote_reference_group = next_footnote_reference_group.saturating_add(1);
+                    group
+                } else {
+                    0
+                };
                 spans.push(StyledRange {
                     range: start..text.len(),
                     style,
-                    footnote_reference: focus_footnote_icons
-                        && run
-                            .link
-                            .as_ref()
-                            .is_some_and(|target| target.fragment().is_some())
-                        && run.style.baseline == TextBaseline::Superscript,
+                    footnote_reference_group,
                 });
             }
             Inline::Math(run) => {
@@ -2077,7 +2101,7 @@ fn prepare_inline_content(
                             color: fallback_color,
                             ..TextStyle::default()
                         },
-                        footnote_reference: false,
+                        footnote_reference_group: 0,
                     });
                 }
             }
@@ -2085,6 +2109,18 @@ fn prepare_inline_content(
         }
     }
     (text, spans, inline_images, source_text_start)
+}
+
+/// Reserves one compact glyph slot for a semantic footnote while retaining the
+/// original scalar count used by source-offset mapping. Remaining scalars become
+/// zero-width word joiners so markers such as `【3】` do not leave three ems of
+/// blank space around the replacement icon.
+fn footnote_icon_placeholder(marker: &str) -> String {
+    marker
+        .chars()
+        .enumerate()
+        .map(|(index, _)| if index == 0 { '0' } else { '\u{2060}' })
+        .collect()
 }
 
 fn list_marker_prefix(kind: TextBlockKind) -> String {
@@ -2911,7 +2947,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn focus_footnote_icons_only_mark_linked_superscripts() {
+    fn focus_footnote_icons_mark_semantic_references_and_legacy_linked_superscripts() {
         let linked_superscript = TextRun {
             text: "1".into(),
             style: TextStyle {
@@ -2930,19 +2966,28 @@ mod tests {
             style: TextStyle::default(),
             link: linked_superscript.link.clone(),
         };
+        let semantic_baseline_reference = TextRun {
+            text: "[4]".into(),
+            style: TextStyle {
+                link_role: LinkRole::FootnoteReference,
+                ..TextStyle::default()
+            },
+            link: linked_superscript.link.clone(),
+        };
         let block = TextBlock {
             kind: TextBlockKind::Paragraph,
             content: vec![
                 Inline::Text(linked_superscript),
                 Inline::Text(unlinked_superscript),
                 Inline::Text(linked_baseline_text),
+                Inline::Text(semantic_baseline_reference),
             ],
             style: rebook_publication::BlockStyle::default(),
             source: None,
         };
         let svg_options = resvg::usvg::Options::default();
 
-        let (_, spans, _, _) = prepare_inline_content(
+        let (focus_text, spans, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &ReaderTypography::default(),
@@ -2953,12 +2998,13 @@ mod tests {
         assert_eq!(
             spans
                 .iter()
-                .map(|span| span.footnote_reference)
+                .map(|span| span.footnote_reference_group != 0)
                 .collect::<Vec<_>>(),
-            [true, false, false]
+            [true, false, false, true]
         );
+        assert_eq!(focus_text, "0230\u{2060}\u{2060}");
 
-        let (_, disabled_spans, _, _) = prepare_inline_content(
+        let (classic_text, disabled_spans, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &ReaderTypography::default(),
@@ -2966,7 +3012,12 @@ mod tests {
             &svg_options,
             false,
         );
-        assert!(disabled_spans.iter().all(|span| !span.footnote_reference));
+        assert!(
+            disabled_spans
+                .iter()
+                .all(|span| span.footnote_reference_group == 0)
+        );
+        assert_eq!(classic_text, "123[4]");
     }
 
     #[test]

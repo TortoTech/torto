@@ -1811,6 +1811,7 @@ fn compile_text_commands(
     text: &TextPlacement,
 ) {
     let transform = Affine::translate((f64::from(text.origin_x), f64::from(text.origin_y)));
+    let mut compiled_footnote_groups = Vec::<u32>::new();
     for line in text
         .layout
         .lines()
@@ -1868,19 +1869,21 @@ fn compile_text_commands(
                 TextBaseline::Subscript => run.font_size() * 0.2,
             };
             if brush.footnote_reference {
+                if compiled_footnote_groups.contains(&brush.footnote_reference_group) {
+                    continue;
+                }
                 if let Some(source) = text.source.clone() {
                     let size = (run.font_size() * 0.78).clamp(8.0, 12.0);
                     let center_x = text.origin_x + glyph_run.offset() + glyph_run.advance() / 2.0;
                     let baseline = text.origin_y + glyph_run.baseline() + baseline_offset;
-                    footnote_regions.push(FootnoteRegion {
-                        bounds: Rect::new(
-                            f64::from(center_x - size / 2.0),
-                            f64::from(baseline - size * 0.88),
-                            f64::from(center_x + size / 2.0),
-                            f64::from(baseline + size * 0.12),
-                        ),
-                        source,
-                    });
+                    let bounds = Rect::new(
+                        f64::from(center_x - size / 2.0),
+                        f64::from(baseline - size * 0.88),
+                        f64::from(center_x + size / 2.0),
+                        f64::from(baseline + size * 0.12),
+                    );
+                    footnote_regions.push(FootnoteRegion { bounds, source });
+                    compiled_footnote_groups.push(brush.footnote_reference_group);
                 }
                 continue;
             }
@@ -2117,8 +2120,8 @@ mod tests {
     }
 
     #[test]
-    fn footnote_reference_keeps_its_layout_slot_but_omits_the_original_glyph() {
-        let text: Arc<str> = "A1".into();
+    fn multi_run_footnote_reference_compiles_to_one_icon_region() {
+        let text: Arc<str> = "A【3】".into();
         let mut font_context = FontContext::new();
         let mut layout_context = LayoutContext::new();
         let mut builder =
@@ -2129,6 +2132,7 @@ mod tests {
             underline: false,
             baseline: TextBaseline::Normal,
             footnote_reference: false,
+            footnote_reference_group: 0,
         }));
         builder.push(
             StyleProperty::Brush(TextBrush {
@@ -2136,9 +2140,13 @@ mod tests {
                 underline: false,
                 baseline: TextBaseline::Superscript,
                 footnote_reference: true,
+                footnote_reference_group: 1,
             }),
-            1..2,
+            1..8,
         );
+        // Force the semantic marker into several glyph runs independently of the
+        // fonts installed on the test machine. All runs must still become one icon.
+        builder.push(StyleProperty::FontSize(17.0), 4..5);
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(240.0));
         layout.align(Alignment::Start, AlignmentOptions::default());
@@ -2151,7 +2159,7 @@ mod tests {
             end: SourceAnchor {
                 spine: SpineItemId::new("chapter-1").unwrap(),
                 node: "paragraph-1".into(),
-                text_offset: 2,
+                text_offset: 8,
             },
         };
         let page = PageLayout {
@@ -2202,6 +2210,7 @@ mod tests {
             underline: false,
             baseline: TextBaseline::Normal,
             footnote_reference: false,
+            footnote_reference_group: 0,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(240.0));
@@ -2294,6 +2303,7 @@ mod tests {
             underline: false,
             baseline: TextBaseline::Normal,
             footnote_reference: false,
+            footnote_reference_group: 0,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(240.0));
@@ -2349,6 +2359,7 @@ mod tests {
             underline: false,
             baseline: TextBaseline::Normal,
             footnote_reference: false,
+            footnote_reference_group: 0,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(150.0));
@@ -2434,6 +2445,7 @@ mod tests {
             underline: false,
             baseline: TextBaseline::Normal,
             footnote_reference: false,
+            footnote_reference_group: 0,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.set_text_indent(
@@ -2517,6 +2529,7 @@ mod tests {
             underline: false,
             baseline: TextBaseline::Normal,
             footnote_reference: false,
+            footnote_reference_group: 0,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(180.0));
@@ -2699,6 +2712,7 @@ mod tests {
             underline: false,
             baseline: TextBaseline::Normal,
             footnote_reference: false,
+            footnote_reference_group: 0,
         }));
         let mut layout = builder.build(text.as_ref());
         layout.break_all_lines(Some(80.0));
