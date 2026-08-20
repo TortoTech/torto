@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use rebook_publication::{
     Block, BlockStyle, CaptionPosition, FigureBlock, ImageBlock, ImageLength, ImageStyle, Inline,
-    LinkRole, MathRun, PublicationUrl, QuoteBlock, Rgba, Section, SectionAnchor, SourceAnchor,
-    SourceRange, SpineItem, SpineItemId, TableBlock, TableCell, TableRow, TextAlignment,
-    TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
+    InlineRole, LinkRole, MathRun, PublicationUrl, QuoteBlock, Rgba, Section, SectionAnchor,
+    SourceAnchor, SourceRange, SpineItem, SpineItemId, TableBlock, TableCell, TableRow,
+    TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 use roxmltree::{Document, Node};
 use thiserror::Error;
@@ -255,8 +255,7 @@ impl ReadingIrParser {
         if self.try_parse_structural_quote(container)? {
             return Ok(());
         }
-        let mut style = self.styles.block_style(container, BlockStyle::default());
-        style.indent = 0.0;
+        let style = self.styles.block_style(container, BlockStyle::default());
         let text_style = self
             .styles
             .text_style_for_block(container, TextBlockKind::Paragraph);
@@ -424,7 +423,7 @@ impl ReadingIrParser {
         match name.as_str() {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let level = name[1..].parse::<u8>().unwrap_or(1);
-                let mut style = self.styles.block_style(
+                let style = self.styles.block_style(
                     node,
                     BlockStyle {
                         margin_before: 32.0,
@@ -434,7 +433,6 @@ impl ReadingIrParser {
                         ..BlockStyle::default()
                     },
                 );
-                style.indent = 0.0;
                 self.push_text_block(node, TextBlockKind::Heading(level), style)?;
             }
             "p" => {
@@ -470,7 +468,9 @@ impl ReadingIrParser {
                         self.paragraph_list_indents.clear();
                         TextBlockKind::Paragraph
                     };
-                    style.indent = 0.0;
+                    if matches!(kind, TextBlockKind::ListItem { .. }) {
+                        style.indent = 0.0;
+                    }
                     self.push_text_block(node, kind, style)?;
                 }
             }
@@ -1445,6 +1445,12 @@ fn collect_inline_node_with_block_boundaries(
         .apply_text_node(node, &mut style, inherited.size_scale);
     if name == "span" {
         let classes = attribute_local(node, "class").unwrap_or_default();
+        if classes
+            .split_ascii_whitespace()
+            .any(|class| matches!(class, "footnote" | "footnote1"))
+        {
+            style.inline_role = InlineRole::Footnote;
+        }
         let is_math = classes
             .split_ascii_whitespace()
             .any(|class| class == "math");
@@ -2526,6 +2532,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preserves_authored_indent_except_for_normalized_list_items() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            .indented { text-indent: 2em; }
+            .bullet { margin-left: 2em; text-indent: -1em; }
+        </style></head><body>
+            <h2 class="indented">Heading</h2>
+            <div class="indented">Container prose</div>
+            <p class="indented">Paragraph prose</p>
+            <p class="bullet"><span class="enumerator">•</span> List item</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let text_blocks = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(block),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(text_blocks.len(), 4);
+        assert!(matches!(text_blocks[0].kind, TextBlockKind::Heading(2)));
+        assert!(text_blocks[0].style.indent > 0.0);
+        assert_eq!(text_blocks[1].kind, TextBlockKind::Paragraph);
+        assert!(text_blocks[1].style.indent > 0.0);
+        assert_eq!(text_blocks[2].kind, TextBlockKind::Paragraph);
+        assert!(text_blocks[2].style.indent > 0.0);
+        assert!(matches!(
+            text_blocks[3].kind,
+            TextBlockKind::ListItem { .. }
+        ));
+        assert!(text_blocks[3].style.indent.abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn applies_external_class_styles_and_inline_cascade() {
         let descriptor = SpineItem {
             id: SpineItemId::new("chapter").unwrap(),
@@ -2568,7 +2617,7 @@ mod tests {
         assert_close(block.style.line_height, 1.8);
         assert_close(block.style.margin_before, 32.0);
         assert_close(block.style.margin_after, 16.0);
-        assert_close(block.style.indent, 0.0);
+        assert_close(block.style.indent, 32.0);
         let Inline::Text(regular) = &block.content[0] else {
             panic!("expected regular text");
         };
@@ -2704,6 +2753,39 @@ mod tests {
                 && style.baseline == TextBaseline::Superscript
                 && (style.size_scale - 0.8).abs() < 0.001
         }));
+    }
+
+    #[test]
+    fn classifies_only_supported_inline_footnote_classes() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p>Body<span class="footnote">First note</span>
+                <span class="minor footnote1">Second note</span>
+                <span class="footnote2">Block-style note</span></p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Text(block)] = section.blocks.as_slice() else {
+            panic!("expected one text block");
+        };
+        let roles = block
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some((run.text.trim(), run.style.inline_role)),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(roles.contains(&("First note", InlineRole::Footnote)));
+        assert!(roles.contains(&("Second note", InlineRole::Footnote)));
+        assert!(roles.contains(&("Block-style note", InlineRole::Normal)));
     }
 
     #[test]

@@ -42,6 +42,18 @@ pub enum SelectionGranularity {
     Paragraph,
 }
 
+/// Returns the contiguous Unicode sentence ranges in `text`.
+///
+/// Ranges are byte offsets and retain the boundary whitespace supplied by
+/// `unicode-segmentation`, so consumers can reconstruct the source text
+/// without rewriting it. Semantic selection trims a chosen range only when it
+/// presents that range to the user.
+pub fn sentence_byte_ranges(text: &str) -> Vec<Range<usize>> {
+    text.split_sentence_bound_indices()
+        .map(|(start, sentence)| start..start + sentence.len())
+        .collect()
+}
+
 /// Stable current position exposed to the application shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderLocation {
@@ -3213,11 +3225,10 @@ fn extend_word_to_sentence_or_paragraph_end(
     if punctuation_end > word.end && has_sentence_terminal {
         return word.start..punctuation_end;
     }
-    let sentence_end = source_text
-        .split_sentence_bound_indices()
-        .find_map(|(start, sentence)| {
-            let sentence_range =
-                selectable.start + start..selectable.start + start + sentence.len();
+    let sentence_end = sentence_byte_ranges(source_text)
+        .into_iter()
+        .find_map(|range| {
+            let sentence_range = selectable.start + range.start..selectable.start + range.end;
             let trimmed = trim_whitespace_range(text, sentence_range)?;
             range_ends_with_word(text, &trimmed, &word).then_some(trimmed.end)
         });
@@ -3309,12 +3320,12 @@ fn semantic_byte_range(
             .unicode_word_indices()
             .map(|(start, word)| selectable.start + start..selectable.start + start + word.len())
             .collect::<Vec<_>>(),
-        SelectionGranularity::Sentence => source_text
-            .split_sentence_bound_indices()
-            .filter_map(|(start, sentence)| {
+        SelectionGranularity::Sentence => sentence_byte_ranges(source_text)
+            .into_iter()
+            .filter_map(|range| {
                 trim_whitespace_range(
                     text,
-                    selectable.start + start..selectable.start + start + sentence.len(),
+                    selectable.start + range.start..selectable.start + range.end,
                 )
             })
             .collect::<Vec<_>>(),

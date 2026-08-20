@@ -666,6 +666,9 @@ pub struct TextStyle {
     /// Semantic role of the surrounding link, when this run is linked.
     #[serde(default)]
     pub link_role: LinkRole,
+    /// Semantic role carried by inline content independently of links.
+    #[serde(default)]
+    pub inline_role: InlineRole,
 }
 
 impl Default for TextStyle {
@@ -678,8 +681,18 @@ impl Default for TextStyle {
             color: Rgba::BLACK,
             baseline: TextBaseline::Normal,
             link_role: LinkRole::Normal,
+            inline_role: InlineRole::Normal,
         }
     }
+}
+
+/// Semantic role carried by inline publication content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InlineRole {
+    #[default]
+    Normal,
+    /// An inline footnote whose body is embedded directly in the prose.
+    Footnote,
 }
 
 /// Semantic role carried by an inline publication link.
@@ -731,6 +744,10 @@ pub struct BlockStyle {
     pub margin_start_fraction: f32,
     pub indent: f32,
     pub line_height: f32,
+    /// Compact vertical gap, in ems, used between semantic subparagraphs that
+    /// remain part of one selectable/source-addressable text block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subparagraph_gap_em: Option<f32>,
 }
 
 impl Default for BlockStyle {
@@ -743,7 +760,8 @@ impl Default for BlockStyle {
             margin_start: 0.0,
             margin_start_fraction: 0.0,
             indent: 0.0,
-            line_height: 1.72,
+            line_height: 1.5,
+            subparagraph_gap_em: None,
         }
     }
 }

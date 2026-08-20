@@ -9,6 +9,7 @@ mod pdf_toc;
 mod pdf_vision;
 mod rewrite;
 mod search;
+mod structure;
 mod translation;
 
 use std::env;
@@ -44,6 +45,7 @@ pub(crate) use pdf_toc::{PdfMetadataExtraction, extract_pdf_metadata};
 pub use rewrite::RewriteBookSource;
 pub use search::{BookSearchResult, search_book};
 pub(crate) use search::{section_title, text_block_text};
+pub(crate) use structure::{ParagraphStructureKey, ParagraphStructureSource};
 pub use translation::{BlockTranslation, TranslationBlockInput, TranslationBookSource};
 
 const SETTINGS_FILE: &str = "plugins.json";

@@ -27,6 +27,14 @@ fn focus_block_activation_color() -> Color {
     Color::from_rgba8(accent.red, accent.green, accent.blue, accent.alpha)
 }
 
+fn focus_unit_activation_color(structured: bool) -> Color {
+    if structured {
+        TEXT_SELECTION_COLOR
+    } else {
+        focus_block_activation_color()
+    }
+}
+
 fn focus_footnote_icon_color() -> Color {
     let color = crate::ui::footnote_link_color();
     Color::from_rgba8(color.r(), color.g(), color.b(), color.a())
@@ -153,13 +161,13 @@ impl DesktopReader {
                 ),
                 7.0,
             );
-            scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                focus_block_activation_color(),
-                None,
-                &background,
-            );
+            let color = self
+                .focus_units
+                .get(self.focus_unit_index)
+                .map_or_else(focus_block_activation_color, |unit| {
+                    focus_unit_activation_color(unit.structured_activation)
+                });
+            scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &background);
         }
         let mut images = Vec::new();
         for (index, entry) in layout.pages.iter().enumerate() {
@@ -335,7 +343,7 @@ impl DesktopReader {
             page.paint_source_block_background(
                 scene,
                 &unit.paint_ranges,
-                focus_block_activation_color(),
+                focus_unit_activation_color(unit.structured_activation),
                 offset_x,
             );
         }
@@ -411,6 +419,12 @@ impl DesktopReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_focus_cards_reuse_the_text_highlight_fill() {
+        assert_eq!(focus_unit_activation_color(true), TEXT_SELECTION_COLOR);
+        assert_ne!(focus_unit_activation_color(false), TEXT_SELECTION_COLOR);
+    }
 
     #[test]
     fn evicting_a_focus_image_page_removes_only_its_cached_scene() {

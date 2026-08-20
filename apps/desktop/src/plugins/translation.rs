@@ -4,9 +4,9 @@ use std::sync::{Arc, RwLock};
 
 use rebook_publication::{
     Block, BlockStyle, Book, BookSource, FigureBlock, FixedPageTextLayer, FixedPageTextRect,
-    FixedPageTextReplacement, FixedPageTextReplacementSegment, Inline, LinkRole, PublicationError,
-    PublicationUrl, RasterResource, RenditionLayout, Resource, Section, SourceRange, TextBaseline,
-    TextBlock, TextBlockKind, TextRun, TextStyle,
+    FixedPageTextReplacement, FixedPageTextReplacementSegment, Inline, InlineRole, LinkRole,
+    PublicationError, PublicationUrl, RasterResource, RenditionLayout, Resource, Section,
+    SourceRange, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 
 use super::TranslationMode;
@@ -941,6 +941,10 @@ fn translation_text(block: &TextBlock) -> String {
 
 fn push_translation_style_markup(output: &mut String, run: &TextRun) {
     let mut closing = Vec::new();
+    if run.style.inline_role == InlineRole::Footnote {
+        output.push_str("<inlinefootnote>");
+        closing.push("</inlinefootnote>");
+    }
     match run.style.link_role {
         LinkRole::Normal => {}
         LinkRole::FootnoteReference => {
@@ -1041,6 +1045,7 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
     style.underline = false;
     style.baseline = TextBaseline::Normal;
     style.link_role = LinkRole::Normal;
+    style.inline_role = InlineRole::Normal;
     style
 }
 
@@ -1146,6 +1151,7 @@ enum TranslationStyleTag {
     Subscript,
     FootnoteReference,
     FootnoteBacklink,
+    InlineFootnote,
 }
 
 fn parse_inline_style_markup(
@@ -1202,6 +1208,16 @@ fn next_translation_style_tag(
         ("</noteref>", TranslationStyleTag::FootnoteReference, false),
         ("<noteback>", TranslationStyleTag::FootnoteBacklink, true),
         ("</noteback>", TranslationStyleTag::FootnoteBacklink, false),
+        (
+            "<inlinefootnote>",
+            TranslationStyleTag::InlineFootnote,
+            true,
+        ),
+        (
+            "</inlinefootnote>",
+            TranslationStyleTag::InlineFootnote,
+            false,
+        ),
     ]
     .into_iter()
     .filter_map(|(token, tag, opening)| text.find(token).map(|index| (index, tag, opening, token)))
@@ -1224,6 +1240,9 @@ fn apply_translation_style_tag(mut style: TextStyle, tag: TranslationStyleTag) -
         }
         TranslationStyleTag::FootnoteBacklink => {
             style.link_role = LinkRole::FootnoteBacklink;
+        }
+        TranslationStyleTag::InlineFootnote => {
+            style.inline_role = InlineRole::Footnote;
         }
     }
     style
@@ -1257,7 +1276,8 @@ fn restore_original_baselines(
                 let offset = original_offset;
                 original_offset += run.text.chars().count();
                 (run.style.baseline != TextBaseline::Normal
-                    || run.style.link_role != LinkRole::Normal)
+                    || run.style.link_role != LinkRole::Normal
+                    || run.style.inline_role != InlineRole::Normal)
                     .then_some((
                         run.text.as_str(),
                         run.style,
@@ -1604,6 +1624,48 @@ mod tests {
                     && run.style.link_role == LinkRole::FootnoteReference
                     && run.style.baseline == TextBaseline::Normal
                     && run.link.as_ref() == Some(&target)
+        )));
+    }
+
+    #[test]
+    fn translation_preserves_inline_footnote_semantics() {
+        let original = vec![
+            Inline::Text(TextRun {
+                text: "Body".into(),
+                style: TextStyle::default(),
+                link: None,
+            }),
+            Inline::Text(TextRun {
+                text: "Inline note".into(),
+                style: TextStyle {
+                    inline_role: InlineRole::Footnote,
+                    ..TextStyle::default()
+                },
+                link: None,
+            }),
+        ];
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: original.clone(),
+            style: BlockStyle::default(),
+            source: None,
+        };
+
+        assert_eq!(
+            translation_text(&block),
+            "Body<inlinefootnote>Inline note</inlinefootnote>"
+        );
+        let translated = replacement_content(
+            "正文<inlinefootnote>行内脚注</inlinefootnote>",
+            TextStyle::default(),
+            Some(&original),
+        );
+        assert!(translated.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run)
+                if run.text == "行内脚注"
+                    && run.style.inline_role == InlineRole::Footnote
+                    && run.link.is_none()
         )));
     }
 

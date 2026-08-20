@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::persistence::write_json_atomic;
 
 const SETTINGS_VERSION: u32 = 1;
+const LEGACY_BODY_LINE_HEIGHT: f32 = 1.72;
+const LEGACY_PARAGRAPH_GAP_EM: f32 = 0.75;
 const SETTINGS_FILE: &str = "reader-settings.json";
 pub(crate) const SYSTEM_INTERFACE_FONT: &str = "System UI";
 pub(crate) const DEFAULT_INTERFACE_FONT_SIZE: f32 = 14.0;
@@ -152,6 +154,8 @@ pub(crate) struct ShortcutPreferences {
     pub(crate) focus_highlight: egui::KeyboardShortcut,
     #[serde(default = "default_focus_note_shortcut")]
     pub(crate) focus_note: egui::KeyboardShortcut,
+    #[serde(default = "default_focus_structure_shortcut")]
+    pub(crate) focus_structure: egui::KeyboardShortcut,
     #[serde(default = "default_focus_footnotes_shortcut")]
     pub(crate) focus_footnotes: egui::KeyboardShortcut,
 }
@@ -171,7 +175,7 @@ impl ShortcutPreferences {
             .any(|binding| shortcut_chord_key_count(binding.modifiers) > MAX_SHORTCUT_KEYS)
     }
 
-    fn bindings(&self) -> [egui::KeyboardShortcut; 10] {
+    fn bindings(&self) -> [egui::KeyboardShortcut; 11] {
         [
             self.fullscreen,
             self.toggle_left_sidebar,
@@ -182,6 +186,7 @@ impl ShortcutPreferences {
             self.focus_chat,
             self.focus_highlight,
             self.focus_note,
+            self.focus_structure,
             self.focus_footnotes,
         ]
     }
@@ -215,6 +220,7 @@ impl Default for ShortcutPreferences {
             focus_chat: default_focus_chat_shortcut(),
             focus_highlight: default_focus_highlight_shortcut(),
             focus_note: default_focus_note_shortcut(),
+            focus_structure: default_focus_structure_shortcut(),
             focus_footnotes: default_focus_footnotes_shortcut(),
         }
     }
@@ -254,6 +260,10 @@ const fn default_focus_highlight_shortcut() -> egui::KeyboardShortcut {
 
 const fn default_focus_note_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num2)
+}
+
+const fn default_focus_structure_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num3)
 }
 
 const fn default_focus_footnotes_shortcut() -> egui::KeyboardShortcut {
@@ -472,6 +482,7 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
     typography.normalize();
     let mut typesetting = stored.typesetting;
     typesetting.normalize();
+    migrate_legacy_typesetting_defaults(&mut typesetting);
     Ok(ReaderPreferences {
         interface_typography,
         typography,
@@ -483,6 +494,15 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
         selection_granularity: stored.selection_granularity.into(),
         shortcuts: stored.shortcuts,
     })
+}
+
+fn migrate_legacy_typesetting_defaults(typesetting: &mut ReaderTypesetting) {
+    if (typesetting.body_line_height - LEGACY_BODY_LINE_HEIGHT).abs() < f32::EPSILON {
+        typesetting.body_line_height = 1.5;
+    }
+    if (typesetting.paragraph_gap_em - LEGACY_PARAGRAPH_GAP_EM).abs() < f32::EPSILON {
+        typesetting.paragraph_gap_em = 0.5;
+    }
 }
 
 fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()> {
@@ -605,6 +625,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_typesetting_defaults_migrate_to_the_compact_profile() {
+        let mut typesetting = ReaderTypesetting {
+            body_line_height: LEGACY_BODY_LINE_HEIGHT,
+            paragraph_gap_em: LEGACY_PARAGRAPH_GAP_EM,
+            ..ReaderTypesetting::unified()
+        };
+
+        migrate_legacy_typesetting_defaults(&mut typesetting);
+
+        assert!((typesetting.body_line_height - 1.5).abs() < f32::EPSILON);
+        assert!((typesetting.paragraph_gap_em - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn system_locale_is_resolved_to_a_supported_interface_language() {
         assert_eq!(
             language_from_system_locale("zh-CN"),
@@ -644,6 +678,10 @@ mod tests {
         assert_eq!(
             shortcuts.focus_footnotes,
             egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::AltLeft)
+        );
+        assert_eq!(
+            shortcuts.focus_structure,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num3)
         );
         assert!(!shortcuts.has_conflicts());
 

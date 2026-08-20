@@ -522,6 +522,7 @@ enum ShortcutAction {
     FocusChat,
     FocusHighlight,
     FocusNote,
+    FocusStructure,
     FocusFootnotes,
 }
 
@@ -537,6 +538,7 @@ impl ShortcutAction {
             Self::FocusChat => shortcuts.focus_chat,
             Self::FocusHighlight => shortcuts.focus_highlight,
             Self::FocusNote => shortcuts.focus_note,
+            Self::FocusStructure => shortcuts.focus_structure,
             Self::FocusFootnotes => shortcuts.focus_footnotes,
         }
     }
@@ -552,6 +554,7 @@ impl ShortcutAction {
             Self::FocusChat => shortcuts.focus_chat = binding,
             Self::FocusHighlight => shortcuts.focus_highlight = binding,
             Self::FocusNote => shortcuts.focus_note = binding,
+            Self::FocusStructure => shortcuts.focus_structure = binding,
             Self::FocusFootnotes => shortcuts.focus_footnotes = binding,
         }
     }

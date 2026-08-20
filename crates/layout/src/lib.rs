@@ -13,9 +13,9 @@ use parley::{
 use read_fonts::{FontRef, TableProvider as _};
 use rebook_publication::{
     Block, BookSource, CaptionPosition, FixedPageDimensions, FixedPageTextLayer, FixedPageTextRect,
-    ImageBlock, ImageStyle, Inline, LinkRole, MathRun, PublicationError, PublicationUrl,
-    RenditionLayout, Rgba, Section, SourceRange, TableBlock, TableCell, TextAlignment,
-    TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle, WritingSystem,
+    ImageBlock, ImageStyle, Inline, InlineRole, LinkRole, MathRun, PublicationError,
+    PublicationUrl, RenditionLayout, Rgba, Section, SourceRange, TableBlock, TableCell,
+    TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle, WritingSystem,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -155,9 +155,9 @@ impl ReaderTypesetting {
     /// Repairs persisted values before they participate in layout cache keys.
     pub fn normalize(&mut self) {
         self.heading_scale = finite_clamp(self.heading_scale, 1.1, 2.2, 1.6);
-        self.body_line_height = finite_clamp(self.body_line_height, 1.2, 2.4, 1.72);
+        self.body_line_height = finite_clamp(self.body_line_height, 1.2, 2.4, 1.5);
         self.paragraph_indent_em = finite_clamp(self.paragraph_indent_em, 0.0, 4.0, 2.0);
-        self.paragraph_gap_em = finite_clamp(self.paragraph_gap_em, 0.0, 2.0, 0.75);
+        self.paragraph_gap_em = finite_clamp(self.paragraph_gap_em, 0.0, 2.0, 0.5);
         self.heading_body_gap_em = finite_clamp(self.heading_body_gap_em, 0.2, 2.0, 0.7);
         self.media_gap_em = finite_clamp(self.media_gap_em, 0.5, 2.0, 1.0);
         self.caption_font_scale = finite_clamp(self.caption_font_scale, 0.7, 1.0, 0.88);
@@ -174,10 +174,10 @@ impl Default for ReaderTypesetting {
         Self {
             mode: TypesettingMode::Book,
             heading_scale: 1.6,
-            body_line_height: 1.72,
+            body_line_height: 1.5,
             paragraph_indent_mode: ParagraphIndentMode::Auto,
             paragraph_indent_em: 2.0,
-            paragraph_gap_em: 0.75,
+            paragraph_gap_em: 0.5,
             heading_body_gap_em: 0.7,
             media_gap_em: 1.0,
             caption_font_scale: 0.88,
@@ -2048,13 +2048,14 @@ fn prepare_inline_content(
                 if style.color == Rgba::BLACK {
                     style.color = fallback_color;
                 }
-                let footnote_reference = focus_footnote_icons
-                    && run
-                        .link
-                        .as_ref()
-                        .is_some_and(|target| target.fragment().is_some())
+                let linked_footnote_reference = run
+                    .link
+                    .as_ref()
+                    .is_some_and(|target| target.fragment().is_some())
                     && (run.style.link_role == LinkRole::FootnoteReference
                         || run.style.baseline == TextBaseline::Superscript);
+                let footnote_reference = focus_footnote_icons
+                    && (run.style.inline_role == InlineRole::Footnote || linked_footnote_reference);
                 if footnote_reference {
                     text.push_str(&footnote_icon_placeholder(&run.text));
                 } else {
@@ -2105,7 +2106,28 @@ fn prepare_inline_content(
                     });
                 }
             }
-            Inline::Break => text.push('\n'),
+            Inline::Break => {
+                let compact_gap = text
+                    .ends_with('\n')
+                    .then_some(block.style.subparagraph_gap_em)
+                    .flatten();
+                if let Some(gap_em) = compact_gap {
+                    let start = text.len();
+                    text.push('\u{2060}');
+                    spans.push(StyledRange {
+                        range: start..text.len(),
+                        style: TextStyle {
+                            size_scale: (block.style.line_height + gap_em.clamp(0.0, 2.0))
+                                / block.style.line_height.max(0.1),
+                            color: fallback_color,
+                            ..TextStyle::default()
+                        },
+                        footnote_reference_group: 0,
+                    });
+                } else {
+                    text.push('\n');
+                }
+            }
         }
     }
     (text, spans, inline_images, source_text_start)
@@ -2974,6 +2996,14 @@ mod tests {
             },
             link: linked_superscript.link.clone(),
         };
+        let inline_footnote = TextRun {
+            text: "inline note".into(),
+            style: TextStyle {
+                inline_role: InlineRole::Footnote,
+                ..TextStyle::default()
+            },
+            link: None,
+        };
         let block = TextBlock {
             kind: TextBlockKind::Paragraph,
             content: vec![
@@ -2981,6 +3011,7 @@ mod tests {
                 Inline::Text(unlinked_superscript),
                 Inline::Text(linked_baseline_text),
                 Inline::Text(semantic_baseline_reference),
+                Inline::Text(inline_footnote),
             ],
             style: rebook_publication::BlockStyle::default(),
             source: None,
@@ -3000,9 +3031,16 @@ mod tests {
                 .iter()
                 .map(|span| span.footnote_reference_group != 0)
                 .collect::<Vec<_>>(),
-            [true, false, false, true]
+            [true, false, false, true, true]
         );
-        assert_eq!(focus_text, "0230\u{2060}\u{2060}");
+        assert_eq!(
+            focus_text,
+            format!(
+                "023{}{}",
+                footnote_icon_placeholder("[4]"),
+                footnote_icon_placeholder("inline note")
+            )
+        );
 
         let (classic_text, disabled_spans, _, _) = prepare_inline_content(
             &block,
@@ -3017,7 +3055,7 @@ mod tests {
                 .iter()
                 .all(|span| span.footnote_reference_group == 0)
         );
-        assert_eq!(classic_text, "123[4]");
+        assert_eq!(classic_text, "123[4]inline note");
     }
 
     #[test]
@@ -3034,6 +3072,47 @@ mod tests {
                 alpha: 255,
             }),
             DARK_QUOTE_ACCENT_COLOR
+        );
+    }
+
+    #[test]
+    fn semantic_subparagraph_break_uses_the_compact_configured_gap() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "First sentence.".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                }),
+                Inline::Break,
+                Inline::Break,
+                Inline::Text(TextRun {
+                    text: "Second sentence.".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                }),
+            ],
+            style: rebook_publication::BlockStyle {
+                line_height: 1.5,
+                subparagraph_gap_em: Some(0.3),
+                ..rebook_publication::BlockStyle::default()
+            },
+            source: None,
+        };
+        let style = ReaderStyle::default();
+        let prepared = LayoutEngine::new().shape_text(&block, &style, 400.0);
+
+        assert_eq!(prepared.layout.len(), 2);
+        let body_line_height = prepared.layout.get(0).unwrap().metrics().line_height;
+        let next_line_height = prepared.layout.get(1).unwrap().metrics().line_height;
+        assert!(
+            (body_line_height - style.typography.font_size * 1.5).abs() < 0.5,
+            "expected the preceding line to keep the 1.5em body line height, got {body_line_height}"
+        );
+        assert!(
+            (next_line_height - style.typography.font_size * 1.8).abs() < 0.5,
+            "expected 1.5em line height plus a 0.3em subparagraph gap, got {next_line_height}"
         );
     }
 

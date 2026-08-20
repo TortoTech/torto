@@ -300,6 +300,10 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 language.text("唤起批注框", "Open note panel"),
             ),
             (
+                ShortcutAction::FocusStructure,
+                language.text("结构化段落", "Structure paragraph"),
+            ),
+            (
                 ShortcutAction::FocusFootnotes,
                 language.text("脚注开关", "Toggle footnotes"),
             ),

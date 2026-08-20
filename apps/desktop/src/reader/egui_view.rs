@@ -1022,6 +1022,8 @@ impl DesktopReader {
                 Some(0)
             } else if input.consume_shortcut(&self.shortcuts.focus_note) {
                 Some(1)
+            } else if input.consume_shortcut(&self.shortcuts.focus_structure) {
+                Some(2)
             } else {
                 None
             }
@@ -1037,6 +1039,10 @@ impl DesktopReader {
                     note: self.current_focus_note().unwrap_or_default(),
                     focus_pending: true,
                 });
+            }
+            Some(2) if !self.current_focus_unit_is_image() => {
+                self.ui.focus_actions_visible = false;
+                self.toggle_current_focus_structure();
             }
             Some(_) => {}
             None => return false,
@@ -1808,6 +1814,10 @@ impl DesktopReader {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the compact focus toolbar keeps its actions and editor transitions together"
+    )]
     fn focus_actions_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
         if !self.ui.focus_actions_visible {
             return;
@@ -1835,9 +1845,14 @@ impl DesktopReader {
         let mut chat = false;
         let mut highlight = false;
         let mut open_note = false;
+        let mut structure = false;
         let mut save_note = false;
         let mut cancel_note = false;
         let can_annotate = !self.current_focus_unit_is_image();
+        let can_structure = self
+            .focus_units
+            .get(self.focus_unit_index)
+            .is_some_and(|unit| !unit.is_image && !unit.is_table);
         let chat_hover = shortcut_tooltip(
             self.language,
             "聊天",
@@ -1856,6 +1871,20 @@ impl DesktopReader {
             "Add note",
             &ctx.format_shortcut(&self.shortcuts.focus_note),
         );
+        let structure_hover = shortcut_tooltip(
+            self.language,
+            "结构化段落",
+            "Structure paragraph",
+            &ctx.format_shortcut(&self.shortcuts.focus_structure),
+        );
+        let structure_active = self
+            .focus_units
+            .get(self.focus_unit_index)
+            .map(|unit| crate::plugins::ParagraphStructureKey {
+                section_index: unit.position.section_index,
+                node: unit.range.start.node.clone(),
+            })
+            .is_some_and(|key| self.structure_source.is_active(&key));
         let area = egui::Area::new("focus-actions".into())
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))
@@ -1882,6 +1911,13 @@ impl DesktopReader {
                             open_note = icon_button(ui, Icon::MessageSquarePlus)
                                 .on_hover_text(&note_hover)
                                 .clicked();
+                            structure = ui
+                                .add_enabled_ui(can_structure, |ui| {
+                                    selectable_icon_button(ui, Icon::ListTree, structure_active)
+                                })
+                                .inner
+                                .on_hover_text(&structure_hover)
+                                .clicked();
                         });
                     });
                 }
@@ -1898,6 +1934,9 @@ impl DesktopReader {
                 note: self.current_focus_note().unwrap_or_default(),
                 focus_pending: true,
             });
+        } else if structure {
+            self.ui.focus_actions_visible = false;
+            self.toggle_current_focus_structure();
         } else if save_note {
             let note = self
                 .annotation_note_draft
@@ -4766,6 +4805,10 @@ mod reference_suggestion_label_tests {
         assert_eq!(
             shortcuts.focus_note,
             egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num2)
+        );
+        assert_eq!(
+            shortcuts.focus_structure,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num3)
         );
         assert_eq!(
             shortcuts.focus_footnotes,

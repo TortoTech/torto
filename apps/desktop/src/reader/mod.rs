@@ -8,8 +8,8 @@ use peniko::{Blob, Color};
 use rebook_formats::{BookFormat, open_file_for_reading as open_publication_file_for_reading};
 use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
 use rebook_publication::{
-    Block, BookSource, Inline, LinkRole, PublicationUrl, RenditionLayout, Rgba, SourceAnchor,
-    SourceRange, TableOfContentsOrigin, TextBaseline, TextBlock, TextBlockKind,
+    Block, BookSource, Inline, InlineRole, LinkRole, PublicationUrl, RenditionLayout, Rgba,
+    SourceAnchor, SourceRange, TableOfContentsOrigin, TextBaseline, TextBlock, TextBlockKind,
 };
 use rebook_reader::{
     PageDirection, ReaderPosition, ReaderSectionPage, ReaderSelection, ReaderSession,
@@ -23,8 +23,9 @@ use crate::highlights::{HighlightStore, StoredHighlight};
 use crate::library::LibraryBook;
 use crate::plugins::{
     BlockTranslation, BookSearchResult, ChatReadingContext, ChatRequestKind, ChatResponse,
-    ChatTurn, PdfOcrSourceController, PdfOcrViewMode, PluginSettings, RewriteBookSource,
-    TranslationBlockInput, TranslationBookSource, has_pending_pdf_ocr_task, load_pdf_ocr_source,
+    ChatTurn, ParagraphStructureSource, PdfOcrSourceController, PdfOcrViewMode, PluginSettings,
+    RewriteBookSource, TranslationBlockInput, TranslationBookSource, has_pending_pdf_ocr_task,
+    load_pdf_ocr_source,
 };
 use crate::preferences::{self, AppLanguage, ReaderPreferences, ReadingMode, ShortcutPreferences};
 use crate::settings::ReaderSettingsChange;
@@ -194,7 +195,8 @@ pub(super) fn open_reader(
     } else {
         TranslationBookSource::new(rewrite_source.clone(), plugin_settings.translation_mode)
     });
-    let source: Arc<dyn BookSource> = translation_source.clone();
+    let structure_source = Arc::new(ParagraphStructureSource::new(translation_source.clone()));
+    let source: Arc<dyn BookSource> = structure_source.clone();
     let mut highlight_store = HighlightStore::from_repository(local_store.clone());
     let mut highlights = highlight_store.for_book(&book_id);
     let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
@@ -297,6 +299,7 @@ pub(super) fn open_reader(
             source,
             rewrite_source,
             translation_source,
+            structure_source,
             pdf_ocr_controller,
             pdf_ocr_available,
             pdf_ocr_mode,
@@ -460,6 +463,7 @@ pub(super) struct DesktopReader {
     source: Arc<dyn BookSource>,
     rewrite_source: Arc<RewriteBookSource>,
     translation_source: Arc<TranslationBookSource>,
+    structure_source: Arc<ParagraphStructureSource>,
     pdf_ocr_controller: Option<Arc<PdfOcrSourceController>>,
     snapshot: ReaderSnapshot,
     cover: Option<Vec<u8>>,
@@ -584,6 +588,7 @@ struct FocusUnit {
     is_image: bool,
     is_table: bool,
     rectangular_activation: bool,
+    structured_activation: bool,
     rectangular_activation_rect: Option<egui::Rect>,
     footnotes: Vec<FocusFootnote>,
 }
@@ -591,6 +596,14 @@ struct FocusUnit {
 #[derive(Clone)]
 struct FocusFootnote {
     text: String,
+}
+
+enum FocusFootnoteSource {
+    Inline(String),
+    Reference {
+        marker: String,
+        target: PublicationUrl,
+    },
 }
 
 fn merge_focus_list_descendant(root: &mut FocusUnit, descendant: FocusUnit) {
@@ -639,6 +652,7 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
     }
 }
 
+#[cfg(test)]
 fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, PublicationUrl)> {
     block
         .content
@@ -656,6 +670,45 @@ fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, Publication
         })
         .filter(|(marker, _)| !marker.is_empty())
         .collect()
+}
+
+fn text_block_focus_footnotes(block: &TextBlock) -> Vec<FocusFootnoteSource> {
+    fn flush_inline_note(notes: &mut Vec<FocusFootnoteSource>, text: &mut String) {
+        let note = text.trim();
+        if !note.is_empty() {
+            notes.push(FocusFootnoteSource::Inline(note.to_owned()));
+        }
+        text.clear();
+    }
+
+    let mut notes = Vec::new();
+    let mut inline_note = String::new();
+    for inline in &block.content {
+        let Inline::Text(run) = inline else {
+            flush_inline_note(&mut notes, &mut inline_note);
+            continue;
+        };
+        if run.style.inline_role == InlineRole::Footnote {
+            inline_note.push_str(&run.text);
+            continue;
+        }
+        flush_inline_note(&mut notes, &mut inline_note);
+        if (run.style.link_role == LinkRole::FootnoteReference
+            || run.style.baseline == TextBaseline::Superscript)
+            && let Some(target) = run
+                .link
+                .clone()
+                .filter(|target| target.fragment().is_some())
+            && !run.text.trim().is_empty()
+        {
+            notes.push(FocusFootnoteSource::Reference {
+                marker: run.text.trim().to_owned(),
+                target,
+            });
+        }
+    }
+    flush_inline_note(&mut notes, &mut inline_note);
+    notes
 }
 
 fn text_block_has_link_role(block: &TextBlock, role: LinkRole) -> bool {
@@ -685,38 +738,51 @@ fn block_is_footnote_definition(block: &Block) -> bool {
     }
 }
 
-fn block_footnote_references(block: &Block) -> Vec<(String, PublicationUrl)> {
+fn block_focus_footnotes(block: &Block) -> Vec<FocusFootnoteSource> {
     match block {
-        Block::Text(block) => text_block_footnote_references(block),
+        Block::Text(block) => text_block_focus_footnotes(block),
         Block::Quote(quote) => quote
             .body
             .iter()
             .chain(quote.attribution.iter())
-            .flat_map(text_block_footnote_references)
+            .flat_map(text_block_focus_footnotes)
             .collect(),
         Block::Table(table) => table
             .rows
             .iter()
             .flat_map(|row| &row.cells)
-            .flat_map(|cell| text_block_footnote_references(&cell.text))
+            .flat_map(|cell| text_block_focus_footnotes(&cell.text))
             .collect(),
         Block::Figure(figure) => figure
             .captions
             .iter()
-            .flat_map(text_block_footnote_references)
+            .flat_map(text_block_focus_footnotes)
             .collect(),
         Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => Vec::new(),
     }
 }
 
+fn text_block_focus_text(block: &TextBlock) -> String {
+    block
+        .content
+        .iter()
+        .filter_map(|inline| match inline {
+            Inline::Text(run) if run.style.inline_role == InlineRole::Footnote => None,
+            Inline::Text(run) => Some(run.text.as_str()),
+            Inline::Math(run) => Some(run.latex.as_str()),
+            Inline::Break => Some("\n"),
+        })
+        .collect()
+}
+
 fn block_focus_text(block: &Block) -> String {
     match block {
-        Block::Text(block) => crate::plugins::text_block_text(block),
+        Block::Text(block) => text_block_focus_text(block),
         Block::Quote(quote) => quote
             .body
             .iter()
             .chain(quote.attribution.iter())
-            .map(crate::plugins::text_block_text)
+            .map(text_block_focus_text)
             .filter(|text| !text.trim().is_empty())
             .collect::<Vec<_>>()
             .join(" "),
@@ -724,14 +790,14 @@ fn block_focus_text(block: &Block) -> String {
             .rows
             .iter()
             .flat_map(|row| &row.cells)
-            .map(|cell| crate::plugins::text_block_text(&cell.text))
+            .map(|cell| text_block_focus_text(&cell.text))
             .collect::<Vec<_>>()
             .join(" "),
         Block::Image(image) => image.alt.clone(),
         Block::Figure(figure) => figure
             .captions
             .iter()
-            .map(crate::plugins::text_block_text)
+            .map(text_block_focus_text)
             .collect::<Vec<_>>()
             .join(" "),
         Block::Separator | Block::LineBreak | Block::PageBreak => String::new(),
@@ -1127,17 +1193,23 @@ impl DesktopReader {
 
     fn resolve_focus_footnotes(&self, block: &Block) -> Vec<FocusFootnote> {
         let mut seen = HashSet::new();
-        block_footnote_references(block)
+        block_focus_footnotes(block)
             .into_iter()
-            .filter(|(_, target)| seen.insert(target.to_string()))
-            .map(|(marker, target)| FocusFootnote {
-                text: self
-                    .focus_footnote_text(&target, &marker)
-                    .unwrap_or_else(|| {
-                        self.language
-                            .text("未能读取脚注内容", "Footnote content is unavailable")
-                            .to_owned()
-                    }),
+            .filter_map(|source| match source {
+                FocusFootnoteSource::Inline(text) => seen
+                    .insert(format!("inline:{text}"))
+                    .then_some(FocusFootnote { text }),
+                FocusFootnoteSource::Reference { marker, target } => {
+                    seen.insert(target.to_string()).then(|| FocusFootnote {
+                        text: self
+                            .focus_footnote_text(&target, &marker)
+                            .unwrap_or_else(|| {
+                                self.language
+                                    .text("未能读取脚注内容", "Footnote content is unavailable")
+                                    .to_owned()
+                            }),
+                    })
+                }
             })
             .collect()
     }
@@ -1233,7 +1305,7 @@ impl DesktopReader {
                         (
                             range.clone(),
                             vec![range],
-                            crate::plugins::text_block_text(block),
+                            text_block_focus_text(block),
                             false,
                             false,
                             block.kind == TextBlockKind::Preformatted,
@@ -1249,7 +1321,7 @@ impl DesktopReader {
                             .body
                             .iter()
                             .chain(quote.attribution.iter())
-                            .map(crate::plugins::text_block_text)
+                            .map(text_block_focus_text)
                             .filter(|text| !text.trim().is_empty())
                             .collect::<Vec<_>>()
                             .join(" ");
@@ -1264,7 +1336,7 @@ impl DesktopReader {
                             .rows
                             .iter()
                             .flat_map(|row| &row.cells)
-                            .map(|cell| crate::plugins::text_block_text(&cell.text))
+                            .map(|cell| text_block_focus_text(&cell.text))
                             .collect::<Vec<_>>()
                             .join(" ");
                         (range, paint_ranges, text, false, true, false, None)
@@ -1296,7 +1368,7 @@ impl DesktopReader {
                         let caption = figure
                             .captions
                             .iter()
-                            .map(crate::plugins::text_block_text)
+                            .map(text_block_focus_text)
                             .filter(|text| !text.trim().is_empty())
                             .collect::<Vec<_>>()
                             .join(" ");
@@ -1323,6 +1395,14 @@ impl DesktopReader {
                         continue;
                     }
                 };
+            let structured_activation = matches!(block, Block::Text(text) if text.kind == TextBlockKind::Paragraph)
+                && self
+                    .structure_source
+                    .is_structured(&crate::plugins::ParagraphStructureKey {
+                        section_index: layout.section_index,
+                        node: range.start.node.clone(),
+                    });
+            let rectangular_activation = rectangular_activation || structured_activation;
             if text.trim().is_empty() {
                 if list_depth.is_none_or(|depth| depth == 0) {
                     active_list_root = None;
@@ -1355,6 +1435,7 @@ impl DesktopReader {
                 is_image,
                 is_table,
                 rectangular_activation,
+                structured_activation,
                 rectangular_activation_rect,
                 footnotes,
             };
@@ -1710,6 +1791,7 @@ struct DesktopReaderResources {
     source: Arc<dyn BookSource>,
     rewrite_source: Arc<RewriteBookSource>,
     translation_source: Arc<TranslationBookSource>,
+    structure_source: Arc<ParagraphStructureSource>,
     pdf_ocr_controller: Option<Arc<PdfOcrSourceController>>,
     pdf_ocr_available: bool,
     pdf_ocr_mode: PdfOcrViewMode,
@@ -2307,6 +2389,7 @@ impl DesktopReader {
             source,
             rewrite_source,
             translation_source,
+            structure_source,
             pdf_ocr_controller,
             pdf_ocr_available,
             pdf_ocr_mode,
@@ -2400,6 +2483,7 @@ impl DesktopReader {
             source,
             rewrite_source,
             translation_source,
+            structure_source,
             pdf_ocr_controller,
             snapshot,
             cover,
@@ -2554,16 +2638,17 @@ mod tests {
     use super::navigation::snapshot_reanchors_focus;
     use super::{
         BookDisplayMetadata, Duration, FOCUS_SCROLL_MAX_DURATION, FOCUS_SCROLL_MIN_DURATION,
-        FocusFootnote, FocusUnit, FollowUp, HashSet, Instant, MOTION_DURATION, Motion, MotionCurve,
-        NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, ScrollSectionLayout, SidebarTab,
-        SnapshotEffects, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer,
-        TranslationUiState, allowed_reading_mode, block_is_footnote_definition,
-        embedded_toc_is_page_index, focus_block_paint_ranges, focus_list_descendant_root,
-        focus_scroll_duration, focus_unit_container_center_y, focus_unit_contains_source_range,
-        focus_unit_geometry_ranges, focus_unit_matches_highlight_ranges,
-        focus_unit_screen_center_y, focus_unit_scroll_bounds, focus_unit_target_offset_for_rect,
-        legacy_translated_paragraph_range, logical_dimension, merge_focus_list_descendant,
-        resolve_book_display_metadata, resolved_focus_unit_index, source_range_contains_anchor,
+        FocusFootnote, FocusFootnoteSource, FocusUnit, FollowUp, HashSet, Instant, MOTION_DURATION,
+        Motion, MotionCurve, NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState,
+        ScrollSectionLayout, SidebarTab, SnapshotEffects, TOOLBAR_HIDE_DELAY,
+        TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState, allowed_reading_mode,
+        block_is_footnote_definition, embedded_toc_is_page_index, focus_block_paint_ranges,
+        focus_list_descendant_root, focus_scroll_duration, focus_unit_container_center_y,
+        focus_unit_contains_source_range, focus_unit_geometry_ranges,
+        focus_unit_matches_highlight_ranges, focus_unit_screen_center_y, focus_unit_scroll_bounds,
+        focus_unit_target_offset_for_rect, legacy_translated_paragraph_range, logical_dimension,
+        merge_focus_list_descendant, resolve_book_display_metadata, resolved_focus_unit_index,
+        source_range_contains_anchor, text_block_focus_footnotes, text_block_focus_text,
         text_block_footnote_references,
     };
     use crate::plugins::PdfOcrViewMode;
@@ -2574,9 +2659,9 @@ mod tests {
         SeparatorPlacement,
     };
     use rebook_publication::{
-        Block, BlockStyle, Inline, LinkRole, PublicationUrl, Rgba, SourceAnchor, SourceRange,
-        SpineItemId, TableBlock, TableCell, TableRow, TextBlock, TextBlockKind, TextRun, TextStyle,
-        TocEntry,
+        Block, BlockStyle, Inline, InlineRole, LinkRole, PublicationUrl, Rgba, SourceAnchor,
+        SourceRange, SpineItemId, TableBlock, TableCell, TableRow, TextBlock, TextBlockKind,
+        TextRun, TextStyle, TocEntry,
     };
     use rebook_reader::{ReaderPosition, ReaderSectionPage};
     use rebook_renderer::DisplayListCompiler;
@@ -2628,6 +2713,41 @@ mod tests {
             source: None,
         });
         assert!(block_is_footnote_definition(&definition));
+    }
+
+    #[test]
+    fn inline_footnotes_are_separated_from_focus_prose() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "Body".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: "Inline note".into(),
+                    style: TextStyle {
+                        inline_role: InlineRole::Footnote,
+                        ..TextStyle::default()
+                    },
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: " continues.".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                }),
+            ],
+            style: BlockStyle::default(),
+            source: None,
+        };
+
+        assert_eq!(text_block_focus_text(&block), "Body continues.");
+        assert!(matches!(
+            text_block_focus_footnotes(&block).as_slice(),
+            [FocusFootnoteSource::Inline(note)] if note == "Inline note"
+        ));
     }
 
     #[test]
@@ -3043,6 +3163,7 @@ mod tests {
             is_image: false,
             is_table: false,
             rectangular_activation: false,
+            structured_activation: false,
             rectangular_activation_rect: None,
             footnotes: Vec::new(),
         };
@@ -3112,6 +3233,7 @@ mod tests {
             is_image: false,
             is_table: false,
             rectangular_activation: false,
+            structured_activation: false,
             rectangular_activation_rect: None,
             footnotes: Vec::new(),
         });

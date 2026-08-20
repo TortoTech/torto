@@ -1657,6 +1657,45 @@ impl DesktopReader {
         }
     }
 
+    pub(super) fn toggle_current_focus_structure(&mut self) {
+        let Some(unit) = self.focus_units.get(self.focus_unit_index) else {
+            return;
+        };
+        if unit.is_image || unit.is_table {
+            return;
+        }
+        let key = crate::plugins::ParagraphStructureKey {
+            section_index: unit.position.section_index,
+            node: unit.range.start.node.clone(),
+        };
+        let active = self.structure_source.is_active(&key);
+        if !active {
+            match self.structure_source.can_structure(&key) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.show_error(
+                        self.language
+                            .text(
+                                "当前段落没有可拆分的多个句子",
+                                "The current paragraph has fewer than two sentences",
+                            )
+                            .to_owned(),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    self.show_error(error);
+                    return;
+                }
+            }
+        }
+        if let Err(error) = self.structure_source.set_active(key.clone(), !active) {
+            self.show_error(error);
+            return;
+        }
+        self.refresh_translation_view();
+    }
+
     pub(crate) fn complete_toc_translation(&mut self, message: TocTranslationTaskMessage) {
         let Some(request) = self.translation.toc_task.complete(message.id) else {
             return;
