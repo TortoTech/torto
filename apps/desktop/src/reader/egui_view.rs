@@ -1871,12 +1871,6 @@ impl DesktopReader {
             "Add note",
             &ctx.format_shortcut(&self.shortcuts.focus_note),
         );
-        let structure_hover = shortcut_tooltip(
-            self.language,
-            "结构化段落",
-            "Structure paragraph",
-            &ctx.format_shortcut(&self.shortcuts.focus_structure),
-        );
         let structure_active = self
             .focus_units
             .get(self.focus_unit_index)
@@ -1885,6 +1879,20 @@ impl DesktopReader {
                 node: unit.range.start.node.clone(),
             })
             .is_some_and(|key| self.structure_source.is_active(&key));
+        let structure_hover = shortcut_tooltip(
+            self.language,
+            if structure_active {
+                "恢复原段落"
+            } else {
+                "按句分段"
+            },
+            if structure_active {
+                "Restore paragraph"
+            } else {
+                "Split by sentence"
+            },
+            &ctx.format_shortcut(&self.shortcuts.focus_structure),
+        );
         let area = egui::Area::new("focus-actions".into())
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use rebook_publication::{
-    Block, Book, BookSource, Inline, PublicationError, PublicationUrl, RasterResource, Resource,
-    Section, TextBlock, TextBlockKind, TextRun,
+    Block, Book, BookSource, Inline, InlineRole, LinkRole, PublicationError, PublicationUrl,
+    RasterResource, Resource, Section, TextBaseline, TextBlock, TextBlockKind, TextRun,
 };
 use rebook_reader::sentence_byte_ranges;
 
@@ -59,7 +59,7 @@ impl ParagraphStructureSource {
     ) -> Result<(), String> {
         self.state
             .write()
-            .map_err(|_| "段落结构化状态已损坏".to_owned())?
+            .map_err(|_| "按句分段状态已损坏".to_owned())?
             .active
             .insert(key, active);
         Ok(())
@@ -101,7 +101,7 @@ impl BookSource for ParagraphStructureSource {
         let state = self
             .state
             .read()
-            .map_err(|_| PublicationError::InvalidPublication("段落结构化状态已损坏".to_owned()))?;
+            .map_err(|_| PublicationError::InvalidPublication("按句分段状态已损坏".to_owned()))?;
         let mut block_index = 0;
         while block_index < section.blocks.len() {
             let active = match &section.blocks[block_index] {
@@ -158,9 +158,16 @@ fn paragraph_atoms_for_content(content: &[Inline]) -> Vec<ParagraphAtom> {
     let text = inline_text(content);
     let mut cursor = 0;
     let mut protected = Vec::new();
+    let mut footnotes = Vec::new();
     for inline in content {
         let len = match inline {
-            Inline::Text(run) => run.text.chars().count(),
+            Inline::Text(run) => {
+                let len = run.text.chars().count();
+                if is_focus_footnote(run) && len > 0 {
+                    footnotes.push(cursor..cursor + len);
+                }
+                len
+            }
             Inline::Math(run) => {
                 let len = run.latex.chars().count();
                 protected.extend((cursor + 1)..(cursor + len));
@@ -170,7 +177,53 @@ fn paragraph_atoms_for_content(content: &[Inline]) -> Vec<ParagraphAtom> {
         };
         cursor += len;
     }
-    paragraph_atoms_with_protected_boundaries(&text, &protected)
+    attach_footnote_atoms(
+        paragraph_atoms_with_protected_boundaries(&text, &protected),
+        &text,
+        &footnotes,
+    )
+}
+
+fn is_focus_footnote(run: &TextRun) -> bool {
+    run.style.inline_role == InlineRole::Footnote
+        || (run
+            .link
+            .as_ref()
+            .is_some_and(|target| target.fragment().is_some())
+            && (run.style.link_role == LinkRole::FootnoteReference
+                || run.style.baseline == TextBaseline::Superscript))
+}
+
+fn attach_footnote_atoms(
+    atoms: Vec<ParagraphAtom>,
+    text: &str,
+    footnotes: &[std::ops::Range<usize>],
+) -> Vec<ParagraphAtom> {
+    if footnotes.is_empty() {
+        return atoms;
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut attached: Vec<ParagraphAtom> = Vec::with_capacity(atoms.len());
+    for atom in atoms {
+        let only_footnote = (atom.start..atom.end).any(|index| {
+            !chars
+                .get(index)
+                .is_some_and(|character| character.is_whitespace())
+                && footnotes.iter().any(|range| range.contains(&index))
+        }) && (atom.start..atom.end).all(|index| {
+            chars
+                .get(index)
+                .is_some_and(|character| character.is_whitespace())
+                || footnotes.iter().any(|range| range.contains(&index))
+        });
+        if only_footnote && let Some(previous) = attached.last_mut() {
+            previous.text.push_str(&atom.text);
+            previous.end = atom.end;
+        } else {
+            attached.push(atom);
+        }
+    }
+    attached
 }
 
 fn paragraph_atoms_with_protected_boundaries(
@@ -348,5 +401,71 @@ mod tests {
         let atoms = paragraph_atoms_for_content(&content);
         assert_eq!(atoms.len(), 2);
         assert_eq!(atoms[0].text, "公式f(x,y):=x+y。");
+    }
+
+    #[test]
+    fn trailing_footnote_stays_attached_to_the_preceding_subparagraph() {
+        let target = PublicationUrl::parse("chapter.xhtml#note-54").unwrap();
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "第一句。第二句。".to_owned(),
+                    style: Default::default(),
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: "54".to_owned(),
+                    style: rebook_publication::TextStyle {
+                        baseline: TextBaseline::Superscript,
+                        link_role: LinkRole::FootnoteReference,
+                        ..Default::default()
+                    },
+                    link: Some(target),
+                }),
+            ],
+            style: Default::default(),
+            source: None,
+        };
+
+        apply_sentence_structure(&mut block);
+
+        assert_eq!(inline_text(&block.content), "第一句。\n\n第二句。54");
+    }
+
+    #[test]
+    fn inline_footnote_sentences_do_not_become_separate_subparagraphs() {
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "正文。".to_owned(),
+                    style: Default::default(),
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: "脚注第一句。脚注第二句。".to_owned(),
+                    style: rebook_publication::TextStyle {
+                        inline_role: InlineRole::Footnote,
+                        ..Default::default()
+                    },
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: "下文。".to_owned(),
+                    style: Default::default(),
+                    link: None,
+                }),
+            ],
+            style: Default::default(),
+            source: None,
+        };
+
+        apply_sentence_structure(&mut block);
+
+        assert_eq!(
+            inline_text(&block.content),
+            "正文。脚注第一句。脚注第二句。\n\n下文。"
+        );
     }
 }

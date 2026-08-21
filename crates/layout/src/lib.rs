@@ -1329,7 +1329,13 @@ impl LayoutEngine {
 
         let mut layout = builder.build(&text);
         if first_line_indent.abs() > f32::EPSILON {
-            layout.set_text_indent(first_line_indent, IndentOptions::default());
+            layout.set_text_indent(
+                first_line_indent,
+                IndentOptions {
+                    each_line: block.style.subparagraph_gap_em.is_some(),
+                    ..IndentOptions::default()
+                },
+            );
         }
         self.apply_list_indent(
             &mut layout,
@@ -3094,6 +3100,7 @@ mod tests {
                 }),
             ],
             style: rebook_publication::BlockStyle {
+                indent: 24.0,
                 line_height: 1.5,
                 subparagraph_gap_em: Some(0.3),
                 ..rebook_publication::BlockStyle::default()
@@ -3104,6 +3111,8 @@ mod tests {
         let prepared = LayoutEngine::new().shape_text(&block, &style, 400.0);
 
         assert_eq!(prepared.layout.len(), 2);
+        assert!((prepared.layout.get(0).unwrap().metrics().offset - 24.0).abs() < 0.01);
+        assert!((prepared.layout.get(1).unwrap().metrics().offset - 24.0).abs() < 0.01);
         let body_line_height = prepared.layout.get(0).unwrap().metrics().line_height;
         let next_line_height = prepared.layout.get(1).unwrap().metrics().line_height;
         assert!(

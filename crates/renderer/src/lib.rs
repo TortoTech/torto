@@ -86,6 +86,25 @@ struct FootnoteRegion {
     source: SourceRange,
 }
 
+const FOOTNOTE_ICON_CENTER_ABOVE_BASELINE: f32 = 0.68;
+
+fn footnote_icon_bounds(center_x: f32, baseline: f32, font_size: f32) -> Rect {
+    let size = (font_size * 0.78).clamp(8.0, 12.0);
+    // Footnote sources are not uniform: some books use a superscript link while
+    // others embed a normal-baseline inline note. The replacement icon should
+    // occupy one stable optical superscript position regardless of that source
+    // encoding. A center slightly over two thirds of its diameter above the
+    // text baseline aligns with the upper half of both CJK em boxes and Latin
+    // cap height without changing the placement of ordinary superscript text.
+    let center_y = baseline - size * FOOTNOTE_ICON_CENTER_ABOVE_BASELINE;
+    Rect::new(
+        f64::from(center_x - size / 2.0),
+        f64::from(center_y - size / 2.0),
+        f64::from(center_x + size / 2.0),
+        f64::from(center_y + size / 2.0),
+    )
+}
+
 const HIGHLIGHT_VERTICAL_OVERLAP: f64 = 0.5;
 
 fn source_range_highlight_path(rects: impl IntoIterator<Item = Rect>) -> BezPath {
@@ -1873,14 +1892,11 @@ fn compile_text_commands(
                     continue;
                 }
                 if let Some(source) = text.source.clone() {
-                    let size = (run.font_size() * 0.78).clamp(8.0, 12.0);
                     let center_x = text.origin_x + glyph_run.offset() + glyph_run.advance() / 2.0;
-                    let baseline = text.origin_y + glyph_run.baseline() + baseline_offset;
-                    let bounds = Rect::new(
-                        f64::from(center_x - size / 2.0),
-                        f64::from(baseline - size * 0.88),
-                        f64::from(center_x + size / 2.0),
-                        f64::from(baseline + size * 0.12),
+                    let bounds = footnote_icon_bounds(
+                        center_x,
+                        text.origin_y + glyph_run.baseline(),
+                        run.font_size(),
                     );
                     footnote_regions.push(FootnoteRegion { bounds, source });
                     compiled_footnote_groups.push(brush.footnote_reference_group);
@@ -2191,6 +2207,18 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(painted_glyphs, 1);
+    }
+
+    #[test]
+    fn footnote_icon_uses_a_stable_optical_superscript_position() {
+        let baseline = 40.0;
+        let bounds = footnote_icon_bounds(24.0, baseline, 20.0);
+
+        assert!((bounds.width() - 12.0).abs() < f64::EPSILON);
+        assert!((bounds.height() - 12.0).abs() < f64::EPSILON);
+        assert!((bounds.center().x - 24.0).abs() < f64::EPSILON);
+        assert!((bounds.center().y - 31.84).abs() < 0.001);
+        assert!(bounds.y1 < f64::from(baseline));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 <h1 id="torto" align="center">Torto</h1>
 
 <p align="center">
-  A focused, local-first ebook reader for Windows and macOS.<br>
+  A local-first ebook reader built around Focus Mode—one meaningful passage at a time.<br>
   Native Rust rendering, no WebView, and your library stays under your control.
 </p>
 
@@ -21,6 +21,7 @@
 </p>
 
 <p align="center">
+  <a href="#focus-mode">Focus Mode</a> •
   <a href="#features">Features</a> •
   <a href="#screenshots">Screenshots</a> •
   <a href="#download">Download</a> •
@@ -32,9 +33,22 @@
 
 ## About
 
-Torto is an open-source desktop reader for people who want their books to stay on their own computer. It combines a native bookshelf, flexible reading layouts, search and annotation tools, translation, an optional AI reading assistant, and direct WebDAV sync.
+Torto is an open-source desktop reader designed around **Focus Mode**. Instead of treating a book as a stack of pages, Focus Mode turns its structure into meaningful reading units—paragraphs, nested lists, quotations, code blocks, tables, and images—and keeps the current unit in a stable reading position. Navigation, highlights, notes, footnotes, translation, and AI conversation all follow that context.
+
+Classic single-column, two-column, and vertical-scroll layouts remain available when you want a conventional page or chapter view. The local bookshelf, full-book search, translation, optional AI assistant, PDF OCR, and direct WebDAV sync are built around the same native reading model.
 
 Unlike browser-based readers, Torto parses, lays out, paginates, and renders book content through a native Rust pipeline built on egui, Parley, Vello, and wgpu.
+
+## Focus Mode
+
+Focus Mode is Torto's default and flagship reading experience—and the feature that most clearly sets it apart from conventional ebook readers.
+
+- **Read by meaning, not by page.** One semantic unit is active at a time. Images are valid reading units, nested list descendants stay with their parent item, and large tables or media remain scrollable instead of being skipped.
+- **Keep your place visually.** Short units begin at a stable position inside a centered reading stage; taller content expands only when it needs more room. Moving between units avoids the constant vertical jump caused by paragraphs of different lengths.
+- **Navigate consistently.** The mouse wheel, arrow keys, and the reader scrollbar move through reading units. When a table of contents, chat, footnote panel, or text editor owns input, scrolling stays inside that surface.
+- **Act on the current passage.** Open the action toolbar with `Space`, chat with `Tab`, highlight with `1`, add a note with `2`, use **Split by sentence** with `3`, and toggle contextual footnotes with `Left Alt`. Shortcuts are configurable.
+- **Keep context attached.** Focus chat sessions are scoped to their reading unit for the current book session, while highlights and notes persist at stable source locations. Footnotes are reduced to compact icons on the active unit and expanded only on demand.
+- **Bring scanned PDFs into the same workflow.** Original-layout PDFs use Classic Mode. After PDF OCR creates a reflowable text layer, Focus Mode becomes available with the same unit navigation and reading tools.
 
 ## Features
 
@@ -42,16 +56,18 @@ Unlike browser-based readers, Torto parses, lays out, paginates, and renders boo
 
 | **Feature** | **Description** | **Status** |
 | --- | --- | --- |
+| **Focus Mode** | Read one semantic unit at a stable position, navigate by unit, and keep actions, conversations, notes, and footnotes attached to the current context. | ✅ Core |
 | **Multi-format support** | Read DRM-free EPUB, MOBI, AZW, AZW3/KF8, FB2, FBZ, CBZ, CHM, and PDF files. | ✅ |
 | **Native rendering** | Parse, lay out, paginate, and render books with Rust instead of embedding a browser or WebView. | ✅ |
-| **Page and scroll modes** | Switch between single-page, two-page, and chapter-based vertical scrolling layouts. | ✅ |
-| **Library management** | Import books in bulk, display metadata and covers, search by title or author, and detect duplicates. | ✅ |
+| **Classic layouts** | Switch between single-column, two-column, and section-based vertical scrolling layouts, with unified typography or the book's authored styles. | ✅ |
+| **Cover-first library** | Import books in bulk, browse cover cards, search by title or author, resume recent reading first, and detect duplicates. | ✅ |
 | **Navigation and search** | Use a hierarchical table of contents, chapter tracking, full-book search, keyboard navigation, mouse-wheel paging, and `F11` fullscreen. | ✅ |
-| **Typography and themes** | Customize reading and interface fonts, font sizes, weight, layout, and Light or Dark themes. | ✅ |
+| **Typography and themes** | Configure default, CJK, code, and interface fonts; choose unified or book-authored typography; and follow the system, Light, or Dark theme. | ✅ |
 | **Selection and annotations** | Select freely or by word, sentence, or paragraph; copy text, create highlights and notes, and return to durable source locations. | ✅ |
 | **Image preview** | Open book images in an overlay, zoom with the wheel, pan when enlarged, and copy images to the clipboard. | ✅ |
 | **Translation** | Translate book content in replacement or bilingual mode and translate the table of contents. | ✅ |
-| **AI reading assistant** | Ask about the current book with source-backed citations and render Markdown, math, SVG, and Mermaid responses. | ✅ Optional |
+| **AI reading assistant** | Stream answers with source-backed citations and render Markdown, tables, math, SVG, and Mermaid, including enlarged visual previews. | ✅ Optional |
+| **PDF OCR and metadata recognition** | Recognize title, author, table of contents, page roles, and body content; switch between the original PDF and a reflowable OCR layout. | ✅ Optional |
 | **WebDAV sync** | Sync books, reading progress, highlights, and notes directly through your own WebDAV provider. | ✅ Optional |
 | **Windows updates** | Check GitHub Releases automatically, verify the MSI with SHA-256, and install updates after confirmation. | ✅ Windows |
 
@@ -63,11 +79,11 @@ Import books, browse covers, search by title or author, and continue where you l
 
 ![Torto local ebook library](assets/screenshots/library.png)
 
-### Focused reading
+### Classic two-column layout
 
-Keep the table of contents, reading surface, translation tools, and AI assistant close without letting them take over the page.
+Focus Mode is the default experience described above. Torto also keeps a conventional two-column layout for readers who prefer a page-like view.
 
-![Torto two-page reader](assets/screenshots/reader.png)
+![Torto classic two-column reader](assets/screenshots/reader.png)
 
 ## Download
 
@@ -79,7 +95,7 @@ Download the latest build from [GitHub Releases](https://github.com/TortoTech/to
 | macOS, Apple silicon | `Torto-*-macos-arm64.dmg` | macOS 12 or later |
 | macOS, Intel | `Torto-*-macos-x86_64.dmg` | macOS 12 or later |
 
-After installation, import one or more books from the bookshelf. Use `←` / `→` or the mouse wheel to navigate, `Ctrl + F` to search the current book, and the reader menu to change layout, theme, translation, AI, and sync settings.
+After installation, import one or more books from the bookshelf and open a book in Focus Mode. Use `↑` / `↓`, the mouse wheel, or the reader scrollbar to move between reading units; press `Space` for passage actions and `Tab` for passage-scoped chat. Use `Ctrl + F` to search the current book and the reader menu to change layout, typography, theme, translation, AI, OCR, shortcuts, and sync settings.
 
 ## Privacy
 
@@ -103,7 +119,7 @@ The core reading path is `parser → Reading IR → layout → renderer`. See th
 
 ## Project status
 
-Torto is under active development. DRM-protected books are not supported. The native renderer intentionally does not aim for full browser-level HTML/CSS compatibility, so complex fixed layouts, vertical writing, Ruby annotations, and some interactive book content may not render completely yet.
+Torto is under active development. DRM-protected books are not supported. Focus Mode is unavailable for an original-layout PDF until reflowable OCR content exists. The native renderer intentionally does not aim for full browser-level HTML/CSS compatibility, so complex fixed layouts, vertical writing, Ruby annotations, and some interactive book content may not render completely yet.
 
 Please report reproducible problems in [Issues](https://github.com/TortoTech/torto/issues). Include the book format, screenshots, and reproduction steps, but do not upload complete copyrighted books.
 

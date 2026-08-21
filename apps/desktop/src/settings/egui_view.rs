@@ -301,7 +301,7 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             ),
             (
                 ShortcutAction::FocusStructure,
-                language.text("结构化段落", "Structure paragraph"),
+                language.text("按句分段", "Split by sentence"),
             ),
             (
                 ShortcutAction::FocusFootnotes,
