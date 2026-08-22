@@ -177,11 +177,9 @@ fn paragraph_atoms_for_content(content: &[Inline]) -> Vec<ParagraphAtom> {
         };
         cursor += len;
     }
-    attach_footnote_atoms(
-        paragraph_atoms_with_protected_boundaries(&text, &protected),
-        &text,
-        &footnotes,
-    )
+    let atoms = paragraph_atoms_with_protected_boundaries(&text, &protected);
+    let atoms = attach_paired_punctuation_atoms(atoms, &text);
+    attach_footnote_atoms(atoms, &text, &footnotes)
 }
 
 fn is_focus_footnote(run: &TextRun) -> bool {
@@ -191,7 +189,163 @@ fn is_focus_footnote(run: &TextRun) -> bool {
             .as_ref()
             .is_some_and(|target| target.fragment().is_some())
             && (run.style.link_role == LinkRole::FootnoteReference
-                || run.style.baseline == TextBaseline::Superscript))
+                || (run.style.link_role == LinkRole::Normal
+                    && run.style.baseline == TextBaseline::Superscript)))
+}
+
+fn attach_paired_punctuation_atoms(atoms: Vec<ParagraphAtom>, text: &str) -> Vec<ParagraphAtom> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let pairs = paired_punctuation_ranges(&chars);
+    if pairs.is_empty() {
+        return atoms;
+    }
+
+    let boundaries = atoms
+        .iter()
+        .take(atoms.len().saturating_sub(1))
+        .map(|atom| atom.end)
+        .map(|mut boundary| {
+            loop {
+                let extended = pairs
+                    .iter()
+                    .filter(|range| range.start < boundary && boundary < range.end)
+                    .map(|range| range.end)
+                    .max()
+                    .unwrap_or(boundary);
+                if extended == boundary {
+                    break boundary;
+                }
+                boundary = extended;
+            }
+        });
+    let normalized = atoms_from_boundaries(boundaries, &chars, atoms.len());
+
+    let mut attached: Vec<ParagraphAtom> = Vec::with_capacity(normalized.len());
+    for atom in normalized {
+        if is_parenthetical_annotation(&atom, &chars, &pairs)
+            && let Some(previous) = attached.last_mut()
+        {
+            previous.text.push_str(&atom.text);
+            previous.end = atom.end;
+        } else {
+            attached.push(atom);
+        }
+    }
+    attached
+}
+
+fn paired_punctuation_ranges(chars: &[char]) -> Vec<std::ops::Range<usize>> {
+    let mut stack = Vec::new();
+    let mut ranges = Vec::new();
+    for (index, character) in chars.iter().copied().enumerate() {
+        if paired_closer(character).is_some() {
+            stack.push((character, index));
+            continue;
+        }
+        let Some(opener) = paired_opener(character) else {
+            continue;
+        };
+        let Some(position) = stack
+            .iter()
+            .rposition(|(candidate, _)| *candidate == opener)
+        else {
+            continue;
+        };
+        let (_, start) = stack[position];
+        stack.truncate(position);
+        ranges.push(start..index + 1);
+    }
+    ranges
+}
+
+fn paired_closer(character: char) -> Option<char> {
+    match character {
+        '“' => Some('”'),
+        '‘' => Some('’'),
+        '《' => Some('》'),
+        '〈' => Some('〉'),
+        '（' => Some('）'),
+        '(' => Some(')'),
+        '【' => Some('】'),
+        '[' => Some(']'),
+        '〔' => Some('〕'),
+        '「' => Some('」'),
+        '『' => Some('』'),
+        '{' => Some('}'),
+        _ => None,
+    }
+}
+
+fn paired_opener(character: char) -> Option<char> {
+    match character {
+        '”' => Some('“'),
+        '’' => Some('‘'),
+        '》' => Some('《'),
+        '〉' => Some('〈'),
+        '）' => Some('（'),
+        ')' => Some('('),
+        '】' => Some('【'),
+        ']' => Some('['),
+        '〕' => Some('〔'),
+        '」' => Some('「'),
+        '』' => Some('『'),
+        '}' => Some('{'),
+        _ => None,
+    }
+}
+
+fn is_parenthetical_annotation(
+    atom: &ParagraphAtom,
+    chars: &[char],
+    pairs: &[std::ops::Range<usize>],
+) -> bool {
+    let start = (atom.start..atom.end)
+        .find(|index| !chars[*index].is_whitespace())
+        .unwrap_or(atom.end);
+    let end = (atom.start..atom.end)
+        .rev()
+        .find(|index| !chars[*index].is_whitespace())
+        .map_or(start, |index| index + 1);
+    matches!(chars.get(start), Some('（' | '(' | '【' | '[' | '〔'))
+        && pairs
+            .iter()
+            .any(|range| range.start == start && range.end == end)
+}
+
+fn atoms_from_boundaries(
+    boundaries: impl IntoIterator<Item = usize>,
+    chars: &[char],
+    capacity: usize,
+) -> Vec<ParagraphAtom> {
+    let mut boundaries = boundaries
+        .into_iter()
+        .filter(|boundary| *boundary > 0 && *boundary < chars.len())
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut atoms: Vec<ParagraphAtom> = Vec::with_capacity(capacity);
+    let mut start = 0;
+    for end in boundaries.into_iter().chain(std::iter::once(chars.len())) {
+        if start >= end {
+            continue;
+        }
+        let value = chars[start..end].iter().collect::<String>();
+        if value.trim().is_empty() {
+            if let Some(previous) = atoms.last_mut() {
+                previous.text.push_str(&value);
+                previous.end = end;
+            }
+        } else {
+            atoms.push(ParagraphAtom {
+                text: value,
+                start,
+                end,
+            });
+        }
+        start = end;
+    }
+    atoms
 }
 
 fn attach_footnote_atoms(
@@ -203,8 +357,21 @@ fn attach_footnote_atoms(
         return atoms;
     }
     let chars = text.chars().collect::<Vec<_>>();
-    let mut attached: Vec<ParagraphAtom> = Vec::with_capacity(atoms.len());
-    for atom in atoms {
+    let boundaries = atoms
+        .iter()
+        .take(atoms.len().saturating_sub(1))
+        .map(|atom| atom.end)
+        .map(|boundary| {
+            footnotes
+                .iter()
+                .find(|range| range.start <= boundary && boundary < range.end)
+                .map_or(boundary, |range| range.end)
+        })
+        .collect::<Vec<_>>();
+    let normalized = atoms_from_boundaries(boundaries, &chars, atoms.len());
+
+    let mut attached: Vec<ParagraphAtom> = Vec::with_capacity(normalized.len());
+    for atom in normalized {
         let only_footnote = (atom.start..atom.end).any(|index| {
             !chars
                 .get(index)
@@ -431,6 +598,91 @@ mod tests {
         apply_sentence_structure(&mut block);
 
         assert_eq!(inline_text(&block.content), "第一句。\n\n第二句。54");
+    }
+
+    #[test]
+    fn linked_footnote_between_sentences_is_not_duplicated_by_structure() {
+        let target = PublicationUrl::parse("chapter.xhtml#note-8").unwrap();
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "分手时，她说：“朝朝暮暮，阳台之下。”".to_owned(),
+                    style: Default::default(),
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: "【8】".to_owned(),
+                    style: rebook_publication::TextStyle {
+                        link_role: LinkRole::FootnoteReference,
+                        ..Default::default()
+                    },
+                    link: Some(target),
+                }),
+                Inline::Text(TextRun {
+                    text: "这里天地交媾的古老宇宙形象已经变成一个美丽的故事。不过应当注意。"
+                        .to_owned(),
+                    style: Default::default(),
+                    link: None,
+                }),
+            ],
+            style: Default::default(),
+            source: None,
+        };
+
+        apply_sentence_structure(&mut block);
+
+        assert_eq!(
+            block
+                .content
+                .iter()
+                .filter(|inline| matches!(inline, Inline::Text(run) if is_focus_footnote(run)))
+                .count(),
+            1
+        );
+        assert_eq!(inline_text(&block.content).matches("【8】").count(), 1);
+        assert_eq!(
+            inline_text(&block.content),
+            "分手时，她说：“朝朝暮暮，阳台之下。”【8】\n\n这里天地交媾的古老宇宙形象已经变成一个美丽的故事。\n\n不过应当注意。"
+        );
+    }
+
+    #[test]
+    fn dialogue_and_its_parenthetical_citation_stay_intact() {
+        let target = PublicationUrl::parse("chapter.xhtml#note-5").unwrap();
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "他说：“唯女子与小人为难养也。近之则不孙，远之则怨。”（《论语》卷十七）"
+                        .to_owned(),
+                    style: Default::default(),
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: "【5】".to_owned(),
+                    style: rebook_publication::TextStyle {
+                        link_role: LinkRole::FootnoteReference,
+                        ..Default::default()
+                    },
+                    link: Some(target),
+                }),
+                Inline::Text(TextRun {
+                    text: "话讲得机智却相当刻薄。无论如何，妇女的地位非常低下。".to_owned(),
+                    style: Default::default(),
+                    link: None,
+                }),
+            ],
+            style: Default::default(),
+            source: None,
+        };
+
+        apply_sentence_structure(&mut block);
+
+        assert_eq!(
+            inline_text(&block.content),
+            "他说：“唯女子与小人为难养也。近之则不孙，远之则怨。”（《论语》卷十七）【5】\n\n话讲得机智却相当刻薄。\n\n无论如何，妇女的地位非常低下。"
+        );
     }
 
     #[test]

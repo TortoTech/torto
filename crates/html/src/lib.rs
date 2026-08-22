@@ -31,12 +31,10 @@ fn classify_footnote_links(
         .iter()
         .filter_map(|node| explicit_link_role(*node).map(|role| (node.range().start, role)))
         .collect::<HashMap<_, _>>();
-    let by_fragment = anchors
-        .iter()
-        .enumerate()
-        .filter_map(|(index, node)| {
-            anchor_fragment(*node).map(|fragment| (fragment.to_owned(), index))
-        })
+    let by_fragment = document
+        .descendants()
+        .filter(Node::is_element)
+        .filter_map(|node| node_fragment(node).map(|fragment| (fragment.to_owned(), node)))
         .collect::<HashMap<_, _>>();
     let targets = anchors
         .iter()
@@ -44,7 +42,7 @@ fn classify_footnote_links(
         .collect::<Vec<_>>();
 
     for (index, node) in anchors.iter().copied().enumerate() {
-        let Some(source_fragment) = anchor_fragment(node) else {
+        let Some(source_fragment) = node_fragment(node) else {
             continue;
         };
         let Some(target) = targets[index].as_ref() else {
@@ -56,22 +54,26 @@ fn classify_footnote_links(
         let Some(target_fragment) = target.fragment() else {
             continue;
         };
-        let Some(&counterpart_index) = by_fragment.get(target_fragment) else {
+        let Some(&target_node) = by_fragment.get(target_fragment) else {
             continue;
         };
-        if index >= counterpart_index {
-            continue;
-        }
-        let counterpart = anchors[counterpart_index];
-        let Some(counterpart_target) = targets[counterpart_index].as_ref() else {
+        let Some(counterpart) = target_node.descendants().find(|candidate| {
+            if !candidate.is_element()
+                || !candidate.tag_name().name().eq_ignore_ascii_case("a")
+                || candidate.range().start == node.range().start
+                || !matching_footnote_markers(node, *candidate)
+            {
+                return false;
+            }
+            attribute_local(*candidate, "href")
+                .and_then(|href| base.resolve(href).ok())
+                .is_some_and(|candidate_target| {
+                    candidate_target.path() == base.path()
+                        && candidate_target.fragment() == Some(source_fragment)
+                })
+        }) else {
             continue;
         };
-        if counterpart_target.path() != base.path()
-            || counterpart_target.fragment() != Some(source_fragment)
-            || !matching_footnote_markers(node, counterpart)
-        {
-            continue;
-        }
 
         let node_has_prose_before = link_has_preceding_block_text(node);
         let counterpart_has_prose_before = link_has_preceding_block_text(counterpart);
@@ -111,7 +113,7 @@ fn explicit_link_role(node: Node<'_, '_>) -> Option<LinkRole> {
     None
 }
 
-fn anchor_fragment<'a>(node: Node<'a, '_>) -> Option<&'a str> {
+fn node_fragment<'a>(node: Node<'a, '_>) -> Option<&'a str> {
     attribute_local(node, "id")
         .or_else(|| attribute_local(node, "name"))
         .map(str::trim)
@@ -2872,6 +2874,43 @@ mod tests {
             runs.iter()
                 .any(|run| { run.text == "[section]" && run.style.link_role == LinkRole::Normal })
         );
+    }
+
+    #[test]
+    fn classifies_reciprocal_footnote_with_target_on_container() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p>Authored prose.<a id="ref-5" href="#note-5"><sup>[5]</sup></a></p>
+            <div id="note-5"><p><a href="#ref-5"><sup>[5] </sup></a>Definition.</p></div>
+        </body></html>"##;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let runs = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(&block.content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(runs.iter().any(|run| {
+            run.text.trim() == "[5]" && run.style.link_role == LinkRole::FootnoteReference
+        }));
+        assert!(runs.iter().any(|run| {
+            run.text.trim() == "[5]" && run.style.link_role == LinkRole::FootnoteBacklink
+        }));
     }
 
     #[test]

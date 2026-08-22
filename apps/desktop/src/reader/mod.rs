@@ -9,7 +9,8 @@ use rebook_formats::{BookFormat, open_file_for_reading as open_publication_file_
 use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
 use rebook_publication::{
     Block, BookSource, Inline, InlineRole, LinkRole, PublicationUrl, RenditionLayout, Rgba,
-    SourceAnchor, SourceRange, TableOfContentsOrigin, TextBaseline, TextBlock, TextBlockKind,
+    SourceAnchor, SourceRange, TableBlock, TableOfContentsOrigin, TextBaseline, TextBlock,
+    TextBlockKind,
 };
 use rebook_reader::{
     PageDirection, ReaderPosition, ReaderSectionPage, ReaderSelection, ReaderSession,
@@ -583,6 +584,7 @@ struct FocusUnit {
     range: SourceRange,
     paint_ranges: Vec<SourceRange>,
     text: String,
+    clipboard_text: String,
     position: ReaderPosition,
     rect: egui::Rect,
     is_image: bool,
@@ -614,6 +616,12 @@ fn merge_focus_list_descendant(root: &mut FocusUnit, descendant: FocusUnit) {
             root.text.push('\n');
         }
         root.text.push_str(&descendant.text);
+    }
+    if !descendant.clipboard_text.trim().is_empty() {
+        if !root.clipboard_text.is_empty() {
+            root.clipboard_text.push('\n');
+        }
+        root.clipboard_text.push_str(&descendant.clipboard_text);
     }
     root.rect = root.rect.union(descendant.rect);
     root.footnotes.extend(descendant.footnotes);
@@ -662,7 +670,8 @@ fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, Publication
                 return None;
             };
             (run.style.link_role == LinkRole::FootnoteReference
-                || run.style.baseline == TextBaseline::Superscript)
+                || (run.style.link_role == LinkRole::Normal
+                    && run.style.baseline == TextBaseline::Superscript))
                 .then(|| run.link.clone())
                 .flatten()
                 .filter(|target| target.fragment().is_some())
@@ -694,7 +703,8 @@ fn text_block_focus_footnotes(block: &TextBlock) -> Vec<FocusFootnoteSource> {
         }
         flush_inline_note(&mut notes, &mut inline_note);
         if (run.style.link_role == LinkRole::FootnoteReference
-            || run.style.baseline == TextBaseline::Superscript)
+            || (run.style.link_role == LinkRole::Normal
+                && run.style.baseline == TextBaseline::Superscript))
             && let Some(target) = run
                 .link
                 .clone()
@@ -773,6 +783,107 @@ fn text_block_focus_text(block: &TextBlock) -> String {
             Inline::Break => Some("\n"),
         })
         .collect()
+}
+
+fn markdown_table_cell(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.trim();
+    let mut escaped = String::with_capacity(normalized.len());
+    for character in normalized.chars() {
+        match character {
+            '|' => {
+                let preceding_backslashes = escaped
+                    .chars()
+                    .rev()
+                    .take_while(|character| *character == '\\')
+                    .count();
+                for _ in 0..=preceding_backslashes {
+                    escaped.push('\\');
+                }
+                escaped.push('|');
+            }
+            '\n' => escaped.push_str("<br>"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn table_block_markdown(table: &TableBlock) -> String {
+    let mut rows = Vec::with_capacity(table.rows.len());
+    let mut row_spans = Vec::<usize>::new();
+
+    for authored_row in &table.rows {
+        let mut row = Vec::<String>::new();
+        let mut column = 0_usize;
+        for cell in &authored_row.cells {
+            let column_span = usize::from(cell.column_span.max(1));
+            loop {
+                let end = column.saturating_add(column_span);
+                if row_spans.len() < end {
+                    row_spans.resize(end, 0);
+                }
+                if row_spans[column..end]
+                    .iter()
+                    .all(|remaining| *remaining == 0)
+                {
+                    break;
+                }
+                if row.len() <= column {
+                    row.resize(column + 1, String::new());
+                }
+                column += 1;
+            }
+
+            if row.len() < column + column_span {
+                row.resize(column + column_span, String::new());
+            }
+            row[column] = markdown_table_cell(&text_block_focus_text(&cell.text));
+            let row_span = usize::from(cell.row_span.max(1));
+            for remaining in &mut row_spans[column..column + column_span] {
+                *remaining = row_span;
+            }
+            column += column_span;
+        }
+
+        if row.len() < row_spans.len() {
+            row.resize(row_spans.len(), String::new());
+        }
+        rows.push(row);
+        for remaining in &mut row_spans {
+            *remaining = remaining.saturating_sub(1);
+        }
+    }
+
+    let column_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if column_count == 0 {
+        return String::new();
+    }
+    for row in &mut rows {
+        row.resize(column_count, String::new());
+    }
+
+    let mut markdown = String::new();
+    let push_row = |output: &mut String, row: &[String]| {
+        output.push('|');
+        for cell in row {
+            output.push(' ');
+            output.push_str(cell);
+            output.push_str(" |");
+        }
+        output.push('\n');
+    };
+
+    // Pipe-table Markdown requires a header row. When the source has no
+    // semantic header, reuse its first row instead of inventing a visible
+    // empty row that changes the copied table's shape.
+    push_row(&mut markdown, &rows[0]);
+    push_row(&mut markdown, &vec!["---".to_owned(); column_count]);
+    for row in rows.iter().skip(1) {
+        push_row(&mut markdown, row);
+    }
+    markdown.pop();
+    markdown
 }
 
 fn block_focus_text(block: &Block) -> String {
@@ -1410,6 +1521,10 @@ impl DesktopReader {
                 continue;
             }
             let footnotes = self.resolve_focus_footnotes(block);
+            let clipboard_text = match block {
+                Block::Table(table) => table_block_markdown(table),
+                _ => text.clone(),
+            };
             let geometry_ranges = focus_unit_geometry_ranges(
                 units.is_empty(),
                 &leading_heading_ranges,
@@ -1430,6 +1545,7 @@ impl DesktopReader {
                 range,
                 paint_ranges,
                 text,
+                clipboard_text,
                 position,
                 rect,
                 is_image,
@@ -2648,8 +2764,8 @@ mod tests {
         focus_unit_matches_highlight_ranges, focus_unit_screen_center_y, focus_unit_scroll_bounds,
         focus_unit_target_offset_for_rect, legacy_translated_paragraph_range, logical_dimension,
         merge_focus_list_descendant, resolve_book_display_metadata, resolved_focus_unit_index,
-        source_range_contains_anchor, text_block_focus_footnotes, text_block_focus_text,
-        text_block_footnote_references,
+        source_range_contains_anchor, table_block_markdown, text_block_focus_footnotes,
+        text_block_focus_text, text_block_footnote_references,
     };
     use crate::plugins::PdfOcrViewMode;
     use crate::preferences::ReadingMode;
@@ -2660,8 +2776,8 @@ mod tests {
     };
     use rebook_publication::{
         Block, BlockStyle, Inline, InlineRole, LinkRole, PublicationUrl, Rgba, SourceAnchor,
-        SourceRange, SpineItemId, TableBlock, TableCell, TableRow, TextBlock, TextBlockKind,
-        TextRun, TextStyle, TocEntry,
+        SourceRange, SpineItemId, TableBlock, TableCell, TableRow, TextBaseline, TextBlock,
+        TextBlockKind, TextRun, TextStyle, TocEntry,
     };
     use rebook_reader::{ReaderPosition, ReaderSectionPage};
     use rebook_renderer::DisplayListCompiler;
@@ -2713,6 +2829,26 @@ mod tests {
             source: None,
         });
         assert!(block_is_footnote_definition(&definition));
+    }
+
+    #[test]
+    fn superscript_backlinks_are_not_exposed_as_focus_footnotes() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "[5]".into(),
+                style: TextStyle {
+                    baseline: TextBaseline::Superscript,
+                    link_role: LinkRole::FootnoteBacklink,
+                    ..TextStyle::default()
+                },
+                link: Some(PublicationUrl::parse("chapter.xhtml#ref-5").unwrap()),
+            })],
+            style: BlockStyle::default(),
+            source: None,
+        };
+
+        assert!(text_block_focus_footnotes(&block).is_empty());
     }
 
     #[test]
@@ -3099,6 +3235,81 @@ mod tests {
     }
 
     #[test]
+    fn authored_table_copies_as_markdown_with_escaped_multiline_cells() {
+        let cell = |text: &str, header: bool| TableCell {
+            text: TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: None,
+            },
+            authored_alignment: None,
+            column_span: 1,
+            row_span: 1,
+            header,
+        };
+        let table = TableBlock {
+            rows: vec![
+                TableRow {
+                    cells: vec![cell("Name", true), cell("Value", true)],
+                },
+                TableRow {
+                    cells: vec![
+                        cell("A | B", false),
+                        cell("first\nsecond; p = \\frac{1}{2}", false),
+                    ],
+                },
+            ],
+            source: None,
+        };
+
+        assert_eq!(
+            table_block_markdown(&table),
+            "| Name | Value |\n| --- | --- |\n| A \\| B | first<br>second; p = \\frac{1}{2} |"
+        );
+    }
+
+    #[test]
+    fn markdown_table_uses_the_first_data_row_as_header_and_flattens_cell_spans() {
+        let cell = |text: &str, column_span: u16, row_span: u16| TableCell {
+            text: TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: None,
+            },
+            authored_alignment: None,
+            column_span,
+            row_span,
+            header: false,
+        };
+        let table = TableBlock {
+            rows: vec![
+                TableRow {
+                    cells: vec![cell("Merged", 2, 2), cell("R1", 1, 1)],
+                },
+                TableRow {
+                    cells: vec![cell("R2", 1, 1)],
+                },
+            ],
+            source: None,
+        };
+
+        assert_eq!(
+            table_block_markdown(&table),
+            "| Merged |  | R1 |\n| --- | --- | --- |\n|  |  | R2 |"
+        );
+    }
+
+    #[test]
     fn first_focus_unit_geometry_includes_leading_headings_without_highlighting_them() {
         let spine = SpineItemId::new("chapter-1").unwrap();
         let range = |node: &str| SourceRange {
@@ -3158,6 +3369,7 @@ mod tests {
             range: range(node),
             paint_ranges: vec![range(node)],
             text: text.into(),
+            clipboard_text: text.into(),
             position,
             rect: egui::Rect::from_min_size(egui::pos2(20.0, y), egui::vec2(400.0, 40.0)),
             is_image: false,
@@ -3228,6 +3440,7 @@ mod tests {
             range: range(node),
             paint_ranges: vec![range(node)],
             text: node.into(),
+            clipboard_text: node.into(),
             position: current,
             rect: egui::Rect::ZERO,
             is_image: false,

@@ -2059,7 +2059,8 @@ fn prepare_inline_content(
                     .as_ref()
                     .is_some_and(|target| target.fragment().is_some())
                     && (run.style.link_role == LinkRole::FootnoteReference
-                        || run.style.baseline == TextBaseline::Superscript);
+                        || (run.style.link_role == LinkRole::Normal
+                            && run.style.baseline == TextBaseline::Superscript));
                 let footnote_reference = focus_footnote_icons
                     && (run.style.inline_role == InlineRole::Footnote || linked_footnote_reference);
                 if footnote_reference {
@@ -3002,6 +3003,15 @@ mod tests {
             },
             link: linked_superscript.link.clone(),
         };
+        let superscript_backlink = TextRun {
+            text: "[5]".into(),
+            style: TextStyle {
+                baseline: TextBaseline::Superscript,
+                link_role: LinkRole::FootnoteBacklink,
+                ..TextStyle::default()
+            },
+            link: Some(rebook_publication::PublicationUrl::parse("chapter.xhtml#ref-5").unwrap()),
+        };
         let inline_footnote = TextRun {
             text: "inline note".into(),
             style: TextStyle {
@@ -3017,6 +3027,7 @@ mod tests {
                 Inline::Text(unlinked_superscript),
                 Inline::Text(linked_baseline_text),
                 Inline::Text(semantic_baseline_reference),
+                Inline::Text(superscript_backlink),
                 Inline::Text(inline_footnote),
             ],
             style: rebook_publication::BlockStyle::default(),
@@ -3037,12 +3048,12 @@ mod tests {
                 .iter()
                 .map(|span| span.footnote_reference_group != 0)
                 .collect::<Vec<_>>(),
-            [true, false, false, true, true]
+            [true, false, false, true, false, true]
         );
         assert_eq!(
             focus_text,
             format!(
-                "023{}{}",
+                "023{}[5]{}",
                 footnote_icon_placeholder("[4]"),
                 footnote_icon_placeholder("inline note")
             )
@@ -3061,7 +3072,7 @@ mod tests {
                 .iter()
                 .all(|span| span.footnote_reference_group == 0)
         );
-        assert_eq!(classic_text, "123[4]inline note");
+        assert_eq!(classic_text, "123[4][5]inline note");
     }
 
     #[test]

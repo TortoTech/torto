@@ -3428,7 +3428,7 @@ impl DesktopReader {
                 self.current_focus_unit_is_image(),
                 self.focus_units
                     .get(self.focus_unit_index)
-                    .map(|unit| unit.text.as_str()),
+                    .map(|unit| unit.clipboard_text.as_str()),
             )
             .map(str::to_owned)
         } else {
