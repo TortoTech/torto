@@ -53,7 +53,7 @@ impl CloudProviderKind {
     const fn base_url(self) -> Option<&'static str> {
         match self {
             Self::Jianguoyun => Some("https://dav.jianguoyun.com/dav"),
-            Self::InfiniCloud => Some("https://webdav.infini-cloud.net"),
+            Self::InfiniCloud => Some("https://higa.teracloud.jp/dav"),
             Self::Koofr => Some("https://app.koofr.net/dav/Koofr"),
             Self::HiDrive => Some("https://webdav.hidrive.strato.com"),
             Self::YandexDisk => Some("https://webdav.yandex.com"),
@@ -271,6 +271,16 @@ mod tests {
 
         assert_eq!(settings.provider, CloudProviderKind::Jianguoyun);
         assert_eq!(settings.base_url, "https://dav.jianguoyun.com/dav");
+    }
+
+    #[test]
+    fn infinicloud_preset_uses_the_configured_account_webdav_node() {
+        let mut settings = SyncSettings::new_device();
+
+        settings.select_provider(CloudProviderKind::InfiniCloud);
+
+        assert_eq!(settings.provider, CloudProviderKind::InfiniCloud);
+        assert_eq!(settings.base_url, "https://higa.teracloud.jp/dav");
     }
 
     #[test]
