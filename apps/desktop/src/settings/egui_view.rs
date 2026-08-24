@@ -522,40 +522,50 @@ fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
 
         ui.add_space(14.0);
         #[cfg(target_os = "windows")]
-        ui.horizontal(|ui| {
-            let checking = matches!(
-                state.update_check_status,
-                super::UpdateCheckStatus::Checking
-            );
-            let check = ui.add_enabled_ui(!checking, |ui| {
-                secondary_button_sized(
-                    ui,
-                    if checking {
-                        state.draft_language.text("检查中...", "Checking...")
-                    } else {
-                        state.draft_language.text("检查", "Check")
-                    },
-                    72.0,
-                )
+        if crate::updater::manual_updates_supported() {
+            ui.horizontal(|ui| {
+                let checking = matches!(
+                    state.update_check_status,
+                    super::UpdateCheckStatus::Checking
+                );
+                let check = ui.add_enabled_ui(!checking, |ui| {
+                    secondary_button_sized(
+                        ui,
+                        if checking {
+                            state.draft_language.text("检查中...", "Checking...")
+                        } else {
+                            state.draft_language.text("检查", "Check")
+                        },
+                        72.0,
+                    )
+                });
+                if check.inner.clicked() {
+                    state.update_check_requested = true;
+                    state.update_check_status = super::UpdateCheckStatus::Checking;
+                }
+                let update_available = matches!(
+                    state.update_check_status,
+                    super::UpdateCheckStatus::Available(_)
+                );
+                let update = ui.add_enabled_ui(update_available, |ui| {
+                    secondary_button_sized(ui, state.draft_language.text("更新", "Update"), 72.0)
+                });
+                if update.inner.clicked() {
+                    state.update_requested = true;
+                }
             });
-            if check.inner.clicked() {
-                state.update_check_requested = true;
-                state.update_check_status = super::UpdateCheckStatus::Checking;
-            }
-            let update_available = matches!(
-                state.update_check_status,
-                super::UpdateCheckStatus::Available(_)
+        } else {
+            ui.label(
+                RichText::new(state.draft_language.text(
+                    "更新由 Microsoft Store 管理。",
+                    "Updates are managed by Microsoft Store.",
+                ))
+                .color(palette().muted),
             );
-            let update = ui.add_enabled_ui(update_available, |ui| {
-                secondary_button_sized(ui, state.draft_language.text("更新", "Update"), 72.0)
-            });
-            if update.inner.clicked() {
-                state.update_requested = true;
-            }
-        });
+        }
 
         #[cfg(target_os = "windows")]
-        {
+        if crate::updater::manual_updates_supported() {
             ui.add_space(8.0);
             match &state.update_check_status {
                 super::UpdateCheckStatus::Idle | super::UpdateCheckStatus::Checking => {}

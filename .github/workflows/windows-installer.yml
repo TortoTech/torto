@@ -94,12 +94,19 @@ jobs:
             --nocapture `
             --output "dist\Torto-$env:TORTO_VERSION-x86_64.msi"
 
+      - name: Build Microsoft Store MSIX package
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: .\scripts\build-msix.ps1 -SkipBuild -OutputDirectory dist
+
       - name: Upload workflow artifact
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v7
         with:
           name: Torto-${{ steps.version.outputs.version }}-windows-x86_64
-          path: dist/*.msi
+          path: |
+            dist/*.msi
+            dist/*.msix
           if-no-files-found: error
 
       - name: Publish GitHub release

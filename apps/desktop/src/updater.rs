@@ -143,6 +143,9 @@ impl WindowsUpdater {
     }
 
     pub(crate) fn request_check(&mut self) {
+        if !manual_updates_supported() {
+            return;
+        }
         self.manual_check = true;
         if !self.check_task.is_pending() {
             self.check_task.begin(());
@@ -150,6 +153,9 @@ impl WindowsUpdater {
     }
 
     pub(crate) fn request_update(&mut self) {
+        if !manual_updates_supported() {
+            return;
+        }
         match self.state.clone() {
             UpdateState::Available(release) | UpdateState::DownloadFailed { release, .. } => {
                 self.download_task.begin(release.clone());
@@ -458,8 +464,20 @@ fn localized_release_notes(markdown: &str, language: AppLanguage) -> &str {
 }
 
 fn automatic_check_enabled() -> bool {
-    !cfg!(debug_assertions)
-        || std::env::var_os("TORTO_ENABLE_UPDATE_CHECK").is_some_and(|value| value == "1")
+    manual_updates_supported()
+        && (!cfg!(debug_assertions)
+            || std::env::var_os("TORTO_ENABLE_UPDATE_CHECK").is_some_and(|value| value == "1"))
+}
+
+pub(crate) fn manual_updates_supported() -> bool {
+    std::env::current_exe().map_or(true, |path| {
+        !path.components().any(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("WindowsApps")
+        })
+    })
 }
 
 async fn check_for_update() -> Result<Option<UpdateRelease>, String> {

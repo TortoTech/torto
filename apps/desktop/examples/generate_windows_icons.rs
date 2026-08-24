@@ -7,12 +7,19 @@ use image::imageops::FilterType;
 use image::{ColorType, ImageEncoder};
 
 const ICON_SIZES: [u32; 9] = [16, 20, 24, 32, 40, 48, 64, 128, 256];
+const STORE_ASSETS: [(&str, u32); 3] = [
+    ("StoreLogo.png", 50),
+    ("Square44x44Logo.png", 44),
+    ("Square150x150Logo.png", 150),
+];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source_path = root.join("assets/logo.png");
     let output_dir = root.join("assets/windows");
+    let store_output_dir = output_dir.join("store");
     fs::create_dir_all(&output_dir)?;
+    fs::create_dir_all(&store_output_dir)?;
 
     let source = image::open(&source_path)?.into_rgba8();
     let (width, height) = source.dimensions();
@@ -32,6 +39,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         fs::write(output_dir.join(format!("torto-{size}.png")), &png)?;
         frames.push((size, png));
+    }
+
+    for (name, size) in STORE_ASSETS {
+        let resized = image::imageops::resize(&source, size, size, FilterType::Lanczos3);
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png).write_image(
+            resized.as_raw(),
+            size,
+            size,
+            ColorType::Rgba8.into(),
+        )?;
+        fs::write(store_output_dir.join(name), png)?;
     }
 
     write_ico(&output_dir.join("torto.ico"), &frames)?;
