@@ -1,5 +1,7 @@
 //! Renderer-independent pagination for normalized reading IR.
 
+pub mod linebreak;
+
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ops::Range;
@@ -112,6 +114,16 @@ pub enum TypesettingMode {
     Unified,
 }
 
+/// Selects the paragraph breakpoint algorithm while retaining Parley for
+/// shaping, line construction, alignment, and justification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LineBreakStrategy {
+    #[default]
+    Greedy,
+    Optimized,
+}
+
 /// Chooses whether paragraph indentation follows the book language or an
 /// explicit reader value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +141,7 @@ pub enum ParagraphIndentMode {
 #[serde(default)]
 pub struct ReaderTypesetting {
     pub mode: TypesettingMode,
+    pub line_break_strategy: LineBreakStrategy,
     pub heading_scale: f32,
     pub body_line_height: f32,
     pub paragraph_indent_mode: ParagraphIndentMode,
@@ -148,6 +161,7 @@ impl ReaderTypesetting {
     pub fn unified() -> Self {
         Self {
             mode: TypesettingMode::Unified,
+            line_break_strategy: LineBreakStrategy::Optimized,
             ..Self::default()
         }
     }
@@ -173,6 +187,7 @@ impl Default for ReaderTypesetting {
     fn default() -> Self {
         Self {
             mode: TypesettingMode::Book,
+            line_break_strategy: LineBreakStrategy::Greedy,
             heading_scale: 1.6,
             body_line_height: 1.5,
             paragraph_indent_mode: ParagraphIndentMode::Auto,
@@ -1343,7 +1358,20 @@ impl LayoutEngine {
             &text[..source_text_start],
             typography,
         );
-        layout.break_all_lines(Some(available_width));
+        let optimized = reader_style.typesetting.line_break_strategy
+            == LineBreakStrategy::Optimized
+            && block.kind == TextBlockKind::Paragraph
+            && block.style.align == TextAlignment::Justify
+            && linebreak::parley::break_optimized(
+                &mut layout,
+                &text,
+                available_width,
+                first_line_indent,
+            )
+            .is_some();
+        if !optimized {
+            layout.break_all_lines(Some(available_width));
+        }
         let alignment = text_alignment(block.style.align);
         layout.align(alignment, AlignmentOptions::default());
         PreparedText {
@@ -1535,7 +1563,14 @@ fn resolve_text_block<'a>(
         };
 
     if context == TextContext::Flow && block.kind != TextBlockKind::Blockquote {
-        resolved.style.align = TextAlignment::Start;
+        resolved.style.align = if matches!(
+            block.kind,
+            TextBlockKind::Paragraph | TextBlockKind::ListItem { .. }
+        ) {
+            TextAlignment::Justify
+        } else {
+            TextAlignment::Start
+        };
     }
     resolved.style.margin_before = 0.0;
     resolved.style.margin_after = margin_after;
@@ -3179,6 +3214,40 @@ mod tests {
     }
 
     #[test]
+    fn unified_typesetting_justifies_paragraphs_and_list_items() {
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        for kind in [
+            TextBlockKind::Paragraph,
+            TextBlockKind::ListItem {
+                ordered: false,
+                ordinal: 1,
+                depth: 0,
+                marker_visible: true,
+            },
+        ] {
+            let block = TextBlock {
+                kind,
+                content: vec![Inline::Text(TextRun {
+                    text: "Unified prose".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle {
+                    align: TextAlignment::End,
+                    ..rebook_publication::BlockStyle::default()
+                },
+                source: None,
+            };
+
+            let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+            assert_eq!(resolved.style.align, TextAlignment::Justify);
+        }
+    }
+
+    #[test]
     fn book_typesetting_preserves_authored_metrics() {
         let block = TextBlock {
             kind: TextBlockKind::Paragraph,
@@ -3251,6 +3320,7 @@ mod tests {
     fn reader_typesetting_normalizes_persisted_values() {
         let mut typesetting = ReaderTypesetting {
             mode: TypesettingMode::Unified,
+            line_break_strategy: LineBreakStrategy::Greedy,
             heading_scale: f32::NAN,
             body_line_height: 9.0,
             paragraph_indent_mode: ParagraphIndentMode::Custom,
@@ -3278,6 +3348,18 @@ mod tests {
         assert!((typesetting.table_font_scale - 0.7).abs() < 0.001);
         assert!((typesetting.table_line_height - 1.45).abs() < 0.001);
         assert!((typesetting.table_cell_padding_em - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn unified_typesetting_enables_optimized_line_breaking() {
+        assert_eq!(
+            ReaderTypesetting::default().line_break_strategy,
+            LineBreakStrategy::Greedy
+        );
+        assert_eq!(
+            ReaderTypesetting::unified().line_break_strategy,
+            LineBreakStrategy::Optimized
+        );
     }
 
     #[test]

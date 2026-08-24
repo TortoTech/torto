@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use directories::ProjectDirs;
-use rebook_layout::{ReaderTypesetting, ReaderTypography, SpreadMode};
+use rebook_layout::{
+    LineBreakStrategy, ReaderTypesetting, ReaderTypography, SpreadMode, TypesettingMode,
+};
 use rebook_reader::SelectionGranularity;
 use serde::{Deserialize, Serialize};
 
@@ -497,6 +499,9 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
 }
 
 fn migrate_legacy_typesetting_defaults(typesetting: &mut ReaderTypesetting) {
+    if typesetting.mode == TypesettingMode::Unified {
+        typesetting.line_break_strategy = LineBreakStrategy::Optimized;
+    }
     if (typesetting.body_line_height - LEGACY_BODY_LINE_HEIGHT).abs() < f32::EPSILON {
         typesetting.body_line_height = 1.5;
     }
@@ -535,7 +540,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rebook_layout::{ReaderDefaultFont, TypesettingMode};
+    use rebook_layout::ReaderDefaultFont;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -627,6 +632,7 @@ mod tests {
     #[test]
     fn legacy_typesetting_defaults_migrate_to_the_compact_profile() {
         let mut typesetting = ReaderTypesetting {
+            line_break_strategy: LineBreakStrategy::Greedy,
             body_line_height: LEGACY_BODY_LINE_HEIGHT,
             paragraph_gap_em: LEGACY_PARAGRAPH_GAP_EM,
             ..ReaderTypesetting::unified()
@@ -636,6 +642,10 @@ mod tests {
 
         assert!((typesetting.body_line_height - 1.5).abs() < f32::EPSILON);
         assert!((typesetting.paragraph_gap_em - 0.5).abs() < f32::EPSILON);
+        assert_eq!(
+            typesetting.line_break_strategy,
+            LineBreakStrategy::Optimized
+        );
     }
 
     #[test]
