@@ -9,7 +9,6 @@ license.workspace = true
 [dependencies]
 anyrender.workspace = true
 kurbo.workspace = true
-parley.workspace = true
 peniko.workspace = true
 rebook-layout = { path = "../layout" }
 rebook-publication = { path = "../publication" }

@@ -3,7 +3,15 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use rebook_assistant::{
+    AssistantAnnotationAction, AssistantToolCall, AssistantToolFuture, AssistantToolHost,
+    AssistantToolResult, CHAT_CITATION_INSTRUCTION, OpenAiToolLoop, ToolLoopStep,
+    chat_citation_marker, citations_for_model,
+};
+pub(crate) use rebook_assistant::{
+    CHAT_CITATION_PREFIX, chat_citation_link, chat_citation_marker_from_link,
+};
+pub use rebook_assistant::{ChatReadingContext, ChatRole, ChatSelection, ChatTurn};
 use rebook_formats::BookFormat;
 use rebook_publication::{
     Block, Book, BookSource, RenditionLayout, SourceRange, SpineItem, TocEntry,
@@ -39,112 +47,6 @@ const DIRECT_SUMMARY_VISUAL_PAGE_LIMIT: usize = 20;
 const DIRECT_SUMMARY_TEXT_CHAR_LIMIT: usize = 50_000;
 const CHAT_VISUALIZATION_INSTRUCTION: &str = "# 图表与可视化\n阅读器可以直接渲染 Mermaid 和 SVG。用户要求结构图、流程图、关系图、时间线或其他可视化时，优先输出 fenced `mermaid` 代码块；需要 Mermaid 难以表达的自定义矢量图时，输出包含完整有效 `<svg>...</svg>` 的 fenced `svg` 代码块。不要声称无法生成图片、图表或可视化；除非用户明确要求纯文本，否则不要用 ASCII 图替代可渲染图形。不要输出依赖外部脚本、网络资源或交互事件的 SVG。";
 const CHAT_MATH_INSTRUCTION: &str = "# 数学公式\n行内公式必须使用 `$...$`，独立公式必须使用 `$$...$$`，分隔符内侧不要留空格。不要使用 `\\(...\\)`、`\\[...\\]` 或裸 LaTeX 命令；阅读器会直接渲染美元符号分隔的 LaTeX。";
-const CHAT_CITATION_INSTRUCTION: &str = "# 引用\n工具和用户引用会提供 OpenAI 风格的 citation 标记。引用书中内容时，逐字复制对应的完整标记。正确示例：`【18/n104†source】`。不要编造 citation、unit 或 id。总结中的每个主要主题、概念或结论都要就近引用。多个引用连续出现时，让完整标记直接相邻，例如 `【18/n104†source】【19/n205†source】`。输出前检查：涉及书中内容时，每个引用都必须是资料中已经提供的完整 citation 标记。";
-pub(crate) const CHAT_CITATION_PREFIX: &str = "link://j/";
-const CITATION_COMPONENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'!')
-    .remove(b'~')
-    .remove(b'*')
-    .remove(b'\'')
-    .remove(b'(')
-    .remove(b')');
-
-pub(crate) fn chat_citation_link(section_index: usize, node: Option<&str>) -> String {
-    node.map_or_else(
-        || format!("{CHAT_CITATION_PREFIX}{section_index}"),
-        |node| {
-            format!(
-                "{CHAT_CITATION_PREFIX}{section_index}/{}",
-                utf8_percent_encode(node, CITATION_COMPONENT_ENCODE_SET)
-            )
-        },
-    )
-}
-
-fn chat_citation_marker(section_index: usize, node: Option<&str>) -> String {
-    let link = chat_citation_link(section_index, node);
-    chat_citation_marker_from_link(&link).expect("generated citation links are valid")
-}
-
-pub(crate) fn chat_citation_marker_from_link(link: &str) -> Option<String> {
-    let locator = link.strip_prefix(CHAT_CITATION_PREFIX)?;
-    let (section, node) = locator
-        .split_once('/')
-        .map_or((locator, None), |(section, node)| (section, Some(node)));
-    if section.is_empty()
-        || !section.bytes().all(|byte| byte.is_ascii_digit())
-        || node.is_some_and(str::is_empty)
-    {
-        return None;
-    }
-    Some(format!("【{locator}†source】"))
-}
-
-fn citations_for_model(mut value: Value) -> Value {
-    replace_citation_links(&mut value);
-    value
-}
-
-fn replace_citation_links(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            if let Some(marker) = object
-                .get("href")
-                .and_then(Value::as_str)
-                .and_then(chat_citation_marker_from_link)
-            {
-                object.remove("href");
-                object.insert("citation".into(), Value::String(marker));
-            }
-            if let Some(markers) = object.get("hrefs").and_then(Value::as_array).map(|links| {
-                links
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .filter_map(chat_citation_marker_from_link)
-                    .map(Value::String)
-                    .collect::<Vec<_>>()
-            }) {
-                object.remove("hrefs");
-                object.insert("citations".into(), Value::Array(markers));
-            }
-            for child in object.values_mut() {
-                replace_citation_links(child);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                replace_citation_links(item);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChatRole {
-    User,
-    Assistant,
-}
-
-impl ChatRole {
-    const fn api_name(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChatTurn {
-    pub role: ChatRole,
-    pub content: String,
-    pub display_content: Option<String>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatResponse {
     pub content: String,
@@ -153,36 +55,73 @@ pub struct ChatResponse {
     pub(crate) annotation_actions: Vec<ChatAnnotationAction>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ChatSelection {
-    pub text: String,
-    pub ranges: Vec<SourceRange>,
+pub(crate) type ChatAnnotationAction = AssistantAnnotationAction<StoredHighlight>;
+
+struct LegacyBookToolHost<'a> {
+    client: Client,
+    source: Arc<dyn BookSource>,
+    rewrite_source: Arc<RewriteBookSource>,
+    book_id: String,
+    selection: Option<ChatSelection>,
+    annotations: &'a mut Vec<StoredHighlight>,
+    annotation_actions: &'a mut Vec<ChatAnnotationAction>,
+    current: ChatReadingContext,
+    settings: PluginSettings,
+    rewrites: &'a mut Vec<BlockRewrite>,
+    rewrite_transactions: &'a mut Vec<RewriteTransaction>,
+    is_pdf: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ChatReadingContext {
-    pub unit_index: usize,
-    pub unit_id: Option<String>,
-    pub unit_kind: String,
-    pub unit_title: Option<String>,
-    pub section_index: usize,
-    pub section_id: Option<String>,
-    pub section_title: Option<String>,
-    pub toc_label: Option<String>,
-    pub toc_href: Option<String>,
-    pub section_fraction: f64,
-    pub total_fraction: f64,
-    pub segment_index: usize,
-    pub segment_count: usize,
-    pub page_index: usize,
-    pub page_count: usize,
-}
+impl AssistantToolHost for LegacyBookToolHost<'_> {
+    fn definitions(&self) -> Value {
+        book_tools()
+    }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ChatAnnotationAction {
-    Create(StoredHighlight),
-    Update(StoredHighlight),
-    Delete { annotation_id: String },
+    fn execute(&mut self, call: AssistantToolCall) -> AssistantToolFuture<'_> {
+        Box::pin(async move {
+            let arguments = call.arguments().cloned().map_err(str::to_owned);
+            match arguments {
+                Ok(arguments) if arguments.is_object() && call.name() == "getVisualContent" => {
+                    if self.is_pdf {
+                        get_visual_content(
+                            &self.client,
+                            Arc::clone(&self.source),
+                            &self.settings,
+                            &self.current,
+                            &arguments,
+                        )
+                        .await
+                    } else {
+                        json!({ "error": "视觉正文工具仅适用于 PDF。" })
+                    }
+                }
+                Ok(arguments) if arguments.is_object() => execute_book_tool(
+                    self.source.as_ref(),
+                    self.rewrite_source.as_ref(),
+                    &self.book_id,
+                    self.selection.as_ref(),
+                    self.annotations,
+                    self.annotation_actions,
+                    &self.current,
+                    call.name(),
+                    &arguments,
+                    self.rewrites,
+                    self.rewrite_transactions,
+                    self.is_pdf,
+                ),
+                Ok(_) => json!({ "error": "工具参数必须是 JSON 对象。" }),
+                Err(error) => json!({ "error": format!("工具参数 JSON 无效：{error}") }),
+            }
+        })
+    }
+
+    fn rollback(&mut self) -> Result<(), String> {
+        rollback_rewrite_transactions(
+            self.rewrite_source.as_ref(),
+            std::mem::take(self.rewrite_transactions),
+        );
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -273,16 +212,38 @@ pub async fn chat_with_book(
             annotation_actions: Vec::new(),
         });
     }
-    let tools = book_tools();
     let mut rewrites = Vec::new();
     let mut rewrite_transactions = Vec::new();
     let mut annotation_actions = Vec::new();
-    for _ in 0..max_tool_steps {
+    let mut tool_host = LegacyBookToolHost {
+        client: client.clone(),
+        source: Arc::clone(&source),
+        rewrite_source: Arc::clone(&rewrite_source),
+        book_id,
+        selection,
+        annotations: &mut annotations,
+        annotation_actions: &mut annotation_actions,
+        current,
+        settings: settings.clone(),
+        rewrites: &mut rewrites,
+        rewrite_transactions: &mut rewrite_transactions,
+        is_pdf: format == BookFormat::Pdf,
+    };
+    let tools = tool_host.definitions();
+    let mut tool_loop = OpenAiToolLoop::new(messages, max_tool_steps);
+    loop {
+        let request_messages = match tool_loop.request_messages() {
+            Ok(messages) => messages,
+            Err(error) => {
+                let _ = tool_host.rollback();
+                return Err(error);
+            }
+        };
         let message = match request_streaming_completion(
             &client,
             provider,
             model,
-            &messages,
+            request_messages,
             Some(&tools),
             &mut on_stream,
         )
@@ -290,88 +251,40 @@ pub async fn chat_with_book(
         {
             Ok(message) => message,
             Err(error) => {
-                rollback_rewrite_transactions(&rewrite_source, rewrite_transactions);
+                let _ = tool_host.rollback();
                 return Err(error);
             }
         };
-        let tool_calls = message
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if tool_calls.is_empty() {
-            let Some(content) =
-                message_content(&message).filter(|content| !content.trim().is_empty())
-            else {
-                rollback_rewrite_transactions(&rewrite_source, rewrite_transactions);
-                return Err("AI 返回了空内容".to_owned());
-            };
-            return Ok(ChatResponse {
-                content,
-                rewrites,
-                rewrite_transactions,
-                annotation_actions,
-            });
-        }
+        let tool_calls = match tool_loop.accept_assistant_message(message) {
+            Ok(ToolLoopStep::Complete(content)) => {
+                drop(tool_host);
+                return Ok(ChatResponse {
+                    content,
+                    rewrites,
+                    rewrite_transactions,
+                    annotation_actions,
+                });
+            }
+            Ok(ToolLoopStep::CallTools(calls)) => calls,
+            Err(error) => {
+                let _ = tool_host.rollback();
+                return Err(error);
+            }
+        };
 
         on_stream(String::new());
-        messages.push(message);
+        let mut tool_results = Vec::with_capacity(tool_calls.len());
         for call in tool_calls {
-            let id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("tool-call");
-            let function = call.get("function").unwrap_or(&Value::Null);
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let arguments = function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            let result = match llm_json::parse::<Value>(arguments) {
-                Ok(arguments) if arguments.is_object() && name == "getVisualContent" => {
-                    if format == BookFormat::Pdf {
-                        get_visual_content(
-                            &client,
-                            Arc::clone(&source),
-                            &settings,
-                            &current,
-                            &arguments,
-                        )
-                        .await
-                    } else {
-                        json!({ "error": "视觉正文工具仅适用于 PDF。" })
-                    }
-                }
-                Ok(arguments) if arguments.is_object() => execute_book_tool(
-                    source.as_ref(),
-                    rewrite_source.as_ref(),
-                    &book_id,
-                    selection.as_ref(),
-                    &mut annotations,
-                    &mut annotation_actions,
-                    &current,
-                    name,
-                    &arguments,
-                    &mut rewrites,
-                    &mut rewrite_transactions,
-                    format == BookFormat::Pdf,
-                ),
-                Ok(_) => json!({ "error": "工具参数必须是 JSON 对象。" }),
-                Err(error) => json!({ "error": format!("工具参数 JSON 无效：{error}") }),
-            };
+            let call_id = call.id().to_owned();
+            let result = tool_host.execute(call).await;
             let result = citations_for_model(result);
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": serde_json::to_string(&result).unwrap_or_else(|_| "{}".into()),
-            }));
+            tool_results.push(AssistantToolResult::new(call_id, result));
+        }
+        if let Err(error) = tool_loop.apply_tool_results(tool_results) {
+            let _ = tool_host.rollback();
+            return Err(error);
         }
     }
-    rollback_rewrite_transactions(&rewrite_source, rewrite_transactions);
-    Err("AI 工具调用次数过多，请缩小问题范围后重试".into())
 }
 
 struct DirectPdfSummaryInput {

@@ -13,8 +13,7 @@ pub(super) const fn snapshot_reanchors_focus(effects: SnapshotEffects) -> bool {
 
 impl DesktopReader {
     pub(in crate::reader) fn go_to_toc(&mut self, id: &str, target: &PublicationUrl) {
-        self.ui.focus_footnotes_visible = false;
-        self.ui.focus_footnote_scroll_delta = 0.0;
+        self.focus_state.hide_footnotes();
         let result = self.reader.go_to_href(target);
         match result {
             Ok(result) => {
@@ -29,14 +28,14 @@ impl DesktopReader {
                             self.snapshot.active_toc_path.push(item.id.clone());
                         }
                     }
-                    self.focus_anchor = focus_anchor.or_else(|| {
+                    let focus_anchor = focus_anchor.or_else(|| {
                         self.reader
                             .current_page()
                             .leading_source_range()
                             .map(|range| range.start.clone())
                     });
+                    self.focus_state.reset(focus_anchor);
                     self.focus_units.clear();
-                    self.focus_unit_index = 0;
                     self.focus_target_offset = None;
                     self.ui.focus_scroll_motion = None;
                 }
@@ -46,26 +45,25 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn go_to_adjacent_section(&mut self, direction: PageDirection) {
-        self.ui.focus_footnotes_visible = false;
-        self.ui.focus_footnote_scroll_delta = 0.0;
+        self.focus_state.hide_footnotes();
         self.focus_toc_override = None;
         match self.reader.go_to_adjacent_reading_unit(direction) {
             Ok(result) if result.outcome == rebook_reader::NavigationOutcome::Moved => {
                 let focus_anchor = self.reader.current_reading_unit_anchor();
                 self.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
                 if self.is_focus_mode() {
-                    self.focus_anchor = focus_anchor.or_else(|| {
+                    let focus_anchor = focus_anchor.or_else(|| {
                         self.reader
                             .current_page()
                             .leading_source_range()
                             .map(|range| range.start.clone())
                     });
+                    self.focus_state.reset(focus_anchor);
                 }
                 // A unit transition inside one spine section must invalidate the
                 // continuous layout just like a section transition.
                 self.scroll_section = None;
                 self.focus_units.clear();
-                self.focus_unit_index = 0;
                 self.focus_target_offset = None;
                 self.ui.focus_scroll_motion = None;
                 self.pending_reading_unit_entry = Some(direction);
@@ -149,16 +147,18 @@ impl DesktopReader {
         // by the user with the current page's leading range. Only an explicit
         // navigation operation establishes a new anchor here.
         if self.is_focus_mode() && snapshot_reanchors_focus(effects) {
-            self.focus_anchor = self
+            let focus_anchor = self
                 .reader
                 .current_page()
                 .leading_source_range()
                 .map(|range| range.start.clone());
+            self.focus_state.set_anchor(focus_anchor);
         }
         if previous_section != target_position.section_index {
             self.scroll_section = None;
             self.focus_units.clear();
-            self.focus_unit_index = 0;
+            let focus_anchor = self.focus_state.anchor().cloned();
+            self.focus_state.reset(focus_anchor);
             self.focus_target_offset = None;
             self.ui.focus_scroll_motion = None;
         }
@@ -177,7 +177,7 @@ impl DesktopReader {
             self.scroll_target_source = None;
         }
         self.selection_toolbar_visible = false;
-        self.ui.focus_actions_visible = false;
+        self.focus_state.hide_actions();
         self.annotation_note_draft = None;
         self.selection_anchor = None;
         self.selection = None;
@@ -224,10 +224,10 @@ impl DesktopReader {
         if self.is_focus_mode() {
             return self
                 .focus_units
-                .get(self.focus_unit_index)
+                .get(self.focus_state.active_index())
                 .map(|unit| unit.range.clone())
                 .or_else(|| {
-                    self.focus_anchor.as_ref().map(|anchor| SourceRange {
+                    self.focus_state.anchor().map(|anchor| SourceRange {
                         start: anchor.clone(),
                         end: anchor.clone(),
                     })

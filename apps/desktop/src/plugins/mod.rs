@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::persistence::write_json_atomic;
 
+pub use rebook_assistant::TranslationMode;
+
 pub(crate) use ai::{
     CHAT_CITATION_PREFIX, ChatAnnotationAction, ChatSelection, chat_citation_link,
     chat_citation_marker_from_link,
@@ -36,17 +38,16 @@ pub use commands::{
     resolve_chat_command,
 };
 pub(crate) use pdf_ocr::{
-    PDF_PAGE_ANCHOR_PREFIX, PdfOcrPageRole, PdfOcrPageRoleAssignment, PdfOcrSourceController,
-    PdfOcrSyncData, PdfOcrViewMode, correct_generated_toc_pages_from_ocr, export_pdf_ocr_sync_data,
-    has_pending_pdf_ocr_task, import_pdf_ocr_sync_data, load_pdf_ocr_source, recognize_pdf,
-    save_pdf_ocr_page_roles, set_pdf_ocr_view_mode,
+    PdfOcrPageRole, PdfOcrPageRoleAssignment, PdfOcrSyncData, correct_generated_toc_pages_from_ocr,
+    export_pdf_ocr_sync_data, has_pending_pdf_ocr_task, import_pdf_ocr_sync_data,
+    load_pdf_ocr_source, persist_pdf_ocr_page_roles, persist_pdf_ocr_view_mode, recognize_pdf,
 };
 pub(crate) use pdf_toc::{PdfMetadataExtraction, extract_pdf_metadata};
 pub use rewrite::RewriteBookSource;
 pub use search::{BookSearchResult, search_book};
 pub(crate) use search::{section_title, text_block_text};
-pub(crate) use structure::{ParagraphStructureKey, ParagraphStructureSource};
-pub use translation::{BlockTranslation, TranslationBlockInput, TranslationBookSource};
+pub(crate) use structure::ParagraphStructureKey;
+pub use translation::{BlockTranslation, TranslationBlockInput};
 
 const SETTINGS_FILE: &str = "plugins.json";
 const AI_CREDENTIAL_SERVICE: &str = "Rebook AI";
@@ -164,14 +165,6 @@ impl AiModelConfig {
     pub(crate) fn language(id: impl Into<String>) -> Self {
         Self { id: id.into() }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TranslationMode {
-    #[default]
-    Replace,
-    Bilingual,
 }
 
 impl Default for AiProvider {

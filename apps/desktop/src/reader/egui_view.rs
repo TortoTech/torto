@@ -3,7 +3,10 @@ use std::time::{Duration, Instant};
 use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, Pos2, Rect, RichText, TextureId, Vec2};
 use rebook_layout::{SpreadMode, reading_content_left, reading_content_width};
-use rebook_reader::{PageDirection, ReaderImage, SelectionGranularity};
+use rebook_reader::{
+    PageDirection, ReaderFocusCommand, ReaderFocusTransition, ReaderFocusViewportPolicy,
+    ReaderImage, SelectionGranularity,
+};
 
 use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, chat_reference_token, move_suggestion_index,
@@ -12,11 +15,11 @@ use super::chat_markdown::ChatMarkdownState;
 use super::{
     AnnotationDraft, AssistantPanel, DesktopReader, GeneratedTocDraft, ImagePointerState,
     ImagePressCandidate, MOTION_EPSILON, ReaderOverlay, SelectedImage, SidebarTab,
-    focus_unit_screen_center_y, focus_unit_target_offset_for_rect,
+    focus_unit_screen_center_y,
 };
-use crate::plugins::{
-    BookSearchResult, ChatCommand, ChatRole, PdfOcrViewMode, chat_command_suggestions,
-};
+use rebook_session::PdfOcrViewMode;
+
+use crate::plugins::{BookSearchResult, ChatCommand, ChatRole, chat_command_suggestions};
 use crate::preferences::{AppLanguage, AppTheme};
 use crate::settings::ReaderSettingsChange;
 use crate::ui::{
@@ -413,16 +416,18 @@ impl DesktopReader {
             if let Some(direction) = self.pending_reading_unit_entry
                 && !self.focus_units.is_empty()
             {
-                self.focus_unit_index = match direction {
+                let index = match direction {
                     PageDirection::Previous => self.focus_units.len() - 1,
                     PageDirection::Next => 0,
                 };
-                self.focus_anchor = self
-                    .focus_units
-                    .get(self.focus_unit_index)
-                    .map(|unit| unit.range.start.clone());
-                self.sync_focus_chat_session();
-                self.sync_focus_selected_image();
+                if matches!(
+                    self.focus_state
+                        .apply(&self.focus_units, ReaderFocusCommand::Select(index)),
+                    ReaderFocusTransition::Selected(_)
+                ) {
+                    self.sync_focus_chat_session();
+                    self.sync_focus_selected_image();
+                }
             }
             // The page texture handed to this UI pass was rendered before the
             // newly selected focus unit existed. Schedule one more frame so the
@@ -455,7 +460,7 @@ impl DesktopReader {
             self.scroll_target_position = None;
             self.scroll_target_source = None;
             let offset = match direction {
-                PageDirection::Previous => layout.content_height,
+                PageDirection::Previous => layout.content_height(),
                 PageDirection::Next => 0.0,
             };
             scroll_area = scroll_area.vertical_scroll_offset(offset);
@@ -477,7 +482,7 @@ impl DesktopReader {
         let scroll_output = scroll_area.show_viewport(ui, |ui, viewport| {
             ui.set_width(viewport.width());
             let content_padding = self.scroll_content_padding(viewport.height());
-            ui.set_height((layout.content_height + content_padding * 2.0).max(viewport.height()));
+            ui.set_height((layout.content_height() + content_padding * 2.0).max(viewport.height()));
             if keyboard_scroll_delta.abs() > f32::EPSILON {
                 ui.scroll_with_delta(Vec2::new(0.0, keyboard_scroll_delta));
             }
@@ -541,16 +546,16 @@ impl DesktopReader {
         });
         let manipulating =
             output.state.vertical_scroll_bar_interacting() && (primary_down || primary_clicked);
+        let focus_viewport_policy = ReaderFocusViewportPolicy::default();
         if manipulating
-            && let Some(index) = focus_unit_index_for_scroll_offset(
-                self.focus_units.iter().map(|unit| unit.rect),
+            && let Some(index) = focus_viewport_policy.nearest_unit_for_offset(
+                self.focus_units.iter().map(|unit| unit.geometry.bounds),
                 output.state.offset.y,
                 viewport_height,
             )
-            && let Some(target_offset) = self
-                .focus_units
-                .get(index)
-                .map(|unit| focus_unit_target_offset_for_rect(unit.rect, viewport_height))
+            && let Some(target_offset) = self.focus_units.get(index).map(|unit| {
+                focus_viewport_policy.unit_target_offset(unit.geometry.bounds, viewport_height)
+            })
         {
             // The native scroll bar supplies a continuous offset. Quantize its
             // state to the nearest focus unit so dragging the handle previews
@@ -680,7 +685,7 @@ impl DesktopReader {
 
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
         if self.is_focus_mode()
-            && self.ui.focus_footnotes_visible
+            && self.focus_state.footnotes_visible()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.close_focus_footnotes();
@@ -688,10 +693,10 @@ impl DesktopReader {
         }
         if self.is_focus_mode()
             && !interaction_blocked
-            && self.ui.focus_actions_visible
+            && self.focus_state.actions_visible()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
-            self.ui.focus_actions_visible = false;
+            self.focus_state.hide_actions();
             self.annotation_note_draft = None;
             ctx.memory_mut(egui::Memory::stop_text_input);
             return;
@@ -708,7 +713,7 @@ impl DesktopReader {
         if self.focus_footnote_shortcut(ctx, interaction_blocked) {
             return;
         }
-        if self.ui.focus_footnotes_visible {
+        if self.focus_state.footnotes_visible() {
             let scroll_delta = ctx.input_mut(|input| {
                 if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
                     -ASSISTANT_KEYBOARD_SCROLL_STEP
@@ -719,7 +724,7 @@ impl DesktopReader {
                 }
             });
             if scroll_delta != 0.0 {
-                self.ui.focus_footnote_scroll_delta += scroll_delta;
+                self.focus_state.add_footnote_scroll_delta(scroll_delta);
                 ctx.request_repaint();
             }
             return;
@@ -772,7 +777,7 @@ impl DesktopReader {
         if self.focus_body_accepts_shortcuts(interaction_blocked)
             && ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_actions))
         {
-            self.ui.focus_actions_visible = true;
+            self.focus_state.show_actions();
             self.cancel_text_selection();
             ctx.memory_mut(egui::Memory::stop_text_input);
             return;
@@ -780,7 +785,7 @@ impl DesktopReader {
         if self.focus_body_accepts_shortcuts(interaction_blocked)
             && ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_chat))
         {
-            self.ui.focus_actions_visible = false;
+            self.focus_state.hide_actions();
             self.cancel_text_selection();
             self.attach_current_focus_reference();
             self.open_assistant_panel(AssistantPanel::Chat);
@@ -818,7 +823,7 @@ impl DesktopReader {
         {
             return false;
         }
-        if self.ui.focus_footnotes_visible {
+        if self.focus_state.footnotes_visible() {
             self.close_focus_footnotes();
             return true;
         }
@@ -831,12 +836,10 @@ impl DesktopReader {
             && !ctx.text_edit_focused()
             && self
                 .focus_units
-                .get(self.focus_unit_index)
+                .get(self.focus_state.active_index())
                 .is_some_and(|unit| !unit.footnotes.is_empty());
         if can_open {
-            self.ui.focus_footnotes_visible = true;
-            self.ui.focus_footnote_scroll_delta = 0.0;
-            self.ui.focus_actions_visible = false;
+            self.focus_state.show_footnotes();
             self.cancel_text_selection();
             ctx.memory_mut(egui::Memory::stop_text_input);
             ctx.request_repaint();
@@ -845,8 +848,7 @@ impl DesktopReader {
     }
 
     fn close_focus_footnotes(&mut self) {
-        self.ui.focus_footnotes_visible = false;
-        self.ui.focus_footnote_scroll_delta = 0.0;
+        self.focus_state.hide_footnotes();
     }
 
     fn operation_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
@@ -992,7 +994,7 @@ impl DesktopReader {
                 .is_some_and(|(layout, viewport)| {
                     let padding = self.scroll_content_padding(viewport.size.y);
                     let max_offset =
-                        (layout.content_height + padding * 2.0 - viewport.size.y).max(0.0);
+                        (layout.content_height() + padding * 2.0 - viewport.size.y).max(0.0);
                     viewport.offset_y >= max_offset - MOTION_EPSILON
                 }),
         };
@@ -1030,18 +1032,18 @@ impl DesktopReader {
         });
         match action {
             Some(0) if !self.current_focus_unit_is_image() => {
-                self.ui.focus_actions_visible = false;
+                self.focus_state.hide_actions();
                 self.create_focus_highlight(None);
             }
             Some(1) if !self.current_focus_unit_is_image() => {
-                self.ui.focus_actions_visible = true;
+                self.focus_state.show_actions();
                 self.annotation_note_draft = Some(AnnotationDraft {
                     note: self.current_focus_note().unwrap_or_default(),
                     focus_pending: true,
                 });
             }
             Some(2) if !self.current_focus_unit_is_image() => {
-                self.ui.focus_actions_visible = false;
+                self.focus_state.hide_actions();
                 self.toggle_current_focus_structure();
             }
             Some(_) => {}
@@ -1058,11 +1060,11 @@ impl DesktopReader {
             && self.image_preview.is_none()
             && self.ui.assistant_panel.is_none()
             && self.annotation_note_draft.is_none()
-            && !self.ui.focus_footnotes_visible
+            && !self.focus_state.footnotes_visible()
     }
 
     fn focus_wheel_interaction(&mut self, response: &egui::Response) {
-        if self.ui.focus_footnotes_visible
+        if self.focus_state.footnotes_visible()
             || self.ui.sidebar_open
             || self.ui.assistant_panel.is_some() && self.current_chat_has_data()
         {
@@ -1174,7 +1176,7 @@ impl DesktopReader {
         else {
             return;
         };
-        let max_offset = (layout.content_height - viewport.size.y).max(0.0);
+        let max_offset = (layout.content_height() - viewport.size.y).max(0.0);
         let direction = if delta > 0.0 && viewport.offset_y <= MOTION_EPSILON {
             Some(PageDirection::Previous)
         } else if delta < 0.0 && viewport.offset_y >= max_offset - MOTION_EPSILON {
@@ -1615,12 +1617,12 @@ impl DesktopReader {
     }
 
     fn focus_footnote_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
-        if !self.ui.focus_footnotes_visible {
+        if !self.focus_state.footnotes_visible() {
             return;
         }
         let footnotes = self
             .focus_units
-            .get(self.focus_unit_index)
+            .get(self.focus_state.active_index())
             .map(|unit| unit.footnotes.clone())
             .unwrap_or_default();
         if footnotes.is_empty() {
@@ -1685,7 +1687,7 @@ impl DesktopReader {
             viewport.top() + 16.0,
             (viewport.bottom() - panel_height - 16.0).max(viewport.top() + 16.0),
         );
-        let keyboard_scroll = std::mem::take(&mut self.ui.focus_footnote_scroll_delta);
+        let keyboard_scroll = self.focus_state.take_footnote_scroll_delta();
 
         egui::Area::new("focus-footnotes".into())
             .order(egui::Order::Foreground)
@@ -1743,9 +1745,9 @@ impl DesktopReader {
         let mut clicked_chat_index = None;
         let mut clicked_note = None;
         for index in 0..self.focus_units.len() {
-            let current_replacement_visible = index == self.focus_unit_index
-                && (self.ui.focus_actions_visible
-                    || self.ui.focus_footnotes_visible
+            let current_replacement_visible = index == self.focus_state.active_index()
+                && (self.focus_state.actions_visible()
+                    || self.focus_state.footnotes_visible()
                     || self.ui.assistant_panel.is_some());
             if current_replacement_visible {
                 continue;
@@ -1799,14 +1801,14 @@ impl DesktopReader {
             }
         }
         if let Some(index) = clicked_chat_index {
-            self.ui.focus_actions_visible = false;
+            self.focus_state.hide_actions();
             self.annotation_note_draft = None;
             self.select_focus_unit(index);
             self.open_assistant_panel(AssistantPanel::Chat);
         } else if let Some((index, note)) = clicked_note {
             self.close_assistant_panel();
             self.select_focus_unit(index);
-            self.ui.focus_actions_visible = true;
+            self.focus_state.show_actions();
             self.annotation_note_draft = Some(AnnotationDraft {
                 note,
                 focus_pending: true,
@@ -1819,7 +1821,7 @@ impl DesktopReader {
         reason = "the compact focus toolbar keeps its actions and editor transitions together"
     )]
     fn focus_actions_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
-        if !self.ui.focus_actions_visible {
+        if !self.focus_state.actions_visible() {
             return;
         }
         let viewport = ctx.content_rect();
@@ -1851,8 +1853,8 @@ impl DesktopReader {
         let can_annotate = !self.current_focus_unit_is_image();
         let can_structure = self
             .focus_units
-            .get(self.focus_unit_index)
-            .is_some_and(|unit| !unit.is_image && !unit.is_table);
+            .get(self.focus_state.active_index())
+            .is_some_and(|unit| !unit.is_image() && !unit.is_table());
         let chat_hover = shortcut_tooltip(
             self.language,
             "聊天",
@@ -1873,12 +1875,12 @@ impl DesktopReader {
         );
         let structure_active = self
             .focus_units
-            .get(self.focus_unit_index)
+            .get(self.focus_state.active_index())
             .map(|unit| crate::plugins::ParagraphStructureKey {
-                section_index: unit.position.section_index,
+                section_index: unit.geometry.position.section_index,
                 node: unit.range.start.node.clone(),
             })
-            .is_some_and(|key| self.structure_source.is_active(&key));
+            .is_some_and(|key| self.document_sources.structure_source().is_active(&key));
         let structure_hover = shortcut_tooltip(
             self.language,
             if structure_active {
@@ -1931,11 +1933,11 @@ impl DesktopReader {
                 }
             });
         if chat {
-            self.ui.focus_actions_visible = false;
+            self.focus_state.hide_actions();
             self.attach_current_focus_reference();
             self.open_assistant_panel(AssistantPanel::Chat);
         } else if highlight {
-            self.ui.focus_actions_visible = false;
+            self.focus_state.hide_actions();
             self.create_focus_highlight(None);
         } else if open_note {
             self.annotation_note_draft = Some(AnnotationDraft {
@@ -1943,14 +1945,14 @@ impl DesktopReader {
                 focus_pending: true,
             });
         } else if structure {
-            self.ui.focus_actions_visible = false;
+            self.focus_state.hide_actions();
             self.toggle_current_focus_structure();
         } else if save_note {
             let note = self
                 .annotation_note_draft
                 .as_ref()
                 .map(|draft| draft.note.clone());
-            self.ui.focus_actions_visible = false;
+            self.focus_state.hide_actions();
             self.create_focus_highlight(note);
         } else if cancel_note {
             self.annotation_note_draft = None;
@@ -1963,7 +1965,7 @@ impl DesktopReader {
                     .is_some_and(|position| !area.response.rect.contains(position))
         });
         if clicked_outside {
-            self.ui.focus_actions_visible = false;
+            self.focus_state.hide_actions();
             self.annotation_note_draft = None;
             ctx.memory_mut(egui::Memory::stop_text_input);
         }
@@ -1986,14 +1988,14 @@ impl DesktopReader {
     }
 
     fn focused_unit_screen_center_y(&self, page_rect: Rect) -> Option<f32> {
-        self.focus_unit_screen_center_y_at(self.focus_unit_index, page_rect)
+        self.focus_unit_screen_center_y_at(self.focus_state.active_index(), page_rect)
     }
 
     fn focus_unit_screen_center_y_at(&self, index: usize, page_rect: Rect) -> Option<f32> {
         let viewport = self.scroll_viewport?;
         let unit = self.focus_units.get(index)?;
         Some(focus_unit_screen_center_y(
-            unit.rect,
+            unit.geometry.bounds,
             viewport.offset_y,
             self.scroll_content_padding(viewport.size.y),
             page_rect,
@@ -2224,14 +2226,20 @@ impl DesktopReader {
 
     fn pdf_toc_controls(&mut self, ui: &mut egui::Ui) {
         if self.format != rebook_formats::BookFormat::Pdf
-            || self.source.table_of_contents_origin()
+            || self
+                .document_sources
+                .presented_source()
+                .table_of_contents_origin()
                 == rebook_publication::TableOfContentsOrigin::Embedded
             || !self.plugin_settings.ocr_enabled
         {
             return;
         }
         let pending = self.pdf_toc.task.is_pending();
-        let generated = self.source.table_of_contents_origin()
+        let generated = self
+            .document_sources
+            .presented_source()
+            .table_of_contents_origin()
             == rebook_publication::TableOfContentsOrigin::Generated;
         let recognize_label = if generated {
             self.language.text("重新识别目录", "Regenerate contents")
@@ -2311,7 +2319,11 @@ impl DesktopReader {
                     ui,
                     draft,
                     self.language,
-                    self.source.book().sections.len(),
+                    self.document_sources
+                        .presented_source()
+                        .book()
+                        .sections
+                        .len(),
                     (ctx.content_rect().height() - 210.0).clamp(220.0, 520.0),
                 );
                 ui.add_space(14.0);
@@ -2677,7 +2689,13 @@ impl DesktopReader {
                     .size(crate::ui::scaled_font_size(12.0))
                     .color(palette().text),
                 );
-                for action in self.chat.pending_annotation_actions.iter().take(3) {
+                for action in self
+                    .chat
+                    .pending_annotation_actions
+                    .actions()
+                    .iter()
+                    .take(3)
+                {
                     let detail = match action {
                         crate::plugins::ChatAnnotationAction::Create(annotation) => format!(
                             "{}: {}",
@@ -3427,7 +3445,7 @@ impl DesktopReader {
                 text_edit_focused,
                 self.current_focus_unit_is_image(),
                 self.focus_units
-                    .get(self.focus_unit_index)
+                    .get(self.focus_state.active_index())
                     .map(|unit| unit.clipboard_text.as_str()),
             )
             .map(str::to_owned)
@@ -4046,22 +4064,6 @@ fn focus_data_indicator(ui: &mut egui::Ui, icon: Icon, hover_text: &str) -> bool
             .gamma_multiply(if response.hovered() { 1.0 } else { 0.72 }),
     );
     response.on_hover_text(hover_text).clicked()
-}
-
-fn focus_unit_index_for_scroll_offset(
-    rects: impl IntoIterator<Item = Rect>,
-    offset: f32,
-    viewport_height: f32,
-) -> Option<usize> {
-    rects
-        .into_iter()
-        .enumerate()
-        .map(|(index, rect)| {
-            let target = focus_unit_target_offset_for_rect(rect, viewport_height);
-            (index, (target - offset).abs())
-        })
-        .min_by(|left, right| left.1.total_cmp(&right.1))
-        .map(|(index, _)| index)
 }
 
 fn focus_actions_overlay_y(note_open: bool, anchor_y: f32, viewport: Rect) -> f32 {
@@ -4779,20 +4781,17 @@ mod reference_suggestion_label_tests {
 
     #[test]
     fn focus_scrollbar_offset_targets_the_nearest_paragraph() {
-        let rects = [
-            Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(300.0, 80.0)),
-            Rect::from_min_size(Pos2::new(0.0, 320.0), Vec2::new(300.0, 80.0)),
-            Rect::from_min_size(Pos2::new(0.0, 720.0), Vec2::new(300.0, 80.0)),
-        ];
+        use rebook_layout::frame::FrameRect;
 
-        assert_eq!(
-            focus_unit_index_for_scroll_offset(rects, 300.0, 600.0),
-            Some(1)
-        );
-        assert_eq!(
-            focus_unit_index_for_scroll_offset(rects, 690.0, 600.0),
-            Some(2)
-        );
+        let rects = [
+            FrameRect::new(0.0, 0.0, 300.0, 80.0),
+            FrameRect::new(0.0, 320.0, 300.0, 400.0),
+            FrameRect::new(0.0, 720.0, 300.0, 800.0),
+        ];
+        let policy = ReaderFocusViewportPolicy::default();
+
+        assert_eq!(policy.nearest_unit_for_offset(rects, 300.0, 600.0), Some(1));
+        assert_eq!(policy.nearest_unit_for_offset(rects, 690.0, 600.0), Some(2));
     }
 
     #[test]

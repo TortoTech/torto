@@ -149,30 +149,31 @@ impl DesktopReader {
         if self.is_focus_mode()
             && let Some(rect) = self
                 .focus_units
-                .get(self.focus_unit_index)
-                .and_then(|unit| unit.rectangular_activation_rect)
+                .get(self.focus_state.active_index())
+                .and_then(|unit| unit.geometry.activation_bounds)
         {
             let background = RoundedRect::from_rect(
                 Rect::new(
-                    f64::from(rect.left()),
-                    f64::from(rect.top() + content_padding - viewport.offset_y),
-                    f64::from(rect.right()),
-                    f64::from(rect.bottom() + content_padding - viewport.offset_y),
+                    f64::from(rect.x0),
+                    f64::from(rect.y0 + content_padding - viewport.offset_y),
+                    f64::from(rect.x1),
+                    f64::from(rect.y1 + content_padding - viewport.offset_y),
                 ),
                 7.0,
             );
             let color = self
                 .focus_units
-                .get(self.focus_unit_index)
+                .get(self.focus_state.active_index())
                 .map_or_else(focus_block_activation_color, |unit| {
-                    focus_unit_activation_color(unit.structured_activation)
+                    focus_unit_activation_color(unit.has_structured_activation())
                 });
             scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &background);
         }
         let mut images = Vec::new();
         for (index, entry) in layout.pages.iter().enumerate() {
-            let top = layout.page_tops[index] + content_padding;
-            let bottom = top + layout.page_heights[index];
+            let geometry = &layout.geometry.frames()[index];
+            let top = geometry.top + content_padding;
+            let bottom = top + geometry.height;
             if bottom <= viewport.offset_y || top >= visible_bottom {
                 continue;
             }
@@ -181,9 +182,9 @@ impl DesktopReader {
             let mut page_scene = Scene::new();
             let clip = Rect::new(
                 0.0,
-                f64::from(layout.page_origins[index]),
+                f64::from(geometry.origin_y),
                 f64::from(entry.page.width()),
-                f64::from(layout.page_origins[index] + layout.page_heights[index]),
+                f64::from(geometry.origin_y + geometry.height),
             );
             page_scene.push_clip_layer(peniko::Fill::NonZero, Affine::IDENTITY, &clip);
             page_scene.append(&layers.underlay, None);
@@ -195,7 +196,7 @@ impl DesktopReader {
                 &page_scene,
                 Some(Affine::translate((
                     0.0,
-                    f64::from(top - viewport.offset_y - layout.page_origins[index]),
+                    f64::from(top - viewport.offset_y - geometry.origin_y),
                 ))),
             );
         }
@@ -335,15 +336,15 @@ impl DesktopReader {
     ) {
         let focus_unit = self
             .is_focus_mode()
-            .then(|| self.focus_units.get(self.focus_unit_index))
+            .then(|| self.focus_units.get(self.focus_state.active_index()))
             .flatten();
         if let Some(unit) =
-            focus_unit.filter(|unit| unit.rectangular_activation && !self.is_scroll_mode())
+            focus_unit.filter(|unit| unit.has_rectangular_activation() && !self.is_scroll_mode())
         {
             page.paint_source_block_background(
                 scene,
                 &unit.paint_ranges,
-                focus_unit_activation_color(unit.structured_activation),
+                focus_unit_activation_color(unit.has_structured_activation()),
                 offset_x,
             );
         }
@@ -365,8 +366,8 @@ impl DesktopReader {
             page.paint_source_ranges(scene, &selection.ranges, TEXT_SELECTION_COLOR, offset_x);
         }
         if let Some(unit) = focus_unit
-            && !unit.is_table
-            && !unit.rectangular_activation
+            && !unit.is_table()
+            && !unit.has_rectangular_activation()
         {
             page.paint_source_ranges(scene, &unit.paint_ranges, TEXT_SELECTION_COLOR, offset_x);
         }
@@ -381,8 +382,8 @@ impl DesktopReader {
         if self.is_focus_mode()
             && let Some(unit) = self
                 .focus_units
-                .get(self.focus_unit_index)
-                .filter(|unit| unit.is_table)
+                .get(self.focus_state.active_index())
+                .filter(|unit| unit.is_table())
         {
             page.paint_source_table_borders(
                 scene,

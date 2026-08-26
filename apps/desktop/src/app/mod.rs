@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use peniko::Blob;
+use rebook_layout::ReaderFontBlob;
 
 use crate::library::LocalLibrary;
 use crate::platform::UserEvent;
@@ -27,7 +27,7 @@ pub(crate) struct DesktopApp {
 }
 
 impl DesktopApp {
-    pub(crate) fn new(library: LocalLibrary, reader_fonts: Arc<[Blob<u8>]>) -> Self {
+    pub(crate) fn new(library: LocalLibrary, reader_fonts: Arc<[ReaderFontBlob]>) -> Self {
         let settings = SettingsFeature::new(&reader_fonts);
         Self {
             shelf: ShelfFeature::new(library, reader_fonts),

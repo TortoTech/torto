@@ -1,0 +1,16 @@
+[package]
+name = "rebook-gpui-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+gpui = { workspace = true, features = ["windows-manifest"] }
+rebook-gpui-renderer = { path = "../../crates/gpui-renderer" }
+rebook-layout = { path = "../../crates/layout" }
+rebook-publication = { path = "../../crates/publication" }
+
+[lints]
+workspace = true

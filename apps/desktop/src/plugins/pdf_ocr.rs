@@ -2,9 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Cursor, Read};
-use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -13,10 +11,17 @@ use bytes::Bytes;
 use directories::ProjectDirs;
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 use quick_xml::escape::unescape;
+#[cfg(test)]
 use rebook_publication::{
-    Book, BookSource, PublicationError, PublicationUrl, RasterResource, RenditionLayout, Resource,
-    Section, SpineItem, SpineItemId, TableOfContentsOrigin, TocEntry,
+    Book, RenditionLayout, Resource, Section, SpineItem, SpineItemId, TocEntry,
 };
+use rebook_publication::{BookSource, PublicationError, PublicationUrl};
+use rebook_session::{
+    PdfOcrLoadedSource, PdfOcrMarkupEngine, PdfOcrReflowBookSource, PdfOcrReflowDocument,
+    PdfOcrReflowPage, PdfOcrReflowResource, PdfOcrSourceController, PdfOcrTocAnchor,
+    PdfOcrViewMode, normalize_pdf_ocr_page_roles,
+};
+pub(crate) use rebook_session::{PdfOcrPageRole, PdfOcrPageRoleAssignment};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -40,151 +45,17 @@ const PADDLE_JOB_FILE: &str = "paddle-job.json";
 const PADDLE_JOB_VERSION: u8 = 1;
 const PADDLE_PAGE_CHUNK_SIZE: usize = 100;
 const MAX_RESULT_BYTES: usize = 512 * 1024 * 1024;
-pub(crate) const PDF_PAGE_ANCHOR_PREFIX: &str = "pdf-page-";
 
 type SharedOcrResult = Result<(), String>;
 type SharedOcrSender = watch::Sender<Option<SharedOcrResult>>;
 
 static PDF_OCR_TASKS: OnceLock<Mutex<HashMap<String, SharedOcrSender>>> = OnceLock::new();
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum PdfOcrViewMode {
-    #[default]
-    Original,
-    Reflow,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum PdfOcrPageRole {
-    Cover,
-    TitlePage,
-    BackCover,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PdfOcrPageRoleAssignment {
-    /// One-based physical PDF page.
-    pub(crate) physical_page: usize,
-    pub(crate) role: PdfOcrPageRole,
-}
-
 #[derive(Serialize, Deserialize)]
 struct StoredPdfOcrPageRoles {
     version: u8,
     book_id: String,
     roles: Vec<PdfOcrPageRoleAssignment>,
-}
-
-pub(crate) struct PdfOcrLoadedSource {
-    pub(crate) source: Arc<dyn BookSource>,
-    pub(crate) controller: Option<Arc<PdfOcrSourceController>>,
-    pub(crate) available: bool,
-    pub(crate) mode: PdfOcrViewMode,
-}
-
-pub(crate) struct PdfOcrSourceController {
-    original: Arc<dyn BookSource>,
-    reflow: Arc<dyn BookSource>,
-    original_page_targets: Vec<PublicationUrl>,
-    reflow_page_targets: Vec<PublicationUrl>,
-    reflow_enabled: AtomicBool,
-}
-
-impl PdfOcrSourceController {
-    fn new(
-        original: Arc<dyn BookSource>,
-        reflow: Arc<dyn BookSource>,
-        reflow_page_targets: Vec<PublicationUrl>,
-        mode: PdfOcrViewMode,
-    ) -> Self {
-        let original_page_targets = original
-            .book()
-            .sections
-            .iter()
-            .map(|section| section.href.clone())
-            .collect();
-        Self {
-            original,
-            reflow,
-            original_page_targets,
-            reflow_page_targets,
-            reflow_enabled: AtomicBool::new(mode == PdfOcrViewMode::Reflow),
-        }
-    }
-
-    pub(crate) fn set_mode(&self, mode: PdfOcrViewMode) {
-        self.reflow_enabled
-            .store(mode == PdfOcrViewMode::Reflow, Ordering::Release);
-    }
-
-    pub(crate) fn is_reflow_enabled(&self) -> bool {
-        self.reflow_enabled.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn original_source(&self) -> Arc<dyn BookSource> {
-        Arc::clone(&self.original)
-    }
-
-    pub(crate) fn reflow_target_for_page(&self, page_index: usize) -> Option<PublicationUrl> {
-        self.reflow_page_targets.get(page_index).cloned()
-    }
-
-    pub(crate) fn original_target_for_page(&self, page_index: usize) -> Option<PublicationUrl> {
-        self.original_page_targets.get(page_index).cloned()
-    }
-
-    pub(crate) fn original_target_for_reflow_anchor(
-        &self,
-        fragment: &str,
-    ) -> Option<PublicationUrl> {
-        let page_number = fragment
-            .strip_prefix(PDF_PAGE_ANCHOR_PREFIX)?
-            .parse::<usize>()
-            .ok()?;
-        self.original_target_for_page(page_number.checked_sub(1)?)
-    }
-
-    fn active(&self) -> &Arc<dyn BookSource> {
-        if self.reflow_enabled.load(Ordering::Acquire) {
-            &self.reflow
-        } else {
-            &self.original
-        }
-    }
-}
-
-impl BookSource for PdfOcrSourceController {
-    fn book(&self) -> &Book {
-        self.active().book()
-    }
-
-    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
-        self.active().table_of_contents_origin()
-    }
-
-    fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
-        self.active().parse_section(index)
-    }
-
-    fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
-        self.active().resource(href)
-    }
-
-    fn raster_resource(
-        &self,
-        href: &PublicationUrl,
-    ) -> Result<Option<RasterResource>, PublicationError> {
-        self.active().raster_resource(href)
-    }
-
-    fn fixed_page_dimensions(
-        &self,
-        section_index: usize,
-    ) -> Result<Option<rebook_publication::FixedPageDimensions>, PublicationError> {
-        self.active().fixed_page_dimensions(section_index)
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -230,6 +101,72 @@ struct ParsedOcrDocument {
     model: String,
     pages: Vec<StoredOcrPage>,
     resources: Vec<OcrResourceData>,
+}
+
+struct LegacyPdfOcrMarkupEngine;
+
+impl PdfOcrMarkupEngine for LegacyPdfOcrMarkupEngine {
+    fn heading_keys(&self, markup: &str) -> Vec<String> {
+        markdown_heading_keys(markup)
+    }
+
+    fn render_html(&self, markup: &str, anchors: &[PdfOcrTocAnchor]) -> String {
+        markdown_to_html_with_toc_anchors(markup, anchors)
+    }
+}
+
+fn build_ocr_reflow_source(
+    source: Arc<dyn BookSource>,
+    document: StoredPdfOcrDocument,
+    reflow_content: bool,
+) -> io::Result<PdfOcrReflowBookSource> {
+    let StoredPdfOcrDocument {
+        book_id,
+        mut pages,
+        resources,
+        page_roles,
+        ..
+    } = document;
+    let zero_based_page_roles = page_roles
+        .iter()
+        .filter_map(|assignment| {
+            assignment
+                .physical_page
+                .checked_sub(1)
+                .map(|index| (index, assignment.role))
+        })
+        .collect::<HashMap<_, _>>();
+    remove_missing_ocr_page_placeholders(&mut pages);
+    if reflow_content {
+        reflow_ocr_page_boundaries(&mut pages, &zero_based_page_roles);
+    }
+    let resource_directory = book_directory(&book_id)?.join("resources");
+    let resources = resources
+        .into_iter()
+        .map(|resource| {
+            Ok(PdfOcrReflowResource {
+                href: PublicationUrl::parse(&resource.href).map_err(publication_io_error)?,
+                path: resource_directory.join(resource.file_name),
+                media_type: resource.media_type,
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    PdfOcrReflowBookSource::new(
+        source,
+        PdfOcrReflowDocument {
+            pages: pages
+                .into_iter()
+                .map(|page| PdfOcrReflowPage {
+                    markup: page.markdown,
+                })
+                .collect(),
+            resources,
+            page_roles,
+        },
+        reflow_content,
+        Arc::new(LegacyPdfOcrMarkupEngine),
+    )
+    .map_err(publication_io_error)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -283,34 +220,6 @@ impl<'a> ConfiguredPdfOcrProvider<'a> {
     }
 }
 
-struct OcrReflowBookSource {
-    inner: Arc<dyn BookSource>,
-    book: Book,
-    pages: Vec<StoredOcrPage>,
-    page_ranges: Vec<Range<usize>>,
-    page_targets: Vec<PublicationUrl>,
-    toc_anchors: Vec<Vec<OcrTocAnchor>>,
-    page_roles: HashMap<usize, PdfOcrPageRole>,
-    resources: HashMap<String, StoredResourceLocation>,
-}
-
-#[derive(Clone, Debug)]
-struct OcrTocAnchor {
-    fragment: String,
-    label: String,
-}
-
-struct ContinuousReflowSections {
-    page_ranges: Vec<Range<usize>>,
-    page_targets: Vec<PublicationUrl>,
-    toc_anchors: Vec<Vec<OcrTocAnchor>>,
-}
-
-struct StoredResourceLocation {
-    path: PathBuf,
-    media_type: String,
-}
-
 pub(crate) fn load_pdf_ocr_source(
     source: Arc<dyn BookSource>,
     reflow_content: bool,
@@ -325,12 +234,12 @@ pub(crate) fn load_pdf_ocr_source(
         });
     };
     let mode = load_pdf_ocr_view_mode(&book_id, document.view_mode)?;
-    let reflow = Arc::new(OcrReflowBookSource::new(
+    let reflow = Arc::new(build_ocr_reflow_source(
         Arc::clone(&source),
         document,
         reflow_content,
     )?);
-    let reflow_page_targets = reflow.page_targets.clone();
+    let reflow_page_targets = reflow.page_targets().to_vec();
     let reflow_source: Arc<dyn BookSource> = reflow;
     let controller = Arc::new(PdfOcrSourceController::new(
         source,
@@ -346,7 +255,7 @@ pub(crate) fn load_pdf_ocr_source(
     })
 }
 
-pub(crate) fn set_pdf_ocr_view_mode(book_id: &str, mode: PdfOcrViewMode) -> io::Result<()> {
+pub(crate) fn persist_pdf_ocr_view_mode(book_id: &str, mode: PdfOcrViewMode) -> io::Result<()> {
     if !document_path(book_id)?.try_exists()? {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -1441,16 +1350,13 @@ fn save_document(book_id: &str, parsed: ParsedOcrDocument) -> io::Result<()> {
     crate::sync::mark_derived_dirty(book_id, crate::sync::DerivedDataKind::Ocr)
 }
 
-pub(crate) fn save_pdf_ocr_page_roles(
+pub(crate) fn persist_pdf_ocr_page_roles(
     book_id: &str,
     roles: &[PdfOcrPageRoleAssignment],
 ) -> io::Result<()> {
     let directory = book_directory(book_id)?;
     fs::create_dir_all(&directory)?;
-    let mut roles = roles.to_vec();
-    roles.retain(|assignment| assignment.physical_page > 0);
-    roles.sort_unstable_by_key(|assignment| assignment.physical_page);
-    roles.dedup_by_key(|assignment| assignment.physical_page);
+    let roles = roles.to_vec();
     write_json_atomic(
         &directory.join(PAGE_ROLES_FILE),
         &StoredPdfOcrPageRoles {
@@ -1478,7 +1384,7 @@ fn load_pdf_ocr_page_roles(book_id: &str) -> io::Result<Vec<PdfOcrPageRoleAssign
     if stored.version != PAGE_ROLES_VERSION || stored.book_id != book_id {
         return Ok(Vec::new());
     }
-    Ok(stored.roles)
+    Ok(normalize_pdf_ocr_page_roles(stored.roles))
 }
 
 pub(crate) fn export_pdf_ocr_sync_data(book_id: &str) -> io::Result<Option<PdfOcrSyncData>> {
@@ -1737,239 +1643,6 @@ fn join_page_paragraphs(tail: &str, head: &str) -> String {
     tail
 }
 
-impl OcrReflowBookSource {
-    fn new(
-        inner: Arc<dyn BookSource>,
-        document: StoredPdfOcrDocument,
-        reflow_content: bool,
-    ) -> io::Result<Self> {
-        let mut book = inner.book().clone();
-        book.metadata.layout = RenditionLayout::Reflowable;
-        let resource_directory = book_directory(&document.book_id)?.join("resources");
-        let resources = document
-            .resources
-            .into_iter()
-            .map(|resource| {
-                (
-                    resource.href,
-                    StoredResourceLocation {
-                        path: resource_directory.join(resource.file_name),
-                        media_type: resource.media_type,
-                    },
-                )
-            })
-            .collect();
-        let page_roles = document
-            .page_roles
-            .into_iter()
-            .filter_map(|assignment| {
-                assignment
-                    .physical_page
-                    .checked_sub(1)
-                    .map(|index| (index, assignment.role))
-            })
-            .collect::<HashMap<_, _>>();
-        let mut pages = document.pages;
-        remove_missing_ocr_page_placeholders(&mut pages);
-        if reflow_content {
-            reflow_ocr_page_boundaries(&mut pages, &page_roles);
-        }
-        let reflow_sections = if reflow_content {
-            build_continuous_reflow_sections(&mut book, &pages, inner.table_of_contents_origin())?
-        } else {
-            let page_ranges = (0..pages.len())
-                .map(|index| index..index + 1)
-                .collect::<Vec<_>>();
-            let page_targets = book
-                .sections
-                .iter()
-                .map(|section| section.href.clone())
-                .collect();
-            ContinuousReflowSections {
-                page_ranges,
-                page_targets,
-                toc_anchors: vec![Vec::new(); pages.len()],
-            }
-        };
-        Ok(Self {
-            inner,
-            book,
-            pages,
-            page_ranges: reflow_sections.page_ranges,
-            page_targets: reflow_sections.page_targets,
-            toc_anchors: reflow_sections.toc_anchors,
-            page_roles,
-            resources,
-        })
-    }
-}
-
-fn build_continuous_reflow_sections(
-    book: &mut Book,
-    pages: &[StoredOcrPage],
-    toc_origin: TableOfContentsOrigin,
-) -> io::Result<ContinuousReflowSections> {
-    let page_count = pages.len();
-    let original_sections = book.sections.clone();
-    let page_indices = original_sections
-        .iter()
-        .enumerate()
-        .map(|(index, section)| (section.href.path().to_owned(), index))
-        .collect::<HashMap<_, _>>();
-    let mut starts = vec![0];
-    if toc_origin != TableOfContentsOrigin::Fallback {
-        starts.extend(
-            book.table_of_contents
-                .iter()
-                .filter_map(|entry| first_toc_page(entry, &page_indices)),
-        );
-    }
-    starts.retain(|start| *start < page_count);
-    starts.sort_unstable();
-    starts.dedup();
-    if starts.is_empty() {
-        starts.push(0);
-    }
-
-    let mut page_ranges = Vec::with_capacity(starts.len());
-    for (position, start) in starts.iter().copied().enumerate() {
-        let end = starts.get(position + 1).copied().unwrap_or(page_count);
-        if start < end || (page_count == 0 && page_ranges.is_empty()) {
-            page_ranges.push(start..end);
-        }
-    }
-    if page_ranges.is_empty() {
-        page_ranges.push(0..page_count);
-    }
-
-    let mut page_targets = Vec::with_capacity(page_count);
-    let mut sections = Vec::with_capacity(page_ranges.len());
-    for (index, range) in page_ranges.iter().enumerate() {
-        let href = PublicationUrl::parse(&format!("Text/ocr-reflow-{}.xhtml", index + 1))
-            .map_err(publication_io_error)?;
-        sections.push(SpineItem {
-            id: SpineItemId::new(format!("pdf-ocr-reflow-{}", index + 1))
-                .map_err(publication_io_error)?,
-            href: href.clone(),
-            media_type: "application/xhtml+xml".into(),
-            linear: true,
-            properties: Vec::new(),
-        });
-        for page_index in range.clone() {
-            page_targets.push(
-                href.resolve(&format!("#{PDF_PAGE_ANCHOR_PREFIX}{}", page_index + 1))
-                    .map_err(publication_io_error)?,
-            );
-        }
-    }
-    let mut toc_anchors = vec![Vec::new(); page_count];
-    let heading_keys = pages
-        .iter()
-        .map(|page| markdown_heading_keys(&page.markdown))
-        .collect::<Vec<_>>();
-    let mut next_anchor = 0;
-    remap_reflow_toc(
-        &mut book.table_of_contents,
-        &page_indices,
-        &page_targets,
-        &heading_keys,
-        &mut toc_anchors,
-        &mut next_anchor,
-    )?;
-    book.sections = sections;
-    Ok(ContinuousReflowSections {
-        page_ranges,
-        page_targets,
-        toc_anchors,
-    })
-}
-
-fn first_toc_page(entry: &TocEntry, page_indices: &HashMap<String, usize>) -> Option<usize> {
-    entry
-        .href
-        .as_ref()
-        .and_then(|href| page_indices.get(href.path()))
-        .copied()
-        .or_else(|| {
-            entry
-                .children
-                .iter()
-                .filter_map(|child| first_toc_page(child, page_indices))
-                .min()
-        })
-}
-
-fn remap_reflow_toc(
-    entries: &mut [TocEntry],
-    page_indices: &HashMap<String, usize>,
-    page_targets: &[PublicationUrl],
-    heading_keys: &[Vec<String>],
-    toc_anchors: &mut [Vec<OcrTocAnchor>],
-    next_anchor: &mut usize,
-) -> io::Result<()> {
-    for entry in entries {
-        if let Some(page_index) = entry
-            .href
-            .as_ref()
-            .and_then(|href| page_indices.get(href.path()))
-            .copied()
-            && let Some(page_target) = page_targets.get(page_index)
-        {
-            let descendant_labels = toc_descendant_heading_keys(&entry.children);
-            let first_child_page = entry
-                .children
-                .first()
-                .and_then(|child| child.href.as_ref())
-                .and_then(|href| page_indices.get(href.path()))
-                .copied();
-            let heading_page = find_matching_heading_page(
-                heading_keys,
-                page_index,
-                &entry.label,
-                &descendant_labels,
-                &[],
-                first_child_page,
-            );
-            let target = if let Some(heading_page) = heading_page {
-                let fragment = format!("ocr-toc-{}", *next_anchor);
-                *next_anchor += 1;
-                toc_anchors[heading_page].push(OcrTocAnchor {
-                    fragment: fragment.clone(),
-                    label: entry.label.clone(),
-                });
-                page_targets[heading_page]
-                    .resource_url()
-                    .resolve(&format!("#{fragment}"))
-                    .map_err(publication_io_error)?
-            } else {
-                page_target.clone()
-            };
-            entry.href = Some(target);
-        }
-        remap_reflow_toc(
-            &mut entry.children,
-            page_indices,
-            page_targets,
-            heading_keys,
-            toc_anchors,
-            next_anchor,
-        )?;
-    }
-    Ok(())
-}
-
-fn toc_descendant_heading_keys(entries: &[TocEntry]) -> Vec<String> {
-    let mut labels = Vec::new();
-    for entry in entries {
-        let label = normalize_toc_heading(&entry.label);
-        if !label.is_empty() {
-            labels.push(label);
-        }
-        labels.extend(toc_descendant_heading_keys(&entry.children));
-    }
-    labels
-}
-
 fn find_matching_heading_page(
     heading_keys: &[Vec<String>],
     preferred_page: usize,
@@ -2020,110 +1693,12 @@ fn publication_io_error(error: PublicationError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
-impl BookSource for OcrReflowBookSource {
-    fn book(&self) -> &Book {
-        &self.book
-    }
-
-    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
-        self.inner.table_of_contents_origin()
-    }
-
-    fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
-        let descriptor = self
-            .book
-            .sections
-            .get(index)
-            .ok_or_else(|| PublicationError::ResourceNotFound(format!("section {index}")))?;
-        let range = self
-            .page_ranges
-            .get(index)
-            .ok_or_else(|| PublicationError::ResourceNotFound(format!("section {index}")))?;
-        let mut body = String::new();
-        for page_index in range.clone() {
-            let _ = write!(
-                body,
-                r#"<div id="{PDF_PAGE_ANCHOR_PREFIX}{}"></div>"#,
-                page_index + 1
-            );
-            if self.page_roles.contains_key(&page_index) {
-                if let Ok(page) = self.inner.parse_section(page_index)
-                    && let Some(image) = page.blocks.iter().find_map(|block| match block {
-                        rebook_publication::Block::Image(image) => Some(image),
-                        rebook_publication::Block::Figure(figure) => figure.images.first(),
-                        rebook_publication::Block::Text(_)
-                        | rebook_publication::Block::Quote(_)
-                        | rebook_publication::Block::Table(_)
-                        | rebook_publication::Block::Separator
-                        | rebook_publication::Block::LineBreak
-                        | rebook_publication::Block::PageBreak => None,
-                    })
-                {
-                    let _ = write!(
-                        body,
-                        r#"<img src="{}" alt="PDF page {}" style="display:block;max-width:100%;max-height:100%;margin:0 auto" />"#,
-                        format_args!("../{}", image.href.path()),
-                        page_index + 1
-                    );
-                }
-                body.push_str("<br />");
-                continue;
-            }
-            let markdown = self
-                .pages
-                .get(page_index)
-                .map_or("", |page| page.markdown.as_str());
-            if !markdown.trim().is_empty() {
-                body.push_str(&markdown_to_html_with_toc_anchors(
-                    markdown,
-                    self.toc_anchors.get(page_index).map_or(&[], Vec::as_slice),
-                ));
-            }
-        }
-        let document = format!(
-            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title></title><style>h1 {{ font-size: 1.75em; margin-top: 32px; margin-bottom: 12px; }} h2 {{ font-size: 1.5em; margin-top: 28px; margin-bottom: 10px; }} h3 {{ font-size: 1.28em; margin-top: 22px; margin-bottom: 8px; }} h4, h5, h6 {{ font-size: 1.12em; margin-top: 18px; margin-bottom: 6px; }}</style></head><body>{body}</body></html>"
-        );
-        rebook_html::parse_section(&document, descriptor, |_| None)
-            .map_err(|error| PublicationError::InvalidPublication(error.to_string()))
-    }
-
-    fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
-        let resource_url = href.resource_url();
-        let path = resource_url.path();
-        if let Some(resource) = self.resources.get(path) {
-            let bytes = fs::read(&resource.path)
-                .map_err(|_| PublicationError::ResourceNotFound(href.to_string()))?;
-            let media_type = if resource.media_type.starts_with("image/") {
-                resource.media_type.clone()
-            } else {
-                image_media_type(path).map_or_else(|| resource.media_type.clone(), str::to_owned)
-            };
-            return Ok(Resource {
-                href: href.resource_url(),
-                media_type,
-                bytes: bytes.into(),
-            });
-        }
-        self.inner.resource(href)
-    }
-
-    fn raster_resource(
-        &self,
-        href: &PublicationUrl,
-    ) -> Result<Option<RasterResource>, PublicationError> {
-        if self.resources.contains_key(href.resource_url().path()) {
-            return Ok(None);
-        }
-        self.inner.raster_resource(href)
-    }
-}
-
 #[cfg(test)]
 fn markdown_to_html(markdown: &str) -> String {
     markdown_to_html_with_toc_anchors(markdown, &[])
 }
 
-fn markdown_to_html_with_toc_anchors(markdown: &str, anchors: &[OcrTocAnchor]) -> String {
+fn markdown_to_html_with_toc_anchors(markdown: &str, anchors: &[PdfOcrTocAnchor]) -> String {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -3035,7 +2610,7 @@ mod tests {
                 table_of_contents: Vec::new(),
             },
         });
-        let reflow = OcrReflowBookSource::new(
+        let reflow = build_ocr_reflow_source(
             source,
             StoredPdfOcrDocument {
                 version: PDF_OCR_VERSION,
@@ -3057,8 +2632,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            reflow.pages[0].markdown,
-            "OCR text must remain cached but hidden in reflow."
+            reflow.page_markup(0),
+            Some("OCR text must remain cached but hidden in reflow.")
         );
         let parsed = reflow.parse_section(0).unwrap();
         assert!(parsed.blocks.iter().any(|block| {
@@ -3201,7 +2776,7 @@ mod tests {
                 ],
             },
         });
-        let reflow = OcrReflowBookSource::new(
+        let reflow = build_ocr_reflow_source(
             source,
             StoredPdfOcrDocument {
                 version: PDF_OCR_VERSION,
@@ -3227,7 +2802,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(reflow.book().sections.len(), 2);
-        assert_eq!(reflow.page_ranges, vec![0..2, 2..3]);
+        assert_eq!(reflow.page_ranges(), &[0..2, 2..3]);
         let first = reflow.parse_section(0).unwrap();
         let text = first
             .blocks
@@ -3308,7 +2883,7 @@ mod tests {
                 }],
             },
         });
-        let reflow = OcrReflowBookSource::new(
+        let reflow = build_ocr_reflow_source(
             source,
             StoredPdfOcrDocument {
                 version: PDF_OCR_VERSION,
@@ -3562,7 +3137,7 @@ mod tests {
                 table_of_contents: Vec::new(),
             },
         });
-        let reflow = OcrReflowBookSource::new(
+        let reflow = build_ocr_reflow_source(
             source,
             StoredPdfOcrDocument {
                 version: PDF_OCR_VERSION,
@@ -3912,7 +3487,7 @@ mod tests {
             },
         });
         let source = crate::generated_toc::load_source(source).unwrap();
-        let reflow = OcrReflowBookSource::new(source, document, true).unwrap();
+        let reflow = build_ocr_reflow_source(source, document, true).unwrap();
         let source: Arc<dyn BookSource> = Arc::new(reflow);
         let rewrite = Arc::new(crate::plugins::rewrite::RewriteBookSource::new(source));
         let source: Arc<dyn BookSource> =

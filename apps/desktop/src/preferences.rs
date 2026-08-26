@@ -4,17 +4,15 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use directories::ProjectDirs;
-use rebook_layout::{
-    LineBreakStrategy, ReaderTypesetting, ReaderTypography, SpreadMode, TypesettingMode,
-};
+use rebook_layout::{ReaderTypesetting, ReaderTypography, SpreadMode};
+pub(crate) use rebook_reader::ReadingMode;
 use rebook_reader::SelectionGranularity;
+use rebook_session::ReaderDocumentPreferences;
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::write_json_atomic;
 
 const SETTINGS_VERSION: u32 = 1;
-const LEGACY_BODY_LINE_HEIGHT: f32 = 1.72;
-const LEGACY_PARAGRAPH_GAP_EM: f32 = 0.75;
 const SETTINGS_FILE: &str = "reader-settings.json";
 pub(crate) const SYSTEM_INTERFACE_FONT: &str = "System UI";
 pub(crate) const DEFAULT_INTERFACE_FONT_SIZE: f32 = 14.0;
@@ -115,25 +113,31 @@ pub(crate) struct ReaderPreferences {
 
 impl Default for ReaderPreferences {
     fn default() -> Self {
+        let document = ReaderDocumentPreferences::default();
         Self {
             interface_typography: InterfaceTypography::default(),
-            typography: ReaderTypography::default(),
-            typesetting: ReaderTypesetting::unified(),
+            typography: document.typography,
+            typesetting: document.typesetting,
             language: AppLanguage::default(),
-            spread: SpreadMode::Single,
-            reading_mode: ReadingMode::Focus,
+            spread: document.spread,
+            reading_mode: document.reading_mode,
             theme: AppTheme::default(),
-            selection_granularity: SelectionGranularity::Free,
+            selection_granularity: document.selection_granularity,
             shortcuts: ShortcutPreferences::default(),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ReadingMode {
-    Classic,
-    #[default]
-    Focus,
+impl ReaderPreferences {
+    pub(crate) fn document_preferences(&self) -> ReaderDocumentPreferences {
+        ReaderDocumentPreferences {
+            typography: self.typography.clone(),
+            typesetting: self.typesetting.clone(),
+            spread: self.spread,
+            reading_mode: self.reading_mode,
+            selection_granularity: self.selection_granularity,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -480,34 +484,25 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
     }
     let mut interface_typography = stored.interface_typography;
     interface_typography.normalize();
-    let mut typography = stored.typography;
-    typography.normalize();
-    let mut typesetting = stored.typesetting;
-    typesetting.normalize();
-    migrate_legacy_typesetting_defaults(&mut typesetting);
-    Ok(ReaderPreferences {
-        interface_typography,
-        typography,
-        typesetting,
-        language: stored.language,
+    let mut document = ReaderDocumentPreferences {
+        typography: stored.typography,
+        typesetting: stored.typesetting,
         spread: stored.spread.into(),
         reading_mode: stored.reading_mode.into(),
-        theme: stored.theme.into(),
         selection_granularity: stored.selection_granularity.into(),
+    };
+    document.normalize();
+    Ok(ReaderPreferences {
+        interface_typography,
+        typography: document.typography,
+        typesetting: document.typesetting,
+        language: stored.language,
+        spread: document.spread,
+        reading_mode: document.reading_mode,
+        theme: stored.theme.into(),
+        selection_granularity: document.selection_granularity,
         shortcuts: stored.shortcuts,
     })
-}
-
-fn migrate_legacy_typesetting_defaults(typesetting: &mut ReaderTypesetting) {
-    if typesetting.mode == TypesettingMode::Unified {
-        typesetting.line_break_strategy = LineBreakStrategy::Optimized;
-    }
-    if (typesetting.body_line_height - LEGACY_BODY_LINE_HEIGHT).abs() < f32::EPSILON {
-        typesetting.body_line_height = 1.5;
-    }
-    if (typesetting.paragraph_gap_em - LEGACY_PARAGRAPH_GAP_EM).abs() < f32::EPSILON {
-        typesetting.paragraph_gap_em = 0.5;
-    }
 }
 
 fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()> {
@@ -517,20 +512,18 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
     fs::create_dir_all(parent)?;
     let mut interface_typography = preferences.interface_typography.clone();
     interface_typography.normalize();
-    let mut typography = preferences.typography.clone();
-    typography.normalize();
-    let mut typesetting = preferences.typesetting.clone();
-    typesetting.normalize();
+    let mut document = preferences.document_preferences();
+    document.normalize();
     let stored = StoredReaderPreferences {
         version: SETTINGS_VERSION,
         interface_typography,
-        typography,
-        typesetting,
+        typography: document.typography,
+        typesetting: document.typesetting,
         language: preferences.language,
-        spread: preferences.spread.into(),
-        reading_mode: preferences.reading_mode.into(),
+        spread: document.spread.into(),
+        reading_mode: document.reading_mode.into(),
         theme: preferences.theme.into(),
-        selection_granularity: preferences.selection_granularity.into(),
+        selection_granularity: document.selection_granularity.into(),
         shortcuts: preferences.shortcuts.clone(),
     };
     write_json_atomic(path, &stored)?;
@@ -540,7 +533,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rebook_layout::ReaderDefaultFont;
+    use rebook_layout::{LineBreakStrategy, ReaderDefaultFont, TypesettingMode};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -631,19 +624,22 @@ mod tests {
 
     #[test]
     fn legacy_typesetting_defaults_migrate_to_the_compact_profile() {
-        let mut typesetting = ReaderTypesetting {
-            line_break_strategy: LineBreakStrategy::Greedy,
-            body_line_height: LEGACY_BODY_LINE_HEIGHT,
-            paragraph_gap_em: LEGACY_PARAGRAPH_GAP_EM,
-            ..ReaderTypesetting::unified()
+        let mut document = ReaderDocumentPreferences {
+            typesetting: ReaderTypesetting {
+                line_break_strategy: LineBreakStrategy::Greedy,
+                body_line_height: 1.72,
+                paragraph_gap_em: 0.75,
+                ..ReaderTypesetting::unified()
+            },
+            ..ReaderDocumentPreferences::default()
         };
 
-        migrate_legacy_typesetting_defaults(&mut typesetting);
+        document.normalize();
 
-        assert!((typesetting.body_line_height - 1.5).abs() < f32::EPSILON);
-        assert!((typesetting.paragraph_gap_em - 0.5).abs() < f32::EPSILON);
+        assert!((document.typesetting.body_line_height - 1.5).abs() < f32::EPSILON);
+        assert!((document.typesetting.paragraph_gap_em - 0.5).abs() < f32::EPSILON);
         assert_eq!(
-            typesetting.line_break_strategy,
+            document.typesetting.line_break_strategy,
             LineBreakStrategy::Optimized
         );
     }

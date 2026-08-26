@@ -2,7 +2,10 @@
 
 use parley::{Layout, style::Brush};
 
-use super::knuth_plass::{self, Item, LineBreak, Options};
+use super::knuth_plass::LineBreak;
+use super::measured::{self, LineWidthProfile, MeasuredCluster, ShrinkSupport};
+use super::unicode;
+use crate::text::TextIndent;
 
 /// Shapes have already been constructed when this function is called. The
 /// temporary unbounded line only exposes Parley's public run/cluster view; the
@@ -11,12 +14,12 @@ pub(crate) fn break_optimized<B: Brush>(
     layout: &mut Layout<B>,
     text: &str,
     column_width: f32,
-    first_line_indent: f32,
+    indent: TextIndent,
 ) -> Option<Vec<LineBreak>> {
     if text.is_empty()
         || !column_width.is_finite()
         || column_width <= 0.0
-        || !is_supported_ltr_prose(text)
+        || !unicode::supports_phase_one_optimized(text)
         || !layout.inline_boxes().is_empty()
         || layout.is_rtl()
     {
@@ -38,167 +41,89 @@ pub(crate) fn break_optimized<B: Brush>(
                 return None;
             }
             let range = cluster.text_range();
-            let source = text.get(range)?;
-            clusters.push(ShapedCluster {
+            let source = text.get(range.clone())?;
+            clusters.push(MeasuredCluster {
+                text_range: range,
                 advance: cluster.advance(),
-                count: 1,
-                is_ascii_space: source == " " && cluster.is_space_or_nbsp(),
-                is_line_boundary: cluster.is_word_boundary(),
+                backend_count: 1,
+                is_space: source == " " && cluster.is_space_or_nbsp(),
             });
         }
-    }
-    let cluster_total = u32::try_from(clusters.len()).ok()?;
-    let mut items = shaped_items(&clusters)?;
-    if first_line_indent > 0.0 {
-        let Item::Box { width, .. } = items.first_mut()? else {
-            return None;
-        };
-        *width += first_line_indent;
     }
     // Parley 0.11 justification only expands positive free space. It does not
     // shrink spaces for an overfull line, so accepting a negative ratio here
     // would leave the line protruding past the column edge.
-    let lines = knuth_plass::optimize(&items, Options::new(column_width).without_shrink())?;
-    if lines.iter().map(|line| line.cluster_count).sum::<u32>() != cluster_total {
-        return None;
-    }
+    let (first_indent, continuation_indent) = if indent.hanging {
+        (0.0, indent.amount)
+    } else {
+        (indent.amount, 0.0)
+    };
+    let measured = measured::optimize_ltr(
+        text,
+        &clusters,
+        LineWidthProfile::from_indents(column_width, first_indent, continuation_indent)?,
+        ShrinkSupport::Unsupported,
+    )?;
 
     let mut breaker = layout.break_lines();
-    for line in &lines {
-        breaker.break_next_with_length(line.cluster_count)?;
+    for selected in &measured {
+        breaker.break_next_with_length(selected.line.cluster_count)?;
         breaker.set_prior_line_width(column_width);
     }
     breaker.finish();
-    Some(lines)
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ShapedCluster {
-    advance: f32,
-    count: u32,
-    is_ascii_space: bool,
-    is_line_boundary: bool,
-}
-
-fn shaped_items(clusters: &[ShapedCluster]) -> Option<Vec<Item>> {
-    let mut items = Vec::new();
-    let mut word_width = 0.0;
-    let mut word_clusters = 0_u32;
-    let mut pending_space = None;
-
-    for cluster in clusters {
-        if !cluster.advance.is_finite() || cluster.advance < 0.0 {
-            return None;
-        }
-        if cluster.is_ascii_space {
-            if word_clusters == 0 || pending_space.is_some() {
-                return None;
-            }
-            pending_space = Some(*cluster);
-            continue;
-        }
-
-        if let Some(space) = pending_space.take() {
-            // Parley places a soft line boundary on the first cluster after
-            // ordinary breakable whitespace. Reject styles/rules that do not.
-            if !cluster.is_line_boundary {
-                return None;
-            }
-            items.push(Item::Box {
-                width: word_width,
-                clusters: word_clusters,
-            });
-            items.push(Item::Glue {
-                width: space.advance,
-                stretch: space.advance * 0.5,
-                shrink: space.advance * 0.33,
-                clusters: space.count,
-            });
-            word_width = 0.0;
-            word_clusters = 0;
-        }
-        word_width += cluster.advance;
-        word_clusters = word_clusters.checked_add(cluster.count)?;
-    }
-
-    if pending_space.is_some() || word_clusters == 0 {
-        return None;
-    }
-    items.push(Item::Box {
-        width: word_width,
-        clusters: word_clusters,
-    });
-    Some(items)
-}
-
-fn is_supported_ltr_prose(text: &str) -> bool {
-    text.chars().all(|character| {
-        character == ' '
-            || (!character.is_control()
-                && !character.is_whitespace()
-                && !is_cjk(character)
-                && !is_rtl_codepoint(character))
-    })
-}
-
-fn is_cjk(character: char) -> bool {
-    matches!(
-        character as u32,
-        0x2E80..=0x2FFF
-            | 0x3040..=0x30FF
-            | 0x31F0..=0x31FF
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xAC00..=0xD7AF
-            | 0xF900..=0xFAFF
-            | 0x20000..=0x323AF
-    )
-}
-
-fn is_rtl_codepoint(character: char) -> bool {
-    matches!(
-        character as u32,
-        0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x1EE00..=0x1EEFF
-    )
+    Some(measured.into_iter().map(|selected| selected.line).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TextBrush;
-    use parley::{FontContext, LayoutContext, StyleProperty};
+    use crate::text::legacy_parley::TextBrush;
+    use parley::{
+        Alignment, AlignmentOptions, FontContext, IndentOptions, LayoutContext, StyleProperty,
+    };
 
     #[test]
     fn only_accepts_single_breakable_ascii_spaces() {
+        let text = "one two";
         let clusters = [
-            ShapedCluster {
+            MeasuredCluster {
+                text_range: 0..3,
                 advance: 20.0,
-                count: 1,
-                is_ascii_space: false,
-                is_line_boundary: false,
+                backend_count: 3,
+                is_space: false,
             },
-            ShapedCluster {
+            MeasuredCluster {
+                text_range: 3..4,
                 advance: 5.0,
-                count: 1,
-                is_ascii_space: true,
-                is_line_boundary: false,
+                backend_count: 1,
+                is_space: true,
             },
-            ShapedCluster {
+            MeasuredCluster {
+                text_range: 4..7,
                 advance: 18.0,
-                count: 1,
-                is_ascii_space: false,
-                is_line_boundary: true,
+                backend_count: 3,
+                is_space: false,
             },
         ];
-        assert_eq!(shaped_items(&clusters).map(|items| items.len()), Some(3));
+        assert!(
+            measured::optimize_ltr(
+                text,
+                &clusters,
+                LineWidthProfile::uniform(50.0),
+                ShrinkSupport::Unsupported,
+            )
+            .is_some()
+        );
     }
 
     #[test]
     fn rejects_scripts_outside_phase_one_scope() {
-        assert!(is_supported_ltr_prose("Ordinary English prose."));
-        assert!(!is_supported_ltr_prose("普通正文"));
-        assert!(!is_supported_ltr_prose("مرحبا"));
-        assert!(!is_supported_ltr_prose("two\tcolumns"));
+        assert!(unicode::supports_phase_one_optimized(
+            "Ordinary English prose."
+        ));
+        assert!(!unicode::supports_phase_one_optimized("普通正文"));
+        assert!(!unicode::supports_phase_one_optimized("مرحبا"));
+        assert!(!unicode::supports_phase_one_optimized("two\tcolumns"));
     }
 
     #[test]
@@ -210,7 +135,7 @@ mod tests {
         builder.push_default(StyleProperty::FontSize(18.0));
         let mut layout = builder.build(text);
 
-        let selected = break_optimized(&mut layout, text, 240.0, 0.0)
+        let selected = break_optimized(&mut layout, text, 240.0, TextIndent::default())
             .expect("ordinary shaped LTR prose should use the optimized adapter");
 
         assert!(selected.len() > 1);
@@ -224,6 +149,41 @@ mod tests {
             layout
                 .lines()
                 .all(|line| (line.metrics().inline_max_coord - 240.0).abs() < 0.01)
+        );
+    }
+
+    #[test]
+    fn hanging_indent_uses_the_narrower_continuation_measure() {
+        let text = "List content should retain a full first line and narrower continuation lines when optimized.";
+        let mut font_context = FontContext::new();
+        let mut layout_context = LayoutContext::<TextBrush>::new();
+        let mut builder = layout_context.ranged_builder(&mut font_context, text, 1.0, false);
+        builder.push_default(StyleProperty::FontSize(18.0));
+        let mut layout = builder.build(text);
+        let indent = TextIndent {
+            amount: 24.0,
+            hanging: true,
+            each_line: false,
+        };
+        layout.set_text_indent(
+            indent.amount,
+            IndentOptions {
+                hanging: true,
+                each_line: false,
+            },
+        );
+
+        let selected = break_optimized(&mut layout, text, 240.0, indent)
+            .expect("ordinary hanging LTR prose should optimize");
+        layout.align(Alignment::Start, AlignmentOptions::default());
+
+        assert!(selected.len() > 1);
+        assert!(layout.get(0).unwrap().metrics().offset.abs() < 0.01);
+        assert!(
+            layout
+                .lines()
+                .skip(1)
+                .all(|line| (line.metrics().offset - indent.amount).abs() < 0.01)
         );
     }
 }

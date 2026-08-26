@@ -50,7 +50,12 @@ impl Item {
 /// Tunable values for the first-stage optimizer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Options {
+    /// Width used by continuation lines.
     pub line_width: f32,
+    /// Optional distinct width for the first line. This keeps paragraph-indent
+    /// policy outside the optimizer while allowing ordinary and hanging
+    /// indents to participate in the global demerit calculation.
+    pub first_line_width: Option<f32>,
     pub line_penalty: f32,
     /// Lowest permitted glue adjustment ratio. The core defaults to full
     /// configured shrink (`-1`); adapters can raise this to zero when their
@@ -63,9 +68,17 @@ impl Options {
     pub const fn new(line_width: f32) -> Self {
         Self {
             line_width,
+            first_line_width: None,
             line_penalty: 10.0,
             minimum_adjustment_ratio: -1.0,
         }
+    }
+
+    /// Uses a distinct measure for the first line of the paragraph.
+    #[must_use]
+    pub const fn with_first_line_width(mut self, width: f32) -> Self {
+        self.first_line_width = Some(width);
+        self
     }
 
     /// Disables shrink candidates while retaining stretch-based optimization.
@@ -120,6 +133,9 @@ pub fn optimize(items: &[Item], options: Options) -> Option<Vec<LineBreak>> {
     if items.is_empty()
         || !options.line_width.is_finite()
         || options.line_width <= 0.0
+        || options
+            .first_line_width
+            .is_some_and(|width| !width.is_finite() || width <= 0.0)
         || !options.line_penalty.is_finite()
         || options.line_penalty < 0.0
         || !options.minimum_adjustment_ratio.is_finite()
@@ -155,12 +171,17 @@ pub fn optimize(items: &[Item], options: Options) -> Option<Vec<LineBreak>> {
                 continue;
             }
             let start = candidates[start_candidate];
+            let line_width = if start == 0 {
+                options.first_line_width.unwrap_or(options.line_width)
+            } else {
+                options.line_width
+            };
             let Some(line) = measure_line(
                 items,
                 &prefix,
                 start,
                 end,
-                options.line_width,
+                line_width,
                 options.minimum_adjustment_ratio,
                 is_last_line,
             ) else {
@@ -346,6 +367,23 @@ mod tests {
 
         assert!(shrinkable.iter().any(|line| line.adjustment_ratio < 0.0));
         assert!(stretch_only.iter().all(|line| line.adjustment_ratio >= 0.0));
+    }
+
+    #[test]
+    fn distinct_first_line_measure_changes_only_the_first_break_search() {
+        let items = paragraph(&[20.0, 20.0, 20.0, 20.0], 10.0);
+        let uniform = optimize(&items, Options::new(80.0).without_shrink()).unwrap();
+        let indented = optimize(
+            &items,
+            Options::new(80.0)
+                .with_first_line_width(60.0)
+                .without_shrink(),
+        )
+        .unwrap();
+
+        assert_eq!(uniform[0].breakpoint, 6);
+        assert_eq!(indented[0].breakpoint, 4);
+        assert_eq!(indented.last().unwrap().breakpoint, 7);
     }
 
     #[test]

@@ -1,4 +1,8 @@
-//! Reader session with section, layout, and display-list caches.
+//! Reader session with section and renderer-independent layout-frame caches.
+
+mod structure;
+
+pub use structure::{ParagraphStructureKey, ParagraphStructureSource};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -8,14 +12,18 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 
 use rebook_layout::{
-    LayoutEngine, LayoutError, LayoutViewport, PageItem, ReaderFontBlob, ReaderStyle,
+    ImagePlacement, LayoutEngine, LayoutError, LayoutFrame, LayoutViewport, PageItem,
+    ReaderFontBlob, ReaderStyle, SpreadMode, TypesettingMode,
+    frame::{FrameInteractionMap, FrameRect, FrameTextCursor, FrameTextHit},
+    text::{TextEngine, legacy_parley::LegacyParleyTextEngine},
 };
 use rebook_publication::{
-    Block, Book, BookSource, Inline, LocatorV1, PublicationError, PublicationUrl, RenditionLayout,
-    Section, SectionAnchor, SourceAnchor, SourceRange, TableOfContentsOrigin, TextBlock, TextRun,
-    TocEntry,
+    Block, Book, BookSource, Inline, InlineRole, LinkRole, LocatorV1, PublicationError,
+    PublicationUrl, RenditionLayout, Section, SectionAnchor, SourceAnchor, SourceRange,
+    TableOfContentsOrigin, TextBaseline, TextBlock, TextBlockKind, TextRun, TocEntry,
 };
-use rebook_renderer::{DisplayListCompiler, PageDisplayList, PageImageHit, PageTextHit};
+#[cfg(feature = "legacy-renderer")]
+use rebook_renderer::{DisplayListCompiler, PageDisplayList};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -24,12 +32,69 @@ const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = PREFETCH_DISTANCE * 2 + 3;
 const FRAGMENT_TEXT_BUDGET: usize = 4_096;
 const LARGE_SECTION_TEXT_BUDGET: usize = FRAGMENT_TEXT_BUDGET * 8;
 const FRAGMENT_BLOCK_BUDGET: usize = 64;
+const FOCUS_MINIMUM_PARAGRAPH_GAP: f32 = 12.0;
 
 /// Direction requested by keyboard, pointer, or command navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageDirection {
     Next,
     Previous,
+}
+
+/// Application-level reading presentation independent of a particular UI
+/// toolkit. Layout still emits immutable page frames; frontends decide how to
+/// animate, scroll, or center those frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReadingMode {
+    Classic,
+    #[default]
+    Focus,
+}
+
+/// Resolved layout-facing policy for a requested reading presentation.
+///
+/// Keeping this decision beside [`ReaderSession`] prevents each frontend from
+/// independently translating focus mode into scroll pagination, footnote
+/// affordances, and compatibility fallbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderPresentationPolicy {
+    pub mode: ReadingMode,
+    pub spread: SpreadMode,
+}
+
+impl ReaderPresentationPolicy {
+    #[must_use]
+    pub const fn resolve(
+        requested_mode: ReadingMode,
+        classic_spread: SpreadMode,
+        focus_supported: bool,
+    ) -> Self {
+        let mode = if matches!(requested_mode, ReadingMode::Focus) && !focus_supported {
+            ReadingMode::Classic
+        } else {
+            requested_mode
+        };
+        let spread = if matches!(mode, ReadingMode::Focus) {
+            SpreadMode::Scroll
+        } else {
+            classic_spread
+        };
+        Self { mode, spread }
+    }
+
+    /// Applies the layout-visible portion of this presentation policy.
+    /// Frontend-only concerns such as sidebar motion remain outside the core.
+    pub fn apply_to_style(self, style: &mut ReaderStyle) {
+        style.spread = self.spread;
+        style.focus_footnote_icons = matches!(self.mode, ReadingMode::Focus);
+        style.minimum_paragraph_gap = if matches!(self.mode, ReadingMode::Focus)
+            && style.typesetting.mode == TypesettingMode::Book
+        {
+            FOCUS_MINIMUM_PARAGRAPH_GAP
+        } else {
+            0.0
+        };
+    }
 }
 
 /// Semantic unit used to expand pointer-driven text selections.
@@ -82,6 +147,57 @@ pub struct ReaderTextHit {
     cluster_end: usize,
 }
 
+/// Logical text caret tied to one reader pagination generation.
+///
+/// Like [`ReaderTextHit`], this value is transient: applications must persist
+/// the [`SourceRange`] values of a selection and resolve fresh cursors after a
+/// resize, style change, source refresh, or other repagination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReaderTextCursor {
+    position: ReaderPosition,
+    cursor: FrameTextCursor,
+}
+
+/// Logical direction used to move a generation-local text caret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextCursorDirection {
+    Previous,
+    Next,
+}
+
+impl ReaderTextHit {
+    /// Returns the exact caret nearest the pointer inside the hit cluster.
+    #[must_use]
+    pub const fn cursor(&self) -> ReaderTextCursor {
+        ReaderTextCursor {
+            position: self.position,
+            cursor: FrameTextCursor::new(self.region_index, self.byte_index),
+        }
+    }
+
+    /// Returns the authored cluster boundaries enclosing this pointer hit.
+    #[must_use]
+    pub const fn cluster_cursors(&self) -> (ReaderTextCursor, ReaderTextCursor) {
+        (
+            ReaderTextCursor {
+                position: self.position,
+                cursor: FrameTextCursor::new(self.region_index, self.cluster_start),
+            },
+            ReaderTextCursor {
+                position: self.position,
+                cursor: FrameTextCursor::new(self.region_index, self.cluster_end),
+            },
+        )
+    }
+}
+
+impl ReaderTextCursor {
+    #[must_use]
+    pub const fn position(self) -> ReaderPosition {
+        self.position
+    }
+}
+
 /// Page-coordinate rectangle used to paint a native selection and anchor its
 /// floating action toolbar.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -130,6 +246,7 @@ pub struct ReaderVisibleTextFragment {
 /// One visual reader surface assembled from adjacent logical pages. In double
 /// mode the secondary page may come from the next layout segment or authored
 /// spine section.
+#[cfg(feature = "legacy-renderer")]
 pub struct ReaderSpread {
     pub primary: Arc<PageDisplayList>,
     pub secondary: Option<Arc<PageDisplayList>>,
@@ -139,6 +256,7 @@ pub struct ReaderSpread {
 
 /// One compiled logical page in the active authored section.
 #[derive(Clone)]
+#[cfg(feature = "legacy-renderer")]
 pub struct ReaderSectionPage {
     pub position: ReaderPosition,
     pub page: Arc<PageDisplayList>,
@@ -149,6 +267,1311 @@ pub struct ReaderSectionPage {
     pub visible_top: Option<f32>,
     /// Optional bottom crop in logical page coordinates for semantic reading views.
     pub visible_bottom: Option<f32>,
+}
+
+/// One renderer-independent reader surface assembled from adjacent logical
+/// pages. Frontends should consume this frame-first contract; legacy display
+/// lists remain available behind the `legacy-renderer` compatibility feature.
+pub struct ReaderFrameSpread {
+    pub primary: Arc<LayoutFrame>,
+    pub secondary: Option<Arc<LayoutFrame>>,
+    pub primary_offset_x: f32,
+    pub secondary_offset_x: f32,
+}
+
+/// Renderer-independent geometry for one semantic focus-reading unit.
+///
+/// The bounds live in the stitched coordinate space of [`ReaderScrollLayout`]
+/// rather than in egui/GPUI window coordinates. Frontends may animate toward
+/// these bounds and paint activation affordances without rebuilding source
+/// geometry from renderer-specific display lists.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReaderFocusGeometry {
+    pub position: ReaderPosition,
+    pub bounds: FrameRect,
+    pub activation_bounds: Option<FrameRect>,
+}
+
+/// Durable identity and immutable geometry for one focus-reading step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReaderFocusUnit {
+    pub range: SourceRange,
+    pub paint_ranges: Vec<SourceRange>,
+    pub geometry: ReaderFocusGeometry,
+    pub content_kind: ReaderFocusContentKind,
+    pub activation: ReaderFocusActivation,
+    pub footnotes: Vec<ReaderFocusFootnote>,
+}
+
+/// Resolved footnote payload attached to a focus unit. Missing linked content
+/// remains explicit so each frontend can localize its unavailable-state text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReaderFocusFootnote {
+    pub marker: Option<String>,
+    pub target: Option<PublicationUrl>,
+    pub text: Option<String>,
+}
+
+/// Reading-IR footnote source before a linked target is resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReaderFocusFootnoteSource {
+    Inline(String),
+    Reference {
+        marker: String,
+        target: PublicationUrl,
+    },
+}
+
+/// Complete frontend-neutral focus presentation for one semantic reading unit.
+///
+/// `first_unit_after_anchor` preserves heading restoration semantics: headings
+/// are not independent focus steps, so an anchor inside one resolves to the
+/// first following readable unit after candidates without frame geometry have
+/// been discarded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReaderFocusLayout {
+    pub units: Vec<ReaderFocusUnit>,
+    pub first_unit_after_anchor: Option<usize>,
+}
+
+/// Geometry adjustments shared by every focus-mode frontend.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReaderFocusLayoutPolicy {
+    pub table_bottom_margin: f32,
+}
+
+impl Default for ReaderFocusLayoutPolicy {
+    fn default() -> Self {
+        Self {
+            table_bottom_margin: 24.0,
+        }
+    }
+}
+
+impl ReaderFocusUnit {
+    #[must_use]
+    pub fn contains_anchor(&self, anchor: &SourceAnchor) -> bool {
+        source_range_contains_anchor(&self.range, anchor)
+            || self
+                .paint_ranges
+                .iter()
+                .any(|range| source_range_contains_anchor(range, anchor))
+    }
+
+    #[must_use]
+    pub const fn is_image(&self) -> bool {
+        matches!(self.content_kind, ReaderFocusContentKind::Image)
+    }
+
+    #[must_use]
+    pub const fn is_table(&self) -> bool {
+        matches!(self.content_kind, ReaderFocusContentKind::Table)
+    }
+}
+
+/// Semantic content class of one focus-reading step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderFocusContentKind {
+    Text,
+    Image,
+    Table,
+}
+
+/// Backend-neutral activation treatment. Frontends choose colors and animation,
+/// while the reader decides whether authored geometry is inline or rectangular.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderFocusActivation {
+    Inline,
+    Rectangular,
+    Structured,
+}
+
+impl ReaderFocusActivation {
+    #[must_use]
+    pub const fn is_rectangular(self) -> bool {
+        !matches!(self, Self::Inline)
+    }
+}
+
+/// Reading-IR result before immutable frame geometry is attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReaderFocusCandidate {
+    pub block_indices: Vec<usize>,
+    pub range: SourceRange,
+    pub paint_ranges: Vec<SourceRange>,
+    pub geometry_ranges: Vec<SourceRange>,
+    pub text: String,
+    pub content_kind: ReaderFocusContentKind,
+    pub activation: ReaderFocusActivation,
+}
+
+impl ReaderFocusCandidate {
+    #[must_use]
+    pub fn into_unit(self, geometry: ReaderFocusGeometry) -> ReaderFocusUnit {
+        self.into_unit_with_footnotes(geometry, Vec::new())
+    }
+
+    #[must_use]
+    pub fn into_unit_with_footnotes(
+        self,
+        geometry: ReaderFocusGeometry,
+        footnotes: Vec<ReaderFocusFootnote>,
+    ) -> ReaderFocusUnit {
+        ReaderFocusUnit {
+            range: self.range,
+            paint_ranges: self.paint_ranges,
+            geometry,
+            content_kind: self.content_kind,
+            activation: self.activation,
+            footnotes,
+        }
+    }
+}
+
+enum FocusBlockCandidate {
+    Heading(SourceRange),
+    Unit {
+        candidate: ReaderFocusCandidate,
+        list_depth: Option<u8>,
+    },
+    Reset,
+    Skip,
+}
+
+/// Compiles normalized Reading IR into ordered focus-reading candidates.
+///
+/// This stage owns semantic inclusion, list-tree grouping, heading attachment,
+/// and source identity. It deliberately does not depend on layout frames or a UI
+/// toolkit. The caller supplies only the external structured-paragraph state.
+pub fn compile_focus_candidates(
+    section: &Section,
+    reading_ranges: &[SourceRange],
+    is_structured: impl FnMut(&SourceRange) -> bool,
+) -> Vec<ReaderFocusCandidate> {
+    compile_focus_candidates_from_blocks(section.blocks.iter(), reading_ranges, is_structured)
+}
+
+fn compile_focus_candidates_from_blocks<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    reading_ranges: &[SourceRange],
+    mut is_structured: impl FnMut(&SourceRange) -> bool,
+) -> Vec<ReaderFocusCandidate> {
+    let mut candidates: Vec<ReaderFocusCandidate> = Vec::new();
+    let mut leading_heading_ranges = Vec::new();
+    let mut active_list_root: Option<(usize, u8)> = None;
+
+    for (block_index, block) in blocks.into_iter().enumerate() {
+        if focus_block_source_range(block).is_some_and(|range| !reading_ranges.contains(range))
+            || focus_block_is_footnote_definition(block)
+        {
+            active_list_root = None;
+            continue;
+        }
+
+        match classify_focus_block(block, block_index, &mut is_structured) {
+            FocusBlockCandidate::Heading(range) => {
+                active_list_root = None;
+                if candidates.is_empty() {
+                    leading_heading_ranges.push(range);
+                }
+            }
+            FocusBlockCandidate::Reset => active_list_root = None,
+            FocusBlockCandidate::Skip => {}
+            FocusBlockCandidate::Unit {
+                mut candidate,
+                list_depth,
+            } => {
+                if candidate.text.trim().is_empty()
+                    && candidate.content_kind != ReaderFocusContentKind::Image
+                {
+                    if list_depth.is_none_or(|depth| depth == 0) {
+                        active_list_root = None;
+                    }
+                    continue;
+                }
+                if candidates.is_empty() && !leading_heading_ranges.is_empty() {
+                    candidate.geometry_ranges = leading_heading_ranges
+                        .iter()
+                        .chain(&candidate.paint_ranges)
+                        .cloned()
+                        .collect();
+                }
+                if let Some(depth) = list_depth {
+                    if let Some(root_index) = focus_list_descendant_root(active_list_root, depth)
+                        && candidates[root_index].range.start.spine == candidate.range.start.spine
+                    {
+                        merge_focus_candidate(&mut candidates[root_index], candidate);
+                        continue;
+                    }
+                    let root_index = candidates.len();
+                    candidates.push(candidate);
+                    active_list_root = Some((root_index, depth));
+                } else {
+                    active_list_root = None;
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    candidates
+}
+
+fn classify_focus_block(
+    block: &Block,
+    block_index: usize,
+    is_structured: &mut impl FnMut(&SourceRange) -> bool,
+) -> FocusBlockCandidate {
+    if let Block::Text(text) = block {
+        return classify_focus_text_block(text, block_index, is_structured);
+    }
+    let (range, paint_ranges, text, content_kind, activation, list_depth) = match block {
+        Block::Text(_) => unreachable!("text blocks return before non-text classification"),
+        Block::Quote(quote) => {
+            let Some(range) = quote.source.clone() else {
+                return FocusBlockCandidate::Skip;
+            };
+            (
+                range.clone(),
+                focus_block_paint_ranges(block, &range),
+                focus_block_text(block),
+                ReaderFocusContentKind::Text,
+                ReaderFocusActivation::Rectangular,
+                None,
+            )
+        }
+        Block::Table(table) => {
+            let Some(range) = table.source.clone() else {
+                return FocusBlockCandidate::Skip;
+            };
+            (
+                range.clone(),
+                focus_block_paint_ranges(block, &range),
+                focus_block_text(block),
+                ReaderFocusContentKind::Table,
+                ReaderFocusActivation::Inline,
+                None,
+            )
+        }
+        Block::Image(image) => {
+            if image.text_layer.is_some() {
+                return FocusBlockCandidate::Reset;
+            }
+            let Some(range) = image.source.clone() else {
+                return FocusBlockCandidate::Skip;
+            };
+            (
+                range.clone(),
+                vec![range],
+                image.alt.clone(),
+                ReaderFocusContentKind::Image,
+                ReaderFocusActivation::Inline,
+                None,
+            )
+        }
+        Block::Figure(figure) => {
+            let Some(range) = figure.source.clone() else {
+                return FocusBlockCandidate::Skip;
+            };
+            (
+                range.clone(),
+                focus_block_paint_ranges(block, &range),
+                focus_block_text(block),
+                ReaderFocusContentKind::Image,
+                ReaderFocusActivation::Inline,
+                None,
+            )
+        }
+        Block::Separator | Block::LineBreak | Block::PageBreak => {
+            return FocusBlockCandidate::Reset;
+        }
+    };
+    let geometry_ranges = paint_ranges.clone();
+    FocusBlockCandidate::Unit {
+        candidate: ReaderFocusCandidate {
+            block_indices: vec![block_index],
+            range,
+            paint_ranges,
+            geometry_ranges,
+            text,
+            content_kind,
+            activation,
+        },
+        list_depth,
+    }
+}
+
+fn classify_focus_text_block(
+    text: &TextBlock,
+    block_index: usize,
+    is_structured: &mut impl FnMut(&SourceRange) -> bool,
+) -> FocusBlockCandidate {
+    if matches!(text.kind, TextBlockKind::Heading(_)) {
+        return text
+            .source
+            .clone()
+            .map_or(FocusBlockCandidate::Skip, FocusBlockCandidate::Heading);
+    }
+    let Some(range) = text.source.clone() else {
+        return FocusBlockCandidate::Skip;
+    };
+    let list_depth = match text.kind {
+        TextBlockKind::ListItem { depth, .. } => Some(depth),
+        _ => None,
+    };
+    let activation = if text.kind == TextBlockKind::Paragraph && is_structured(&range) {
+        ReaderFocusActivation::Structured
+    } else if text.kind == TextBlockKind::Preformatted {
+        ReaderFocusActivation::Rectangular
+    } else {
+        ReaderFocusActivation::Inline
+    };
+    FocusBlockCandidate::Unit {
+        candidate: ReaderFocusCandidate {
+            block_indices: vec![block_index],
+            geometry_ranges: vec![range.clone()],
+            paint_ranges: vec![range.clone()],
+            range,
+            text: focus_text_block_text(text),
+            content_kind: ReaderFocusContentKind::Text,
+            activation,
+        },
+        list_depth,
+    }
+}
+
+fn merge_focus_candidate(root: &mut ReaderFocusCandidate, descendant: ReaderFocusCandidate) {
+    root.range.end = descendant.range.end;
+    root.paint_ranges.extend(descendant.paint_ranges);
+    root.geometry_ranges.extend(descendant.geometry_ranges);
+    root.block_indices.extend(descendant.block_indices);
+    if !descendant.text.trim().is_empty() {
+        if !root.text.is_empty() {
+            root.text.push('\n');
+        }
+        root.text.push_str(&descendant.text);
+    }
+}
+
+fn focus_list_descendant_root(active_root: Option<(usize, u8)>, depth: u8) -> Option<usize> {
+    active_root.and_then(|(root_index, root_depth)| (depth > root_depth).then_some(root_index))
+}
+
+/// Returns the candidate containing, or immediately following, the source block
+/// addressed by `anchor`. Heading anchors resolve to the first following prose
+/// candidate because headings are intentionally not independent focus steps.
+#[must_use]
+pub fn focus_candidate_index_for_anchor(
+    section: &Section,
+    candidates: &[ReaderFocusCandidate],
+    anchor: Option<&SourceAnchor>,
+) -> Option<usize> {
+    let block_index = focus_anchor_block_index(&section.blocks, anchor)?;
+    candidates.iter().position(|candidate| {
+        candidate
+            .block_indices
+            .last()
+            .is_some_and(|last| *last >= block_index)
+    })
+}
+
+#[must_use]
+pub fn focus_anchor_block_index(blocks: &[Block], anchor: Option<&SourceAnchor>) -> Option<usize> {
+    focus_anchor_block_index_from_blocks(blocks.iter(), anchor)
+}
+
+fn focus_anchor_block_index_from_blocks<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    anchor: Option<&SourceAnchor>,
+) -> Option<usize> {
+    let anchor = anchor?;
+    blocks.into_iter().position(|block| {
+        let Some(range) = focus_block_source_range(block) else {
+            return false;
+        };
+        source_range_contains_anchor(range, anchor)
+            || focus_block_paint_ranges(block, range)
+                .iter()
+                .any(|range| source_range_contains_anchor(range, anchor))
+    })
+}
+
+#[must_use]
+pub fn focus_block_source_range(block: &Block) -> Option<&SourceRange> {
+    match block {
+        Block::Text(block) => block.source.as_ref(),
+        Block::Quote(quote) => quote.source.as_ref(),
+        Block::Table(table) => table.source.as_ref(),
+        Block::Image(image) => image.source.as_ref(),
+        Block::Figure(figure) => figure.source.as_ref(),
+        Block::Separator | Block::LineBreak | Block::PageBreak => None,
+    }
+}
+
+#[must_use]
+pub fn focus_block_paint_ranges(block: &Block, range: &SourceRange) -> Vec<SourceRange> {
+    let nested = match block {
+        Block::Quote(quote) => quote
+            .body
+            .iter()
+            .chain(&quote.attribution)
+            .filter_map(|block| block.source.clone())
+            .collect::<Vec<_>>(),
+        Block::Table(table) => table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .filter_map(|cell| cell.text.source.clone())
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    if nested.is_empty() {
+        vec![range.clone()]
+    } else {
+        nested
+    }
+}
+
+#[must_use]
+pub fn focus_block_text(block: &Block) -> String {
+    match block {
+        Block::Text(block) => focus_text_block_text(block),
+        Block::Quote(quote) => quote
+            .body
+            .iter()
+            .chain(&quote.attribution)
+            .map(focus_text_block_text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        Block::Table(table) => table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .map(|cell| focus_text_block_text(&cell.text))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Block::Image(image) => image.alt.clone(),
+        Block::Figure(figure) => {
+            let captions = figure
+                .captions
+                .iter()
+                .map(focus_text_block_text)
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if captions.is_empty() {
+                figure
+                    .images
+                    .iter()
+                    .map(|image| image.alt.trim())
+                    .filter(|alt| !alt.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            } else {
+                captions
+            }
+        }
+        Block::Separator | Block::LineBreak | Block::PageBreak => String::new(),
+    }
+}
+
+fn focus_text_block_text(block: &TextBlock) -> String {
+    block
+        .content
+        .iter()
+        .filter_map(|inline| match inline {
+            Inline::Text(run) if run.style.inline_role == InlineRole::Footnote => None,
+            Inline::Text(run) => Some(run.text.as_str()),
+            Inline::Math(run) => Some(run.latex.as_str()),
+            Inline::Break => Some("\n"),
+        })
+        .collect()
+}
+
+fn text_block_has_link_role(block: &TextBlock, role: LinkRole) -> bool {
+    block.content.iter().any(|inline| {
+        matches!(inline, Inline::Text(run) if run.link.is_some() && run.style.link_role == role)
+    })
+}
+
+fn text_block_focus_footnote_sources(block: &TextBlock) -> Vec<ReaderFocusFootnoteSource> {
+    fn flush_inline_note(notes: &mut Vec<ReaderFocusFootnoteSource>, text: &mut String) {
+        let note = text.trim();
+        if !note.is_empty() {
+            notes.push(ReaderFocusFootnoteSource::Inline(note.to_owned()));
+        }
+        text.clear();
+    }
+
+    let mut notes = Vec::new();
+    let mut inline_note = String::new();
+    for inline in &block.content {
+        let Inline::Text(run) = inline else {
+            flush_inline_note(&mut notes, &mut inline_note);
+            continue;
+        };
+        if run.style.inline_role == InlineRole::Footnote {
+            inline_note.push_str(&run.text);
+            continue;
+        }
+        flush_inline_note(&mut notes, &mut inline_note);
+        if (run.style.link_role == LinkRole::FootnoteReference
+            || (run.style.link_role == LinkRole::Normal
+                && run.style.baseline == TextBaseline::Superscript))
+            && let Some(target) = run
+                .link
+                .clone()
+                .filter(|target| target.fragment().is_some())
+            && !run.text.trim().is_empty()
+        {
+            notes.push(ReaderFocusFootnoteSource::Reference {
+                marker: run.text.trim().to_owned(),
+                target,
+            });
+        }
+    }
+    flush_inline_note(&mut notes, &mut inline_note);
+    notes
+}
+
+/// Extracts inline and linked footnote sources from any focus-readable block.
+#[must_use]
+pub fn focus_block_footnote_sources(block: &Block) -> Vec<ReaderFocusFootnoteSource> {
+    match block {
+        Block::Text(block) => text_block_focus_footnote_sources(block),
+        Block::Quote(quote) => quote
+            .body
+            .iter()
+            .chain(&quote.attribution)
+            .flat_map(text_block_focus_footnote_sources)
+            .collect(),
+        Block::Table(table) => table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .flat_map(|cell| text_block_focus_footnote_sources(&cell.text))
+            .collect(),
+        Block::Figure(figure) => figure
+            .captions
+            .iter()
+            .flat_map(text_block_focus_footnote_sources)
+            .collect(),
+        Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => Vec::new(),
+    }
+}
+
+#[must_use]
+pub fn focus_block_is_footnote_definition(block: &Block) -> bool {
+    match block {
+        Block::Text(block) => text_block_has_link_role(block, LinkRole::FootnoteBacklink),
+        Block::Quote(quote) => quote
+            .body
+            .iter()
+            .chain(&quote.attribution)
+            .any(|block| text_block_has_link_role(block, LinkRole::FootnoteBacklink)),
+        Block::Table(table) => table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .any(|cell| text_block_has_link_role(&cell.text, LinkRole::FootnoteBacklink)),
+        Block::Figure(figure) => figure
+            .captions
+            .iter()
+            .any(|caption| text_block_has_link_role(caption, LinkRole::FootnoteBacklink)),
+        Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => false,
+    }
+}
+
+impl AsRef<Self> for ReaderFocusUnit {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
+/// Toolkit-neutral outcome of an Up/Down focus-navigation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderFocusMove {
+    Empty,
+    Boundary,
+    Select(usize),
+}
+
+/// Focus-only overlays that replace the active unit's inline affordance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReaderFocusOverlay {
+    #[default]
+    None,
+    Actions,
+    Footnotes,
+}
+
+/// Frontend-neutral command accepted by [`ReaderFocusState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderFocusCommand {
+    Select(usize),
+    Move(PageDirection),
+}
+
+/// Semantic effect emitted after reducing a focus command. Frontends attach
+/// animation, persistence, and adjacent-section navigation to these effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderFocusTransition {
+    Unchanged,
+    Empty,
+    Boundary(PageDirection),
+    Selected(usize),
+}
+
+/// Durable focus selection plus mutually-exclusive focus affordance state.
+///
+/// No toolkit coordinates or animation clocks are retained here. The source
+/// anchor survives candidate/frame regeneration; active indexes are resolved
+/// again against each fresh unit generation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReaderFocusState {
+    active_index: usize,
+    anchor: Option<SourceAnchor>,
+    overlay: ReaderFocusOverlay,
+    footnote_scroll_delta: f32,
+}
+
+impl Default for ReaderFocusState {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl ReaderFocusState {
+    #[must_use]
+    pub const fn new(anchor: Option<SourceAnchor>) -> Self {
+        Self {
+            active_index: 0,
+            anchor,
+            overlay: ReaderFocusOverlay::None,
+            footnote_scroll_delta: 0.0,
+        }
+    }
+
+    #[must_use]
+    pub const fn active_index(&self) -> usize {
+        self.active_index
+    }
+
+    #[must_use]
+    pub fn anchor(&self) -> Option<&SourceAnchor> {
+        self.anchor.as_ref()
+    }
+
+    #[must_use]
+    pub const fn overlay(&self) -> ReaderFocusOverlay {
+        self.overlay
+    }
+
+    #[must_use]
+    pub const fn actions_visible(&self) -> bool {
+        matches!(self.overlay, ReaderFocusOverlay::Actions)
+    }
+
+    #[must_use]
+    pub const fn footnotes_visible(&self) -> bool {
+        matches!(self.overlay, ReaderFocusOverlay::Footnotes)
+    }
+
+    pub fn reset(&mut self, anchor: Option<SourceAnchor>) {
+        self.active_index = 0;
+        self.anchor = anchor;
+        self.overlay = ReaderFocusOverlay::None;
+        self.footnote_scroll_delta = 0.0;
+    }
+
+    pub fn set_anchor(&mut self, anchor: Option<SourceAnchor>) {
+        self.anchor = anchor;
+    }
+
+    pub fn resolve<T: AsRef<ReaderFocusUnit>>(
+        &mut self,
+        units: &[T],
+        first_unit_after_anchor: Option<usize>,
+        current: ReaderPosition,
+    ) {
+        self.active_index = resolve_focus_unit_index(
+            units,
+            self.anchor.as_ref(),
+            first_unit_after_anchor,
+            current,
+        );
+        self.anchor = units
+            .get(self.active_index)
+            .map(|unit| unit.as_ref().range.start.clone());
+    }
+
+    pub fn apply<T: AsRef<ReaderFocusUnit>>(
+        &mut self,
+        units: &[T],
+        command: ReaderFocusCommand,
+    ) -> ReaderFocusTransition {
+        let requested = match command {
+            ReaderFocusCommand::Select(index) => ReaderFocusMove::Select(index),
+            ReaderFocusCommand::Move(direction) => {
+                match focus_move(self.active_index, units.len(), direction) {
+                    ReaderFocusMove::Empty => return ReaderFocusTransition::Empty,
+                    ReaderFocusMove::Boundary => {
+                        return ReaderFocusTransition::Boundary(direction);
+                    }
+                    selected @ ReaderFocusMove::Select(_) => selected,
+                }
+            }
+        };
+        let ReaderFocusMove::Select(index) = requested else {
+            unreachable!("explicit selection is the only remaining focus move")
+        };
+        let Some(unit) = units.get(index) else {
+            return ReaderFocusTransition::Unchanged;
+        };
+        let anchor = unit.as_ref().range.start.clone();
+        let changed = index != self.active_index || self.anchor.as_ref() != Some(&anchor);
+        self.active_index = index;
+        self.anchor = Some(anchor);
+        self.hide_footnotes();
+        if changed {
+            ReaderFocusTransition::Selected(index)
+        } else {
+            ReaderFocusTransition::Unchanged
+        }
+    }
+
+    pub fn show_actions(&mut self) {
+        self.overlay = ReaderFocusOverlay::Actions;
+        self.footnote_scroll_delta = 0.0;
+    }
+
+    pub fn hide_actions(&mut self) {
+        if self.overlay == ReaderFocusOverlay::Actions {
+            self.overlay = ReaderFocusOverlay::None;
+        }
+    }
+
+    pub fn show_footnotes(&mut self) {
+        self.overlay = ReaderFocusOverlay::Footnotes;
+        self.footnote_scroll_delta = 0.0;
+    }
+
+    pub fn hide_footnotes(&mut self) {
+        if self.overlay == ReaderFocusOverlay::Footnotes {
+            self.overlay = ReaderFocusOverlay::None;
+        }
+        self.footnote_scroll_delta = 0.0;
+    }
+
+    pub fn add_footnote_scroll_delta(&mut self, delta: f32) {
+        self.footnote_scroll_delta += delta;
+    }
+
+    pub fn take_footnote_scroll_delta(&mut self) -> f32 {
+        std::mem::take(&mut self.footnote_scroll_delta)
+    }
+}
+
+#[must_use]
+pub fn focus_move(current: usize, unit_count: usize, direction: PageDirection) -> ReaderFocusMove {
+    if unit_count == 0 {
+        return ReaderFocusMove::Empty;
+    }
+    match direction {
+        PageDirection::Previous if current == 0 => ReaderFocusMove::Boundary,
+        PageDirection::Next if current + 1 >= unit_count => ReaderFocusMove::Boundary,
+        PageDirection::Previous => ReaderFocusMove::Select(current - 1),
+        PageDirection::Next => ReaderFocusMove::Select(current + 1),
+    }
+}
+
+#[must_use]
+pub fn resolve_focus_unit_index<T: AsRef<ReaderFocusUnit>>(
+    units: &[T],
+    anchor: Option<&SourceAnchor>,
+    first_unit_after_anchor: Option<usize>,
+    current: ReaderPosition,
+) -> usize {
+    anchor
+        .and_then(|anchor| {
+            units
+                .iter()
+                .position(|unit| unit.as_ref().contains_anchor(anchor))
+        })
+        .or(first_unit_after_anchor)
+        .or_else(|| {
+            units
+                .iter()
+                .position(|unit| unit.as_ref().geometry.position == current)
+        })
+        .unwrap_or(0)
+}
+
+#[must_use]
+pub fn source_range_contains_anchor(range: &SourceRange, anchor: &SourceAnchor) -> bool {
+    if range.start.spine != anchor.spine || range.start.node != anchor.node {
+        return false;
+    }
+    if range.start.spine != range.end.spine || range.start.node != range.end.node {
+        return range.start == *anchor;
+    }
+    anchor.text_offset >= range.start.text_offset
+        && (anchor.text_offset < range.end.text_offset
+            || (range.start.text_offset == range.end.text_offset
+                && anchor.text_offset == range.start.text_offset))
+}
+
+/// Shared viewport policy for centering and manually scrolling focus units.
+/// Animation curves and clocks remain frontend-owned.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReaderFocusViewportPolicy {
+    pub minimum_unit_height: f32,
+}
+
+/// Explicit content-to-viewport alignment for a focus navigation target.
+/// This avoids assuming that a frontend inserted synthetic half-viewport
+/// padding around its scroll surface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReaderFocusViewportTarget {
+    pub content_y: f32,
+    pub viewport_y: f32,
+}
+
+impl Default for ReaderFocusViewportPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_unit_height: 240.0,
+        }
+    }
+}
+
+impl ReaderFocusViewportPolicy {
+    #[must_use]
+    pub fn unit_viewport_target(
+        self,
+        bounds: FrameRect,
+        viewport_height: f32,
+    ) -> ReaderFocusViewportTarget {
+        let height = (bounds.y1 - bounds.y0).max(0.0);
+        if height > viewport_height {
+            return ReaderFocusViewportTarget {
+                content_y: bounds.y0,
+                viewport_y: 0.0,
+            };
+        }
+        ReaderFocusViewportTarget {
+            content_y: bounds.y0 + height * 0.5,
+            viewport_y: viewport_height * 0.5,
+        }
+    }
+
+    #[must_use]
+    pub fn unit_scroll_bounds(
+        self,
+        bounds: FrameRect,
+        viewport_height: f32,
+        content_padding: f32,
+    ) -> (f32, f32) {
+        let top = (bounds.y0 + content_padding).max(0.0);
+        let bottom = (bounds.y1 + content_padding - viewport_height).max(top);
+        (top, bottom)
+    }
+
+    #[must_use]
+    pub fn unit_target_offset(self, bounds: FrameRect, viewport_height: f32) -> f32 {
+        let content_padding = viewport_height * 0.5;
+        let (top, bottom) = self.unit_scroll_bounds(bounds, viewport_height, content_padding);
+        if bottom > top {
+            return top;
+        }
+        let unit_height = (bounds.y1 - bounds.y0).max(self.minimum_unit_height);
+        (bounds.y0 + unit_height * 0.5 + content_padding - viewport_height * 0.5).max(0.0)
+    }
+
+    #[must_use]
+    pub fn nearest_unit_for_offset(
+        self,
+        bounds: impl IntoIterator<Item = FrameRect>,
+        offset: f32,
+        viewport_height: f32,
+    ) -> Option<usize> {
+        bounds
+            .into_iter()
+            .enumerate()
+            .map(|(index, bounds)| {
+                let target = self.unit_target_offset(bounds, viewport_height);
+                (index, (target - offset).abs())
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(index, _)| index)
+    }
+}
+
+/// One immutable logical frame in an authored section or semantic reading
+/// unit. Crop bounds are expressed in logical frame coordinates.
+#[derive(Clone)]
+pub struct ReaderSectionFrame {
+    pub position: ReaderPosition,
+    pub frame: Arc<LayoutFrame>,
+    pub placeholder: bool,
+    pub visible_top: Option<f32>,
+    pub visible_bottom: Option<f32>,
+}
+
+/// One immutable logical frame positioned inside a continuous reading unit.
+#[derive(Clone)]
+pub struct ReaderScrollFrame {
+    pub position: ReaderPosition,
+    pub frame: Arc<LayoutFrame>,
+    pub placeholder: bool,
+    pub top: f32,
+    pub origin_y: f32,
+    pub height: f32,
+}
+
+/// Backend-neutral vertical composition of the frames in one semantic reading
+/// unit. This is shared by scroll and focus presentations; renderers only paint
+/// the retained frames at the resulting offsets.
+pub struct ReaderScrollLayout {
+    pub section_index: usize,
+    pub reading_unit_index: usize,
+    frames: Vec<ReaderScrollFrame>,
+    content_height: f32,
+}
+
+impl ReaderScrollLayout {
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "layout viewport dimensions are bounded logical pixels composed as f32"
+    )]
+    pub fn new(
+        section_index: usize,
+        reading_unit_index: usize,
+        frames: Vec<ReaderSectionFrame>,
+        preserve_physical_pages: bool,
+    ) -> Self {
+        let mut cursor = 0.0;
+        let mut composed: Vec<ReaderScrollFrame> = Vec::with_capacity(frames.len());
+        for (index, entry) in frames.into_iter().enumerate() {
+            let logical_height = entry.frame.viewport.height as f32;
+            let (retained_top, retained_bottom) = entry
+                .frame
+                .content_vertical_bounds()
+                .unwrap_or((0.0, logical_height));
+            let content_top = entry
+                .visible_top
+                .unwrap_or(retained_top)
+                .clamp(0.0, logical_height);
+            let content_bottom = entry
+                .visible_bottom
+                .unwrap_or(retained_bottom)
+                .clamp(content_top, logical_height);
+            let leading_gap =
+                if preserve_physical_pages || entry.visible_top.is_some() || index == 0 {
+                    0.0
+                } else {
+                    entry.frame.leading_gap
+                };
+            let origin_y = if preserve_physical_pages || entry.visible_top.is_some() || index > 0 {
+                content_top
+            } else {
+                0.0
+            };
+            let height = if preserve_physical_pages {
+                content_bottom - content_top
+            } else {
+                content_bottom - origin_y
+            };
+            if leading_gap > 0.0 {
+                if let Some(previous) = composed.last_mut() {
+                    previous.height += leading_gap;
+                }
+                cursor += leading_gap;
+            }
+            composed.push(ReaderScrollFrame {
+                position: entry.position,
+                frame: entry.frame,
+                placeholder: entry.placeholder,
+                top: cursor,
+                origin_y,
+                height,
+            });
+            cursor += height;
+        }
+        Self {
+            section_index,
+            reading_unit_index,
+            frames: composed,
+            content_height: cursor,
+        }
+    }
+
+    #[must_use]
+    pub fn frames(&self) -> &[ReaderScrollFrame] {
+        &self.frames
+    }
+
+    #[must_use]
+    pub const fn content_height(&self) -> f32 {
+        self.content_height
+    }
+
+    #[must_use]
+    pub fn frame_index(&self, position: ReaderPosition) -> Option<usize> {
+        self.frames
+            .iter()
+            .position(|entry| entry.position == position)
+    }
+
+    #[must_use]
+    pub fn frame_top(&self, position: ReaderPosition) -> Option<f32> {
+        self.frame_index(position)
+            .map(|index| self.frames[index].top)
+    }
+
+    /// Maps one continuous-content coordinate to a frame and page-local y.
+    #[must_use]
+    pub fn frame_at_content_y(&self, y: f32) -> Option<(usize, f32)> {
+        self.frames.iter().enumerate().find_map(|(index, frame)| {
+            let local_y = y - frame.top;
+            (local_y >= 0.0 && local_y < frame.height).then_some((index, local_y + frame.origin_y))
+        })
+    }
+
+    #[must_use]
+    pub fn content_y(&self, index: usize, frame_y: f32) -> Option<f32> {
+        let frame = self.frames.get(index)?;
+        Some(frame.top + frame_y - frame.origin_y)
+    }
+
+    #[must_use]
+    pub fn content_y_for_position(&self, position: ReaderPosition, frame_y: f32) -> Option<f32> {
+        self.content_y(self.frame_index(position)?, frame_y)
+    }
+
+    #[must_use]
+    pub fn source_top(&self, range: &SourceRange) -> Option<f32> {
+        self.frames.iter().enumerate().find_map(|(index, entry)| {
+            entry
+                .frame
+                .source_content_bounds(std::slice::from_ref(range))
+                .and_then(|bounds| self.content_y(index, bounds.y0))
+        })
+    }
+
+    /// Resolves a durable anchor to a vertical coordinate in the stitched
+    /// surface. Generation-local frame IDs never leave this presentation model.
+    #[must_use]
+    pub fn source_anchor_top(&self, anchor: &SourceAnchor) -> Option<f32> {
+        self.frames.iter().enumerate().find_map(|(index, entry)| {
+            entry
+                .frame
+                .source_anchor_bounds(anchor)
+                .and_then(|bounds| self.content_y(index, bounds.y0))
+        })
+    }
+
+    /// Resolves durable ranges to their union in stitched reading-unit
+    /// coordinates and reports the first logical frame that contributes.
+    #[must_use]
+    pub fn source_content_bounds(
+        &self,
+        ranges: &[SourceRange],
+    ) -> Option<(FrameRect, ReaderPosition)> {
+        let mut bounds = None;
+        let mut position = None;
+        for (index, entry) in self.frames.iter().enumerate() {
+            let Some(local) = entry.frame.source_content_bounds(ranges) else {
+                continue;
+            };
+            let stitched = self.stitched_rect(index, local)?;
+            bounds = Some(bounds.map_or(stitched, |current: FrameRect| current.union(stitched)));
+            position.get_or_insert(entry.position);
+        }
+        bounds.zip(position)
+    }
+
+    /// Resolves rectangular semantic-block geometry into stitched coordinates.
+    #[must_use]
+    pub fn source_block_bounds(&self, ranges: &[SourceRange]) -> Option<FrameRect> {
+        self.frames
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let local = entry.frame.source_block_bounds(ranges)?;
+                self.stitched_rect(index, local)
+            })
+            .reduce(FrameRect::union)
+    }
+
+    /// Builds the neutral geometry consumed by focus-mode frontends. The
+    /// optional activation ranges are used for quote/preformatted/structured
+    /// rectangular affordances; ordinary prose can omit them.
+    #[must_use]
+    pub fn focus_geometry(
+        &self,
+        content_ranges: &[SourceRange],
+        activation_ranges: Option<&[SourceRange]>,
+    ) -> Option<ReaderFocusGeometry> {
+        let (bounds, position) = self.source_content_bounds(content_ranges)?;
+        let activation_bounds =
+            activation_ranges.and_then(|ranges| self.source_block_bounds(ranges));
+        Some(ReaderFocusGeometry {
+            position,
+            bounds,
+            activation_bounds,
+        })
+    }
+
+    fn stitched_rect(&self, index: usize, local: FrameRect) -> Option<FrameRect> {
+        Some(FrameRect::new(
+            local.x0,
+            self.content_y(index, local.y0)?,
+            local.x1,
+            self.content_y(index, local.y1)?,
+        ))
+    }
+
+    /// Resolves text inside one displayed scroll-frame crop. `y` is relative to
+    /// the cropped frame, not the original logical page.
+    #[must_use]
+    pub fn hit_test_text(
+        &self,
+        frame_index: usize,
+        x: f32,
+        y: f32,
+        exact: bool,
+    ) -> Option<ReaderTextHit> {
+        let entry = self.frames.get(frame_index)?;
+        entry
+            .frame
+            .interaction()
+            .hit_test_text(x, y + entry.origin_y, exact)
+            .map(|hit| reader_text_hit(entry.position, hit))
+    }
+
+    /// First and last generation-local text carets in this reading unit.
+    #[must_use]
+    pub fn cursor_range(&self) -> Option<(ReaderTextCursor, ReaderTextCursor)> {
+        let first = self.frames.iter().find_map(|entry| {
+            entry
+                .frame
+                .interaction()
+                .first_cursor()
+                .map(|cursor| ReaderTextCursor {
+                    position: entry.position,
+                    cursor,
+                })
+        });
+        let last = self.frames.iter().rev().find_map(|entry| {
+            entry
+                .frame
+                .interaction()
+                .last_cursor()
+                .map(|cursor| ReaderTextCursor {
+                    position: entry.position,
+                    cursor,
+                })
+        });
+        first.zip(last)
+    }
+
+    /// Restores generation-local carets for durable ranges across every frame
+    /// in this stitched reading unit.
+    #[must_use]
+    pub fn cursors_for_source_ranges(
+        &self,
+        ranges: &[SourceRange],
+    ) -> Option<(ReaderTextCursor, ReaderTextCursor)> {
+        if ranges.is_empty() {
+            return None;
+        }
+        let mut first = None;
+        let mut last = None;
+        for entry in &self.frames {
+            if let Some((start, end)) = entry.frame.interaction().cursors_for_source_ranges(ranges)
+            {
+                first.get_or_insert(ReaderTextCursor {
+                    position: entry.position,
+                    cursor: start,
+                });
+                last = Some(ReaderTextCursor {
+                    position: entry.position,
+                    cursor: end,
+                });
+            }
+        }
+        first.zip(last)
+    }
+
+    /// Moves one caret by a shaped cluster, crossing stitched frame boundaries.
+    #[must_use]
+    pub fn move_text_cursor(
+        &self,
+        cursor: ReaderTextCursor,
+        direction: TextCursorDirection,
+    ) -> Option<ReaderTextCursor> {
+        let frame_index = self.frame_index(cursor.position)?;
+        let local = match direction {
+            TextCursorDirection::Previous => self.frames[frame_index]
+                .frame
+                .interaction()
+                .previous_cursor(cursor.cursor),
+            TextCursorDirection::Next => self.frames[frame_index]
+                .frame
+                .interaction()
+                .next_cursor(cursor.cursor),
+        };
+        if let Some(local) = local {
+            return Some(ReaderTextCursor {
+                position: cursor.position,
+                cursor: local,
+            });
+        }
+        match direction {
+            TextCursorDirection::Previous => {
+                self.frames[..frame_index].iter().rev().find_map(|entry| {
+                    entry
+                        .frame
+                        .interaction()
+                        .last_cursor()
+                        .map(|cursor| ReaderTextCursor {
+                            position: entry.position,
+                            cursor,
+                        })
+                })
+            }
+            TextCursorDirection::Next => self.frames[frame_index + 1..].iter().find_map(|entry| {
+                entry
+                    .frame
+                    .interaction()
+                    .first_cursor()
+                    .map(|cursor| ReaderTextCursor {
+                        position: entry.position,
+                        cursor,
+                    })
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn first_visible_frame(&self, offset_y: f32) -> Option<ReaderPosition> {
+        self.frames
+            .iter()
+            .find(|entry| entry.top + entry.height > offset_y)
+            .map(|entry| entry.position)
+    }
+
+    #[must_use]
+    pub fn visible_frames(&self, offset_y: f32, viewport_height: f32) -> Vec<ReaderPosition> {
+        let bottom = offset_y + viewport_height;
+        self.frames
+            .iter()
+            .filter(|entry| entry.top + entry.height > offset_y && entry.top < bottom)
+            .map(|entry| entry.position)
+            .collect()
+    }
 }
 
 /// Position inside the semantic table-of-contents units of the current view.
@@ -207,6 +1630,8 @@ enum PositionAttempt {
 
 struct CachedSegment {
     section: Arc<PreparedSection>,
+    frames: Vec<Arc<LayoutFrame>>,
+    #[cfg(feature = "legacy-renderer")]
     pages: Vec<Arc<PageDisplayList>>,
     anchor_pages: HashMap<String, usize>,
     visible_pages: usize,
@@ -386,6 +1811,7 @@ impl PrefetchWorker {
             .name("rebook-prefetch".into())
             .spawn(move || {
                 let mut layout_engine = LayoutEngine::with_fonts(fonts.iter().cloned());
+                #[cfg(feature = "legacy-renderer")]
                 let display_compiler = DisplayListCompiler;
                 while let Ok(request) = request_receiver.recv() {
                     if worker_cancelled.load(Ordering::Acquire) {
@@ -404,6 +1830,7 @@ impl PrefetchWorker {
                                 request.viewport,
                                 &request.style,
                                 &mut layout_engine,
+                                #[cfg(feature = "legacy-renderer")]
                                 &display_compiler,
                             )
                             .map(Arc::new)
@@ -469,6 +1896,23 @@ impl PrefetchWorker {
     }
 }
 
+fn spawn_optional_prefetch_worker(
+    enabled: bool,
+    source: &Arc<dyn BookSource>,
+    repository: &Arc<SectionRepository>,
+    fonts: &Arc<[ReaderFontBlob]>,
+) -> Result<Option<PrefetchWorker>, ReaderError> {
+    enabled
+        .then(|| {
+            PrefetchWorker::spawn(
+                Arc::clone(source),
+                Arc::clone(repository),
+                Arc::clone(fonts),
+            )
+        })
+        .transpose()
+}
+
 impl Drop for PrefetchWorker {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
@@ -519,13 +1963,14 @@ impl TocIndex {
     }
 }
 
-/// Single-owner reader orchestration. The parser and renderer communicate only
-/// through the publication and layout IR crates.
+/// Single-owner reader orchestration over publication and immutable layout
+/// frames. Paint backends are optional compatibility consumers of those frames.
 pub struct ReaderSession {
     source: Arc<dyn BookSource>,
     repository: Arc<SectionRepository>,
     fonts: Arc<[ReaderFontBlob]>,
-    layout_engine: LayoutEngine,
+    layout_engine: LayoutEngine<Box<dyn TextEngine>>,
+    #[cfg(feature = "legacy-renderer")]
     display_compiler: DisplayListCompiler,
     viewport: LayoutViewport,
     style: ReaderStyle,
@@ -535,7 +1980,7 @@ pub struct ReaderSession {
     cache_capacity: usize,
     cache: HashMap<SegmentKey, Arc<CachedSegment>>,
     lru: VecDeque<SegmentKey>,
-    prefetch_worker: PrefetchWorker,
+    prefetch_worker: Option<PrefetchWorker>,
     prefetch_inflight: HashSet<PrefetchKey>,
     prefetch_failures: HashMap<SegmentKey, ReaderError>,
     current_section: usize,
@@ -571,6 +2016,90 @@ impl ReaderSession {
         Ok(session)
     }
 
+    /// Opens a reader whose foreground layout is shaped by an application-owned
+    /// text engine. This is the migration boundary used by the GPUI shell: the
+    /// reader still owns pagination and immutable frames, while GPUI supplies
+    /// only font fallback and shaping.
+    ///
+    /// Application-owned engines may be tied to the UI thread, so background
+    /// prefetch is disabled for this session. Missing segments are compiled by
+    /// the same injected engine on the caller thread until an engine-factory
+    /// based prefetch path is introduced.
+    pub fn open_with_text_engine<E: TextEngine + 'static>(
+        source: Arc<dyn BookSource>,
+        viewport: LayoutViewport,
+        style: ReaderStyle,
+        text_engine: E,
+    ) -> Result<Self, ReaderError> {
+        Self::open_with_fonts_and_text_engine(source, viewport, style, Arc::default(), text_engine)
+    }
+
+    /// Variant of [`Self::open_with_text_engine`] that registers application
+    /// font bytes with both the neutral layout catalog and the injected engine.
+    pub fn open_with_fonts_and_text_engine<E: TextEngine + 'static>(
+        source: Arc<dyn BookSource>,
+        viewport: LayoutViewport,
+        style: ReaderStyle,
+        fonts: Arc<[ReaderFontBlob]>,
+        text_engine: E,
+    ) -> Result<Self, ReaderError> {
+        let mut session = Self::new_unpositioned_with_text_engine(
+            source,
+            viewport,
+            style,
+            fonts,
+            Box::new(text_engine),
+            false,
+        )?;
+        session.ensure_segment(SegmentKey {
+            section_index: 0,
+            segment_index: 0,
+        })?;
+        Ok(session)
+    }
+
+    /// Opens directly at a durable locator while using an application-owned
+    /// text engine. Like [`Self::open_with_fonts_at_locator`], this avoids
+    /// compiling the first section when the saved position belongs elsewhere.
+    pub fn open_with_text_engine_at_locator<E: TextEngine + 'static>(
+        source: Arc<dyn BookSource>,
+        viewport: LayoutViewport,
+        style: ReaderStyle,
+        text_engine: E,
+        locator: &LocatorV1,
+    ) -> Result<Self, ReaderError> {
+        Self::open_with_fonts_and_text_engine_at_locator(
+            source,
+            viewport,
+            style,
+            Arc::default(),
+            text_engine,
+            locator,
+        )
+    }
+
+    /// Variant of [`Self::open_with_text_engine_at_locator`] that registers
+    /// application-provided font bytes before restoring the locator.
+    pub fn open_with_fonts_and_text_engine_at_locator<E: TextEngine + 'static>(
+        source: Arc<dyn BookSource>,
+        viewport: LayoutViewport,
+        style: ReaderStyle,
+        fonts: Arc<[ReaderFontBlob]>,
+        text_engine: E,
+        locator: &LocatorV1,
+    ) -> Result<Self, ReaderError> {
+        let mut session = Self::new_unpositioned_with_text_engine(
+            source,
+            viewport,
+            style,
+            fonts,
+            Box::new(text_engine),
+            false,
+        )?;
+        session.restore_locator(locator)?;
+        Ok(session)
+    }
+
     /// Opens directly at a durable locator without first compiling the first
     /// section. This avoids duplicate parsing and pagination when resuming a
     /// book away from its beginning.
@@ -589,8 +2118,26 @@ impl ReaderSession {
     fn new_unpositioned(
         source: Arc<dyn BookSource>,
         viewport: LayoutViewport,
+        style: ReaderStyle,
+        fonts: Arc<[ReaderFontBlob]>,
+    ) -> Result<Self, ReaderError> {
+        Self::new_unpositioned_with_text_engine(
+            source,
+            viewport,
+            style,
+            fonts,
+            Box::new(LegacyParleyTextEngine::default()),
+            true,
+        )
+    }
+
+    fn new_unpositioned_with_text_engine(
+        source: Arc<dyn BookSource>,
+        viewport: LayoutViewport,
         mut style: ReaderStyle,
         fonts: Arc<[ReaderFontBlob]>,
+        text_engine: Box<dyn TextEngine>,
+        enable_background_prefetch: bool,
     ) -> Result<Self, ReaderError> {
         if source.book().sections.is_empty() {
             return Err(ReaderError::EmptyBook);
@@ -611,16 +2158,20 @@ impl ReaderSession {
         let fixed_reading_units =
             build_fixed_reading_units(source.as_ref(), &toc_items, &section_indices_by_path);
         let repository = Arc::new(SectionRepository::new(Arc::clone(&source)));
-        let prefetch_worker = PrefetchWorker::spawn(
-            Arc::clone(&source),
-            Arc::clone(&repository),
-            Arc::clone(&fonts),
+        let prefetch_worker = spawn_optional_prefetch_worker(
+            enable_background_prefetch,
+            &source,
+            &repository,
+            &fonts,
         )?;
+        let mut layout_engine = LayoutEngine::with_text_engine(text_engine);
+        layout_engine.register_fonts(fonts.iter().cloned());
         Ok(Self {
             source,
             repository,
-            layout_engine: LayoutEngine::with_fonts(fonts.iter().cloned()),
+            layout_engine,
             fonts,
+            #[cfg(feature = "legacy-renderer")]
             display_compiler: DisplayListCompiler,
             viewport,
             style,
@@ -643,6 +2194,15 @@ impl ReaderSession {
 
     pub fn book(&self) -> &Book {
         self.source.book()
+    }
+
+    /// Returns the lazy normalized publication source for frontend-neutral
+    /// services such as assistant search. Consumers must keep durable
+    /// navigation in [`SourceAnchor`] / [`SourceRange`] rather than retaining
+    /// layout-relative positions.
+    #[must_use]
+    pub fn book_source(&self) -> Arc<dyn BookSource> {
+        Arc::clone(&self.source)
     }
 
     pub fn viewport(&self) -> LayoutViewport {
@@ -727,7 +2287,10 @@ impl ReaderSession {
             progression: Some(progression.clamp(0.0, 1.0)),
             total_progression: Some(self.snapshot().total_progression),
             position: None,
-            source: self.current_page().leading_source_range(),
+            source: self
+                .current_layout_frame()
+                .interaction()
+                .leading_source_range(),
             partial_cfi: None,
             text: None,
         }
@@ -783,7 +2346,7 @@ impl ReaderSession {
         let page_count = self
             .cache
             .get(&key)
-            .map_or(1, |segment| segment.pages.len().max(1));
+            .map_or(1, |segment| segment.frames.len().max(1));
         let within_segment = if progression >= 1.0 {
             1.0
         } else {
@@ -808,6 +2371,7 @@ impl ReaderSession {
     ///
     /// Panics if the reader's internal invariant is broken and the current
     /// section or page is missing from the cache.
+    #[cfg(feature = "legacy-renderer")]
     pub fn current_page(&self) -> &PageDisplayList {
         self.cache
             .get(&self.current_key())
@@ -816,20 +2380,33 @@ impl ReaderSession {
             .as_ref()
     }
 
-    /// Returns the logical pages visible in the current reader viewport.
-    /// Adjacent content is resolved across layout-segment and spine-section
-    /// boundaries so those implementation boundaries never create a blank
-    /// right page.
-    pub fn current_spread(&mut self) -> Result<ReaderSpread, ReaderError> {
+    /// Returns the immutable layout frame for the current page.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reader's internal invariant is broken and the current
+    /// section or page is missing from the cache.
+    pub fn current_layout_frame(&self) -> &LayoutFrame {
+        self.cache
+            .get(&self.current_key())
+            .expect("current layout segment must remain cached")
+            .frames[self.current_page]
+            .as_ref()
+    }
+
+    /// Returns the immutable frames currently composed into the reader
+    /// viewport. This is the primary frontend contract and does not require a
+    /// paint backend.
+    pub fn current_frame_spread(&mut self) -> Result<ReaderFrameSpread, ReaderError> {
         self.poll_prefetch()?;
         let position = self.current_position();
-        let (primary, visible_pages, secondary_offset_x) = self
+        let (primary, visible_pages, default_secondary_offset_x) = self
             .cache
             .get(&self.current_key())
             .and_then(|segment| {
-                segment.pages.get(self.current_page).map(|page| {
+                segment.frames.get(self.current_page).map(|frame| {
                     (
-                        Arc::clone(page),
+                        Arc::clone(frame),
                         segment.visible_pages,
                         segment.continuation_offset_x,
                     )
@@ -838,18 +2415,18 @@ impl ReaderSession {
             .ok_or(ReaderError::PageOutOfBounds(position))?;
         let secondary = if visible_pages > 1 {
             self.next_position(position)?
-                .map(|position| self.page_at(position))
+                .map(|position| self.layout_frame_at(position))
                 .transpose()?
         } else {
             None
         };
-        let (primary_offset_x, secondary_offset_x) = resolve_spread_offsets(
+        let (primary_offset_x, secondary_offset_x) = resolve_frame_spread_offsets(
             &primary,
             secondary.as_deref(),
-            secondary_offset_x,
+            default_secondary_offset_x,
             self.style.column_gap == 0.0,
         );
-        Ok(ReaderSpread {
+        Ok(ReaderFrameSpread {
             primary,
             secondary,
             primary_offset_x,
@@ -857,11 +2434,309 @@ impl ReaderSession {
         })
     }
 
+    /// Returns the logical pages visible in the current reader viewport.
+    /// Adjacent content is resolved across layout-segment and spine-section
+    /// boundaries so those implementation boundaries never create a blank
+    /// right page.
+    #[cfg(feature = "legacy-renderer")]
+    pub fn current_spread(&mut self) -> Result<ReaderSpread, ReaderError> {
+        let position = self.current_position();
+        let frames = self.current_frame_spread()?;
+        let primary = self.page_at(position)?;
+        let secondary = if frames.secondary.is_some() {
+            self.next_position(position)?
+                .map(|position| self.page_at(position))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(ReaderSpread {
+            primary,
+            secondary,
+            primary_offset_x: frames.primary_offset_x,
+            secondary_offset_x: frames.secondary_offset_x,
+        })
+    }
+
     /// Compiles and returns every logical page in the active authored section.
+    /// Frames are retained by the returned `Arc`s even when the segment LRU
+    /// later evicts their owning compiled segment.
+    pub fn current_section_frames(&mut self) -> Result<Vec<ReaderSectionFrame>, ReaderError> {
+        self.section_frames(self.current_section)
+    }
+
+    /// Compiles and returns every legacy display list in the active authored
+    /// section.
     /// Pages are retained by the returned `Arc`s even when the segment LRU later
     /// evicts their owning compiled segment.
+    #[cfg(feature = "legacy-renderer")]
     pub fn current_section_pages(&mut self) -> Result<Vec<ReaderSectionPage>, ReaderError> {
         self.section_pages(self.current_section)
+    }
+
+    /// Returns the renderer-independent frames intersecting the active
+    /// semantic table-of-contents unit.
+    pub fn current_reading_unit_frames(&mut self) -> Result<Vec<ReaderSectionFrame>, ReaderError> {
+        if let Some(unit) = self
+            .fixed_reading_units
+            .as_ref()
+            .and_then(|units| units.get(self.current_reading_unit))
+            .cloned()
+        {
+            let mut frames = Vec::new();
+            for section_index in unit.section_range {
+                if section_index == self.current_section {
+                    frames.extend(self.section_frames(section_index)?);
+                    continue;
+                }
+                let Some(dimensions) = self.source.fixed_page_dimensions(section_index)? else {
+                    frames.extend(self.section_frames(section_index)?);
+                    continue;
+                };
+                if let Some(cached) = self.cached_fixed_section_frames(section_index) {
+                    frames.extend(cached);
+                } else {
+                    let layout = self.layout_engine.layout_fixed_page_placeholder(
+                        dimensions,
+                        self.viewport,
+                        &self.style,
+                    );
+                    frames.extend(layout.into_frames().into_iter().enumerate().map(
+                        |(page_index, frame)| ReaderSectionFrame {
+                            position: ReaderPosition {
+                                section_index,
+                                segment_index: 0,
+                                page_index,
+                            },
+                            frame: Arc::new(frame),
+                            placeholder: true,
+                            visible_top: None,
+                            visible_bottom: None,
+                        },
+                    ));
+                }
+            }
+            return Ok(frames);
+        }
+        let section = self.repository.load(self.current_section)?;
+        let Some(unit) = section
+            .reading_units
+            .get(self.current_reading_unit)
+            .or_else(|| section.reading_units.first())
+        else {
+            return self.section_frames(self.current_section);
+        };
+        let ranges = section.fragments[unit.fragment_range.clone()]
+            .iter()
+            .flat_map(|fragment| &fragment.blocks)
+            .filter_map(block_source)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut frames = self.section_frames(self.current_section)?;
+        let visible = frames
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                entry
+                    .frame
+                    .source_content_bounds(&ranges)
+                    .map(|bounds| (index, bounds.y0, bounds.y1))
+            })
+            .collect::<Vec<_>>();
+        let (Some((first, first_top, _)), Some((last, _, last_bottom))) =
+            (visible.first().copied(), visible.last().copied())
+        else {
+            return Ok(frames);
+        };
+        frames = frames.drain(first..=last).collect();
+        if let Some(frame) = frames.first_mut() {
+            frame.visible_top = Some(first_top);
+        }
+        if let Some(frame) = frames.last_mut() {
+            frame.visible_bottom = Some(last_bottom);
+        }
+        Ok(frames)
+    }
+
+    /// Composes the active semantic reading unit into one renderer-independent
+    /// vertical surface for scroll and focus presentations.
+    pub fn current_scroll_layout(
+        &mut self,
+        preserve_physical_pages: bool,
+    ) -> Result<ReaderScrollLayout, ReaderError> {
+        let section_index = self.current_section;
+        let reading_unit_index = self.current_reading_unit;
+        let frames = self.current_reading_unit_frames()?;
+        Ok(ReaderScrollLayout::new(
+            section_index,
+            reading_unit_index,
+            frames,
+            preserve_physical_pages,
+        ))
+    }
+
+    /// Resolves every footnote referenced by one semantic focus candidate.
+    /// Linked targets remain source-backed and unresolved content is retained as
+    /// `None` rather than replaced with frontend-localized copy.
+    #[must_use]
+    pub fn resolve_focus_candidate_footnotes(
+        &self,
+        section: &Section,
+        candidate: &ReaderFocusCandidate,
+    ) -> Vec<ReaderFocusFootnote> {
+        self.resolve_focus_footnotes_from_blocks(
+            candidate
+                .block_indices
+                .iter()
+                .filter_map(|index| section.blocks.get(*index)),
+        )
+    }
+
+    fn resolve_focus_footnotes_from_blocks<'a>(
+        &self,
+        blocks: impl IntoIterator<Item = &'a Block>,
+    ) -> Vec<ReaderFocusFootnote> {
+        let mut seen = HashSet::new();
+        blocks
+            .into_iter()
+            .flat_map(focus_block_footnote_sources)
+            .filter_map(|source| match source {
+                ReaderFocusFootnoteSource::Inline(text) => seen
+                    .insert(format!("inline:{text}"))
+                    .then_some(ReaderFocusFootnote {
+                        marker: None,
+                        target: None,
+                        text: Some(text),
+                    }),
+                ReaderFocusFootnoteSource::Reference { marker, target } => seen
+                    .insert(target.to_string())
+                    .then(|| ReaderFocusFootnote {
+                        text: self.focus_footnote_text(&target, &marker),
+                        marker: Some(marker),
+                        target: Some(target),
+                    }),
+            })
+            .collect()
+    }
+
+    fn focus_footnote_text(&self, target: &PublicationUrl, marker: &str) -> Option<String> {
+        let section_index = self
+            .source
+            .book()
+            .sections
+            .iter()
+            .position(|section| section.href.path() == target.path())?;
+        let section = self.source.parse_section(section_index).ok()?;
+        let fragment = target.fragment()?;
+        let anchor = section
+            .anchors
+            .iter()
+            .find(|anchor| anchor.fragment == fragment)?
+            .source
+            .clone();
+        let block = section.blocks.iter().find(|block| {
+            focus_block_source_range(block).is_some_and(|range| {
+                source_range_contains_anchor(range, &anchor)
+                    || focus_block_paint_ranges(block, range)
+                        .iter()
+                        .any(|range| source_range_contains_anchor(range, &anchor))
+            })
+        })?;
+        let text = focus_block_text(block);
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let without_marker = text.strip_prefix(marker.trim()).map_or(text, |rest| {
+            rest.trim_start_matches(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '.' | '．' | '、' | ')' | '）' | ']' | '】')
+            })
+        });
+        Some(without_marker.to_owned())
+    }
+
+    /// Compiles the active Reading IR into immutable focus units and attaches
+    /// their geometry from an already composed scroll layout.
+    ///
+    /// This keeps semantic inclusion and source restoration in the reader while
+    /// allowing egui and GPUI to own only input, animation, and final paint.
+    pub fn current_focus_layout(
+        &mut self,
+        scroll_layout: &ReaderScrollLayout,
+        anchor: Option<&SourceAnchor>,
+        policy: ReaderFocusLayoutPolicy,
+        mut is_structured: impl FnMut(&SourceRange) -> bool,
+    ) -> Result<ReaderFocusLayout, ReaderError> {
+        let reading_ranges = self.current_reading_unit_source_ranges()?;
+        let mut section_indices = Vec::new();
+        for frame in scroll_layout.frames() {
+            if section_indices.last().copied() != Some(frame.position.section_index) {
+                section_indices.push(frame.position.section_index);
+            }
+        }
+        if section_indices.is_empty() {
+            section_indices.push(self.current_section);
+        }
+
+        let mut units = Vec::new();
+        let mut first_unit_after_anchor = None;
+        for section_index in section_indices {
+            let section = self.repository.load(section_index)?;
+            let blocks = section
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.blocks.iter())
+                .collect::<Vec<_>>();
+            let candidates = compile_focus_candidates_from_blocks(
+                blocks.iter().copied(),
+                &reading_ranges,
+                &mut is_structured,
+            );
+            let focus_candidate_index =
+                focus_anchor_block_index_from_blocks(blocks.iter().copied(), anchor).and_then(
+                    |block_index| {
+                        candidates.iter().position(|candidate| {
+                            candidate
+                                .block_indices
+                                .last()
+                                .is_some_and(|last| *last >= block_index)
+                        })
+                    },
+                );
+
+            for (candidate_index, candidate) in candidates.into_iter().enumerate() {
+                let footnotes = self.resolve_focus_footnotes_from_blocks(
+                    candidate
+                        .block_indices
+                        .iter()
+                        .filter_map(|index| blocks.get(*index).copied()),
+                );
+                let activation_ranges = candidate
+                    .activation
+                    .is_rectangular()
+                    .then_some(candidate.paint_ranges.as_slice());
+                let Some(mut geometry) =
+                    scroll_layout.focus_geometry(&candidate.geometry_ranges, activation_ranges)
+                else {
+                    continue;
+                };
+                if candidate.content_kind == ReaderFocusContentKind::Table {
+                    geometry.bounds.y1 += policy.table_bottom_margin;
+                }
+                if first_unit_after_anchor.is_none()
+                    && focus_candidate_index.is_some_and(|target| candidate_index >= target)
+                {
+                    first_unit_after_anchor = Some(units.len());
+                }
+                units.push(candidate.into_unit_with_footnotes(geometry, footnotes));
+            }
+        }
+
+        Ok(ReaderFocusLayout {
+            units,
+            first_unit_after_anchor,
+        })
     }
 
     /// Returns the pages intersecting the active semantic table-of-contents unit.
@@ -871,6 +2746,7 @@ impl ReaderSession {
         clippy::cast_possible_truncation,
         reason = "renderer page coordinates are viewport-bounded f32 values stored in kurbo f64"
     )]
+    #[cfg(feature = "legacy-renderer")]
     pub fn current_reading_unit_pages(&mut self) -> Result<Vec<ReaderSectionPage>, ReaderError> {
         if let Some(unit) = self
             .fixed_reading_units
@@ -1070,6 +2946,75 @@ impl ReaderSession {
         self.go_to_reading_unit(section_index, unit_index)
     }
 
+    fn section_frames(
+        &mut self,
+        section_index: usize,
+    ) -> Result<Vec<ReaderSectionFrame>, ReaderError> {
+        self.poll_prefetch()?;
+        let segment_count = self.repository.load(section_index)?.segments.len();
+        let mut frames = Vec::new();
+        for segment_index in 0..segment_count {
+            let key = SegmentKey {
+                section_index,
+                segment_index,
+            };
+            self.ensure_segment(key)?;
+            let segment_frames = self
+                .cache
+                .get(&key)
+                .ok_or(ReaderError::SegmentOutOfBounds {
+                    section: section_index,
+                    segment: segment_index,
+                })?
+                .frames
+                .clone();
+            frames.extend(
+                segment_frames
+                    .into_iter()
+                    .enumerate()
+                    .map(|(page_index, frame)| ReaderSectionFrame {
+                        position: ReaderPosition {
+                            section_index,
+                            segment_index,
+                            page_index,
+                        },
+                        frame,
+                        placeholder: false,
+                        visible_top: None,
+                        visible_bottom: None,
+                    }),
+            );
+        }
+        Ok(frames)
+    }
+
+    fn cached_fixed_section_frames(&self, section_index: usize) -> Option<Vec<ReaderSectionFrame>> {
+        let key = SegmentKey {
+            section_index,
+            segment_index: 0,
+        };
+        let segment = self.cache.get(&key)?;
+        Some(
+            segment
+                .frames
+                .iter()
+                .enumerate()
+                .map(|(page_index, frame)| ReaderSectionFrame {
+                    position: ReaderPosition {
+                        section_index,
+                        segment_index: 0,
+                        page_index,
+                    },
+                    frame: Arc::clone(frame),
+                    placeholder: false,
+                    visible_top: None,
+                    visible_bottom: None,
+                })
+                .collect(),
+        )
+    }
+
+    #[cfg(feature = "legacy-renderer")]
     fn section_pages(
         &mut self,
         section_index: usize,
@@ -1112,6 +3057,7 @@ impl ReaderSession {
         Ok(pages)
     }
 
+    #[cfg(feature = "legacy-renderer")]
     fn cached_fixed_section_pages(&self, section_index: usize) -> Option<Vec<ReaderSectionPage>> {
         let key = SegmentKey {
             section_index,
@@ -1142,7 +3088,7 @@ impl ReaderSession {
     /// spread, in visual order from left to right.
     pub fn current_spread_positions(&mut self) -> Result<Vec<ReaderPosition>, ReaderError> {
         Ok(self
-            .current_spread_pages()?
+            .current_spread_frames()?
             .into_iter()
             .map(|(position, _, _)| position)
             .collect())
@@ -1171,7 +3117,7 @@ impl ReaderSession {
         let page_exists = self
             .cache
             .get(&key)
-            .is_some_and(|segment| position.page_index < segment.pages.len());
+            .is_some_and(|segment| position.page_index < segment.frames.len());
         if !page_exists {
             return Err(ReaderError::PageOutOfBounds(position));
         }
@@ -1206,7 +3152,7 @@ impl ReaderSession {
         Ok(self
             .cache
             .get(&key)
-            .is_some_and(|segment| position.page_index < segment.pages.len()))
+            .is_some_and(|segment| position.page_index < segment.frames.len()))
     }
 
     pub fn hit_test_page(
@@ -1222,7 +3168,8 @@ impl ReaderSession {
         };
         self.ensure_segment(key)?;
         Ok(self
-            .page_at(position)?
+            .layout_frame_at(position)?
+            .interaction()
             .hit_test_text(x, y, exact)
             .map(|hit| reader_text_hit(position, hit)))
     }
@@ -1238,10 +3185,8 @@ impl ReaderSession {
             segment_index: position.segment_index,
         };
         self.ensure_segment(key)?;
-        Ok(self
-            .page_at(position)?
-            .image_at(x, y)
-            .map(|hit| reader_image(position, hit, 0.0)))
+        let frame = self.layout_frame_at(position)?;
+        Ok(frame_image_at(frame.as_ref(), x, y).map(|image| reader_image(position, image, 0.0)))
     }
 
     pub fn source_ranges_contain_point_on_page(
@@ -1257,15 +3202,18 @@ impl ReaderSession {
         };
         self.ensure_segment(key)?;
         Ok(self
-            .page_at(position)?
-            .source_ranges_contain_point(ranges, x, y))
+            .layout_frame_at(position)?
+            .interaction()
+            .source_rects(ranges)
+            .iter()
+            .any(|rect| rect.contains(x, y)))
     }
 
     /// Returns the authored spine sections represented by the currently
     /// visible logical pages, in visual order and without duplicates.
     pub fn current_spread_section_indices(&mut self) -> Result<Vec<usize>, ReaderError> {
         let mut indices = Vec::with_capacity(self.current_visible_pages());
-        for (position, _, _) in self.current_spread_pages()? {
+        for (position, _, _) in self.current_spread_frames()? {
             if indices.last().copied() != Some(position.section_index) {
                 indices.push(position.section_index);
             }
@@ -1280,8 +3228,9 @@ impl ReaderSession {
         &mut self,
     ) -> Result<Vec<ReaderVisibleTextFragment>, ReaderError> {
         let mut fragments = Vec::new();
-        for (position, page, _) in self.current_spread_pages()? {
-            append_visible_text_fragments(&mut fragments, position, &page);
+        for (position, _, _) in self.current_spread_frames()? {
+            let frame = self.layout_frame_at(position)?;
+            append_visible_text_fragments(&mut fragments, position, frame.interaction());
         }
         Ok(fragments)
     }
@@ -1295,8 +3244,8 @@ impl ReaderSession {
     ) -> Result<Vec<ReaderVisibleTextFragment>, ReaderError> {
         let mut fragments = Vec::new();
         for &position in positions {
-            let page = self.page_at(position)?;
-            append_visible_text_fragments(&mut fragments, position, &page);
+            let frame = self.layout_frame_at(position)?;
+            append_visible_text_fragments(&mut fragments, position, frame.interaction());
         }
         Ok(fragments)
     }
@@ -1310,21 +3259,145 @@ impl ReaderSession {
         y: f32,
         exact: bool,
     ) -> Result<Option<ReaderTextHit>, ReaderError> {
-        let pages = self.current_spread_pages()?;
+        let pages = self.current_spread_frames()?;
         if pages.is_empty() {
             return Ok(None);
         }
         if exact {
-            return Ok(pages.iter().find_map(|(position, page, offset_x)| {
-                page.hit_test_text(x - *offset_x, y, true)
-                    .map(|hit| reader_text_hit(*position, hit))
-            }));
+            for (position, _, offset_x) in &pages {
+                if let Some(hit) = self
+                    .layout_frame_at(*position)?
+                    .interaction()
+                    .hit_test_text(x - *offset_x, y, true)
+                {
+                    return Ok(Some(reader_text_hit(*position, hit)));
+                }
+            }
+            return Ok(None);
         }
         let page_index = usize::from(pages.len() > 1 && x >= pages[1].2);
-        let (position, page, offset_x) = &pages[page_index];
-        Ok(page
+        let (position, _, offset_x) = &pages[page_index];
+        Ok(self
+            .layout_frame_at(*position)?
+            .interaction()
             .hit_test_text(x - *offset_x, y, false)
             .map(|hit| reader_text_hit(*position, hit)))
+    }
+
+    /// Returns the first and last logical carets in the currently visible
+    /// spread. These are generation-local values and must not be persisted.
+    pub fn current_spread_cursor_range(
+        &mut self,
+    ) -> Result<Option<(ReaderTextCursor, ReaderTextCursor)>, ReaderError> {
+        let pages = self.current_spread_frames()?;
+        let first = pages.iter().find_map(|(position, frame, _)| {
+            frame
+                .interaction()
+                .first_cursor()
+                .map(|cursor| ReaderTextCursor {
+                    position: *position,
+                    cursor,
+                })
+        });
+        let last = pages.iter().rev().find_map(|(position, frame, _)| {
+            frame
+                .interaction()
+                .last_cursor()
+                .map(|cursor| ReaderTextCursor {
+                    position: *position,
+                    cursor,
+                })
+        });
+        Ok(first.zip(last))
+    }
+
+    /// Moves a logical caret by one shaped cluster within the currently
+    /// visible spread, crossing its page boundary when necessary.
+    pub fn move_text_cursor_current_spread(
+        &mut self,
+        cursor: ReaderTextCursor,
+        direction: TextCursorDirection,
+    ) -> Result<Option<ReaderTextCursor>, ReaderError> {
+        let pages = self.current_spread_frames()?;
+        let Some(page_index) = pages
+            .iter()
+            .position(|(position, _, _)| *position == cursor.position)
+        else {
+            return Ok(None);
+        };
+        let local = match direction {
+            TextCursorDirection::Previous => pages[page_index]
+                .1
+                .interaction()
+                .previous_cursor(cursor.cursor),
+            TextCursorDirection::Next => {
+                pages[page_index].1.interaction().next_cursor(cursor.cursor)
+            }
+        };
+        if let Some(local) = local {
+            return Ok(Some(ReaderTextCursor {
+                position: cursor.position,
+                cursor: local,
+            }));
+        }
+        let adjacent = match direction {
+            TextCursorDirection::Previous => {
+                pages[..page_index]
+                    .iter()
+                    .rev()
+                    .find_map(|(position, frame, _)| {
+                        frame
+                            .interaction()
+                            .last_cursor()
+                            .map(|cursor| ReaderTextCursor {
+                                position: *position,
+                                cursor,
+                            })
+                    })
+            }
+            TextCursorDirection::Next => {
+                pages[page_index + 1..]
+                    .iter()
+                    .find_map(|(position, frame, _)| {
+                        frame
+                            .interaction()
+                            .first_cursor()
+                            .map(|cursor| ReaderTextCursor {
+                                position: *position,
+                                cursor,
+                            })
+                    })
+            }
+        };
+        Ok(adjacent)
+    }
+
+    /// Resolves durable source ranges to fresh generation-local carets in the
+    /// currently visible spread. This is the required restoration path after
+    /// repagination.
+    pub fn cursors_for_current_spread_source_ranges(
+        &mut self,
+        ranges: &[SourceRange],
+    ) -> Result<Option<(ReaderTextCursor, ReaderTextCursor)>, ReaderError> {
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        let pages = self.current_spread_frames()?;
+        let mut first = None;
+        let mut last = None;
+        for (position, frame, _) in pages {
+            if let Some((start, end)) = frame.interaction().cursors_for_source_ranges(ranges) {
+                first.get_or_insert(ReaderTextCursor {
+                    position,
+                    cursor: start,
+                });
+                last = Some(ReaderTextCursor {
+                    position,
+                    cursor: end,
+                });
+            }
+        }
+        Ok(first.zip(last))
     }
 
     /// Resolves the top-most raster image under a visible spread coordinate.
@@ -1334,13 +3407,26 @@ impl ReaderSession {
         y: f32,
     ) -> Result<Option<ReaderImage>, ReaderError> {
         Ok(self
-            .current_spread_pages()?
+            .current_spread_frames()?
             .iter()
             .rev()
-            .find_map(|(position, page, offset_x)| {
-                page.image_at(x - *offset_x, y)
-                    .map(|hit| reader_image(*position, hit, *offset_x))
+            .find_map(|(position, frame, offset_x)| {
+                frame_image_at(frame, x - *offset_x, y)
+                    .map(|image| reader_image(*position, image, *offset_x))
             }))
+    }
+
+    /// Builds a source-backed selection between two generation-local carets.
+    /// The returned ranges are durable even though the carets are not.
+    pub fn selection_between_cursors(
+        &mut self,
+        anchor: ReaderTextCursor,
+        focus: ReaderTextCursor,
+    ) -> Result<Option<ReaderSelection>, ReaderError> {
+        self.selection_between(
+            &reader_text_hit_for_cursor(anchor),
+            &reader_text_hit_for_cursor(focus),
+        )
     }
 
     /// Builds a source-backed selection between two pointer hits. Native
@@ -1368,17 +3454,21 @@ impl ReaderSession {
         {
             self.selection_pages(anchor, focus)?
         } else {
-            let visible_offsets = self.current_spread_pages()?;
-            self.section_pages(anchor.position.section_index)?
-                .into_iter()
-                .map(|entry| {
-                    let offset_x = visible_offsets
-                        .iter()
-                        .find(|(position, _, _)| *position == entry.position)
-                        .map_or(0.0, |(_, _, offset_x)| *offset_x);
-                    (entry.position, entry.page, offset_x)
-                })
-                .collect()
+            let visible_offsets = self.current_spread_frames()?;
+            let entries = self.section_frames(anchor.position.section_index)?;
+            let mut frames = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let offset_x = visible_offsets
+                    .iter()
+                    .find(|(position, _, _)| *position == entry.position)
+                    .map_or(0.0, |(_, _, offset_x)| *offset_x);
+                frames.push((
+                    entry.position,
+                    self.layout_frame_at(entry.position)?,
+                    offset_x,
+                ));
+            }
+            frames
         };
         let Some(anchor_page) = pages
             .iter()
@@ -1410,15 +3500,20 @@ impl ReaderSession {
             )
         };
         if granularity != SelectionGranularity::Free {
-            let start_range =
-                semantic_source_range(&pages[start.page].1, start_hit, granularity, false);
-            let end_range = semantic_source_range(&pages[end.page].1, end_hit, granularity, false);
+            let start_range = semantic_source_range(
+                pages[start.page].1.interaction(),
+                start_hit,
+                granularity,
+                false,
+            );
+            let end_range =
+                semantic_source_range(pages[end.page].1.interaction(), end_hit, granularity, false);
             let (Some(start_range), Some(end_range)) = (start_range, end_range) else {
                 return Ok(None);
             };
             let end_range = if granularity == SelectionGranularity::Word && start_range != end_range
             {
-                semantic_source_range(&pages[end.page].1, end_hit, granularity, true)
+                semantic_source_range(pages[end.page].1.interaction(), end_hit, granularity, true)
                     .unwrap_or(end_range)
             } else {
                 end_range
@@ -1453,10 +3548,18 @@ impl ReaderSession {
         x: f32,
         y: f32,
     ) -> Result<bool, ReaderError> {
-        Ok(self
-            .current_spread_pages()?
-            .iter()
-            .any(|(_, page, offset_x)| page.source_ranges_contain_point(ranges, x - *offset_x, y)))
+        for (position, _, offset_x) in self.current_spread_frames()? {
+            if self
+                .layout_frame_at(position)?
+                .interaction()
+                .source_rects(ranges)
+                .iter()
+                .any(|rect| rect.contains(x - offset_x, y))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Navigates to a durable source anchor, resolving its page again under
@@ -1659,13 +3762,22 @@ impl ReaderSession {
     /// Blocks until all currently queued prefetch work has been collected.
     /// Intended for diagnostics and deterministic tests, not interactive shells.
     pub fn wait_for_prefetch(&mut self) -> Result<(), ReaderError> {
-        let generation = self.prefetch_worker.generation();
+        let Some(generation) = self
+            .prefetch_worker
+            .as_ref()
+            .map(PrefetchWorker::generation)
+        else {
+            return Ok(());
+        };
         while self
             .prefetch_inflight
             .iter()
             .any(|key| key.generation == generation)
         {
-            let result = self.prefetch_worker.recv()?;
+            let Some(worker) = self.prefetch_worker.as_ref() else {
+                return Ok(());
+            };
+            let result = worker.recv()?;
             self.install_prefetch(result);
         }
         if let Some(key) = self.prefetch_failures.keys().next().copied()
@@ -1730,7 +3842,11 @@ impl ReaderSession {
         let fraction = page_fraction(self.current_page, self.current_page_count());
         let visible_source_anchor = target
             .is_none()
-            .then(|| self.current_page().leading_source_range())
+            .then(|| {
+                self.current_layout_frame()
+                    .interaction()
+                    .leading_source_range()
+            })
             .flatten()
             .map(|range| range.start);
         let toc_items: Arc<[TocViewItem]> =
@@ -1781,12 +3897,14 @@ impl ReaderSession {
             self.viewport,
             &style,
             &mut self.layout_engine,
+            #[cfg(feature = "legacy-renderer")]
             &self.display_compiler,
         )?;
-        let prefetch_worker = PrefetchWorker::spawn(
-            Arc::clone(&self.source),
-            Arc::clone(&repository),
-            Arc::clone(&self.fonts),
+        let prefetch_worker = spawn_optional_prefetch_worker(
+            self.prefetch_worker.is_some(),
+            &self.source,
+            &repository,
+            &self.fonts,
         )?;
         let target_page = target
             .and_then(PublicationUrl::fragment)
@@ -1795,9 +3913,9 @@ impl ReaderSession {
             .or_else(|| {
                 visible_source_anchor.as_ref().and_then(|anchor| {
                     segment
-                        .pages
+                        .frames
                         .iter()
-                        .position(|page| page.contains_source_anchor(anchor))
+                        .position(|frame| frame.interaction().contains_source_anchor(anchor))
                 })
             });
 
@@ -1858,11 +3976,11 @@ impl ReaderSession {
         self.cache.len()
     }
 
-    fn current_spread_pages(
+    fn current_spread_frames(
         &mut self,
-    ) -> Result<Vec<(ReaderPosition, Arc<PageDisplayList>, f32)>, ReaderError> {
+    ) -> Result<Vec<(ReaderPosition, Arc<LayoutFrame>, f32)>, ReaderError> {
         let position = self.current_position();
-        let spread = self.current_spread()?;
+        let spread = self.current_frame_spread()?;
         let mut pages = vec![(position, spread.primary, spread.primary_offset_x)];
         if let Some(secondary) = spread.secondary
             && let Some(position) = self.next_position(position)?
@@ -1876,8 +3994,12 @@ impl ReaderSession {
         &mut self,
         anchor: &ReaderTextHit,
         focus: &ReaderTextHit,
-    ) -> Result<Vec<(ReaderPosition, Arc<PageDisplayList>, f32)>, ReaderError> {
-        let pages = self.current_spread_pages()?;
+    ) -> Result<Vec<SelectionPage>, ReaderError> {
+        let visible_pages = self.current_spread_frames()?;
+        let mut pages = Vec::with_capacity(visible_pages.len());
+        for (position, _, offset_x) in visible_pages {
+            pages.push((position, self.layout_frame_at(position)?, offset_x));
+        }
         let spread_contains_both = pages
             .iter()
             .any(|(position, _, _)| *position == anchor.position)
@@ -1887,11 +4009,13 @@ impl ReaderSession {
         if spread_contains_both || anchor.position.section_index != focus.position.section_index {
             return Ok(pages);
         }
-        Ok(self
-            .current_section_pages()?
+        self.current_section_frames()?
             .into_iter()
-            .map(|entry| (entry.position, entry.page, 0.0))
-            .collect())
+            .map(|entry| {
+                self.layout_frame_at(entry.position)
+                    .map(|frame| (entry.position, frame, 0.0))
+            })
+            .collect::<Result<Vec<_>, _>>()
     }
 
     fn next_page(&mut self) -> Result<NavigationResult, ReaderError> {
@@ -1997,7 +4121,7 @@ impl ReaderSession {
             .cache
             .get(&key)
             .expect("ready layout segment must remain cached");
-        if position.page_index + 1 < segment.pages.len() {
+        if position.page_index + 1 < segment.frames.len() {
             return Ok(PositionAttempt::Ready(Some(ReaderPosition {
                 page_index: position.page_index + 1,
                 ..position
@@ -2074,7 +4198,7 @@ impl ReaderSession {
             .cache
             .get(&previous_key)
             .expect("ready layout segment must remain cached")
-            .pages
+            .frames
             .len()
             .saturating_sub(1);
         Ok(PositionAttempt::Ready(Some(ReaderPosition {
@@ -2097,7 +4221,7 @@ impl ReaderSession {
             .cache
             .get(&key)
             .expect("ensured layout segment must remain cached");
-        if position.page_index + 1 < segment.pages.len() {
+        if position.page_index + 1 < segment.frames.len() {
             return Ok(Some(ReaderPosition {
                 page_index: position.page_index + 1,
                 ..position
@@ -2156,7 +4280,7 @@ impl ReaderSession {
             .cache
             .get(&previous_key)
             .expect("ensured layout segment must remain cached")
-            .pages
+            .frames
             .len()
             .saturating_sub(1);
         Ok(Some(ReaderPosition {
@@ -2166,6 +4290,7 @@ impl ReaderSession {
         }))
     }
 
+    #[cfg(feature = "legacy-renderer")]
     fn page_at(&self, position: ReaderPosition) -> Result<Arc<PageDisplayList>, ReaderError> {
         self.cache
             .get(&SegmentKey {
@@ -2173,6 +4298,21 @@ impl ReaderSession {
                 segment_index: position.segment_index,
             })
             .and_then(|segment| segment.pages.get(position.page_index))
+            .cloned()
+            .ok_or(ReaderError::PageOutOfBounds(position))
+    }
+
+    /// Returns the immutable layout frame behind a cached painted page.
+    pub fn layout_frame_at(
+        &self,
+        position: ReaderPosition,
+    ) -> Result<Arc<LayoutFrame>, ReaderError> {
+        self.cache
+            .get(&SegmentKey {
+                section_index: position.section_index,
+                segment_index: position.segment_index,
+            })
+            .and_then(|segment| segment.frames.get(position.page_index))
             .cloned()
             .ok_or(ReaderError::PageOutOfBounds(position))
     }
@@ -2284,9 +4424,9 @@ impl ReaderSession {
             .get(&key)
             .and_then(|segment| {
                 segment
-                    .pages
+                    .frames
                     .iter()
-                    .position(|page| page.contains_source_anchor(anchor))
+                    .position(|frame| frame.interaction().contains_source_anchor(anchor))
             })
             .unwrap_or(0);
         Ok(ReaderPosition {
@@ -2339,15 +4479,21 @@ impl ReaderSession {
         if let Some(error) = self.prefetch_failures.remove(&key) {
             return Err(error);
         }
-        let prefetch_key = PrefetchKey {
-            generation: self.prefetch_worker.generation(),
-            segment: key,
-        };
-        if self.prefetch_inflight.contains(&prefetch_key) {
-            self.wait_for_segment(key)?;
-            if self.cache.contains_key(&key) {
-                self.touch(key);
-                return Ok(());
+        if let Some(generation) = self
+            .prefetch_worker
+            .as_ref()
+            .map(PrefetchWorker::generation)
+        {
+            let prefetch_key = PrefetchKey {
+                generation,
+                segment: key,
+            };
+            if self.prefetch_inflight.contains(&prefetch_key) {
+                self.wait_for_segment(key)?;
+                if self.cache.contains_key(&key) {
+                    self.touch(key);
+                    return Ok(());
+                }
             }
         }
         let section = self.repository.load(key.section_index)?;
@@ -2358,6 +4504,7 @@ impl ReaderSession {
             self.viewport,
             &self.style,
             &mut self.layout_engine,
+            #[cfg(feature = "legacy-renderer")]
             &self.display_compiler,
         )?;
         self.cache.insert(key, Arc::new(segment));
@@ -2374,8 +4521,16 @@ impl ReaderSession {
         if let Some(error) = self.prefetch_failures.remove(&key) {
             return Err(error);
         }
+        let Some(generation) = self
+            .prefetch_worker
+            .as_ref()
+            .map(PrefetchWorker::generation)
+        else {
+            self.ensure_segment(key)?;
+            return Ok(true);
+        };
         let prefetch_key = PrefetchKey {
-            generation: self.prefetch_worker.generation(),
+            generation,
             segment: key,
         };
         if !self.prefetch_inflight.contains(&prefetch_key) {
@@ -2385,7 +4540,9 @@ impl ReaderSession {
     }
 
     fn invalidate_layout(&mut self, fraction: f32) -> Result<(), ReaderError> {
-        self.prefetch_worker.invalidate();
+        if let Some(worker) = self.prefetch_worker.as_ref() {
+            worker.invalidate();
+        }
         self.prefetch_inflight.clear();
         self.prefetch_failures.clear();
         let current_section = Arc::clone(self.current_section_data());
@@ -2399,6 +4556,7 @@ impl ReaderSession {
             self.viewport,
             &self.style,
             &mut self.layout_engine,
+            #[cfg(feature = "legacy-renderer")]
             &self.display_compiler,
         )?;
         self.cache.insert(key, Arc::new(segment));
@@ -2409,14 +4567,17 @@ impl ReaderSession {
     }
 
     fn queue_prefetch(&mut self, segment: SegmentKey) -> Result<(), ReaderError> {
+        let Some(worker) = self.prefetch_worker.as_ref() else {
+            return Ok(());
+        };
         let key = PrefetchKey {
-            generation: self.prefetch_worker.generation(),
+            generation: worker.generation(),
             segment,
         };
         if self.cache.contains_key(&segment) || self.prefetch_inflight.contains(&key) {
             return Ok(());
         }
-        self.prefetch_worker.send(PrefetchRequest {
+        worker.send(PrefetchRequest {
             key: segment,
             viewport: self.viewport,
             style: self.style.clone(),
@@ -2427,8 +4588,15 @@ impl ReaderSession {
     }
 
     fn poll_prefetch(&mut self) -> Result<(), ReaderError> {
+        if self.prefetch_worker.is_none() {
+            return Ok(());
+        }
         loop {
-            match self.prefetch_worker.try_recv() {
+            let Some(worker) = self.prefetch_worker.as_ref() else {
+                return Ok(());
+            };
+            let result = worker.try_recv();
+            match result {
                 Ok(result) => self.install_prefetch(result),
                 Err(TryRecvError::Empty) => return Ok(()),
                 Err(TryRecvError::Disconnected) if self.prefetch_inflight.is_empty() => {
@@ -2442,12 +4610,22 @@ impl ReaderSession {
     }
 
     fn wait_for_segment(&mut self, segment: SegmentKey) -> Result<(), ReaderError> {
+        let Some(generation) = self
+            .prefetch_worker
+            .as_ref()
+            .map(PrefetchWorker::generation)
+        else {
+            return Ok(());
+        };
         let key = PrefetchKey {
-            generation: self.prefetch_worker.generation(),
+            generation,
             segment,
         };
         while self.prefetch_inflight.contains(&key) {
-            let result = self.prefetch_worker.recv()?;
+            let Some(worker) = self.prefetch_worker.as_ref() else {
+                return Ok(());
+            };
+            let result = worker.recv()?;
             self.install_prefetch(result);
         }
         if let Some(error) = self.prefetch_failures.remove(&segment) {
@@ -2457,12 +4635,19 @@ impl ReaderSession {
     }
 
     fn install_prefetch(&mut self, result: PrefetchResult) {
+        let Some(generation) = self
+            .prefetch_worker
+            .as_ref()
+            .map(PrefetchWorker::generation)
+        else {
+            return;
+        };
         let key = PrefetchKey {
             generation: result.generation,
             segment: result.key,
         };
         self.prefetch_inflight.remove(&key);
-        if result.generation != self.prefetch_worker.generation() {
+        if result.generation != generation {
             return;
         }
         let segment = match result.segment {
@@ -2482,7 +4667,7 @@ impl ReaderSession {
     fn current_page_count(&self) -> usize {
         self.cache
             .get(&self.current_key())
-            .map_or(0, |segment| segment.pages.len())
+            .map_or(0, |segment| segment.frames.len())
     }
 
     fn current_key(&self) -> SegmentKey {
@@ -2552,14 +4737,14 @@ impl ReaderSession {
     }
 }
 
-fn compile_segment(
+fn compile_segment<E: TextEngine>(
     source: &dyn BookSource,
     section: Arc<PreparedSection>,
     key: SegmentKey,
     viewport: LayoutViewport,
     style: &ReaderStyle,
-    layout_engine: &mut LayoutEngine,
-    display_compiler: &DisplayListCompiler,
+    layout_engine: &mut LayoutEngine<E>,
+    #[cfg(feature = "legacy-renderer")] display_compiler: &DisplayListCompiler,
 ) -> Result<CachedSegment, ReaderError> {
     let segment =
         section
@@ -2609,13 +4794,21 @@ fn compile_segment(
                 .map(|page| (anchor.fragment.clone(), page))
         })
         .collect();
-    let pages = layout
+    let frames = layout
         .pages
+        .into_iter()
+        .map(LayoutFrame::freeze)
+        .map(Arc::new)
+        .collect::<Vec<_>>();
+    #[cfg(feature = "legacy-renderer")]
+    let pages = frames
         .iter()
-        .map(|page| Arc::new(display_compiler.compile(page)))
+        .map(|frame| Arc::new(display_compiler.compile_frame(frame)))
         .collect();
     Ok(CachedSegment {
         section,
+        frames,
+        #[cfg(feature = "legacy-renderer")]
         pages,
         anchor_pages,
         visible_pages,
@@ -3113,13 +5306,13 @@ fn block_text_len(block: &Block) -> usize {
 fn append_visible_text_fragments(
     fragments: &mut Vec<ReaderVisibleTextFragment>,
     position: ReaderPosition,
-    page: &PageDisplayList,
+    interaction: &FrameInteractionMap,
 ) {
-    for region_index in 0..page.text_region_count() {
-        let Some(visible_range) = page.text_region_visible_range(region_index) else {
+    for region_index in 0..interaction.text_region_count() {
+        let Some(visible_range) = interaction.visible_byte_range(region_index) else {
             continue;
         };
-        let Some(fragment) = page.selection_fragment(region_index, visible_range) else {
+        let Some(fragment) = interaction.selection_fragment(region_index, visible_range) else {
             continue;
         };
         if fragment.quote.trim().is_empty() {
@@ -3157,7 +5350,7 @@ fn source_range_contains(range: &SourceRange, anchor: &SourceAnchor) -> bool {
                 && anchor.text_offset == range.start.text_offset))
 }
 
-fn reader_text_hit(position: ReaderPosition, hit: PageTextHit) -> ReaderTextHit {
+fn reader_text_hit(position: ReaderPosition, hit: FrameTextHit) -> ReaderTextHit {
     ReaderTextHit {
         position,
         region_index: hit.region_index,
@@ -3167,7 +5360,17 @@ fn reader_text_hit(position: ReaderPosition, hit: PageTextHit) -> ReaderTextHit 
     }
 }
 
-type SelectionPage = (ReaderPosition, Arc<PageDisplayList>, f32);
+fn reader_text_hit_for_cursor(cursor: ReaderTextCursor) -> ReaderTextHit {
+    ReaderTextHit {
+        position: cursor.position,
+        region_index: cursor.cursor.region_index,
+        byte_index: cursor.cursor.byte_index,
+        cluster_start: cursor.cursor.byte_index,
+        cluster_end: cursor.cursor.byte_index,
+    }
+}
+
+type SelectionPage = (ReaderPosition, Arc<LayoutFrame>, f32);
 
 #[derive(Clone, Copy)]
 struct SelectionBoundary {
@@ -3187,18 +5390,18 @@ impl SelectionBoundary {
 }
 
 fn semantic_source_range(
-    page: &PageDisplayList,
+    interaction: &FrameInteractionMap,
     hit: &ReaderTextHit,
     granularity: SelectionGranularity,
     include_trailing_boundary_punctuation: bool,
 ) -> Option<SourceRange> {
-    let text = page.text_region_text(hit.region_index)?;
-    let selectable = page.text_region_selectable_range(hit.region_index)?;
+    let text = interaction.text(hit.region_index)?;
+    let selectable = interaction.selectable_byte_range(hit.region_index)?;
     let mut byte_range = semantic_byte_range(text, selectable.clone(), hit, granularity)?;
     if include_trailing_boundary_punctuation && granularity == SelectionGranularity::Word {
         byte_range = extend_word_to_sentence_or_paragraph_end(text, selectable, byte_range);
     }
-    page.text_region_source_range(hit.region_index, byte_range)
+    interaction.source_range_for_bytes(hit.region_index, byte_range)
 }
 
 fn extend_word_to_sentence_or_paragraph_end(
@@ -3382,9 +5585,11 @@ fn first_source_boundary(
     pages
         .iter()
         .enumerate()
-        .find_map(|(page_index, (_, page, _))| {
-            (0..page.text_region_count()).find_map(|region_index| {
-                page.text_region_byte_range_for_source(region_index, range)
+        .find_map(|(page_index, (_, frame, _))| {
+            let interaction = frame.interaction();
+            (0..interaction.text_region_count()).find_map(|region_index| {
+                interaction
+                    .byte_range_for_source(region_index, range)
                     .map(|bytes| SelectionBoundary::new(page_index, region_index, bytes.start))
             })
         })
@@ -3394,12 +5599,14 @@ fn expand_paragraph_source_range(
     pages: &[SelectionPage],
     mut paragraph: SourceRange,
 ) -> SourceRange {
-    for (_, page, _) in pages {
-        for region_index in 0..page.text_region_count() {
-            let Some(selectable) = page.text_region_selectable_range(region_index) else {
+    for (_, frame, _) in pages {
+        let interaction = frame.interaction();
+        for region_index in 0..interaction.text_region_count() {
+            let Some(selectable) = interaction.selectable_byte_range(region_index) else {
                 continue;
             };
-            let Some(candidate) = page.text_region_source_range(region_index, selectable) else {
+            let Some(candidate) = interaction.source_range_for_bytes(region_index, selectable)
+            else {
                 continue;
             };
             if candidate.start.spine != paragraph.start.spine
@@ -3423,11 +5630,13 @@ fn last_source_boundary(pages: &[SelectionPage], range: &SourceRange) -> Option<
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(page_index, (_, page, _))| {
-            (0..page.text_region_count())
+        .find_map(|(page_index, (_, frame, _))| {
+            let interaction = frame.interaction();
+            (0..interaction.text_region_count())
                 .rev()
                 .find_map(|region_index| {
-                    page.text_region_byte_range_for_source(region_index, range)
+                    interaction
+                        .byte_range_for_source(region_index, range)
                         .map(|bytes| SelectionBoundary::new(page_index, region_index, bytes.end))
                 })
         })
@@ -3441,7 +5650,7 @@ fn build_reader_selection(
     let mut ranges = Vec::new();
     let mut quote = String::new();
     let mut rects = Vec::new();
-    for (page_index, (position, page, offset_x)) in
+    for (page_index, (position, frame, offset_x)) in
         pages.iter().enumerate().take(end.page + 1).skip(start.page)
     {
         let first_region = if page_index == start.page {
@@ -3452,10 +5661,11 @@ fn build_reader_selection(
         let last_region = if page_index == end.page {
             end.region
         } else {
-            page.text_region_count().saturating_sub(1)
+            frame.interaction().text_region_count().saturating_sub(1)
         };
         for region_index in first_region..=last_region {
-            let Some(visible) = page.text_region_visible_range(region_index) else {
+            let interaction = frame.interaction();
+            let Some(visible) = interaction.visible_byte_range(region_index) else {
                 continue;
             };
             let byte_start = if page_index == start.page && region_index == start.region {
@@ -3468,7 +5678,8 @@ fn build_reader_selection(
             } else {
                 visible.end
             };
-            let Some(fragment) = page.selection_fragment(region_index, byte_start..byte_end) else {
+            let Some(fragment) = interaction.selection_fragment(region_index, byte_start..byte_end)
+            else {
                 continue;
             };
             let source_continues = ranges.last().is_some_and(|previous: &SourceRange| {
@@ -3480,10 +5691,10 @@ fn build_reader_selection(
             push_source_range(&mut ranges, fragment.range);
             rects.extend(fragment.rects.into_iter().map(|rect| ReaderSelectionRect {
                 position: *position,
-                x: logical_coordinate(rect.x0) + *offset_x,
-                y: logical_coordinate(rect.y0),
-                width: logical_coordinate(rect.width()),
-                height: logical_coordinate(rect.height()),
+                x: rect.x0 + *offset_x,
+                y: rect.y0,
+                width: rect.x1 - rect.x0,
+                height: rect.y1 - rect.y0,
             }));
         }
     }
@@ -3496,20 +5707,26 @@ fn build_reader_selection(
     )
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "page geometry is already represented as bounded f32 layout coordinates"
-)]
-fn reader_image(position: ReaderPosition, hit: PageImageHit, offset_x: f32) -> ReaderImage {
+fn frame_image_at(frame: &LayoutFrame, x: f32, y: f32) -> Option<&ImagePlacement> {
+    frame.items.iter().rev().find_map(|item| {
+        let PageItem::Image(image) = item else {
+            return None;
+        };
+        (x >= image.x && x <= image.x + image.width && y >= image.y && y <= image.y + image.height)
+            .then_some(image)
+    })
+}
+
+fn reader_image(position: ReaderPosition, image: &ImagePlacement, offset_x: f32) -> ReaderImage {
     ReaderImage {
         position,
-        x: hit.bounds.x0 as f32 + offset_x,
-        y: hit.bounds.y0 as f32,
-        display_width: hit.bounds.width() as f32,
-        display_height: hit.bounds.height() as f32,
-        width: hit.width,
-        height: hit.height,
-        pixels: hit.pixels,
+        x: image.x + offset_x,
+        y: image.y,
+        display_width: image.width,
+        display_height: image.height,
+        width: image.image.width,
+        height: image.image.height,
+        pixels: Arc::clone(&image.image.pixels),
     }
 }
 
@@ -3643,12 +5860,26 @@ fn total_progression(location: ReaderLocation, section_count: usize) -> f64 {
     ((to_f64(location.section_index) + segment_progress) / section_count).clamp(0.0, 1.0)
 }
 
-// Spread bounds use kurbo's f64 geometry while reader composition uses bounded
-// logical f32 coordinates.
-#[allow(clippy::cast_possible_truncation)]
-fn resolve_spread_offsets(
-    primary: &PageDisplayList,
-    secondary: Option<&PageDisplayList>,
+fn frame_image_bounds(frame: &LayoutFrame) -> Option<(f32, f32)> {
+    frame
+        .items
+        .iter()
+        .filter_map(|item| {
+            let PageItem::Image(image) = item else {
+                return None;
+            };
+            Some((image.x, image.x + image.width))
+        })
+        .reduce(|left, right| (left.0.min(right.0), left.1.max(right.1)))
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "layout viewports are bounded logical dimensions represented as f32 during composition"
+)]
+fn resolve_frame_spread_offsets(
+    primary: &LayoutFrame,
+    secondary: Option<&LayoutFrame>,
     default_secondary_offset_x: f32,
     compact_images: bool,
 ) -> (f32, f32) {
@@ -3656,30 +5887,26 @@ fn resolve_spread_offsets(
         return (0.0, default_secondary_offset_x);
     };
     let (Some(primary_bounds), Some(secondary_bounds)) =
-        (primary.image_bounds(), secondary.image_bounds())
+        (frame_image_bounds(primary), frame_image_bounds(secondary))
     else {
         return (0.0, default_secondary_offset_x);
     };
-    let viewport_width = f64::from(primary.width());
-    let primary_offset_x = f64::midpoint(
-        viewport_width - primary_bounds.x0 - primary_bounds.x1 - secondary_bounds.x1,
-        secondary_bounds.x0,
+    let viewport_width = primary.viewport.width as f32;
+    let primary_offset_x = f32::midpoint(
+        viewport_width - primary_bounds.0 - primary_bounds.1 - secondary_bounds.1,
+        secondary_bounds.0,
     );
-    let secondary_offset_x = primary_bounds.x1 + primary_offset_x - secondary_bounds.x0;
+    let secondary_offset_x = primary_bounds.1 + primary_offset_x - secondary_bounds.0;
     if !primary_offset_x.is_finite() || !secondary_offset_x.is_finite() {
         return (0.0, default_secondary_offset_x);
     }
-    (primary_offset_x as f32, secondary_offset_x as f32)
+    (primary_offset_x, secondary_offset_x)
 }
 
-// Renderer geometry uses f64 (kurbo), while pointer events and the reader's
-// public logical-pixel geometry use f32. Page coordinates are viewport-bounded,
-// so the conversion cannot overflow and only discards unused sub-pixel precision.
+#[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
-fn logical_coordinate(value: f64) -> f32 {
-    debug_assert!(value.is_finite());
-    debug_assert!((f64::from(f32::MIN)..=f64::from(f32::MAX)).contains(&value));
-    value as f32
+fn logical_coordinate(value: impl Into<f64>) -> f32 {
+    value.into() as f32
 }
 
 // Page counts are bounded by the pages that fit in memory, so they remain far
@@ -3738,13 +5965,74 @@ mod tests {
 
     use rebook_layout::{ReaderDefaultFont, SpreadMode};
     use rebook_publication::{
-        Block, BlockStyle, FixedPageDimensions, ImageBlock, ImageStyle, Inline, Metadata,
+        Block, BlockStyle, FixedPageDimensions, ImageBlock, ImageStyle, Inline, LinkRole, Metadata,
         PublicationId, PublicationUrl, RasterResource, Resource, Section, SectionAnchor,
         SourceAnchor, SourceRange, SpineItem, SpineItemId, TextBlock, TextBlockKind, TextRun,
         TextStyle, TocEntry,
     };
 
     use super::*;
+
+    #[test]
+    fn focus_presentation_applies_the_shared_layout_contract() {
+        let policy =
+            ReaderPresentationPolicy::resolve(ReadingMode::Focus, SpreadMode::Double, true);
+        let mut style = ReaderStyle::default();
+
+        policy.apply_to_style(&mut style);
+
+        assert_eq!(policy.mode, ReadingMode::Focus);
+        assert_eq!(policy.spread, SpreadMode::Scroll);
+        assert_eq!(style.spread, SpreadMode::Scroll);
+        assert!(style.focus_footnote_icons);
+        assert!((style.minimum_paragraph_gap - FOCUS_MINIMUM_PARAGRAPH_GAP).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn unsupported_focus_falls_back_to_the_requested_classic_spread() {
+        let policy =
+            ReaderPresentationPolicy::resolve(ReadingMode::Focus, SpreadMode::Double, false);
+        let mut style = ReaderStyle::default();
+
+        policy.apply_to_style(&mut style);
+
+        assert_eq!(policy.mode, ReadingMode::Classic);
+        assert_eq!(style.spread, SpreadMode::Double);
+        assert!(!style.focus_footnote_icons);
+        assert!(style.minimum_paragraph_gap.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn unified_focus_keeps_flow_owned_paragraph_spacing() {
+        let policy =
+            ReaderPresentationPolicy::resolve(ReadingMode::Focus, SpreadMode::Single, true);
+        let mut style = ReaderStyle::default();
+        style.typesetting.mode = TypesettingMode::Unified;
+
+        policy.apply_to_style(&mut style);
+
+        assert_eq!(style.spread, SpreadMode::Scroll);
+        assert!(style.minimum_paragraph_gap.abs() < f32::EPSILON);
+    }
+
+    struct CountingTextEngine {
+        shape_calls: Arc<AtomicUsize>,
+        inner: LegacyParleyTextEngine,
+    }
+
+    impl TextEngine for CountingTextEngine {
+        fn register_font(&mut self, font: &rebook_layout::text::TextFontBlob) {
+            self.inner.register_font(font);
+        }
+
+        fn shape(
+            &mut self,
+            request: &rebook_layout::text::TextLayoutRequest<'_>,
+        ) -> rebook_layout::text::TextLayoutStore {
+            self.shape_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.shape(request)
+        }
+    }
 
     struct CountingSource {
         book: Book,
@@ -3947,6 +6235,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn application_text_engine_shapes_every_synchronously_loaded_segment() {
+        let source = CountingSource::new(&[
+            "The first section uses the application-owned shaper.".repeat(12),
+            "The second section must use that same shaper after navigation.".repeat(12),
+        ]);
+        let shape_calls = Arc::new(AtomicUsize::new(0));
+        let text_engine = CountingTextEngine {
+            shape_calls: Arc::clone(&shape_calls),
+            inner: LegacyParleyTextEngine::default(),
+        };
+        let mut reader = ReaderSession::open_with_text_engine(
+            source,
+            viewport(600, 400),
+            ReaderStyle::default(),
+            text_engine,
+        )
+        .unwrap();
+
+        let first_section_calls = shape_calls.load(Ordering::Relaxed);
+        assert!(first_section_calls > 0);
+        assert!(reader.prefetch_worker.is_none());
+
+        reader.go_to_section(1).unwrap();
+        assert!(shape_calls.load(Ordering::Relaxed) > first_section_calls);
+        assert_eq!(reader.location().section_index, 1);
+    }
+
     struct SwitchingSource {
         original_book: Book,
         original_sections: Vec<Section>,
@@ -4001,8 +6317,8 @@ mod tests {
         LayoutViewport::new(width, height).unwrap()
     }
 
-    fn image_page(image_x: f32) -> PageDisplayList {
-        DisplayListCompiler.compile(&rebook_layout::PageLayout {
+    fn image_frame(image_x: f32) -> LayoutFrame {
+        LayoutFrame::freeze(rebook_layout::PageLayout {
             viewport: viewport(1_200, 700),
             background: rebook_publication::Rgba::BLACK,
             leading_gap: 0.0,
@@ -4025,21 +6341,92 @@ mod tests {
         })
     }
 
+    fn scroll_image_frame(page_index: usize, leading_gap: f32) -> ReaderSectionFrame {
+        let frame = LayoutFrame::freeze(rebook_layout::PageLayout {
+            viewport: viewport(600, 400),
+            background: rebook_publication::Rgba::BLACK,
+            leading_gap,
+            items: vec![rebook_layout::PageItem::Image(
+                rebook_layout::ImagePlacement {
+                    image: rebook_layout::RasterImage {
+                        width: 100,
+                        height: 100,
+                        pixels: vec![255; 100 * 100 * 4].into(),
+                    },
+                    x: 50.0,
+                    y: 40.0,
+                    width: 100.0,
+                    height: 100.0,
+                    source: None,
+                    text_layer: None,
+                    replacement: None,
+                },
+            )],
+        });
+        ReaderSectionFrame {
+            position: ReaderPosition {
+                section_index: 0,
+                segment_index: 0,
+                page_index,
+            },
+            frame: Arc::new(frame),
+            placeholder: false,
+            visible_top: None,
+            visible_bottom: None,
+        }
+    }
+
     #[test]
     fn compact_image_spread_touches_and_centers_page_edges() {
-        let primary = image_page(150.0);
-        let secondary = image_page(150.0);
+        let primary = image_frame(150.0);
+        let secondary = image_frame(150.0);
         let (primary_offset, secondary_offset) =
-            resolve_spread_offsets(&primary, Some(&secondary), 600.0, true);
-        let primary_bounds = primary.image_bounds().unwrap();
-        let secondary_bounds = secondary.image_bounds().unwrap();
-        let primary_left = primary_bounds.x0 + f64::from(primary_offset);
-        let primary_right = primary_bounds.x1 + f64::from(primary_offset);
-        let secondary_left = secondary_bounds.x0 + f64::from(secondary_offset);
-        let secondary_right = secondary_bounds.x1 + f64::from(secondary_offset);
+            resolve_frame_spread_offsets(&primary, Some(&secondary), 600.0, true);
+        let primary_bounds = frame_image_bounds(&primary).unwrap();
+        let secondary_bounds = frame_image_bounds(&secondary).unwrap();
+        let primary_left = primary_bounds.0 + primary_offset;
+        let primary_right = primary_bounds.1 + primary_offset;
+        let secondary_left = secondary_bounds.0 + secondary_offset;
+        let secondary_right = secondary_bounds.1 + secondary_offset;
 
-        assert!((primary_right - secondary_left).abs() < f64::EPSILON);
-        assert!((f64::midpoint(primary_left, secondary_right) - 600.0).abs() < f64::EPSILON);
+        assert!((primary_right - secondary_left).abs() < f32::EPSILON);
+        assert!((f32::midpoint(primary_left, secondary_right) - 600.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn scroll_layout_stitches_neutral_frames_and_restores_leading_gap() {
+        let layout = ReaderScrollLayout::new(
+            0,
+            0,
+            vec![scroll_image_frame(0, 0.0), scroll_image_frame(1, 20.0)],
+            false,
+        );
+
+        assert!((layout.content_height() - 260.0).abs() < f32::EPSILON);
+        assert!(layout.frames()[0].top.abs() < f32::EPSILON);
+        assert!(layout.frames()[0].origin_y.abs() < f32::EPSILON);
+        assert!((layout.frames()[0].height - 160.0).abs() < f32::EPSILON);
+        assert!((layout.frames()[1].top - 160.0).abs() < f32::EPSILON);
+        assert!((layout.frames()[1].origin_y - 40.0).abs() < f32::EPSILON);
+        assert!((layout.frames()[1].height - 100.0).abs() < f32::EPSILON);
+        let (index, frame_y) = layout.frame_at_content_y(170.0).unwrap();
+        assert_eq!(index, 1);
+        assert!((frame_y - 50.0).abs() < f32::EPSILON);
+        assert_eq!(
+            layout.visible_frames(150.0, 20.0),
+            [
+                ReaderPosition {
+                    section_index: 0,
+                    segment_index: 0,
+                    page_index: 0,
+                },
+                ReaderPosition {
+                    section_index: 0,
+                    segment_index: 0,
+                    page_index: 1,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -4081,7 +6468,7 @@ mod tests {
         )
         .unwrap();
         let initial = reader.location();
-        let pages = reader.current_section_pages().unwrap();
+        let pages = reader.current_section_frames().unwrap();
 
         assert!(pages.len() >= initial.page_count);
         assert!(pages.len() > 1);
@@ -4126,7 +6513,8 @@ mod tests {
             },
         };
         let rect = reader
-            .current_page()
+            .current_layout_frame()
+            .interaction()
             .source_rects(std::slice::from_ref(&selected_source))[0];
         let first_character = SourceRange {
             start: selected_source.start.clone(),
@@ -4143,12 +6531,14 @@ mod tests {
             end: selected_source.end.clone(),
         };
         let first_rect = reader
-            .current_page()
+            .current_layout_frame()
+            .interaction()
             .source_rects(std::slice::from_ref(&first_character))[0];
         let last_rect = reader
-            .current_page()
+            .current_layout_frame()
+            .interaction()
             .source_rects(std::slice::from_ref(&last_character))[0];
-        let y = logical_coordinate(rect.center().y);
+        let y = logical_coordinate(rect.center().1);
         let anchor = reader
             .hit_test_current_spread(logical_coordinate(first_rect.x1) - 0.1, y, true)
             .unwrap()
@@ -4185,6 +6575,444 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reverse_selection.text, "选择文字");
+    }
+
+    #[test]
+    fn scroll_layout_owns_cross_frame_text_interaction_and_anchor_geometry() {
+        let source = CountingSource::new(&["Alpha beta gamma.".into()]);
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        let beta_range = SourceRange {
+            start: SourceAnchor {
+                spine: SpineItemId::new("section-0").unwrap(),
+                node: "paragraph-0".into(),
+                text_offset: 6,
+            },
+            end: SourceAnchor {
+                spine: SpineItemId::new("section-0").unwrap(),
+                node: "paragraph-0".into(),
+                text_offset: 10,
+            },
+        };
+        let layout = reader.current_scroll_layout(false).unwrap();
+        let position = layout.frames()[0].position;
+        let frame = &layout.frames()[0];
+        let rect = frame
+            .frame
+            .interaction()
+            .source_rects(std::slice::from_ref(&beta_range))[0];
+        let hit = layout
+            .hit_test_text(
+                0,
+                logical_coordinate(rect.center().0),
+                logical_coordinate(rect.center().1 - frame.origin_y),
+                true,
+            )
+            .unwrap();
+        let selected = reader
+            .selection_between_with_granularity(&hit, &hit, SelectionGranularity::Word)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.text, "beta");
+
+        let (anchor, focus) = layout.cursors_for_source_ranges(&selected.ranges).unwrap();
+        assert_eq!(anchor.position(), position);
+        assert_eq!(layout.cursor_range().unwrap().0.position(), position);
+        assert!(
+            layout
+                .move_text_cursor(focus, TextCursorDirection::Previous)
+                .is_some()
+        );
+
+        let expected_top = layout.content_y(0, rect.y0).unwrap();
+        let actual_top = layout.source_anchor_top(&beta_range.start).unwrap();
+        assert!((actual_top - expected_top).abs() < f32::EPSILON);
+
+        let focus_geometry = layout
+            .focus_geometry(
+                std::slice::from_ref(&beta_range),
+                Some(std::slice::from_ref(&beta_range)),
+            )
+            .unwrap();
+        assert_eq!(focus_geometry.position, position);
+        assert!((focus_geometry.bounds.y0 - expected_top).abs() < f32::EPSILON);
+        assert!(focus_geometry.activation_bounds.is_some());
+
+        let focus_layout = reader
+            .current_focus_layout(
+                &layout,
+                Some(&beta_range.start),
+                ReaderFocusLayoutPolicy::default(),
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(focus_layout.units.len(), 1);
+        assert!(focus_layout.units[0].contains_anchor(&beta_range.start));
+        assert_eq!(focus_layout.units[0].geometry.position, position);
+        assert!(focus_layout.first_unit_after_anchor.is_some());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the linked-footnote fixture keeps the source reference, target anchor, and resolved focus assertion together"
+    )]
+    fn focus_layout_resolves_linked_footnotes_from_reading_ir() {
+        let id = SpineItemId::new("section-0").unwrap();
+        let href = PublicationUrl::parse("section-0.xhtml").unwrap();
+        let range = |node: &str, end: u64| SourceRange {
+            start: SourceAnchor {
+                spine: id.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: id.clone(),
+                node: node.into(),
+                text_offset: end,
+            },
+        };
+        let reference_range = range("paragraph", 8);
+        let note_range = range("note", 17);
+        let section = Section {
+            id: id.clone(),
+            href: href.clone(),
+            blocks: vec![
+                Block::Text(TextBlock {
+                    kind: TextBlockKind::Paragraph,
+                    content: vec![
+                        Inline::Text(TextRun {
+                            text: "Body".into(),
+                            style: TextStyle::default(),
+                            link: None,
+                        }),
+                        Inline::Text(TextRun {
+                            text: "[1]".into(),
+                            style: TextStyle {
+                                link_role: LinkRole::FootnoteReference,
+                                ..TextStyle::default()
+                            },
+                            link: Some(PublicationUrl::parse("section-0.xhtml#note-1").unwrap()),
+                        }),
+                    ],
+                    style: BlockStyle::default(),
+                    source: Some(reference_range.clone()),
+                }),
+                Block::Text(TextBlock {
+                    kind: TextBlockKind::Paragraph,
+                    content: vec![
+                        Inline::Text(TextRun {
+                            text: "[1]".into(),
+                            style: TextStyle {
+                                link_role: LinkRole::FootnoteBacklink,
+                                ..TextStyle::default()
+                            },
+                            link: Some(PublicationUrl::parse("section-0.xhtml#paragraph").unwrap()),
+                        }),
+                        Inline::Text(TextRun {
+                            text: " Footnote body".into(),
+                            style: TextStyle::default(),
+                            link: None,
+                        }),
+                    ],
+                    style: BlockStyle::default(),
+                    source: Some(note_range.clone()),
+                }),
+            ],
+            anchors: vec![SectionAnchor {
+                fragment: "note-1".into(),
+                source: note_range.start.clone(),
+            }],
+        };
+        let source = Arc::new(CountingSource {
+            book: Book {
+                id: PublicationId::new("focus-footnote-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: vec![SpineItem {
+                    id,
+                    href,
+                    media_type: "application/xhtml+xml".into(),
+                    linear: true,
+                    properties: Vec::new(),
+                }],
+                table_of_contents: Vec::new(),
+            },
+            sections: vec![section],
+            parse_counts: vec![AtomicUsize::new(0)],
+            background_delay: Duration::ZERO,
+        });
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        let scroll = reader.current_scroll_layout(false).unwrap();
+        let focus = reader
+            .current_focus_layout(
+                &scroll,
+                Some(&reference_range.start),
+                ReaderFocusLayoutPolicy::default(),
+                |_| false,
+            )
+            .unwrap();
+
+        assert_eq!(focus.units.len(), 1);
+        assert_eq!(focus.units[0].footnotes.len(), 1);
+        assert_eq!(focus.units[0].footnotes[0].marker.as_deref(), Some("[1]"));
+        assert_eq!(
+            focus.units[0].footnotes[0].text.as_deref(),
+            Some("Footnote body")
+        );
+    }
+
+    #[test]
+    fn focus_viewport_policy_centers_short_units_and_aligns_tall_units() {
+        let policy = ReaderFocusViewportPolicy::default();
+        let short = FrameRect::new(0.0, 100.0, 500.0, 180.0);
+        let tall = FrameRect::new(0.0, 400.0, 500.0, 1_200.0);
+
+        assert_eq!(
+            policy.unit_viewport_target(short, 600.0),
+            ReaderFocusViewportTarget {
+                content_y: 140.0,
+                viewport_y: 300.0,
+            }
+        );
+        assert_eq!(
+            policy.unit_viewport_target(tall, 600.0),
+            ReaderFocusViewportTarget {
+                content_y: 400.0,
+                viewport_y: 0.0,
+            }
+        );
+        assert!((policy.unit_target_offset(short, 600.0) - 220.0).abs() < f32::EPSILON);
+        assert!((policy.unit_target_offset(tall, 600.0) - 700.0).abs() < f32::EPSILON);
+        assert_eq!(
+            policy.nearest_unit_for_offset([short, tall], 680.0, 600.0),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn focus_navigation_uses_durable_half_open_unit_identity() {
+        let spine = SpineItemId::new("section-0").unwrap();
+        let range = |node: &str, start, end| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: start,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: end,
+            },
+        };
+        let position = ReaderPosition {
+            section_index: 0,
+            segment_index: 0,
+            page_index: 0,
+        };
+        let units = [range("p1", 0, 5), range("p2", 0, 5)].map(|range| ReaderFocusUnit {
+            paint_ranges: vec![range.clone()],
+            range,
+            geometry: ReaderFocusGeometry {
+                position,
+                bounds: FrameRect::new(0.0, 0.0, 100.0, 20.0),
+                activation_bounds: None,
+            },
+            content_kind: ReaderFocusContentKind::Text,
+            activation: ReaderFocusActivation::Inline,
+            footnotes: Vec::new(),
+        });
+        let inside_second = SourceAnchor {
+            spine: spine.clone(),
+            node: "p2".into(),
+            text_offset: 4,
+        };
+        let exclusive_end = SourceAnchor {
+            spine,
+            node: "p2".into(),
+            text_offset: 5,
+        };
+
+        assert_eq!(
+            resolve_focus_unit_index(&units, Some(&inside_second), None, position),
+            1
+        );
+        assert!(!units[1].contains_anchor(&exclusive_end));
+        assert_eq!(
+            focus_move(0, units.len(), PageDirection::Next),
+            ReaderFocusMove::Select(1)
+        );
+        assert_eq!(
+            focus_move(1, units.len(), PageDirection::Next),
+            ReaderFocusMove::Boundary
+        );
+
+        let mut state = ReaderFocusState::new(Some(inside_second));
+        state.resolve(&units, None, position);
+        assert_eq!(state.active_index(), 1);
+        state.show_actions();
+        assert_eq!(
+            state.apply(&units, ReaderFocusCommand::Move(PageDirection::Previous)),
+            ReaderFocusTransition::Selected(0)
+        );
+        assert!(state.actions_visible());
+        state.show_footnotes();
+        state.add_footnote_scroll_delta(32.0);
+        assert_eq!(
+            state.apply(&units, ReaderFocusCommand::Move(PageDirection::Next)),
+            ReaderFocusTransition::Selected(1)
+        );
+        assert!(!state.footnotes_visible());
+        assert!(state.take_footnote_scroll_delta().abs() < f32::EPSILON);
+        assert_eq!(
+            state.apply(&units, ReaderFocusCommand::Move(PageDirection::Next)),
+            ReaderFocusTransition::Boundary(PageDirection::Next)
+        );
+    }
+
+    struct FocusCandidateFixture {
+        section: Section,
+        reading_ranges: Vec<SourceRange>,
+        heading: SourceRange,
+        root: SourceRange,
+        child: SourceRange,
+        paragraph: SourceRange,
+    }
+
+    fn focus_candidate_fixture() -> FocusCandidateFixture {
+        let spine = SpineItemId::new("section-0").unwrap();
+        let range = |node: &str, end| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: end,
+            },
+        };
+        let text_block = |kind, text: &str, source: SourceRange| {
+            Block::Text(TextBlock {
+                kind,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: Some(source),
+            })
+        };
+        let heading = range("heading", 7);
+        let root = range("root", 4);
+        let child = range("child", 5);
+        let definition = range("note", 9);
+        let paragraph = range("paragraph", 10);
+        let backlink = PublicationUrl::parse("chapter.xhtml#reference").unwrap();
+        let section = Section {
+            id: spine,
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![
+                text_block(TextBlockKind::Heading(1), "Heading", heading.clone()),
+                text_block(
+                    TextBlockKind::ListItem {
+                        ordered: false,
+                        ordinal: 1,
+                        depth: 0,
+                        marker_visible: true,
+                    },
+                    "Root",
+                    root.clone(),
+                ),
+                text_block(
+                    TextBlockKind::ListItem {
+                        ordered: false,
+                        ordinal: 1,
+                        depth: 1,
+                        marker_visible: true,
+                    },
+                    "Child",
+                    child.clone(),
+                ),
+                Block::Text(TextBlock {
+                    kind: TextBlockKind::Paragraph,
+                    content: vec![Inline::Text(TextRun {
+                        text: "1. Note".into(),
+                        style: TextStyle {
+                            link_role: LinkRole::FootnoteBacklink,
+                            ..TextStyle::default()
+                        },
+                        link: Some(backlink),
+                    })],
+                    style: BlockStyle::default(),
+                    source: Some(definition.clone()),
+                }),
+                text_block(TextBlockKind::Paragraph, "Structured", paragraph.clone()),
+            ],
+            anchors: Vec::new(),
+        };
+        let reading_ranges = vec![
+            heading.clone(),
+            root.clone(),
+            child.clone(),
+            definition,
+            paragraph.clone(),
+        ];
+        FocusCandidateFixture {
+            section,
+            reading_ranges,
+            heading,
+            root,
+            child,
+            paragraph,
+        }
+    }
+
+    #[test]
+    fn focus_candidates_compile_reading_ir_before_geometry() {
+        let FocusCandidateFixture {
+            section,
+            reading_ranges,
+            heading,
+            root,
+            child,
+            paragraph,
+        } = focus_candidate_fixture();
+
+        let candidates = compile_focus_candidates(&section, &reading_ranges, |range| {
+            range.start.node == "paragraph"
+        });
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].block_indices, [1, 2]);
+        assert_eq!(candidates[0].text, "Root\nChild");
+        assert_eq!(
+            candidates[0].geometry_ranges,
+            [heading, root.clone(), child.clone()]
+        );
+        assert_eq!(candidates[0].range.start, root.start);
+        assert_eq!(candidates[0].range.end, child.end);
+        assert_eq!(candidates[0].activation, ReaderFocusActivation::Inline);
+        assert_eq!(candidates[1].activation, ReaderFocusActivation::Structured);
+        assert_eq!(
+            focus_candidate_index_for_anchor(
+                &section,
+                &candidates,
+                Some(&SourceAnchor {
+                    spine: section.id.clone(),
+                    node: "heading".into(),
+                    text_offset: 0,
+                })
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            focus_candidate_index_for_anchor(&section, &candidates, Some(&paragraph.start)),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4267,11 +7095,14 @@ mod tests {
             },
         };
         let hit_for = |reader: &mut ReaderSession, range: SourceRange| {
-            let rect = reader.current_page().source_rects(&[range])[0];
+            let rect = reader
+                .current_layout_frame()
+                .interaction()
+                .source_rects(&[range])[0];
             reader
                 .hit_test_current_spread(
-                    logical_coordinate(rect.center().x),
-                    logical_coordinate(rect.center().y),
+                    logical_coordinate(rect.center().0),
+                    logical_coordinate(rect.center().1),
                     true,
                 )
                 .unwrap()
@@ -4294,6 +7125,83 @@ mod tests {
     }
 
     #[test]
+    fn reader_text_cursors_move_and_restore_from_durable_ranges() {
+        let text = "Alpha beta gamma.";
+        let source = CountingSource::new(&[text.into()]);
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        let beta_range = SourceRange {
+            start: SourceAnchor {
+                spine: SpineItemId::new("section-0").unwrap(),
+                node: "paragraph-0".into(),
+                text_offset: 6,
+            },
+            end: SourceAnchor {
+                spine: SpineItemId::new("section-0").unwrap(),
+                node: "paragraph-0".into(),
+                text_offset: 10,
+            },
+        };
+        let rect = reader
+            .current_layout_frame()
+            .interaction()
+            .source_rects(std::slice::from_ref(&beta_range))[0];
+        let hit = reader
+            .hit_test_current_spread(
+                logical_coordinate(rect.center().0),
+                logical_coordinate(rect.center().1),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        let selected = reader
+            .selection_between_with_granularity(&hit, &hit, SelectionGranularity::Word)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.text, "beta");
+
+        let (anchor, focus) = reader
+            .cursors_for_current_spread_source_ranges(&selected.ranges)
+            .unwrap()
+            .unwrap();
+        assert_eq!(anchor.position(), focus.position());
+        assert_eq!(
+            reader
+                .selection_between_cursors(anchor, focus)
+                .unwrap()
+                .unwrap()
+                .text,
+            "beta"
+        );
+        let previous = reader
+            .move_text_cursor_current_spread(focus, TextCursorDirection::Previous)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reader
+                .selection_between_cursors(anchor, previous)
+                .unwrap()
+                .unwrap()
+                .text,
+            "bet"
+        );
+
+        reader.resize(viewport(500, 400)).unwrap();
+        let (restored_anchor, restored_focus) = reader
+            .cursors_for_current_spread_source_ranges(&selected.ranges)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reader
+                .selection_between_cursors(restored_anchor, restored_focus)
+                .unwrap()
+                .unwrap()
+                .text,
+            "beta"
+        );
+    }
+
+    #[test]
     fn semantic_selection_on_the_right_page_keeps_its_spread_offset() {
         let source = CountingSource::new(&["word ".repeat(FRAGMENT_TEXT_BUDGET)]);
         let mut reader = ReaderSession::open(
@@ -4305,19 +7213,20 @@ mod tests {
             },
         )
         .unwrap();
-        let spread = reader.current_spread().unwrap();
+        let spread = reader.current_frame_spread().unwrap();
         let secondary = spread.secondary.unwrap();
         let offset_x = spread.secondary_offset_x;
-        let leading = secondary.leading_source_range().unwrap();
+        let leading = secondary.interaction().leading_source_range().unwrap();
         let target = secondary
+            .interaction()
             .source_rects(std::slice::from_ref(&leading))
             .into_iter()
             .next()
             .unwrap();
         let hit = reader
             .hit_test_current_spread(
-                logical_coordinate(target.center().x) + offset_x,
-                logical_coordinate(target.center().y),
+                logical_coordinate(target.center().0) + offset_x,
+                logical_coordinate(target.center().1),
                 true,
             )
             .unwrap()
@@ -4339,7 +7248,7 @@ mod tests {
         let drag_anchor = reader
             .hit_test_current_spread(
                 logical_coordinate(target.x0) + offset_x + 1.0,
-                logical_coordinate(target.center().y),
+                logical_coordinate(target.center().1),
                 false,
             )
             .unwrap()
@@ -4347,7 +7256,7 @@ mod tests {
         let drag_focus = reader
             .hit_test_current_spread(
                 logical_coordinate(target.x1) + offset_x - 1.0,
-                logical_coordinate(target.center().y),
+                logical_coordinate(target.center().1),
                 false,
             )
             .unwrap()
@@ -4383,12 +7292,13 @@ mod tests {
             },
         };
         let rect = reader
-            .current_page()
+            .current_layout_frame()
+            .interaction()
             .source_rects(std::slice::from_ref(&first_character))[0];
         let hit = reader
             .hit_test_current_spread(
-                logical_coordinate(rect.center().x),
-                logical_coordinate(rect.center().y),
+                logical_coordinate(rect.center().0),
+                logical_coordinate(rect.center().1),
                 true,
             )
             .unwrap()
@@ -4491,7 +7401,12 @@ mod tests {
 
         reader.go_to_source(&anchor).unwrap();
         assert!(reader.location().page_index > 0);
-        assert!(reader.current_page().contains_source_anchor(&anchor));
+        assert!(
+            reader
+                .current_layout_frame()
+                .interaction()
+                .contains_source_anchor(&anchor)
+        );
     }
 
     #[test]
@@ -4516,7 +7431,8 @@ mod tests {
 
         assert!(
             restored
-                .current_page()
+                .current_layout_frame()
+                .interaction()
                 .contains_source_anchor(&source_anchor)
         );
         assert_eq!(
@@ -4546,6 +7462,36 @@ mod tests {
             viewport(600, 400),
             ReaderStyle::default(),
             Arc::default(),
+            &locator,
+        )
+        .unwrap();
+
+        assert_eq!(reader.location().section_index, 1);
+        assert_eq!(source.parse_count(0), 0);
+        assert_eq!(source.parse_count(1), 1);
+    }
+
+    #[test]
+    fn application_text_engine_opens_directly_at_a_locator() {
+        let source =
+            CountingSource::new(&["first section".repeat(200), "resumed section".repeat(200)]);
+        let locator = LocatorV1 {
+            version: LocatorV1::VERSION,
+            publication_id: source.book.id.clone(),
+            href: source.book.sections[1].href.clone(),
+            progression: Some(0.0),
+            total_progression: Some(0.5),
+            position: None,
+            source: None,
+            partial_cfi: None,
+            text: None,
+        };
+
+        let reader = ReaderSession::open_with_text_engine_at_locator(
+            source.clone(),
+            viewport(600, 400),
+            ReaderStyle::default(),
+            LegacyParleyTextEngine::default(),
             &locator,
         )
         .unwrap();
@@ -4755,7 +7701,7 @@ mod tests {
             .expect("another logical page should follow");
         assert_eq!(next.section_index, 0);
         assert_eq!(next.segment_index, 0);
-        let spread = reader.current_spread().unwrap();
+        let spread = reader.current_frame_spread().unwrap();
         assert!(spread.secondary.is_some());
     }
 
@@ -4801,21 +7747,22 @@ mod tests {
         )
         .unwrap();
 
-        let spread = reader.current_spread().unwrap();
+        let spread = reader.current_frame_spread().unwrap();
         let secondary = spread.secondary.as_ref().unwrap();
         let secondary_offset_x = spread.secondary_offset_x;
-        assert!(spread.primary.command_count() > 0);
+        assert!(!spread.primary.items.is_empty());
         assert!(
             spread
                 .secondary
                 .as_ref()
-                .is_some_and(|page| page.command_count() > 0)
+                .is_some_and(|page| !page.items.is_empty())
         );
         assert_eq!(source.parse_count(1), 1);
         assert_eq!(reader.current_spread_section_indices().unwrap(), [0, 1]);
 
-        let leading = secondary.leading_source_range().unwrap();
+        let leading = secondary.interaction().leading_source_range().unwrap();
         let target = secondary
+            .interaction()
             .source_rects(std::slice::from_ref(&leading))
             .into_iter()
             .next()
@@ -4823,7 +7770,7 @@ mod tests {
         let hit = reader
             .hit_test_current_spread(
                 logical_coordinate(target.x0) + secondary_offset_x + 1.0,
-                logical_coordinate(target.center().y),
+                logical_coordinate(target.center().1),
                 true,
             )
             .unwrap()
@@ -5386,12 +8333,22 @@ mod tests {
         for _ in 0..reader.location().page_count / 2 {
             reader.turn_page(PageDirection::Next).unwrap();
         }
-        let anchor = reader.current_page().leading_source_range().unwrap().start;
+        let anchor = reader
+            .current_layout_frame()
+            .interaction()
+            .leading_source_range()
+            .unwrap()
+            .start;
 
         source.set_derived(true);
         reader.refresh_source().unwrap();
 
-        assert!(reader.current_page().contains_source_anchor(&anchor));
+        assert!(
+            reader
+                .current_layout_frame()
+                .interaction()
+                .contains_source_anchor(&anchor)
+        );
     }
 
     #[test]
@@ -5673,12 +8630,12 @@ mod tests {
             reader.reading_unit_location(),
             ReadingUnitLocation { index: 0, count: 4 }
         );
-        assert_eq!(reader.current_reading_unit_pages().unwrap().len(), 1);
+        assert_eq!(reader.current_reading_unit_frames().unwrap().len(), 1);
 
         reader
             .go_to_adjacent_reading_unit(PageDirection::Next)
             .unwrap();
-        let pages = reader.current_reading_unit_pages().unwrap();
+        let pages = reader.current_reading_unit_frames().unwrap();
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].position.section_index, 1);
         assert_eq!(pages[1].position.section_index, 2);
@@ -5703,7 +8660,7 @@ mod tests {
         )
         .unwrap();
 
-        let pages = reader.current_reading_unit_pages().unwrap();
+        let pages = reader.current_reading_unit_frames().unwrap();
         assert_eq!(pages.len(), 3);
         assert!(!pages[0].placeholder);
         assert!(pages[1].placeholder);
@@ -5722,7 +8679,7 @@ mod tests {
             std::thread::yield_now();
         }
 
-        let pages = reader.current_reading_unit_pages().unwrap();
+        let pages = reader.current_reading_unit_frames().unwrap();
         assert!(!pages[1].placeholder);
         assert!(pages[2].placeholder);
         assert_eq!(source.parse_counts[1].load(Ordering::Relaxed), 1);
@@ -5893,8 +8850,12 @@ mod tests {
         let source = CountingSource::new(&["第一章".into(), "第二章".into()]);
         let mut reader =
             ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
-        let stale_generation = reader.prefetch_worker.generation();
-        let current_generation = reader.prefetch_worker.invalidate();
+        let worker = reader
+            .prefetch_worker
+            .as_ref()
+            .expect("default reader session enables background prefetch");
+        let stale_generation = worker.generation();
+        let current_generation = worker.invalidate();
         let segment = SegmentKey {
             section_index: 1,
             segment_index: 0,
@@ -5911,6 +8872,8 @@ mod tests {
             generation: stale_generation,
             segment: Ok(Arc::new(CachedSegment {
                 section,
+                frames: Vec::new(),
+                #[cfg(feature = "legacy-renderer")]
                 pages: Vec::new(),
                 anchor_pages: HashMap::new(),
                 visible_pages: 1,

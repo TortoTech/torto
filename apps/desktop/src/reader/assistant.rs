@@ -1,8 +1,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
+use rebook_assistant::{AssistantAnnotationAction, confirm_annotation_actions};
 use rebook_publication::{Block, BookSource, Inline, RenditionLayout, SourceRange};
 use rebook_reader::ReaderVisibleTextFragment;
+use rebook_session::{
+    PDF_PAGE_ANCHOR_PREFIX, PdfDocumentMetadataCommand, PdfOcrViewLocation, PdfOcrViewMode,
+    StoredHighlightMutationTarget,
+};
 
 use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, build_chat_prompt_with_references,
@@ -14,22 +20,24 @@ use super::{
     PdfTocTask, PdfTocTaskMessage, SearchTask, SearchTaskMessage, SidebarTab, SnapshotEffects,
     TocTranslationTask, TocTranslationTaskMessage, TranslationTask, TranslationTaskMessage,
 };
+#[cfg(test)]
+use crate::highlights::{HighlightStore, StoredHighlight};
 use crate::platform::UserEvent;
 use crate::plugins::{
-    BookSearchResult, ChatAnnotationAction, ChatCommand, ChatCommandResolution, ChatReadingContext,
-    ChatRequestKind, ChatResponse, ChatRole, ChatSelection, ChatTurn, PDF_PAGE_ANCHOR_PREFIX,
-    PdfOcrViewMode, TranslationBlockInput, chat_citation_link, chat_with_book,
-    extract_pdf_metadata, recognize_pdf, resolve_chat_command, search_book, section_title,
-    set_pdf_ocr_view_mode, translate_blocks, translate_blocks_incremental,
+    BookSearchResult, ChatCommand, ChatCommandResolution, ChatReadingContext, ChatRequestKind,
+    ChatResponse, ChatRole, ChatSelection, ChatTurn, TranslationBlockInput, chat_citation_link,
+    chat_with_book, extract_pdf_metadata, recognize_pdf, resolve_chat_command, search_book,
+    section_title, translate_blocks, translate_blocks_incremental,
 };
 
 impl DesktopReader {
     pub(super) fn attach_current_focus_reference(&mut self) {
         self.sync_focus_chat_session();
-        let Some(unit) = self.focus_units.get(self.focus_unit_index).cloned() else {
+        let focus_unit_index = self.focus_state.active_index();
+        let Some(unit) = self.focus_units.get(focus_unit_index).cloned() else {
             return;
         };
-        let section_index = unit.position.section_index;
+        let section_index = unit.geometry.position.section_index;
         let node = unit.range.start.node.clone();
         let id = format!("focus:{section_index}:{node}");
         self.chat
@@ -46,7 +54,7 @@ impl DesktopReader {
             );
         let reference = paragraph_reference(
             section_index,
-            self.focus_unit_index + 1,
+            focus_unit_index + 1,
             &title,
             &node,
             0,
@@ -259,7 +267,7 @@ impl DesktopReader {
         self.pdf_toc.progress = "正在准备页面…".into();
         self.pdf_toc.task.begin(PdfTocTask {
             source: self.pdf_ocr_controller.as_ref().map_or_else(
-                || Arc::clone(&self.source),
+                || Arc::clone(self.document_sources.presented_source()),
                 |controller| controller.original_source(),
             ),
             book_id: self.book_id.clone(),
@@ -271,7 +279,8 @@ impl DesktopReader {
     }
 
     pub(super) fn start_pdf_metadata_extraction(&mut self) {
-        let need_toc = super::needs_generated_toc(self.source.as_ref());
+        let need_toc =
+            super::needs_generated_toc(self.document_sources.presented_source().as_ref());
         if self.pdf_toc.task.is_pending()
             || self.format != rebook_formats::BookFormat::Pdf
             || !self.plugin_settings.ocr_enabled
@@ -286,7 +295,7 @@ impl DesktopReader {
             .into();
         self.pdf_toc.task.begin(PdfTocTask {
             source: self.pdf_ocr_controller.as_ref().map_or_else(
-                || Arc::clone(&self.source),
+                || Arc::clone(self.document_sources.presented_source()),
                 |controller| controller.original_source(),
             ),
             book_id: self.book_id.clone(),
@@ -308,21 +317,27 @@ impl DesktopReader {
         self.pdf_ocr.task.begin(PdfOcrTask {
             path: self.source_path.clone(),
             book_id: self.book_id.clone(),
-            page_count: self.source.book().sections.len(),
+            page_count: self
+                .document_sources
+                .presented_source()
+                .book()
+                .sections
+                .len(),
             settings: self.plugin_settings.clone(),
         });
         if !self.pdf_toc.task.is_pending()
             && self.plugin_settings.ocr_enabled
             && self.plugin_settings.ocr_endpoint().is_ok()
         {
-            let need_toc = super::needs_generated_toc(self.source.as_ref());
+            let need_toc =
+                super::needs_generated_toc(self.document_sources.presented_source().as_ref());
             self.pdf_toc.progress = self
                 .language
                 .text("正在准备 PDF 信息识别…", "Preparing PDF recognition…")
                 .into();
             self.pdf_toc.task.begin(PdfTocTask {
                 source: self.pdf_ocr_controller.as_ref().map_or_else(
-                    || Arc::clone(&self.source),
+                    || Arc::clone(self.document_sources.presented_source()),
                     |controller| controller.original_source(),
                 ),
                 book_id: self.book_id.clone(),
@@ -381,29 +396,28 @@ impl DesktopReader {
         let Some(controller) = self.pdf_ocr_controller.clone() else {
             return false;
         };
-        let previous_mode = self.pdf_ocr.mode;
-        let mode = match self.pdf_ocr.mode {
-            PdfOcrViewMode::Original => PdfOcrViewMode::Reflow,
-            PdfOcrViewMode::Reflow => PdfOcrViewMode::Original,
-        };
-        let navigation_target = match self.pdf_ocr.mode {
+        let location = match controller.mode() {
             PdfOcrViewMode::Original => {
-                controller.reflow_target_for_page(self.reader.location().section_index)
+                PdfOcrViewLocation::OriginalPage(self.reader.location().section_index)
             }
-            PdfOcrViewMode::Reflow => self
-                .reader
-                .current_preceding_anchor(PDF_PAGE_ANCHOR_PREFIX)
-                .and_then(|fragment| controller.original_target_for_reflow_anchor(&fragment)),
+            PdfOcrViewMode::Reflow => PdfOcrViewLocation::ReflowAnchor(
+                self.reader.current_preceding_anchor(PDF_PAGE_ANCHOR_PREFIX),
+            ),
         };
-        match set_pdf_ocr_view_mode(&self.book_id, mode) {
+        let transition = controller.plan_toggle(location);
+        let previous_mode = transition.previous_mode;
+        let mode = transition.next_mode;
+        let navigation_target = transition.navigation_target;
+        match crate::pdf_ocr_session::apply_view_mode(&controller, &self.book_id, mode) {
             Ok(()) => {
                 self.persist_progress();
-                controller.set_mode(mode);
                 let fixed_page = mode == PdfOcrViewMode::Original;
-                self.translation_source
+                self.document_sources
+                    .translation_source()
                     .set_fixed_page_replacement_only(fixed_page);
                 let _ = self
-                    .translation_source
+                    .document_sources
+                    .translation_source()
                     .set_mode(self.plugin_settings.translation_mode);
                 let mut style = self.reader.style().clone();
                 style.column_gap = if fixed_page {
@@ -432,14 +446,19 @@ impl DesktopReader {
                         true
                     }
                     Err(error) => {
-                        controller.set_mode(previous_mode);
                         let previous_fixed_page = previous_mode == PdfOcrViewMode::Original;
-                        self.translation_source
+                        self.document_sources
+                            .translation_source()
                             .set_fixed_page_replacement_only(previous_fixed_page);
                         let _ = self
-                            .translation_source
+                            .document_sources
+                            .translation_source()
                             .set_mode(self.plugin_settings.translation_mode);
-                        let _ = set_pdf_ocr_view_mode(&self.book_id, previous_mode);
+                        let _ = crate::pdf_ocr_session::rollback_view_mode(
+                            &controller,
+                            &self.book_id,
+                            previous_mode,
+                        );
                         self.error_timer.show(
                             &mut self.error,
                             format!(
@@ -505,7 +524,8 @@ impl DesktopReader {
     }
 
     fn pdf_metadata_work_was_omitted(&self, request: &super::PdfTocTask) -> bool {
-        (!request.need_toc && super::needs_generated_toc(self.source.as_ref()))
+        (!request.need_toc
+            && super::needs_generated_toc(self.document_sources.presented_source().as_ref()))
             || (self.pdf_metadata_missing.title && !request.missing.title)
             || (self.pdf_metadata_missing.authors && !request.missing.authors)
     }
@@ -519,8 +539,10 @@ impl DesktopReader {
         let mut update = None;
         let mut page_roles_updated = false;
         if request.need_page_roles
-            && let Err(error) =
-                crate::plugins::save_pdf_ocr_page_roles(&request.book_id, &extraction.page_roles)
+            && let Err(error) = crate::document_metadata::apply(
+                &request.book_id,
+                PdfDocumentMetadataCommand::ReplaceOcrPageRoles(extraction.page_roles.clone()),
+            )
         {
             failures.push(format!("保存 PDF 特殊页面识别结果失败：{error}"));
         } else if request.need_page_roles {
@@ -651,7 +673,11 @@ impl DesktopReader {
         }
         cached.provider_name.clone_from(&metadata.provider_name);
         cached.model.clone_from(&metadata.model);
-        crate::generated_metadata::save(book_id, &cached).map_err(|error| {
+        crate::document_metadata::apply(
+            book_id,
+            PdfDocumentMetadataCommand::ReplaceBibliographic(cached),
+        )
+        .map_err(|error| {
             format!(
                 "{}：{error}",
                 self.language
@@ -695,7 +721,7 @@ impl DesktopReader {
         self.search.results.clear();
         self.focused_mark = None;
         self.search.task.begin(SearchTask {
-            source: Arc::clone(&self.source),
+            source: Arc::clone(self.document_sources.presented_source()),
             query,
         });
         self.bump_scene_revision();
@@ -739,7 +765,7 @@ impl DesktopReader {
                 self.focused_mark = Some(FocusedMark::search(result.range.clone()));
                 self.apply_snapshot(navigation.snapshot, SnapshotEffects::navigation());
                 if self.is_focus_mode() {
-                    self.focus_anchor = focus_anchor;
+                    self.focus_state.reset(focus_anchor);
                     self.focus_units.clear();
                     self.focus_target_offset = None;
                     self.ui.focus_scroll_motion = None;
@@ -777,7 +803,7 @@ impl DesktopReader {
     }
 
     fn current_focus_chat_key(&self) -> Option<String> {
-        self.focus_chat_key_at(self.focus_unit_index)
+        self.focus_chat_key_at(self.focus_state.active_index())
     }
 
     pub(super) fn sync_focus_chat_session(&mut self) {
@@ -856,8 +882,7 @@ impl DesktopReader {
     }
 
     pub(super) fn open_assistant_panel(&mut self, panel: AssistantPanel) {
-        self.ui.focus_footnotes_visible = false;
-        self.ui.focus_footnote_scroll_delta = 0.0;
+        self.focus_state.hide_footnotes();
         if self.is_focus_mode() {
             self.sync_focus_chat_session();
         }
@@ -1011,7 +1036,8 @@ impl DesktopReader {
         }
         let section_index = location.0;
         let english = self.language.resolved() == crate::preferences::AppLanguage::English;
-        let book_title = self.source.book().metadata.title.trim().to_owned();
+        let source = Arc::clone(self.document_sources.presented_source());
+        let book_title = source.book().metadata.title.trim().to_owned();
         let mut options = vec![ChatReference {
             id: "book:full-text".into(),
             kind: ChatReferenceKind::Book,
@@ -1026,8 +1052,8 @@ impl DesktopReader {
         }];
 
         let mut section_titles = Vec::new();
-        if let Ok(section) = self.source.parse_section(section_index) {
-            let title = section_title(self.source.as_ref(), section_index, &section.blocks);
+        if let Ok(section) = source.parse_section(section_index) {
+            let title = section_title(source.as_ref(), section_index, &section.blocks);
             section_titles.push((section_index, title.clone()));
             options.push(ChatReference {
                 id: format!("section:{section_index}"),
@@ -1055,7 +1081,7 @@ impl DesktopReader {
                 .iter()
                 .position(|(candidate, _)| *candidate == section_index);
             let title_index = title_index.unwrap_or_else(|| {
-                let title = self.source.parse_section(section_index).map_or_else(
+                let title = source.parse_section(section_index).map_or_else(
                     |_| {
                         format!(
                             "{} {}",
@@ -1063,7 +1089,7 @@ impl DesktopReader {
                             section_index + 1
                         )
                     },
-                    |section| section_title(self.source.as_ref(), section_index, &section.blocks),
+                    |section| section_title(source.as_ref(), section_index, &section.blocks),
                 );
                 section_titles.push((section_index, title));
                 section_titles.len() - 1
@@ -1101,7 +1127,7 @@ impl DesktopReader {
             crate::preferences::AppLanguage::System => unreachable!(),
         };
         let references = selection_reference(
-            self.source.as_ref(),
+            self.document_sources.presented_source().as_ref(),
             &selection.ranges,
             selected_text,
             english,
@@ -1153,7 +1179,11 @@ impl DesktopReader {
             .iter()
             .filter_map(|citation| {
                 citation.node.as_deref().and_then(|node| {
-                    source_range_for_node(self.source.as_ref(), citation.section_index, node)
+                    source_range_for_node(
+                        self.document_sources.presented_source().as_ref(),
+                        citation.section_index,
+                        node,
+                    )
                 })
             })
             .collect::<Vec<_>>();
@@ -1176,7 +1206,7 @@ impl DesktopReader {
                     },
                 );
                 if self.is_focus_mode() {
-                    self.focus_anchor = focus_anchor;
+                    self.focus_state.reset(focus_anchor);
                     self.focus_units.clear();
                     self.focus_target_offset = None;
                     self.ui.focus_scroll_motion = None;
@@ -1227,10 +1257,10 @@ impl DesktopReader {
         let current = self.chat_reading_context();
         let id = self.chat.task.begin(ChatTask {
             session_id: self.chat.session_id,
-            source: Arc::clone(&self.source),
+            source: Arc::clone(self.document_sources.presented_source()),
             format: self.format,
             kind,
-            rewrite_source: Arc::clone(&self.rewrite_source),
+            rewrite_source: Arc::clone(self.document_sources.rewrite_source()),
             book_id: self.book_id.clone(),
             selection: self.selection.as_ref().map(|selection| ChatSelection {
                 text: selection.text.clone(),
@@ -1269,7 +1299,7 @@ impl DesktopReader {
         let toc_href = active_toc
             .and_then(|item| item.target.as_ref())
             .map(ToString::to_string);
-        let book = self.source.book();
+        let book = self.document_sources.presented_source().book();
         let fixed_page = book.metadata.layout == RenditionLayout::PrePaginated;
         let spine = book.sections.get(location.section_index);
         let current_title = if fixed_page {
@@ -1277,7 +1307,11 @@ impl DesktopReader {
                 .clone()
                 .unwrap_or_else(|| format!("第 {} 页", location.section_index + 1))
         } else {
-            section_title(self.source.as_ref(), location.section_index, &[])
+            section_title(
+                self.document_sources.presented_source().as_ref(),
+                location.section_index,
+                &[],
+            )
         };
         let to_f64 = |value: usize| f64::from(u32::try_from(value).unwrap_or(u32::MAX));
         let page_fraction = if location.page_count <= 1 {
@@ -1361,7 +1395,10 @@ impl DesktopReader {
                                 .into_iter()
                                 .rev()
                                 .find_map(|transaction| {
-                                    self.rewrite_source.rollback(transaction).err()
+                                    self.document_sources
+                                        .rewrite_source()
+                                        .rollback(transaction)
+                                        .err()
                                 });
                             let language = self.language;
                             let message = match (language.resolved(), rollback_error) {
@@ -1401,7 +1438,8 @@ impl DesktopReader {
                         display_content: None,
                     });
                     if !response.annotation_actions.is_empty() {
-                        chat.pending_annotation_actions = response.annotation_actions;
+                        chat.pending_annotation_actions
+                            .replace(response.annotation_actions);
                     }
                     chat.error = None;
                 }
@@ -1444,35 +1482,21 @@ impl DesktopReader {
     pub(super) fn clear_chat(&mut self) {
         if !self.chat.task.is_pending() {
             self.chat.messages.clear();
-            self.chat.pending_annotation_actions.clear();
+            self.chat.pending_annotation_actions.cancel();
             self.chat.error = None;
         }
     }
 
     pub(super) fn confirm_chat_annotation_actions(&mut self) {
-        let actions = std::mem::take(&mut self.chat.pending_annotation_actions);
-        let mut error = None;
-        for action in actions {
-            let result = match action {
-                ChatAnnotationAction::Create(annotation) => {
-                    self.highlight_store.insert(&annotation).map(|()| true)
-                }
-                ChatAnnotationAction::Update(annotation) => {
-                    self.highlight_store.update(&annotation)
-                }
-                ChatAnnotationAction::Delete { annotation_id } => {
-                    self.highlight_store.remove(&annotation_id)
-                }
-            };
-            if let Err(action_error) = result {
-                error = Some(action_error.to_string());
-                break;
-            }
-        }
+        let mut target = StoredHighlightMutationTarget::new(
+            &mut self.highlight_store,
+            self.highlights.iter().cloned(),
+        );
+        let result = self.chat.pending_annotation_actions.confirm(&mut target);
         self.highlights = self.highlight_store.for_book(&self.book_id);
         self.selected_highlight_id = None;
         self.bump_scene_revision();
-        self.chat.error = error.map(|error| {
+        self.chat.error = result.err().map(|error| {
             format!(
                 "{}: {error}",
                 self.language.text(
@@ -1484,7 +1508,7 @@ impl DesktopReader {
     }
 
     pub(super) fn cancel_chat_annotation_actions(&mut self) {
-        self.chat.pending_annotation_actions.clear();
+        self.chat.pending_annotation_actions.cancel();
     }
 
     pub(super) fn toggle_translation(&mut self) {
@@ -1509,12 +1533,15 @@ impl DesktopReader {
             self.error = Some(error);
             return;
         }
-        self.translation_source.set_fixed_page_replacement_only(
-            self.format == rebook_formats::BookFormat::Pdf
-                && self.pdf_ocr.mode == PdfOcrViewMode::Original,
-        );
+        self.document_sources
+            .translation_source()
+            .set_fixed_page_replacement_only(
+                self.format == rebook_formats::BookFormat::Pdf
+                    && self.pdf_ocr.mode == PdfOcrViewMode::Original,
+            );
         if let Err(error) = self
-            .translation_source
+            .document_sources
+            .translation_source()
             .set_mode(self.plugin_settings.translation_mode)
         {
             self.translation.show_error(error, Instant::now());
@@ -1552,7 +1579,8 @@ impl DesktopReader {
         };
         let candidate = visible.into_iter().find_map(|(section_index, ranges)| {
             match self
-                .translation_source
+                .document_sources
+                .translation_source()
                 .untranslated_blocks_for_ranges(section_index, &ranges)
             {
                 Ok(blocks) if blocks.is_empty() => None,
@@ -1626,7 +1654,8 @@ impl DesktopReader {
                     return;
                 };
                 if let Err(error) = self
-                    .translation_source
+                    .document_sources
+                    .translation_source()
                     .store_batch(section_index, &translations)
                 {
                     self.translation.show_error(error, Instant::now());
@@ -1658,19 +1687,19 @@ impl DesktopReader {
     }
 
     pub(super) fn toggle_current_focus_structure(&mut self) {
-        let Some(unit) = self.focus_units.get(self.focus_unit_index) else {
+        let Some(unit) = self.focus_units.get(self.focus_state.active_index()) else {
             return;
         };
-        if unit.is_image || unit.is_table {
+        if unit.is_image() || unit.is_table() {
             return;
         }
         let key = crate::plugins::ParagraphStructureKey {
-            section_index: unit.position.section_index,
+            section_index: unit.geometry.position.section_index,
             node: unit.range.start.node.clone(),
         };
-        let active = self.structure_source.is_active(&key);
+        let active = self.document_sources.structure_source().is_active(&key);
         if !active {
-            match self.structure_source.can_structure(&key) {
+            match self.document_sources.structure_source().can_structure(&key) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.show_error(
@@ -1689,7 +1718,11 @@ impl DesktopReader {
                 }
             }
         }
-        if let Err(error) = self.structure_source.set_active(key.clone(), !active) {
+        if let Err(error) = self
+            .document_sources
+            .structure_source()
+            .set_active(key.clone(), !active)
+        {
             self.show_error(error);
             return;
         }
@@ -1785,7 +1818,11 @@ impl DesktopReader {
         if self.translation.render_enabled == enabled {
             return true;
         }
-        if let Err(error) = self.translation_source.set_enabled(enabled) {
+        if let Err(error) = self
+            .document_sources
+            .translation_source()
+            .set_enabled(enabled)
+        {
             self.translation.show_error(error, Instant::now());
             return false;
         }
@@ -2026,8 +2063,55 @@ fn translated_toc_labels(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use rebook_publication::{SourceAnchor, SpineItemId};
+    use rebook_sync::{HighlightRepository, HighlightResult};
+
     use super::*;
     use crate::plugins::BlockTranslation;
+
+    #[derive(Clone, Default)]
+    struct MemoryHighlightRepository {
+        annotations: Arc<Mutex<Vec<StoredHighlight>>>,
+    }
+
+    impl HighlightRepository for MemoryHighlightRepository {
+        fn highlights_for_book(&self, book_id: &str) -> HighlightResult<Vec<StoredHighlight>> {
+            Ok(self
+                .annotations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|annotation| annotation.book_id == book_id)
+                .cloned()
+                .collect())
+        }
+
+        fn insert_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<()> {
+            self.annotations.lock().unwrap().push(highlight.clone());
+            Ok(())
+        }
+
+        fn update_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<bool> {
+            let mut annotations = self.annotations.lock().unwrap();
+            let Some(existing) = annotations
+                .iter_mut()
+                .find(|existing| existing.id == highlight.id)
+            else {
+                return Ok(false);
+            };
+            *existing = highlight.clone();
+            Ok(true)
+        }
+
+        fn remove_highlight(&self, id: &str) -> HighlightResult<bool> {
+            let mut annotations = self.annotations.lock().unwrap();
+            let previous_len = annotations.len();
+            annotations.retain(|annotation| annotation.id != id);
+            Ok(annotations.len() != previous_len)
+        }
+    }
 
     #[test]
     fn toc_translations_are_mapped_by_their_stable_row_ids() {
@@ -2050,5 +2134,67 @@ mod tests {
 
         assert_eq!(labels.len(), 1);
         assert_eq!(labels.get("chapter-1").map(String::as_str), Some("第一章"));
+    }
+
+    #[test]
+    fn highlight_adapter_rolls_back_an_earlier_create_when_a_later_update_is_invalid() {
+        let repository = MemoryHighlightRepository::default();
+        let mut store = HighlightStore::from_repository(repository.clone());
+        let created = StoredHighlight::with_note(
+            "book".into(),
+            Vec::new(),
+            "created".into(),
+            Some("note".into()),
+        );
+        let missing = StoredHighlight::with_note(
+            "book".into(),
+            Vec::new(),
+            "missing".into(),
+            Some("updated".into()),
+        );
+        let actions = vec![
+            AssistantAnnotationAction::Create(created),
+            AssistantAnnotationAction::Update(missing),
+        ];
+        let mut target = StoredHighlightMutationTarget::new(&mut store, Vec::new());
+
+        assert!(confirm_annotation_actions(&mut target, &actions).is_err());
+        assert!(repository.annotations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn confirmed_annotation_preserves_its_exact_source_range() {
+        let repository = MemoryHighlightRepository::default();
+        let mut store = HighlightStore::from_repository(repository.clone());
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let range = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "paragraph-4".into(),
+                text_offset: 2,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "paragraph-4".into(),
+                text_offset: 9,
+            },
+        };
+        let annotation = StoredHighlight::with_note(
+            "book".into(),
+            vec![range.clone()],
+            "source text".into(),
+            None,
+        );
+        let actions = vec![AssistantAnnotationAction::Create(annotation)];
+        let mut target = StoredHighlightMutationTarget::new(&mut store, Vec::new());
+
+        assert_eq!(
+            confirm_annotation_actions(&mut target, &actions).unwrap(),
+            rebook_assistant::AssistantMutationResolution::Confirmed { applied: 1 }
+        );
+        assert_eq!(
+            repository.annotations.lock().unwrap()[0].ranges,
+            vec![range]
+        );
     }
 }

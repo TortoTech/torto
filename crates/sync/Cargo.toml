@@ -1,0 +1,22 @@
+[package]
+name = "rebook-sync"
+description = "UI-independent local reading progress and annotation store for Torto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+directories.workspace = true
+rebook-publication = { path = "../publication" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

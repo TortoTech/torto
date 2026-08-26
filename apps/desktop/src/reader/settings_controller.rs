@@ -57,7 +57,7 @@ impl DesktopReader {
         self.ui.sidebar_pinned = true;
         self.set_sidebar_open(true);
         self.close_assistant_panel();
-        self.ui.focus_actions_visible = false;
+        self.focus_state.hide_actions();
         self.focus_toc_override = None;
         self.cancel_text_selection();
     }
@@ -69,7 +69,13 @@ impl DesktopReader {
     pub(crate) fn apply_global_settings(&mut self, settings: &AppliedSettings) {
         let mut plugin_settings = settings.plugin_settings.clone();
         if self.format == BookFormat::Pdf
-            && self.source.book().metadata.layout == RenditionLayout::PrePaginated
+            && self
+                .document_sources
+                .presented_source()
+                .book()
+                .metadata
+                .layout
+                == RenditionLayout::PrePaginated
         {
             plugin_settings.translation_mode = TranslationMode::Replace;
         }
@@ -99,11 +105,12 @@ impl DesktopReader {
             self.plugin_settings.pdf_ocr_reflow_enabled != plugin_settings.pdf_ocr_reflow_enabled;
 
         if let Err(error) = self
-            .translation_source
+            .document_sources
+            .translation_source()
             .set_mode(plugin_settings.translation_mode)
             .and_then(|()| {
                 if translation_backend_changed {
-                    self.translation_source.clear()
+                    self.document_sources.translation_source().clear()
                 } else {
                     Ok(())
                 }
@@ -116,32 +123,21 @@ impl DesktopReader {
             return;
         }
 
-        let reading_mode = if settings.reading_mode == crate::preferences::ReadingMode::Focus
-            && !self.focus_mode_allowed()
-        {
-            crate::preferences::ReadingMode::Classic
-        } else {
-            settings.reading_mode
-        };
+        let fixed_page = self
+            .document_sources
+            .presented_source()
+            .book()
+            .metadata
+            .layout
+            == RenditionLayout::PrePaginated;
+        let resolved_preferences = settings
+            .document_preferences()
+            .resolve(self.focus_mode_allowed(), fixed_page);
+        let reading_mode = resolved_preferences.presentation.mode;
         let mode_changed = self.reading_mode != reading_mode;
         self.reading_mode = reading_mode;
-        let mut style = self.reader.style();
-        style.spread = if self.reading_mode == crate::preferences::ReadingMode::Focus {
-            rebook_layout::SpreadMode::Scroll
-        } else {
-            settings.spread
-        };
-        style.focus_footnote_icons = self.reading_mode == crate::preferences::ReadingMode::Focus;
-        style.minimum_paragraph_gap = if self.reading_mode == crate::preferences::ReadingMode::Focus
-            && settings.typesetting.mode == rebook_layout::TypesettingMode::Book
-        {
-            super::FOCUS_MINIMUM_PARAGRAPH_GAP
-        } else {
-            0.0
-        };
-        style.typography.clone_from(&settings.typography);
-        style.typesetting.clone_from(&settings.typesetting);
-        self.selection_granularity = settings.selection_granularity;
+        let mut style = resolved_preferences.style;
+        self.selection_granularity = resolved_preferences.selection_granularity;
         super::apply_theme_colors(&mut style, crate::ui::theme());
         match self.reader.set_style(style) {
             Ok(snapshot) => {
@@ -149,8 +145,7 @@ impl DesktopReader {
                 self.language = language;
                 self.shortcuts.clone_from(&settings.shortcuts);
                 if mode_changed {
-                    self.ui.focus_footnotes_visible = false;
-                    self.ui.focus_footnote_scroll_delta = 0.0;
+                    self.focus_state.hide_footnotes();
                     if !self.is_focus_mode() {
                         self.restore_book_chat_session();
                     }
@@ -163,7 +158,7 @@ impl DesktopReader {
                         self.reading_mode == crate::preferences::ReadingMode::Classic,
                     );
                     self.close_assistant_panel();
-                    self.ui.focus_actions_visible = false;
+                    self.focus_state.hide_actions();
                     self.focus_toc_override = None;
                     self.cancel_text_selection();
                 }

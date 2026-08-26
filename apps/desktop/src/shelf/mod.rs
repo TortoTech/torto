@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText, TextureHandle, Vec2};
-use peniko::Blob;
+use rebook_layout::ReaderFontBlob;
 
 use crate::async_task::{TaskResult, TaskSlot};
 use crate::library::{LibraryBook, LocalLibrary};
@@ -78,7 +78,7 @@ pub(crate) struct ShelfFeature {
     shelf: ShelfState,
     import_task: TaskSlot<()>,
     pending_reader: Option<DesktopReader>,
-    reader_fonts: Arc<[Blob<u8>]>,
+    reader_fonts: Arc<[ReaderFontBlob]>,
     local_store: Option<SyncStore>,
     sync: SyncUiState,
     language: AppLanguage,
@@ -136,7 +136,7 @@ impl ShelfFeature {
         self.shelf.library.update_metadata(book_id, title, authors)
     }
 
-    pub(crate) fn new(library: LocalLibrary, reader_fonts: Arc<[Blob<u8>]>) -> Self {
+    pub(crate) fn new(library: LocalLibrary, reader_fonts: Arc<[ReaderFontBlob]>) -> Self {
         let (language, language_error) = preferences::load_app_language().map_or_else(
             |error| {
                 (

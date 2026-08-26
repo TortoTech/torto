@@ -1,0 +1,28 @@
+[package]
+name = "rebook-session"
+description = "Toolkit-neutral document source composition for Torto reader sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+atomicwrites.workspace = true
+directories.workspace = true
+rebook-assistant = { path = "../assistant" }
+rebook-html = { path = "../html" }
+rebook-layout = { path = "../layout" }
+rebook-publication = { path = "../publication" }
+rebook-reader = { path = "../reader", default-features = false }
+rebook-sync = { path = "../sync" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

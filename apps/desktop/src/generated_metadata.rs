@@ -3,6 +3,8 @@ use std::io;
 use std::path::PathBuf;
 
 use directories::ProjectDirs;
+pub(crate) use rebook_session::GeneratedPdfMetadata;
+use rebook_session::normalize_generated_pdf_metadata;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -11,14 +13,6 @@ use crate::persistence::{write_bytes_atomic, write_json_atomic};
 const GENERATED_METADATA_VERSION: u8 = 1;
 const GENERATED_METADATA_DIRECTORY: &str = "generated-metadata";
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct GeneratedPdfMetadata {
-    pub(crate) title: String,
-    pub(crate) authors: Vec<String>,
-    pub(crate) provider_name: String,
-    pub(crate) model: String,
-}
-
 #[derive(Serialize, Deserialize)]
 struct StoredGeneratedMetadata {
     version: u8,
@@ -26,7 +20,7 @@ struct StoredGeneratedMetadata {
     metadata: GeneratedPdfMetadata,
 }
 
-pub(crate) fn save(book_id: &str, metadata: &GeneratedPdfMetadata) -> io::Result<()> {
+pub(crate) fn persist_normalized(book_id: &str, metadata: &GeneratedPdfMetadata) -> io::Result<()> {
     let path = generated_metadata_path(book_id)?;
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -40,7 +34,7 @@ pub(crate) fn save(book_id: &str, metadata: &GeneratedPdfMetadata) -> io::Result
         &StoredGeneratedMetadata {
             version: GENERATED_METADATA_VERSION,
             book_id: book_id.to_owned(),
-            metadata: normalize(metadata.clone()),
+            metadata: metadata.clone(),
         },
     )?;
     crate::sync::mark_derived_dirty(book_id, crate::sync::DerivedDataKind::Metadata)
@@ -86,7 +80,7 @@ pub(crate) fn load(book_id: &str) -> io::Result<Option<GeneratedPdfMetadata>> {
     if stored.version != GENERATED_METADATA_VERSION || stored.book_id != book_id {
         return Ok(None);
     }
-    Ok(Some(normalize(stored.metadata)))
+    Ok(Some(normalize_generated_pdf_metadata(stored.metadata)))
 }
 
 fn generated_metadata_path(book_id: &str) -> io::Result<PathBuf> {
@@ -110,27 +104,14 @@ fn generated_metadata_path(book_id: &str) -> io::Result<PathBuf> {
         .join(format!("{safe_id}.json")))
 }
 
-fn normalize(mut metadata: GeneratedPdfMetadata) -> GeneratedPdfMetadata {
-    metadata.title = metadata.title.trim().to_owned();
-    metadata.authors = metadata
-        .authors
-        .into_iter()
-        .map(|author| author.trim().to_owned())
-        .filter(|author| !author.is_empty())
-        .collect();
-    metadata.authors.dedup();
-    metadata.provider_name = metadata.provider_name.trim().to_owned();
-    metadata.model = metadata.model.trim().to_owned();
-    metadata
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{GeneratedPdfMetadata, normalize};
+    use super::GeneratedPdfMetadata;
+    use rebook_session::normalize_generated_pdf_metadata;
 
     #[test]
     fn generated_metadata_is_normalized() {
-        let metadata = normalize(GeneratedPdfMetadata {
+        let metadata = normalize_generated_pdf_metadata(GeneratedPdfMetadata {
             title: "  A Book  ".into(),
             authors: vec![" Alice ".into(), String::new(), "Alice".into()],
             provider_name: " Provider ".into(),

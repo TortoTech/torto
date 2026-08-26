@@ -1,0 +1,28 @@
+[package]
+name = "rebook-assistant"
+description = "Frontend-neutral assistant session and request contracts for Torto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+directories.workspace = true
+jsonrepair-rs.workspace = true
+keyring.workspace = true
+percent-encoding.workspace = true
+rebook-publication = { path = "../publication" }
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rebook-html = { path = "../html" }
+
+[lints]
+workspace = true

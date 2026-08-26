@@ -5,11 +5,13 @@
 mod app;
 mod async_task;
 mod diagnostics;
+mod document_metadata;
 mod fonts;
 mod generated_metadata;
 mod generated_toc;
 mod highlights;
 mod library;
+mod pdf_ocr_session;
 mod persistence;
 mod platform;
 mod plugins;

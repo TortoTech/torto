@@ -1,15 +1,22 @@
 [workspace]
 members = [
     "apps/desktop",
+    "apps/gpui-desktop",
+    "apps/gpui-probe",
     "apps/inspect",
+    "crates/assistant",
     "crates/formats",
+    "crates/gpui-renderer",
     "crates/html",
     "crates/layout",
+    "crates/library",
     "crates/macos-open-file",
     "crates/math",
     "crates/publication",
     "crates/reader",
     "crates/renderer",
+    "crates/session",
+    "crates/sync",
     "crates/windows-window-background",
 ]
 exclude = [
@@ -46,6 +53,7 @@ egui-winit = { version = "0.36.1", default-features = false, features = ["clipbo
 encoding_rs = "0.8.35"
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 fontdb = "0.23.0"
+gpui = { version = "0.2.2", default-features = false }
 hayro = "0.7.1"
 image = { version = "=0.25.6", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 jsonrepair-rs = "0.2.1"
@@ -78,6 +86,7 @@ thiserror = "2.0.19"
 tracing = "0.1.44"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "sync", "time"] }
 unicode-segmentation = "1.13.3"
+unicode-linebreak = "0.1.5"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 vello = { version = "0.10.0", default-features = false, features = ["wgpu"] }
 wgpu = { version = "29.0.3", default-features = false, features = ["std", "parking_lot", "wgsl"] }

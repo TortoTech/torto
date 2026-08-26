@@ -46,7 +46,6 @@ egui-wgpu.workspace = true
 egui-winit.workspace = true
 fontdb.workspace = true
 image.workspace = true
-jsonrepair-rs.workspace = true
 keyring.workspace = true
 kurbo.workspace = true
 mermaid-rs-renderer.workspace = true
@@ -56,13 +55,17 @@ pollster.workspace = true
 pulldown-cmark.workspace = true
 quick-xml.workspace = true
 regex.workspace = true
+rebook-assistant = { path = "../../crates/assistant" }
 rebook-formats = { path = "../../crates/formats" }
 rebook-html = { path = "../../crates/html" }
 rebook-layout = { path = "../../crates/layout" }
+rebook-library = { path = "../../crates/library" }
 rebook-math = { path = "../../crates/math" }
 rebook-publication = { path = "../../crates/publication" }
 rebook-reader = { path = "../../crates/reader" }
 rebook-renderer = { path = "../../crates/renderer" }
+rebook-session = { path = "../../crates/session" }
+rebook-sync = { path = "../../crates/sync" }
 reqwest.workspace = true
 resvg.workspace = true
 rfd.workspace = true

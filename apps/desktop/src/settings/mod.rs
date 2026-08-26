@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-use peniko::Blob;
 use rebook_layout::{
-    LayoutEngine, ReaderFontFamilies, ReaderTypesetting, ReaderTypography, SpreadMode,
+    LayoutEngine, ReaderFontBlob, ReaderFontFamilies, ReaderTypesetting, ReaderTypography,
+    SpreadMode,
 };
 use rebook_reader::SelectionGranularity;
+use rebook_session::{ReaderDocumentPreferenceChange, ReaderDocumentPreferences};
 
 use crate::plugins::PluginSettings;
 use crate::preferences::{
@@ -35,6 +36,18 @@ pub(crate) struct AppliedSettings {
     pub(crate) shortcuts: ShortcutPreferences,
     pub(crate) sync_settings: SyncSettings,
     pub(crate) sync_password: String,
+}
+
+impl AppliedSettings {
+    pub(crate) fn document_preferences(&self) -> ReaderDocumentPreferences {
+        ReaderDocumentPreferences {
+            typography: self.typography.clone(),
+            typesetting: self.typesetting.clone(),
+            spread: self.spread,
+            reading_mode: self.reading_mode,
+            selection_granularity: self.selection_granularity,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +91,7 @@ pub(crate) struct SettingsFeature {
 }
 
 impl SettingsFeature {
-    pub(crate) fn new(reader_fonts: &[Blob<u8>]) -> Self {
+    pub(crate) fn new(reader_fonts: &[ReaderFontBlob]) -> Self {
         let preferences = preferences::load_reader_preferences().unwrap_or_else(|error| {
             tracing::warn!(%error, "failed to load reader preferences; using defaults");
             ReaderPreferences::default()
@@ -259,38 +272,44 @@ impl SettingsFeature {
         &mut self,
         change: ReaderSettingsChange,
     ) -> Result<(), String> {
-        let mut preferences = ReaderPreferences {
-            interface_typography: self.applied.interface_typography.clone(),
-            typography: self.applied.typography.clone(),
-            typesetting: self.applied.typesetting.clone(),
-            language: self.applied.language,
-            spread: self.applied.spread,
-            reading_mode: self.applied.reading_mode,
-            theme: self.applied.theme,
-            selection_granularity: self.applied.selection_granularity,
-            shortcuts: self.applied.shortcuts.clone(),
-        };
         let layout_changed = matches!(
             change,
             ReaderSettingsChange::Spread(_)
                 | ReaderSettingsChange::ReadingMode(_)
                 | ReaderSettingsChange::Theme(_)
         );
+        let mut document = self.applied.document_preferences();
+        let mut theme = self.applied.theme;
         match change {
-            ReaderSettingsChange::Spread(spread) => preferences.spread = spread,
-            ReaderSettingsChange::ReadingMode(mode) => preferences.reading_mode = mode,
-            ReaderSettingsChange::Theme(theme) => preferences.theme = theme,
+            ReaderSettingsChange::Spread(spread) => {
+                document.apply(ReaderDocumentPreferenceChange::Spread(spread));
+            }
+            ReaderSettingsChange::ReadingMode(mode) => {
+                document.apply(ReaderDocumentPreferenceChange::ReadingMode(mode));
+            }
+            ReaderSettingsChange::Theme(next_theme) => theme = next_theme,
             ReaderSettingsChange::SelectionGranularity(granularity) => {
-                preferences.selection_granularity = granularity;
+                document.apply(ReaderDocumentPreferenceChange::SelectionGranularity(
+                    granularity,
+                ));
             }
         }
-        let values_unchanged = preferences.spread == self.applied.spread
-            && preferences.reading_mode == self.applied.reading_mode
-            && preferences.theme == self.applied.theme
-            && preferences.selection_granularity == self.applied.selection_granularity;
+        let values_unchanged =
+            document == self.applied.document_preferences() && theme == self.applied.theme;
         if !reader_change_needs_apply(values_unchanged, layout_changed) {
             return Ok(());
         }
+        let preferences = ReaderPreferences {
+            interface_typography: self.applied.interface_typography.clone(),
+            typography: document.typography,
+            typesetting: document.typesetting,
+            language: self.applied.language,
+            spread: document.spread,
+            reading_mode: document.reading_mode,
+            theme,
+            selection_granularity: document.selection_granularity,
+            shortcuts: self.applied.shortcuts.clone(),
+        };
         if !values_unchanged {
             preferences::save_reader_preferences(&preferences).map_err(|error| {
                 format!(
@@ -351,10 +370,14 @@ impl SettingsFeature {
     fn apply_settings(&mut self) {
         let mut plugin_settings = self.draft_plugin_settings.clone();
         plugin_settings.normalize();
-        let mut typography = self.draft_typography.clone();
-        typography.normalize();
-        let mut typesetting = self.draft_typesetting.clone();
-        typesetting.normalize();
+        let mut document = ReaderDocumentPreferences {
+            typography: self.draft_typography.clone(),
+            typesetting: self.draft_typesetting.clone(),
+            spread: self.draft_spread,
+            reading_mode: self.draft_reading_mode,
+            selection_granularity: self.applied.selection_granularity,
+        };
+        document.normalize();
         let mut interface_typography = self.draft_interface_typography.clone();
         interface_typography.normalize();
         let mut sync_settings = self.draft_sync_settings.clone();
@@ -385,13 +408,13 @@ impl SettingsFeature {
         }
         let reader_preferences = ReaderPreferences {
             interface_typography: interface_typography.clone(),
-            typography: typography.clone(),
-            typesetting: typesetting.clone(),
+            typography: document.typography.clone(),
+            typesetting: document.typesetting.clone(),
             language,
             theme,
-            spread: self.draft_spread,
-            reading_mode: self.draft_reading_mode,
-            selection_granularity: self.applied.selection_granularity,
+            spread: document.spread,
+            reading_mode: document.reading_mode,
+            selection_granularity: document.selection_granularity,
             shortcuts: self.draft_shortcuts.clone(),
         };
         if sync_settings.enabled
@@ -409,15 +432,15 @@ impl SettingsFeature {
             self.draft_sync_password.clone()
         };
         let next_applied = AppliedSettings {
-            spread: self.draft_spread,
-            reading_mode: self.draft_reading_mode,
+            spread: document.spread,
+            reading_mode: document.reading_mode,
             interface_typography,
-            typography,
-            typesetting,
+            typography: document.typography,
+            typesetting: document.typesetting,
             plugin_settings,
             language,
             theme,
-            selection_granularity: self.applied.selection_granularity,
+            selection_granularity: document.selection_granularity,
             shortcuts: self.draft_shortcuts.clone(),
             sync_settings,
             sync_password,

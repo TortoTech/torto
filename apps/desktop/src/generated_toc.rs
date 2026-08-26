@@ -8,6 +8,8 @@ use rebook_publication::{
     Book, BookSource, PublicationError, PublicationUrl, RasterResource, Resource, Section,
     TableOfContentsOrigin, TocEntry,
 };
+pub(crate) use rebook_session::{GeneratedTocDraft, GeneratedTocEntry};
+use rebook_session::{PdfDocumentMetadataCommand, normalize_generated_toc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -16,24 +18,6 @@ use crate::persistence::{write_bytes_atomic, write_json_atomic};
 const GENERATED_TOC_VERSION: u8 = 1;
 const PAGE_MAPPING_REVISION: u8 = 2;
 const GENERATED_TOC_DIRECTORY: &str = "generated-toc";
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct GeneratedTocEntry {
-    pub(crate) depth: usize,
-    pub(crate) title: String,
-    pub(crate) printed_page: String,
-    /// One-based physical PDF page.
-    pub(crate) physical_page: usize,
-    pub(crate) confidence: f32,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct GeneratedTocDraft {
-    pub(crate) provider_name: String,
-    pub(crate) model: String,
-    pub(crate) source_pages: Vec<usize>,
-    pub(crate) entries: Vec<GeneratedTocEntry>,
-}
 
 #[derive(Serialize, Deserialize)]
 struct StoredGeneratedToc {
@@ -57,14 +41,14 @@ impl StoredGeneratedToc {
             provider_name: draft.provider_name.clone(),
             model: draft.model.clone(),
             source_pages: draft.source_pages.clone(),
-            entries: normalize_entries(draft.entries.clone()),
+            entries: draft.entries.clone(),
             verified_pages: true,
             page_mapping_revision: PAGE_MAPPING_REVISION,
         }
     }
 }
 
-pub(crate) fn save(book_id: &str, draft: &GeneratedTocDraft) -> io::Result<()> {
+pub(crate) fn persist_normalized(book_id: &str, draft: &GeneratedTocDraft) -> io::Result<()> {
     let path = generated_toc_path(book_id)?;
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -121,12 +105,12 @@ pub(crate) fn load(book_id: &str) -> io::Result<Option<GeneratedTocDraft>> {
     {
         return Ok(None);
     }
-    Ok(Some(GeneratedTocDraft {
+    Ok(Some(normalize_generated_toc(GeneratedTocDraft {
         provider_name: stored.provider_name,
         model: stored.model,
         source_pages: stored.source_pages,
-        entries: normalize_entries(stored.entries),
-    }))
+        entries: stored.entries,
+    })))
 }
 
 pub(crate) fn load_source(source: Arc<dyn BookSource>) -> io::Result<Arc<dyn BookSource>> {
@@ -135,7 +119,14 @@ pub(crate) fn load_source(source: Arc<dyn BookSource>) -> io::Result<Arc<dyn Boo
         return Ok(source);
     };
     if crate::plugins::correct_generated_toc_pages_from_ocr(&book_id, &mut draft.entries)? {
-        save(&book_id, &draft)?;
+        let command = crate::document_metadata::apply(
+            &book_id,
+            PdfDocumentMetadataCommand::ReplaceGeneratedToc(draft),
+        )?;
+        let PdfDocumentMetadataCommand::ReplaceGeneratedToc(normalized) = command else {
+            unreachable!("generated TOC command changed variant")
+        };
+        draft = normalized;
     }
     let entries = draft.entries;
     if entries.is_empty()
@@ -167,54 +158,6 @@ fn generated_toc_path(book_id: &str) -> io::Result<PathBuf> {
         .data_local_dir()
         .join(GENERATED_TOC_DIRECTORY)
         .join(format!("{safe_id}.json")))
-}
-
-fn normalize_entries(mut entries: Vec<GeneratedTocEntry>) -> Vec<GeneratedTocEntry> {
-    entries.retain(|entry| !entry.title.trim().is_empty() && entry.physical_page > 0);
-    for entry in &mut entries {
-        entry.title = entry.title.trim().to_owned();
-        entry.printed_page = entry.printed_page.trim().to_owned();
-        entry.confidence = entry.confidence.clamp(0.0, 1.0);
-    }
-    entries.sort_by(|left, right| {
-        left.physical_page
-            .cmp(&right.physical_page)
-            .then_with(|| left.depth.cmp(&right.depth))
-            .then_with(|| {
-                toc_title_starts_with_number(&left.title)
-                    .cmp(&toc_title_starts_with_number(&right.title))
-            })
-    });
-    let mut previous_depth = 0;
-    let mut previous_page = 0;
-    let mut previous_title_was_numbered = false;
-    for (index, entry) in entries.iter_mut().enumerate() {
-        let title_is_numbered = toc_title_starts_with_number(&entry.title);
-        entry.depth = if index == 0 {
-            0
-        } else if entry.depth == 0
-            && previous_depth == 0
-            && entry.physical_page == previous_page
-            && !previous_title_was_numbered
-            && title_is_numbered
-        {
-            1
-        } else {
-            entry.depth.min(previous_depth + 1)
-        };
-        previous_depth = entry.depth;
-        previous_page = entry.physical_page;
-        previous_title_was_numbered = title_is_numbered;
-    }
-    entries
-}
-
-fn toc_title_starts_with_number(title: &str) -> bool {
-    title
-        .trim_start()
-        .chars()
-        .next()
-        .is_some_and(|character| character.is_ascii_digit() || ('０'..='９').contains(&character))
 }
 
 fn nested_toc(
@@ -310,11 +253,12 @@ impl BookSource for GeneratedTocBookSource {
 
 #[cfg(test)]
 mod tests {
-    use super::{GeneratedTocEntry, normalize_entries};
+    use super::GeneratedTocEntry;
+    use rebook_session::normalize_generated_toc_entries;
 
     #[test]
     fn generated_depth_never_skips_a_level() {
-        let entries = normalize_entries(vec![
+        let entries = normalize_generated_toc_entries(vec![
             GeneratedTocEntry {
                 depth: 4,
                 title: " Chapter ".into(),
@@ -345,7 +289,7 @@ mod tests {
             physical_page,
             confidence: 0.9,
         };
-        let entries = normalize_entries(vec![
+        let entries = normalize_generated_toc_entries(vec![
             entry(0, "1 书籍的过去、现在和未来", "6", 10),
             entry(1, "2 一本书的诞生", "13", 17),
             entry(1, "致谢", "253", 257),

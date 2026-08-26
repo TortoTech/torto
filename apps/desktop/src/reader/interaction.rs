@@ -24,7 +24,7 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn focus_clicked_unit(&mut self, x: f32, y: f32) {
-        self.ui.focus_actions_visible = false;
+        self.focus_state.hide_actions();
         self.focus_toc_override = None;
         if let Some(index) = self.focus_unit_at_canvas(x, y) {
             self.select_focus_unit(index);
@@ -33,12 +33,12 @@ impl DesktopReader {
 
     pub(in crate::reader) fn current_focus_unit_is_image(&self) -> bool {
         self.focus_units
-            .get(self.focus_unit_index)
-            .is_some_and(|unit| unit.is_image)
+            .get(self.focus_state.active_index())
+            .is_some_and(|unit| unit.is_image())
     }
 
     pub(in crate::reader) fn current_focus_note(&self) -> Option<String> {
-        self.focus_note_at(self.focus_unit_index)
+        self.focus_note_at(self.focus_state.active_index())
     }
 
     pub(in crate::reader) fn focus_note_at(&self, index: usize) -> Option<String> {
@@ -53,8 +53,8 @@ impl DesktopReader {
     pub(in crate::reader) fn create_focus_highlight(&mut self, note: Option<String>) {
         let Some(unit) = self
             .focus_units
-            .get(self.focus_unit_index)
-            .filter(|unit| !unit.is_image)
+            .get(self.focus_state.active_index())
+            .filter(|unit| !unit.is_image())
             .cloned()
         else {
             return;
@@ -87,8 +87,12 @@ impl DesktopReader {
             }
             return;
         }
-        let highlight =
-            StoredHighlight::with_note(self.book_id.clone(), unit.paint_ranges, unit.text, note);
+        let highlight = StoredHighlight::with_note(
+            self.book_id.clone(),
+            unit.core.paint_ranges,
+            unit.text,
+            note,
+        );
         match self.highlight_store.insert(&highlight) {
             Ok(()) => {
                 self.highlights.insert(0, highlight);

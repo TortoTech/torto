@@ -1945,8 +1945,9 @@ impl StyleSheet {
                 .get(logical)
                 .or_else(|| properties.get(physical))
                 .and_then(|value| css_horizontal_length(value))
-                .map(|(pixels, fraction)| fraction.mul_add(REFERENCE_WIDTH, pixels))
-                .unwrap_or(0.0)
+                .map_or(0.0, |(pixels, fraction)| {
+                    fraction.mul_add(REFERENCE_WIDTH, pixels)
+                })
         };
         let vertical = |logical: &str, physical: &str| {
             properties

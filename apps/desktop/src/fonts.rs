@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use peniko::Blob;
+use rebook_layout::ReaderFontBlob;
 
 const BITTER_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Bitter-wght.ttf");
 const BITTER_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Bitter-Italic-wght.ttf");
@@ -10,7 +10,7 @@ pub(crate) fn cjk_font_bytes() -> &'static [u8] {
     rebook_formats::cjk_fallback_font_bytes()
 }
 
-pub fn embedded_reader_fonts() -> Arc<[Blob<u8>]> {
+pub fn embedded_reader_fonts() -> Arc<[ReaderFontBlob]> {
     [
         font_blob(BITTER_REGULAR),
         font_blob(BITTER_ITALIC),
@@ -21,8 +21,8 @@ pub fn embedded_reader_fonts() -> Arc<[Blob<u8>]> {
     .into()
 }
 
-fn font_blob(bytes: &'static [u8]) -> Blob<u8> {
-    Blob::new(Arc::new(bytes))
+fn font_blob(bytes: &'static [u8]) -> ReaderFontBlob {
+    ReaderFontBlob::from_static(bytes)
 }
 
 #[cfg(test)]

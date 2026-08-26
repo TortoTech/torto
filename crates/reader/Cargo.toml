@@ -1,15 +1,19 @@
 [package]
 name = "rebook-reader"
-description = "Cached reader session orchestrating parser, layout, and renderer"
+description = "Cached reader session orchestrating publication parsing and layout"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["legacy-renderer"]
+legacy-renderer = ["dep:rebook-renderer"]
+
 [dependencies]
 rebook-layout = { path = "../layout" }
 rebook-publication = { path = "../publication" }
-rebook-renderer = { path = "../renderer" }
+rebook-renderer = { path = "../renderer", optional = true }
 thiserror.workspace = true
 unicode-segmentation.workspace = true
 
