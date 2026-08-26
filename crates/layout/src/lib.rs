@@ -1291,20 +1291,110 @@ impl LayoutEngine {
         } else {
             typography.default_stack()
         };
+        let mut layout = self.build_text_layout(
+            &text,
+            &spans,
+            &inline_images,
+            &font_stack,
+            typography,
+            block.style.line_height,
+            reader_style.foreground,
+            &[],
+        );
+        self.apply_text_indents(
+            &mut layout,
+            block,
+            &text[..source_text_start],
+            typography,
+            first_line_indent,
+        );
+        let should_optimize = reader_style.typesetting.line_break_strategy
+            == LineBreakStrategy::Optimized
+            && block.kind == TextBlockKind::Paragraph
+            && block.style.align == TextAlignment::Justify;
+        let optimized = should_optimize
+            && linebreak::parley::plan_optimized(
+                &mut layout,
+                &text,
+                available_width,
+                first_line_indent,
+                typography.font_size,
+            )
+            .and_then(|plan| {
+                let mut adjusted = self.build_text_layout(
+                    &text,
+                    &spans,
+                    &inline_images,
+                    &font_stack,
+                    typography,
+                    block.style.line_height,
+                    reader_style.foreground,
+                    &plan.adjustments,
+                );
+                self.apply_text_indents(
+                    &mut adjusted,
+                    block,
+                    &text[..source_text_start],
+                    typography,
+                    first_line_indent,
+                );
+                linebreak::parley::apply_breaks(&mut adjusted, &plan.lines, available_width)?;
+                layout = adjusted;
+                Some(())
+            })
+            .is_some();
+        if !optimized {
+            layout.break_all_lines(Some(available_width));
+        }
+        let alignment = if optimized {
+            Alignment::Start
+        } else {
+            text_alignment(block.style.align)
+        };
+        layout.align(alignment, AlignmentOptions::default());
+        PreparedText {
+            layout: Arc::new(layout),
+            text: text.into(),
+            source_text_start,
+            start_offset,
+            available_width,
+            inline_images: inline_images
+                .into_iter()
+                .map(|image| InlineImage {
+                    id: image.id,
+                    image: image.image,
+                    width: image.width,
+                    height: image.height,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_text_layout(
+        &mut self,
+        text: &str,
+        spans: &[StyledRange],
+        inline_images: &[PreparedInlineImage],
+        font_stack: &str,
+        typography: &ReaderTypography,
+        line_height: f32,
+        foreground: Rgba,
+        spacing: &[linebreak::parley::SpacingAdjustment],
+    ) -> Layout<TextBrush> {
         let mut builder =
             self.layout_context
-                .ranged_builder(&mut self.font_context, &text, 1.0, false);
-        builder.push_default(StyleProperty::FontFamily(FontFamily::from(
-            font_stack.as_str(),
-        )));
+                .ranged_builder(&mut self.font_context, text, 1.0, false);
+        builder.push_default(StyleProperty::FontFamily(FontFamily::from(font_stack)));
         builder.push_default(StyleProperty::FontSize(typography.font_size));
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(f32::from(
             typography.font_weight,
         ))));
         builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(
-            block.style.line_height,
+            line_height,
         )));
-        let default_brush = TextBrush::new(reader_style.foreground, false, TextBaseline::Normal, 0);
+        let default_brush = TextBrush::new(foreground, false, TextBaseline::Normal, 0);
         builder.push_default(StyleProperty::Brush(default_brush));
 
         for span in spans {
@@ -1335,11 +1425,17 @@ impl LayoutEngine {
                 );
             }
             if span.style.underline {
-                builder.push(StyleProperty::Underline(true), span.range);
+                builder.push(StyleProperty::Underline(true), span.range.clone());
             }
         }
 
-        for image in &inline_images {
+        for adjustment in spacing {
+            builder.push(
+                StyleProperty::LetterSpacing(adjustment.amount),
+                adjustment.range.clone(),
+            );
+        }
+        for image in inline_images {
             builder.push_inline_box(ParleyInlineBox {
                 id: image.id,
                 kind: InlineBoxKind::InFlow,
@@ -1348,8 +1444,17 @@ impl LayoutEngine {
                 height: image.height,
             });
         }
+        builder.build(text)
+    }
 
-        let mut layout = builder.build(&text);
+    fn apply_text_indents(
+        &mut self,
+        layout: &mut Layout<TextBrush>,
+        block: &TextBlock,
+        marker: &str,
+        typography: &ReaderTypography,
+        first_line_indent: f32,
+    ) {
         if first_line_indent.abs() > f32::EPSILON {
             layout.set_text_indent(
                 first_line_indent,
@@ -1359,45 +1464,7 @@ impl LayoutEngine {
                 },
             );
         }
-        self.apply_list_indent(
-            &mut layout,
-            block.kind,
-            &text[..source_text_start],
-            typography,
-        );
-        let optimized = reader_style.typesetting.line_break_strategy
-            == LineBreakStrategy::Optimized
-            && block.kind == TextBlockKind::Paragraph
-            && block.style.align == TextAlignment::Justify
-            && linebreak::parley::break_optimized(
-                &mut layout,
-                &text,
-                available_width,
-                first_line_indent,
-            )
-            .is_some();
-        if !optimized {
-            layout.break_all_lines(Some(available_width));
-        }
-        let alignment = text_alignment(block.style.align);
-        layout.align(alignment, AlignmentOptions::default());
-        PreparedText {
-            layout: Arc::new(layout),
-            text: text.into(),
-            source_text_start,
-            start_offset,
-            available_width,
-            inline_images: inline_images
-                .into_iter()
-                .map(|image| InlineImage {
-                    id: image.id,
-                    image: image.image,
-                    width: image.width,
-                    height: image.height,
-                })
-                .collect::<Vec<_>>()
-                .into(),
-        }
+        self.apply_list_indent(layout, block.kind, marker, typography);
     }
 
     fn measure_list_marker_width(
@@ -1575,10 +1642,9 @@ fn resolve_text_block<'a>(
             && let Some(authored_alignment) = block.style.authored_alignment
         {
             authored_alignment
-        } else if matches!(
-            block.kind,
-            TextBlockKind::Paragraph | TextBlockKind::ListItem { .. }
-        ) && text_block_supports_space_justification(block)
+        } else if block.kind == TextBlockKind::Paragraph
+            || matches!(block.kind, TextBlockKind::ListItem { .. })
+                && text_block_supports_space_justification(block)
         {
             TextAlignment::Justify
         } else {
@@ -3351,7 +3417,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_typesetting_start_aligns_cjk_and_non_breaking_space_prose() {
+    fn unified_typesetting_justifies_cjk_and_nbsp_paragraphs_but_not_lists() {
         let style = ReaderStyle {
             typesetting: ReaderTypesetting::unified(),
             ..ReaderStyle::default()
@@ -3371,6 +3437,11 @@ mod tests {
         ];
 
         for (kind, text) in cases {
+            let expected = if kind == TextBlockKind::Paragraph {
+                TextAlignment::Justify
+            } else {
+                TextAlignment::Start
+            };
             let block = TextBlock {
                 kind,
                 content: vec![Inline::Text(TextRun {
@@ -3383,7 +3454,7 @@ mod tests {
             };
 
             let resolved = resolve_text_block(&block, &style, TextContext::Flow);
-            assert_eq!(resolved.style.align, TextAlignment::Start, "{text}");
+            assert_eq!(resolved.style.align, expected, "{text}");
         }
     }
 

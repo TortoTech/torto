@@ -2121,6 +2121,7 @@ version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c0794db0b1a86193ac9c48768d0e6c52c54448e0870ad87907d456ee0dac964"
 dependencies = [
+ "core_maths",
  "icu_collections",
  "icu_locale",
  "icu_provider",
@@ -3805,7 +3806,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-desktop"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyrender",
  "atomicwrites",
@@ -3860,7 +3861,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-formats"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "base64",
  "crc32fast",
@@ -3881,7 +3882,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-html"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "rebook-publication",
  "roxmltree 0.21.1",
@@ -3890,7 +3891,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-inspect"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "rebook-formats",
  "rebook-publication",
@@ -3901,8 +3902,9 @@ dependencies = [
 
 [[package]]
 name = "rebook-layout"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
+ "icu_segmenter",
  "image",
  "parley",
  "read-fonts 0.41.0",
@@ -3911,11 +3913,12 @@ dependencies = [
  "resvg",
  "serde",
  "thiserror 2.0.19",
+ "unicode-script",
 ]
 
 [[package]]
 name = "rebook-macos-open-file"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
@@ -3924,7 +3927,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-math"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "ratex-layout",
  "ratex-parser",
@@ -3934,7 +3937,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-publication"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "percent-encoding",
  "serde",
@@ -3943,7 +3946,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-reader"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "rebook-layout",
  "rebook-publication",
@@ -3954,7 +3957,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-renderer"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyrender",
  "kurbo",
@@ -3966,7 +3969,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-windows-window-background"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "windows-sys 0.61.2",
 ]

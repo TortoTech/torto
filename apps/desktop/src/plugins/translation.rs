@@ -1104,12 +1104,10 @@ fn normalize_translation_line_spacing(line: &str) -> String {
         if previous.is_some_and(is_cjk) || next.is_some_and(is_cjk) {
             continue;
         }
-        // Parley stretches both regular and non-breaking spaces during
-        // justification. A thin space preserves visible word separation
-        // without becoming a justification slot; the following zero-width
-        // break still permits long embedded phrases to wrap.
-        normalized.push('\u{2009}');
-        normalized.push('\u{200b}');
+        // The layout engine caps ordinary space stretch before sharing the
+        // remaining justification across CJK boundaries. Keep real Latin
+        // word spaces so UAX #14 and hit testing see the source text.
+        normalized.push(' ');
     }
     normalized
 }
@@ -1496,7 +1494,7 @@ mod tests {
     fn translation_spacing_collapses_llm_whitespace_and_protects_latin_phrases() {
         assert_eq!(
             normalize_translation_spacing("OER    运动由 Dick      Durbin 提出"),
-            "OER运动由Dick\u{2009}\u{200b}Durbin提出"
+            "OER运动由Dick Durbin提出"
         );
         assert_eq!(
             normalize_translation_spacing("A long English sentence keeps normal spaces"),

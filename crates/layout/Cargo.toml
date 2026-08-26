@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 image.workspace = true
+icu_segmenter.workspace = true
 parley.workspace = true
 read-fonts.workspace = true
 rebook-math = { path = "../math" }
@@ -15,6 +16,7 @@ rebook-publication = { path = "../publication" }
 resvg.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+unicode-script.workspace = true
 
 [lints]
 workspace = true

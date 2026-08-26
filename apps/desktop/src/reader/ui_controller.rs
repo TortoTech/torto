@@ -13,7 +13,11 @@ impl DesktopReader {
             // 16 ms timer produces uneven frame intervals on displays whose
             // refresh period is not exactly 60 Hz.
             ctx.request_repaint();
-        } else if self.ui.needs_motion_tick() || self.pending_page_turn.is_some() {
+        } else if self.ui.needs_motion_tick()
+            || self.pending_page_turn.is_some()
+            || self.pending_reading_unit_turn.is_some()
+            || self.pending_toc_navigation.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
@@ -138,6 +142,8 @@ impl DesktopReader {
         self.error_timer.advance(&mut self.error, now);
         self.chat.error_timer.advance(&mut self.chat.error, now);
         self.retry_pending_page_turn();
+        self.retry_pending_reading_unit_turn();
+        self.retry_pending_toc_navigation();
     }
 
     pub(in crate::reader) fn apply_pending_focus_wheel_turn(&mut self) {

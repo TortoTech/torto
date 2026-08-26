@@ -1,10 +1,10 @@
 use rebook_layout::LayoutViewport;
 use rebook_publication::{PublicationUrl, SourceRange};
-use rebook_reader::{PageDirection, ReaderSnapshot};
+use rebook_reader::{NavigationAttempt, PageDirection, ReaderSnapshot};
 
 use super::{
-    DesktopReader, FollowUp, MarkRetention, ProgressChange, SceneChange, SnapshotEffects,
-    logical_dimension,
+    DesktopReader, FollowUp, MarkRetention, PendingTocNavigation, ProgressChange, SceneChange,
+    SnapshotEffects, logical_dimension,
 };
 
 pub(super) const fn snapshot_reanchors_focus(effects: SnapshotEffects) -> bool {
@@ -15,6 +15,15 @@ impl DesktopReader {
     pub(in crate::reader) fn go_to_toc(&mut self, id: &str, target: &PublicationUrl) {
         self.ui.focus_footnotes_visible = false;
         self.ui.focus_footnote_scroll_delta = 0.0;
+        if self.is_focus_mode() {
+            self.pending_reading_unit_turn = None;
+            self.pending_toc_navigation = Some(PendingTocNavigation {
+                id: id.to_owned(),
+                target: target.clone(),
+            });
+            self.retry_pending_toc_navigation();
+            return;
+        }
         let result = self.reader.go_to_href(target);
         match result {
             Ok(result) => {
@@ -45,12 +54,69 @@ impl DesktopReader {
         }
     }
 
+    pub(in crate::reader) fn retry_pending_toc_navigation(&mut self) {
+        let Some(pending) = self.pending_toc_navigation.clone() else {
+            return;
+        };
+        match self.reader.try_go_to_href(&pending.target) {
+            Ok(NavigationAttempt::Pending) => {}
+            Ok(NavigationAttempt::Ready(result)) => {
+                self.pending_toc_navigation = None;
+                let focus_anchor = self.reader.source_anchor_for_href(&pending.target);
+                self.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
+                self.focus_toc_override = Some(pending.id.clone());
+                if let Some(item) = self
+                    .reader
+                    .toc_items()
+                    .iter()
+                    .find(|item| item.id == pending.id)
+                {
+                    self.snapshot.active_toc_id = Some(item.id.clone());
+                    self.snapshot.active_toc_path.clone_from(&item.ancestors);
+                    if item.has_children {
+                        self.snapshot.active_toc_path.push(item.id.clone());
+                    }
+                }
+                self.focus_anchor = focus_anchor.or_else(|| {
+                    self.reader
+                        .current_page()
+                        .leading_source_range()
+                        .map(|range| range.start.clone())
+                });
+                self.focus_units.clear();
+                self.focus_unit_index = 0;
+                self.focus_target_offset = None;
+                self.ui.focus_scroll_motion = None;
+            }
+            Err(error) => {
+                self.pending_toc_navigation = None;
+                self.error = Some(format!("目录跳转失败：{error}"));
+            }
+        }
+    }
+
     pub(in crate::reader) fn go_to_adjacent_section(&mut self, direction: PageDirection) {
+        if self.pending_reading_unit_turn.is_some() {
+            return;
+        }
         self.ui.focus_footnotes_visible = false;
         self.ui.focus_footnote_scroll_delta = 0.0;
         self.focus_toc_override = None;
-        match self.reader.go_to_adjacent_reading_unit(direction) {
-            Ok(result) if result.outcome == rebook_reader::NavigationOutcome::Moved => {
+        self.pending_toc_navigation = None;
+        self.pending_reading_unit_turn = Some(direction);
+        self.retry_pending_reading_unit_turn();
+    }
+
+    pub(in crate::reader) fn retry_pending_reading_unit_turn(&mut self) {
+        let Some(direction) = self.pending_reading_unit_turn else {
+            return;
+        };
+        match self.reader.try_go_to_adjacent_reading_unit(direction) {
+            Ok(NavigationAttempt::Pending) => {}
+            Ok(NavigationAttempt::Ready(result))
+                if result.outcome == rebook_reader::NavigationOutcome::Moved =>
+            {
+                self.pending_reading_unit_turn = None;
                 let focus_anchor = self.reader.current_reading_unit_anchor();
                 self.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
                 if self.is_focus_mode() {
@@ -70,8 +136,13 @@ impl DesktopReader {
                 self.ui.focus_scroll_motion = None;
                 self.pending_reading_unit_entry = Some(direction);
             }
-            Ok(_) => {}
-            Err(error) => self.error = Some(format!("小节跳转失败：{error}")),
+            Ok(NavigationAttempt::Ready(_)) => {
+                self.pending_reading_unit_turn = None;
+            }
+            Err(error) => {
+                self.pending_reading_unit_turn = None;
+                self.error = Some(format!("小节跳转失败：{error}"));
+            }
         }
     }
 
@@ -142,6 +213,8 @@ impl DesktopReader {
             page_index: snapshot.location.page_index,
         };
         self.pending_page_turn = None;
+        self.pending_reading_unit_turn = None;
+        self.pending_toc_navigation = None;
         self.install_snapshot(snapshot);
         // Focus navigation owns a source anchor that can be more precise than the
         // ReaderSession's page-level location. A source refresh or resize rebuilds

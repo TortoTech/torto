@@ -366,6 +366,7 @@ struct PrefetchWorker {
     requests: Option<Sender<PrefetchRequest>>,
     results: Mutex<Receiver<PrefetchResult>>,
     active_generation: Arc<AtomicU64>,
+    active_request: Arc<Mutex<Option<PrefetchKey>>>,
     cancelled: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -379,8 +380,10 @@ impl PrefetchWorker {
         let (request_sender, request_receiver) = mpsc::channel::<PrefetchRequest>();
         let (result_sender, result_receiver) = mpsc::channel::<PrefetchResult>();
         let active_generation = Arc::new(AtomicU64::new(0));
+        let active_request = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_generation = Arc::clone(&active_generation);
+        let worker_active_request = Arc::clone(&active_request);
         let worker_cancelled = Arc::clone(&cancelled);
         let handle = thread::Builder::new()
             .name("rebook-prefetch".into())
@@ -393,6 +396,13 @@ impl PrefetchWorker {
                     }
                     if worker_generation.load(Ordering::Acquire) != request.generation {
                         continue;
+                    }
+                    let request_key = PrefetchKey {
+                        generation: request.generation,
+                        segment: request.key,
+                    };
+                    if let Ok(mut active) = worker_active_request.lock() {
+                        *active = Some(request_key);
                     }
                     let segment = repository
                         .load(request.key.section_index)
@@ -408,6 +418,11 @@ impl PrefetchWorker {
                             )
                             .map(Arc::new)
                         });
+                    if let Ok(mut active) = worker_active_request.lock()
+                        && *active == Some(request_key)
+                    {
+                        *active = None;
+                    }
                     if worker_cancelled.load(Ordering::Acquire) {
                         break;
                     }
@@ -431,6 +446,7 @@ impl PrefetchWorker {
             requests: Some(request_sender),
             results: Mutex::new(result_receiver),
             active_generation,
+            active_request,
             cancelled,
             handle: Some(handle),
         })
@@ -442,6 +458,10 @@ impl PrefetchWorker {
 
     fn invalidate(&self) -> u64 {
         self.active_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn active_key(&self) -> Option<PrefetchKey> {
+        self.active_request.lock().ok().and_then(|active| *active)
     }
 
     fn send(&self, request: PrefetchRequest) -> Result<(), ReaderError> {
@@ -1070,6 +1090,87 @@ impl ReaderSession {
         self.go_to_reading_unit(section_index, unit_index)
     }
 
+    /// Attempts to move between semantic TOC units without laying out or
+    /// waiting on the caller thread. Explicit navigation takes priority over
+    /// speculative prefetch work, so a requested chapter cannot sit behind a
+    /// stale look-ahead queue.
+    pub fn try_go_to_adjacent_reading_unit(
+        &mut self,
+        direction: PageDirection,
+    ) -> Result<NavigationAttempt, ReaderError> {
+        self.poll_prefetch()?;
+        if let Some(units) = &self.fixed_reading_units {
+            let target = match direction {
+                PageDirection::Previous => self.current_reading_unit.checked_sub(1),
+                PageDirection::Next => (self.current_reading_unit + 1 < units.len())
+                    .then_some(self.current_reading_unit + 1),
+            };
+            let Some(unit_index) = target else {
+                return Ok(NavigationAttempt::Ready(self.boundary()));
+            };
+            let section_index = units[unit_index].section_range.start;
+            let key = SegmentKey {
+                section_index,
+                segment_index: 0,
+            };
+            if !self.try_ensure_navigation_segment(key)? {
+                return Ok(NavigationAttempt::Pending);
+            }
+            let result = self.go_to_section(section_index)?;
+            self.current_reading_unit = unit_index;
+            return Ok(NavigationAttempt::Ready(result));
+        }
+
+        let count = self
+            .repository
+            .load(self.current_section)?
+            .reading_units
+            .len();
+        let target = match direction {
+            PageDirection::Previous if self.current_reading_unit > 0 => {
+                Some((self.current_section, self.current_reading_unit - 1))
+            }
+            PageDirection::Next if self.current_reading_unit + 1 < count => {
+                Some((self.current_section, self.current_reading_unit + 1))
+            }
+            PageDirection::Previous => {
+                if let Some(section) = self.current_section.checked_sub(1) {
+                    if self.repository.get(section).is_none()
+                        && !self.try_ensure_navigation_segment(SegmentKey {
+                            section_index: section,
+                            segment_index: 0,
+                        })?
+                    {
+                        return Ok(NavigationAttempt::Pending);
+                    }
+                    let count = self.repository.load(section)?.reading_units.len().max(1);
+                    Some((section, count - 1))
+                } else {
+                    None
+                }
+            }
+            PageDirection::Next => (self.current_section + 1 < self.section_count())
+                .then_some((self.current_section + 1, 0)),
+        };
+        let Some((section_index, unit_index)) = target else {
+            return Ok(NavigationAttempt::Ready(self.boundary()));
+        };
+        let key = if unit_index == 0 {
+            SegmentKey {
+                section_index,
+                segment_index: 0,
+            }
+        } else {
+            self.reading_unit_segment_key(section_index, unit_index)?
+        };
+        if !self.try_ensure_navigation_segment(key)? {
+            return Ok(NavigationAttempt::Pending);
+        }
+        Ok(NavigationAttempt::Ready(
+            self.go_to_reading_unit(section_index, unit_index)?,
+        ))
+    }
+
     fn section_pages(
         &mut self,
         section_index: usize,
@@ -1681,6 +1782,20 @@ impl ReaderSession {
                     section_index: self.current_section,
                     segment_index,
                 })?;
+            } else {
+                let section_distance = distance - self.current_segment - 1;
+                let Some(section_index) = self.current_section.checked_sub(section_distance + 1)
+                else {
+                    continue;
+                };
+                self.queue_prefetch(SegmentKey {
+                    section_index,
+                    // Segment zero is known from the publication spine without
+                    // parsing the previous section on the caller thread. Books
+                    // with multiple authored segments resolve their exact last
+                    // reading unit through prioritized navigation when needed.
+                    segment_index: 0,
+                })?;
             }
         }
         self.touch(self.current_key());
@@ -1935,6 +2050,41 @@ impl ReaderSession {
         }
         self.install_position(destination);
         Ok(self.moved())
+    }
+
+    /// Attempts to navigate to an authored link without blocking the caller on
+    /// destination pagination. The requested segment is promoted ahead of
+    /// speculative prefetch work.
+    pub fn try_go_to_href(
+        &mut self,
+        href: &PublicationUrl,
+    ) -> Result<NavigationAttempt, ReaderError> {
+        self.poll_prefetch()?;
+        let index = self
+            .section_index_for_href(href)
+            .ok_or_else(|| ReaderError::NavigationTargetNotFound(href.to_string()))?;
+        if href.fragment().is_some()
+            && self.repository.get(index).is_none()
+            && !self.try_ensure_navigation_segment(SegmentKey {
+                section_index: index,
+                segment_index: 0,
+            })?
+        {
+            return Ok(NavigationAttempt::Pending);
+        }
+        let segment_index = self.repository.get(index).map_or(0, |section| {
+            href.fragment()
+                .and_then(|fragment| section.anchor_segments.get(fragment))
+                .copied()
+                .unwrap_or(0)
+        });
+        if !self.try_ensure_navigation_segment(SegmentKey {
+            section_index: index,
+            segment_index,
+        })? {
+            return Ok(NavigationAttempt::Pending);
+        }
+        Ok(NavigationAttempt::Ready(self.go_to_href(href)?))
     }
 
     fn previous_page(&mut self) -> Result<NavigationResult, ReaderError> {
@@ -2349,6 +2499,40 @@ impl ReaderSession {
         Ok(result)
     }
 
+    fn reading_unit_segment_key(
+        &self,
+        section_index: usize,
+        unit_index: usize,
+    ) -> Result<SegmentKey, ReaderError> {
+        let section = self.repository.load(section_index)?;
+        let unit = section
+            .reading_units
+            .get(unit_index)
+            .ok_or(ReaderError::SectionOutOfBounds(section_index))?;
+        let segment_index = unit
+            .start
+            .as_ref()
+            .and_then(|anchor| {
+                section.fragments.iter().position(|fragment| {
+                    fragment.blocks.iter().any(|block| {
+                        block_source(block)
+                            .is_some_and(|range| source_range_contains(range, anchor))
+                    })
+                })
+            })
+            .and_then(|fragment_index| {
+                section
+                    .segments
+                    .iter()
+                    .position(|segment| segment.fragment_range.contains(&fragment_index))
+            })
+            .unwrap_or(0);
+        Ok(SegmentKey {
+            section_index,
+            segment_index,
+        })
+    }
+
     fn current_visible_pages(&self) -> usize {
         self.cache
             .get(&self.current_key())
@@ -2412,6 +2596,36 @@ impl ReaderSession {
         if !self.prefetch_inflight.contains(&prefetch_key) {
             self.queue_prefetch(key)?;
         }
+        Ok(false)
+    }
+
+    fn try_ensure_navigation_segment(&mut self, key: SegmentKey) -> Result<bool, ReaderError> {
+        if self.cache.contains_key(&key) {
+            self.touch(key);
+            return Ok(true);
+        }
+        if let Some(error) = self.prefetch_failures.remove(&key) {
+            return Err(error);
+        }
+        let prefetch_key = PrefetchKey {
+            generation: self.prefetch_worker.generation(),
+            segment: key,
+        };
+        if self.prefetch_inflight.contains(&prefetch_key)
+            && (self.prefetch_inflight.len() == 1
+                || self.prefetch_worker.active_key() == Some(prefetch_key))
+        {
+            return Ok(false);
+        }
+
+        // A direct user request must not wait behind speculative work. Advancing
+        // the generation cheaply discards queued look-ahead requests; a segment
+        // already being compiled finishes normally, then the worker immediately
+        // picks up this destination.
+        self.prefetch_worker.invalidate();
+        self.prefetch_inflight.clear();
+        self.prefetch_failures.clear();
+        self.queue_prefetch(key)?;
         Ok(false)
     }
 
@@ -5306,6 +5520,79 @@ mod tests {
             panic!("prefetched destination should be ready");
         };
         assert_eq!(result.outcome, NavigationOutcome::Moved);
+        assert_eq!(result.snapshot.location.section_index, 1);
+    }
+
+    #[test]
+    fn interactive_focus_chapter_turn_waits_in_background_in_both_directions() {
+        let source = CountingSource::with_background_delay(
+            &["first".into(), "large target".into(), "third".into()],
+            Duration::from_millis(300),
+        );
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+
+        let started = Instant::now();
+        let attempt = reader
+            .try_go_to_adjacent_reading_unit(PageDirection::Next)
+            .unwrap();
+        assert_eq!(attempt, NavigationAttempt::Pending);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        reader.wait_for_prefetch().unwrap();
+        let NavigationAttempt::Ready(result) = reader
+            .try_go_to_adjacent_reading_unit(PageDirection::Next)
+            .unwrap()
+        else {
+            panic!("next chapter should be ready after prefetch");
+        };
+        assert_eq!(result.snapshot.location.section_index, 1);
+
+        let source = CountingSource::with_background_delay(
+            &["first".into(), "large target".into(), "third".into()],
+            Duration::from_millis(300),
+        );
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        reader.go_to_section(2).unwrap();
+        let started = Instant::now();
+        let attempt = reader
+            .try_go_to_adjacent_reading_unit(PageDirection::Previous)
+            .unwrap();
+        assert_eq!(attempt, NavigationAttempt::Pending);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        reader.wait_for_prefetch().unwrap();
+        let NavigationAttempt::Ready(result) = reader
+            .try_go_to_adjacent_reading_unit(PageDirection::Previous)
+            .unwrap()
+        else {
+            panic!("previous chapter should be ready after prefetch");
+        };
+        assert_eq!(result.snapshot.location.section_index, 1);
+    }
+
+    #[test]
+    fn interactive_toc_navigation_does_not_parse_the_target_on_the_caller() {
+        let mut source = CountingSource::with_background_delay(
+            &["first".into(), "large target".into()],
+            Duration::from_millis(300),
+        );
+        Arc::get_mut(&mut source).unwrap().book.table_of_contents = vec![TocEntry {
+            label: "Target".into(),
+            href: Some(PublicationUrl::parse("section-1.xhtml#target").unwrap()),
+            children: Vec::new(),
+        }];
+        let target = PublicationUrl::parse("section-1.xhtml#target").unwrap();
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+
+        let started = Instant::now();
+        let attempt = reader.try_go_to_href(&target).unwrap();
+        assert_eq!(attempt, NavigationAttempt::Pending);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        reader.wait_for_prefetch().unwrap();
+        let NavigationAttempt::Ready(result) = reader.try_go_to_href(&target).unwrap() else {
+            panic!("TOC target should be ready after prefetch");
+        };
         assert_eq!(result.snapshot.location.section_index, 1);
     }
 

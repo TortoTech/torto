@@ -9,7 +9,7 @@ use rebook_formats::{BookFormat, open_file_for_reading as open_publication_file_
 use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
 use rebook_publication::{
     Block, BookSource, Inline, InlineRole, LinkRole, PublicationUrl, RenditionLayout, Rgba,
-    SourceAnchor, SourceRange, TableBlock, TableOfContentsOrigin, TextBaseline, TextBlock,
+    Section, SourceAnchor, SourceRange, TableBlock, TableOfContentsOrigin, TextBaseline, TextBlock,
     TextBlockKind,
 };
 use rebook_reader::{
@@ -521,6 +521,8 @@ pub(super) struct DesktopReader {
     focus_anchor: Option<SourceAnchor>,
     focus_toc_override: Option<String>,
     pending_page_turn: Option<PageDirection>,
+    pending_reading_unit_turn: Option<PageDirection>,
+    pending_toc_navigation: Option<PendingTocNavigation>,
     pending_reading_unit_entry: Option<PageDirection>,
     pending_focus_wheel_turn: Option<PageDirection>,
     pending_keyboard_scroll_delta: f32,
@@ -535,6 +537,12 @@ pub(super) struct DesktopReader {
     reopen_notice: Option<String>,
     reopen_error: Option<String>,
     pub(super) exit_requested: bool,
+}
+
+#[derive(Clone)]
+struct PendingTocNavigation {
+    id: String,
+    target: PublicationUrl,
 }
 
 struct ImagePreview {
@@ -777,6 +785,66 @@ fn block_focus_footnotes(block: &Block) -> Vec<FocusFootnoteSource> {
             .collect(),
         Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => Vec::new(),
     }
+}
+
+fn focus_footnote_text(
+    source: &dyn BookSource,
+    target: &PublicationUrl,
+    marker: &str,
+    current_section_index: usize,
+    current_section: &Section,
+    linked_sections: &mut HashMap<usize, Section>,
+) -> Option<String> {
+    let section_index = source
+        .book()
+        .sections
+        .iter()
+        .position(|section| section.href.path() == target.path())?;
+    let section = if section_index == current_section_index {
+        current_section
+    } else {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            linked_sections.entry(section_index)
+        {
+            entry.insert(source.parse_section(section_index).ok()?);
+        }
+        linked_sections.get(&section_index)?
+    };
+    focus_footnote_text_in_section(section, target, marker)
+}
+
+fn focus_footnote_text_in_section(
+    section: &Section,
+    target: &PublicationUrl,
+    marker: &str,
+) -> Option<String> {
+    let fragment = target.fragment()?;
+    let anchor = section
+        .anchors
+        .iter()
+        .find(|anchor| anchor.fragment == fragment)?
+        .source
+        .clone();
+    let block = section.blocks.iter().find(|block| {
+        block_source_range(block).is_some_and(|range| source_range_contains_anchor(range, &anchor))
+            || block_source_range(block).is_some_and(|range| {
+                focus_block_paint_ranges(block, range)
+                    .iter()
+                    .any(|range| source_range_contains_anchor(range, &anchor))
+            })
+    })?;
+    let text = block_focus_text(block);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let without_marker = text.strip_prefix(marker.trim()).map_or(text, |rest| {
+        rest.trim_start_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(character, '.' | '．' | '、' | ')' | '）' | ']' | '】')
+        })
+    });
+    Some(without_marker.to_owned())
 }
 
 fn text_block_focus_text(block: &TextBlock) -> String {
@@ -1344,7 +1412,13 @@ impl DesktopReader {
         Ok(layout)
     }
 
-    fn resolve_focus_footnotes(&self, block: &Block) -> Vec<FocusFootnote> {
+    fn resolve_focus_footnotes(
+        &self,
+        block: &Block,
+        current_section_index: usize,
+        current_section: &Section,
+        linked_sections: &mut HashMap<usize, Section>,
+    ) -> Vec<FocusFootnote> {
         let mut seen = HashSet::new();
         block_focus_footnotes(block)
             .into_iter()
@@ -1354,55 +1428,23 @@ impl DesktopReader {
                     .then_some(FocusFootnote { text }),
                 FocusFootnoteSource::Reference { marker, target } => {
                     seen.insert(target.to_string()).then(|| FocusFootnote {
-                        text: self
-                            .focus_footnote_text(&target, &marker)
-                            .unwrap_or_else(|| {
-                                self.language
-                                    .text("未能读取脚注内容", "Footnote content is unavailable")
-                                    .to_owned()
-                            }),
+                        text: focus_footnote_text(
+                            self.source.as_ref(),
+                            &target,
+                            &marker,
+                            current_section_index,
+                            current_section,
+                            linked_sections,
+                        )
+                        .unwrap_or_else(|| {
+                            self.language
+                                .text("未能读取脚注内容", "Footnote content is unavailable")
+                                .to_owned()
+                        }),
                     })
                 }
             })
             .collect()
-    }
-
-    fn focus_footnote_text(&self, target: &PublicationUrl, marker: &str) -> Option<String> {
-        let section_index = self
-            .source
-            .book()
-            .sections
-            .iter()
-            .position(|section| section.href.path() == target.path())?;
-        let section = self.source.parse_section(section_index).ok()?;
-        let fragment = target.fragment()?;
-        let anchor = section
-            .anchors
-            .iter()
-            .find(|anchor| anchor.fragment == fragment)?
-            .source
-            .clone();
-        let block = section.blocks.iter().find(|block| {
-            block_source_range(block)
-                .is_some_and(|range| source_range_contains_anchor(range, &anchor))
-                || block_source_range(block).is_some_and(|range| {
-                    focus_block_paint_ranges(block, range)
-                        .iter()
-                        .any(|range| source_range_contains_anchor(range, &anchor))
-                })
-        })?;
-        let text = block_focus_text(block);
-        let text = text.trim();
-        if text.is_empty() {
-            return None;
-        }
-        let without_marker = text.strip_prefix(marker.trim()).map_or(text, |rest| {
-            rest.trim_start_matches(|character: char| {
-                character.is_whitespace()
-                    || matches!(character, '.' | '．' | '、' | ')' | '）' | ']' | '】')
-            })
-        });
-        Some(without_marker.to_owned())
     }
 
     #[allow(
@@ -1415,6 +1457,7 @@ impl DesktopReader {
             self.focus_unit_index = 0;
             return;
         };
+        let mut linked_footnote_sections = HashMap::new();
         let reading_ranges = self
             .reader
             .current_reading_unit_source_ranges()
@@ -1562,7 +1605,12 @@ impl DesktopReader {
                 }
                 continue;
             }
-            let footnotes = self.resolve_focus_footnotes(block);
+            let footnotes = self.resolve_focus_footnotes(
+                block,
+                layout.section_index,
+                &section,
+                &mut linked_footnote_sections,
+            );
             let clipboard_text = match block {
                 Block::Table(table) => table_block_markdown(table),
                 _ => text.clone(),
@@ -2715,6 +2763,8 @@ impl DesktopReader {
             focus_anchor: restored_focus_anchor,
             focus_toc_override: None,
             pending_page_turn: None,
+            pending_reading_unit_turn: None,
+            pending_toc_navigation: None,
             pending_reading_unit_entry: None,
             pending_focus_wheel_turn: None,
             pending_keyboard_scroll_delta: 0.0,
@@ -2795,14 +2845,15 @@ mod tests {
         ReaderOverlay, ReaderUiState, ScrollSectionLayout, SidebarTab, SnapshotEffects,
         TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState,
         allowed_reading_mode, block_is_footnote_definition, embedded_toc_is_page_index,
-        focus_block_paint_ranges, focus_list_descendant_root, focus_navigation_destination,
-        focus_scroll_content_height, focus_scroll_duration, focus_unit_container_center_y,
-        focus_unit_contains_source_range, focus_unit_geometry_ranges,
-        focus_unit_matches_highlight_ranges, focus_unit_screen_center_y, focus_unit_scroll_bounds,
-        focus_unit_target_offset_for_rect, legacy_translated_paragraph_range, logical_dimension,
-        merge_focus_list_descendant, resolve_book_display_metadata, resolved_focus_unit_index,
-        source_range_contains_anchor, table_block_markdown, text_block_focus_footnotes,
-        text_block_focus_text, text_block_footnote_references,
+        focus_block_paint_ranges, focus_footnote_text, focus_list_descendant_root,
+        focus_navigation_destination, focus_scroll_content_height, focus_scroll_duration,
+        focus_unit_container_center_y, focus_unit_contains_source_range,
+        focus_unit_geometry_ranges, focus_unit_matches_highlight_ranges,
+        focus_unit_screen_center_y, focus_unit_scroll_bounds, focus_unit_target_offset_for_rect,
+        legacy_translated_paragraph_range, logical_dimension, merge_focus_list_descendant,
+        resolve_book_display_metadata, resolved_focus_unit_index, source_range_contains_anchor,
+        table_block_markdown, text_block_focus_footnotes, text_block_focus_text,
+        text_block_footnote_references,
     };
     use crate::plugins::PdfOcrViewMode;
     use crate::preferences::ReadingMode;
@@ -2812,13 +2863,16 @@ mod tests {
         SeparatorPlacement,
     };
     use rebook_publication::{
-        Block, BlockStyle, Inline, InlineRole, LinkRole, PublicationUrl, Rgba, SourceAnchor,
-        SourceRange, SpineItemId, TableBlock, TableCell, TableRow, TextBaseline, TextBlock,
-        TextBlockKind, TextRun, TextStyle, TocEntry,
+        Block, BlockStyle, Book, BookSource, Inline, InlineRole, LinkRole, Metadata,
+        PublicationError, PublicationId, PublicationUrl, Resource, Rgba, Section, SectionAnchor,
+        SourceAnchor, SourceRange, SpineItem, SpineItemId, TableBlock, TableCell, TableRow,
+        TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle, TocEntry,
     };
     use rebook_reader::{PageDirection, ReaderPosition, ReaderSectionPage};
     use rebook_renderer::DisplayListCompiler;
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn toc_entry(label: &str, children: Vec<TocEntry>) -> TocEntry {
         TocEntry {
@@ -2826,6 +2880,122 @@ mod tests {
             href: None,
             children,
         }
+    }
+
+    struct CountingFootnoteSource {
+        book: Book,
+        sections: Vec<Section>,
+        parse_count: AtomicUsize,
+    }
+
+    impl BookSource for CountingFootnoteSource {
+        fn book(&self) -> &Book {
+            &self.book
+        }
+
+        fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+            self.parse_count.fetch_add(1, Ordering::Relaxed);
+            self.sections
+                .get(index)
+                .cloned()
+                .ok_or_else(|| PublicationError::ResourceNotFound(format!("section {index}")))
+        }
+
+        fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+            Err(PublicationError::ResourceNotFound(href.to_string()))
+        }
+    }
+
+    fn footnote_section(id: &str, path: &str, note: &str) -> Section {
+        let id = SpineItemId::new(id).unwrap();
+        let href = PublicationUrl::parse(path).unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: id.clone(),
+                node: "note".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: id.clone(),
+                node: "note".into(),
+                text_offset: u64::try_from(note.chars().count()).unwrap(),
+            },
+        };
+        Section {
+            id,
+            href,
+            blocks: vec![Block::Text(TextBlock {
+                kind: TextBlockKind::FootnoteDefinition,
+                content: vec![Inline::Text(TextRun {
+                    text: note.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: Some(source.clone()),
+            })],
+            anchors: vec![SectionAnchor {
+                fragment: "note".into(),
+                source: source.start,
+            }],
+        }
+    }
+
+    #[test]
+    fn focus_footnotes_reuse_current_and_linked_section_parses() {
+        let current = footnote_section("current", "current.xhtml", "1 Current note");
+        let linked = footnote_section("linked", "linked.xhtml", "2 Linked note");
+        let source = CountingFootnoteSource {
+            book: Book {
+                id: PublicationId::new("footnote-cache").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: [&current, &linked]
+                    .into_iter()
+                    .map(|section| SpineItem {
+                        id: section.id.clone(),
+                        href: section.href.clone(),
+                        media_type: "application/xhtml+xml".into(),
+                        linear: true,
+                        properties: Vec::new(),
+                    })
+                    .collect(),
+                table_of_contents: Vec::new(),
+            },
+            sections: vec![current.clone(), linked],
+            parse_count: AtomicUsize::new(0),
+        };
+        let mut linked_sections = HashMap::new();
+
+        assert_eq!(
+            focus_footnote_text(
+                &source,
+                &PublicationUrl::parse("current.xhtml#note").unwrap(),
+                "1",
+                0,
+                &current,
+                &mut linked_sections,
+            )
+            .as_deref(),
+            Some("Current note")
+        );
+        assert_eq!(source.parse_count.load(Ordering::Relaxed), 0);
+
+        for _ in 0..2 {
+            assert_eq!(
+                focus_footnote_text(
+                    &source,
+                    &PublicationUrl::parse("linked.xhtml#note").unwrap(),
+                    "2",
+                    0,
+                    &current,
+                    &mut linked_sections,
+                )
+                .as_deref(),
+                Some("Linked note")
+            );
+        }
+        assert_eq!(source.parse_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

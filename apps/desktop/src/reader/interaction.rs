@@ -155,7 +155,12 @@ impl DesktopReader {
         else {
             return Ok(None);
         };
-        let footnotes = self.resolve_focus_footnotes(&section.blocks[block_index]);
+        let footnotes = self.resolve_focus_footnotes(
+            &section.blocks[block_index],
+            position.section_index,
+            &section,
+            &mut std::collections::HashMap::new(),
+        );
         Ok((!footnotes.is_empty()).then_some(footnotes))
     }
 

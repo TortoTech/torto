@@ -93,6 +93,421 @@ pub struct LineBreak {
     pub natural_width: f32,
 }
 
+/// One shaped cluster in the Unicode-aware paragraph model.
+///
+/// Spacing owned by a boundary is stored on the cluster before that boundary,
+/// which lets the adapter write the result back as Parley letter spacing
+/// without changing the source text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClusterItem {
+    pub width: f32,
+    pub stretch: f32,
+    pub shrink: f32,
+    pub boundary_width_after: f32,
+    pub boundary_shrink_after: f32,
+    pub line_end_adjustment: f32,
+    pub clusters: u32,
+    pub break_after: bool,
+    pub trimmable: bool,
+    pub justifiable_after: bool,
+}
+
+/// Tunable values for Unicode-aware whole-paragraph optimization.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParagraphOptions {
+    pub line_width: f32,
+    pub first_line_indent: f32,
+    pub em: f32,
+    pub line_penalty: f32,
+    pub minimum_adjustment_ratio: f32,
+}
+
+impl ParagraphOptions {
+    #[must_use]
+    pub const fn new(line_width: f32, em: f32) -> Self {
+        Self {
+            line_width,
+            first_line_indent: 0.0,
+            em,
+            line_penalty: 10.0,
+            minimum_adjustment_ratio: -1.0,
+        }
+    }
+}
+
+/// Optimized breaks and the trailing spacing delta for every input cluster.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParagraphLayout {
+    pub lines: Vec<LineBreak>,
+    pub adjustments: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ClusterPrefixSums {
+    width: f32,
+    stretch: f32,
+    shrink: f32,
+    boundary_width: f32,
+    boundary_shrink: f32,
+    justifiable_boundaries: f32,
+    clusters: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClusterCandidateLine {
+    start: usize,
+    measured_end: usize,
+    cluster_count: u32,
+    breakpoint: u32,
+    ratio: f32,
+    badness: f32,
+    natural_width: f32,
+    difference: f32,
+    stretch: f32,
+    shrink: f32,
+    justifiable_boundaries: f32,
+    is_last: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ClusterLineFit {
+    Feasible(ClusterCandidateLine),
+    TooLong,
+    Infeasible,
+}
+
+const CLUSTER_FIT_EPSILON: f32 = 0.001;
+
+/// Finds whole-paragraph breakpoints using legal Unicode line boundaries.
+///
+/// Unlike [`optimize`], this model works at shaped-cluster granularity and can
+/// distribute width over CJK boundaries as well as stretch or shrink spaces.
+#[must_use]
+pub fn optimize_clusters(
+    items: &[ClusterItem],
+    options: ParagraphOptions,
+) -> Option<ParagraphLayout> {
+    if items.is_empty() || !paragraph_options_are_valid(options) || !cluster_items_are_valid(items)
+    {
+        return None;
+    }
+
+    let prefix = cluster_prefix_sums(items)?;
+    let mut candidates = Vec::with_capacity(items.len() + 1);
+    candidates.push(0);
+    candidates.extend(
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| item.break_after.then_some(index + 1)),
+    );
+    if candidates.last().copied() != Some(items.len()) {
+        candidates.push(items.len());
+    }
+    candidates.dedup();
+
+    let mut best = vec![f64::INFINITY; candidates.len()];
+    let mut predecessor = vec![None; candidates.len()];
+    let mut selected_line = vec![None; candidates.len()];
+    best[0] = 0.0;
+
+    for end_candidate in 1..candidates.len() {
+        let end = candidates[end_candidate];
+        // Walk from the shortest line towards progressively longer ones. Once
+        // a line cannot fit even after all permitted shrink, every earlier
+        // legal start is wider as well, so the remaining candidates can be
+        // skipped without changing the optimum. This is especially important
+        // for CJK paragraphs, where almost every cluster is a legal break.
+        for start_candidate in (0..end_candidate).rev() {
+            let start = candidates[start_candidate];
+            let line = match measure_cluster_line(items, &prefix, start, end, options) {
+                ClusterLineFit::Feasible(line) => line,
+                ClusterLineFit::TooLong => break,
+                ClusterLineFit::Infeasible => continue,
+            };
+            if !best[start_candidate].is_finite() {
+                continue;
+            }
+            let demerit = f64::from((options.line_penalty + line.badness).powi(2));
+            let total = best[start_candidate] + demerit;
+            if total < best[end_candidate] {
+                best[end_candidate] = total;
+                predecessor[end_candidate] = Some(start_candidate);
+                selected_line[end_candidate] = Some(line);
+            }
+        }
+    }
+
+    if !best.last()?.is_finite() {
+        return None;
+    }
+    let mut selected = Vec::new();
+    let mut cursor = candidates.len() - 1;
+    while cursor != 0 {
+        selected.push(selected_line[cursor]?);
+        cursor = predecessor[cursor]?;
+    }
+    selected.reverse();
+
+    let mut adjustments = vec![0.0; items.len()];
+    for line in &selected {
+        apply_cluster_line_adjustments(items, line, &mut adjustments);
+    }
+    let lines = selected
+        .into_iter()
+        .map(|line| LineBreak {
+            cluster_count: line.cluster_count,
+            breakpoint: line.breakpoint,
+            adjustment_ratio: line.ratio,
+            badness: line.badness,
+            natural_width: line.natural_width,
+        })
+        .collect();
+    Some(ParagraphLayout { lines, adjustments })
+}
+
+fn paragraph_options_are_valid(options: ParagraphOptions) -> bool {
+    options.line_width.is_finite()
+        && options.line_width > 0.0
+        && options.first_line_indent.is_finite()
+        && options.first_line_indent >= 0.0
+        && options.first_line_indent < options.line_width
+        && options.em.is_finite()
+        && options.em > 0.0
+        && options.line_penalty.is_finite()
+        && options.line_penalty >= 0.0
+        && options.minimum_adjustment_ratio.is_finite()
+        && (-1.0..=0.0).contains(&options.minimum_adjustment_ratio)
+}
+
+fn cluster_items_are_valid(items: &[ClusterItem]) -> bool {
+    items.iter().all(|item| {
+        item.width.is_finite()
+            && item.width >= 0.0
+            && item.stretch.is_finite()
+            && item.stretch >= 0.0
+            && item.shrink.is_finite()
+            && item.shrink >= 0.0
+            && item.boundary_width_after.is_finite()
+            && item.boundary_shrink_after.is_finite()
+            && item.boundary_shrink_after >= 0.0
+            && item.line_end_adjustment.is_finite()
+            && item.clusters > 0
+            // Required by the predecessor-pruning proof: adding a cluster and
+            // its following internal boundary must not reduce the line's
+            // minimum achievable width.
+            && item.width + item.boundary_width_after
+                - item.shrink
+                - item.boundary_shrink_after
+                >= -CLUSTER_FIT_EPSILON
+    })
+}
+
+fn cluster_prefix_sums(items: &[ClusterItem]) -> Option<Vec<ClusterPrefixSums>> {
+    let mut prefix = Vec::with_capacity(items.len() + 1);
+    prefix.push(ClusterPrefixSums::default());
+    for item in items {
+        let previous = *prefix.last()?;
+        let next = ClusterPrefixSums {
+            width: previous.width + item.width,
+            stretch: previous.stretch + item.stretch,
+            shrink: previous.shrink + item.shrink,
+            boundary_width: previous.boundary_width + item.boundary_width_after,
+            boundary_shrink: previous.boundary_shrink + item.boundary_shrink_after,
+            justifiable_boundaries: previous.justifiable_boundaries
+                + if item.justifiable_after { 1.0 } else { 0.0 },
+            clusters: previous.clusters.checked_add(item.clusters)?,
+        };
+        if !next.width.is_finite()
+            || !next.stretch.is_finite()
+            || !next.shrink.is_finite()
+            || !next.boundary_width.is_finite()
+            || !next.boundary_shrink.is_finite()
+            || !next.justifiable_boundaries.is_finite()
+        {
+            return None;
+        }
+        prefix.push(next);
+    }
+    Some(prefix)
+}
+
+fn internal_boundary_sum(
+    prefix: &[ClusterPrefixSums],
+    start: usize,
+    measured_end: usize,
+    select: impl Fn(ClusterPrefixSums) -> f32,
+) -> f32 {
+    if measured_end.saturating_sub(start) < 2 {
+        return 0.0;
+    }
+    select(prefix[measured_end - 1]) - select(prefix[start])
+}
+
+fn internal_justifiable_count(
+    prefix: &[ClusterPrefixSums],
+    start: usize,
+    measured_end: usize,
+) -> f32 {
+    if measured_end.saturating_sub(start) < 2 {
+        return 0.0;
+    }
+    prefix[measured_end - 1].justifiable_boundaries - prefix[start].justifiable_boundaries
+}
+
+fn measure_cluster_line(
+    items: &[ClusterItem],
+    prefix: &[ClusterPrefixSums],
+    start: usize,
+    end: usize,
+    options: ParagraphOptions,
+) -> ClusterLineFit {
+    if start >= end {
+        return ClusterLineFit::Infeasible;
+    }
+    let mut measured_end = end;
+    while measured_end > start && items[measured_end - 1].trimmable {
+        measured_end -= 1;
+    }
+    if measured_end <= start {
+        return ClusterLineFit::Infeasible;
+    }
+
+    let item_width = prefix[measured_end].width - prefix[start].width;
+    let boundary_width =
+        internal_boundary_sum(prefix, start, measured_end, |sum| sum.boundary_width);
+    let natural_width = item_width + boundary_width + items[measured_end - 1].line_end_adjustment;
+    let stretch = prefix[measured_end].stretch - prefix[start].stretch;
+    let shrink = prefix[measured_end].shrink - prefix[start].shrink
+        + internal_boundary_sum(prefix, start, measured_end, |sum| sum.boundary_shrink);
+    let justifiable_boundaries = internal_justifiable_count(prefix, start, measured_end);
+    let Some(cluster_count) = prefix[end].clusters.checked_sub(prefix[start].clusters) else {
+        return ClusterLineFit::Infeasible;
+    };
+    let breakpoint = prefix[end].clusters;
+    let target_width = options.line_width
+        - if start == 0 {
+            options.first_line_indent
+        } else {
+            0.0
+        };
+    if target_width <= 0.0 {
+        return ClusterLineFit::Infeasible;
+    }
+    let difference = target_width - natural_width;
+    let is_last = end == items.len();
+    let minimum_width = natural_width + options.minimum_adjustment_ratio * shrink;
+    if target_width + CLUSTER_FIT_EPSILON < minimum_width {
+        return ClusterLineFit::TooLong;
+    }
+    let Some((ratio, badness)) = cluster_adjustment_cost(
+        difference,
+        stretch,
+        shrink,
+        justifiable_boundaries,
+        options,
+        is_last,
+    ) else {
+        return ClusterLineFit::Infeasible;
+    };
+    ClusterLineFit::Feasible(ClusterCandidateLine {
+        start,
+        measured_end,
+        cluster_count,
+        breakpoint,
+        ratio,
+        badness,
+        natural_width,
+        difference,
+        stretch,
+        shrink,
+        justifiable_boundaries,
+        is_last,
+    })
+}
+
+fn cluster_adjustment_cost(
+    difference: f32,
+    stretch: f32,
+    shrink: f32,
+    justifiable_boundaries: f32,
+    options: ParagraphOptions,
+    is_last: bool,
+) -> Option<(f32, f32)> {
+    if is_last && difference >= 0.0 {
+        return Some((0.0, 0.0));
+    }
+    let ratio = if difference.abs() <= f32::EPSILON {
+        0.0
+    } else if difference < 0.0 {
+        if shrink <= f32::EPSILON {
+            return None;
+        }
+        difference / shrink
+    } else if stretch > f32::EPSILON {
+        let natural_ratio = difference / stretch;
+        if natural_ratio <= 1.0 || justifiable_boundaries <= f32::EPSILON {
+            natural_ratio
+        } else {
+            1.0 + (difference - stretch) / justifiable_boundaries / (options.em * 0.5)
+        }
+    } else if justifiable_boundaries > f32::EPSILON {
+        1.0 + difference / justifiable_boundaries / (options.em * 0.5)
+    } else {
+        return None;
+    };
+    if !ratio.is_finite() || ratio < options.minimum_adjustment_ratio {
+        return None;
+    }
+    Some((ratio, 100.0 * ratio.abs().powi(3)))
+}
+
+fn apply_cluster_line_adjustments(
+    items: &[ClusterItem],
+    line: &ClusterCandidateLine,
+    adjustments: &mut [f32],
+) {
+    for index in line.start..line.measured_end.saturating_sub(1) {
+        adjustments[index] += items[index].boundary_width_after;
+    }
+    adjustments[line.measured_end - 1] += items[line.measured_end - 1].line_end_adjustment;
+
+    if line.difference.abs() <= f32::EPSILON || (line.is_last && line.difference >= 0.0) {
+        return;
+    }
+    if line.difference < 0.0 {
+        let ratio = line.difference / line.shrink;
+        for index in line.start..line.measured_end {
+            adjustments[index] += items[index].shrink * ratio;
+            if index + 1 < line.measured_end {
+                adjustments[index] += items[index].boundary_shrink_after * ratio;
+            }
+        }
+        return;
+    }
+
+    let stretch_amount = if line.justifiable_boundaries <= f32::EPSILON {
+        line.difference
+    } else {
+        line.difference.min(line.stretch)
+    };
+    if line.stretch > f32::EPSILON {
+        let stretch_ratio = stretch_amount / line.stretch;
+        for index in line.start..line.measured_end {
+            adjustments[index] += items[index].stretch * stretch_ratio;
+        }
+    }
+    let remainder = line.difference - stretch_amount;
+    if remainder > f32::EPSILON && line.justifiable_boundaries > f32::EPSILON {
+        let per_boundary = remainder / line.justifiable_boundaries;
+        for index in line.start..line.measured_end.saturating_sub(1) {
+            if items[index].justifiable_after {
+                adjustments[index] += per_boundary;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct PrefixSums {
     width: f32,
@@ -367,6 +782,75 @@ mod tests {
         assert!((optimized[0].natural_width - 52.0).abs() < f32::EPSILON);
         assert!(total_demerit(&optimized, options) < total_demerit(&greedy, options));
         assert!(optimized[1].badness < greedy[1].badness);
+    }
+
+    #[test]
+    fn cluster_optimizer_distributes_cjk_justification_without_spaces() {
+        let items = (0..7)
+            .map(|index| ClusterItem {
+                width: 20.0,
+                stretch: 0.0,
+                shrink: 0.0,
+                boundary_width_after: 0.0,
+                boundary_shrink_after: 0.0,
+                line_end_adjustment: 0.0,
+                clusters: 1,
+                break_after: true,
+                trimmable: false,
+                justifiable_after: index != 6,
+            })
+            .collect::<Vec<_>>();
+
+        let result = optimize_clusters(&items, ParagraphOptions::new(66.0, 20.0))
+            .expect("CJK gaps should make the paragraph feasible");
+
+        assert!(result.lines.len() > 1);
+        assert!(result.adjustments.iter().any(|amount| *amount > 0.0));
+        assert_eq!(
+            result
+                .lines
+                .iter()
+                .map(|line| line.cluster_count)
+                .sum::<u32>(),
+            7
+        );
+    }
+
+    #[test]
+    fn cluster_optimizer_uses_boundary_shrink_for_mixed_script_spacing() {
+        let items = [
+            ClusterItem {
+                width: 20.0,
+                stretch: 0.0,
+                shrink: 0.0,
+                boundary_width_after: 5.0,
+                boundary_shrink_after: 2.5,
+                line_end_adjustment: 0.0,
+                clusters: 1,
+                break_after: false,
+                trimmable: false,
+                justifiable_after: false,
+            },
+            ClusterItem {
+                width: 20.0,
+                stretch: 0.0,
+                shrink: 0.0,
+                boundary_width_after: 0.0,
+                boundary_shrink_after: 0.0,
+                line_end_adjustment: 0.0,
+                clusters: 1,
+                break_after: true,
+                trimmable: false,
+                justifiable_after: false,
+            },
+        ];
+
+        let result = optimize_clusters(&items, ParagraphOptions::new(43.0, 20.0))
+            .expect("mixed-script boundary should shrink within its capacity");
+
+        assert_eq!(result.lines.len(), 1);
+        assert!((result.adjustments[0] - 3.0).abs() < 0.001);
+        assert!(result.lines[0].adjustment_ratio < 0.0);
     }
 
     fn greedy_lines_for_test(items: &[Item], options: Options) -> Option<Vec<LineBreak>> {
