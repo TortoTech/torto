@@ -1,9 +1,13 @@
 use crate::highlights::StoredHighlight;
-use rebook_reader::{NavigationAttempt, NavigationOutcome, PageDirection, SelectionGranularity};
+use rebook_publication::SourceRange;
+use rebook_reader::{
+    NavigationAttempt, NavigationOutcome, PageDirection, ReaderPosition, SelectionGranularity,
+};
 
 use super::{
-    DesktopReader, FollowUp, MarkRetention, ProgressChange, SidebarTab, SnapshotEffects,
-    focus_unit_contains_source_range, focus_unit_matches_highlight_ranges,
+    DesktopReader, FocusFootnote, FollowUp, MarkRetention, ProgressChange, SidebarTab,
+    SnapshotEffects, focus_anchor_block_index, focus_unit_contains_source_range,
+    focus_unit_matches_highlight_ranges,
 };
 
 impl DesktopReader {
@@ -114,6 +118,45 @@ impl DesktopReader {
         } else {
             self.reader.hit_test_current_spread(x, y, exact)
         }
+    }
+
+    fn footnote_source_at_canvas(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<(ReaderPosition, SourceRange)>, rebook_reader::ReaderError> {
+        if self.is_scroll_mode() {
+            let Some((position, page_x, page_y)) = self.scroll_page_coordinates(x, y) else {
+                return Ok(None);
+            };
+            self.reader
+                .footnote_source_at_page(position, page_x, page_y)
+                .map(|source| source.map(|source| (position, source)))
+        } else {
+            self.reader.footnote_source_at_current_spread(x, y)
+        }
+    }
+
+    pub(in crate::reader) fn classic_footnotes_at_canvas(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<Vec<FocusFootnote>>, rebook_reader::ReaderError> {
+        if self.is_focus_mode() {
+            return Ok(None);
+        }
+        let Some((position, source)) = self.footnote_source_at_canvas(x, y)? else {
+            return Ok(None);
+        };
+        let Ok(section) = self.source.parse_section(position.section_index) else {
+            return Ok(None);
+        };
+        let Some(block_index) = focus_anchor_block_index(&section.blocks, Some(&source.start))
+        else {
+            return Ok(None);
+        };
+        let footnotes = self.resolve_focus_footnotes(&section.blocks[block_index]);
+        Ok((!footnotes.is_empty()).then_some(footnotes))
     }
 
     fn source_ranges_contain_canvas_point(

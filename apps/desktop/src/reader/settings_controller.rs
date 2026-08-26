@@ -131,7 +131,8 @@ impl DesktopReader {
         } else {
             settings.spread
         };
-        style.focus_footnote_icons = self.reading_mode == crate::preferences::ReadingMode::Focus;
+        style.focus_footnote_icons =
+            self.source.book().metadata.layout != RenditionLayout::PrePaginated;
         style.minimum_paragraph_gap = if self.reading_mode == crate::preferences::ReadingMode::Focus
             && settings.typesetting.mode == rebook_layout::TypesettingMode::Book
         {

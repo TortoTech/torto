@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use anyrender::{Glyph, NormalizedCoord, PaintScene};
-use kurbo::{Affine, BezPath, Circle, Line, Rect, RoundedRect, Shape, Stroke, Vec2};
+use kurbo::{Affine, BezPath, Circle, Line, Point, Rect, RoundedRect, Shape, Stroke, Vec2};
 use parley::editing::{Cursor, Selection};
 use parley::layout::{Affinity, BreakReason, Cluster, ClusterSide};
 use parley::{FontData, Layout, PositionedLayoutItem};
@@ -103,6 +103,32 @@ fn footnote_icon_bounds(center_x: f32, baseline: f32, font_size: f32) -> Rect {
         f64::from(center_x + size / 2.0),
         f64::from(center_y + size / 2.0),
     )
+}
+
+fn paint_footnote_region(
+    scene: &mut impl PaintScene,
+    footnote: &FootnoteRegion,
+    color: Color,
+    transform: Affine,
+) {
+    let bounds = footnote.bounds;
+    let circle = Circle::new(bounds.center(), bounds.width().min(bounds.height()) * 0.5);
+    scene.stroke(&Stroke::new(1.15), transform, color, None, &circle);
+    let center_x = bounds.center().x;
+    let dot = Rect::new(
+        center_x - 0.7,
+        bounds.y0 + 2.0,
+        center_x + 0.7,
+        bounds.y0 + 3.4,
+    );
+    scene.fill(Fill::NonZero, transform, color, None, &dot);
+    scene.stroke(
+        &Stroke::new(1.2),
+        transform,
+        color,
+        None,
+        &Line::new((center_x, bounds.y0 + 5.0), (center_x, bounds.y1 - 2.0)),
+    );
 }
 
 const HIGHLIGHT_VERTICAL_OVERLAP: f64 = 0.5;
@@ -582,7 +608,7 @@ impl PageDisplayList {
         }
     }
 
-    /// Paints compact focus-mode footnote icons for the active source ranges.
+    /// Paints compact footnote icons for the active focus-mode source ranges.
     pub fn paint_footnote_icons(
         &self,
         scene: &mut impl PaintScene,
@@ -595,25 +621,31 @@ impl PageDisplayList {
             if !ranges.iter().any(|range| range == &footnote.source) {
                 continue;
             }
-            let bounds = footnote.bounds;
-            let circle = Circle::new(bounds.center(), bounds.width().min(bounds.height()) * 0.5);
-            scene.stroke(&Stroke::new(1.15), transform, color, None, &circle);
-            let center_x = bounds.center().x;
-            let dot = Rect::new(
-                center_x - 0.7,
-                bounds.y0 + 2.0,
-                center_x + 0.7,
-                bounds.y0 + 3.4,
-            );
-            scene.fill(Fill::NonZero, transform, color, None, &dot);
-            scene.stroke(
-                &Stroke::new(1.2),
-                transform,
-                color,
-                None,
-                &Line::new((center_x, bounds.y0 + 5.0), (center_x, bounds.y1 - 2.0)),
-            );
+            paint_footnote_region(scene, footnote, color, transform);
         }
+    }
+
+    /// Paints every semantic footnote icon on a classic-mode page.
+    pub fn paint_all_footnote_icons(
+        &self,
+        scene: &mut impl PaintScene,
+        color: Color,
+        offset_x: f32,
+    ) {
+        let transform = Affine::translate((f64::from(offset_x), 0.0));
+        for footnote in &self.footnote_regions {
+            paint_footnote_region(scene, footnote, color, transform);
+        }
+    }
+
+    /// Returns the source-backed paragraph owning a semantic footnote icon.
+    pub fn footnote_source_at(&self, x: f32, y: f32) -> Option<SourceRange> {
+        let point = Point::new(f64::from(x), f64::from(y));
+        self.footnote_regions
+            .iter()
+            .rev()
+            .find(|footnote| footnote.bounds.contains(point))
+            .map(|footnote| footnote.source.clone())
     }
 
     /// Paints block-level outlines for table chunks containing any requested source range.
@@ -2198,6 +2230,12 @@ mod tests {
         let list = DisplayListCompiler.compile(&page);
         assert_eq!(list.footnote_regions.len(), 1);
         assert_eq!(list.footnote_regions[0].source, source);
+        let icon_bounds = list.footnote_regions[0].bounds;
+        assert_eq!(
+            list.footnote_source_at(icon_bounds.center().x as f32, icon_bounds.center().y as f32),
+            Some(source.clone())
+        );
+        assert_eq!(list.footnote_source_at(0.0, 0.0), None);
         let painted_glyphs = list
             .commands
             .iter()

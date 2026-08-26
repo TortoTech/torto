@@ -365,6 +365,30 @@ pub enum Block {
     PageBreak,
 }
 
+impl Block {
+    /// Returns whether this block belongs to an EPUB footnote definition.
+    pub fn is_footnote_definition(&self) -> bool {
+        match self {
+            Self::Text(block) => block.kind.is_footnote_definition(),
+            Self::Quote(quote) => quote
+                .body
+                .iter()
+                .chain(quote.attribution.iter())
+                .any(|block| block.kind.is_footnote_definition()),
+            Self::Table(table) => table
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .any(|cell| cell.text.kind.is_footnote_definition()),
+            Self::Figure(figure) => figure
+                .captions
+                .iter()
+                .any(|caption| caption.kind.is_footnote_definition()),
+            Self::Image(_) | Self::Separator | Self::LineBreak | Self::PageBreak => false,
+        }
+    }
+}
+
 /// A semantic quotation whose source remains attached to the quoted prose.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuoteBlock {
@@ -391,6 +415,9 @@ pub enum TextBlockKind {
     Preformatted,
     /// Text semantically attached to an authored figure.
     Caption,
+    /// Content belonging to an EPUB footnote definition. Readers may keep this
+    /// block available for note resolution while omitting it from the main flow.
+    FootnoteDefinition,
     /// Ordered or unordered list item.
     ListItem {
         /// Whether numbering should be displayed.
@@ -417,6 +444,13 @@ pub enum TextBlockKind {
         #[serde(default)]
         depth: u8,
     },
+}
+
+impl TextBlockKind {
+    /// Returns whether this text is stored as the definition of a footnote.
+    pub const fn is_footnote_definition(self) -> bool {
+        matches!(self, Self::FootnoteDefinition)
+    }
 }
 
 const fn default_list_marker_visible() -> bool {
@@ -730,6 +764,11 @@ pub enum TextAlignment {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BlockStyle {
     pub align: TextAlignment,
+    /// Horizontal alignment explicitly supplied by the publication. This stays
+    /// `None` when `align` only contains the reader/parser default, allowing
+    /// unified typesetting to distinguish authored intent from fallback style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_alignment: Option<TextAlignment>,
     pub margin_before: f32,
     pub margin_after: f32,
     /// A structural line break follows this block. Layout engines should retain
@@ -754,6 +793,7 @@ impl Default for BlockStyle {
     fn default() -> Self {
         Self {
             align: TextAlignment::Start,
+            authored_alignment: None,
             margin_before: 0.0,
             margin_after: 16.0,
             hard_break_after: false,

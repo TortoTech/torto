@@ -12,7 +12,7 @@ use super::chat_markdown::ChatMarkdownState;
 use super::{
     AnnotationDraft, AssistantPanel, DesktopReader, GeneratedTocDraft, ImagePointerState,
     ImagePressCandidate, MOTION_EPSILON, ReaderOverlay, SelectedImage, SidebarTab,
-    focus_unit_screen_center_y, focus_unit_target_offset_for_rect,
+    focus_scroll_content_height, focus_unit_screen_center_y, focus_unit_target_offset_for_rect,
 };
 use crate::plugins::{
     BookSearchResult, ChatCommand, ChatRole, PdfOcrViewMode, chat_command_suggestions,
@@ -356,8 +356,8 @@ impl DesktopReader {
         if self.is_focus_mode() {
             self.focus_actions_overlay(&ctx, page_rect);
             self.focus_assistant_overlay(&ctx, page_rect);
-            self.focus_footnote_overlay(&ctx, page_rect);
         }
+        self.focus_footnote_overlay(&ctx, page_rect);
         self.resize_side_panels(
             &ctx,
             sidebar_progress,
@@ -477,7 +477,12 @@ impl DesktopReader {
         let scroll_output = scroll_area.show_viewport(ui, |ui, viewport| {
             ui.set_width(viewport.width());
             let content_padding = self.scroll_content_padding(viewport.height());
-            ui.set_height((layout.content_height + content_padding * 2.0).max(viewport.height()));
+            let scroll_content_height = if self.is_focus_mode() {
+                focus_scroll_content_height(layout.content_height, viewport.height())
+            } else {
+                (layout.content_height + content_padding * 2.0).max(viewport.height())
+            };
+            ui.set_height(scroll_content_height);
             if keyboard_scroll_delta.abs() > f32::EPSILON {
                 ui.scroll_with_delta(Vec2::new(0.0, keyboard_scroll_delta));
             }
@@ -847,6 +852,9 @@ impl DesktopReader {
     fn close_focus_footnotes(&mut self) {
         self.ui.focus_footnotes_visible = false;
         self.ui.focus_footnote_scroll_delta = 0.0;
+        self.classic_footnotes.clear();
+        self.classic_footnote_anchor_y = None;
+        self.classic_footnote_overlay_rect = None;
     }
 
     fn operation_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
@@ -1618,11 +1626,14 @@ impl DesktopReader {
         if !self.ui.focus_footnotes_visible {
             return;
         }
-        let footnotes = self
-            .focus_units
-            .get(self.focus_unit_index)
-            .map(|unit| unit.footnotes.clone())
-            .unwrap_or_default();
+        let footnotes = if self.is_focus_mode() {
+            self.focus_units
+                .get(self.focus_unit_index)
+                .map(|unit| unit.footnotes.clone())
+                .unwrap_or_default()
+        } else {
+            self.classic_footnotes.clone()
+        };
         if footnotes.is_empty() {
             self.close_focus_footnotes();
             return;
@@ -1678,16 +1689,20 @@ impl DesktopReader {
         let measured_body_height = (measured_text_height + separator_height + 2.0)
             .clamp(body_font.size.max(19.0), maximum_body_height);
         let panel_height = measured_body_height + 24.0;
-        let anchor_y = self
-            .focused_unit_screen_center_y(page_rect)
-            .unwrap_or_else(|| page_rect.center().y);
+        let anchor_y = if self.is_focus_mode() {
+            self.focused_unit_screen_center_y(page_rect)
+                .unwrap_or_else(|| page_rect.center().y)
+        } else {
+            self.classic_footnote_anchor_y
+                .unwrap_or_else(|| page_rect.center().y)
+        };
         let y = (anchor_y - panel_height / 2.0).clamp(
             viewport.top() + 16.0,
             (viewport.bottom() - panel_height - 16.0).max(viewport.top() + 16.0),
         );
         let keyboard_scroll = std::mem::take(&mut self.ui.focus_footnote_scroll_delta);
 
-        egui::Area::new("focus-footnotes".into())
+        let overlay = egui::Area::new("focus-footnotes".into())
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))
             .show(ctx, |ui| {
@@ -1731,6 +1746,11 @@ impl DesktopReader {
                     });
                 });
             });
+        if self.is_focus_mode() {
+            self.classic_footnote_overlay_rect = None;
+        } else {
+            self.classic_footnote_overlay_rect = Some(overlay.response.rect);
+        }
     }
 
     fn focus_data_indicator_overlays(
@@ -3217,7 +3237,39 @@ impl DesktopReader {
         }
     }
 
+    fn classic_footnote_hover_interaction(&mut self, response: &egui::Response) {
+        if self.is_focus_mode() {
+            return;
+        }
+        let hover_position = response.ctx.input(|input| input.pointer.hover_pos());
+        let over_overlay = hover_position.is_some_and(|position| {
+            self.classic_footnote_overlay_rect
+                .is_some_and(|rect| rect.expand(12.0).contains(position))
+        });
+        if let Some(position) = hover_position.filter(|position| response.rect.contains(*position))
+        {
+            let x = position.x - response.rect.min.x;
+            let y = position.y - response.rect.min.y;
+            match self.classic_footnotes_at_canvas(x, y) {
+                Ok(Some(footnotes)) => {
+                    self.classic_footnotes = footnotes;
+                    self.classic_footnote_anchor_y = Some(position.y);
+                    self.ui.focus_footnotes_visible = true;
+                    self.ui.focus_footnote_scroll_delta = 0.0;
+                    response.ctx.request_repaint();
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => self.error = Some(format!("Footnote hover failed: {error}")),
+            }
+        }
+        if !over_overlay {
+            self.close_focus_footnotes();
+        }
+    }
+
     fn pointer_interaction(&mut self, response: &egui::Response) {
+        self.classic_footnote_hover_interaction(response);
         let Some(position) = response.interact_pointer_pos() else {
             if !response.ctx.input(|input| input.pointer.primary_down()) {
                 self.image_pointer_state = ImagePointerState::Idle;

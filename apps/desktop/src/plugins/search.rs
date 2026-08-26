@@ -175,6 +175,7 @@ pub(crate) fn text_block_kind(block: &TextBlock) -> &'static str {
         TextBlockKind::DefinitionTerm { .. } => "definition-term",
         TextBlockKind::DefinitionDescription { .. } => "definition-description",
         TextBlockKind::Caption => "caption",
+        TextBlockKind::FootnoteDefinition => "footnote-definition",
     }
 }
 

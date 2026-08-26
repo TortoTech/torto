@@ -141,7 +141,7 @@ fn is_supported_ltr_prose(text: &str) -> bool {
     })
 }
 
-fn is_cjk(character: char) -> bool {
+pub(crate) fn is_cjk(character: char) -> bool {
     matches!(
         character as u32,
         0x2E80..=0x2FFF

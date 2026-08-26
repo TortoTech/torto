@@ -98,7 +98,7 @@ pub struct ReaderStyle {
     /// preserves the publication-authored margins exactly.
     pub minimum_paragraph_gap: f32,
     pub spread: SpreadMode,
-    /// Replaces linked superscript markers with focus-mode footnote icon slots.
+    /// Replaces linked superscript markers with semantic footnote icon slots.
     pub focus_footnote_icons: bool,
     pub foreground: Rgba,
     pub background: Rgba,
@@ -598,6 +598,10 @@ pub struct LayoutEngine {
     svg_options: resvg::usvg::Options<'static>,
 }
 
+fn should_layout_flow_block(block: &Block, reader_style: &ReaderStyle) -> bool {
+    !reader_style.focus_footnote_icons || !block.is_footnote_definition()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReaderFontFamilies {
     pub all: Vec<String>,
@@ -832,6 +836,9 @@ impl LayoutEngine {
 
         for blocks in fragments {
             for block in *blocks {
+                if !should_layout_flow_block(block, reader_style) {
+                    continue;
+                }
                 match block {
                     Block::Text(block) => {
                         let resolved = resolve_text_block(block, reader_style, TextContext::Flow);
@@ -1542,6 +1549,7 @@ fn resolve_text_block<'a>(
             ),
             TextBlockKind::QuoteAttribution => (0.88, 1.4, 0.0),
             TextBlockKind::Paragraph
+            | TextBlockKind::FootnoteDefinition
             | TextBlockKind::ListItem { .. }
             | TextBlockKind::DefinitionDescription { .. } => (
                 1.0,
@@ -1563,10 +1571,15 @@ fn resolve_text_block<'a>(
         };
 
     if context == TextContext::Flow && block.kind != TextBlockKind::Blockquote {
-        resolved.style.align = if matches!(
+        resolved.style.align = if block.kind == TextBlockKind::Paragraph
+            && let Some(authored_alignment) = block.style.authored_alignment
+        {
+            authored_alignment
+        } else if matches!(
             block.kind,
             TextBlockKind::Paragraph | TextBlockKind::ListItem { .. }
-        ) {
+        ) && text_block_supports_space_justification(block)
+        {
             TextAlignment::Justify
         } else {
             TextAlignment::Start
@@ -1579,7 +1592,8 @@ fn resolve_text_block<'a>(
             TextBlockKind::Paragraph => {
                 base_size * paragraph_indent_em(profile, reader_style.writing_system)
             }
-            TextBlockKind::Blockquote => block.style.indent,
+            TextBlockKind::Blockquote if block.style.indent > f32::EPSILON => base_size * 2.0,
+            TextBlockKind::Blockquote => 0.0,
             _ => 0.0,
         }
     } else {
@@ -1664,6 +1678,16 @@ fn resolve_text_block<'a>(
         }
     }
     Cow::Owned(resolved)
+}
+
+fn text_block_supports_space_justification(block: &TextBlock) -> bool {
+    block.content.iter().all(|inline| match inline {
+        Inline::Text(run) => run
+            .text
+            .chars()
+            .all(|character| character != '\u{00a0}' && !linebreak::parley::is_cjk(character)),
+        Inline::Math(_) | Inline::Break => true,
+    })
 }
 
 fn paragraph_indent_em(profile: &ReaderTypesetting, writing_system: WritingSystem) -> f32 {
@@ -3011,6 +3035,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn focus_layout_omits_semantic_footnote_definitions_from_the_main_flow() {
+        let block = Block::Text(TextBlock {
+            kind: TextBlockKind::FootnoteDefinition,
+            content: vec![Inline::Text(TextRun {
+                text: "Footnote body".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        });
+
+        assert!(should_layout_flow_block(&block, &ReaderStyle::default()));
+        assert!(!should_layout_flow_block(
+            &block,
+            &ReaderStyle {
+                focus_footnote_icons: true,
+                ..ReaderStyle::default()
+            }
+        ));
+    }
+
+    #[test]
     fn focus_footnote_icons_mark_semantic_references_and_legacy_linked_superscripts() {
         let linked_superscript = TextRun {
             text: "1".into(),
@@ -3186,6 +3233,7 @@ mod tests {
             })],
             style: rebook_publication::BlockStyle {
                 align: TextAlignment::Center,
+                authored_alignment: Some(TextAlignment::Center),
                 margin_before: 40.0,
                 margin_after: 50.0,
                 indent: 20.0,
@@ -3214,7 +3262,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_typesetting_justifies_paragraphs_and_list_items() {
+    fn unified_typesetting_justifies_latin_paragraphs_and_list_items() {
         let style = ReaderStyle {
             typesetting: ReaderTypesetting::unified(),
             ..ReaderStyle::default()
@@ -3244,6 +3292,98 @@ mod tests {
 
             let resolved = resolve_text_block(&block, &style, TextContext::Flow);
             assert_eq!(resolved.style.align, TextAlignment::Justify);
+        }
+    }
+
+    #[test]
+    fn unified_typesetting_preserves_authored_alignment_only_for_paragraphs() {
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        for alignment in [
+            TextAlignment::Start,
+            TextAlignment::Center,
+            TextAlignment::End,
+            TextAlignment::Justify,
+        ] {
+            let block = TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: "作者声明的正文对齐".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle {
+                    align: alignment,
+                    authored_alignment: Some(alignment),
+                    ..rebook_publication::BlockStyle::default()
+                },
+                source: None,
+            };
+
+            let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+            assert_eq!(resolved.style.align, alignment);
+        }
+
+        let list_item = TextBlock {
+            kind: TextBlockKind::ListItem {
+                ordered: false,
+                ordinal: 1,
+                depth: 0,
+                marker_visible: true,
+            },
+            content: vec![Inline::Text(TextRun {
+                text: "Unified list prose".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle {
+                align: TextAlignment::End,
+                authored_alignment: Some(TextAlignment::End),
+                ..rebook_publication::BlockStyle::default()
+            },
+            source: None,
+        };
+
+        let resolved = resolve_text_block(&list_item, &style, TextContext::Flow);
+        assert_eq!(resolved.style.align, TextAlignment::Justify);
+    }
+
+    #[test]
+    fn unified_typesetting_start_aligns_cjk_and_non_breaking_space_prose() {
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let cases = [
+            (TextBlockKind::Paragraph, "2015年，Dark Reading报道"),
+            (
+                TextBlockKind::ListItem {
+                    ordered: true,
+                    ordinal: 1,
+                    depth: 0,
+                    marker_visible: true,
+                },
+                "攻击者调查了几个目标",
+            ),
+            (TextBlockKind::Paragraph, "Dark\u{00a0}Reading report"),
+        ];
+
+        for (kind, text) in cases {
+            let block = TextBlock {
+                kind,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            };
+
+            let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+            assert_eq!(resolved.style.align, TextAlignment::Start, "{text}");
         }
     }
 
@@ -3542,7 +3682,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_quotes_preserve_authored_alignment_and_first_line_indent() {
+    fn unified_quotes_preserve_authored_alignment_and_normalize_indentation() {
         let block = TextBlock {
             kind: TextBlockKind::Blockquote,
             content: vec![Inline::Text(TextRun {
@@ -3559,17 +3699,26 @@ mod tests {
             source: None,
         };
         let style = ReaderStyle {
+            typography: ReaderTypography {
+                font_size: 20.0,
+                ..ReaderTypography::default()
+            },
             typesetting: ReaderTypesetting::unified(),
             ..ReaderStyle::default()
         };
 
         let resolved = resolve_text_block(&block, &style, TextContext::Flow);
         assert_eq!(resolved.style.align, TextAlignment::Center);
-        assert!((resolved.style.indent - 32.0).abs() < 0.001);
+        assert!((resolved.style.indent - 40.0).abs() < 0.001);
         assert!(resolved.style.margin_start.abs() < 0.001);
         let (start_offset, _, first_line_indent) = resolve_text_measure(&resolved, 320.0, 40.0);
         assert!(start_offset.abs() < 0.001);
-        assert!((first_line_indent - 32.0).abs() < 0.001);
+        assert!((first_line_indent - 40.0).abs() < 0.001);
+
+        let mut unindented = block;
+        unindented.style.indent = 0.0;
+        let resolved = resolve_text_block(&unindented, &style, TextContext::Flow);
+        assert!(resolved.style.indent.abs() < 0.001);
     }
 
     #[test]

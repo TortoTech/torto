@@ -40,6 +40,7 @@ const FOCUS_SCROLL_POINTS_PER_SECOND: f32 = 1_000.0;
 const FOCUS_SCROLL_MIN_DURATION: Duration = Duration::from_millis(160);
 const FOCUS_SCROLL_MAX_DURATION: Duration = Duration::from_millis(360);
 const FOCUS_UNIT_MIN_HEIGHT: f32 = 240.0;
+const FOCUS_TRAILING_SCROLL_SPACE: f32 = FOCUS_UNIT_MIN_HEIGHT / 2.0;
 const TOOLBAR_HIDE_DELAY: Duration = Duration::from_millis(500);
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const MOTION_EPSILON: f32 = 0.001;
@@ -219,7 +220,7 @@ pub(super) fn open_reader(
         } else {
             reader_preferences.spread
         },
-        focus_footnote_icons: reading_mode == ReadingMode::Focus,
+        focus_footnote_icons: !fixed_page,
         typography: reader_preferences.typography.clone(),
         typesetting: reader_preferences.typesetting.clone(),
         ..ReaderStyle::default()
@@ -512,6 +513,9 @@ pub(super) struct DesktopReader {
     scroll_target_position: Option<ReaderPosition>,
     scroll_target_source: Option<SourceRange>,
     focus_units: Vec<FocusUnit>,
+    classic_footnotes: Vec<FocusFootnote>,
+    classic_footnote_anchor_y: Option<f32>,
+    classic_footnote_overlay_rect: Option<egui::Rect>,
     focus_unit_index: usize,
     focus_target_offset: Option<f32>,
     focus_anchor: Option<SourceAnchor>,
@@ -728,6 +732,9 @@ fn text_block_has_link_role(block: &TextBlock, role: LinkRole) -> bool {
 }
 
 fn block_is_footnote_definition(block: &Block) -> bool {
+    if block.is_footnote_definition() {
+        return true;
+    }
     match block {
         Block::Text(block) => text_block_has_link_role(block, LinkRole::FootnoteBacklink),
         Block::Quote(quote) => quote
@@ -1047,6 +1054,33 @@ fn resolved_focus_unit_index(
         .unwrap_or(0)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusNavigationDestination {
+    AdjacentSection,
+    Unit(usize),
+}
+
+fn focus_navigation_destination(
+    unit_count: usize,
+    current_index: usize,
+    direction: PageDirection,
+) -> FocusNavigationDestination {
+    if unit_count == 0 || current_index >= unit_count {
+        return FocusNavigationDestination::AdjacentSection;
+    }
+    match direction {
+        PageDirection::Previous if current_index > 0 => {
+            FocusNavigationDestination::Unit(current_index - 1)
+        }
+        PageDirection::Next if current_index + 1 < unit_count => {
+            FocusNavigationDestination::Unit(current_index + 1)
+        }
+        PageDirection::Previous | PageDirection::Next => {
+            FocusNavigationDestination::AdjacentSection
+        }
+    }
+}
+
 fn snapshot_position(snapshot: &ReaderSnapshot) -> ReaderPosition {
     ReaderPosition {
         section_index: snapshot.location.section_index,
@@ -1090,6 +1124,14 @@ fn focus_unit_target_offset_for_rect(rect: egui::Rect, viewport_height: f32) -> 
     } else {
         (focus_unit_container_center_y(rect) + padding - viewport_height / 2.0).max(0.0)
     }
+}
+
+fn focus_scroll_content_height(content_height: f32, viewport_height: f32) -> f32 {
+    // Focus units shorter than `FOCUS_UNIT_MIN_HEIGHT` use a virtual container
+    // whose center sits up to half that minimum height below the final content
+    // edge. Keep that endpoint inside the ScrollArea's reachable range so egui
+    // never clamps the viewport while our animation continues past it.
+    (content_height + viewport_height + FOCUS_TRAILING_SCROLL_SPACE).max(viewport_height)
 }
 
 fn focus_unit_screen_center_y(
@@ -1662,22 +1704,13 @@ impl DesktopReader {
     }
 
     fn move_focus_unit(&mut self, direction: PageDirection) {
-        if self.focus_units.is_empty() {
-            return;
+        match focus_navigation_destination(self.focus_units.len(), self.focus_unit_index, direction)
+        {
+            FocusNavigationDestination::AdjacentSection => {
+                self.go_to_adjacent_section(direction);
+            }
+            FocusNavigationDestination::Unit(index) => self.select_focus_unit(index),
         }
-        let at_boundary = match direction {
-            PageDirection::Previous => self.focus_unit_index == 0,
-            PageDirection::Next => self.focus_unit_index + 1 >= self.focus_units.len(),
-        };
-        if at_boundary {
-            self.go_to_adjacent_section(direction);
-            return;
-        }
-        let next = match direction {
-            PageDirection::Previous => self.focus_unit_index - 1,
-            PageDirection::Next => self.focus_unit_index + 1,
-        };
-        self.select_focus_unit(next);
     }
 
     fn select_focus_unit(&mut self, index: usize) {
@@ -2674,6 +2707,9 @@ impl DesktopReader {
             scroll_target_position,
             scroll_target_source,
             focus_units: Vec::new(),
+            classic_footnotes: Vec::new(),
+            classic_footnote_anchor_y: None,
+            classic_footnote_overlay_rect: None,
             focus_unit_index: 0,
             focus_target_offset: None,
             focus_anchor: restored_focus_anchor,
@@ -2754,12 +2790,13 @@ mod tests {
     use super::navigation::snapshot_reanchors_focus;
     use super::{
         BookDisplayMetadata, Duration, FOCUS_SCROLL_MAX_DURATION, FOCUS_SCROLL_MIN_DURATION,
-        FocusFootnote, FocusFootnoteSource, FocusUnit, FollowUp, HashSet, Instant, MOTION_DURATION,
-        Motion, MotionCurve, NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState,
-        ScrollSectionLayout, SidebarTab, SnapshotEffects, TOOLBAR_HIDE_DELAY,
-        TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState, allowed_reading_mode,
-        block_is_footnote_definition, embedded_toc_is_page_index, focus_block_paint_ranges,
-        focus_list_descendant_root, focus_scroll_duration, focus_unit_container_center_y,
+        FocusFootnote, FocusFootnoteSource, FocusNavigationDestination, FocusUnit, FollowUp,
+        HashSet, Instant, MOTION_DURATION, Motion, MotionCurve, NOTICE_AUTO_DISMISS_DELAY,
+        ReaderOverlay, ReaderUiState, ScrollSectionLayout, SidebarTab, SnapshotEffects,
+        TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState,
+        allowed_reading_mode, block_is_footnote_definition, embedded_toc_is_page_index,
+        focus_block_paint_ranges, focus_list_descendant_root, focus_navigation_destination,
+        focus_scroll_content_height, focus_scroll_duration, focus_unit_container_center_y,
         focus_unit_contains_source_range, focus_unit_geometry_ranges,
         focus_unit_matches_highlight_ranges, focus_unit_screen_center_y, focus_unit_scroll_bounds,
         focus_unit_target_offset_for_rect, legacy_translated_paragraph_range, logical_dimension,
@@ -2779,7 +2816,7 @@ mod tests {
         SourceRange, SpineItemId, TableBlock, TableCell, TableRow, TextBaseline, TextBlock,
         TextBlockKind, TextRun, TextStyle, TocEntry,
     };
-    use rebook_reader::{ReaderPosition, ReaderSectionPage};
+    use rebook_reader::{PageDirection, ReaderPosition, ReaderSectionPage};
     use rebook_renderer::DisplayListCompiler;
     use std::sync::Arc;
 
@@ -2829,6 +2866,18 @@ mod tests {
             source: None,
         });
         assert!(block_is_footnote_definition(&definition));
+
+        let semantic_definition = Block::Text(TextBlock {
+            kind: TextBlockKind::FootnoteDefinition,
+            content: vec![Inline::Text(TextRun {
+                text: "Definition without an authored backlink".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: BlockStyle::default(),
+            source: None,
+        });
+        assert!(block_is_footnote_definition(&semantic_definition));
     }
 
     #[test]
@@ -3463,6 +3512,38 @@ mod tests {
     }
 
     #[test]
+    fn focus_navigation_empty_section_uses_the_adjacent_section() {
+        assert_eq!(
+            focus_navigation_destination(0, 0, PageDirection::Previous),
+            FocusNavigationDestination::AdjacentSection
+        );
+        assert_eq!(
+            focus_navigation_destination(0, 0, PageDirection::Next),
+            FocusNavigationDestination::AdjacentSection
+        );
+    }
+
+    #[test]
+    fn focus_navigation_moves_within_units_and_crosses_their_boundaries() {
+        assert_eq!(
+            focus_navigation_destination(3, 0, PageDirection::Previous),
+            FocusNavigationDestination::AdjacentSection
+        );
+        assert_eq!(
+            focus_navigation_destination(3, 0, PageDirection::Next),
+            FocusNavigationDestination::Unit(1)
+        );
+        assert_eq!(
+            focus_navigation_destination(3, 2, PageDirection::Previous),
+            FocusNavigationDestination::Unit(1)
+        );
+        assert_eq!(
+            focus_navigation_destination(3, 2, PageDirection::Next),
+            FocusNavigationDestination::AdjacentSection
+        );
+    }
+
+    #[test]
     fn focus_anchor_survives_async_content_and_viewport_refreshes() {
         assert!(!snapshot_reanchors_focus(
             SnapshotEffects::static_content_change()
@@ -3511,6 +3592,20 @@ mod tests {
             egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 180.0));
 
         assert!((focus_unit_target_offset_for_rect(paragraph, 800.0) - 620.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn final_short_focus_unit_has_a_reachable_centered_scroll_target() {
+        let viewport_height = 800.0;
+        let content_height = 820.0;
+        let final_line =
+            egui::Rect::from_min_size(egui::pos2(20.0, 780.0), egui::vec2(600.0, 40.0));
+        let target = focus_unit_target_offset_for_rect(final_line, viewport_height);
+        let maximum_offset =
+            focus_scroll_content_height(content_height, viewport_height) - viewport_height;
+
+        assert!(target > content_height);
+        assert!(target <= maximum_offset);
     }
 
     #[test]

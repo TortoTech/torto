@@ -113,6 +113,19 @@ fn explicit_link_role(node: Node<'_, '_>) -> Option<LinkRole> {
     None
 }
 
+fn is_semantic_footnote_definition(node: Node<'_, '_>) -> bool {
+    [attribute_local(node, "type"), attribute_local(node, "role")]
+        .into_iter()
+        .flatten()
+        .flat_map(str::split_ascii_whitespace)
+        .any(|token| {
+            matches!(
+                token.to_ascii_lowercase().as_str(),
+                "footnote" | "doc-footnote" | "endnote" | "doc-endnote"
+            )
+        })
+}
+
 fn node_fragment<'a>(node: Node<'a, '_>) -> Option<&'a str> {
     attribute_local(node, "id")
         .or_else(|| attribute_local(node, "name"))
@@ -314,6 +327,15 @@ impl ReadingIrParser {
         Ok(())
     }
 
+    fn parse_footnote_definition(&mut self, note: Node<'_, '_>) -> Result<(), HtmlError> {
+        let block_start = self.blocks.len();
+        self.parse_block_container(note)?;
+        for block in &mut self.blocks[block_start..] {
+            mark_block_as_footnote_definition(block);
+        }
+        Ok(())
+    }
+
     fn try_parse_sibling_quote(
         &mut self,
         container: Node<'_, '_>,
@@ -422,6 +444,10 @@ impl ReadingIrParser {
             self.paragraph_list_indents.clear();
         }
         self.queue_node_anchors(node);
+        if is_semantic_footnote_definition(node) {
+            self.parse_footnote_definition(node)?;
+            return Ok(());
+        }
         match name.as_str() {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let level = name[1..].parse::<u8>().unwrap_or(1);
@@ -563,7 +589,7 @@ impl ReadingIrParser {
         if children.is_empty() {
             let start = self.blocks.len();
             let mut style = self.styles.block_style(quote, BlockStyle::default());
-            style.indent += 24.0;
+            apply_default_blockquote_margin(&mut style);
             self.push_text_block(quote, TextBlockKind::Blockquote, style)?;
             let mut body = self
                 .blocks
@@ -667,7 +693,7 @@ impl ReadingIrParser {
                 Block::Text(mut block) => {
                     block.kind = TextBlockKind::Blockquote;
                     if semantic_blockquote {
-                        block.style.indent += 24.0;
+                        apply_default_blockquote_margin(&mut block.style);
                     }
                     Some(block)
                 }
@@ -851,6 +877,7 @@ impl ReadingIrParser {
                         "img" | "image"
                     )
                     && !has_nested_structured_container_ancestor(*descendant, node)
+                    && !image_is_footnote_reference(*descendant, &self.footnote_links)
             })
             .collect::<Vec<_>>();
         let image_count = images.len();
@@ -1092,6 +1119,7 @@ impl ReadingIrParser {
                         descendant.tag_name().name().to_ascii_lowercase().as_str(),
                         "img" | "image"
                     )
+                    && !image_is_footnote_reference(*descendant, &self.footnote_links)
             })
             .collect::<Vec<_>>();
         let image_count = images.len();
@@ -1234,6 +1262,24 @@ impl ReadingIrParser {
     }
 }
 
+fn mark_block_as_footnote_definition(block: &mut Block) {
+    let mark = |text: &mut TextBlock| text.kind = TextBlockKind::FootnoteDefinition;
+    match block {
+        Block::Text(text) => mark(text),
+        Block::Quote(quote) => {
+            quote.body.iter_mut().for_each(mark);
+            quote.attribution.iter_mut().for_each(mark);
+        }
+        Block::Table(table) => table
+            .rows
+            .iter_mut()
+            .flat_map(|row| &mut row.cells)
+            .for_each(|cell| mark(&mut cell.text)),
+        Block::Figure(figure) => figure.captions.iter_mut().for_each(mark),
+        Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => {}
+    }
+}
+
 struct InlineCollector {
     content: Vec<Inline>,
     preserve_whitespace: bool,
@@ -1255,7 +1301,7 @@ impl InlineCollector {
         } else {
             let mut result = String::new();
             for character in text.chars() {
-                if character.is_whitespace() {
+                if is_collapsible_html_whitespace(character) {
                     if !self.last_was_space {
                         result.push(' ');
                         self.last_was_space = true;
@@ -1282,6 +1328,31 @@ impl InlineCollector {
                 link,
             }));
         }
+    }
+
+    fn push_footnote_reference_marker(
+        &mut self,
+        marker: &str,
+        style: TextStyle,
+        link: Option<PublicationUrl>,
+    ) {
+        if !self.preserve_whitespace {
+            if let Some(Inline::Text(previous)) = self.content.last_mut() {
+                while previous
+                    .text
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| matches!(character, ' ' | '\u{00a0}'))
+                {
+                    previous.text.pop();
+                }
+                if previous.text.is_empty() {
+                    self.content.pop();
+                }
+            }
+            self.last_was_space = false;
+        }
+        self.push_text(marker, style, link);
     }
 
     fn push_break(&mut self) {
@@ -1328,6 +1399,13 @@ impl InlineCollector {
     }
 }
 
+fn is_collapsible_html_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' | ' '
+    )
+}
+
 struct InlineParseContext<'a> {
     base: &'a PublicationUrl,
     styles: &'a StyleSheet,
@@ -1346,6 +1424,41 @@ impl<'a> InlineParseContext<'a> {
             footnote_links,
         }
     }
+}
+
+fn image_is_footnote_reference(
+    image: Node<'_, '_>,
+    footnote_links: &HashMap<usize, LinkRole>,
+) -> bool {
+    image.ancestors().skip(1).any(|ancestor| {
+        ancestor.is_element()
+            && ancestor.tag_name().name().eq_ignore_ascii_case("a")
+            && footnote_links.get(&ancestor.range().start) == Some(&LinkRole::FootnoteReference)
+    })
+}
+
+fn footnote_reference_image_marker(image: Node<'_, '_>) -> String {
+    let accessible_text = [
+        attribute_local(image, "alt"),
+        attribute_local(image, "title"),
+        attribute_local(image, "aria-label"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|text| !text.is_empty());
+    let note_text = attribute_local(image, "zy-footnote")
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .or(accessible_text);
+
+    if note_text.is_some_and(|text| text.contains("译者注")) {
+        return "译".to_owned();
+    }
+    if let Some(marker) = accessible_text.and_then(normalize_footnote_marker) {
+        return marker;
+    }
+    "注".to_owned()
 }
 
 fn collect_inline(
@@ -1418,7 +1531,17 @@ fn collect_inline_node_with_block_boundaries(
         collector.push_break();
         return;
     }
-    if matches!(name.as_str(), "img" | "script" | "style") {
+    if name == "img" || name == "image" {
+        if inherited.link_role == LinkRole::FootnoteReference && link.is_some() {
+            collector.push_footnote_reference_marker(
+                &footnote_reference_image_marker(node),
+                inherited,
+                link.cloned(),
+            );
+        }
+        return;
+    }
+    if matches!(name.as_str(), "script" | "style") {
         return;
     }
     if preserve_block_boundaries && is_block_boundary(name.as_str()) {
@@ -1545,6 +1668,12 @@ fn effective_start_offset(style: BlockStyle) -> f32 {
     style
         .margin_start_fraction
         .mul_add(1_000.0, style.margin_start)
+}
+
+fn apply_default_blockquote_margin(style: &mut BlockStyle) {
+    if effective_start_offset(*style).abs() <= f32::EPSILON {
+        style.margin_start = 24.0;
+    }
 }
 
 fn quote_source_range(body: &[TextBlock], attribution: Option<&TextBlock>) -> Option<SourceRange> {
@@ -1862,6 +1991,12 @@ impl StyleSheet {
             let inherited_only = ancestor != node;
             let properties = self.cascaded_properties(ancestor);
             apply_block_properties(&mut style, &properties, inherited_only);
+            if let Some(alignment) =
+                attribute_local(ancestor, "align").and_then(parse_text_alignment)
+            {
+                style.align = alignment;
+                style.authored_alignment = Some(alignment);
+            }
         }
         style
     }
@@ -2225,6 +2360,7 @@ fn apply_block_properties(
         .and_then(|value| parse_text_alignment(value))
     {
         style.align = alignment;
+        style.authored_alignment = Some(alignment);
     }
     if let Some(value) = properties
         .get("text-indent")
@@ -2616,6 +2752,7 @@ mod tests {
             panic!("expected a text block");
         };
         assert_eq!(block.style.align, TextAlignment::End);
+        assert_eq!(block.style.authored_alignment, Some(TextAlignment::End));
         assert_close(block.style.line_height, 1.8);
         assert_close(block.style.margin_before, 32.0);
         assert_close(block.style.margin_after, 16.0);
@@ -2758,6 +2895,35 @@ mod tests {
     }
 
     #[test]
+    fn preserves_non_breaking_spaces_while_collapsing_html_whitespace() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p>2015年，Dark&#160;Reading
+                报道</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let Block::Text(paragraph) = &section.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        let text = paragraph
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run.text.as_str()),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "2015年，Dark\u{00a0}Reading 报道");
+    }
+
+    #[test]
     fn classifies_only_supported_inline_footnote_classes() {
         let descriptor = SpineItem {
             id: SpineItemId::new("chapter").unwrap(),
@@ -2831,6 +2997,89 @@ mod tests {
                 && run.style.baseline == TextBaseline::Normal
                 && run.style.link_role == LinkRole::FootnoteBacklink
         }));
+    }
+
+    #[test]
+    fn parses_image_noteref_and_marks_unlinked_epub_footnote_definition() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("EPUB/xhtml/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html xmlns="http://www.w3.org/1999/xhtml"
+            xmlns:epub="http://www.idpf.org/2007/ops"><body>
+            <aside epub:type="footnote" id="footnote-18-20">
+                <ol class="duokan-footnote-content">
+                    <li class="duokan-footnote-item">国际知名的演说家、作家。——译者注</li>
+                </ol>
+            </aside>
+            <p>——齐格·金克拉（Zig Ziglar）网站&#160;
+                <sup><a epub:type="noteref" href="#footnote-18-20"> <img
+                src="../images/image_010.png"
+                alt="国际知名的演说家、作家。——译者注"
+                zy-footnote="国际知名的演说家、作家。——译者注"
+                class="epub-footnote"/></a></sup>以及其他网站</p>
+        </body></html>"##;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        assert!(
+            !section
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Image(_)))
+        );
+
+        let definition = section
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Text(block) if block.kind == TextBlockKind::FootnoteDefinition => {
+                    Some(block)
+                }
+                _ => None,
+            })
+            .expect("semantic footnote definition");
+        assert!(definition.content.iter().any(|inline| {
+            matches!(inline, Inline::Text(run) if run.text.contains("国际知名的演说家"))
+        }));
+
+        let reference = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(&block.content),
+                _ => None,
+            })
+            .flatten()
+            .find_map(|inline| match inline {
+                Inline::Text(run) if run.style.link_role == LinkRole::FootnoteReference => {
+                    Some(run)
+                }
+                Inline::Text(_) | Inline::Math(_) | Inline::Break => None,
+            })
+            .expect("image-backed footnote reference");
+        assert_eq!(reference.text, "译");
+        assert_eq!(reference.style.baseline, TextBaseline::Superscript);
+        assert_eq!(
+            reference.link.as_ref().and_then(PublicationUrl::fragment),
+            Some("footnote-18-20")
+        );
+        let paragraph_text = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) if block.kind == TextBlockKind::Paragraph => Some(block),
+                _ => None,
+            })
+            .flat_map(|block| &block.content)
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run.text.as_str()),
+                Inline::Math(_) | Inline::Break => None,
+            })
+            .collect::<String>();
+        assert!(paragraph_text.contains("网站译以及"));
     }
 
     #[test]
@@ -4066,10 +4315,37 @@ mod tests {
             panic!("expected one semantic quote");
         };
         assert_eq!(quote.body.len(), 1);
+        assert_close(quote.body[0].style.margin_start, 24.0);
+        assert_close(quote.body[0].style.indent, 0.0);
         assert_eq!(
             quote.attribution.as_ref().map(|block| block.kind),
             Some(TextBlockKind::QuoteAttribution)
         );
+    }
+
+    #[test]
+    fn nested_blockquote_keeps_authored_margin_without_adding_first_line_indent() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            .outer { margin-left: 2em; }
+            .body { margin-left: 2em; text-indent: 2em; }
+        </style></head><body>
+            <blockquote class="outer"><blockquote class="body">Quoted prose.</blockquote></blockquote>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Quote(quote)] = section.blocks.as_slice() else {
+            panic!("expected one nested semantic quote");
+        };
+        assert_eq!(quote.body.len(), 1);
+        assert_close(quote.body[0].style.margin_start, 64.0);
+        assert_close(quote.body[0].style.indent, 32.0);
     }
 
     fn assert_close(actual: f32, expected: f32) {

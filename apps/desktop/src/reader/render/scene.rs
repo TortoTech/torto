@@ -64,6 +64,21 @@ pub(crate) struct ReaderScene {
     pub(crate) refresh_image_atlas: bool,
 }
 
+impl ReaderScene {
+    fn new(scene: Scene, images: Arc<[ImageData]>) -> Self {
+        // Vello's persistent image atlas must be refreshed whenever a rendered
+        // scene references images. This is a scene-content invariant, not a
+        // reading-mode behavior: classic and focus modes replay the same
+        // ImageData through the same renderer.
+        let refresh_image_atlas = !images.is_empty();
+        Self {
+            scene: Arc::new(scene),
+            images,
+            refresh_image_atlas,
+        }
+    }
+}
+
 fn evict_page_scene<T>(
     scenes: &mut HashMap<PageSceneKey, T>,
     lru: &mut VecDeque<PageSceneKey>,
@@ -83,7 +98,6 @@ impl DesktopReader {
         if self.is_scroll_mode() {
             return self.scroll_page_scene();
         }
-        let refresh_image_atlas = self.is_focus_mode();
         let layers = self.page_scene_layers();
         let mut scene = Scene::new();
         scene.append(&layers.underlay, None);
@@ -116,31 +130,18 @@ impl DesktopReader {
             }
             Err(error) => self.error = Some(format!("组合双页失败：{error}")),
         }
-        ReaderScene {
-            scene: Arc::new(scene),
-            images: Arc::clone(&layers.images),
-            refresh_image_atlas,
-        }
+        ReaderScene::new(scene, Arc::clone(&layers.images))
     }
 
     fn scroll_page_scene(&mut self) -> ReaderScene {
-        let refresh_image_atlas = self.is_focus_mode();
         let Some(viewport) = self.scroll_viewport else {
-            return ReaderScene {
-                scene: Arc::new(Scene::new()),
-                images: Arc::from([]),
-                refresh_image_atlas,
-            };
+            return ReaderScene::new(Scene::new(), Arc::from([]));
         };
         let layout = match self.current_scroll_layout() {
             Ok(layout) => layout,
             Err(error) => {
                 self.error = Some(format!("生成滑动章节失败：{error}"));
-                return ReaderScene {
-                    scene: Arc::new(Scene::new()),
-                    images: Arc::from([]),
-                    refresh_image_atlas,
-                };
+                return ReaderScene::new(Scene::new(), Arc::from([]));
             }
         };
         let content_padding = self.scroll_content_padding(viewport.size.y);
@@ -218,11 +219,7 @@ impl DesktopReader {
                 ),
             );
         }
-        ReaderScene {
-            scene: Arc::new(scene),
-            images: images.into(),
-            refresh_image_atlas,
-        }
+        ReaderScene::new(scene, images.into())
     }
 
     fn scroll_page_layers(&mut self, entry: &ReaderSectionPage) -> Arc<PageSceneLayers> {
@@ -354,6 +351,8 @@ impl DesktopReader {
                 focus_footnote_icon_color(),
                 offset_x,
             );
+        } else if !self.is_focus_mode() {
+            page.paint_all_footnote_icons(scene, focus_footnote_icon_color(), offset_x);
         }
         for highlight in &self.highlights {
             page.paint_source_ranges(scene, &highlight.ranges, ANNOTATION_MARK_COLOR, offset_x);
@@ -427,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn evicting_a_focus_image_page_removes_only_its_cached_scene() {
+    fn evicting_an_image_page_removes_only_its_cached_scene() {
         let image_page = ReaderPosition {
             section_index: 2,
             segment_index: 1,
@@ -456,5 +455,19 @@ mod tests {
         assert_eq!(lru, VecDeque::from([text_key]));
         assert!(!evict_page_scene(&mut scenes, &mut lru, image_page));
         assert_eq!(lru, VecDeque::from([text_key]));
+    }
+
+    #[test]
+    fn every_scene_with_images_refreshes_the_vello_atlas() {
+        let image = ImageData {
+            data: peniko::Blob::new(Arc::new(vec![255, 255, 255, 255])),
+            format: peniko::ImageFormat::Rgba8,
+            alpha_type: peniko::ImageAlphaType::Alpha,
+            width: 1,
+            height: 1,
+        };
+
+        assert!(!ReaderScene::new(Scene::new(), Arc::from([])).refresh_image_atlas);
+        assert!(ReaderScene::new(Scene::new(), vec![image].into()).refresh_image_atlas);
     }
 }

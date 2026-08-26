@@ -1227,6 +1227,21 @@ impl ReaderSession {
             .map(|hit| reader_text_hit(position, hit)))
     }
 
+    /// Resolves a semantic footnote icon on one logical page.
+    pub fn footnote_source_at_page(
+        &mut self,
+        position: ReaderPosition,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<SourceRange>, ReaderError> {
+        let key = SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        };
+        self.ensure_segment(key)?;
+        Ok(self.page_at(position)?.footnote_source_at(x, y))
+    }
+
     pub fn image_at_page(
         &mut self,
         position: ReaderPosition,
@@ -1340,6 +1355,22 @@ impl ReaderSession {
             .find_map(|(position, page, offset_x)| {
                 page.image_at(x - *offset_x, y)
                     .map(|hit| reader_image(*position, hit, *offset_x))
+            }))
+    }
+
+    /// Resolves a semantic footnote icon under a visible spread coordinate.
+    pub fn footnote_source_at_current_spread(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<(ReaderPosition, SourceRange)>, ReaderError> {
+        Ok(self
+            .current_spread_pages()?
+            .iter()
+            .rev()
+            .find_map(|(position, page, offset_x)| {
+                page.footnote_source_at(x - *offset_x, y)
+                    .map(|source| (*position, source))
             }))
     }
 
