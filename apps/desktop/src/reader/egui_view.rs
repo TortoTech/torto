@@ -2629,9 +2629,13 @@ impl DesktopReader {
                     );
                 }
             });
+        let clicked_visual_preview = self.chat_markdown.take_clicked_visual_preview();
         auto_scroll_assistant_selection(ui.ctx(), &scroll_output);
         if let Some(locator) = clicked_citation {
             self.open_chat_citation(&locator);
+        }
+        if let Some(preview) = clicked_visual_preview {
+            self.open_color_image_preview(ui.ctx(), preview.image, "chat-visual-preview");
         }
     }
 
@@ -3429,8 +3433,23 @@ impl DesktopReader {
 
         let color_image =
             egui::ColorImage::from_rgba_unmultiplied([width, height], &image.pixels[..byte_len]);
+        self.open_color_image_preview(ctx, color_image, "reader-image-preview");
+        true
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "GPU-bounded image dimensions are converted to egui's f32 geometry"
+    )]
+    fn open_color_image_preview(
+        &mut self,
+        ctx: &egui::Context,
+        color_image: egui::ColorImage,
+        texture_namespace: &str,
+    ) {
+        let source_size = Vec2::new(color_image.size[0] as f32, color_image.size[1] as f32);
         let texture = ctx.load_texture(
-            format!("reader-image-preview-{}", self.scene_revision),
+            format!("{texture_namespace}-{}", self.scene_revision),
             color_image.clone(),
             egui::TextureOptions::LINEAR,
         );
@@ -3441,12 +3460,11 @@ impl DesktopReader {
         self.image_preview = Some(super::ImagePreview {
             texture,
             image: color_image,
-            source_size: Vec2::new(image.width as f32, image.height as f32),
+            source_size,
             zoom: 1.0,
             pan: Vec2::ZERO,
         });
         ctx.request_repaint();
-        true
     }
 
     fn copy_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) {

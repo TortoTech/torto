@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
-use egui::{Color32, FontFamily, FontId, ImageSource, RichText, Sense, Stroke, TextStyle, Vec2};
+use egui::load::{ImagePoll, SizeHint};
+use egui::{
+    Color32, ColorImage, FontFamily, FontId, ImageSource, RichText, Sense, Stroke, TextStyle, Vec2,
+};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
@@ -36,6 +39,11 @@ pub(super) struct ChatMarkdownState {
     asset_sender: SyncSender<AssetRequest>,
     asset_receiver: Receiver<AssetResult>,
     preview_states: HashMap<u64, PreviewState>,
+    clicked_visual_preview: Option<ChatVisualPreview>,
+}
+
+pub(super) struct ChatVisualPreview {
+    pub(super) image: ColorImage,
 }
 
 impl Default for ChatMarkdownState {
@@ -52,11 +60,16 @@ impl Default for ChatMarkdownState {
             asset_sender,
             asset_receiver,
             preview_states: HashMap::new(),
+            clicked_visual_preview: None,
         }
     }
 }
 
 impl ChatMarkdownState {
+    pub(super) fn take_clicked_visual_preview(&mut self) -> Option<ChatVisualPreview> {
+        self.clicked_visual_preview.take()
+    }
+
     pub(super) fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -241,12 +254,13 @@ impl ChatMarkdownState {
         streaming: bool,
         state: &mut PreviewState,
     ) {
-        match kind {
+        let clicked_preview = match kind {
             PreviewKind::Svg => {
                 if is_svg_markup(source) {
-                    paint_svg(ui, source.as_bytes(), "svg-preview", false);
+                    paint_svg(ui, source.as_bytes(), "svg-preview", false, true)
                 } else {
                     preview_error(ui, language.text("SVG 内容无效", "Invalid SVG content"));
+                    None
                 }
             }
             PreviewKind::Mermaid => {
@@ -275,8 +289,11 @@ impl ChatMarkdownState {
                     streaming,
                     &mut state.frame_height,
                     &mut state.frame_width,
-                );
+                )
             }
+        };
+        if clicked_preview.is_some() {
+            self.clicked_visual_preview = clicked_preview;
         }
     }
 
@@ -370,7 +387,7 @@ fn show_commonmark_fragment(
     };
     let html_renderer = |ui: &mut egui::Ui, html: &str| {
         if is_svg_markup(html) {
-            paint_svg(ui, html.as_bytes(), "inline-svg", false);
+            paint_svg(ui, html.as_bytes(), "inline-svg", false, false);
         } else {
             ui.add(
                 egui::Label::new(RichText::new(html).monospace().size(markdown_font_size()))
@@ -764,10 +781,10 @@ fn paint_preview_asset(
     streaming: bool,
     frame_height: &mut f32,
     frame_width: &mut f32,
-) {
+) -> Option<ChatVisualPreview> {
     let Some(AssetStatus::Ready(asset)) = assets.get(key) else {
         paint_asset(ui, assets, key, false);
-        return;
+        return None;
     };
 
     let available_width = ui.available_width().max(1.0);
@@ -779,26 +796,31 @@ fn paint_preview_asset(
 
     let uri = format!("bytes://rebook-chat-{}.svg", stable_hash(key));
     let image = egui::Image::new(ImageSource::Bytes {
-        uri: uri.into(),
+        uri: uri.clone().into(),
         bytes: egui::load::Bytes::Shared(Arc::clone(&asset.svg)),
     })
     .fit_to_exact_size(display_size);
     ui.allocate_ui_with_layout(
         Vec2::new(available_width, (*frame_height).max(display_size.y)),
         egui::Layout::top_down(egui::Align::Center),
-        |ui| {
-            ui.add(image);
-        },
-    );
+        |ui| paint_visual_preview_image(ui, image, &uri, true),
+    )
+    .inner
 }
 
-fn paint_svg(ui: &mut egui::Ui, bytes: &[u8], namespace: &str, inline: bool) {
+fn paint_svg(
+    ui: &mut egui::Ui,
+    bytes: &[u8],
+    namespace: &str,
+    inline: bool,
+    previewable: bool,
+) -> Option<ChatVisualPreview> {
     let uri = format!(
         "bytes://rebook-chat-{namespace}-{}.svg",
         stable_hash(&bytes)
     );
     let mut image = egui::Image::new(ImageSource::Bytes {
-        uri: uri.into(),
+        uri: uri.clone().into(),
         bytes: egui::load::Bytes::Shared(Arc::from(bytes)),
     });
     if inline {
@@ -808,7 +830,7 @@ fn paint_svg(ui: &mut egui::Ui, bytes: &[u8], namespace: &str, inline: bool) {
             Ok(source_size) => source_size,
             Err(error) => {
                 preview_error(ui, &error);
-                return;
+                return None;
             }
         };
         image = image.fit_to_exact_size(asset_display_size(
@@ -818,7 +840,66 @@ fn paint_svg(ui: &mut egui::Ui, bytes: &[u8], namespace: &str, inline: bool) {
             true,
         ));
     }
-    ui.add(image);
+    paint_visual_preview_image(ui, image, &uri, previewable)
+}
+
+fn paint_visual_preview_image(
+    ui: &mut egui::Ui,
+    image: egui::Image<'_>,
+    uri: &str,
+    previewable: bool,
+) -> Option<ChatVisualPreview> {
+    let image = if previewable {
+        image.sense(Sense::click())
+    } else {
+        image
+    };
+    let mut response = ui.add(image);
+    if !previewable {
+        return None;
+    }
+    response = response.on_hover_cursor(egui::CursorIcon::ZoomIn);
+    if !response.clicked() {
+        return None;
+    }
+    match ui
+        .ctx()
+        .try_load_image(uri, visual_preview_size_hint(ui.ctx()))
+    {
+        Ok(ImagePoll::Ready { image }) => Some(ChatVisualPreview {
+            image: (*image).clone(),
+        }),
+        Ok(ImagePoll::Pending { .. }) => {
+            ui.ctx().request_repaint();
+            None
+        }
+        Err(_) => {
+            crate::diagnostics::log(
+                "chat.visual_preview.load_error",
+                &[crate::diagnostics::Field::Text("stage", "svg_raster")],
+            );
+            None
+        }
+    }
+}
+
+fn visual_preview_size_hint(ctx: &egui::Context) -> SizeHint {
+    visual_preview_size_hint_for(ctx.content_rect().size(), ctx.pixels_per_point())
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the bounded positive viewport size is converted to an SVG raster size hint"
+)]
+fn visual_preview_size_hint_for(viewport_size: Vec2, pixels_per_point: f32) -> SizeHint {
+    const MAX_RASTER_DIMENSION: f32 = 4096.0;
+    let pixels = viewport_size * pixels_per_point.max(1.0);
+    SizeHint::Size {
+        width: pixels.x.round().clamp(1.0, MAX_RASTER_DIMENSION) as u32,
+        height: pixels.y.round().clamp(1.0, MAX_RASTER_DIMENSION) as u32,
+        maintain_aspect_ratio: true,
+    }
 }
 
 fn preview_error(ui: &mut egui::Ui, error: &str) {
@@ -1860,6 +1941,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn visual_preview_raster_size_tracks_pixels_and_stays_gpu_bounded() {
+        assert_eq!(
+            visual_preview_size_hint_for(Vec2::new(1280.0, 720.0), 1.5),
+            SizeHint::Size {
+                width: 1920,
+                height: 1080,
+                maintain_aspect_ratio: true,
+            }
+        );
+        assert_eq!(
+            visual_preview_size_hint_for(Vec2::new(8000.0, 6000.0), 2.0),
+            SizeHint::Size {
+                width: 4096,
+                height: 4096,
+                maintain_aspect_ratio: true,
+            }
+        );
+    }
+
+    #[test]
     fn extracts_svg_and_mermaid_without_replacing_regular_code() {
         let source = r#"# Heading
 
@@ -1926,6 +2027,7 @@ flowchart LR
             asset_sender,
             asset_receiver,
             preview_states: HashMap::new(),
+            clicked_visual_preview: None,
         };
         let first = AssetKey::Mermaid("flowchart LR\nA".to_owned());
         let newest = AssetKey::Mermaid("flowchart LR\nA --> B".to_owned());

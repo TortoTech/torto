@@ -719,6 +719,7 @@ fn reader_font_settings(
     typesetting: &mut rebook_layout::ReaderTypesetting,
     font_families: &rebook_layout::ReaderFontFamilies,
 ) {
+    enforce_focus_typesetting_mode(*reading_mode, typesetting);
     settings_card(ui, |ui| {
         egui::Grid::new("typography-settings-grid")
             .num_columns(2)
@@ -730,6 +731,7 @@ fn reader_font_settings(
                     if choice_button(ui, language.text("专注模式", "Focus mode"), focus).clicked()
                     {
                         *reading_mode = ReadingMode::Focus;
+                        enforce_focus_typesetting_mode(*reading_mode, typesetting);
                     }
                     let classic = *reading_mode == ReadingMode::Classic;
                     if choice_button(ui, language.text("经典模式", "Classic mode"), classic)
@@ -740,7 +742,7 @@ fn reader_font_settings(
                 });
                 ui.end_row();
 
-                if *reading_mode == ReadingMode::Classic {
+                if classic_content_settings_visible(*reading_mode) {
                     settings_row_label(ui, language.text("正文布局", "Content layout"));
                     settings_row_control_sized(ui, 300.0, |ui| {
                         let single = *spread == SpreadMode::Single;
@@ -762,21 +764,24 @@ fn reader_font_settings(
                     ui.end_row();
                 }
 
-                settings_row_label(ui, language.text("正文样式", "Content style"));
-                settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
-                    let unified = typesetting.mode == TypesettingMode::Unified;
-                    if choice_button(ui, language.text("统一覆盖", "Unified override"), unified)
-                        .clicked()
-                    {
-                        typesetting.mode = TypesettingMode::Unified;
-                    }
-                    let book = typesetting.mode == TypesettingMode::Book;
-                    if choice_button(ui, language.text("跟随书籍", "Follow book"), book).clicked()
-                    {
-                        typesetting.mode = TypesettingMode::Book;
-                    }
-                });
-                ui.end_row();
+                if classic_content_settings_visible(*reading_mode) {
+                    settings_row_label(ui, language.text("正文样式", "Content style"));
+                    settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
+                        let unified = typesetting.mode == TypesettingMode::Unified;
+                        if choice_button(ui, language.text("统一覆盖", "Unified override"), unified)
+                            .clicked()
+                        {
+                            typesetting.mode = TypesettingMode::Unified;
+                        }
+                        let book = typesetting.mode == TypesettingMode::Book;
+                        if choice_button(ui, language.text("跟随书籍", "Follow book"), book)
+                            .clicked()
+                        {
+                            typesetting.mode = TypesettingMode::Book;
+                        }
+                    });
+                    ui.end_row();
+                }
 
                 settings_row_label(ui, language.text("默认字体", "Default font"));
                 settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
@@ -831,6 +836,19 @@ fn reader_font_settings(
                 );
             });
     });
+}
+
+fn enforce_focus_typesetting_mode(
+    reading_mode: ReadingMode,
+    typesetting: &mut rebook_layout::ReaderTypesetting,
+) {
+    if reading_mode == ReadingMode::Focus {
+        typesetting.mode = TypesettingMode::Unified;
+    }
+}
+
+fn classic_content_settings_visible(reading_mode: ReadingMode) -> bool {
+    reading_mode == ReadingMode::Classic
 }
 
 #[allow(
@@ -2086,6 +2104,28 @@ fn secondary_button_with_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_mode_forces_unified_typesetting_and_locks_the_content_style() {
+        let mut typesetting = rebook_layout::ReaderTypesetting::default();
+        typesetting.mode = TypesettingMode::Book;
+
+        enforce_focus_typesetting_mode(ReadingMode::Focus, &mut typesetting);
+
+        assert_eq!(typesetting.mode, TypesettingMode::Unified);
+        assert!(!classic_content_settings_visible(ReadingMode::Focus));
+        assert!(classic_content_settings_visible(ReadingMode::Classic));
+    }
+
+    #[test]
+    fn classic_mode_preserves_the_selected_typesetting_mode() {
+        let mut typesetting = rebook_layout::ReaderTypesetting::default();
+        typesetting.mode = TypesettingMode::Book;
+
+        enforce_focus_typesetting_mode(ReadingMode::Classic, &mut typesetting);
+
+        assert_eq!(typesetting.mode, TypesettingMode::Book);
+    }
 
     #[test]
     fn secondary_buttons_keep_dynamic_and_fixed_widths_separate() {
