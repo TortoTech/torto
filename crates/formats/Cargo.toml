@@ -11,6 +11,7 @@ crc32fast.workspace = true
 encoding_rs.workspace = true
 flate2.workspace = true
 hayro.workspace = true
+image.workspace = true
 kurbo.workspace = true
 libchm.workspace = true
 quick-xml.workspace = true

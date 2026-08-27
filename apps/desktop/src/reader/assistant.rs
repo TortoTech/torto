@@ -1897,7 +1897,8 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
         Block::Figure(block) => block.source.as_ref(),
-        Block::Separator | Block::LineBreak | Block::PageBreak => None,
+        Block::Note(block) => block.source.as_ref(),
+        Block::Separator(_) | Block::LineBreak | Block::PageBreak => None,
     }
 }
 
@@ -1965,7 +1966,8 @@ fn block_text(block: &Block) -> String {
                 caption
             }
         }
-        Block::Separator | Block::LineBreak | Block::PageBreak => String::new(),
+        Block::Note(_) => String::new(),
+        Block::Separator(_) | Block::LineBreak | Block::PageBreak => String::new(),
     }
 }
 

@@ -139,7 +139,8 @@ fn search_sections(
                 }
                 Block::Figure(_)
                 | Block::Table(_)
-                | Block::Separator
+                | Block::Note(_)
+                | Block::Separator(_)
                 | Block::LineBreak
                 | Block::PageBreak => {
                     continue;

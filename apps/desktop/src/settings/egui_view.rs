@@ -266,6 +266,8 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         "operation-shortcuts-grid",
         language.text("操作", "Actions"),
         &[
+            (ShortcutAction::Search, language.text("搜索", "Search")),
+            (ShortcutAction::Copy, language.text("复制", "Copy")),
             (
                 ShortcutAction::ToggleTranslation,
                 language.text("翻译开关", "Toggle translation"),

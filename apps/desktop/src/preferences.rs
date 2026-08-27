@@ -146,6 +146,10 @@ pub(crate) struct ShortcutPreferences {
     pub(crate) toggle_right_sidebar: egui::KeyboardShortcut,
     #[serde(default = "default_toggle_translation_shortcut")]
     pub(crate) toggle_translation: egui::KeyboardShortcut,
+    #[serde(default = "default_search_shortcut")]
+    pub(crate) search: egui::KeyboardShortcut,
+    #[serde(default = "default_copy_shortcut")]
+    pub(crate) copy: egui::KeyboardShortcut,
     #[serde(default = "default_return_to_shelf_shortcut")]
     pub(crate) return_to_shelf: egui::KeyboardShortcut,
     #[serde(default = "default_focus_actions_shortcut")]
@@ -177,12 +181,14 @@ impl ShortcutPreferences {
             .any(|binding| shortcut_chord_key_count(binding.modifiers) > MAX_SHORTCUT_KEYS)
     }
 
-    fn bindings(&self) -> [egui::KeyboardShortcut; 11] {
+    fn bindings(&self) -> [egui::KeyboardShortcut; 13] {
         [
             self.fullscreen,
             self.toggle_left_sidebar,
             self.toggle_right_sidebar,
             self.toggle_translation,
+            self.search,
+            self.copy,
             self.return_to_shelf,
             self.focus_actions,
             self.focus_chat,
@@ -217,6 +223,8 @@ impl Default for ShortcutPreferences {
             toggle_left_sidebar: default_toggle_left_sidebar_shortcut(),
             toggle_right_sidebar: default_toggle_right_sidebar_shortcut(),
             toggle_translation: default_toggle_translation_shortcut(),
+            search: default_search_shortcut(),
+            copy: default_copy_shortcut(),
             return_to_shelf: default_return_to_shelf_shortcut(),
             focus_actions: default_focus_actions_shortcut(),
             focus_chat: default_focus_chat_shortcut(),
@@ -242,6 +250,14 @@ const fn default_toggle_right_sidebar_shortcut() -> egui::KeyboardShortcut {
 
 const fn default_toggle_translation_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::T)
+}
+
+const fn default_search_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F)
+}
+
+const fn default_copy_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C)
 }
 
 const fn default_return_to_shelf_shortcut() -> egui::KeyboardShortcut {
@@ -630,6 +646,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_shortcuts_gain_search_and_copy_defaults() {
+        let json = r#"{"version":1,"shortcuts":{}}"#;
+        let stored: StoredReaderPreferences = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            stored.shortcuts.search,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F)
+        );
+        assert_eq!(
+            stored.shortcuts.copy,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C)
+        );
+    }
+
+    #[test]
     fn legacy_typesetting_defaults_migrate_to_the_compact_profile() {
         let mut typesetting = ReaderTypesetting {
             line_break_strategy: LineBreakStrategy::Greedy,
@@ -680,6 +711,14 @@ mod tests {
         assert_eq!(
             shortcuts.toggle_translation,
             egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::T)
+        );
+        assert_eq!(
+            shortcuts.search,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F)
+        );
+        assert_eq!(
+            shortcuts.copy,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C)
         );
         assert_eq!(
             shortcuts.return_to_shelf,

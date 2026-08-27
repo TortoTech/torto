@@ -2986,7 +2986,7 @@ fn reading_unit_has_activatable_content(unit: &ReadingUnit, fragments: &[Content
                     && block_text_len(block) > 0
             }
             Block::Quote(_) | Block::Image(_) | Block::Figure(_) | Block::Table(_) => true,
-            Block::Separator | Block::LineBreak | Block::PageBreak => false,
+            Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => false,
         })
 }
 
@@ -3351,7 +3351,8 @@ fn block_text_len(block: &Block) -> usize {
             .iter()
             .map(|caption| inline_content_len(&caption.content))
             .sum(),
-        Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => 0,
+        Block::Note(note) => note.blocks.iter().map(block_text_len).sum(),
+        Block::Image(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => 0,
     }
 }
 
@@ -3385,7 +3386,8 @@ fn block_source(block: &Block) -> Option<&SourceRange> {
         Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
         Block::Figure(block) => block.source.as_ref(),
-        Block::Separator | Block::LineBreak | Block::PageBreak => None,
+        Block::Note(block) => block.source.as_ref(),
+        Block::Separator(_) | Block::LineBreak | Block::PageBreak => None,
     }
 }
 

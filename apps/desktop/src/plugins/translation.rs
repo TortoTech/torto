@@ -290,7 +290,7 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
                     },
                 ));
             }
-            Block::Separator | Block::LineBreak | Block::PageBreak => {}
+            Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {}
         }
     }
     blocks
@@ -322,7 +322,8 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
         Block::Figure(block) => block.source.as_ref(),
-        Block::Separator | Block::LineBreak | Block::PageBreak => None,
+        Block::Note(block) => block.source.as_ref(),
+        Block::Separator(_) | Block::LineBreak | Block::PageBreak => None,
     }
 }
 

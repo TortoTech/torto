@@ -793,7 +793,7 @@ impl DesktopReader {
         }
         let open_search = !interaction_blocked
             && !self.ui.overlay_visible()
-            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F));
+            && ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.search));
         if open_search {
             self.open_search();
             return;
@@ -3507,7 +3507,7 @@ impl DesktopReader {
         if copy_image.is_none() && selection_text.is_none() && focus_text.is_none() {
             return;
         }
-        if !ctx.input_mut(consume_copy_shortcut) {
+        if !ctx.input_mut(|input| consume_copy_shortcut(input, &self.shortcuts.copy)) {
             return;
         }
 
@@ -4611,9 +4611,10 @@ impl SelectedImage {
     }
 }
 
-fn consume_copy_shortcut(input: &mut egui::InputState) -> bool {
-    consume_copy_event(&mut input.events)
-        || input.consume_key(egui::Modifiers::COMMAND, egui::Key::C)
+fn consume_copy_shortcut(input: &mut egui::InputState, shortcut: &egui::KeyboardShortcut) -> bool {
+    let native_copy = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C);
+    (*shortcut == native_copy && consume_copy_event(&mut input.events))
+        || input.consume_shortcut(shortcut)
 }
 
 fn focus_unit_copy_text(
@@ -4868,6 +4869,14 @@ mod reference_suggestion_label_tests {
     #[test]
     fn focus_mode_shortcuts_match_the_reader_contract() {
         let shortcuts = crate::preferences::ShortcutPreferences::default();
+        assert_eq!(
+            shortcuts.search,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F)
+        );
+        assert_eq!(
+            shortcuts.copy,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C)
+        );
         assert_eq!(
             shortcuts.focus_actions,
             egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Space)

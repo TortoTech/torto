@@ -2124,7 +2124,7 @@ fn ai_block_content(block: &Block, is_pdf: bool) -> Option<(&SourceRange, String
                 .join("; ");
             (!is_pdf && !alt.is_empty()).then_some((source, alt, "figure-alt"))
         }
-        Block::Separator | Block::LineBreak | Block::PageBreak => None,
+        Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => None,
     }
 }
 

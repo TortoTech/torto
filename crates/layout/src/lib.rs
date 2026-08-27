@@ -14,10 +14,11 @@ use parley::{
 };
 use read_fonts::{FontRef, TableProvider as _};
 use rebook_publication::{
-    Block, BookSource, CaptionPosition, FixedPageDimensions, FixedPageTextLayer, FixedPageTextRect,
-    ImageBlock, ImageStyle, Inline, InlineRole, LinkRole, MathRun, PublicationError,
-    PublicationUrl, RenditionLayout, Rgba, Section, SourceRange, TableBlock, TableCell,
-    TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle, WritingSystem,
+    Block, BlockStyle, BookSource, CaptionPosition, FixedPageDimensions, FixedPageTextLayer,
+    FixedPageTextRect, ImageBlock, ImageStyle, Inline, InlineRole, LinkRole, MathRun,
+    NoteBlockKind, PublicationError, PublicationUrl, RenditionLayout, Rgba, Section, SeparatorKind,
+    SourceRange, TableBlock, TableCell, TextAlignment, TextBaseline, TextBlock, TextBlockKind,
+    TextRun, TextStyle, WritingSystem,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -602,6 +603,28 @@ fn should_layout_flow_block(block: &Block, reader_style: &ReaderStyle) -> bool {
     !reader_style.focus_footnote_icons || !block.is_footnote_definition()
 }
 
+fn collect_layout_blocks<'a>(
+    blocks: &'a [Block],
+    reader_style: &ReaderStyle,
+    output: &mut Vec<&'a Block>,
+) {
+    for block in blocks {
+        if let Block::Note(note) = block {
+            let hidden = match note.kind {
+                NoteBlockKind::Definition => reader_style.focus_footnote_icons,
+                NoteBlockKind::Section => reader_style.typesetting.mode == TypesettingMode::Unified,
+            };
+            if !hidden {
+                collect_layout_blocks(&note.blocks, reader_style, output);
+            }
+            continue;
+        }
+        if should_layout_flow_block(block, reader_style) {
+            output.push(block);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReaderFontFamilies {
     pub all: Vec<String>,
@@ -834,262 +857,211 @@ impl LayoutEngine {
         );
         paginator.media_start_offset = media_start_offset;
 
+        let mut layout_blocks = Vec::new();
         for blocks in fragments {
-            for block in *blocks {
-                if !should_layout_flow_block(block, reader_style) {
-                    continue;
+            collect_layout_blocks(blocks, reader_style, &mut layout_blocks);
+        }
+        let mut block_index = 0;
+        while block_index < layout_blocks.len() {
+            if unified_reflow
+                && let (Some(Block::Image(image)), Some(Block::Text(caption))) = (
+                    layout_blocks.get(block_index).copied(),
+                    layout_blocks.get(block_index + 1).copied(),
+                )
+                && caption.kind == TextBlockKind::Caption
+            {
+                self.push_figure(
+                    &mut paginator,
+                    source,
+                    std::slice::from_ref(image),
+                    std::slice::from_ref(caption),
+                    CaptionPosition::After,
+                    BlockStyle::default(),
+                    reader_style,
+                    content_width,
+                    media_start_offset,
+                    true,
+                )?;
+                block_index += 2;
+                continue;
+            }
+
+            let block = layout_blocks[block_index];
+            match block {
+                Block::Text(block) => {
+                    let resolved = resolve_text_block(block, reader_style, TextContext::Flow);
+                    let prepared = self.shape_text(&resolved, reader_style, content_width);
+                    paginator.push_text(&prepared, &resolved)?;
                 }
-                match block {
-                    Block::Text(block) => {
-                        let resolved = resolve_text_block(block, reader_style, TextContext::Flow);
-                        let prepared = self.shape_text(&resolved, reader_style, content_width);
-                        paginator.push_text(&prepared, &resolved)?;
-                    }
-                    Block::Quote(quote) => {
-                        let quote_horizontal_padding = if unified_reflow {
-                            reader_style.typography.font_size
-                                * paragraph_indent_em(
-                                    &reader_style.typesetting,
-                                    reader_style.writing_system,
-                                )
-                        } else {
-                            0.0
-                        };
-                        let quote_width = if unified_reflow {
-                            (content_width - quote_horizontal_padding * 2.0).max(40.0)
-                        } else {
-                            content_width
-                        };
-                        let mut prepared_body = Vec::with_capacity(quote.body.len());
-                        for (index, body) in quote.body.iter().enumerate() {
-                            let mut resolved =
-                                resolve_text_block(body, reader_style, TextContext::Flow);
-                            if unified_reflow
-                                && quote.attribution.is_none()
-                                && index + 1 == quote.body.len()
-                            {
-                                // The card already owns its bottom padding. Keeping the unified
-                                // paragraph gap after the final body paragraph would make a quote
-                                // without an attribution visibly bottom-heavy.
-                                resolved.to_mut().style.margin_after = 0.0;
-                            }
-                            let mut prepared =
-                                self.shape_text(&resolved, reader_style, quote_width);
-                            if unified_reflow {
-                                prepared.start_offset += quote_horizontal_padding;
-                            }
-                            prepared_body.push((prepared, resolved));
+                Block::Quote(quote) => {
+                    let quote_horizontal_padding = if unified_reflow {
+                        reader_style.typography.font_size
+                            * paragraph_indent_em(
+                                &reader_style.typesetting,
+                                reader_style.writing_system,
+                            )
+                    } else {
+                        0.0
+                    };
+                    let quote_width = if unified_reflow {
+                        (content_width - quote_horizontal_padding * 2.0).max(40.0)
+                    } else {
+                        content_width
+                    };
+                    let mut prepared_body = Vec::with_capacity(quote.body.len());
+                    for (index, body) in quote.body.iter().enumerate() {
+                        let mut resolved =
+                            resolve_text_block(body, reader_style, TextContext::Flow);
+                        if unified_reflow
+                            && quote.attribution.is_none()
+                            && index + 1 == quote.body.len()
+                        {
+                            // The card already owns its bottom padding. Keeping the unified
+                            // paragraph gap after the final body paragraph would make a quote
+                            // without an attribution visibly bottom-heavy.
+                            resolved.to_mut().style.margin_after = 0.0;
                         }
-                        let prepared_attribution = quote.attribution.as_ref().map(|attribution| {
-                            let resolved =
-                                resolve_text_block(attribution, reader_style, TextContext::Flow);
-                            let mut prepared =
-                                self.shape_text(&resolved, reader_style, quote_width);
-                            if unified_reflow {
-                                prepared.start_offset += quote_horizontal_padding;
-                            }
-                            (prepared, resolved)
-                        });
+                        let mut prepared = self.shape_text(&resolved, reader_style, quote_width);
                         if unified_reflow {
-                            let content_height = prepared_body
-                                .iter()
-                                .map(|(prepared, resolved)| {
-                                    prepared_flow_height(prepared)
-                                        + resolved.style.margin_before.max(0.0)
-                                        + resolved.style.margin_after.max(0.0)
-                                })
-                                .chain(prepared_attribution.iter().map(|(prepared, resolved)| {
-                                    prepared_flow_height(prepared)
-                                        + resolved.style.margin_before.max(0.0)
-                                        + resolved.style.margin_after.max(0.0)
-                                }))
-                                .sum::<f32>();
-                            // Keep a short quote card intact. The leading outer
-                            // gap and both internal paddings must fit before its
-                            // trailing attribution; the final outer gap may flow
-                            // naturally after the completed card.
-                            paginator.keep_together_if_fits(
-                                content_height + QUOTE_VERTICAL_PADDING * 3.0,
-                            );
-                            let sources = quote
-                                .body
-                                .iter()
-                                .filter_map(|block| block.source.clone())
-                                .chain(
-                                    quote
-                                        .attribution
-                                        .iter()
-                                        .filter_map(|block| block.source.clone()),
-                                )
-                                .collect();
-                            let outer_gap = (reader_style.typography.font_size
-                                * reader_style.typesetting.paragraph_gap_em)
-                                .max(QUOTE_VERTICAL_PADDING);
-                            paginator.begin_quote(sources, reader_style.foreground, outer_gap);
+                            prepared.start_offset += quote_horizontal_padding;
                         }
-                        for (prepared, resolved) in &prepared_body {
-                            paginator.push_text(prepared, resolved.as_ref())?;
-                        }
-                        if let Some((prepared, resolved)) = &prepared_attribution {
-                            paginator.push_text(prepared, resolved.as_ref())?;
-                        }
+                        prepared_body.push((prepared, resolved));
+                    }
+                    let prepared_attribution = quote.attribution.as_ref().map(|attribution| {
+                        let resolved =
+                            resolve_text_block(attribution, reader_style, TextContext::Flow);
+                        let mut prepared = self.shape_text(&resolved, reader_style, quote_width);
                         if unified_reflow {
-                            paginator.end_quote();
+                            prepared.start_offset += quote_horizontal_padding;
                         }
-                    }
-                    Block::Table(table) => {
-                        let prepared = self.shape_table(
-                            table,
-                            reader_style,
-                            (content_width - media_start_offset).max(1.0),
-                        );
-                        paginator.push_table(&prepared);
-                    }
-                    Block::Image(image) => {
-                        let raster = load_raster_image(source, image)?;
-                        let mut image_style = image.style;
-                        if unified_reflow {
-                            let gap = reader_style.typography.font_size
-                                * reader_style.typesetting.media_gap_em;
-                            image_style.margin_before = gap;
-                            image_style.margin_after = gap;
-                        }
-                        let replacements = paginator.push_image(
-                            raster,
-                            image_style,
-                            image.source.clone(),
-                            image.text_layer.clone(),
-                        );
-                        for replacement in replacements {
-                            let prepared =
-                                self.shape_fixed_page_replacement(&replacement, reader_style);
-                            paginator.push_fixed_page_replacement(&prepared, replacement)?;
-                        }
-                    }
-                    Block::Figure(figure) => {
-                        let authored_outer_gap = figure
-                            .images
-                            .iter()
-                            .map(|image| image.style.margin_before.max(image.style.margin_after))
-                            .fold(0.0, f32::max)
-                            .max(figure.style.margin_before)
-                            .max(figure.style.margin_after);
-                        let mut images = Vec::with_capacity(figure.images.len());
-                        for image in &figure.images {
-                            let mut style = image.style;
-                            // The figure owns its outer spacing. Keeping authored
-                            // margins on each child would double the gap between
-                            // an image and its caption.
-                            style.margin_before = 0.0;
-                            style.margin_after = 0.0;
-                            images.push((load_raster_image(source, image)?, style, image));
-                        }
-                        let captions = figure
-                            .captions
-                            .iter()
-                            .map(|caption| {
-                                self.shape_figure_caption(
-                                    caption,
-                                    reader_style,
-                                    (content_width - media_start_offset).max(1.0),
-                                    unified_reflow,
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        let outer_gap = if unified_reflow {
-                            reader_style.typography.font_size
-                                * reader_style.typesetting.media_gap_em
-                        } else {
-                            authored_outer_gap.max(IMAGE_BLOCK_GAP)
-                        };
-                        let caption_gap = if unified_reflow {
-                            reader_style.typography.font_size
-                                * reader_style.typesetting.caption_gap_em
-                        } else {
-                            6.0
-                        };
-                        let image_height = images
-                            .iter()
-                            .map(|(raster, style, _)| {
-                                paginator.image_display_size(raster, *style).1
-                            })
-                            .sum::<f32>();
-                        let caption_height = captions
+                        (prepared, resolved)
+                    });
+                    if unified_reflow {
+                        let content_height = prepared_body
                             .iter()
                             .map(|(prepared, resolved)| {
-                                prepared_text_height(prepared)
+                                prepared_flow_height(prepared)
                                     + resolved.style.margin_before.max(0.0)
                                     + resolved.style.margin_after.max(0.0)
                             })
+                            .chain(prepared_attribution.iter().map(|(prepared, resolved)| {
+                                prepared_flow_height(prepared)
+                                    + resolved.style.margin_before.max(0.0)
+                                    + resolved.style.margin_after.max(0.0)
+                            }))
                             .sum::<f32>();
-                        let internal_image_gaps =
-                            caption_gap * images.len().saturating_sub(1) as f32;
-                        let image_caption_gap = if images.is_empty() || captions.is_empty() {
-                            0.0
-                        } else {
-                            caption_gap
-                        };
-                        paginator.prepare_group(
-                            image_height + caption_height + internal_image_gaps + image_caption_gap,
-                            outer_gap,
-                        );
-
-                        let push_images = |paginator: &mut Paginator,
-                                           engine: &mut LayoutEngine|
-                         -> Result<(), LayoutError> {
-                            for (index, (raster, style, image)) in images.iter().enumerate() {
-                                if index > 0 {
-                                    paginator.add_semantic_spacing(caption_gap);
+                        // Keep a short quote card intact. The leading outer
+                        // gap and both internal paddings must fit before its
+                        // trailing attribution; the final outer gap may flow
+                        // naturally after the completed card.
+                        paginator
+                            .keep_together_if_fits(content_height + QUOTE_VERTICAL_PADDING * 3.0);
+                        let sources = quote
+                            .body
+                            .iter()
+                            .filter_map(|block| block.source.clone())
+                            .chain(
+                                quote
+                                    .attribution
+                                    .iter()
+                                    .filter_map(|block| block.source.clone()),
+                            )
+                            .collect();
+                        let outer_gap = (reader_style.typography.font_size
+                            * reader_style.typesetting.paragraph_gap_em)
+                            .max(QUOTE_VERTICAL_PADDING);
+                        paginator.begin_quote(sources, reader_style.foreground, outer_gap);
+                    }
+                    for (prepared, resolved) in &prepared_body {
+                        paginator.push_text(prepared, resolved.as_ref())?;
+                    }
+                    if let Some((prepared, resolved)) = &prepared_attribution {
+                        paginator.push_text(prepared, resolved.as_ref())?;
+                    }
+                    if unified_reflow {
+                        paginator.end_quote();
+                    }
+                }
+                Block::Table(table) => {
+                    let prepared = self.shape_table(
+                        table,
+                        reader_style,
+                        (content_width - media_start_offset).max(1.0),
+                    );
+                    paginator.push_table(&prepared);
+                }
+                Block::Image(image) => {
+                    let raster = load_raster_image(source, image)?;
+                    let mut image_style = image.style;
+                    if unified_reflow {
+                        let gap = reader_style.typography.font_size
+                            * reader_style.typesetting.media_gap_em;
+                        image_style.margin_before = gap;
+                        image_style.margin_after = gap;
+                    }
+                    let replacements = paginator.push_image(
+                        raster,
+                        image_style,
+                        image.source.clone(),
+                        image.text_layer.clone(),
+                    );
+                    for replacement in replacements {
+                        let prepared =
+                            self.shape_fixed_page_replacement(&replacement, reader_style);
+                        paginator.push_fixed_page_replacement(&prepared, replacement)?;
+                    }
+                }
+                Block::Figure(figure) => self.push_figure(
+                    &mut paginator,
+                    source,
+                    &figure.images,
+                    &figure.captions,
+                    figure.caption_position,
+                    figure.style,
+                    reader_style,
+                    content_width,
+                    media_start_offset,
+                    unified_reflow,
+                )?,
+                Block::Separator(separator) => {
+                    if !unified_reflow || separator.in_quote {
+                        match separator.kind {
+                            SeparatorKind::Spacing => paginator.ensure_minimum_spacing(
+                                separator.style.margin_before.max(0.0)
+                                    + reader_style.typography.font_size
+                                        * separator.style.line_height.max(1.0)
+                                    + separator.style.margin_after.max(0.0),
+                            ),
+                            SeparatorKind::Rule => paginator.push_separator(),
+                            SeparatorKind::Ornament => {
+                                if let Some(image) = &separator.image {
+                                    let raster = load_raster_image(source, image)?;
+                                    let replacements = paginator.push_image(
+                                        raster,
+                                        image.style,
+                                        image.source.clone(),
+                                        image.text_layer.clone(),
+                                    );
+                                    for replacement in replacements {
+                                        let prepared = self.shape_fixed_page_replacement(
+                                            &replacement,
+                                            reader_style,
+                                        );
+                                        paginator
+                                            .push_fixed_page_replacement(&prepared, replacement)?;
+                                    }
                                 }
-                                let replacements = paginator.push_image_with_gaps(
-                                    raster.clone(),
-                                    *style,
-                                    image.source.clone(),
-                                    image.text_layer.clone(),
-                                    0.0,
-                                    0.0,
-                                );
-                                for replacement in replacements {
-                                    let prepared = engine
-                                        .shape_fixed_page_replacement(&replacement, reader_style);
-                                    paginator
-                                        .push_fixed_page_replacement(&prepared, replacement)?;
-                                }
-                            }
-                            Ok(())
-                        };
-                        let push_captions = |paginator: &mut Paginator| -> Result<(), LayoutError> {
-                            for (prepared, resolved) in &captions {
-                                paginator.push_text(prepared, resolved.as_ref())?;
-                            }
-                            Ok(())
-                        };
-                        match figure.caption_position {
-                            CaptionPosition::Before => {
-                                push_captions(&mut paginator)?;
-                                if !captions.is_empty() && !images.is_empty() {
-                                    paginator.add_semantic_spacing(caption_gap);
-                                }
-                                push_images(&mut paginator, self)?;
-                            }
-                            CaptionPosition::After => {
-                                push_images(&mut paginator, self)?;
-                                if !captions.is_empty() && !images.is_empty() {
-                                    paginator.add_semantic_spacing(caption_gap);
-                                }
-                                push_captions(&mut paginator)?;
                             }
                         }
-                        paginator.ensure_minimum_spacing(outer_gap);
                     }
-                    Block::Separator => paginator.push_separator(),
-                    Block::LineBreak => paginator.ensure_minimum_spacing(
-                        reader_style.typography.font_size
-                            * reader_style.typesetting.body_line_height,
-                    ),
-                    Block::PageBreak => paginator.force_page(),
                 }
+                Block::LineBreak => paginator.ensure_minimum_spacing(
+                    reader_style.typography.font_size * reader_style.typesetting.body_line_height,
+                ),
+                Block::PageBreak => paginator.force_page(),
+                Block::Note(_) => unreachable!("note blocks are flattened before layout"),
             }
+            block_index += 1;
         }
 
         Ok(SectionLayout {
@@ -1097,6 +1069,127 @@ impl LayoutEngine {
             visible_pages,
             continuation_offset_x,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_figure(
+        &mut self,
+        paginator: &mut Paginator,
+        source: &dyn BookSource,
+        figure_images: &[ImageBlock],
+        figure_captions: &[TextBlock],
+        caption_position: CaptionPosition,
+        figure_style: BlockStyle,
+        reader_style: &ReaderStyle,
+        content_width: f32,
+        media_start_offset: f32,
+        unified_reflow: bool,
+    ) -> Result<(), LayoutError> {
+        let authored_outer_gap = figure_images
+            .iter()
+            .map(|image| image.style.margin_before.max(image.style.margin_after))
+            .fold(0.0, f32::max)
+            .max(figure_style.margin_before)
+            .max(figure_style.margin_after);
+        let mut images = Vec::with_capacity(figure_images.len());
+        for image in figure_images {
+            let mut style = image.style;
+            // The figure owns its outer spacing. Keeping authored margins on each
+            // child would double the gap between an image and its caption.
+            style.margin_before = 0.0;
+            style.margin_after = 0.0;
+            images.push((load_raster_image(source, image)?, style, image));
+        }
+        let captions = figure_captions
+            .iter()
+            .map(|caption| {
+                self.shape_figure_caption(
+                    caption,
+                    reader_style,
+                    (content_width - media_start_offset).max(1.0),
+                    unified_reflow,
+                )
+            })
+            .collect::<Vec<_>>();
+        let outer_gap = if unified_reflow {
+            reader_style.typography.font_size * reader_style.typesetting.media_gap_em
+        } else {
+            authored_outer_gap.max(IMAGE_BLOCK_GAP)
+        };
+        let caption_gap = if unified_reflow {
+            reader_style.typography.font_size * reader_style.typesetting.caption_gap_em
+        } else {
+            6.0
+        };
+        let image_height = images
+            .iter()
+            .map(|(raster, style, _)| paginator.image_display_size(raster, *style).1)
+            .sum::<f32>();
+        let caption_height = captions
+            .iter()
+            .map(|(prepared, resolved)| {
+                prepared_text_height(prepared)
+                    + resolved.style.margin_before.max(0.0)
+                    + resolved.style.margin_after.max(0.0)
+            })
+            .sum::<f32>();
+        let internal_image_gaps = caption_gap * images.len().saturating_sub(1) as f32;
+        let image_caption_gap = if images.is_empty() || captions.is_empty() {
+            0.0
+        } else {
+            caption_gap
+        };
+        paginator.prepare_group(
+            image_height + caption_height + internal_image_gaps + image_caption_gap,
+            outer_gap,
+        );
+
+        let push_images = |paginator: &mut Paginator,
+                           engine: &mut LayoutEngine|
+         -> Result<(), LayoutError> {
+            for (index, (raster, style, image)) in images.iter().enumerate() {
+                if index > 0 {
+                    paginator.add_semantic_spacing(caption_gap);
+                }
+                let replacements = paginator.push_image_with_gaps(
+                    raster.clone(),
+                    *style,
+                    image.source.clone(),
+                    image.text_layer.clone(),
+                    0.0,
+                    0.0,
+                );
+                for replacement in replacements {
+                    let prepared = engine.shape_fixed_page_replacement(&replacement, reader_style);
+                    paginator.push_fixed_page_replacement(&prepared, replacement)?;
+                }
+            }
+            Ok(())
+        };
+        let push_captions = |paginator: &mut Paginator| -> Result<(), LayoutError> {
+            for (prepared, resolved) in &captions {
+                paginator.push_text(prepared, resolved.as_ref())?;
+            }
+            Ok(())
+        };
+        match caption_position {
+            CaptionPosition::Before => {
+                push_captions(paginator)?;
+                if !captions.is_empty() && !images.is_empty() {
+                    paginator.add_semantic_spacing(caption_gap);
+                }
+                push_images(paginator, self)?;
+            }
+            CaptionPosition::After => {
+                push_images(paginator, self)?;
+                if !captions.is_empty() && !images.is_empty() {
+                    paginator.add_semantic_spacing(caption_gap);
+                }
+                push_captions(paginator)?;
+            }
+        }
+        paginator.ensure_minimum_spacing(outer_gap);
+        Ok(())
     }
 
     fn shape_text(
@@ -1637,12 +1730,17 @@ fn resolve_text_block<'a>(
             0.0
         };
 
-    if context == TextContext::Flow && block.kind != TextBlockKind::Blockquote {
-        resolved.style.align = if block.kind == TextBlockKind::Paragraph
+    if context == TextContext::Flow {
+        let prose = matches!(
+            block.kind,
+            TextBlockKind::Paragraph | TextBlockKind::Blockquote
+        );
+        resolved.style.align = if prose
             && let Some(authored_alignment) = block.style.authored_alignment
+            && authored_alignment != TextAlignment::Start
         {
             authored_alignment
-        } else if block.kind == TextBlockKind::Paragraph
+        } else if prose
             || matches!(block.kind, TextBlockKind::ListItem { .. })
                 && text_block_supports_space_justification(block)
         {
@@ -1815,7 +1913,8 @@ fn dominant_paragraph_start_offset(fragments: &[&[Block]], content_width: f32) -
             | Block::Table(_)
             | Block::Image(_)
             | Block::Figure(_)
-            | Block::Separator
+            | Block::Note(_)
+            | Block::Separator(_)
             | Block::LineBreak
             | Block::PageBreak => None,
         })
@@ -3124,6 +3223,60 @@ mod tests {
     }
 
     #[test]
+    fn unified_layout_hides_note_sections_while_book_layout_keeps_them() {
+        let body = Block::Text(TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "Endnote body".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        });
+        let section_note = Block::Note(rebook_publication::NoteBlock {
+            kind: NoteBlockKind::Section,
+            blocks: vec![body.clone()],
+            source: None,
+        });
+        let definition_note = Block::Note(rebook_publication::NoteBlock {
+            kind: NoteBlockKind::Definition,
+            blocks: vec![body],
+            source: None,
+        });
+
+        let mut output = Vec::new();
+        collect_layout_blocks(
+            std::slice::from_ref(&section_note),
+            &ReaderStyle::default(),
+            &mut output,
+        );
+        assert_eq!(output.len(), 1);
+
+        output.clear();
+        collect_layout_blocks(
+            std::slice::from_ref(&section_note),
+            &ReaderStyle {
+                typesetting: ReaderTypesetting::unified(),
+                ..ReaderStyle::default()
+            },
+            &mut output,
+        );
+        assert!(output.is_empty());
+
+        output.clear();
+        collect_layout_blocks(
+            std::slice::from_ref(&definition_note),
+            &ReaderStyle {
+                focus_footnote_icons: true,
+                ..ReaderStyle::default()
+            },
+            &mut output,
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn focus_footnote_icons_mark_semantic_references_and_legacy_linked_superscripts() {
         let linked_superscript = TextRun {
             text: "1".into(),
@@ -3362,16 +3515,16 @@ mod tests {
     }
 
     #[test]
-    fn unified_typesetting_preserves_authored_alignment_only_for_paragraphs() {
+    fn unified_typesetting_ignores_authored_start_alignment_for_paragraphs() {
         let style = ReaderStyle {
             typesetting: ReaderTypesetting::unified(),
             ..ReaderStyle::default()
         };
-        for alignment in [
-            TextAlignment::Start,
-            TextAlignment::Center,
-            TextAlignment::End,
-            TextAlignment::Justify,
+        for (alignment, expected) in [
+            (TextAlignment::Start, TextAlignment::Justify),
+            (TextAlignment::Center, TextAlignment::Center),
+            (TextAlignment::End, TextAlignment::End),
+            (TextAlignment::Justify, TextAlignment::Justify),
         ] {
             let block = TextBlock {
                 kind: TextBlockKind::Paragraph,
@@ -3389,7 +3542,7 @@ mod tests {
             };
 
             let resolved = resolve_text_block(&block, &style, TextContext::Flow);
-            assert_eq!(resolved.style.align, alignment);
+            assert_eq!(resolved.style.align, expected);
         }
 
         let list_item = TextBlock {
@@ -3753,16 +3906,15 @@ mod tests {
     }
 
     #[test]
-    fn unified_quotes_preserve_authored_alignment_and_normalize_indentation() {
+    fn unified_quotes_justify_baseline_alignment_and_preserve_special_alignment() {
         let block = TextBlock {
             kind: TextBlockKind::Blockquote,
             content: vec![Inline::Text(TextRun {
-                text: "Centered and indented quotation".into(),
+                text: "An indented quotation with baseline alignment".into(),
                 style: TextStyle::default(),
                 link: None,
             })],
             style: rebook_publication::BlockStyle {
-                align: TextAlignment::Center,
                 margin_start: 60.0,
                 indent: 32.0,
                 ..rebook_publication::BlockStyle::default()
@@ -3779,16 +3931,34 @@ mod tests {
         };
 
         let resolved = resolve_text_block(&block, &style, TextContext::Flow);
-        assert_eq!(resolved.style.align, TextAlignment::Center);
+        assert_eq!(resolved.style.align, TextAlignment::Justify);
         assert!((resolved.style.indent - 40.0).abs() < 0.001);
         assert!(resolved.style.margin_start.abs() < 0.001);
         let (start_offset, _, first_line_indent) = resolve_text_measure(&resolved, 320.0, 40.0);
         assert!(start_offset.abs() < 0.001);
         assert!((first_line_indent - 40.0).abs() < 0.001);
 
+        let mut authored_start = block.clone();
+        authored_start.style.authored_alignment = Some(TextAlignment::Start);
+        let resolved = resolve_text_block(&authored_start, &style, TextContext::Flow);
+        assert_eq!(resolved.style.align, TextAlignment::Justify);
+
+        for alignment in [
+            TextAlignment::Center,
+            TextAlignment::End,
+            TextAlignment::Justify,
+        ] {
+            let mut specially_aligned = block.clone();
+            specially_aligned.style.align = alignment;
+            specially_aligned.style.authored_alignment = Some(alignment);
+            let resolved = resolve_text_block(&specially_aligned, &style, TextContext::Flow);
+            assert_eq!(resolved.style.align, alignment);
+        }
+
         let mut unindented = block;
         unindented.style.indent = 0.0;
         let resolved = resolve_text_block(&unindented, &style, TextContext::Flow);
+        assert_eq!(resolved.style.align, TextAlignment::Justify);
         assert!(resolved.style.indent.abs() < 0.001);
     }
 
@@ -4155,8 +4325,8 @@ mod tests {
     use rebook_publication::{
         Book, FixedPageTextReplacement, FixedPageTextReplacementSegment, FixedPageTextSpan,
         ImageBlock, ImageLength, Metadata, PublicationId, PublicationUrl, QuoteBlock,
-        RasterResource, RenditionLayout, Resource, SourceAnchor, SpineItemId, TableCell, TableRow,
-        TocEntry,
+        RasterResource, RenditionLayout, Resource, SeparatorBlock, SourceAnchor, SpineItemId,
+        TableCell, TableRow, TocEntry,
     };
 
     struct EmptySource {
@@ -4279,6 +4449,87 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(text_origins.len(), 2);
         assert!(text_origins[1] - text_origins[0] > style.typography.font_size * 2.0);
+    }
+
+    #[test]
+    fn unified_typesetting_filters_body_separators_but_book_typesetting_preserves_them() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("separator-filter-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let paragraph = |text: &str| {
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            })
+        };
+        let ornament = ImageBlock {
+            href: PublicationUrl::parse("rule.png").unwrap(),
+            alt: String::new(),
+            style: ImageStyle::default(),
+            source: None,
+            text_layer: None,
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![
+                paragraph("Before"),
+                Block::Separator(SeparatorBlock::spacing(
+                    rebook_publication::BlockStyle::default(),
+                )),
+                Block::Separator(SeparatorBlock::rule()),
+                Block::Separator(SeparatorBlock::ornament(ornament)),
+                paragraph("After"),
+            ],
+            anchors: Vec::new(),
+        };
+        let viewport = LayoutViewport::new(600, 600).unwrap();
+        let unified = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                viewport,
+                &ReaderStyle {
+                    typesetting: ReaderTypesetting::unified(),
+                    ..ReaderStyle::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            unified
+                .pages
+                .iter()
+                .flat_map(|page| &page.items)
+                .all(|item| { !matches!(item, PageItem::Separator(_) | PageItem::Image(_)) })
+        );
+
+        let book = LayoutEngine::new()
+            .layout_section(&source, &section, viewport, &ReaderStyle::default())
+            .unwrap();
+        assert!(
+            book.pages
+                .iter()
+                .flat_map(|page| &page.items)
+                .any(|item| matches!(item, PageItem::Separator(_)))
+        );
+        assert!(
+            book.pages
+                .iter()
+                .flat_map(|page| &page.items)
+                .any(|item| matches!(item, PageItem::Image(_)))
+        );
     }
 
     #[test]
@@ -5085,6 +5336,85 @@ mod tests {
         assert!(
             first.metrics().offset > 0.0,
             "a short unified caption should be centered"
+        );
+    }
+
+    #[test]
+    fn inferred_adjacent_caption_is_grouped_only_by_unified_typesetting() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("inferred-caption-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![
+                Block::Image(ImageBlock {
+                    href: PublicationUrl::parse("images/figure.png").unwrap(),
+                    alt: "Figure".into(),
+                    style: ImageStyle::default(),
+                    source: None,
+                    text_layer: None,
+                }),
+                Block::Text(TextBlock {
+                    kind: TextBlockKind::Caption,
+                    content: vec![Inline::Text(TextRun {
+                        text: "Figure 1. A leaf.".into(),
+                        style: TextStyle::default(),
+                        link: None,
+                    })],
+                    style: BlockStyle::default(),
+                    source: None,
+                }),
+            ],
+            anchors: Vec::new(),
+        };
+        let classic_style = ReaderStyle::default();
+        let unified_style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let viewport = LayoutViewport::new(400, 500).unwrap();
+
+        let classic = LayoutEngine::new()
+            .layout_section(&source, &section, viewport, &classic_style)
+            .unwrap();
+        let unified = LayoutEngine::new()
+            .layout_section(&source, &section, viewport, &unified_style)
+            .unwrap();
+        let [PageItem::Image(_), PageItem::Text(classic_caption)] =
+            classic.pages[0].items.as_slice()
+        else {
+            panic!("classic typesetting should preserve the two authored blocks");
+        };
+        let [
+            PageItem::Image(unified_image),
+            PageItem::Text(unified_caption),
+        ] = unified.pages[0].items.as_slice()
+        else {
+            panic!("unified typesetting should lay out one inferred figure and caption");
+        };
+        let classic_line = classic_caption
+            .layout
+            .get(classic_caption.lines.start)
+            .unwrap();
+        let unified_line = unified_caption
+            .layout
+            .get(unified_caption.lines.start)
+            .unwrap();
+        assert!(classic_line.metrics().offset.abs() < 0.001);
+        assert!(unified_line.metrics().offset > 0.0);
+        let unified_caption_top = unified_caption.origin_y + unified_line.metrics().block_min_coord;
+        let expected_gap =
+            unified_style.typography.font_size * unified_style.typesetting.caption_gap_em;
+        assert!(
+            (unified_caption_top - (unified_image.y + unified_image.height) - expected_gap).abs()
+                < 0.01
         );
     }
 
@@ -5926,9 +6256,9 @@ mod tests {
             style: rebook_publication::BlockStyle::default(),
             source: Some(source),
         };
-        // Nine separators leave enough room for the quote body but not its
+        // Nine quote-owned rules leave enough room for the quote body but not its
         // attribution. The complete short quote should move as one unit.
-        let mut blocks = vec![Block::Separator; 9];
+        let mut blocks = vec![Block::Separator(SeparatorBlock::rule_in_quote()); 9];
         blocks.push(Block::Quote(QuoteBlock {
             body: vec![text(
                 TextBlockKind::Blockquote,

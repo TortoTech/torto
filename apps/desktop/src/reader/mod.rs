@@ -410,7 +410,11 @@ fn legacy_translated_paragraph_range(
                 .filter(matches_range)
                 .map(|source| (source, crate::plugins::text_block_text(caption)))
         }),
-        Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => None,
+        Block::Note(_)
+        | Block::Image(_)
+        | Block::Separator(_)
+        | Block::LineBreak
+        | Block::PageBreak => None,
     })?;
     let stored_length = range.end.text_offset.checked_sub(range.start.text_offset)?;
     let canonical_length = canonical_range
@@ -668,7 +672,8 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Table(table) => table.source.as_ref(),
         Block::Image(image) => image.source.as_ref(),
         Block::Figure(figure) => figure.source.as_ref(),
-        Block::Separator | Block::LineBreak | Block::PageBreak => None,
+        Block::Note(note) => note.source.as_ref(),
+        Block::Separator(_) | Block::LineBreak | Block::PageBreak => None,
     }
 }
 
@@ -744,6 +749,7 @@ fn block_is_footnote_definition(block: &Block) -> bool {
         return true;
     }
     match block {
+        Block::Note(_) => true,
         Block::Text(block) => text_block_has_link_role(block, LinkRole::FootnoteBacklink),
         Block::Quote(quote) => quote
             .body
@@ -759,7 +765,7 @@ fn block_is_footnote_definition(block: &Block) -> bool {
             .captions
             .iter()
             .any(|caption| text_block_has_link_role(caption, LinkRole::FootnoteBacklink)),
-        Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => false,
+        Block::Image(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => false,
     }
 }
 
@@ -783,7 +789,8 @@ fn block_focus_footnotes(block: &Block) -> Vec<FocusFootnoteSource> {
             .iter()
             .flat_map(text_block_focus_footnotes)
             .collect(),
-        Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => Vec::new(),
+        Block::Note(_) => Vec::new(),
+        Block::Image(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => Vec::new(),
     }
 }
 
@@ -825,15 +832,55 @@ fn focus_footnote_text_in_section(
         .find(|anchor| anchor.fragment == fragment)?
         .source
         .clone();
-    let block = section.blocks.iter().find(|block| {
-        block_source_range(block).is_some_and(|range| source_range_contains_anchor(range, &anchor))
-            || block_source_range(block).is_some_and(|range| {
-                focus_block_paint_ranges(block, range)
-                    .iter()
-                    .any(|range| source_range_contains_anchor(range, &anchor))
-            })
-    })?;
-    let text = block_focus_text(block);
+    if let Some(note) = section
+        .blocks
+        .iter()
+        .find_map(|block| note_definition_containing_anchor(block, &anchor))
+    {
+        return normalize_resolved_footnote_text(&block_focus_text(note), marker);
+    }
+    let block = section
+        .blocks
+        .iter()
+        .find_map(|block| find_block_containing_anchor(block, &anchor))?;
+    normalize_resolved_footnote_text(&block_focus_text(block), marker)
+}
+
+fn find_block_containing_anchor<'a>(block: &'a Block, anchor: &SourceAnchor) -> Option<&'a Block> {
+    if let Block::Note(note) = block {
+        return note
+            .blocks
+            .iter()
+            .find_map(|child| find_block_containing_anchor(child, anchor));
+    }
+    (block_source_range(block).is_some_and(|range| source_range_contains_anchor(range, anchor))
+        || block_source_range(block).is_some_and(|range| {
+            focus_block_paint_ranges(block, range)
+                .iter()
+                .any(|range| source_range_contains_anchor(range, anchor))
+        }))
+    .then_some(block)
+}
+
+fn note_definition_containing_anchor<'a>(
+    block: &'a Block,
+    anchor: &SourceAnchor,
+) -> Option<&'a Block> {
+    let Block::Note(note) = block else {
+        return None;
+    };
+    for child in &note.blocks {
+        if let Some(definition) = note_definition_containing_anchor(child, anchor) {
+            return Some(definition);
+        }
+    }
+    note.blocks
+        .iter()
+        .any(|child| find_block_containing_anchor(child, anchor).is_some())
+        .then_some(block)
+}
+
+fn normalize_resolved_footnote_text(text: &str, marker: &str) -> Option<String> {
     let text = text.trim();
     if text.is_empty() {
         return None;
@@ -841,7 +888,10 @@ fn focus_footnote_text_in_section(
     let without_marker = text.strip_prefix(marker.trim()).map_or(text, |rest| {
         rest.trim_start_matches(|character: char| {
             character.is_whitespace()
-                || matches!(character, '.' | '．' | '、' | ')' | '）' | ']' | '】')
+                || matches!(
+                    character,
+                    '.' | '．' | '，' | '、' | ')' | '）' | ']' | '】'
+                )
         })
     });
     Some(without_marker.to_owned())
@@ -986,7 +1036,14 @@ fn block_focus_text(block: &Block) -> String {
             .map(text_block_focus_text)
             .collect::<Vec<_>>()
             .join(" "),
-        Block::Separator | Block::LineBreak | Block::PageBreak => String::new(),
+        Block::Note(note) => note
+            .blocks
+            .iter()
+            .map(block_focus_text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Block::Separator(_) | Block::LineBreak | Block::PageBreak => String::new(),
     }
 }
 
@@ -1018,7 +1075,43 @@ fn focus_block_paint_ranges(block: &Block, range: &SourceRange) -> Vec<SourceRan
             return cell_ranges;
         }
     }
+    if let Block::Figure(figure) = block {
+        let figure_ranges = figure
+            .images
+            .iter()
+            .filter_map(|image| image.source.clone())
+            .chain(
+                figure
+                    .captions
+                    .iter()
+                    .filter_map(|caption| caption.source.clone()),
+            )
+            .collect::<Vec<_>>();
+        if !figure_ranges.is_empty() {
+            return figure_ranges;
+        }
+    }
     vec![range.clone()]
+}
+
+fn merge_inferred_caption_focus_unit(image: &mut FocusUnit, caption: FocusUnit) {
+    image.range.end = caption.range.end;
+    image.paint_ranges.extend(caption.paint_ranges);
+    image.text = caption.text;
+    image.clipboard_text = caption.clipboard_text;
+    image.rect = image.rect.union(caption.rect);
+    image.is_table |= caption.is_table;
+    image.rectangular_activation |= caption.rectangular_activation;
+    image.structured_activation |= caption.structured_activation;
+    image.rectangular_activation_rect = match (
+        image.rectangular_activation_rect,
+        caption.rectangular_activation_rect,
+    ) {
+        (Some(image), Some(caption)) => Some(image.union(caption)),
+        (image @ Some(_), None) => image,
+        (None, caption) => caption,
+    };
+    image.footnotes.extend(caption.footnotes);
 }
 
 fn focus_unit_geometry_ranges(
@@ -1477,6 +1570,20 @@ impl DesktopReader {
                 active_list_root = None;
                 continue;
             }
+            let inferred_caption_image_range = if matches!(
+                block,
+                Block::Text(text) if text.kind == TextBlockKind::Caption
+            ) {
+                block_index
+                    .checked_sub(1)
+                    .and_then(|index| section.blocks.get(index))
+                    .and_then(|block| match block {
+                        Block::Image(image) if image.text_layer.is_none() => image.source.clone(),
+                        _ => None,
+                    })
+            } else {
+                None
+            };
             let (range, paint_ranges, text, is_image, is_table, rectangular_activation, list_depth) =
                 match block {
                     Block::Text(block) => {
@@ -1586,7 +1693,7 @@ impl DesktopReader {
                         };
                         (range, paint_ranges, text, true, false, false, None)
                     }
-                    Block::Separator | Block::LineBreak | Block::PageBreak => {
+                    Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {
                         active_list_root = None;
                         continue;
                     }
@@ -1645,6 +1752,19 @@ impl DesktopReader {
                 rectangular_activation_rect,
                 footnotes,
             };
+            if let Some(image_range) = inferred_caption_image_range
+                && let Some(image_index) = units.len().checked_sub(1)
+                && let Some(image_unit) = units.get_mut(image_index)
+                && image_unit.is_image
+                && image_unit.range == image_range
+            {
+                if target_reached {
+                    first_unit_after_anchor = Some(image_index);
+                }
+                merge_inferred_caption_focus_unit(image_unit, unit);
+                active_list_root = None;
+                continue;
+            }
             if let Some(depth) = list_depth {
                 if let Some(root_index) = focus_list_descendant_root(active_list_root, depth)
                     && units[root_index].range.start.spine == unit.range.start.spine
@@ -2845,15 +2965,15 @@ mod tests {
         ReaderOverlay, ReaderUiState, ScrollSectionLayout, SidebarTab, SnapshotEffects,
         TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState,
         allowed_reading_mode, block_is_footnote_definition, embedded_toc_is_page_index,
-        focus_block_paint_ranges, focus_footnote_text, focus_list_descendant_root,
-        focus_navigation_destination, focus_scroll_content_height, focus_scroll_duration,
-        focus_unit_container_center_y, focus_unit_contains_source_range,
+        focus_block_paint_ranges, focus_footnote_text, focus_footnote_text_in_section,
+        focus_list_descendant_root, focus_navigation_destination, focus_scroll_content_height,
+        focus_scroll_duration, focus_unit_container_center_y, focus_unit_contains_source_range,
         focus_unit_geometry_ranges, focus_unit_matches_highlight_ranges,
         focus_unit_screen_center_y, focus_unit_scroll_bounds, focus_unit_target_offset_for_rect,
         legacy_translated_paragraph_range, logical_dimension, merge_focus_list_descendant,
-        resolve_book_display_metadata, resolved_focus_unit_index, source_range_contains_anchor,
-        table_block_markdown, text_block_focus_footnotes, text_block_focus_text,
-        text_block_footnote_references,
+        merge_inferred_caption_focus_unit, resolve_book_display_metadata,
+        resolved_focus_unit_index, source_range_contains_anchor, table_block_markdown,
+        text_block_focus_footnotes, text_block_focus_text, text_block_footnote_references,
     };
     use crate::plugins::PdfOcrViewMode;
     use crate::preferences::ReadingMode;
@@ -2863,10 +2983,11 @@ mod tests {
         SeparatorPlacement,
     };
     use rebook_publication::{
-        Block, BlockStyle, Book, BookSource, Inline, InlineRole, LinkRole, Metadata,
-        PublicationError, PublicationId, PublicationUrl, Resource, Rgba, Section, SectionAnchor,
-        SourceAnchor, SourceRange, SpineItem, SpineItemId, TableBlock, TableCell, TableRow,
-        TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle, TocEntry,
+        Block, BlockStyle, Book, BookSource, CaptionPosition, FigureBlock, ImageBlock, ImageStyle,
+        Inline, InlineRole, LinkRole, Metadata, NoteBlock, NoteBlockKind, PublicationError,
+        PublicationId, PublicationUrl, Resource, Rgba, Section, SectionAnchor, SourceAnchor,
+        SourceRange, SpineItem, SpineItemId, TableBlock, TableCell, TableRow, TextBaseline,
+        TextBlock, TextBlockKind, TextRun, TextStyle, TocEntry,
     };
     use rebook_reader::{PageDirection, ReaderPosition, ReaderSectionPage};
     use rebook_renderer::DisplayListCompiler;
@@ -2996,6 +3117,82 @@ mod tests {
             );
         }
         assert_eq!(source.parse_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn multiblock_note_popup_includes_every_continuation_block() {
+        let id = SpineItemId::new("notes").unwrap();
+        let first_source = SourceRange {
+            start: SourceAnchor {
+                spine: id.clone(),
+                node: "note-1".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: id.clone(),
+                node: "note-1".into(),
+                text_offset: 17,
+            },
+        };
+        let continuation_source = SourceRange {
+            start: SourceAnchor {
+                spine: id.clone(),
+                node: "note-1-continuation".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: id.clone(),
+                node: "note-1-continuation".into(),
+                text_offset: 22,
+            },
+        };
+        let section = Section {
+            id: id.clone(),
+            href: PublicationUrl::parse("notes.xhtml").unwrap(),
+            blocks: vec![Block::Note(NoteBlock {
+                kind: NoteBlockKind::Section,
+                source: Some(SourceRange {
+                    start: first_source.start.clone(),
+                    end: continuation_source.end.clone(),
+                }),
+                blocks: vec![
+                    Block::Text(TextBlock {
+                        kind: TextBlockKind::FootnoteDefinition,
+                        content: vec![Inline::Text(TextRun {
+                            text: "1 First paragraph".into(),
+                            style: TextStyle::default(),
+                            link: None,
+                        })],
+                        style: BlockStyle::default(),
+                        source: Some(first_source.clone()),
+                    }),
+                    Block::Text(TextBlock {
+                        kind: TextBlockKind::FootnoteDefinition,
+                        content: vec![Inline::Text(TextRun {
+                            text: "Continuation paragraph".into(),
+                            style: TextStyle::default(),
+                            link: None,
+                        })],
+                        style: BlockStyle::default(),
+                        source: Some(continuation_source),
+                    }),
+                ],
+            })],
+            anchors: vec![SectionAnchor {
+                fragment: "note-1".into(),
+                source: first_source.start,
+            }],
+        };
+
+        assert_eq!(
+            focus_footnote_text_in_section(
+                &section,
+                &PublicationUrl::parse("notes.xhtml#note-1").unwrap(),
+                "1",
+            )
+            .as_deref(),
+            Some("First paragraph\n\nContinuation paragraph")
+        );
     }
 
     #[test]
@@ -3451,6 +3648,112 @@ mod tests {
             focus_block_paint_ranges(&block, &table_range),
             vec![first_cell, second_cell]
         );
+    }
+
+    #[test]
+    fn figure_focus_unit_paints_both_images_and_captions() {
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let range = |node: &str| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 8,
+            },
+        };
+        let figure_range = range("figure");
+        let image_range = range("image");
+        let caption_range = range("caption");
+        let block = Block::Figure(FigureBlock {
+            images: vec![ImageBlock {
+                href: PublicationUrl::parse("image.png").unwrap(),
+                alt: String::new(),
+                style: ImageStyle::default(),
+                source: Some(image_range.clone()),
+                text_layer: None,
+            }],
+            captions: vec![TextBlock {
+                kind: TextBlockKind::Caption,
+                content: Vec::new(),
+                style: BlockStyle::default(),
+                source: Some(caption_range.clone()),
+            }],
+            caption_position: CaptionPosition::After,
+            style: BlockStyle::default(),
+            source: Some(figure_range.clone()),
+        });
+
+        assert_eq!(
+            focus_block_paint_ranges(&block, &figure_range),
+            vec![image_range, caption_range]
+        );
+    }
+
+    #[test]
+    fn inferred_caption_merges_into_the_image_focus_unit() {
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let range = |node: &str, length: u64| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: length,
+            },
+        };
+        let image_range = range("image", 0);
+        let caption_range = range("caption", 18);
+        let mut image = FocusUnit {
+            range: image_range.clone(),
+            paint_ranges: vec![image_range],
+            text: "Image".into(),
+            clipboard_text: "Image".into(),
+            position: ReaderPosition {
+                section_index: 0,
+                segment_index: 0,
+                page_index: 0,
+            },
+            rect: egui::Rect::from_min_max(egui::pos2(10.0, 10.0), egui::pos2(90.0, 80.0)),
+            is_image: true,
+            is_table: false,
+            rectangular_activation: false,
+            structured_activation: false,
+            rectangular_activation_rect: None,
+            footnotes: Vec::new(),
+        };
+        let caption = FocusUnit {
+            range: caption_range.clone(),
+            paint_ranges: vec![caption_range.clone()],
+            text: "Figure 1. A leaf.".into(),
+            clipboard_text: "Figure 1. A leaf.".into(),
+            position: image.position,
+            rect: egui::Rect::from_min_max(egui::pos2(10.0, 84.0), egui::pos2(90.0, 104.0)),
+            is_image: false,
+            is_table: false,
+            rectangular_activation: false,
+            structured_activation: false,
+            rectangular_activation_rect: None,
+            footnotes: vec![FocusFootnote {
+                text: "Caption note".into(),
+            }],
+        };
+
+        merge_inferred_caption_focus_unit(&mut image, caption);
+
+        assert_eq!(image.range.end, caption_range.end);
+        assert_eq!(image.paint_ranges.len(), 2);
+        assert_eq!(image.text, "Figure 1. A leaf.");
+        assert_eq!(image.clipboard_text, "Figure 1. A leaf.");
+        assert_eq!(image.rect.max.y, 104.0);
+        assert!(image.is_image);
+        assert_eq!(image.footnotes[0].text, "Caption note");
     }
 
     #[test]

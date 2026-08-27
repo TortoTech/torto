@@ -3868,6 +3868,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "hayro",
+ "image",
  "kurbo",
  "libchm",
  "quick-xml",

@@ -1,15 +1,16 @@
 //! Safe, pull-based EPUB publication parser.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor, Read};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crc32fast::hash as crc32;
 use flate2::read::DeflateDecoder;
+use image::ImageReader;
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use rebook_html::parse_section;
+use rebook_html::{SectionParseHints, parse_section_with_hints_and_image_classifier};
 use rebook_publication::{
     Book, BookSource, Metadata, PublicationError, PublicationId, PublicationUrl, RenditionLayout,
     Resource, Section, SpineItem, SpineItemId, TocEntry, promote_single_toc_root,
@@ -67,6 +68,8 @@ pub(super) struct EpubPublication {
     book: Book,
     media_types: HashMap<String, String>,
     archive: EpubArchive,
+    decorative_separator_images: Mutex<HashMap<String, bool>>,
+    note_section_paths: HashSet<String>,
 }
 
 impl EpubPublication {
@@ -107,6 +110,7 @@ impl EpubPublication {
         let reading_order = build_reading_order(&package_model)?;
         let table_of_contents =
             promote_single_toc_root(parse_navigation(&archive, &package_model)?);
+        let note_section_paths = collect_note_section_paths(&table_of_contents);
         let digest = Sha256::digest(bytes.as_ref());
         let id = PublicationId::new(format!("{digest:x}"))?;
 
@@ -120,8 +124,59 @@ impl EpubPublication {
             },
             media_types,
             archive,
+            decorative_separator_images: Mutex::new(HashMap::new()),
+            note_section_paths,
         })
     }
+}
+
+fn collect_note_section_paths(entries: &[TocEntry]) -> HashSet<String> {
+    fn visit(entries: &[TocEntry], classifications: &mut HashMap<String, (bool, bool)>) {
+        for entry in entries {
+            if let Some(href) = &entry.href {
+                let classification = classifications.entry(href.path().to_owned()).or_default();
+                if is_note_navigation_label(&entry.label) {
+                    classification.0 = true;
+                } else {
+                    classification.1 = true;
+                }
+            }
+            visit(&entry.children, classifications);
+        }
+    }
+
+    let mut classifications = HashMap::new();
+    visit(entries, &mut classifications);
+    classifications
+        .into_iter()
+        .filter_map(|(path, (is_notes, has_non_note_entry))| {
+            (is_notes && !has_non_note_entry).then_some(path)
+        })
+        .collect()
+}
+
+fn is_note_navigation_label(label: &str) -> bool {
+    let label = label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches([':', '：'])
+        .to_owned();
+    matches!(
+        label.to_ascii_lowercase().as_str(),
+        "note"
+            | "notes"
+            | "endnote"
+            | "endnotes"
+            | "footnote"
+            | "footnotes"
+            | "注释"
+            | "注解"
+            | "尾注"
+            | "本章注"
+            | "章节注释"
+            | "作者附注"
+    )
 }
 
 impl BookSource for EpubPublication {
@@ -167,9 +222,47 @@ impl EpubPublication {
         }
 
         let xml = self.archive.read_xml(&descriptor.href)?;
-        Ok(parse_section(&xml, descriptor, |href| {
-            self.archive.read_stylesheet(href).ok()
-        })?)
+        Ok(parse_section_with_hints_and_image_classifier(
+            &xml,
+            descriptor,
+            |href| self.archive.read_stylesheet(href).ok(),
+            |href| self.is_decorative_separator_image(href),
+            SectionParseHints {
+                note_section: self.note_section_paths.contains(descriptor.href.path()),
+            },
+        )?)
+    }
+
+    fn is_decorative_separator_image(&self, href: &PublicationUrl) -> bool {
+        if let Some(classified) = self
+            .decorative_separator_images
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(href.path()).copied())
+        {
+            return classified;
+        }
+
+        let classified = self
+            .archive
+            .read(href)
+            .ok()
+            .and_then(|bytes| {
+                ImageReader::new(Cursor::new(bytes))
+                    .with_guessed_format()
+                    .ok()?
+                    .into_dimensions()
+                    .ok()
+            })
+            .is_some_and(|(width, height)| {
+                (1..=8).contains(&height)
+                    && (32..=512).contains(&width)
+                    && width >= height.saturating_mul(8)
+            });
+        if let Ok(mut cache) = self.decorative_separator_images.lock() {
+            cache.insert(href.path().to_owned(), classified);
+        }
+        classified
     }
 }
 #[derive(Debug)]
@@ -1383,6 +1476,7 @@ impl EpubError {
 mod tests {
     use std::io::{Cursor, Write};
 
+    use image::{DynamicImage, ImageFormat};
     use rebook_publication::{
         Block, BookSource, PublicationUrl, RenditionLayout, TocEntry, promote_single_toc_root,
     };
@@ -1391,7 +1485,7 @@ mod tests {
 
     use super::{
         EpubError, EpubLimits, EpubOpenOptions, EpubPublication, ZIP_CENTRAL_HEADER_SIGNATURE,
-        ZIP_CENTRAL_HEADER_SIZE, ZIP_SIGNATURE_SIZE, read_u16,
+        ZIP_CENTRAL_HEADER_SIZE, ZIP_SIGNATURE_SIZE, collect_note_section_paths, read_u16,
     };
 
     #[test]
@@ -1445,6 +1539,47 @@ mod tests {
         assert_eq!(retained.len(), 2);
         assert_eq!(retained[0].label, "Part One");
         assert_eq!(retained[1].label, "Part Two");
+    }
+
+    #[test]
+    fn recognizes_only_exact_note_navigation_entries() {
+        let entries = vec![
+            TocEntry {
+                label: "Back Matter".into(),
+                href: None,
+                children: vec![TocEntry {
+                    label: " Notes: ".into(),
+                    href: Some(PublicationUrl::parse("Text/notes.xhtml#start").unwrap()),
+                    children: Vec::new(),
+                }],
+            },
+            TocEntry {
+                label: "作者附注".into(),
+                href: Some(PublicationUrl::parse("Text/author-notes.xhtml").unwrap()),
+                children: Vec::new(),
+            },
+            TocEntry {
+                label: "Notes on the Translation".into(),
+                href: Some(PublicationUrl::parse("Text/essay.xhtml").unwrap()),
+                children: Vec::new(),
+            },
+            TocEntry {
+                label: "Chapter One".into(),
+                href: Some(PublicationUrl::parse("Text/chapter.xhtml#start").unwrap()),
+                children: Vec::new(),
+            },
+            TocEntry {
+                label: "Notes".into(),
+                href: Some(PublicationUrl::parse("Text/chapter.xhtml#notes").unwrap()),
+                children: Vec::new(),
+            },
+        ];
+
+        let paths = collect_note_section_paths(&entries);
+        assert!(paths.contains("Text/notes.xhtml"));
+        assert!(paths.contains("Text/author-notes.xhtml"));
+        assert!(!paths.contains("Text/essay.xhtml"));
+        assert!(!paths.contains("Text/chapter.xhtml"));
     }
 
     #[test]
@@ -1643,6 +1778,43 @@ mod tests {
         publication
             .parse_section(0)
             .expect("bare ampersands in XHTML text must be escaped");
+    }
+
+    #[test]
+    fn classifies_only_extremely_thin_small_images_as_decorative_separators() {
+        let thin = png(78, 6);
+        let formula = png(150, 14);
+        let mut entries: Vec<(&str, &[u8], CompressionMethod)> = minimal_entries();
+        entries.extend([
+            (
+                "OPS/Text/rule.png",
+                thin.as_slice(),
+                CompressionMethod::Deflated,
+            ),
+            (
+                "OPS/Text/formula.png",
+                formula.as_slice(),
+                CompressionMethod::Deflated,
+            ),
+        ]);
+        let publication = EpubPublication::open_bytes(zip_entries(&entries)).unwrap();
+
+        assert!(
+            publication.is_decorative_separator_image(
+                &PublicationUrl::parse("OPS/Text/rule.png").unwrap()
+            )
+        );
+        assert!(!publication.is_decorative_separator_image(
+            &PublicationUrl::parse("OPS/Text/formula.png").unwrap()
+        ));
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut output = Cursor::new(Vec::new());
+        DynamicImage::new_rgba8(width, height)
+            .write_to(&mut output, ImageFormat::Png)
+            .unwrap();
+        output.into_inner()
     }
 
     fn minimal_epub() -> Vec<u8> {

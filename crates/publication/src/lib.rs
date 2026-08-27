@@ -357,8 +357,10 @@ pub enum Block {
     Image(ImageBlock),
     /// One or more authored images and their semantic caption.
     Figure(FigureBlock),
-    /// Thematic separator.
-    Separator,
+    /// A semantic footnote definition or a larger authored notes section.
+    Note(NoteBlock),
+    /// Authored spacing, rule, or decorative image separating body prose.
+    Separator(SeparatorBlock),
     /// Authored standalone line break between block elements.
     LineBreak,
     /// Explicit page boundary requested by the source.
@@ -384,9 +386,93 @@ impl Block {
                 .captions
                 .iter()
                 .any(|caption| caption.kind.is_footnote_definition()),
-            Self::Image(_) | Self::Separator | Self::LineBreak | Self::PageBreak => false,
+            Self::Note(_) => true,
+            Self::Image(_) | Self::Separator(_) | Self::LineBreak | Self::PageBreak => false,
         }
     }
+}
+
+/// Semantic role of a grouped note block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoteBlockKind {
+    /// One footnote or endnote definition, potentially spanning several blocks.
+    Definition,
+    /// A complete authored Notes/Endnotes region, including its title and subsections.
+    Section,
+}
+
+/// A grouped note region that preserves the authored blocks and their source order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoteBlock {
+    pub kind: NoteBlockKind,
+    pub blocks: Vec<Block>,
+    pub source: Option<SourceRange>,
+}
+
+/// A non-prose boundary retained semantically so reading modes can choose whether to show it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeparatorBlock {
+    pub kind: SeparatorKind,
+    /// Quote-owned separators retain their authored rendering in every typesetting mode.
+    #[serde(default)]
+    pub in_quote: bool,
+    /// Original image payload for decorative separators rendered by book-defined typesetting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageBlock>,
+    /// Authored spacing retained for whitespace separators in book-defined typesetting.
+    #[serde(default)]
+    pub style: BlockStyle,
+}
+
+impl SeparatorBlock {
+    pub fn spacing(style: BlockStyle) -> Self {
+        Self {
+            kind: SeparatorKind::Spacing,
+            in_quote: false,
+            image: None,
+            style,
+        }
+    }
+
+    pub fn rule() -> Self {
+        Self {
+            kind: SeparatorKind::Rule,
+            in_quote: false,
+            image: None,
+            style: BlockStyle::default(),
+        }
+    }
+
+    pub fn ornament(image: ImageBlock) -> Self {
+        Self {
+            kind: SeparatorKind::Ornament,
+            in_quote: false,
+            image: Some(image),
+            style: BlockStyle::default(),
+        }
+    }
+
+    pub fn rule_in_quote() -> Self {
+        Self {
+            kind: SeparatorKind::Rule,
+            in_quote: true,
+            image: None,
+            style: BlockStyle::default(),
+        }
+    }
+}
+
+/// Visual form used by the source to express a semantic body separator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeparatorKind {
+    /// An authored blank paragraph or equivalent vertical spacer.
+    Spacing,
+    /// A semantic or visual horizontal rule such as HTML `hr`.
+    #[default]
+    Rule,
+    /// A small decorative image used between prose passages.
+    Ornament,
 }
 
 /// A semantic quotation whose source remains attached to the quoted prose.

@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 
 use rebook_publication::{
     Block, BlockStyle, CaptionPosition, FigureBlock, ImageBlock, ImageLength, ImageStyle, Inline,
-    InlineRole, LinkRole, MathRun, PublicationUrl, QuoteBlock, Rgba, Section, SectionAnchor,
-    SourceAnchor, SourceRange, SpineItem, SpineItemId, TableBlock, TableCell, TableRow,
-    TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
+    InlineRole, LinkRole, MathRun, NoteBlock, NoteBlockKind, PublicationUrl, QuoteBlock, Rgba,
+    Section, SectionAnchor, SeparatorBlock, SourceAnchor, SourceRange, SpineItem, SpineItemId,
+    TableBlock, TableCell, TableRow, TextAlignment, TextBaseline, TextBlock, TextBlockKind,
+    TextRun, TextStyle,
 };
 use roxmltree::{Document, Node};
 use thiserror::Error;
@@ -17,6 +18,13 @@ pub enum HtmlError {
     InvalidDocument { resource: String, message: String },
     #[error(transparent)]
     Publication(#[from] rebook_publication::PublicationError),
+}
+
+/// Publication-level semantic hints that cannot be derived reliably from one HTML resource.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SectionParseHints {
+    /// The publication navigation identifies this entire resource as Notes/Endnotes.
+    pub note_section: bool,
 }
 
 fn classify_footnote_links(
@@ -148,10 +156,11 @@ fn matching_footnote_markers(left: Node<'_, '_>, right: Node<'_, '_>) -> bool {
 }
 
 fn normalize_footnote_marker(marker: &str) -> Option<String> {
-    let marker = marker.trim();
+    let marker = marker.trim().trim_end_matches(['.', '．']).trim();
     let marker = marker
         .trim_start_matches(['[', '(', '（', '【'])
         .trim_end_matches([']', ')', '）', '】'])
+        .trim_end_matches(['.', '．'])
         .trim();
     let compact = !marker.is_empty()
         && marker.chars().count() <= 8
@@ -179,7 +188,35 @@ fn link_has_preceding_block_text(link: Node<'_, '_>) -> bool {
 pub fn parse_section(
     xml: &str,
     descriptor: &SpineItem,
+    load_stylesheet: impl FnMut(&PublicationUrl) -> Option<String>,
+) -> Result<Section, HtmlError> {
+    parse_section_with_image_classifier(xml, descriptor, load_stylesheet, |_| false)
+}
+
+/// Parses one HTML section while allowing its publication container to identify decorative
+/// image resources from intrinsic metadata that is unavailable to the HTML layer.
+pub fn parse_section_with_image_classifier(
+    xml: &str,
+    descriptor: &SpineItem,
+    load_stylesheet: impl FnMut(&PublicationUrl) -> Option<String>,
+    is_decorative_separator_image: impl FnMut(&PublicationUrl) -> bool,
+) -> Result<Section, HtmlError> {
+    parse_section_with_hints_and_image_classifier(
+        xml,
+        descriptor,
+        load_stylesheet,
+        is_decorative_separator_image,
+        SectionParseHints::default(),
+    )
+}
+
+/// Parses one HTML section with publication-level semantic hints and image classification.
+pub fn parse_section_with_hints_and_image_classifier(
+    xml: &str,
+    descriptor: &SpineItem,
     mut load_stylesheet: impl FnMut(&PublicationUrl) -> Option<String>,
+    mut is_decorative_separator_image: impl FnMut(&PublicationUrl) -> bool,
+    hints: SectionParseHints,
 ) -> Result<Section, HtmlError> {
     let document = Document::parse(xml).map_err(|error| HtmlError::InvalidDocument {
         resource: descriptor.href.to_string(),
@@ -196,9 +233,14 @@ pub fn parse_section(
         descriptor.href.clone(),
         styles,
         footnote_links,
+        &mut is_decorative_separator_image,
     );
     parser.queue_node_anchors(root);
-    parser.parse_children(root)?;
+    if hints.note_section {
+        parser.parse_note_section_children(root)?;
+    } else {
+        parser.parse_children(root)?;
+    }
 
     if parser.blocks.is_empty() && !parser.suppressed_content {
         let style = parser.styles.block_style(root, BlockStyle::default());
@@ -213,7 +255,7 @@ pub fn parse_section(
     })
 }
 
-struct ReadingIrParser {
+struct ReadingIrParser<'a> {
     section_id: SpineItemId,
     section_href: PublicationUrl,
     next_node: u64,
@@ -225,14 +267,18 @@ struct ReadingIrParser {
     footnote_links: HashMap<usize, LinkRole>,
     paragraph_list_indents: Vec<f32>,
     suppressed_content: bool,
+    inside_quote: bool,
+    inside_note_definition: bool,
+    is_decorative_separator_image: &'a mut dyn FnMut(&PublicationUrl) -> bool,
 }
 
-impl ReadingIrParser {
+impl<'a> ReadingIrParser<'a> {
     fn new(
         section_id: SpineItemId,
         section_href: PublicationUrl,
         styles: StyleSheet,
         footnote_links: HashMap<usize, LinkRole>,
+        is_decorative_separator_image: &'a mut dyn FnMut(&PublicationUrl) -> bool,
     ) -> Self {
         Self {
             section_id,
@@ -246,6 +292,9 @@ impl ReadingIrParser {
             footnote_links,
             paragraph_list_indents: Vec::new(),
             suppressed_content: false,
+            inside_quote: false,
+            inside_note_definition: false,
+            is_decorative_separator_image,
         }
     }
 
@@ -255,6 +304,17 @@ impl ReadingIrParser {
         while index < children.len() {
             let node = children[index];
             if node.is_element() {
+                if let Some(caption_index) =
+                    inferred_figure_caption_sibling(&children, index, &self.footnote_links)
+                {
+                    self.parse_inferred_figure_pair(node, children[caption_index])?;
+                    index = caption_index + 1;
+                    continue;
+                }
+                if note_section_starts_at(node, &children[index + 1..], &self.footnote_links) {
+                    self.parse_note_section_nodes(&children[index..])?;
+                    break;
+                }
                 if let Some(consumed) = self.try_parse_sibling_quote(parent, &children[index..])? {
                     index += consumed;
                     continue;
@@ -264,6 +324,126 @@ impl ReadingIrParser {
             index += 1;
         }
         Ok(())
+    }
+
+    fn parse_inferred_figure_pair(
+        &mut self,
+        image: Node<'_, '_>,
+        caption: Node<'_, '_>,
+    ) -> Result<(), HtmlError> {
+        let image_start = self.blocks.len();
+        self.parse_node(image)?;
+        let parsed_as_images = self.blocks.len() > image_start
+            && self.blocks[image_start..]
+                .iter()
+                .all(|block| matches!(block, Block::Image(_)));
+
+        let caption_start = self.blocks.len();
+        self.parse_node(caption)?;
+        if parsed_as_images
+            && let [Block::Text(caption)] = &mut self.blocks[caption_start..]
+            && caption.kind == TextBlockKind::Paragraph
+        {
+            caption.kind = TextBlockKind::Caption;
+        }
+        Ok(())
+    }
+
+    fn parse_note_section_children(&mut self, parent: Node<'_, '_>) -> Result<(), HtmlError> {
+        let children = parent.children().collect::<Vec<_>>();
+        self.parse_note_section_nodes(&children)
+    }
+
+    fn parse_note_section_nodes(&mut self, nodes: &[Node<'_, '_>]) -> Result<(), HtmlError> {
+        let mut index = 0;
+        while index < nodes.len() {
+            let node = nodes[index];
+            if !node.is_element() {
+                index += 1;
+                continue;
+            }
+            if note_entry_starts_at(node, &self.footnote_links, true) {
+                let end = nodes[index + 1..]
+                    .iter()
+                    .position(|candidate| {
+                        candidate.is_element()
+                            && (note_entry_starts_at(*candidate, &self.footnote_links, true)
+                                || is_note_subsection_heading(*candidate))
+                    })
+                    .map_or(nodes.len(), |offset| index + 1 + offset);
+                self.parse_grouped_note_nodes(&nodes[index..end], NoteBlockKind::Section)?;
+                index = end;
+                continue;
+            }
+            let block_start = self.blocks.len();
+            self.parse_node(node)?;
+            self.wrap_blocks(block_start, NoteBlockKind::Section);
+            index += 1;
+        }
+        Ok(())
+    }
+
+    fn parse_note_definition_nodes(&mut self, nodes: &[Node<'_, '_>]) -> Result<(), HtmlError> {
+        self.parse_grouped_note_nodes(nodes, NoteBlockKind::Definition)
+    }
+
+    fn parse_grouped_note_nodes(
+        &mut self,
+        nodes: &[Node<'_, '_>],
+        kind: NoteBlockKind,
+    ) -> Result<(), HtmlError> {
+        let block_start = self.blocks.len();
+        let previous = self.inside_note_definition;
+        self.inside_note_definition = true;
+        for node in nodes.iter().copied().filter(Node::is_element) {
+            if let Err(error) = self.parse_node(node) {
+                self.inside_note_definition = previous;
+                return Err(error);
+            }
+        }
+        self.inside_note_definition = previous;
+        self.wrap_blocks(block_start, kind);
+        Ok(())
+    }
+
+    fn parse_implicit_note_container(&mut self, container: Node<'_, '_>) -> Result<(), HtmlError> {
+        let nodes = container.children().collect::<Vec<_>>();
+        let mut index = 0;
+        while index < nodes.len() {
+            let node = nodes[index];
+            if !node.is_element() {
+                index += 1;
+                continue;
+            }
+            if note_entry_starts_at(node, &self.footnote_links, false) {
+                let end = nodes[index + 1..]
+                    .iter()
+                    .position(|candidate| {
+                        candidate.is_element()
+                            && note_entry_starts_at(*candidate, &self.footnote_links, false)
+                    })
+                    .map_or(nodes.len(), |offset| index + 1 + offset);
+                self.parse_note_definition_nodes(&nodes[index..end])?;
+                index = end;
+                continue;
+            }
+            self.parse_node(node)?;
+            index += 1;
+        }
+        Ok(())
+    }
+
+    fn wrap_blocks(&mut self, block_start: usize, kind: NoteBlockKind) {
+        let blocks = self.blocks.split_off(block_start);
+        if blocks.is_empty() {
+            return;
+        }
+        let source = combined_block_source(&blocks);
+        self.blocks.push(Block::Note(NoteBlock {
+            kind,
+            blocks,
+            source,
+        }));
     }
 
     fn parse_block_container(&mut self, container: Node<'_, '_>) -> Result<(), HtmlError> {
@@ -289,6 +469,17 @@ impl ReadingIrParser {
                     style,
                     std::mem::replace(&mut collector, InlineCollector::new(false)),
                 );
+                if let Some(caption_index) =
+                    inferred_figure_caption_sibling(&children, index, &self.footnote_links)
+                {
+                    self.parse_inferred_figure_pair(child, children[caption_index])?;
+                    index = caption_index + 1;
+                    continue;
+                }
+                if note_section_starts_at(child, &children[index + 1..], &self.footnote_links) {
+                    self.parse_note_section_nodes(&children[index..])?;
+                    break;
+                }
                 if let Some(consumed) =
                     self.try_parse_sibling_quote(container, &children[index..])?
                 {
@@ -329,10 +520,15 @@ impl ReadingIrParser {
 
     fn parse_footnote_definition(&mut self, note: Node<'_, '_>) -> Result<(), HtmlError> {
         let block_start = self.blocks.len();
-        self.parse_block_container(note)?;
+        let previous = self.inside_note_definition;
+        self.inside_note_definition = true;
+        let result = self.parse_block_container(note);
+        self.inside_note_definition = previous;
+        result?;
         for block in &mut self.blocks[block_start..] {
             mark_block_as_footnote_definition(block);
         }
+        self.wrap_blocks(block_start, NoteBlockKind::Definition);
         Ok(())
     }
 
@@ -448,6 +644,14 @@ impl ReadingIrParser {
             self.parse_footnote_definition(node)?;
             return Ok(());
         }
+        if !self.inside_note_definition && is_implicit_note_container(node, &self.footnote_links) {
+            self.parse_implicit_note_container(node)?;
+            return Ok(());
+        }
+        if !self.inside_note_definition && note_entry_starts_at(node, &self.footnote_links, false) {
+            self.parse_note_definition_nodes(&[node])?;
+            return Ok(());
+        }
         match name.as_str() {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let level = name[1..].parse::<u8>().unwrap_or(1);
@@ -471,6 +675,12 @@ impl ReadingIrParser {
                     self.parse_standalone_quote(node)?;
                 } else {
                     let mut style = self.styles.block_style(node, BlockStyle::default());
+                    if !self.inside_quote && is_authored_spacing_paragraph(node) {
+                        self.queue_descendant_anchors(node);
+                        self.blocks
+                            .push(Block::Separator(SeparatorBlock::spacing(style)));
+                        return Ok(());
+                    }
                     if contains_display_math(node) && has_only_math_content(node) {
                         style.align = TextAlignment::Center;
                         style.margin_before = style.margin_before.max(12.0);
@@ -522,8 +732,12 @@ impl ReadingIrParser {
             "dl" => self.parse_definition_list(node, 0)?,
             "dt" => self.parse_definition_entry(node, true, 0)?,
             "dd" => self.parse_definition_entry(node, false, 0)?,
-            "img" | "image" => self.push_image(node, None)?,
-            "hr" => self.blocks.push(Block::Separator),
+            "img" | "image" => self.push_image(node, None, true)?,
+            "hr" => self.blocks.push(Block::Separator(if self.inside_quote {
+                SeparatorBlock::rule_in_quote()
+            } else {
+                SeparatorBlock::rule()
+            })),
             "br" => self.blocks.push(Block::LineBreak),
             _ => self.parse_children(node)?,
         }
@@ -590,7 +804,11 @@ impl ReadingIrParser {
             let start = self.blocks.len();
             let mut style = self.styles.block_style(quote, BlockStyle::default());
             apply_default_blockquote_margin(&mut style);
-            self.push_text_block(quote, TextBlockKind::Blockquote, style)?;
+            let previously_inside_quote = self.inside_quote;
+            self.inside_quote = true;
+            let parse_result = self.push_text_block(quote, TextBlockKind::Blockquote, style);
+            self.inside_quote = previously_inside_quote;
+            parse_result?;
             let mut body = self
                 .blocks
                 .drain(start..)
@@ -626,7 +844,11 @@ impl ReadingIrParser {
     fn parse_standalone_quote(&mut self, node: Node<'_, '_>) -> Result<(), HtmlError> {
         let start = self.blocks.len();
         let style = self.styles.block_style(node, BlockStyle::default());
-        self.push_text_block(node, TextBlockKind::Blockquote, style)?;
+        let previously_inside_quote = self.inside_quote;
+        self.inside_quote = true;
+        let parse_result = self.push_text_block(node, TextBlockKind::Blockquote, style);
+        self.inside_quote = previously_inside_quote;
+        parse_result?;
         let mut body = self
             .blocks
             .drain(start..)
@@ -662,15 +884,22 @@ impl ReadingIrParser {
         stanza_break_after: &[usize],
     ) -> Result<(), HtmlError> {
         let start = self.blocks.len();
-        for node in body_nodes.iter().copied().chain(attribution_node) {
-            // The enclosing structure has already established the quote roles. Parsing the
-            // child through `parse_node` would run standalone quote detection again and turn a
-            // class such as `prosequote1` into a nested Quote, which drops its sibling source
-            // when the outer quote collects text blocks.
-            self.queue_node_anchors(node);
-            let style = self.styles.block_style(node, BlockStyle::default());
-            self.push_text_block(node, TextBlockKind::Paragraph, style)?;
-        }
+        let previously_inside_quote = self.inside_quote;
+        self.inside_quote = true;
+        let parse_result: Result<(), HtmlError> = (|| {
+            for node in body_nodes.iter().copied().chain(attribution_node) {
+                // The enclosing structure has already established the quote roles. Parsing the
+                // child through `parse_node` would run standalone quote detection again and turn a
+                // class such as `prosequote1` into a nested Quote, which drops its sibling source
+                // when the outer quote collects text blocks.
+                self.queue_node_anchors(node);
+                let style = self.styles.block_style(node, BlockStyle::default());
+                self.push_text_block(node, TextBlockKind::Paragraph, style)?;
+            }
+            Ok(())
+        })();
+        self.inside_quote = previously_inside_quote;
+        parse_result?;
         let mut parsed = self.blocks.drain(start..).collect::<Vec<_>>();
         let attribution = attribution_node.and_then(|_| match parsed.pop() {
             Some(Block::Text(mut block)) => {
@@ -890,7 +1119,7 @@ impl ReadingIrParser {
                     0.0
                 },
             ));
-            self.push_image(image, container_style)?;
+            self.push_image(image, container_style, false)?;
         }
         Ok(())
     }
@@ -1132,7 +1361,7 @@ impl ReadingIrParser {
                     0.0
                 },
             ));
-            self.push_image(image, container_style)?;
+            self.push_image(image, container_style, text_len == 0 && image_count == 1)?;
         }
         Ok(())
     }
@@ -1171,9 +1400,30 @@ impl ReadingIrParser {
         &mut self,
         node: Node<'_, '_>,
         container_style: Option<(f32, f32)>,
+        allow_separator: bool,
     ) -> Result<(), HtmlError> {
         if let Some(image) = self.image_block(node, container_style, None)? {
-            self.blocks.push(Block::Image(image));
+            let generic_alt = image.alt.trim();
+            let generic_alt = generic_alt.is_empty()
+                || generic_alt.eq_ignore_ascii_case("image")
+                || generic_alt.eq_ignore_ascii_case("ornament")
+                || generic_alt.eq_ignore_ascii_case("separator")
+                || generic_alt.eq_ignore_ascii_case("divider");
+            if allow_separator
+                && !self.inside_quote
+                && generic_alt
+                && !node.ancestors().any(|ancestor| {
+                    ancestor.is_element()
+                        && ancestor.tag_name().name().eq_ignore_ascii_case("a")
+                        && attribute_local(ancestor, "href").is_some()
+                })
+                && (self.is_decorative_separator_image)(&image.href)
+            {
+                self.blocks
+                    .push(Block::Separator(SeparatorBlock::ornament(image)));
+            } else {
+                self.blocks.push(Block::Image(image));
+            }
         }
         Ok(())
     }
@@ -1276,8 +1526,366 @@ fn mark_block_as_footnote_definition(block: &mut Block) {
             .flat_map(|row| &mut row.cells)
             .for_each(|cell| mark(&mut cell.text)),
         Block::Figure(figure) => figure.captions.iter_mut().for_each(mark),
-        Block::Image(_) | Block::Separator | Block::LineBreak | Block::PageBreak => {}
+        Block::Note(note) => note
+            .blocks
+            .iter_mut()
+            .for_each(mark_block_as_footnote_definition),
+        Block::Image(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {}
     }
+}
+
+fn combined_block_source(blocks: &[Block]) -> Option<SourceRange> {
+    let first = blocks.iter().find_map(block_source_range)?.start.clone();
+    let last = blocks
+        .iter()
+        .rev()
+        .find_map(block_source_range)?
+        .end
+        .clone();
+    Some(SourceRange {
+        start: first,
+        end: last,
+    })
+}
+
+fn block_source_range(block: &Block) -> Option<&SourceRange> {
+    match block {
+        Block::Text(text) => text.source.as_ref(),
+        Block::Quote(quote) => quote.source.as_ref(),
+        Block::Table(table) => table.source.as_ref(),
+        Block::Image(image) => image.source.as_ref(),
+        Block::Figure(figure) => figure.source.as_ref(),
+        Block::Note(note) => note.source.as_ref(),
+        Block::Separator(_) | Block::LineBreak | Block::PageBreak => None,
+    }
+}
+
+fn inferred_figure_caption_sibling(
+    siblings: &[Node<'_, '_>],
+    image_index: usize,
+    footnote_links: &HashMap<usize, LinkRole>,
+) -> Option<usize> {
+    let image = *siblings.get(image_index)?;
+    if !is_captionable_image_container(image, footnote_links) {
+        return None;
+    }
+    for (index, sibling) in siblings.iter().copied().enumerate().skip(image_index + 1) {
+        if sibling.is_text() {
+            if sibling.text().is_some_and(|text| !text.trim().is_empty()) {
+                return None;
+            }
+            continue;
+        }
+        if !sibling.is_element() {
+            continue;
+        }
+        return is_inferred_figure_caption(sibling).then_some(index);
+    }
+    None
+}
+
+fn is_captionable_image_container(
+    node: Node<'_, '_>,
+    footnote_links: &HashMap<usize, LinkRole>,
+) -> bool {
+    if !node.is_element()
+        || node
+            .descendants()
+            .filter(Node::is_text)
+            .filter_map(|text| text.text())
+            .any(|text| !text.trim().is_empty())
+    {
+        return false;
+    }
+
+    let images = node
+        .descendants()
+        .filter(|descendant| {
+            descendant.is_element()
+                && matches!(
+                    descendant.tag_name().name().to_ascii_lowercase().as_str(),
+                    "img" | "image"
+                )
+        })
+        .collect::<Vec<_>>();
+    !images.is_empty()
+        && images
+            .iter()
+            .all(|image| !image_is_footnote_reference(*image, footnote_links))
+        && !node.descendants().skip(1).any(|descendant| {
+            descendant.is_element()
+                && matches!(
+                    descendant.tag_name().name().to_ascii_lowercase().as_str(),
+                    "figcaption" | "table"
+                )
+        })
+}
+
+fn is_inferred_figure_caption(node: Node<'_, '_>) -> bool {
+    if !node.is_element()
+        || !matches!(
+            node.tag_name().name().to_ascii_lowercase().as_str(),
+            "p" | "div"
+        )
+        || node.descendants().skip(1).any(|descendant| {
+            descendant.is_element()
+                && matches!(
+                    descendant.tag_name().name().to_ascii_lowercase().as_str(),
+                    "div" | "figure" | "figcaption" | "img" | "image" | "table"
+                )
+        })
+    {
+        return false;
+    }
+
+    let text = node_text(node);
+    !text.trim().is_empty()
+        && (has_caption_semantic_attribute(node) || starts_with_numbered_caption_label(&text))
+}
+
+fn has_caption_semantic_attribute(node: Node<'_, '_>) -> bool {
+    [
+        attribute_local(node, "class"),
+        attribute_local(node, "type"),
+        attribute_local(node, "role"),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(str::split_whitespace)
+    .map(|token| {
+        token
+            .chars()
+            .filter(|character| !matches!(character, '-' | '_'))
+            .collect::<String>()
+            .to_ascii_lowercase()
+    })
+    .any(|token| {
+        matches!(
+            token.as_str(),
+            "caption"
+                | "fcaption"
+                | "figcaption"
+                | "figurecaption"
+                | "doccaption"
+                | "legend"
+                | "finure"
+                | "tushuo"
+        )
+    })
+}
+
+fn starts_with_numbered_caption_label(text: &str) -> bool {
+    let text = text.trim_start_matches(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '▲' | '△' | '◆' | '◇' | '■' | '□' | '●' | '○' | '※'
+            )
+    });
+
+    for label in ["图片", "图表", "插图", "图版", "表格", "图", "表"] {
+        if let Some(rest) = text.strip_prefix(label) {
+            return starts_with_caption_identifier(rest.trim_start());
+        }
+    }
+
+    let lower = text.to_ascii_lowercase();
+    for label in [
+        "illustration",
+        "figure",
+        "table",
+        "plate",
+        "chart",
+        "exhibit",
+        "fig",
+    ] {
+        if lower.starts_with(label) {
+            let mut rest = &text[label.len()..];
+            if label == "fig" {
+                rest = rest.strip_prefix('.').unwrap_or(rest);
+            }
+            return starts_with_caption_identifier(rest.trim_start());
+        }
+    }
+    false
+}
+
+fn starts_with_caption_identifier(text: &str) -> bool {
+    text.chars().next().is_some_and(|character| {
+        character.is_ascii_digit()
+            || character.is_ascii_uppercase()
+            || matches!(
+                character,
+                '一' | '二'
+                    | '三'
+                    | '四'
+                    | '五'
+                    | '六'
+                    | '七'
+                    | '八'
+                    | '九'
+                    | '十'
+                    | '百'
+                    | '千'
+                    | '零'
+                    | '〇'
+            )
+    })
+}
+
+fn is_note_section_heading(node: Node<'_, '_>) -> bool {
+    let name = node.tag_name().name().to_ascii_lowercase();
+    matches!(name.as_str(), "h1" | "h2" | "h3" | "p") && is_note_section_label(&node_text(node))
+}
+
+fn node_text(node: Node<'_, '_>) -> String {
+    node.descendants()
+        .filter(Node::is_text)
+        .filter_map(|text| text.text())
+        .collect()
+}
+
+fn is_note_section_label(label: &str) -> bool {
+    let label = label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches([':', '：'])
+        .to_owned();
+    matches!(
+        label.to_ascii_lowercase().as_str(),
+        "note"
+            | "notes"
+            | "endnote"
+            | "endnotes"
+            | "footnote"
+            | "footnotes"
+            | "注释"
+            | "注解"
+            | "尾注"
+            | "本章注"
+            | "章节注释"
+            | "作者附注"
+    )
+}
+
+fn note_section_extends_to_container_end(heading: Node<'_, '_>, suffix: &[Node<'_, '_>]) -> bool {
+    let level = heading
+        .tag_name()
+        .name()
+        .get(1..)
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(1);
+    let has_content = suffix.iter().any(|node| {
+        node.is_element()
+            || (node.is_text() && node.text().is_some_and(|text| !text.trim().is_empty()))
+    });
+    has_content
+        && !suffix.iter().any(|node| {
+            node.is_element()
+                && node
+                    .tag_name()
+                    .name()
+                    .to_ascii_lowercase()
+                    .strip_prefix('h')
+                    .and_then(|value| value.parse::<u8>().ok())
+                    .is_some_and(|candidate| candidate <= level)
+        })
+}
+
+fn note_section_starts_at(
+    heading: Node<'_, '_>,
+    suffix: &[Node<'_, '_>],
+    footnote_links: &HashMap<usize, LinkRole>,
+) -> bool {
+    is_note_section_heading(heading)
+        && note_section_extends_to_container_end(heading, suffix)
+        && suffix
+            .iter()
+            .copied()
+            .any(|node| node.is_element() && note_entry_starts_at(node, footnote_links, true))
+}
+
+fn is_note_subsection_heading(node: Node<'_, '_>) -> bool {
+    let name = node.tag_name().name().to_ascii_lowercase();
+    name.strip_prefix('h')
+        .and_then(|value| value.parse::<u8>().ok())
+        .is_some_and(|level| (1..=6).contains(&level))
+}
+
+fn note_entry_starts_at(
+    node: Node<'_, '_>,
+    footnote_links: &HashMap<usize, LinkRole>,
+    confirmed_note_section: bool,
+) -> bool {
+    node.descendants()
+        .filter(|candidate| {
+            candidate.is_element()
+                && candidate.tag_name().name().eq_ignore_ascii_case("a")
+                && !link_has_preceding_block_text(*candidate)
+                && link_is_scoped_to_note_entry_node(node, *candidate)
+        })
+        .any(|anchor| {
+            if footnote_links.get(&anchor.range().start) == Some(&LinkRole::FootnoteBacklink) {
+                return true;
+            }
+            if !confirmed_note_section
+                || (node_fragment(anchor).is_none() && node_fragment(node).is_none())
+                || !attribute_local(anchor, "href").is_some_and(|href| href.contains('#'))
+            {
+                return false;
+            }
+            let marker = anchor
+                .descendants()
+                .filter(Node::is_text)
+                .filter_map(|text| text.text())
+                .collect::<String>();
+            normalize_footnote_marker(&marker).is_some()
+        })
+}
+
+fn link_is_scoped_to_note_entry_node(node: Node<'_, '_>, link: Node<'_, '_>) -> bool {
+    let closest_block = link.ancestors().skip(1).find(|ancestor| {
+        ancestor.is_element()
+            && is_block_boundary(ancestor.tag_name().name().to_ascii_lowercase().as_str())
+    });
+    if closest_block == Some(node) {
+        return true;
+    }
+    node_fragment(node).is_some()
+        && !node
+            .descendants()
+            .take_while(|descendant| descendant.range().start < link.range().start)
+            .filter(Node::is_text)
+            .filter_map(|text| text.text())
+            .any(|text| !text.trim().is_empty())
+}
+
+fn is_implicit_note_container(
+    node: Node<'_, '_>,
+    footnote_links: &HashMap<usize, LinkRole>,
+) -> bool {
+    let name = node.tag_name().name().to_ascii_lowercase();
+    if !matches!(name.as_str(), "div" | "section" | "ol" | "ul") {
+        return false;
+    }
+    let semantic_name = [attribute_local(node, "class"), attribute_local(node, "id")]
+        .into_iter()
+        .flatten()
+        .flat_map(|value| {
+            value.split(|character: char| character.is_whitespace() || character == '-')
+        })
+        .any(|token| {
+            matches!(
+                token.to_ascii_lowercase().as_str(),
+                "footnote" | "footnotes" | "endnote" | "endnotes"
+            )
+        });
+    semantic_name
+        && node
+            .children()
+            .filter(Node::is_element)
+            .any(|child| note_entry_starts_at(child, footnote_links, false))
 }
 
 struct InlineCollector {
@@ -1404,6 +2012,34 @@ fn is_collapsible_html_whitespace(character: char) -> bool {
         character,
         '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' | ' '
     )
+}
+
+fn is_authored_spacing_paragraph(node: Node<'_, '_>) -> bool {
+    let mut has_spacing_marker = false;
+    for descendant in node.descendants().skip(1) {
+        if descendant.is_element() {
+            let name = descendant.tag_name().name().to_ascii_lowercase();
+            if matches!(name.as_str(), "img" | "image" | "svg" | "math") {
+                return false;
+            }
+            if name == "br" {
+                has_spacing_marker = true;
+            }
+            continue;
+        }
+        let Some(text) = descendant.text() else {
+            continue;
+        };
+        for character in text.chars() {
+            if !character.is_whitespace() {
+                return false;
+            }
+            if matches!(character, '\u{00a0}' | '\u{3000}') {
+                has_spacing_marker = true;
+            }
+        }
+    }
+    has_spacing_marker
 }
 
 struct InlineParseContext<'a> {
@@ -2669,6 +3305,46 @@ fn attribute_local<'a>(node: Node<'a, '_>, name: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
 
+    fn collect_text_blocks<'a>(blocks: &'a [Block], output: &mut Vec<&'a TextBlock>) {
+        for block in blocks {
+            match block {
+                Block::Text(block) => output.push(block),
+                Block::Note(note) => collect_text_blocks(&note.blocks, output),
+                _ => {}
+            }
+        }
+    }
+
+    fn all_text_blocks(section: &Section) -> Vec<&TextBlock> {
+        let mut blocks = Vec::new();
+        collect_text_blocks(&section.blocks, &mut blocks);
+        blocks
+    }
+
+    fn text_block_text(block: &TextBlock) -> String {
+        block
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run.text.as_str()),
+                Inline::Math(run) => Some(run.latex.as_str()),
+                Inline::Break => Some("\n"),
+            })
+            .collect()
+    }
+
+    fn note_text(note: &NoteBlock) -> String {
+        note.blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(text_block_text(block)),
+                Block::Note(note) => Some(note_text(note)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
     fn preserves_authored_indent_except_for_normalized_list_items() {
         let descriptor = SpineItem {
@@ -2973,13 +3649,9 @@ mod tests {
         </body></html>"##;
 
         let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
-        let runs = section
-            .blocks
-            .iter()
-            .filter_map(|block| match block {
-                Block::Text(block) => Some(&block.content),
-                _ => None,
-            })
+        let runs = all_text_blocks(&section)
+            .into_iter()
+            .map(|block| &block.content)
             .flatten()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run),
@@ -3031,15 +3703,9 @@ mod tests {
                 .any(|block| matches!(block, Block::Image(_)))
         );
 
-        let definition = section
-            .blocks
-            .iter()
-            .find_map(|block| match block {
-                Block::Text(block) if block.kind == TextBlockKind::FootnoteDefinition => {
-                    Some(block)
-                }
-                _ => None,
-            })
+        let definition = all_text_blocks(&section)
+            .into_iter()
+            .find(|block| block.kind == TextBlockKind::FootnoteDefinition)
             .expect("semantic footnote definition");
         assert!(definition.content.iter().any(|inline| {
             matches!(inline, Inline::Text(run) if run.text.contains("国际知名的演说家"))
@@ -3099,13 +3765,9 @@ mod tests {
         </body></html>"##;
 
         let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
-        let runs = section
-            .blocks
-            .iter()
-            .filter_map(|block| match block {
-                Block::Text(block) => Some(&block.content),
-                _ => None,
-            })
+        let runs = all_text_blocks(&section)
+            .into_iter()
+            .map(|block| &block.content)
             .flatten()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run),
@@ -3140,13 +3802,9 @@ mod tests {
         </body></html>"##;
 
         let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
-        let runs = section
-            .blocks
-            .iter()
-            .filter_map(|block| match block {
-                Block::Text(block) => Some(&block.content),
-                _ => None,
-            })
+        let runs = all_text_blocks(&section)
+            .into_iter()
+            .map(|block| &block.content)
             .flatten()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run),
@@ -3160,6 +3818,172 @@ mod tests {
         assert!(runs.iter().any(|run| {
             run.text.trim() == "[5]" && run.style.link_role == LinkRole::FootnoteBacklink
         }));
+    }
+
+    #[test]
+    fn groups_multiblock_implicit_footnote_definitions() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p>Body<a id="ref-1" href="#note-1">1</a>
+                and more<a id="ref-2" href="#note-2">2</a>.</p>
+            <div class="footnotes">
+                <p id="note-1"><a href="#ref-1">1.</a> First definition.</p>
+                <p>Continuation of the first definition.</p>
+                <p id="note-2"><a href="#ref-2">2.</a> Second definition.</p>
+            </div>
+        </body></html>"##;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let notes = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Note(note) if note.kind == NoteBlockKind::Definition => Some(note),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(notes.len(), 2);
+        assert!(note_text(notes[0]).contains("First definition"));
+        assert!(note_text(notes[0]).contains("Continuation of the first definition"));
+        assert!(!note_text(notes[0]).contains("Second definition"));
+        assert!(note_text(notes[1]).contains("Second definition"));
+    }
+
+    #[test]
+    fn groups_a_local_notes_suffix_without_reclassifying_a_plain_note_callout() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <div class="note"><p>An ordinary editorial callout.</p></div>
+            <h2>Notes</h2>
+            <p id="note-1"><a href="chapter.xhtml#ref-1">1.</a> First note.</p>
+            <p>Continuation of the first note.</p>
+            <p id="note-2"><a href="chapter.xhtml#ref-2">2.</a> Second note.</p>
+        </body></html>"##;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        assert!(matches!(section.blocks.first(), Some(Block::Text(_))));
+        let notes = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Note(note) if note.kind == NoteBlockKind::Section => Some(note),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(notes.len(), 3);
+        assert_eq!(note_text(notes[0]).trim(), "Notes");
+        assert!(note_text(notes[1]).contains("First note"));
+        assert!(note_text(notes[1]).contains("Continuation of the first note"));
+        assert!(!note_text(notes[1]).contains("Second note"));
+        assert!(note_text(notes[2]).contains("Second note"));
+    }
+
+    #[test]
+    fn splits_a_paragraph_titled_notes_suffix_inside_a_large_body_container() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("text/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <div class="calibre1">
+                <h3>第二章</h3>
+                <p>正文内容。<a id="q2d1" href="#h2d1">【1】</a></p>
+                <p><b>注释：</b></p>
+                <p id="note-row"><a id="h2d1" href="#q2d1">【1】</a>第一条注释。</p>
+                <p>第一条注释的续段。</p>
+            </div>
+        </body></html>"##;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let body_text = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(text_block_text(block)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let notes = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Note(note) if note.kind == NoteBlockKind::Section => Some(note),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(body_text.contains("第二章"));
+        assert!(body_text.contains("正文内容"));
+        assert_eq!(notes.len(), 2);
+        assert_eq!(note_text(notes[0]).trim(), "注释：");
+        assert!(note_text(notes[1]).contains("第一条注释"));
+        assert!(note_text(notes[1]).contains("第一条注释的续段"));
+        assert!(!note_text(notes[1]).contains("正文内容"));
+    }
+
+    #[test]
+    fn whole_section_hint_groups_container_anchored_multiblock_notes() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("notes").unwrap(),
+            href: PublicationUrl::parse("OPS/notes.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p class="book-title">Notes</p>
+            <h2>Chapter One</h2>
+            <p id="note-1"><a href="chapter.xhtml#ref-1">1.</a> First note.</p>
+            <p class="indent">A second paragraph in the first note.</p>
+            <p id="note-2"><a href="chapter.xhtml#ref-2">2.</a> Second note.</p>
+        </body></html>"##;
+
+        let section = parse_section_with_hints_and_image_classifier(
+            xml,
+            &descriptor,
+            |_| unreachable!(),
+            |_| false,
+            SectionParseHints { note_section: true },
+        )
+        .unwrap();
+        assert!(
+            section
+                .blocks
+                .iter()
+                .all(|block| matches!(block, Block::Note(_)))
+        );
+        let notes = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Note(note) => Some(note),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(notes.len(), 4);
+        assert!(note_text(notes[2]).contains("First note"));
+        assert!(note_text(notes[2]).contains("A second paragraph in the first note"));
+        assert!(!note_text(notes[2]).contains("Second note"));
+        assert!(note_text(notes[3]).contains("Second note"));
     }
 
     #[test]
@@ -3254,6 +4078,75 @@ mod tests {
         assert_eq!(before.caption_position, CaptionPosition::Before);
         assert_eq!(before.captions.len(), 1);
         assert!(captionless.captions.is_empty());
+    }
+
+    #[test]
+    fn marks_adjacent_class_and_numbered_paragraphs_as_inferred_captions() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><div>
+            <p class="IMG"><a id="leaf"/><img src="images/leaf.jpg"/></p>
+            <p class="caption">A leaf without a numbered label.</p>
+            <div class="calibre21"><img src="images/chart.jpg"/></div>
+            <p class="calibre7"><span>▲图6-5 实战中的图表</span></p>
+            <img src="images/direct.jpg"/>
+            <p>Figure 2-1. A directly adjacent image caption.</p>
+            <p>Ordinary body text.</p>
+        </div></body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [
+            Block::Image(_),
+            Block::Text(class_caption),
+            Block::Image(_),
+            Block::Text(label_caption),
+            Block::Image(_),
+            Block::Text(direct_caption),
+            Block::Text(body),
+        ] = section.blocks.as_slice()
+        else {
+            panic!("expected adjacent images, inferred captions, and body text");
+        };
+        assert_eq!(class_caption.kind, TextBlockKind::Caption);
+        assert_eq!(label_caption.kind, TextBlockKind::Caption);
+        assert_eq!(direct_caption.kind, TextBlockKind::Caption);
+        assert_eq!(body.kind, TextBlockKind::Paragraph);
+        assert_eq!(
+            text_block_text(class_caption),
+            "A leaf without a numbered label."
+        );
+        assert_eq!(text_block_text(label_caption), "▲图6-5 实战中的图表");
+    }
+
+    #[test]
+    fn leaves_unnumbered_figure_references_and_nonadjacent_labels_as_paragraphs() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p><img src="images/a.jpg"/></p>
+            <p>Figure shows the ordinary workflow.</p>
+            <p><img src="images/b.jpg"/></p>
+            <hr/>
+            <p>Figure 2. This label is not adjacent to its image.</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let text = all_text_blocks(&section);
+        assert_eq!(text.len(), 2);
+        assert!(
+            text.iter()
+                .all(|block| block.kind == TextBlockKind::Paragraph)
+        );
     }
 
     #[test]
@@ -3623,7 +4516,8 @@ mod tests {
                 | Block::Quote(_)
                 | Block::Image(_)
                 | Block::Figure(_)
-                | Block::Separator
+                | Block::Note(_)
+                | Block::Separator(_)
                 | Block::LineBreak
                 | Block::PageBreak => None,
             })
@@ -3672,7 +4566,8 @@ mod tests {
                 | Block::Quote(_)
                 | Block::Table(_)
                 | Block::Figure(_)
-                | Block::Separator
+                | Block::Note(_)
+                | Block::Separator(_)
                 | Block::LineBreak
                 | Block::PageBreak => None,
             })
@@ -3734,7 +4629,8 @@ mod tests {
                 | Block::Table(_)
                 | Block::Image(_)
                 | Block::Figure(_)
-                | Block::Separator
+                | Block::Note(_)
+                | Block::Separator(_)
                 | Block::LineBreak
                 | Block::PageBreak => None,
             })
@@ -3750,7 +4646,8 @@ mod tests {
                 | Block::Table(_)
                 | Block::Image(_)
                 | Block::Figure(_)
-                | Block::Separator
+                | Block::Note(_)
+                | Block::Separator(_)
                 | Block::LineBreak
                 | Block::PageBreak => None,
             })
@@ -3773,7 +4670,8 @@ mod tests {
                 | Block::Table(_)
                 | Block::Image(_)
                 | Block::Figure(_)
-                | Block::Separator
+                | Block::Note(_)
+                | Block::Separator(_)
                 | Block::LineBreak
                 | Block::PageBreak => None,
             })
@@ -3827,7 +4725,8 @@ mod tests {
                 | Block::Table(_)
                 | Block::Image(_)
                 | Block::Figure(_)
-                | Block::Separator
+                | Block::Note(_)
+                | Block::Separator(_)
                 | Block::LineBreak
                 | Block::PageBreak => None,
             })
@@ -3888,7 +4787,8 @@ mod tests {
                 | Block::Table(_)
                 | Block::Image(_)
                 | Block::Figure(_)
-                | Block::Separator
+                | Block::Note(_)
+                | Block::Separator(_)
                 | Block::LineBreak
                 | Block::PageBreak => None,
             })
@@ -4346,6 +5246,92 @@ mod tests {
         assert_eq!(quote.body.len(), 1);
         assert_close(quote.body[0].style.margin_start, 64.0);
         assert_close(quote.body[0].style.indent, 32.0);
+    }
+
+    #[test]
+    fn body_unicode_spacing_paragraphs_become_semantic_separators() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p>Before.</p>
+            <p class="ideographic">&#x3000;</p>
+            <p class="nbsp">&#160;</p>
+            <p class="break"><br/></p>
+            <p>After.</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        assert_eq!(section.blocks.len(), 5);
+        assert!(matches!(section.blocks[0], Block::Text(_)));
+        for block in &section.blocks[1..4] {
+            let Block::Separator(separator) = block else {
+                panic!("expected semantic spacing separator");
+            };
+            assert_eq!(separator.kind, rebook_publication::SeparatorKind::Spacing);
+            assert!(!separator.in_quote);
+        }
+        assert!(matches!(section.blocks[4], Block::Text(_)));
+    }
+
+    #[test]
+    fn body_separator_recognition_does_not_rewrite_quote_contents() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <blockquote>
+                <p>First quoted paragraph.</p>
+                <p>&#x3000;</p>
+                <hr/>
+                <p>Second quoted paragraph.</p>
+            </blockquote>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Quote(quote)] = section.blocks.as_slice() else {
+            panic!("expected one quote without promoted separators");
+        };
+        assert_eq!(quote.body.len(), 2);
+    }
+
+    #[test]
+    fn image_classifier_only_promotes_uncaptioned_body_images() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p><img src="rule.png" alt="image"/></p>
+            <figure><img src="rule.png" alt="image"/><figcaption>A real figure.</figcaption></figure>
+        </body></html>"#;
+
+        let section = parse_section_with_image_classifier(
+            xml,
+            &descriptor,
+            |_| unreachable!(),
+            |href| href.path().ends_with("rule.png"),
+        )
+        .unwrap();
+        let [Block::Separator(separator), Block::Figure(_)] = section.blocks.as_slice() else {
+            panic!("expected one ornament separator followed by one figure");
+        };
+        assert_eq!(separator.kind, rebook_publication::SeparatorKind::Ornament);
+        assert_eq!(
+            separator.image.as_ref().map(|image| image.href.path()),
+            Some("OPS/rule.png")
+        );
     }
 
     fn assert_close(actual: f32, expected: f32) {
