@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zip::{CompressionMethod, ZipArchive};
 
+use crate::source::{TocHeadingHint, collect_toc_heading_hints, promote_toc_headings};
+
 /// Resource budgets applied before and during decompression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EpubLimits {
@@ -70,6 +72,7 @@ pub(super) struct EpubPublication {
     archive: EpubArchive,
     decorative_separator_images: Mutex<HashMap<String, bool>>,
     note_section_paths: HashSet<String>,
+    toc_heading_hints: HashMap<String, Vec<TocHeadingHint>>,
 }
 
 impl EpubPublication {
@@ -111,6 +114,7 @@ impl EpubPublication {
         let table_of_contents =
             promote_single_toc_root(parse_navigation(&archive, &package_model)?);
         let note_section_paths = collect_note_section_paths(&table_of_contents);
+        let toc_heading_hints = collect_toc_heading_hints(&table_of_contents);
         let digest = Sha256::digest(bytes.as_ref());
         let id = PublicationId::new(format!("{digest:x}"))?;
 
@@ -126,6 +130,7 @@ impl EpubPublication {
             archive,
             decorative_separator_images: Mutex::new(HashMap::new()),
             note_section_paths,
+            toc_heading_hints,
         })
     }
 }
@@ -222,7 +227,7 @@ impl EpubPublication {
         }
 
         let xml = self.archive.read_xml(&descriptor.href)?;
-        Ok(parse_section_with_hints_and_image_classifier(
+        let mut section = parse_section_with_hints_and_image_classifier(
             &xml,
             descriptor,
             |href| self.archive.read_stylesheet(href).ok(),
@@ -230,7 +235,11 @@ impl EpubPublication {
             SectionParseHints {
                 note_section: self.note_section_paths.contains(descriptor.href.path()),
             },
-        )?)
+        )?;
+        if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {
+            promote_toc_headings(&mut section, hints);
+        }
+        Ok(section)
     }
 
     fn is_decorative_separator_image(&self, href: &PublicationUrl) -> bool {
@@ -265,6 +274,7 @@ impl EpubPublication {
         classified
     }
 }
+
 #[derive(Debug)]
 struct EpubArchive {
     bytes: Arc<[u8]>,
@@ -1478,7 +1488,8 @@ mod tests {
 
     use image::{DynamicImage, ImageFormat};
     use rebook_publication::{
-        Block, BookSource, PublicationUrl, RenditionLayout, TocEntry, promote_single_toc_root,
+        Block, BookSource, Inline, PublicationUrl, RenditionLayout, TextBlockKind, TocEntry,
+        promote_single_toc_root,
     };
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
@@ -1610,6 +1621,85 @@ mod tests {
             .resource(publication.book().cover.as_ref().expect("EPUB 3 cover"))
             .expect("cover resource");
         assert_eq!(cover.bytes.as_ref(), b"fake-png");
+    }
+
+    #[test]
+    fn promotes_only_exact_toc_targeted_paragraphs_to_headings() {
+        let mut entries = minimal_entries();
+        for (name, bytes, _) in &mut entries {
+            match *name {
+                "OPS/nav.xhtml" => {
+                    *bytes = br#"<?xml version="1.0"?>
+                    <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+                      <body><nav epub:type="toc"><ol>
+                        <li><a href="Text/chapter.xhtml#alignment">Alignment</a></li>
+                        <li><a href="Text/chapter.xhtml#hierarchy">Hierarchy</a></li>
+                        <li><a href="Text/chapter.xhtml#native">Native heading</a></li>
+                      </ol></nav></body>
+                    </html>"#;
+                }
+                "OPS/Text/chapter.xhtml" => {
+                    *bytes = br#"<?xml version="1.0"?>
+                    <html xmlns="http://www.w3.org/1999/xhtml"><body>
+                      <p id="alignment" style="font-size: 0.8em; font-weight: normal"> ALIGNMENT </p>
+                      <p id="hierarchy">Hierarchy in practice</p>
+                      <h3 id="native">Native heading</h3>
+                      <p>Body text.</p>
+                    </body></html>"#;
+                }
+                _ => {}
+            }
+        }
+        let publication = EpubPublication::open_bytes(zip_entries(&entries)).expect("valid EPUB");
+        let section = publication.parse_section(0).expect("reading IR");
+        let text_blocks = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(text_blocks[0].kind, TextBlockKind::Heading(1));
+        assert_eq!(text_blocks[1].kind, TextBlockKind::Paragraph);
+        assert_eq!(text_blocks[2].kind, TextBlockKind::Heading(3));
+        let Inline::Text(alignment) = &text_blocks[0].content[0] else {
+            panic!("heading should retain authored text");
+        };
+        assert!((alignment.style.size_scale - 0.8).abs() < 0.001);
+        assert!(!alignment.style.bold);
+    }
+
+    #[test]
+    fn promotes_a_path_only_toc_label_only_near_the_section_start() {
+        let mut entries = minimal_entries();
+        for (name, bytes, _) in &mut entries {
+            match *name {
+                "OPS/nav.xhtml" => {
+                    *bytes = br#"<?xml version="1.0"?>
+                    <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+                      <body><nav epub:type="toc"><ol>
+                        <li><a href="Text/chapter.xhtml">Introduction</a></li>
+                      </ol></nav></body>
+                    </html>"#;
+                }
+                "OPS/Text/chapter.xhtml" => {
+                    *bytes = br#"<?xml version="1.0"?>
+                    <html xmlns="http://www.w3.org/1999/xhtml"><body>
+                      <p>Introduction</p><p>Body text.</p>
+                    </body></html>"#;
+                }
+                _ => {}
+            }
+        }
+        let publication = EpubPublication::open_bytes(zip_entries(&entries)).expect("valid EPUB");
+        let section = publication.parse_section(0).expect("reading IR");
+
+        assert!(matches!(
+            section.blocks.first(),
+            Some(Block::Text(text)) if text.kind == TextBlockKind::Heading(1)
+        ));
     }
 
     #[test]

@@ -15,6 +15,7 @@ use rebook_publication::{
 use scraper::{ElementRef, Html, Node, Selector};
 use sha2::{Digest, Sha256};
 
+use crate::source::{TocHeadingHint, collect_toc_heading_hints, promote_toc_headings};
 use crate::{BookFormat, FormatError, conversion_error};
 
 const MAX_ENTRIES: usize = 20_000;
@@ -26,6 +27,7 @@ pub(crate) struct ChmPublication {
     book: Book,
     table_of_contents_origin: TableOfContentsOrigin,
     resources: HashMap<String, StoredResource>,
+    toc_heading_hints: HashMap<String, Vec<TocHeadingHint>>,
 }
 
 struct StoredResource {
@@ -157,6 +159,12 @@ fn build_publication(
     } else {
         TableOfContentsOrigin::Fallback
     };
+    let table_of_contents = if navigation.authored {
+        navigation.table_of_contents
+    } else {
+        fallback_toc
+    };
+    let toc_heading_hints = collect_toc_heading_hints(&table_of_contents);
     Ok(ChmPublication {
         book: Book {
             id: PublicationId::new(publication_id)?,
@@ -168,14 +176,11 @@ fn build_publication(
             },
             cover: metadata.cover,
             sections,
-            table_of_contents: if navigation.authored {
-                navigation.table_of_contents
-            } else {
-                fallback_toc
-            },
+            table_of_contents,
         },
         table_of_contents_origin,
         resources,
+        toc_heading_hints,
     })
 }
 
@@ -341,10 +346,14 @@ impl BookSource for ChmPublication {
         let bytes = resource_bytes(&self.resources, &descriptor.href)
             .ok_or_else(|| PublicationError::ResourceNotFound(descriptor.href.to_string()))?;
         let xhtml = html_to_xhtml(&decode_text(bytes));
-        parse_section(&xhtml, descriptor, |href| {
+        let mut section = parse_section(&xhtml, descriptor, |href| {
             resource_bytes(&self.resources, href).map(decode_text)
         })
-        .map_err(|error| PublicationError::InvalidPublication(error.to_string()))
+        .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
+        if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {
+            promote_toc_headings(&mut section, hints);
+        }
+        Ok(section)
     }
 
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {

@@ -21,6 +21,7 @@ const CREDENTIAL_SERVICE: &str = "Rebook WebDAV";
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum CloudProviderKind {
     Jianguoyun,
+    CstCloud,
     InfiniCloud,
     Koofr,
     HiDrive,
@@ -30,8 +31,9 @@ pub(crate) enum CloudProviderKind {
 }
 
 impl CloudProviderKind {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Jianguoyun,
+        Self::CstCloud,
         Self::InfiniCloud,
         Self::Koofr,
         Self::HiDrive,
@@ -42,6 +44,7 @@ impl CloudProviderKind {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Jianguoyun => "坚果云",
+            Self::CstCloud => "cstcloud",
             Self::InfiniCloud => "InfiniCLOUD",
             Self::Koofr => "Koofr",
             Self::HiDrive => "STRATO HiDrive",
@@ -53,6 +56,7 @@ impl CloudProviderKind {
     const fn base_url(self) -> Option<&'static str> {
         match self {
             Self::Jianguoyun => Some("https://dav.jianguoyun.com/dav"),
+            Self::CstCloud => Some("https://data.cstcloud.cn/dav"),
             Self::InfiniCloud => Some("https://higa.teracloud.jp/dav"),
             Self::Koofr => Some("https://app.koofr.net/dav/Koofr"),
             Self::HiDrive => Some("https://webdav.hidrive.strato.com"),
@@ -64,11 +68,26 @@ impl CloudProviderKind {
     pub(crate) const fn credential_url(self) -> &'static str {
         match self {
             Self::Jianguoyun => "https://www.jianguoyun.com/s/downloads",
+            Self::CstCloud => "https://data.cstcloud.cn/",
             Self::InfiniCloud => "https://infini-cloud.net/en/",
             Self::Koofr => "https://app.koofr.net",
             Self::HiDrive => "https://www.strato.de/",
             Self::YandexDisk => "https://id.yandex.com/security/app-passwords",
             Self::Custom => "https://tortotech.github.io/guides/cloud-storage/",
+        }
+    }
+
+    pub(crate) const fn user_agent(self) -> Option<&'static str> {
+        match self {
+            // data.cstcloud.cn rejects otherwise valid WebDAV requests unless
+            // the User-Agent contains a recognized WebDAV client token.
+            Self::CstCloud => Some(concat!("Torto/", env!("CARGO_PKG_VERSION"), " Zotero/7.0")),
+            Self::Jianguoyun
+            | Self::InfiniCloud
+            | Self::Koofr
+            | Self::HiDrive
+            | Self::YandexDisk
+            | Self::Custom => None,
         }
     }
 }
@@ -281,6 +300,20 @@ mod tests {
 
         assert_eq!(settings.provider, CloudProviderKind::InfiniCloud);
         assert_eq!(settings.base_url, "https://higa.teracloud.jp/dav");
+    }
+
+    #[test]
+    fn cstcloud_preset_uses_its_webdav_endpoint_and_compatibility_user_agent() {
+        let mut settings = SyncSettings::new_device();
+
+        settings.select_provider(CloudProviderKind::CstCloud);
+
+        assert_eq!(settings.provider, CloudProviderKind::CstCloud);
+        assert_eq!(settings.base_url, "https://data.cstcloud.cn/dav");
+        assert_eq!(
+            settings.provider.user_agent(),
+            Some(concat!("Torto/", env!("CARGO_PKG_VERSION"), " Zotero/7.0"))
+        );
     }
 
     #[test]

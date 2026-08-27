@@ -50,9 +50,17 @@ impl WebDavClient {
         }
         let allowed_origin = root.origin();
         let download_allowed_origin = allowed_origin.clone();
-        let client = Client::builder()
+        let mut client_builder = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT);
+        let mut download_client_builder = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(DOWNLOAD_READ_TIMEOUT);
+        if let Some(user_agent) = settings.provider.user_agent() {
+            client_builder = client_builder.user_agent(user_agent);
+            download_client_builder = download_client_builder.user_agent(user_agent);
+        }
+        let client = client_builder
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 if attempt.url().origin() == allowed_origin {
                     attempt.follow()
@@ -61,9 +69,7 @@ impl WebDavClient {
                 }
             }))
             .build()?;
-        let download_client = Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(DOWNLOAD_READ_TIMEOUT)
+        let download_client = download_client_builder
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 if attempt.url().origin() == download_allowed_origin {
                     attempt.follow()
@@ -393,7 +399,54 @@ fn parse_propfind_hrefs(xml: &str, base: &Url) -> SyncResult<Vec<Url>> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
     use super::*;
+    use crate::sync::CloudProviderKind;
+
+    fn captured_request_headers(provider: CloudProviderKind, download: bool) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let mut settings = SyncSettings::new_device();
+        settings.provider = provider;
+        settings.base_url = format!("http://{address}");
+        settings.username = "reader".into();
+        let client = WebDavClient::new(&settings, "secret".into()).unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            if download {
+                client
+                    .download_client
+                    .get(client.root.clone())
+                    .basic_auth(&client.username, Some(&client.password))
+                    .send()
+                    .await
+                    .unwrap();
+            } else {
+                client.get_optional("probe").await.unwrap();
+            }
+        });
+        server.join().unwrap()
+    }
 
     #[test]
     fn propfind_parser_handles_namespaces_and_escaped_paths() {
@@ -416,5 +469,31 @@ mod tests {
             Some(262_144)
         );
         assert_eq!(content_range_start("bytes */1048576"), None);
+    }
+
+    #[test]
+    fn cstcloud_requests_include_the_required_compatibility_user_agent() {
+        let expected = concat!("Torto/", env!("CARGO_PKG_VERSION"), " Zotero/7.0");
+        let expected_header = format!("user-agent: {expected}");
+
+        for headers in [
+            captured_request_headers(CloudProviderKind::CstCloud, false),
+            captured_request_headers(CloudProviderKind::CstCloud, true),
+        ] {
+            assert!(headers.lines().any(|line| {
+                line.trim_end_matches('\r')
+                    .eq_ignore_ascii_case(&expected_header)
+            }));
+        }
+    }
+
+    #[test]
+    fn custom_webdav_requests_do_not_impersonate_a_compatibility_client() {
+        let headers = captured_request_headers(CloudProviderKind::Custom, false);
+        assert!(
+            !headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
+        );
     }
 }

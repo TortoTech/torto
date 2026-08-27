@@ -1845,8 +1845,12 @@ fn ai_provider_kind_label(language: AppLanguage, kind: AiProviderKind) -> &'stat
 }
 
 fn cloud_provider_kind_label(language: AppLanguage, kind: CloudProviderKind) -> &'static str {
-    if language.resolved() == AppLanguage::SimplifiedChinese && kind == CloudProviderKind::Custom {
-        "自定义"
+    if language.resolved() == AppLanguage::SimplifiedChinese {
+        match kind {
+            CloudProviderKind::CstCloud => "中国科技云",
+            CloudProviderKind::Custom => "自定义",
+            _ => kind.label(),
+        }
     } else {
         kind.label()
     }
@@ -2191,6 +2195,14 @@ mod tests {
         assert_eq!(
             cloud_provider_kind_label(AppLanguage::English, CloudProviderKind::Custom),
             "Custom"
+        );
+        assert_eq!(
+            cloud_provider_kind_label(AppLanguage::SimplifiedChinese, CloudProviderKind::CstCloud),
+            "中国科技云"
+        );
+        assert_eq!(
+            cloud_provider_kind_label(AppLanguage::English, CloudProviderKind::CstCloud),
+            "cstcloud"
         );
     }
 

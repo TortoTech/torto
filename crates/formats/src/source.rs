@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use rebook_html::parse_section;
 use rebook_publication::{
-    Block, Book, BookSource, ImageBlock, ImageStyle, Metadata, PublicationError, PublicationId,
-    PublicationUrl, Resource, Section, SpineItem, SpineItemId, TableOfContentsOrigin, TocEntry,
-    promote_single_toc_root,
+    Block, Book, BookSource, ImageBlock, ImageStyle, Inline, Metadata, PublicationError,
+    PublicationId, PublicationUrl, RenditionLayout, Resource, Section, SpineItem, SpineItemId,
+    TableOfContentsOrigin, TextBlock, TextBlockKind, TocEntry, promote_single_toc_root,
 };
 
 use crate::{BookFormat, FormatError, conversion_error};
@@ -48,6 +48,110 @@ pub(crate) struct DirectBookSource {
     table_of_contents_origin: TableOfContentsOrigin,
     sections: Vec<SectionContent>,
     resources: HashMap<String, StoredResource>,
+    toc_heading_hints: HashMap<String, Vec<TocHeadingHint>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TocHeadingHint {
+    label: String,
+    fragment: Option<String>,
+    level: u8,
+}
+
+const PATH_ONLY_HEADING_SEARCH_BLOCKS: usize = 8;
+
+pub(crate) fn collect_toc_heading_hints(
+    entries: &[TocEntry],
+) -> HashMap<String, Vec<TocHeadingHint>> {
+    fn visit(entries: &[TocEntry], depth: u8, hints: &mut HashMap<String, Vec<TocHeadingHint>>) {
+        for entry in entries {
+            if let Some(href) = &entry.href {
+                let label = normalize_heading_text(&entry.label);
+                if !label.is_empty() {
+                    hints
+                        .entry(href.path().to_owned())
+                        .or_default()
+                        .push(TocHeadingHint {
+                            label,
+                            fragment: href.fragment().map(str::to_owned),
+                            level: depth.clamp(1, 6),
+                        });
+                }
+            }
+            visit(&entry.children, depth.saturating_add(1), hints);
+        }
+    }
+
+    let mut hints = HashMap::new();
+    visit(entries, 1, &mut hints);
+    hints
+}
+
+pub(crate) fn promote_toc_headings(section: &mut Section, hints: &[TocHeadingHint]) {
+    for hint in hints {
+        let block_index = hint.fragment.as_deref().and_then(|fragment| {
+            let node = section
+                .anchors
+                .iter()
+                .find(|anchor| anchor.fragment == fragment)?
+                .source
+                .node
+                .as_str();
+            section.blocks.iter().position(|block| {
+                matches!(
+                    block,
+                    Block::Text(text)
+                        if text.source.as_ref().is_some_and(|source| source.start.node == node)
+                )
+            })
+        });
+
+        let block_index = block_index.or_else(|| {
+            hint.fragment.is_none().then(|| {
+                section
+                    .blocks
+                    .iter()
+                    .take(PATH_ONLY_HEADING_SEARCH_BLOCKS)
+                    .position(|block| {
+                        matches!(
+                            block,
+                            Block::Text(text)
+                                if matches!(
+                                    text.kind,
+                                    TextBlockKind::Paragraph | TextBlockKind::Heading(_)
+                                ) && normalized_text_block(text) == hint.label
+                        )
+                    })
+            })?
+        });
+
+        let Some(Block::Text(text)) = block_index.and_then(|index| section.blocks.get_mut(index))
+        else {
+            continue;
+        };
+        if text.kind == TextBlockKind::Paragraph && normalized_text_block(text) == hint.label {
+            text.kind = TextBlockKind::Heading(hint.level);
+        }
+    }
+}
+
+fn normalized_text_block(block: &TextBlock) -> String {
+    let mut text = String::new();
+    for inline in &block.content {
+        match inline {
+            Inline::Text(run) => text.push_str(&run.text),
+            Inline::Math(run) => text.push_str(&run.latex),
+            Inline::Break => text.push(' '),
+        }
+    }
+    normalize_heading_text(&text)
+}
+
+fn normalize_heading_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 struct StoredResource {
@@ -99,6 +203,11 @@ impl DirectBookSource {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let table_of_contents = promote_single_toc_root(table_of_contents);
+        let toc_heading_hints = if book.metadata.layout == RenditionLayout::Reflowable {
+            collect_toc_heading_hints(&table_of_contents)
+        } else {
+            HashMap::new()
+        };
         let cover = book
             .cover_path
             .as_deref()
@@ -130,6 +239,7 @@ impl DirectBookSource {
             table_of_contents_origin,
             sections,
             resources,
+            toc_heading_hints,
         })
     }
 }
@@ -158,8 +268,12 @@ impl BookSource for DirectBookSource {
                 let document = format!(
                     "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title></title></head><body>{body}</body></html>"
                 );
-                parse_section(&document, descriptor, |_| None)
-                    .map_err(|error| PublicationError::InvalidPublication(error.to_string()))
+                let mut section = parse_section(&document, descriptor, |_| None)
+                    .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
+                if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {
+                    promote_toc_headings(&mut section, hints);
+                }
+                Ok(section)
             }
             SectionContent::Image { resource_path, alt } => {
                 let href = PublicationUrl::parse(resource_path)?;
@@ -219,7 +333,7 @@ pub(crate) fn escape_attribute(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rebook_publication::{BookSource, RenditionLayout};
+    use rebook_publication::{BookSource, RenditionLayout, TextBlockKind};
 
     use super::*;
 
@@ -314,5 +428,82 @@ mod tests {
             .resource(source.book().cover.as_ref().unwrap())
             .unwrap();
         assert_eq!(cover.bytes.as_ref(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn reflowable_direct_source_promotes_an_exact_toc_paragraph() {
+        let source = DirectBookSource::open(
+            SourceBook {
+                id: "toc-heading-test".into(),
+                metadata: Metadata {
+                    title: "Direct".into(),
+                    authors: Vec::new(),
+                    languages: Vec::new(),
+                    layout: RenditionLayout::Reflowable,
+                },
+                sections: vec![SourceSection {
+                    title: "Chapter".into(),
+                    content: SectionContent::Html(
+                        "<p id=\"alignment\" style=\"font-size: 0.8em\">ALIGNMENT</p><p>Body.</p>"
+                            .into(),
+                    ),
+                    linear: true,
+                }],
+                table_of_contents: vec![SourceTocEntry {
+                    label: "Alignment".into(),
+                    href: "Text/section-1.xhtml#alignment".into(),
+                    children: Vec::new(),
+                }],
+                resources: Vec::new(),
+                cover_path: None,
+            },
+            BookFormat::Azw3,
+        )
+        .unwrap();
+
+        let section = source.parse_section(0).unwrap();
+        let Some(Block::Text(heading)) = section.blocks.first() else {
+            panic!("first block should be text");
+        };
+        assert_eq!(heading.kind, TextBlockKind::Heading(1));
+        let Some(Inline::Text(run)) = heading.content.first() else {
+            panic!("heading should retain authored text");
+        };
+        assert!((run.style.size_scale - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn pre_paginated_direct_source_does_not_infer_toc_headings() {
+        let source = DirectBookSource::open(
+            SourceBook {
+                id: "fixed-toc-heading-test".into(),
+                metadata: Metadata {
+                    title: "Fixed".into(),
+                    authors: Vec::new(),
+                    languages: Vec::new(),
+                    layout: RenditionLayout::PrePaginated,
+                },
+                sections: vec![SourceSection {
+                    title: "Page 1".into(),
+                    content: SectionContent::Html("<p id=\"title\">Title</p>".into()),
+                    linear: true,
+                }],
+                table_of_contents: vec![SourceTocEntry {
+                    label: "Title".into(),
+                    href: "Text/section-1.xhtml#title".into(),
+                    children: Vec::new(),
+                }],
+                resources: Vec::new(),
+                cover_path: None,
+            },
+            BookFormat::Pdf,
+        )
+        .unwrap();
+
+        let section = source.parse_section(0).unwrap();
+        assert!(matches!(
+            section.blocks.first(),
+            Some(Block::Text(text)) if text.kind == TextBlockKind::Paragraph
+        ));
     }
 }

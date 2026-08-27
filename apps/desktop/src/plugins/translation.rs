@@ -13,6 +13,9 @@ use super::TranslationMode;
 #[cfg(test)]
 use super::search::text_block_text;
 
+const MATH_PLACEHOLDER_PREFIX: &str = "<torto-math-";
+const MATH_PLACEHOLDER_SUFFIX: &str = "/>";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranslationBlockInput {
     pub block_index: usize,
@@ -206,8 +209,7 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
     for (block_index, block) in section.blocks.iter().enumerate() {
         match block {
             Block::Text(block) => {
-                let text = translation_text(block);
-                if !text.trim().is_empty() {
+                if let Some(text) = translatable_text(block) {
                     blocks.push(TranslationBlockInput {
                         block_index,
                         segment_index: None,
@@ -223,8 +225,7 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
                         .chain(quote.attribution.iter())
                         .enumerate()
                         .filter_map(|(segment_index, block)| {
-                            let text = translation_text(block);
-                            (!text.trim().is_empty()).then_some(TranslationBlockInput {
+                            translatable_text(block).map(|text| TranslationBlockInput {
                                 block_index,
                                 segment_index: Some(segment_index),
                                 text,
@@ -269,8 +270,7 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
                         .flat_map(|row| &row.cells)
                         .enumerate()
                         .filter_map(|(cell_index, cell)| {
-                            let text = translation_text(&cell.text);
-                            (!text.trim().is_empty()).then_some(TranslationBlockInput {
+                            translatable_text(&cell.text).map(|text| TranslationBlockInput {
                                 block_index,
                                 segment_index: Some(cell_index),
                                 text,
@@ -281,8 +281,7 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
             Block::Figure(figure) => {
                 blocks.extend(figure.captions.iter().enumerate().filter_map(
                     |(caption_index, caption)| {
-                        let text = translation_text(caption);
-                        (!text.trim().is_empty()).then_some(TranslationBlockInput {
+                        translatable_text(caption).map(|text| TranslationBlockInput {
                             block_index,
                             segment_index: Some(caption_index),
                             text,
@@ -926,18 +925,72 @@ fn translated_fixed_page_block(text: &str, source: Option<SourceRange>) -> TextB
 
 fn translation_text(block: &TextBlock) -> String {
     let mut text = String::new();
+    let mut math_index = 0;
     for inline in &block.content {
         match inline {
             Inline::Text(run) => push_translation_style_markup(&mut text, run),
-            Inline::Math(run) => {
-                text.push('$');
-                text.push_str(&run.latex);
-                text.push('$');
+            Inline::Math(_) => {
+                push_math_placeholder(&mut text, math_index);
+                math_index += 1;
             }
             Inline::Break => text.push('\n'),
         }
     }
     text
+}
+
+fn translatable_text(block: &TextBlock) -> Option<String> {
+    block
+        .content
+        .iter()
+        .any(|inline| {
+            matches!(inline, Inline::Text(run) if run.text.chars().any(|character| !character.is_whitespace()))
+        })
+        .then(|| translation_text(block))
+}
+
+fn push_math_placeholder(output: &mut String, index: usize) {
+    use std::fmt::Write as _;
+
+    write!(
+        output,
+        "{MATH_PLACEHOLDER_PREFIX}{index}{MATH_PLACEHOLDER_SUFFIX}"
+    )
+    .expect("writing to a String should not fail");
+}
+
+fn math_placeholder_indices(text: &str) -> Result<Vec<usize>, ()> {
+    let mut rest = text;
+    let mut indices = Vec::new();
+    while let Some(start) = rest.find(MATH_PLACEHOLDER_PREFIX) {
+        rest = &rest[start + MATH_PLACEHOLDER_PREFIX.len()..];
+        let digit_count = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digit_count == 0 || !rest[digit_count..].starts_with(MATH_PLACEHOLDER_SUFFIX) {
+            return Err(());
+        }
+        indices.push(rest[..digit_count].parse().map_err(|_| ())?);
+        rest = &rest[digit_count + MATH_PLACEHOLDER_SUFFIX.len()..];
+    }
+    Ok(indices)
+}
+
+pub(super) fn validate_translation_math_placeholders(
+    source: &str,
+    translation: &str,
+) -> Result<(), String> {
+    let expected =
+        math_placeholder_indices(source).map_err(|()| "原文包含无效的公式占位符".to_owned())?;
+    let actual = math_placeholder_indices(translation)
+        .map_err(|()| "译文修改了公式占位符格式".to_owned())?;
+    let mut expected = expected;
+    let mut actual = actual;
+    expected.sort_unstable();
+    actual.sort_unstable();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err("译文必须完整保留每个公式占位符且各出现一次".to_owned())
+    }
 }
 
 fn push_translation_style_markup(output: &mut String, run: &TextRun) {
@@ -989,25 +1042,76 @@ fn push_translation_style_markup(output: &mut String, run: &TextRun) {
 fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>) -> Vec<Inline> {
     let text = normalize_translation_spacing(text);
     let original = original.unwrap_or_default();
+    let math = original
+        .iter()
+        .filter_map(|inline| match inline {
+            Inline::Math(run) => Some(run.clone()),
+            Inline::Text(_) | Inline::Break => None,
+        })
+        .collect::<Vec<_>>();
+    if !math.is_empty() && validate_math_placeholder_count(&text, math.len()).is_err() {
+        // Never degrade structured formulas into untranslated LaTeX text. This
+        // also safely handles translations cached by versions that exposed
+        // formulas to the model as `$...$`.
+        return original.to_vec();
+    }
     let style = neutral_translation_style(style, original);
     let styled = parse_inline_style_markup(&text, style)
         .unwrap_or_else(|| restore_original_baselines(&text, style, original));
     let mut content = Vec::new();
     for (text, style) in styled {
-        for (index, line) in text.split('\n').enumerate() {
-            if index > 0 {
-                content.push(Inline::Break);
-            }
-            if !line.is_empty() {
-                content.push(Inline::Text(TextRun {
-                    text: line.to_owned(),
-                    style,
-                    link: translated_footnote_link(line, style, original),
-                }));
-            }
-        }
+        append_translated_span(&mut content, &text, style, original, &math);
     }
     content
+}
+
+fn validate_math_placeholder_count(text: &str, math_count: usize) -> Result<(), ()> {
+    let mut actual = math_placeholder_indices(text)?;
+    actual.sort_unstable();
+    (actual == (0..math_count).collect::<Vec<_>>())
+        .then_some(())
+        .ok_or(())
+}
+
+fn append_translated_span(
+    content: &mut Vec<Inline>,
+    text: &str,
+    style: TextStyle,
+    original: &[Inline],
+    math: &[rebook_publication::MathRun],
+) {
+    let mut rest = text;
+    while let Some(start) = rest.find(MATH_PLACEHOLDER_PREFIX) {
+        append_translated_text(content, &rest[..start], style, original);
+        let token = &rest[start + MATH_PLACEHOLDER_PREFIX.len()..];
+        let digit_count = token.bytes().take_while(u8::is_ascii_digit).count();
+        let index = token[..digit_count]
+            .parse::<usize>()
+            .expect("validated formula placeholder should contain an index");
+        content.push(Inline::Math(math[index].clone()));
+        rest = &token[digit_count + MATH_PLACEHOLDER_SUFFIX.len()..];
+    }
+    append_translated_text(content, rest, style, original);
+}
+
+fn append_translated_text(
+    content: &mut Vec<Inline>,
+    text: &str,
+    style: TextStyle,
+    original: &[Inline],
+) {
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            content.push(Inline::Break);
+        }
+        if !line.is_empty() {
+            content.push(Inline::Text(TextRun {
+                text: line.to_owned(),
+                style,
+                link: translated_footnote_link(line, style, original),
+            }));
+        }
+    }
 }
 
 fn translated_footnote_link(
@@ -1583,6 +1687,133 @@ mod tests {
                     && run.style.baseline == TextBaseline::Superscript
                     && run.link.as_ref() == Some(&footnote_target)
         )));
+    }
+
+    #[test]
+    fn translation_preserves_structured_math_without_exposing_latex() {
+        let first = rebook_publication::MathRun {
+            latex: r"E=mc^2".into(),
+            display: false,
+            size_scale: 1.0,
+        };
+        let second = rebook_publication::MathRun {
+            latex: r"\int_0^1 x\,dx".into(),
+            display: true,
+            size_scale: 1.25,
+        };
+        let original = vec![
+            Inline::Text(TextRun {
+                text: "First ".into(),
+                style: TextStyle::default(),
+                link: None,
+            }),
+            Inline::Math(first.clone()),
+            Inline::Text(TextRun {
+                text: ", then ".into(),
+                style: TextStyle::default(),
+                link: None,
+            }),
+            Inline::Math(second.clone()),
+        ];
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: original.clone(),
+            style: BlockStyle::default(),
+            source: None,
+        };
+
+        assert_eq!(
+            translation_text(&block),
+            "First <torto-math-0/>, then <torto-math-1/>"
+        );
+        assert!(!translation_text(&block).contains("E=mc"));
+
+        let translated = replacement_content(
+            "先计算 <torto-math-1/>，再使用 <strong><torto-math-0/></strong>。",
+            TextStyle::default(),
+            Some(&original),
+        );
+        let formulas = translated
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Math(run) => Some(run),
+                Inline::Text(_) | Inline::Break => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(formulas, [&second, &first]);
+    }
+
+    #[test]
+    fn invalid_math_translation_falls_back_to_original_structured_content() {
+        let original = vec![
+            Inline::Text(TextRun {
+                text: "Energy is ".into(),
+                style: TextStyle::default(),
+                link: None,
+            }),
+            Inline::Math(rebook_publication::MathRun {
+                latex: r"E=mc^2".into(),
+                display: false,
+                size_scale: 1.0,
+            }),
+        ];
+
+        assert_eq!(
+            replacement_content("能量是 $E=mc^2$", TextStyle::default(), Some(&original),),
+            original
+        );
+    }
+
+    #[test]
+    fn formula_only_blocks_are_not_sent_for_translation() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Math(rebook_publication::MathRun {
+                latex: r"\sum_{i=1}^n i".into(),
+                display: true,
+                size_scale: 1.0,
+            })],
+            style: BlockStyle::default(),
+            source: None,
+        };
+
+        assert_eq!(translatable_text(&block), None);
+    }
+
+    #[test]
+    fn translated_math_placeholders_must_be_complete_and_unique() {
+        assert!(
+            validate_translation_math_placeholders(
+                "Use <torto-math-0/> and <torto-math-1/>.",
+                "使用 <torto-math-1/> 和 <torto-math-0/>。"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_translation_math_placeholders(
+                "Use <torto-math-0/> and <torto-math-1/>.",
+                "使用 <torto-math-0/>。"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_translation_math_placeholders(
+                "Use <torto-math-0/> and <torto-math-1/>.",
+                "使用 <torto-math-0/>、<torto-math-1/> 和 <torto-math-1/>。"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_translation_math_placeholders(
+                "Use <torto-math-0/>.",
+                "使用 <torto-math-0 />。"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_translation_math_placeholders("No formula.", "无公式 <torto-math-0/>。")
+                .is_err()
+        );
     }
 
     #[test]

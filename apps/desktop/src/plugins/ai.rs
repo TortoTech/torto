@@ -23,6 +23,7 @@ use super::pdf_vision::{
 };
 use super::rewrite::{BlockRewrite, RewriteBookSource, RewriteTransaction};
 use super::search::{search_book, search_section, section_title, text_block_kind, text_block_text};
+use super::translation::validate_translation_math_placeholders;
 use super::{
     AiProvider, BlockTranslation, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN,
     CHAT_TOOL_STEPS_MAX, CHAT_TOOL_STEPS_MIN, PluginSettings, TranslationBlockInput,
@@ -610,7 +611,7 @@ async fn translate_block_batch(
             json!({
                 "role": "system",
                 "content": format!(
-                    "你是一名专业图书翻译。请把输入 JSON 对象中的每个值翻译为{target_language}，忠实保留原文语气、专有名词与段落结构。每个 JSON 值都是独立正文块：原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时则保持相同类型。文本中的 <strong>、<em>、<u>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记：必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。{fixed_page_hint}只返回一个 JSON 对象，必须保留完全相同的键，每个值只能是对应译文字符串。"
+                    "你是一名专业图书翻译。请把输入 JSON 对象中的每个值翻译为{target_language}，忠实保留原文语气、专有名词与段落结构。每个 JSON 值都是独立正文块：原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时则保持相同类型。文本中的 <strong>、<em>、<u>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记：必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。形如 <torto-math-0/>、<torto-math-1/> 的自闭合标签是不可修改的公式占位符：可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。{fixed_page_hint}只返回一个 JSON 对象，必须保留完全相同的键，每个值只能是对应译文字符串。"
                 ),
             }),
             json!({ "role": "user", "content": Value::Object(input.clone()).to_string() }),
@@ -633,6 +634,16 @@ async fn translate_block_batch(
             };
         match parse_translation_object(&content, &keys) {
             Ok(values) => {
+                if let Some(error) = blocks.iter().zip(&values).find_map(|(block, translation)| {
+                    validate_translation_math_placeholders(&block.text, translation)
+                        .err()
+                        .map(|error| {
+                            format!("第 {} 个正文块的公式结构无效：{error}", block.block_index)
+                        })
+                }) {
+                    last_error = Some(error);
+                    continue;
+                }
                 return Ok(blocks
                     .iter()
                     .zip(values)
@@ -3384,6 +3395,58 @@ mod tests {
                 block_index: 7,
                 segment_index: None,
                 text: "你好".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn translation_retries_when_a_formula_placeholder_is_damaged() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _request = read_http_request(&mut stream);
+                let body = if attempt == 0 {
+                    r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"能量为 $E=mc^2$\"}"}}]}"#
+                } else {
+                    r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"能量为 <torto-math-0/>\"}"}}]}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let provider = AiProvider {
+            base_url: format!("http://{address}/v1"),
+            ..AiProvider::default()
+        };
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(translate_block_batch(
+                &Client::new(),
+                &provider,
+                "test-model",
+                "简体中文",
+                &[TranslationBlockInput {
+                    block_index: 8,
+                    segment_index: None,
+                    text: "Energy is <torto-math-0/>".into(),
+                }],
+            ))
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(
+            result,
+            vec![BlockTranslation {
+                block_index: 8,
+                segment_index: None,
+                text: "能量为 <torto-math-0/>".into(),
             }]
         );
     }
