@@ -110,10 +110,17 @@ impl EpubPublication {
             media_types.insert(item.href.path().to_owned(), item.media_type.clone());
         }
 
-        let reading_order = build_reading_order(&package_model)?;
+        let mut reading_order = build_reading_order(&package_model)?;
         let table_of_contents =
             promote_single_toc_root(parse_navigation(&archive, &package_model)?);
         let note_section_paths = collect_note_section_paths(&table_of_contents);
+        for section in &mut reading_order {
+            if note_section_paths.contains(section.href.path()) && !section.is_note_section() {
+                section
+                    .properties
+                    .push(rebook_publication::NOTE_SECTION_PROPERTY.to_owned());
+            }
+        }
         let toc_heading_hints = collect_toc_heading_hints(&table_of_contents);
         let digest = Sha256::digest(bytes.as_ref());
         let id = PublicationId::new(format!("{digest:x}"))?;
@@ -1594,6 +1601,21 @@ mod tests {
     }
 
     #[test]
+    fn marks_a_whole_note_resource_on_the_spine_descriptor() {
+        let publication = EpubPublication::open_bytes(note_section_epub()).expect("valid EPUB");
+
+        assert!(!publication.book().sections[0].is_note_section());
+        assert!(publication.book().sections[1].is_note_section());
+        let notes = publication.parse_section(1).expect("parsed notes section");
+        assert!(notes.blocks.iter().all(|block| {
+            matches!(
+                block,
+                Block::Note(note) if note.kind == rebook_publication::NoteBlockKind::Section
+            )
+        }));
+    }
+
+    #[test]
     fn opens_epub3_navigation_and_lazy_resources() {
         let bytes = minimal_epub();
         let publication = EpubPublication::open_bytes(bytes).expect("valid EPUB");
@@ -1909,6 +1931,57 @@ mod tests {
 
     fn minimal_epub() -> Vec<u8> {
         zip_entries(&minimal_entries())
+    }
+
+    fn note_section_epub() -> Vec<u8> {
+        zip_entries(&[
+            ("mimetype", b"application/epub+zip", CompressionMethod::Stored),
+            (
+                "META-INF/container.xml",
+                br#"<?xml version="1.0"?>
+                <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+                  <rootfiles><rootfile full-path="OPS/package.opf" media-type="application/oebps-package+xml"/></rootfiles>
+                </container>"#,
+                CompressionMethod::Deflated,
+            ),
+            (
+                "OPS/package.opf",
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+                <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id">
+                  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                    <dc:identifier id="book-id">urn:uuid:notes-test</dc:identifier>
+                    <dc:title>Notes test</dc:title><dc:language>en</dc:language>
+                  </metadata>
+                  <manifest>
+                    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+                    <item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/>
+                    <item id="notes" href="Text/notes.xhtml" media-type="application/xhtml+xml"/>
+                  </manifest>
+                  <spine><itemref idref="chapter"/><itemref idref="notes"/></spine>
+                </package>"#,
+                CompressionMethod::Deflated,
+            ),
+            (
+                "OPS/nav.xhtml",
+                br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+                  <body><nav epub:type="toc"><ol>
+                    <li><a href="Text/chapter.xhtml">Chapter</a></li>
+                    <li><a href="Text/notes.xhtml">Notes</a></li>
+                  </ol></nav></body>
+                </html>"#,
+                CompressionMethod::Deflated,
+            ),
+            (
+                "OPS/Text/chapter.xhtml",
+                br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Chapter</h1><p>Body.</p></body></html>"#,
+                CompressionMethod::Deflated,
+            ),
+            (
+                "OPS/Text/notes.xhtml",
+                br#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Notes</h1><p id="note-1">1. A note.</p></body></html>"#,
+                CompressionMethod::Deflated,
+            ),
+        ])
     }
 
     fn minimal_entries() -> Vec<(&'static str, &'static [u8], CompressionMethod)> {

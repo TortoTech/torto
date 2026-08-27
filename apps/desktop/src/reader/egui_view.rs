@@ -778,7 +778,6 @@ impl DesktopReader {
             && ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_actions))
         {
             self.ui.focus_actions_visible = true;
-            self.cancel_text_selection();
             ctx.memory_mut(egui::Memory::stop_text_input);
             return;
         }
@@ -786,7 +785,6 @@ impl DesktopReader {
             && ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_chat))
         {
             self.ui.focus_actions_visible = false;
-            self.cancel_text_selection();
             self.attach_current_focus_reference();
             self.open_assistant_panel(AssistantPanel::Chat);
             return;
@@ -918,20 +916,34 @@ impl DesktopReader {
 
     fn reading_navigation_shortcuts(&mut self, ctx: &egui::Context) {
         if self.is_focus_mode() {
-            let (previous_unit, next_unit, previous_section, next_section) =
-                ctx.input_mut(|input| {
-                    (
-                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
-                        input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
-                    )
-                });
-            if previous_unit {
+            let (
+                extend_previous,
+                extend_next,
+                previous_unit,
+                next_unit,
+                previous_section,
+                next_section,
+            ) = ctx.input_mut(|input| {
+                (
+                    input.consume_shortcut(&self.shortcuts.focus_extend_selection_previous),
+                    input.consume_shortcut(&self.shortcuts.focus_extend_selection_next),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                )
+            });
+            if extend_previous {
+                self.extend_focus_selection(PageDirection::Previous);
+            } else if extend_next {
+                self.extend_focus_selection(PageDirection::Next);
+            } else if previous_unit {
+                self.cancel_text_selection();
                 if !self.scroll_within_tall_focus_unit(PageDirection::Previous) {
                     self.move_focus_unit(PageDirection::Previous);
                 }
             } else if next_unit {
+                self.cancel_text_selection();
                 if !self.scroll_within_tall_focus_unit(PageDirection::Next) {
                     self.move_focus_unit(PageDirection::Next);
                 }
@@ -1037,18 +1049,18 @@ impl DesktopReader {
             }
         });
         match action {
-            Some(0) if !self.current_focus_unit_is_image() => {
+            Some(0) if self.focus_has_annotatable_units() => {
                 self.ui.focus_actions_visible = false;
                 self.create_focus_highlight(None);
             }
-            Some(1) if !self.current_focus_unit_is_image() => {
+            Some(1) if self.focus_has_annotatable_units() => {
                 self.ui.focus_actions_visible = true;
                 self.annotation_note_draft = Some(AnnotationDraft {
                     note: self.current_focus_note().unwrap_or_default(),
                     focus_pending: true,
                 });
             }
-            Some(2) if !self.current_focus_unit_is_image() => {
+            Some(2) if self.focus_has_structurable_units() => {
                 self.ui.focus_actions_visible = false;
                 self.toggle_current_focus_structure();
             }
@@ -1868,11 +1880,8 @@ impl DesktopReader {
         let mut structure = false;
         let mut save_note = false;
         let mut cancel_note = false;
-        let can_annotate = !self.current_focus_unit_is_image();
-        let can_structure = self
-            .focus_units
-            .get(self.focus_unit_index)
-            .is_some_and(|unit| !unit.is_image && !unit.is_table);
+        let can_annotate = self.focus_has_annotatable_units();
+        let can_structure = self.focus_has_structurable_units();
         let chat_hover = shortcut_tooltip(
             self.language,
             "聊天",
@@ -1891,14 +1900,7 @@ impl DesktopReader {
             "Add note",
             &ctx.format_shortcut(&self.shortcuts.focus_note),
         );
-        let structure_active = self
-            .focus_units
-            .get(self.focus_unit_index)
-            .map(|unit| crate::plugins::ParagraphStructureKey {
-                section_index: unit.position.section_index,
-                node: unit.range.start.node.clone(),
-            })
-            .is_some_and(|key| self.structure_source.is_active(&key));
+        let structure_active = self.focus_structure_is_active();
         let structure_hover = shortcut_tooltip(
             self.language,
             if structure_active {
@@ -4900,6 +4902,14 @@ mod reference_suggestion_label_tests {
         assert_eq!(
             shortcuts.focus_footnotes,
             egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::AltLeft)
+        );
+        assert_eq!(
+            shortcuts.focus_extend_selection_previous,
+            egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
+        );
+        assert_eq!(
+            shortcuts.focus_extend_selection_next,
+            egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
         );
     }
 

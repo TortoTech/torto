@@ -253,6 +253,7 @@ impl DesktopReader {
         self.ui.focus_actions_visible = false;
         self.annotation_note_draft = None;
         self.selection_anchor = None;
+        self.focus_selection_anchor = None;
         self.selection = None;
         self.selected_image = None;
         self.image_pointer_state = super::ImagePointerState::Idle;

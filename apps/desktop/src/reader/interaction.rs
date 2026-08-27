@@ -42,6 +42,15 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn current_focus_note(&self) -> Option<String> {
+        if self.selection.is_some() && self.focus_selection_anchor.is_some() {
+            let (ranges, _) = self.focus_annotation_payload()?;
+            return self
+                .highlights
+                .iter()
+                .find(|highlight| highlight.ranges == ranges)
+                .and_then(|highlight| highlight.note.clone())
+                .filter(|note| !note.trim().is_empty());
+        }
         self.focus_note_at(self.focus_unit_index)
     }
 
@@ -55,12 +64,7 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn create_focus_highlight(&mut self, note: Option<String>) {
-        let Some(unit) = self
-            .focus_units
-            .get(self.focus_unit_index)
-            .filter(|unit| !unit.is_image)
-            .cloned()
-        else {
+        let Some((ranges, text)) = self.focus_annotation_payload() else {
             return;
         };
         let note = note.and_then(|note| {
@@ -70,7 +74,7 @@ impl DesktopReader {
         if let Some(index) = self
             .highlights
             .iter()
-            .position(|highlight| focus_unit_matches_highlight_ranges(&unit, &highlight.ranges))
+            .position(|highlight| highlight.ranges == ranges)
         {
             let Some(note) = note else {
                 return;
@@ -91,8 +95,7 @@ impl DesktopReader {
             }
             return;
         }
-        let highlight =
-            StoredHighlight::with_note(self.book_id.clone(), unit.paint_ranges, unit.text, note);
+        let highlight = StoredHighlight::with_note(self.book_id.clone(), ranges, text, note);
         match self.highlight_store.insert(&highlight) {
             Ok(()) => {
                 self.highlights.insert(0, highlight);
@@ -102,6 +105,25 @@ impl DesktopReader {
             }
             Err(error) => self.error = Some(format!("Failed to save highlight: {error}")),
         }
+    }
+
+    fn focus_annotation_payload(&self) -> Option<(Vec<SourceRange>, String)> {
+        let units = self
+            .focus_action_units()
+            .iter()
+            .filter(|unit| !unit.is_image)
+            .collect::<Vec<_>>();
+        let ranges = units
+            .iter()
+            .flat_map(|unit| unit.paint_ranges.iter().cloned())
+            .collect::<Vec<_>>();
+        let text = units
+            .iter()
+            .map(|unit| unit.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!ranges.is_empty() && !text.is_empty()).then_some((ranges, text))
     }
 
     fn hit_test_canvas(
@@ -187,6 +209,7 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn begin_text_selection(&mut self, x: f32, y: f32) {
+        self.focus_selection_anchor = None;
         self.selection_toolbar_visible = false;
         self.annotation_note_draft = None;
         match self.hit_test_canvas(x, y, true) {
@@ -261,6 +284,7 @@ impl DesktopReader {
         self.selection_toolbar_visible = false;
         self.annotation_note_draft = None;
         self.selection_anchor = None;
+        self.focus_selection_anchor = None;
         self.selection = None;
         self.bump_scene_revision();
         let candidates = self
@@ -287,6 +311,7 @@ impl DesktopReader {
         self.selection_toolbar_visible = false;
         self.annotation_note_draft = None;
         self.selection_anchor = None;
+        self.focus_selection_anchor = None;
         if self.selection.take().is_some() {
             self.bump_scene_revision();
         }

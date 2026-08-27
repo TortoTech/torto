@@ -21,6 +21,7 @@ const SETTINGS_SELECT_WIDTH: f32 = 156.0;
 const SETTINGS_MODEL_SELECT_WIDTH: f32 = 280.0;
 const SETTINGS_FONT_SELECT_WIDTH: f32 = 260.0;
 const SETTINGS_SCROLLBAR_GUTTER: f32 = 14.0;
+const SHORTCUT_CONTROL_WIDTH: f32 = 180.0;
 
 struct ConfiguredModel {
     provider_id: String,
@@ -279,38 +280,7 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         ],
     );
     ui.add_space(12.0);
-    shortcut_group(
-        ui,
-        state,
-        "focus-shortcuts-grid",
-        language.text("专注模式", "Focus mode"),
-        &[
-            (
-                ShortcutAction::FocusActions,
-                language.text("唤起工具栏", "Open action toolbar"),
-            ),
-            (
-                ShortcutAction::FocusChat,
-                language.text("唤起对话框", "Open chat panel"),
-            ),
-            (
-                ShortcutAction::FocusHighlight,
-                language.text("高亮段落", "Highlight paragraph"),
-            ),
-            (
-                ShortcutAction::FocusNote,
-                language.text("唤起批注框", "Open note panel"),
-            ),
-            (
-                ShortcutAction::FocusStructure,
-                language.text("按句分段", "Split by sentence"),
-            ),
-            (
-                ShortcutAction::FocusFootnotes,
-                language.text("脚注开关", "Toggle footnotes"),
-            ),
-        ],
-    );
+    focus_shortcut_group(ui, state, language);
     ui.add_space(12.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if secondary_button(ui, language.text("恢复默认", "Restore defaults")).clicked() {
@@ -341,6 +311,49 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     }
 }
 
+fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language: AppLanguage) {
+    shortcut_group(
+        ui,
+        state,
+        "focus-shortcuts-grid",
+        language.text("专注模式", "Focus mode"),
+        &[
+            (
+                ShortcutAction::FocusActions,
+                language.text("唤起工具栏", "Open action toolbar"),
+            ),
+            (
+                ShortcutAction::FocusChat,
+                language.text("唤起对话框", "Open chat panel"),
+            ),
+            (
+                ShortcutAction::FocusHighlight,
+                language.text("高亮段落", "Highlight paragraph"),
+            ),
+            (
+                ShortcutAction::FocusNote,
+                language.text("唤起批注框", "Open note panel"),
+            ),
+            (
+                ShortcutAction::FocusStructure,
+                language.text("按句分段", "Split by sentence"),
+            ),
+            (
+                ShortcutAction::FocusFootnotes,
+                language.text("脚注开关", "Toggle footnotes"),
+            ),
+            (
+                ShortcutAction::FocusExtendSelectionPrevious,
+                language.text("向上扩展选区", "Extend selection upward"),
+            ),
+            (
+                ShortcutAction::FocusExtendSelectionNext,
+                language.text("向下扩展选区", "Extend selection downward"),
+            ),
+        ],
+    );
+}
+
 fn shortcut_group(
     ui: &mut egui::Ui,
     state: &mut SettingsFeature,
@@ -351,19 +364,25 @@ fn shortcut_group(
     settings_card(ui, |ui| {
         settings_module_label(ui, title);
         ui.add_space(4.0);
+        let label_min_width = shortcut_label_min_width();
         egui::Grid::new(grid_id)
             .num_columns(2)
+            .min_col_width(label_min_width)
             .spacing([24.0, 12.0])
             .show(ui, |ui| {
                 for &(action, label) in actions {
                     settings_row_label(ui, label);
-                    settings_row_control_sized(ui, 180.0, |ui| {
+                    settings_row_control_sized(ui, SHORTCUT_CONTROL_WIDTH, |ui| {
                         shortcut_binding_button(ui, state, action);
                     });
                     ui.end_row();
                 }
             });
     });
+}
+
+fn shortcut_label_min_width() -> f32 {
+    crate::ui::scaled_font_size(12.0) * 6.0
 }
 
 fn shortcut_binding_button(ui: &mut egui::Ui, state: &mut SettingsFeature, action: ShortcutAction) {
@@ -377,7 +396,7 @@ fn shortcut_binding_button(ui: &mut egui::Ui, state: &mut SettingsFeature, actio
     };
     let response = ui
         .add_sized(
-            [180.0, 32.0],
+            [SHORTCUT_CONTROL_WIDTH, 32.0],
             egui::Button::new(RichText::new(label).color(if capturing {
                 palette().surface
             } else {
@@ -2230,6 +2249,13 @@ mod tests {
         assert!((choice_button_width(long_text, false) - long_text - 28.0).abs() < 0.01);
         assert!(choice_button_width(long_text, false) > choice_button_width(short_text, false));
         assert!(choice_button_width(long_text, true) > choice_button_width(long_text, false));
+    }
+
+    #[test]
+    fn shortcut_label_column_starts_at_six_cjk_characters() {
+        assert!(
+            (shortcut_label_min_width() - crate::ui::scaled_font_size(12.0) * 6.0).abs() < 0.01
+        );
     }
 
     #[test]

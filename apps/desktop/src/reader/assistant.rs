@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use rebook_publication::{Block, BookSource, Inline, RenditionLayout, SourceRange};
+use rebook_publication::{Block, BookSource, RenditionLayout, SourceRange};
 use rebook_reader::ReaderVisibleTextFragment;
 
 use super::chat_autocomplete::{
@@ -26,15 +26,29 @@ use crate::plugins::{
 impl DesktopReader {
     pub(super) fn attach_current_focus_reference(&mut self) {
         self.sync_focus_chat_session();
+        self.chat.references.retain(|reference| {
+            !reference.id.starts_with("focus:") && !reference.id.starts_with("selection:")
+        });
+        if self.selection.is_some()
+            && self.focus_selection_anchor.is_some()
+            && let Some(selection) = self.selection.clone()
+            && let Some(reference) = selection_reference(
+                self.source.as_ref(),
+                &selection.ranges,
+                &selection.text,
+                self.language.resolved() == crate::preferences::AppLanguage::English,
+            )
+        {
+            self.chat.references.push(reference);
+            self.chat.move_cursor_to_end = true;
+            return;
+        }
         let Some(unit) = self.focus_units.get(self.focus_unit_index).cloned() else {
             return;
         };
         let section_index = unit.position.section_index;
         let node = unit.range.start.node.clone();
         let id = format!("focus:{section_index}:{node}");
-        self.chat
-            .references
-            .retain(|reference| !reference.id.starts_with("focus:"));
         let title = self
             .reader
             .toc_items()
@@ -1658,42 +1672,62 @@ impl DesktopReader {
     }
 
     pub(super) fn toggle_current_focus_structure(&mut self) {
-        let Some(unit) = self.focus_units.get(self.focus_unit_index) else {
-            return;
-        };
-        if unit.is_image || unit.is_table {
+        let keys = self.focus_structure_keys();
+        if keys.is_empty() {
             return;
         }
-        let key = crate::plugins::ParagraphStructureKey {
-            section_index: unit.position.section_index,
-            node: unit.range.start.node.clone(),
-        };
-        let active = self.structure_source.is_active(&key);
-        if !active {
+        let mut candidates = Vec::new();
+        for key in keys {
+            let active = self.structure_source.is_active(&key);
+            if active {
+                candidates.push((key, true));
+                continue;
+            }
             match self.structure_source.can_structure(&key) {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.show_error(
-                        self.language
-                            .text(
-                                "当前段落没有可拆分的多个句子",
-                                "The current paragraph has fewer than two sentences",
-                            )
-                            .to_owned(),
-                    );
-                    return;
-                }
+                Ok(true) => candidates.push((key, false)),
+                Ok(false) => continue,
                 Err(error) => {
                     self.show_error(error);
                     return;
                 }
             }
         }
-        if let Err(error) = self.structure_source.set_active(key.clone(), !active) {
-            self.show_error(error);
+        let Some(activate) = focus_structure_activation(&candidates) else {
             return;
+        };
+        for (key, active) in candidates {
+            if active == activate {
+                continue;
+            }
+            if let Err(error) = self.structure_source.set_active(key, activate) {
+                self.show_error(error);
+                return;
+            }
         }
         self.refresh_translation_view();
+    }
+
+    pub(super) fn focus_structure_is_active(&self) -> bool {
+        let keys = self.focus_structure_keys();
+        !keys.is_empty() && keys.iter().all(|key| self.structure_source.is_active(key))
+    }
+
+    fn focus_structure_keys(&self) -> Vec<crate::plugins::ParagraphStructureKey> {
+        let mut keys = Vec::new();
+        for unit in self
+            .focus_action_units()
+            .iter()
+            .filter(|unit| unit.is_paragraph)
+        {
+            let key = crate::plugins::ParagraphStructureKey {
+                section_index: unit.position.section_index,
+                node: unit.range.start.node.clone(),
+            };
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
     }
 
     pub(crate) fn complete_toc_translation(&mut self, message: TocTranslationTaskMessage) {
@@ -1759,7 +1793,8 @@ impl DesktopReader {
                     },
                 );
                 if let Some(positions) = positions {
-                    self.reader.visible_text_fragments_for_pages(&positions)?
+                    self.reader
+                        .cached_visible_text_fragments_for_pages(&positions)
                 } else {
                     self.reader.current_visible_text_fragments()?
                 }
@@ -1854,24 +1889,25 @@ fn selection_reference(
         .position(|section| section.id == range.start.spine)?;
     let section = source.parse_section(section_index).ok()?;
     let title = section_title(source, section_index, &section.blocks);
-    let paragraph = section.blocks.iter().find_map(|block| {
-        let source_range = block_source_range(block)?;
-        (source_range.start.node == range.start.node).then(|| block_text(block))
-    });
     Some(ChatReference {
         id: format!("selection:{section_index}:{}", range.start.node),
         kind: ChatReferenceKind::Paragraph,
         label: clip_chat_reference_text(selected_text, 32),
         description: if english {
-            format!("Selected paragraph · {title}")
+            format!("Selected content · {title}")
         } else {
-            format!("选中段落 · {title}")
+            format!("选中内容 · {title}")
         },
         link: chat_citation_link(section_index, Some(&range.start.node)),
-        excerpt: paragraph
-            .filter(|text| !text.trim().is_empty())
-            .map(|text| clip_chat_reference_text(&text, 500)),
+        excerpt: (!selected_text.trim().is_empty())
+            .then(|| clip_chat_reference_text(selected_text, 500)),
     })
+}
+
+fn focus_structure_activation(
+    candidates: &[(crate::plugins::ParagraphStructureKey, bool)],
+) -> Option<bool> {
+    (!candidates.is_empty()).then(|| !candidates.iter().all(|(_, active)| *active))
 }
 
 fn source_range_for_node(
@@ -1899,75 +1935,6 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
         Block::Figure(block) => block.source.as_ref(),
         Block::Note(block) => block.source.as_ref(),
         Block::Separator(_) | Block::LineBreak | Block::PageBreak => None,
-    }
-}
-
-fn block_text(block: &Block) -> String {
-    match block {
-        Block::Text(block) => block
-            .content
-            .iter()
-            .map(|inline| match inline {
-                Inline::Text(run) => run.text.as_str(),
-                Inline::Math(run) => run.latex.as_str(),
-                Inline::Break => "\n",
-            })
-            .collect(),
-        Block::Quote(quote) => quote
-            .body
-            .iter()
-            .chain(quote.attribution.iter())
-            .map(|block| block_text(&Block::Text(block.clone())))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Block::Table(table) => table
-            .rows
-            .iter()
-            .map(|row| {
-                row.cells
-                    .iter()
-                    .map(|cell| {
-                        cell.text
-                            .content
-                            .iter()
-                            .map(|inline| match inline {
-                                Inline::Text(run) => run.text.as_str(),
-                                Inline::Math(run) => run.latex.as_str(),
-                                Inline::Break => "\n",
-                            })
-                            .collect::<String>()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\t")
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Block::Image(block) => block
-            .text_layer
-            .as_ref()
-            .map_or_else(|| block.alt.clone(), |layer| layer.text.clone()),
-        Block::Figure(figure) => {
-            let caption = figure
-                .captions
-                .iter()
-                .map(|caption| block_text(&Block::Text(caption.clone())))
-                .filter(|text| !text.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if caption.is_empty() {
-                figure
-                    .images
-                    .iter()
-                    .map(|image| image.alt.trim())
-                    .filter(|alt| !alt.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            } else {
-                caption
-            }
-        }
-        Block::Note(_) => String::new(),
-        Block::Separator(_) | Block::LineBreak | Block::PageBreak => String::new(),
     }
 }
 
@@ -2052,5 +2019,23 @@ mod tests {
 
         assert_eq!(labels.len(), 1);
         assert_eq!(labels.get("chapter-1").map(String::as_str), Some("第一章"));
+    }
+
+    #[test]
+    fn focus_structure_batch_activates_until_every_candidate_is_active() {
+        let key = |node: &str| crate::plugins::ParagraphStructureKey {
+            section_index: 0,
+            node: node.into(),
+        };
+
+        assert_eq!(focus_structure_activation(&[]), None);
+        assert_eq!(
+            focus_structure_activation(&[(key("one"), false), (key("two"), true)]),
+            Some(true)
+        );
+        assert_eq!(
+            focus_structure_activation(&[(key("one"), true), (key("two"), true)]),
+            Some(false)
+        );
     }
 }

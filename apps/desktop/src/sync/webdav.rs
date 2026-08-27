@@ -32,6 +32,7 @@ pub(crate) struct WebDavClient {
     root: Url,
     username: String,
     password: String,
+    cstcloud_compatibility: bool,
 }
 
 impl WebDavClient {
@@ -56,7 +57,8 @@ impl WebDavClient {
         let mut download_client_builder = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(DOWNLOAD_READ_TIMEOUT);
-        if let Some(user_agent) = settings.provider.user_agent() {
+        let compatibility_user_agent = settings.user_agent();
+        if let Some(user_agent) = compatibility_user_agent {
             client_builder = client_builder.user_agent(user_agent);
             download_client_builder = download_client_builder.user_agent(user_agent);
         }
@@ -84,6 +86,7 @@ impl WebDavClient {
             root,
             username: settings.username.clone(),
             password,
+            cstcloud_compatibility: compatibility_user_agent.is_some(),
         })
     }
 
@@ -250,6 +253,18 @@ impl WebDavClient {
         bytes: Vec<u8>,
         content_type: &'static str,
     ) -> SyncResult<bool> {
+        if self.cstcloud_compatibility {
+            if self.get_optional(path).await?.is_some() {
+                return Ok(false);
+            }
+            self.request(Method::PUT, self.url(path)?)
+                .header(CONTENT_TYPE, content_type)
+                .body(bytes)
+                .send()
+                .await?
+                .error_for_status()?;
+            return Ok(true);
+        }
         let response = self
             .request(Method::PUT, self.url(path)?)
             .header(IF_NONE_MATCH, "*")
@@ -287,6 +302,15 @@ impl WebDavClient {
         let bytes = serde_json::to_vec_pretty(value)?;
         for _ in 0..2 {
             let existing = self.get_optional(path).await?;
+            if self.cstcloud_compatibility {
+                self.request(Method::PUT, self.url(path)?)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(bytes.clone())
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                return Ok(());
+            }
             let mut request = self
                 .request(Method::PUT, self.url(path)?)
                 .header(CONTENT_TYPE, "application/json")
@@ -329,11 +353,7 @@ impl WebDavClient {
         let mut names = parse_propfind_hrefs(&xml, &self.root)?
             .into_iter()
             .filter_map(|href| href.path_segments()?.next_back().map(str::to_owned))
-            .filter(|name| {
-                std::path::Path::new(name)
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-            })
+            .filter_map(|name| self.logical_json_file_name(name))
             .collect::<Vec<_>>();
         names.sort();
         names.dedup();
@@ -347,7 +367,30 @@ impl WebDavClient {
     }
 
     fn url(&self, path: &str) -> SyncResult<Url> {
-        Ok(self.root.join(path.trim_start_matches('/'))?)
+        let path = path.trim_start_matches('/');
+        if !self.cstcloud_compatibility || path.ends_with('/') {
+            return Ok(self.root.join(path)?);
+        }
+        let lower = path.to_ascii_lowercase();
+        let mapped = if lower.ends_with(".prop") || lower.ends_with(".zip") {
+            path.to_owned()
+        } else if lower.ends_with(".json") {
+            format!("{path}.prop")
+        } else {
+            format!("{path}.zip")
+        };
+        Ok(self.root.join(&mapped)?)
+    }
+
+    fn logical_json_file_name(&self, name: String) -> Option<String> {
+        let lower = name.to_ascii_lowercase();
+        if self.cstcloud_compatibility && lower.ends_with(".json.prop") {
+            return Some(name[..name.len() - ".prop".len()].to_owned());
+        }
+        std::path::Path::new(&name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            .then_some(name)
     }
 
     async fn ensure_collection_absolute(&self, url: Url) -> SyncResult<()> {
@@ -495,5 +538,92 @@ mod tests {
                 .lines()
                 .any(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
         );
+    }
+
+    #[test]
+    fn cstcloud_checks_before_using_an_unconditional_create() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for status in ["404 Not Found", "201 Created"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                requests.push(String::from_utf8(request).unwrap());
+            }
+            requests
+        });
+
+        let mut settings = SyncSettings::new_device();
+        settings.provider = CloudProviderKind::CstCloud;
+        settings.base_url = format!("http://{address}");
+        settings.username = "reader".into();
+        let client = WebDavClient::new(&settings, "secret".into()).unwrap();
+        let created = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(client.put_immutable("probe.json", b"payload".to_vec(), "application/json"))
+            .unwrap();
+        assert!(created);
+
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /Rebook/v1/probe.json.prop HTTP/1.1"));
+        assert!(requests[1].starts_with("PUT /Rebook/v1/probe.json.prop HTTP/1.1"));
+        assert!(!requests[1].to_ascii_lowercase().contains("if-none-match:"));
+    }
+
+    #[test]
+    fn cstcloud_maps_logical_files_to_its_allowed_extensions() {
+        let mut settings = SyncSettings::new_device();
+        settings.provider = CloudProviderKind::CstCloud;
+        settings.base_url = "http://127.0.0.1:1".into();
+        settings.username = "reader".into();
+        let client = WebDavClient::new(&settings, "secret".into()).unwrap();
+
+        assert!(
+            client
+                .url("protocol.json")
+                .unwrap()
+                .path()
+                .ends_with("protocol.json.prop")
+        );
+        assert!(
+            client
+                .url("books/id/content.epub")
+                .unwrap()
+                .path()
+                .ends_with("content.epub.zip")
+        );
+        assert!(
+            client
+                .url("derived/id/ocr.zip")
+                .unwrap()
+                .path()
+                .ends_with("ocr.zip")
+        );
+        assert!(
+            client
+                .url("library/devices/")
+                .unwrap()
+                .path()
+                .ends_with("library/devices/")
+        );
+        assert_eq!(
+            client.logical_json_file_name("device.json.prop".into()),
+            Some("device.json".into())
+        );
+        assert_eq!(client.logical_json_file_name("content.zip".into()), None);
     }
 }

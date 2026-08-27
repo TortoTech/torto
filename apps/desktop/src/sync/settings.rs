@@ -16,6 +16,8 @@ const SETTINGS_VERSION: u32 = 2;
 const FIRST_SUPPORTED_SETTINGS_VERSION: u32 = 1;
 const SETTINGS_FILE: &str = "webdav-sync.json";
 const CREDENTIAL_SERVICE: &str = "Rebook WebDAV";
+const CSTCLOUD_HOST: &str = "data.cstcloud.cn";
+const CSTCLOUD_USER_AGENT: &str = concat!("Torto/", env!("CARGO_PKG_VERSION"), " Zotero/7.0");
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -74,20 +76,6 @@ impl CloudProviderKind {
             Self::HiDrive => "https://www.strato.de/",
             Self::YandexDisk => "https://id.yandex.com/security/app-passwords",
             Self::Custom => "https://tortotech.github.io/guides/cloud-storage/",
-        }
-    }
-
-    pub(crate) const fn user_agent(self) -> Option<&'static str> {
-        match self {
-            // data.cstcloud.cn rejects otherwise valid WebDAV requests unless
-            // the User-Agent contains a recognized WebDAV client token.
-            Self::CstCloud => Some(concat!("Torto/", env!("CARGO_PKG_VERSION"), " Zotero/7.0")),
-            Self::Jianguoyun
-            | Self::InfiniCloud
-            | Self::Koofr
-            | Self::HiDrive
-            | Self::YandexDisk
-            | Self::Custom => None,
         }
     }
 }
@@ -159,6 +147,13 @@ impl SyncSettings {
             self.base_url = base_url.into();
         }
         self.base_url = self.base_url.trim().trim_end_matches('/').to_owned();
+        if self.provider == CloudProviderKind::Custom && self.is_cstcloud_endpoint() {
+            self.provider = CloudProviderKind::CstCloud;
+            self.base_url = CloudProviderKind::CstCloud
+                .base_url()
+                .expect("cstcloud is a preset provider")
+                .into();
+        }
         self.username = self.username.trim().to_owned();
         self.device_name = self.device_name.trim().to_owned();
         if self.device_name.is_empty() {
@@ -171,6 +166,20 @@ impl SyncSettings {
         if let Some(base_url) = provider.base_url() {
             self.base_url = base_url.into();
         }
+    }
+
+    pub(crate) fn user_agent(&self) -> Option<&'static str> {
+        // Match the exact host as well as the preset so legacy custom settings
+        // receive CSTCloud's required recognized WebDAV client token.
+        (self.provider == CloudProviderKind::CstCloud || self.is_cstcloud_endpoint())
+            .then_some(CSTCLOUD_USER_AGENT)
+    }
+
+    fn is_cstcloud_endpoint(&self) -> bool {
+        Url::parse(&self.base_url).ok().is_some_and(|url| {
+            url.host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case(CSTCLOUD_HOST))
+        })
     }
 
     fn migrate_from_version(&mut self, version: u32) {
@@ -310,10 +319,21 @@ mod tests {
 
         assert_eq!(settings.provider, CloudProviderKind::CstCloud);
         assert_eq!(settings.base_url, "https://data.cstcloud.cn/dav");
-        assert_eq!(
-            settings.provider.user_agent(),
-            Some(concat!("Torto/", env!("CARGO_PKG_VERSION"), " Zotero/7.0"))
-        );
+        assert_eq!(settings.user_agent(), Some(CSTCLOUD_USER_AGENT));
+    }
+
+    #[test]
+    fn legacy_custom_cstcloud_endpoint_is_promoted_and_gets_the_compatibility_user_agent() {
+        let mut settings = SyncSettings::new_device();
+        settings.provider = CloudProviderKind::Custom;
+        settings.base_url = "https://data.cstcloud.cn/dav/".into();
+
+        assert_eq!(settings.user_agent(), Some(CSTCLOUD_USER_AGENT));
+        settings.normalize();
+
+        assert_eq!(settings.provider, CloudProviderKind::CstCloud);
+        assert_eq!(settings.base_url, "https://data.cstcloud.cn/dav");
+        assert_eq!(settings.user_agent(), Some(CSTCLOUD_USER_AGENT));
     }
 
     #[test]

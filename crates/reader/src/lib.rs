@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 
 use rebook_layout::{
     LayoutEngine, LayoutError, LayoutViewport, PageItem, ReaderFontBlob, ReaderStyle,
+    TypesettingMode,
 };
 use rebook_publication::{
     Block, Book, BookSource, Inline, LocatorV1, PublicationError, PublicationUrl, RenditionLayout,
@@ -552,6 +553,7 @@ pub struct ReaderSession {
     toc_items: Arc<[TocViewItem]>,
     toc_index: TocIndex,
     section_indices_by_path: HashMap<String, usize>,
+    hidden_sections: HashSet<usize>,
     cache_capacity: usize,
     cache: HashMap<SegmentKey, Arc<CachedSegment>>,
     lru: VecDeque<SegmentKey>,
@@ -584,10 +586,7 @@ impl ReaderSession {
         fonts: Arc<[ReaderFontBlob]>,
     ) -> Result<Self, ReaderError> {
         let mut session = Self::new_unpositioned(source, viewport, style, fonts)?;
-        session.ensure_segment(SegmentKey {
-            section_index: 0,
-            segment_index: 0,
-        })?;
+        session.ensure_segment(session.current_key())?;
         Ok(session)
     }
 
@@ -616,13 +615,19 @@ impl ReaderSession {
             return Err(ReaderError::EmptyBook);
         }
         style.writing_system = source.book().metadata.writing_system();
-        let toc_items: Arc<[TocViewItem]> = flatten_toc(&source.book().table_of_contents).into();
         let mut section_indices_by_path = HashMap::with_capacity(source.book().sections.len());
         for (index, section) in source.book().sections.iter().enumerate() {
             section_indices_by_path
                 .entry(section.href.path().to_owned())
                 .or_insert(index);
         }
+        let hidden_sections = hidden_sections_for_style(source.book(), &style);
+        let toc_items: Arc<[TocViewItem]> = flatten_reader_toc(
+            &source.book().table_of_contents,
+            &section_indices_by_path,
+            &hidden_sections,
+        )
+        .into();
         let toc_index = TocIndex::new(
             &toc_items,
             &section_indices_by_path,
@@ -636,6 +641,8 @@ impl ReaderSession {
             Arc::clone(&repository),
             Arc::clone(&fonts),
         )?;
+        let current_section =
+            first_visible_section(source.book().sections.len(), &hidden_sections).unwrap_or(0);
         Ok(Self {
             source,
             repository,
@@ -647,13 +654,14 @@ impl ReaderSession {
             toc_items,
             toc_index,
             section_indices_by_path,
+            hidden_sections,
             cache_capacity: DEFAULT_SEGMENT_CACHE_CAPACITY,
             cache: HashMap::new(),
             lru: VecDeque::new(),
             prefetch_worker,
             prefetch_inflight: HashSet::new(),
             prefetch_failures: HashMap::new(),
-            current_section: 0,
+            current_section,
             current_segment: 0,
             current_page: 0,
             current_reading_unit: 0,
@@ -683,6 +691,45 @@ impl ReaderSession {
 
     pub fn section_count(&self) -> usize {
         self.source.book().sections.len()
+    }
+
+    fn next_visible_section(&self, section_index: usize) -> Option<usize> {
+        (section_index + 1..self.section_count())
+            .find(|index| !self.hidden_sections.contains(index))
+    }
+
+    fn previous_visible_section(&self, section_index: usize) -> Option<usize> {
+        (0..section_index)
+            .rev()
+            .find(|index| !self.hidden_sections.contains(index))
+    }
+
+    fn nearest_visible_section(&self, section_index: usize) -> Option<usize> {
+        if section_index < self.section_count() && !self.hidden_sections.contains(&section_index) {
+            return Some(section_index);
+        }
+        self.next_visible_section(section_index)
+            .or_else(|| self.previous_visible_section(section_index))
+    }
+
+    fn rebuild_toc_index(&mut self) {
+        let toc_items: Arc<[TocViewItem]> = flatten_reader_toc(
+            &self.source.book().table_of_contents,
+            &self.section_indices_by_path,
+            &self.hidden_sections,
+        )
+        .into();
+        self.toc_index = TocIndex::new(
+            &toc_items,
+            &self.section_indices_by_path,
+            self.source.book().sections.len(),
+        );
+        self.fixed_reading_units = build_fixed_reading_units(
+            self.source.as_ref(),
+            &toc_items,
+            &self.section_indices_by_path,
+        );
+        self.toc_items = toc_items;
     }
 
     pub fn location(&self) -> ReaderLocation {
@@ -776,7 +823,7 @@ impl ReaderSession {
             return Ok(result);
         }
 
-        let (section_index, progression) =
+        let (requested_section, mut progression) =
             if let Some(index) = self.section_index_for_href(&locator.href) {
                 (index, locator.progression.unwrap_or(0.0))
             } else if let Some(total) = locator.total_progression {
@@ -787,6 +834,12 @@ impl ReaderSession {
             } else {
                 return self.go_to_href(&locator.href);
             };
+        let section_index = self
+            .nearest_visible_section(requested_section)
+            .ok_or(ReaderError::EmptyBook)?;
+        if section_index != requested_section {
+            progression = 0.0;
+        }
         let section = self.repository.load(section_index)?;
         let segment_count = section.segments.len().max(1);
         let scaled = progression.clamp(0.0, 1.0) * segment_count as f64;
@@ -1074,15 +1127,16 @@ impl ReaderSession {
                 Some((self.current_section, self.current_reading_unit + 1))
             }
             PageDirection::Previous => {
-                if let Some(section) = self.current_section.checked_sub(1) {
+                if let Some(section) = self.previous_visible_section(self.current_section) {
                     let count = self.repository.load(section)?.reading_units.len().max(1);
                     Some((section, count - 1))
                 } else {
                     None
                 }
             }
-            PageDirection::Next => (self.current_section + 1 < self.section_count())
-                .then_some((self.current_section + 1, 0)),
+            PageDirection::Next => self
+                .next_visible_section(self.current_section)
+                .map(|section| (section, 0)),
         };
         let Some((section_index, unit_index)) = target else {
             return Ok(self.boundary());
@@ -1134,7 +1188,7 @@ impl ReaderSession {
                 Some((self.current_section, self.current_reading_unit + 1))
             }
             PageDirection::Previous => {
-                if let Some(section) = self.current_section.checked_sub(1) {
+                if let Some(section) = self.previous_visible_section(self.current_section) {
                     if self.repository.get(section).is_none()
                         && !self.try_ensure_navigation_segment(SegmentKey {
                             section_index: section,
@@ -1149,8 +1203,9 @@ impl ReaderSession {
                     None
                 }
             }
-            PageDirection::Next => (self.current_section + 1 < self.section_count())
-                .then_some((self.current_section + 1, 0)),
+            PageDirection::Next => self
+                .next_visible_section(self.current_section)
+                .map(|section| (section, 0)),
         };
         let Some((section_index, unit_index)) = target else {
             return Ok(NavigationAttempt::Ready(self.boundary()));
@@ -1417,6 +1472,24 @@ impl ReaderSession {
         Ok(fragments)
     }
 
+    /// Returns source-backed text for the requested logical pages that are
+    /// already compiled in the reader cache. Fixed-layout scroll views can
+    /// contain lightweight placeholders while adjacent PDF pages are still
+    /// materializing; those positions are intentionally skipped here.
+    pub fn cached_visible_text_fragments_for_pages(
+        &self,
+        positions: &[ReaderPosition],
+    ) -> Vec<ReaderVisibleTextFragment> {
+        let mut fragments = Vec::new();
+        for &position in positions {
+            let Ok(page) = self.page_at(position) else {
+                continue;
+            };
+            append_visible_text_fragments(&mut fragments, position, &page);
+        }
+        fragments
+    }
+
     /// Resolves a canvas point against the currently visible logical pages.
     /// Exact hits start a selection; nearest hits extend an active drag through
     /// whitespace in the same page or across a two-page spread.
@@ -1595,6 +1668,12 @@ impl ReaderSession {
     /// the current viewport and reader style.
     pub fn go_to_source(&mut self, anchor: &SourceAnchor) -> Result<NavigationResult, ReaderError> {
         let position = self.position_for_source_anchor(anchor)?;
+        if self.hidden_sections.contains(&position.section_index) {
+            let section_index = self
+                .nearest_visible_section(position.section_index)
+                .ok_or(ReaderError::EmptyBook)?;
+            return self.go_to_section(section_index);
+        }
         self.install_position(position);
         self.sync_reading_unit_to_anchor(anchor);
         Ok(self.moved())
@@ -1613,6 +1692,9 @@ impl ReaderSession {
     /// segments; the current segment is always compiled.
     pub fn position_for_href(&self, href: &PublicationUrl) -> Option<ReaderPosition> {
         let section_index = self.section_index_for_href(href)?;
+        if self.hidden_sections.contains(&section_index) {
+            return None;
+        }
         let section = self.repository.get(section_index);
         let segment_index = href
             .fragment()
@@ -1649,6 +1731,9 @@ impl ReaderSession {
     /// when multiple contents entries share one laid-out page.
     pub fn source_anchor_for_href(&self, href: &PublicationUrl) -> Option<SourceAnchor> {
         let section_index = self.section_index_for_href(href)?;
+        if self.hidden_sections.contains(&section_index) {
+            return None;
+        }
         let fragment = href.fragment()?;
         self.repository
             .get(section_index)?
@@ -1665,6 +1750,9 @@ impl ReaderSession {
         if index >= self.source.book().sections.len() {
             return Err(ReaderError::SectionOutOfBounds(index));
         }
+        let index = self
+            .nearest_visible_section(index)
+            .ok_or(ReaderError::EmptyBook)?;
         let key = SegmentKey {
             section_index: index,
             segment_index: 0,
@@ -1683,6 +1771,12 @@ impl ReaderSession {
         let index = self
             .section_index_for_href(href)
             .ok_or_else(|| ReaderError::NavigationTargetNotFound(href.to_string()))?;
+        if self.hidden_sections.contains(&index) {
+            let section_index = self
+                .nearest_visible_section(index)
+                .ok_or(ReaderError::EmptyBook)?;
+            return self.go_to_section(section_index);
+        }
         let section = self.repository.load(index)?;
         let segment_index = href
             .fragment()
@@ -1840,9 +1934,29 @@ impl ReaderSession {
         if self.style == style {
             return Ok(self.snapshot());
         }
-        let fraction = page_fraction(self.current_page, self.current_page_count());
+        let mut fraction = page_fraction(self.current_page, self.current_page_count());
+        let hidden_sections = hidden_sections_for_style(self.source.book(), &style);
+        let relocated_section = if hidden_sections.contains(&self.current_section) {
+            nearest_visible_section(
+                self.current_section,
+                self.source.book().sections.len(),
+                &hidden_sections,
+            )
+        } else {
+            None
+        };
         self.style = style;
+        self.hidden_sections = hidden_sections;
+        self.rebuild_toc_index();
+        if let Some(section_index) = relocated_section {
+            self.current_section = section_index;
+            self.current_segment = 0;
+            self.current_page = 0;
+            self.current_reading_unit = 0;
+            fraction = 0.0;
+        }
         self.invalidate_layout(fraction)?;
+        self.sync_reading_unit_to_position();
         Ok(self.snapshot())
     }
 
@@ -1879,14 +1993,19 @@ impl ReaderSession {
             .then(|| self.current_page().leading_source_range())
             .flatten()
             .map(|range| range.start);
-        let toc_items: Arc<[TocViewItem]> =
-            flatten_toc(&self.source.book().table_of_contents).into();
         let mut section_indices_by_path = HashMap::with_capacity(self.source.book().sections.len());
         for (index, section) in self.source.book().sections.iter().enumerate() {
             section_indices_by_path
                 .entry(section.href.path().to_owned())
                 .or_insert(index);
         }
+        let hidden_sections = hidden_sections_for_style(self.source.book(), &style);
+        let toc_items: Arc<[TocViewItem]> = flatten_reader_toc(
+            &self.source.book().table_of_contents,
+            &section_indices_by_path,
+            &hidden_sections,
+        )
+        .into();
         let toc_index = TocIndex::new(
             &toc_items,
             &section_indices_by_path,
@@ -1895,7 +2014,7 @@ impl ReaderSession {
         let fixed_reading_units =
             build_fixed_reading_units(self.source.as_ref(), &toc_items, &section_indices_by_path);
         let repository = Arc::new(SectionRepository::new(Arc::clone(&self.source)));
-        let section_index = target.map_or_else(
+        let requested_section = target.map_or_else(
             || {
                 self.current_section
                     .min(self.source.book().sections.len().saturating_sub(1))
@@ -1907,8 +2026,16 @@ impl ReaderSession {
                     .unwrap_or(0)
             },
         );
+        let section_index = nearest_visible_section(
+            requested_section,
+            self.source.book().sections.len(),
+            &hidden_sections,
+        )
+        .unwrap_or(requested_section);
         let section = repository.load(section_index)?;
-        let segment_index = target
+        let segment_index = (section_index == requested_section)
+            .then_some(target)
+            .flatten()
             .and_then(PublicationUrl::fragment)
             .and_then(|fragment| section.anchor_segments.get(fragment))
             .copied()
@@ -1952,6 +2079,7 @@ impl ReaderSession {
         self.toc_items = toc_items;
         self.toc_index = toc_index;
         self.section_indices_by_path = section_indices_by_path;
+        self.hidden_sections = hidden_sections;
         self.fixed_reading_units = fixed_reading_units;
         self.prefetch_inflight.clear();
         self.prefetch_failures.clear();
@@ -2063,6 +2191,19 @@ impl ReaderSession {
         let index = self
             .section_index_for_href(href)
             .ok_or_else(|| ReaderError::NavigationTargetNotFound(href.to_string()))?;
+        if self.hidden_sections.contains(&index) {
+            let section_index = self
+                .nearest_visible_section(index)
+                .ok_or(ReaderError::EmptyBook)?;
+            let key = SegmentKey {
+                section_index,
+                segment_index: 0,
+            };
+            if !self.try_ensure_navigation_segment(key)? {
+                return Ok(NavigationAttempt::Pending);
+            }
+            return Ok(NavigationAttempt::Ready(self.go_to_section(section_index)?));
+        }
         if href.fragment().is_some()
             && self.repository.get(index).is_none()
             && !self.try_ensure_navigation_segment(SegmentKey {
@@ -2190,10 +2331,9 @@ impl ReaderSession {
                 segment_index: position.segment_index + 1,
             }
         } else {
-            let section_index = position.section_index + 1;
-            if section_index >= self.source.book().sections.len() {
+            let Some(section_index) = self.next_visible_section(position.section_index) else {
                 return Ok(PositionAttempt::Ready(None));
-            }
+            };
             SegmentKey {
                 section_index,
                 segment_index: 0,
@@ -2225,7 +2365,7 @@ impl ReaderSession {
                 segment_index,
             }
         } else {
-            let Some(section_index) = position.section_index.checked_sub(1) else {
+            let Some(section_index) = self.previous_visible_section(position.section_index) else {
                 return Ok(PositionAttempt::Ready(None));
             };
             let first_key = SegmentKey {
@@ -2290,10 +2430,9 @@ impl ReaderSession {
                 segment_index: position.segment_index + 1,
             }
         } else {
-            let section_index = position.section_index + 1;
-            if section_index >= self.source.book().sections.len() {
+            let Some(section_index) = self.next_visible_section(position.section_index) else {
                 return Ok(None);
-            }
+            };
             SegmentKey {
                 section_index,
                 segment_index: 0,
@@ -2323,7 +2462,7 @@ impl ReaderSession {
                 segment_index,
             }
         } else {
-            let Some(section_index) = position.section_index.checked_sub(1) else {
+            let Some(section_index) = self.previous_visible_section(position.section_index) else {
                 return Ok(None);
             };
             let section = self.repository.load(section_index)?;
@@ -2633,7 +2772,10 @@ impl ReaderSession {
         self.prefetch_worker.invalidate();
         self.prefetch_inflight.clear();
         self.prefetch_failures.clear();
-        let current_section = Arc::clone(self.current_section_data());
+        let current_section = self.repository.load(self.current_section)?;
+        self.current_segment = self
+            .current_segment
+            .min(current_section.segments.len().saturating_sub(1));
         self.cache.clear();
         self.lru.clear();
         let key = self.current_key();
@@ -3792,13 +3934,54 @@ fn push_source_range(ranges: &mut Vec<SourceRange>, range: SourceRange) {
 }
 
 fn flatten_toc(entries: &[TocEntry]) -> Vec<TocViewItem> {
+    flatten_toc_excluding_sections(entries, &HashMap::new(), &HashSet::new())
+}
+
+fn flatten_reader_toc(
+    entries: &[TocEntry],
+    section_indices_by_path: &HashMap<String, usize>,
+    hidden_sections: &HashSet<usize>,
+) -> Vec<TocViewItem> {
+    if hidden_sections.is_empty() {
+        flatten_toc(entries)
+    } else {
+        flatten_toc_excluding_sections(entries, section_indices_by_path, hidden_sections)
+    }
+}
+
+fn flatten_toc_excluding_sections(
+    entries: &[TocEntry],
+    section_indices_by_path: &HashMap<String, usize>,
+    hidden_sections: &HashSet<usize>,
+) -> Vec<TocViewItem> {
+    fn visible(
+        entry: &TocEntry,
+        section_indices_by_path: &HashMap<String, usize>,
+        hidden_sections: &HashSet<usize>,
+    ) -> bool {
+        if entry
+            .href
+            .as_ref()
+            .and_then(|href| section_indices_by_path.get(href.path()))
+            .is_some_and(|section| hidden_sections.contains(section))
+        {
+            return false;
+        }
+        true
+    }
+
     fn append(
         entries: &[TocEntry],
         depth: usize,
         ancestors: &[String],
+        section_indices_by_path: &HashMap<String, usize>,
+        hidden_sections: &HashSet<usize>,
         items: &mut Vec<TocViewItem>,
     ) {
         for (index, entry) in entries.iter().enumerate() {
+            if !visible(entry, section_indices_by_path, hidden_sections) {
+                continue;
+            }
             let id = ancestors
                 .last()
                 .map_or_else(|| index.to_string(), |parent| format!("{parent}/{index}"));
@@ -3808,17 +3991,75 @@ fn flatten_toc(entries: &[TocEntry]) -> Vec<TocViewItem> {
                 target: entry.href.clone(),
                 depth,
                 ancestors: ancestors.to_vec(),
-                has_children: !entry.children.is_empty(),
+                has_children: entry
+                    .children
+                    .iter()
+                    .any(|child| visible(child, section_indices_by_path, hidden_sections)),
             });
             let mut child_ancestors = ancestors.to_vec();
             child_ancestors.push(id);
-            append(&entry.children, depth + 1, &child_ancestors, items);
+            append(
+                &entry.children,
+                depth + 1,
+                &child_ancestors,
+                section_indices_by_path,
+                hidden_sections,
+                items,
+            );
         }
     }
 
     let mut items = Vec::new();
-    append(entries, 0, &[], &mut items);
+    append(
+        entries,
+        0,
+        &[],
+        section_indices_by_path,
+        hidden_sections,
+        &mut items,
+    );
     items
+}
+
+fn hidden_sections_for_style(book: &Book, style: &ReaderStyle) -> HashSet<usize> {
+    if style.typesetting.mode != TypesettingMode::Unified {
+        return HashSet::new();
+    }
+    let hidden = book
+        .sections
+        .iter()
+        .enumerate()
+        .filter_map(|(index, section)| section.is_note_section().then_some(index))
+        .collect::<HashSet<_>>();
+    // A malformed publication made entirely from a notes resource must remain
+    // openable. The filter only removes destinations when another readable
+    // section exists to receive navigation.
+    if hidden.len() == book.sections.len() {
+        HashSet::new()
+    } else {
+        hidden
+    }
+}
+
+fn first_visible_section(section_count: usize, hidden_sections: &HashSet<usize>) -> Option<usize> {
+    (0..section_count).find(|index| !hidden_sections.contains(index))
+}
+
+fn nearest_visible_section(
+    section_index: usize,
+    section_count: usize,
+    hidden_sections: &HashSet<usize>,
+) -> Option<usize> {
+    if section_index < section_count && !hidden_sections.contains(&section_index) {
+        return Some(section_index);
+    }
+    (section_index + 1..section_count)
+        .find(|index| !hidden_sections.contains(index))
+        .or_else(|| {
+            (0..section_index.min(section_count))
+                .rev()
+                .find(|index| !hidden_sections.contains(index))
+        })
 }
 
 fn active_toc_item_for_location<'a>(
@@ -3983,12 +4224,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use rebook_layout::{ReaderDefaultFont, SpreadMode};
+    use rebook_layout::{ReaderDefaultFont, ReaderTypesetting, SpreadMode};
     use rebook_publication::{
         Block, BlockStyle, FixedPageDimensions, ImageBlock, ImageStyle, Inline, Metadata,
-        PublicationId, PublicationUrl, RasterResource, Resource, Section, SectionAnchor,
-        SourceAnchor, SourceRange, SpineItem, SpineItemId, TextBlock, TextBlockKind, TextRun,
-        TextStyle, TocEntry,
+        NOTE_SECTION_PROPERTY, PublicationId, PublicationUrl, RasterResource, Resource, Section,
+        SectionAnchor, SourceAnchor, SourceRange, SpineItem, SpineItemId, TextBlock, TextBlockKind,
+        TextRun, TextStyle, TocEntry,
     };
 
     use super::*;
@@ -4313,6 +4554,109 @@ mod tests {
         }
         assert!(moved > 2);
         assert_eq!(source.parse_count(0), 1);
+    }
+
+    #[test]
+    fn unified_typesetting_omits_whole_note_sections_from_toc_and_navigation() {
+        let source = CountingSource::new(&[
+            "chapter before notes".into(),
+            "authored note definitions".into(),
+            "back matter after notes".into(),
+        ]);
+        let mut source = Arc::try_unwrap(source)
+            .ok()
+            .expect("new counting source has one owner");
+        source.book.sections[1]
+            .properties
+            .push(NOTE_SECTION_PROPERTY.into());
+        source.book.table_of_contents = source
+            .book
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(index, section)| TocEntry {
+                label: ["Chapter", "Notes", "Bibliography"][index].into(),
+                href: Some(section.href.clone()),
+                children: Vec::new(),
+            })
+            .collect();
+        let notes_href = source.book.sections[1].href.clone();
+        let source = Arc::new(source);
+
+        let mut reader = ReaderSession::open(
+            source,
+            viewport(600, 400),
+            ReaderStyle {
+                typesetting: ReaderTypesetting::unified(),
+                ..ReaderStyle::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            reader
+                .toc_items()
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Chapter", "Bibliography"]
+        );
+        assert_eq!(
+            reader
+                .go_to_section(1)
+                .unwrap()
+                .snapshot
+                .location
+                .section_index,
+            2
+        );
+        assert_eq!(
+            reader
+                .go_to_href(&notes_href)
+                .unwrap()
+                .snapshot
+                .location
+                .section_index,
+            2
+        );
+        assert_eq!(
+            reader
+                .go_to_adjacent_reading_unit(PageDirection::Previous)
+                .unwrap()
+                .snapshot
+                .location
+                .section_index,
+            0
+        );
+    }
+
+    #[test]
+    fn switching_to_unified_typesetting_relocates_an_open_note_section() {
+        let source = CountingSource::new(&[
+            "chapter before notes".into(),
+            "authored note definitions".into(),
+            "back matter after notes".into(),
+        ]);
+        let mut source = Arc::try_unwrap(source)
+            .ok()
+            .expect("new counting source has one owner");
+        source.book.sections[1]
+            .properties
+            .push(NOTE_SECTION_PROPERTY.into());
+        let mut reader =
+            ReaderSession::open(Arc::new(source), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        reader.go_to_section(1).unwrap();
+
+        let snapshot = reader
+            .set_style(ReaderStyle {
+                typesetting: ReaderTypesetting::unified(),
+                ..ReaderStyle::default()
+            })
+            .unwrap();
+
+        assert_eq!(snapshot.location.section_index, 2);
+        assert!(reader.current_page().content_top().is_some());
     }
 
     #[test]
@@ -4723,6 +5067,38 @@ mod tests {
                 .iter()
                 .any(|fragment| fragment.position == second[0].position)
         );
+    }
+
+    #[test]
+    fn cached_visible_text_fragments_skip_pages_that_are_not_compiled_yet() {
+        let source =
+            CountingSource::new(&["visible page text".into(), "not compiled page text".into()]);
+        let mut reader = ReaderSession::open(
+            source,
+            viewport(600, 400),
+            ReaderStyle {
+                spread: SpreadMode::Single,
+                ..ReaderStyle::default()
+            },
+        )
+        .unwrap();
+        let visible = reader.current_visible_text_fragments().unwrap();
+        assert!(!visible.is_empty());
+        let visible_position = visible[0].position;
+        let pending_position = ReaderPosition {
+            section_index: 1,
+            segment_index: 0,
+            page_index: 0,
+        };
+
+        assert_eq!(
+            reader.cached_visible_text_fragments_for_pages(&[visible_position, pending_position,]),
+            visible
+        );
+        assert!(!reader.cache.contains_key(&SegmentKey {
+            section_index: 1,
+            segment_index: 0,
+        }));
     }
 
     #[test]

@@ -164,6 +164,10 @@ pub(crate) struct ShortcutPreferences {
     pub(crate) focus_structure: egui::KeyboardShortcut,
     #[serde(default = "default_focus_footnotes_shortcut")]
     pub(crate) focus_footnotes: egui::KeyboardShortcut,
+    #[serde(default = "default_focus_extend_selection_previous_shortcut")]
+    pub(crate) focus_extend_selection_previous: egui::KeyboardShortcut,
+    #[serde(default = "default_focus_extend_selection_next_shortcut")]
+    pub(crate) focus_extend_selection_next: egui::KeyboardShortcut,
 }
 
 impl ShortcutPreferences {
@@ -181,7 +185,7 @@ impl ShortcutPreferences {
             .any(|binding| shortcut_chord_key_count(binding.modifiers) > MAX_SHORTCUT_KEYS)
     }
 
-    fn bindings(&self) -> [egui::KeyboardShortcut; 13] {
+    fn bindings(&self) -> [egui::KeyboardShortcut; 15] {
         [
             self.fullscreen,
             self.toggle_left_sidebar,
@@ -196,6 +200,8 @@ impl ShortcutPreferences {
             self.focus_note,
             self.focus_structure,
             self.focus_footnotes,
+            self.focus_extend_selection_previous,
+            self.focus_extend_selection_next,
         ]
     }
 }
@@ -232,6 +238,8 @@ impl Default for ShortcutPreferences {
             focus_note: default_focus_note_shortcut(),
             focus_structure: default_focus_structure_shortcut(),
             focus_footnotes: default_focus_footnotes_shortcut(),
+            focus_extend_selection_previous: default_focus_extend_selection_previous_shortcut(),
+            focus_extend_selection_next: default_focus_extend_selection_next_shortcut(),
         }
     }
 }
@@ -286,6 +294,14 @@ const fn default_focus_structure_shortcut() -> egui::KeyboardShortcut {
 
 const fn default_focus_footnotes_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::AltLeft)
+}
+
+const fn default_focus_extend_selection_previous_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
+}
+
+const fn default_focus_extend_selection_next_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -646,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_shortcuts_gain_search_and_copy_defaults() {
+    fn legacy_shortcuts_gain_new_action_defaults() {
         let json = r#"{"version":1,"shortcuts":{}}"#;
         let stored: StoredReaderPreferences = serde_json::from_str(json).unwrap();
 
@@ -657,6 +673,14 @@ mod tests {
         assert_eq!(
             stored.shortcuts.copy,
             egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C)
+        );
+        assert_eq!(
+            stored.shortcuts.focus_extend_selection_previous,
+            egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
+        );
+        assert_eq!(
+            stored.shortcuts.focus_extend_selection_next,
+            egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
         );
     }
 
@@ -731,6 +755,14 @@ mod tests {
         assert_eq!(
             shortcuts.focus_structure,
             egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num3)
+        );
+        assert_eq!(
+            shortcuts.focus_extend_selection_previous,
+            egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
+        );
+        assert_eq!(
+            shortcuts.focus_extend_selection_next,
+            egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
         );
         assert!(!shortcuts.has_conflicts());
 

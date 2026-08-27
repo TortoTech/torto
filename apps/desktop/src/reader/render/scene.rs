@@ -64,6 +64,13 @@ pub(crate) struct ReaderScene {
     pub(crate) refresh_image_atlas: bool,
 }
 
+const fn focus_unit_activation_visible(
+    has_selection: bool,
+    has_focus_selection_anchor: bool,
+) -> bool {
+    !(has_selection && has_focus_selection_anchor)
+}
+
 impl ReaderScene {
     fn new(scene: Scene, images: Arc<[ImageData]>) -> Self {
         // Vello's persistent image atlas must be refreshed whenever a rendered
@@ -148,6 +155,10 @@ impl DesktopReader {
         let visible_bottom = viewport.offset_y + viewport.size.y;
         let mut scene = Scene::new();
         if self.is_focus_mode()
+            && focus_unit_activation_visible(
+                self.selection.is_some(),
+                self.focus_selection_anchor.is_some(),
+            )
             && let Some(rect) = self
                 .focus_units
                 .get(self.focus_unit_index)
@@ -334,9 +345,13 @@ impl DesktopReader {
             .is_focus_mode()
             .then(|| self.focus_units.get(self.focus_unit_index))
             .flatten();
-        if let Some(unit) =
-            focus_unit.filter(|unit| unit.rectangular_activation && !self.is_scroll_mode())
-        {
+        let activation_visible = focus_unit_activation_visible(
+            self.selection.is_some(),
+            self.focus_selection_anchor.is_some(),
+        );
+        if let Some(unit) = focus_unit.filter(|unit| {
+            activation_visible && unit.rectangular_activation && !self.is_scroll_mode()
+        }) {
             page.paint_source_block_background(
                 scene,
                 &unit.paint_ranges,
@@ -364,6 +379,7 @@ impl DesktopReader {
             page.paint_source_ranges(scene, &selection.ranges, TEXT_SELECTION_COLOR, offset_x);
         }
         if let Some(unit) = focus_unit
+            && activation_visible
             && !unit.is_table
             && !unit.rectangular_activation
         {
@@ -378,6 +394,10 @@ impl DesktopReader {
         offset_x: f32,
     ) {
         if self.is_focus_mode()
+            && focus_unit_activation_visible(
+                self.selection.is_some(),
+                self.focus_selection_anchor.is_some(),
+            )
             && let Some(unit) = self
                 .focus_units
                 .get(self.focus_unit_index)
@@ -423,6 +443,14 @@ mod tests {
     fn structured_focus_cards_reuse_the_text_highlight_fill() {
         assert_eq!(focus_unit_activation_color(true), TEXT_SELECTION_COLOR);
         assert_ne!(focus_unit_activation_color(false), TEXT_SELECTION_COLOR);
+    }
+
+    #[test]
+    fn semantic_multi_selection_suppresses_the_duplicate_focus_fill() {
+        assert!(focus_unit_activation_visible(false, false));
+        assert!(focus_unit_activation_visible(true, false));
+        assert!(focus_unit_activation_visible(false, true));
+        assert!(!focus_unit_activation_visible(true, true));
     }
 
     #[test]

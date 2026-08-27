@@ -61,9 +61,15 @@ pub struct PageDisplayList {
     background: Color,
     commands: Vec<DisplayCommand>,
     text_regions: Vec<TextRegion>,
+    inline_content_regions: Vec<InlineContentRegion>,
     table_regions: Vec<TableRegion>,
     quote_regions: Vec<QuoteRegion>,
     footnote_regions: Vec<FootnoteRegion>,
+}
+
+struct InlineContentRegion {
+    bounds: Rect,
+    source: SourceRange,
 }
 
 struct TableRegion {
@@ -397,7 +403,8 @@ impl PageDisplayList {
 
     /// Resolves durable source ranges to page-coordinate highlight rectangles.
     pub fn source_rects(&self, ranges: &[SourceRange]) -> Vec<Rect> {
-        self.text_regions
+        let mut rects = self
+            .text_regions
             .iter()
             .flat_map(|region| {
                 ranges
@@ -405,7 +412,19 @@ impl PageDisplayList {
                     .filter_map(|range| region.byte_range_for_source(range))
                     .flat_map(|range| region.selection_rects(range))
             })
-            .collect()
+            .chain(
+                self.inline_content_regions
+                    .iter()
+                    .filter(|region| ranges.iter().any(|range| range == &region.source))
+                    .map(|region| region.bounds),
+            )
+            .collect::<Vec<_>>();
+        rects.sort_by(|left, right| {
+            left.y0
+                .total_cmp(&right.y0)
+                .then_with(|| left.x0.total_cmp(&right.x0))
+        });
+        rects
     }
 
     /// Resolves table cell source ranges to their complete table-chunk bounds.
@@ -836,11 +855,16 @@ struct ShapedTextRegion {
 
 impl ShapedTextRegion {
     fn visible_byte_range(&self) -> Option<Range<usize>> {
-        let first = self.layout.get(self.lines.start)?;
-        let last = self.layout.get(self.lines.end.checked_sub(1)?)?;
-        let start = first.text_range().start.max(self.source_text_start);
-        let end = last.text_range().end.min(self.text.len());
-        (end > start).then_some(start..end)
+        let mut visible = self.lines.clone().filter_map(|line_index| {
+            let line = self.layout.get(line_index)?;
+            let range = line.text_range();
+            let start = range.start.max(self.source_text_start).min(self.text.len());
+            let end = range.end.max(self.source_text_start).min(self.text.len());
+            (end > start).then_some(start..end)
+        });
+        let first = visible.next()?;
+        let end = visible.last().map_or(first.end, |range| range.end);
+        Some(first.start..end)
     }
 
     fn vertical_bounds(&self) -> Option<(f32, f32)> {
@@ -1491,6 +1515,7 @@ impl DisplayListCompiler {
             .reduce(f32::max);
         let mut commands = Vec::new();
         let mut text_regions = Vec::new();
+        let mut inline_content_regions = Vec::new();
         let mut table_regions = Vec::new();
         let mut quote_regions = Vec::new();
         let mut footnote_regions = Vec::new();
@@ -1500,7 +1525,12 @@ impl DisplayListCompiler {
                     if let Some(region) = text_region(text) {
                         text_regions.push(region);
                     }
-                    compile_text_commands(&mut commands, &mut footnote_regions, text);
+                    compile_text_commands(
+                        &mut commands,
+                        &mut inline_content_regions,
+                        &mut footnote_regions,
+                        text,
+                    );
                 }
                 PageItem::Quote(quote) => {
                     let bounds = quote_bounds(quote);
@@ -1545,6 +1575,7 @@ impl DisplayListCompiler {
                     compile_table_commands(
                         &mut commands,
                         &mut text_regions,
+                        &mut inline_content_regions,
                         &mut footnote_regions,
                         table,
                     );
@@ -1593,6 +1624,7 @@ impl DisplayListCompiler {
                             }
                             compile_text_commands(
                                 &mut commands,
+                                &mut inline_content_regions,
                                 &mut footnote_regions,
                                 &segment.text,
                             );
@@ -1624,6 +1656,7 @@ impl DisplayListCompiler {
             background: color(page.background),
             commands,
             text_regions,
+            inline_content_regions,
             table_regions,
             quote_regions,
             footnote_regions,
@@ -1664,6 +1697,7 @@ fn table_region(table: &TablePlacement) -> Option<TableRegion> {
 fn compile_table_commands(
     commands: &mut Vec<DisplayCommand>,
     text_regions: &mut Vec<TextRegion>,
+    inline_content_regions: &mut Vec<InlineContentRegion>,
     footnote_regions: &mut Vec<FootnoteRegion>,
     table: &TablePlacement,
 ) {
@@ -1685,7 +1719,7 @@ fn compile_table_commands(
             if let Some(region) = text_region(text) {
                 text_regions.push(region);
             }
-            compile_text_commands(commands, footnote_regions, text);
+            compile_text_commands(commands, inline_content_regions, footnote_regions, text);
         }
     }
     for cell in &table.cells {
@@ -1858,6 +1892,7 @@ fn fixed_text_region(image: &ImagePlacement) -> Option<TextRegion> {
 
 fn compile_text_commands(
     commands: &mut Vec<DisplayCommand>,
+    inline_content_regions: &mut Vec<InlineContentRegion>,
     footnote_regions: &mut Vec<FootnoteRegion>,
     text: &TextPlacement,
 ) {
@@ -1910,6 +1945,17 @@ fn compile_text_commands(
                     interactive: false,
                     source: None,
                 }));
+                if let Some(source) = &text.source {
+                    inline_content_regions.push(InlineContentRegion {
+                        bounds: Rect::new(
+                            f64::from(x),
+                            f64::from(y),
+                            f64::from(x + image.width),
+                            f64::from(y + image.height),
+                        ),
+                        source: source.clone(),
+                    });
+                }
                 continue;
             };
             let run = glyph_run.run();
@@ -1986,8 +2032,8 @@ mod tests {
     use parley::{Alignment, AlignmentOptions, FontContext, LayoutContext, StyleProperty};
     use rebook_layout::{
         FixedPageTextReplacementPlacement, FixedPageTextReplacementSegmentPlacement,
-        ImagePlacement, LayoutViewport, PageItem, PageLayout, QuotePlacement, RasterImage,
-        SeparatorPlacement, TextBrush, TextPlacement,
+        ImagePlacement, InlineImage, LayoutViewport, PageItem, PageLayout, QuotePlacement,
+        RasterImage, SeparatorPlacement, TextBrush, TextPlacement,
     };
 
     #[test]
@@ -2409,6 +2455,164 @@ mod tests {
         let selection = list.selection_fragment(0, 0..text.len()).unwrap();
         assert_eq!(selection.range, source);
         assert!(!list.source_rects(std::slice::from_ref(&source)).is_empty());
+    }
+
+    #[test]
+    fn trailing_inline_only_line_does_not_hide_preceding_source_text() {
+        let text: Arc<str> =
+            "Of course it is necessary that the letters be beautiful. Given a sequence".into();
+        let mut font_context = FontContext::new();
+        let mut layout_context = LayoutContext::new();
+        let mut builder =
+            layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
+        builder.push_default(StyleProperty::FontSize(18.0));
+        builder.push_default(StyleProperty::Brush(TextBrush {
+            color: Rgba::BLACK,
+            underline: false,
+            baseline: TextBaseline::Normal,
+            footnote_reference: false,
+            footnote_reference_group: 0,
+        }));
+        builder.push_inline_box(parley::InlineBox {
+            id: 1,
+            kind: parley::InlineBoxKind::InFlow,
+            index: text.len(),
+            width: 220.0,
+            height: 60.0,
+        });
+        let mut layout = builder.build(text.as_ref());
+        layout.break_all_lines(Some(160.0));
+        layout.align(Alignment::Start, AlignmentOptions::default());
+        let line_count = layout.len();
+        let trailing_range = layout
+            .get(line_count - 1)
+            .expect("inline formula line")
+            .text_range();
+        assert!(
+            trailing_range.end <= trailing_range.start,
+            "the regression needs an inline-only trailing line"
+        );
+
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "paragraph-with-formula".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "paragraph-with-formula".into(),
+                text_offset: u64::try_from(text.chars().count()).unwrap(),
+            },
+        };
+        let page = PageLayout {
+            viewport: LayoutViewport::new(320, 360).unwrap(),
+            background: Rgba::BLACK,
+            leading_gap: 0.0,
+            items: vec![PageItem::Text(TextPlacement {
+                layout: Arc::new(layout),
+                text,
+                source_text_start: 0,
+                lines: 0..line_count,
+                origin_x: 24.0,
+                origin_y: 24.0,
+                available_width: 160.0,
+                source: Some(source.clone()),
+                inline_images: Arc::from([InlineImage {
+                    id: 1,
+                    image: RasterImage {
+                        width: 1,
+                        height: 1,
+                        pixels: Arc::from([0_u8, 0, 0, 255]),
+                    },
+                    width: 220.0,
+                    height: 60.0,
+                }]),
+            })],
+        };
+        let list = DisplayListCompiler.compile(&page);
+
+        let rects = list.source_rects(std::slice::from_ref(&source));
+        assert!(!rects.is_empty());
+        assert!(
+            rects
+                .iter()
+                .any(|rect| rect.width() == 220.0 && rect.height() == 60.0),
+            "the complete semantic block should include its trailing formula"
+        );
+    }
+
+    #[test]
+    fn pure_formula_with_empty_source_span_has_selectable_geometry() {
+        let text: Arc<str> = "".into();
+        let mut font_context = FontContext::new();
+        let mut layout_context = LayoutContext::new();
+        let mut builder =
+            layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
+        builder.push_default(StyleProperty::FontSize(18.0));
+        builder.push_default(StyleProperty::Brush(TextBrush {
+            color: Rgba::BLACK,
+            underline: false,
+            baseline: TextBaseline::Normal,
+            footnote_reference: false,
+            footnote_reference_group: 0,
+        }));
+        builder.push_inline_box(parley::InlineBox {
+            id: 7,
+            kind: parley::InlineBoxKind::InFlow,
+            index: 0,
+            width: 180.0,
+            height: 44.0,
+        });
+        let mut layout = builder.build(text.as_ref());
+        layout.break_all_lines(Some(240.0));
+        layout.align(Alignment::Start, AlignmentOptions::default());
+        let line_count = layout.len();
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "formula-only".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "formula-only".into(),
+                text_offset: 0,
+            },
+        };
+        let page = PageLayout {
+            viewport: LayoutViewport::new(320, 180).unwrap(),
+            background: Rgba::BLACK,
+            leading_gap: 0.0,
+            items: vec![PageItem::Text(TextPlacement {
+                layout: Arc::new(layout),
+                text,
+                source_text_start: 0,
+                lines: 0..line_count,
+                origin_x: 24.0,
+                origin_y: 24.0,
+                available_width: 240.0,
+                source: Some(source.clone()),
+                inline_images: Arc::from([InlineImage {
+                    id: 7,
+                    image: RasterImage {
+                        width: 1,
+                        height: 1,
+                        pixels: Arc::from([0_u8, 0, 0, 255]),
+                    },
+                    width: 180.0,
+                    height: 44.0,
+                }]),
+            })],
+        };
+        let list = DisplayListCompiler.compile(&page);
+
+        let rects = list.source_rects(std::slice::from_ref(&source));
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].width(), 180.0);
+        assert_eq!(rects[0].height(), 44.0);
     }
 
     #[test]

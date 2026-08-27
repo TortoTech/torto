@@ -237,6 +237,25 @@ pub struct SpineItem {
     pub properties: Vec<String>,
 }
 
+/// Internal spine property used when a source format can identify an entire
+/// authored resource as a Notes/Endnotes section before parsing its contents.
+///
+/// Keeping this hint on the lightweight reading-order descriptor lets reader
+/// modes omit that destination without eagerly parsing a potentially large
+/// notes document. Source wrappers that clone a [`Book`] retain the semantic
+/// hint automatically.
+pub const NOTE_SECTION_PROPERTY: &str = "rebook-note-section";
+
+impl SpineItem {
+    /// Returns whether this complete reading-order resource is an authored
+    /// Notes/Endnotes section rather than ordinary prose containing local notes.
+    pub fn is_note_section(&self) -> bool {
+        self.properties
+            .iter()
+            .any(|property| property == NOTE_SECTION_PROPERTY)
+    }
+}
+
 /// Hierarchical table-of-contents entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TocEntry {

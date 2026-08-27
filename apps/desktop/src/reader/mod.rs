@@ -13,8 +13,8 @@ use rebook_publication::{
     TextBlockKind,
 };
 use rebook_reader::{
-    PageDirection, ReaderPosition, ReaderSectionPage, ReaderSelection, ReaderSession,
-    ReaderSnapshot, ReaderTextHit, SelectionGranularity,
+    PageDirection, ReaderPosition, ReaderSectionPage, ReaderSelection, ReaderSelectionRect,
+    ReaderSession, ReaderSnapshot, ReaderTextHit, SelectionGranularity,
 };
 use rebook_renderer::PageQuoteBridge;
 
@@ -521,6 +521,7 @@ pub(super) struct DesktopReader {
     classic_footnote_anchor_y: Option<f32>,
     classic_footnote_overlay_rect: Option<egui::Rect>,
     focus_unit_index: usize,
+    focus_selection_anchor: Option<usize>,
     focus_target_offset: Option<f32>,
     focus_anchor: Option<SourceAnchor>,
     focus_toc_override: Option<String>,
@@ -605,6 +606,7 @@ struct FocusUnit {
     rect: egui::Rect,
     is_image: bool,
     is_table: bool,
+    is_paragraph: bool,
     rectangular_activation: bool,
     structured_activation: bool,
     rectangular_activation_rect: Option<egui::Rect>,
@@ -1159,6 +1161,49 @@ fn focus_unit_geometry(
     bounds.zip(position)
 }
 
+const fn ordered_focus_selection_bounds(anchor: usize, focus: usize) -> (usize, usize) {
+    if anchor <= focus {
+        (anchor, focus)
+    } else {
+        (focus, anchor)
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "renderer page coordinates are GPU-bounded and selection geometry uses f32"
+)]
+fn focus_unit_selection_endpoint_rect(
+    layout: &ScrollSectionLayout,
+    unit: &FocusUnit,
+    take_last: bool,
+) -> Option<ReaderSelectionRect> {
+    let mut endpoint = None;
+    for page in &layout.pages {
+        for rect in page
+            .page
+            .source_rects(&unit.paint_ranges)
+            .into_iter()
+            .chain(page.page.image_source_rects(&unit.paint_ranges))
+            .chain(page.page.source_table_bounds(&unit.paint_ranges))
+            .chain(page.page.source_quote_bounds(&unit.paint_ranges))
+        {
+            let rect = ReaderSelectionRect {
+                position: page.position,
+                x: rect.x0 as f32,
+                y: rect.y0 as f32,
+                width: rect.width() as f32,
+                height: rect.height() as f32,
+            };
+            if !take_last {
+                return Some(rect);
+            }
+            endpoint = Some(rect);
+        }
+    }
+    endpoint
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     reason = "renderer page coordinates are GPU-bounded and egui geometry uses f32"
@@ -1545,6 +1590,11 @@ impl DesktopReader {
         reason = "focus-unit construction keeps semantic, paint, and geometry ranges synchronized"
     )]
     fn rebuild_focus_units(&mut self, layout: &ScrollSectionLayout) {
+        if self.focus_selection_anchor.take().is_some() {
+            self.selection_anchor = None;
+            self.selection = None;
+            self.selection_toolbar_visible = false;
+        }
         let Ok(section) = self.source.parse_section(layout.section_index) else {
             self.focus_units.clear();
             self.focus_unit_index = 0;
@@ -1584,120 +1634,138 @@ impl DesktopReader {
             } else {
                 None
             };
-            let (range, paint_ranges, text, is_image, is_table, rectangular_activation, list_depth) =
-                match block {
-                    Block::Text(block) => {
-                        if matches!(block.kind, TextBlockKind::Heading(_)) {
-                            active_list_root = None;
-                            if units.is_empty()
-                                && let Some(range) = block.source.clone()
-                            {
-                                leading_heading_ranges.push(range);
-                            }
-                            continue;
+            let (
+                range,
+                paint_ranges,
+                text,
+                is_image,
+                is_table,
+                is_paragraph,
+                rectangular_activation,
+                list_depth,
+            ) = match block {
+                Block::Text(block) => {
+                    if matches!(block.kind, TextBlockKind::Heading(_)) {
+                        active_list_root = None;
+                        if units.is_empty()
+                            && let Some(range) = block.source.clone()
+                        {
+                            leading_heading_ranges.push(range);
                         }
-                        let Some(range) = block.source.clone() else {
-                            // Bilingual translation companions have no canonical
-                            // source range and must not split an authored list tree.
-                            continue;
-                        };
-                        let list_depth = match block.kind {
-                            TextBlockKind::ListItem { depth, .. } => Some(depth),
-                            _ => None,
-                        };
-                        (
-                            range.clone(),
-                            vec![range],
-                            text_block_focus_text(block),
-                            false,
-                            false,
-                            block.kind == TextBlockKind::Preformatted,
-                            list_depth,
-                        )
+                        continue;
                     }
-                    Block::Quote(quote) => {
-                        let Some(range) = quote.source.clone() else {
-                            continue;
-                        };
-                        let paint_ranges = focus_block_paint_ranges(block, &range);
-                        let text = quote
-                            .body
-                            .iter()
-                            .chain(quote.attribution.iter())
-                            .map(text_block_focus_text)
-                            .filter(|text| !text.trim().is_empty())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        (range, paint_ranges, text, false, false, true, None)
-                    }
-                    Block::Table(table) => {
-                        let Some(range) = table.source.clone() else {
-                            continue;
-                        };
-                        let paint_ranges = focus_block_paint_ranges(block, &range);
-                        let text = table
-                            .rows
-                            .iter()
-                            .flat_map(|row| &row.cells)
-                            .map(|cell| text_block_focus_text(&cell.text))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        (range, paint_ranges, text, false, true, false, None)
-                    }
-                    Block::Image(image) => {
-                        // Fixed-layout PDF pages are represented as images with a text
-                        // layer; their paragraphs already supply the focus units. A
-                        // source-backed image without a text layer is an authored block
-                        // image and should occupy one step in focus navigation.
-                        if image.text_layer.is_some() {
-                            active_list_root = None;
-                            continue;
-                        }
-                        let Some(range) = image.source.clone() else {
-                            continue;
-                        };
-                        let text = if image.alt.trim().is_empty() {
-                            self.language.text("图片", "Image").to_owned()
-                        } else {
-                            image.alt.clone()
-                        };
-                        (range.clone(), vec![range], text, true, false, false, None)
-                    }
-                    Block::Figure(figure) => {
-                        let Some(range) = figure.source.clone() else {
-                            continue;
-                        };
-                        let paint_ranges = focus_block_paint_ranges(block, &range);
-                        let caption = figure
-                            .captions
-                            .iter()
-                            .map(text_block_focus_text)
-                            .filter(|text| !text.trim().is_empty())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let text = if caption.is_empty() {
-                            figure
-                                .images
-                                .iter()
-                                .map(|image| image.alt.trim())
-                                .filter(|alt| !alt.is_empty())
-                                .collect::<Vec<_>>()
-                                .join("; ")
-                        } else {
-                            caption
-                        };
-                        let text = if text.is_empty() {
-                            self.language.text("图片", "Image").to_owned()
-                        } else {
-                            text
-                        };
-                        (range, paint_ranges, text, true, false, false, None)
-                    }
-                    Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {
+                    let Some(range) = block.source.clone() else {
+                        // Bilingual translation companions have no canonical
+                        // source range and must not split an authored list tree.
+                        continue;
+                    };
+                    let list_depth = match block.kind {
+                        TextBlockKind::ListItem { depth, .. } => Some(depth),
+                        _ => None,
+                    };
+                    (
+                        range.clone(),
+                        vec![range],
+                        text_block_focus_text(block),
+                        false,
+                        false,
+                        block.kind == TextBlockKind::Paragraph,
+                        block.kind == TextBlockKind::Preformatted,
+                        list_depth,
+                    )
+                }
+                Block::Quote(quote) => {
+                    let Some(range) = quote.source.clone() else {
+                        continue;
+                    };
+                    let paint_ranges = focus_block_paint_ranges(block, &range);
+                    let text = quote
+                        .body
+                        .iter()
+                        .chain(quote.attribution.iter())
+                        .map(text_block_focus_text)
+                        .filter(|text| !text.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (range, paint_ranges, text, false, false, false, true, None)
+                }
+                Block::Table(table) => {
+                    let Some(range) = table.source.clone() else {
+                        continue;
+                    };
+                    let paint_ranges = focus_block_paint_ranges(block, &range);
+                    let text = table
+                        .rows
+                        .iter()
+                        .flat_map(|row| &row.cells)
+                        .map(|cell| text_block_focus_text(&cell.text))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (range, paint_ranges, text, false, true, false, false, None)
+                }
+                Block::Image(image) => {
+                    // Fixed-layout PDF pages are represented as images with a text
+                    // layer; their paragraphs already supply the focus units. A
+                    // source-backed image without a text layer is an authored block
+                    // image and should occupy one step in focus navigation.
+                    if image.text_layer.is_some() {
                         active_list_root = None;
                         continue;
                     }
-                };
+                    let Some(range) = image.source.clone() else {
+                        continue;
+                    };
+                    let text = if image.alt.trim().is_empty() {
+                        self.language.text("图片", "Image").to_owned()
+                    } else {
+                        image.alt.clone()
+                    };
+                    (
+                        range.clone(),
+                        vec![range],
+                        text,
+                        true,
+                        false,
+                        false,
+                        false,
+                        None,
+                    )
+                }
+                Block::Figure(figure) => {
+                    let Some(range) = figure.source.clone() else {
+                        continue;
+                    };
+                    let paint_ranges = focus_block_paint_ranges(block, &range);
+                    let caption = figure
+                        .captions
+                        .iter()
+                        .map(text_block_focus_text)
+                        .filter(|text| !text.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let text = if caption.is_empty() {
+                        figure
+                            .images
+                            .iter()
+                            .map(|image| image.alt.trim())
+                            .filter(|alt| !alt.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    } else {
+                        caption
+                    };
+                    let text = if text.is_empty() {
+                        self.language.text("图片", "Image").to_owned()
+                    } else {
+                        text
+                    };
+                    (range, paint_ranges, text, true, false, false, false, None)
+                }
+                Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {
+                    active_list_root = None;
+                    continue;
+                }
+            };
             let structured_activation = matches!(block, Block::Text(text) if text.kind == TextBlockKind::Paragraph)
                 && self
                     .structure_source
@@ -1747,6 +1815,7 @@ impl DesktopReader {
                 rect,
                 is_image,
                 is_table,
+                is_paragraph,
                 rectangular_activation,
                 structured_activation,
                 rectangular_activation_rect,
@@ -1872,17 +1941,24 @@ impl DesktopReader {
     }
 
     fn move_focus_unit(&mut self, direction: PageDirection) {
+        self.cancel_text_selection();
         match focus_navigation_destination(self.focus_units.len(), self.focus_unit_index, direction)
         {
             FocusNavigationDestination::AdjacentSection => {
                 self.go_to_adjacent_section(direction);
             }
-            FocusNavigationDestination::Unit(index) => self.select_focus_unit(index),
+            FocusNavigationDestination::Unit(index) => self.set_focus_unit(index),
         }
     }
 
     fn select_focus_unit(&mut self, index: usize) {
+        self.cancel_text_selection();
+        self.set_focus_unit(index);
+    }
+
+    fn set_focus_unit(&mut self, index: usize) {
         if index == self.focus_unit_index || index >= self.focus_units.len() {
+            self.sync_focus_selected_image();
             return;
         }
         self.ui.focus_footnotes_visible = false;
@@ -1903,6 +1979,90 @@ impl DesktopReader {
         }
         self.bump_scene_revision();
         self.persist_progress();
+    }
+
+    fn extend_focus_selection(&mut self, direction: PageDirection) {
+        let anchor = self.focus_selection_anchor.unwrap_or(self.focus_unit_index);
+        let FocusNavigationDestination::Unit(index) =
+            focus_navigation_destination(self.focus_units.len(), self.focus_unit_index, direction)
+        else {
+            return;
+        };
+        if self.focus_selection_anchor.is_none() {
+            self.cancel_text_selection();
+            self.focus_selection_anchor = Some(anchor);
+        }
+        self.set_focus_unit(index);
+        self.update_focus_semantic_selection(anchor, index);
+    }
+
+    fn update_focus_semantic_selection(&mut self, anchor: usize, focus: usize) {
+        self.annotation_note_draft = None;
+        self.selected_highlight_id = None;
+        if anchor == focus {
+            self.selection = None;
+            self.selection_toolbar_visible = false;
+            self.sync_focus_selected_image();
+            self.bump_scene_revision();
+            return;
+        }
+        let (start, end) = ordered_focus_selection_bounds(anchor, focus);
+        let Some(units) = self.focus_units.get(start..=end) else {
+            return;
+        };
+        let ranges = units
+            .iter()
+            .flat_map(|unit| unit.paint_ranges.iter().cloned())
+            .collect::<Vec<_>>();
+        let text = units
+            .iter()
+            .map(|unit| unit.clipboard_text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if ranges.is_empty() || text.is_empty() {
+            return;
+        }
+        let rects = self
+            .scroll_section
+            .as_ref()
+            .and_then(|layout| {
+                self.focus_units.get(focus).and_then(|unit| {
+                    focus_unit_selection_endpoint_rect(layout, unit, focus > anchor)
+                })
+            })
+            .into_iter()
+            .collect();
+        self.selection = Some(ReaderSelection {
+            ranges,
+            text,
+            rects,
+        });
+        self.selection_toolbar_visible = true;
+        self.selected_image = None;
+        self.bump_scene_revision();
+    }
+
+    fn focus_action_units(&self) -> &[FocusUnit] {
+        if self.selection.is_some()
+            && let Some(anchor) = self.focus_selection_anchor
+        {
+            let (start, end) = ordered_focus_selection_bounds(anchor, self.focus_unit_index);
+            return self.focus_units.get(start..=end).unwrap_or_default();
+        }
+        self.focus_units
+            .get(self.focus_unit_index..=self.focus_unit_index)
+            .unwrap_or_default()
+    }
+
+    fn focus_has_annotatable_units(&self) -> bool {
+        self.focus_action_units().iter().any(|unit| !unit.is_image)
+    }
+
+    fn focus_has_structurable_units(&self) -> bool {
+        self.focus_action_units()
+            .iter()
+            .any(|unit| unit.is_paragraph)
     }
 
     fn sync_focus_selected_image(&mut self) {
@@ -1997,7 +2157,8 @@ impl DesktopReader {
                 }
             }
         }
-        if !ready_placeholders.is_empty() {
+        let materialized_visible_pages = !ready_placeholders.is_empty();
+        if materialized_visible_pages {
             self.invalidate_page_scenes();
         }
         if materialization_pending {
@@ -2023,7 +2184,7 @@ impl DesktopReader {
                 Err(error) => self.error = Some(format!("更新滑动阅读位置失败：{error}")),
             }
         }
-        if changed
+        if (changed || materialized_visible_pages)
             && !self
                 .ui
                 .focus_scroll_motion
@@ -2879,6 +3040,7 @@ impl DesktopReader {
             classic_footnote_anchor_y: None,
             classic_footnote_overlay_rect: None,
             focus_unit_index: 0,
+            focus_selection_anchor: None,
             focus_target_offset: None,
             focus_anchor: restored_focus_anchor,
             focus_toc_override: None,
@@ -2971,9 +3133,10 @@ mod tests {
         focus_unit_geometry_ranges, focus_unit_matches_highlight_ranges,
         focus_unit_screen_center_y, focus_unit_scroll_bounds, focus_unit_target_offset_for_rect,
         legacy_translated_paragraph_range, logical_dimension, merge_focus_list_descendant,
-        merge_inferred_caption_focus_unit, resolve_book_display_metadata,
-        resolved_focus_unit_index, source_range_contains_anchor, table_block_markdown,
-        text_block_focus_footnotes, text_block_focus_text, text_block_footnote_references,
+        merge_inferred_caption_focus_unit, ordered_focus_selection_bounds,
+        resolve_book_display_metadata, resolved_focus_unit_index, source_range_contains_anchor,
+        table_block_markdown, text_block_focus_footnotes, text_block_focus_text,
+        text_block_footnote_references,
     };
     use crate::plugins::PdfOcrViewMode;
     use crate::preferences::ReadingMode;
@@ -3001,6 +3164,13 @@ mod tests {
             href: None,
             children,
         }
+    }
+
+    #[test]
+    fn focus_selection_keeps_a_stable_anchor_while_the_endpoint_reverses() {
+        assert_eq!(ordered_focus_selection_bounds(4, 7), (4, 7));
+        assert_eq!(ordered_focus_selection_bounds(4, 2), (2, 4));
+        assert_eq!(ordered_focus_selection_bounds(4, 4), (4, 4));
     }
 
     struct CountingFootnoteSource {
@@ -3723,6 +3893,7 @@ mod tests {
             rect: egui::Rect::from_min_max(egui::pos2(10.0, 10.0), egui::pos2(90.0, 80.0)),
             is_image: true,
             is_table: false,
+            is_paragraph: false,
             rectangular_activation: false,
             structured_activation: false,
             rectangular_activation_rect: None,
@@ -3737,6 +3908,7 @@ mod tests {
             rect: egui::Rect::from_min_max(egui::pos2(10.0, 84.0), egui::pos2(90.0, 104.0)),
             is_image: false,
             is_table: false,
+            is_paragraph: false,
             rectangular_activation: false,
             structured_activation: false,
             rectangular_activation_rect: None,
@@ -3896,6 +4068,7 @@ mod tests {
             rect: egui::Rect::from_min_size(egui::pos2(20.0, y), egui::vec2(400.0, 40.0)),
             is_image: false,
             is_table: false,
+            is_paragraph: false,
             rectangular_activation: false,
             structured_activation: false,
             rectangular_activation_rect: None,
@@ -3967,6 +4140,7 @@ mod tests {
             rect: egui::Rect::ZERO,
             is_image: false,
             is_table: false,
+            is_paragraph: true,
             rectangular_activation: false,
             structured_activation: false,
             rectangular_activation_rect: None,

@@ -1403,8 +1403,11 @@ impl LayoutEngine {
         );
         let should_optimize = reader_style.typesetting.line_break_strategy
             == LineBreakStrategy::Optimized
-            && block.kind == TextBlockKind::Paragraph
-            && block.style.align == TextAlignment::Justify;
+            && ((block.kind == TextBlockKind::Paragraph
+                && block.style.align == TextAlignment::Justify)
+                || (reader_style.typesetting.mode == TypesettingMode::Unified
+                    && block.kind == TextBlockKind::Caption
+                    && block.style.align == TextAlignment::Start));
         let optimized = should_optimize
             && linebreak::parley::plan_optimized(
                 &mut layout,
@@ -5459,6 +5462,13 @@ mod tests {
                 .abs()
                 < 0.01)),
             "multi-line caption should be left aligned"
+        );
+        assert!(
+            long.layout
+                .lines()
+                .take(long.layout.len().saturating_sub(1))
+                .all(|line| (line.metrics().inline_max_coord - 180.0).abs() < 0.01),
+            "multi-line caption should use optimized full-measure breaks"
         );
     }
 
