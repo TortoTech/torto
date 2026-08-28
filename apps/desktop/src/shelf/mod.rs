@@ -82,6 +82,7 @@ pub(crate) struct ShelfFeature {
     local_store: Option<SyncStore>,
     sync: SyncUiState,
     language: AppLanguage,
+    search_shortcut: egui::KeyboardShortcut,
     settings_requested: bool,
     cover_textures: HashMap<String, TextureHandle>,
     read_activity: HashMap<String, u64>,
@@ -95,6 +96,8 @@ struct ShelfState {
     error: Option<String>,
     error_dismiss_at: Option<Instant>,
     remove_confirmation: Option<ShelfRemoveConfirmation>,
+    selected_book_id: Option<String>,
+    focus_selected_book: bool,
 }
 
 struct SyncUiState {
@@ -186,6 +189,8 @@ impl ShelfFeature {
                 error: initial_error,
                 error_dismiss_at: initial_error_dismiss_at,
                 remove_confirmation: None,
+                selected_book_id: None,
+                focus_selected_book: true,
             },
             import_task: TaskSlot::default(),
             pending_reader: None,
@@ -200,6 +205,7 @@ impl ShelfFeature {
                 import_error: None,
             },
             language,
+            search_shortcut: egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F),
             settings_requested: false,
             cover_textures: HashMap::new(),
             read_activity: HashMap::new(),
@@ -342,6 +348,7 @@ impl ShelfFeature {
 
     pub(crate) fn apply_global_settings(&mut self, settings: &AppliedSettings) {
         self.language = settings.language;
+        self.search_shortcut = settings.shortcuts.search;
         self.sync.settings.clone_from(&settings.sync_settings);
         self.sync.password.clone_from(&settings.sync_password);
         self.start_sync();
@@ -352,6 +359,8 @@ impl ShelfFeature {
             self.language = language;
         }
         self.refresh_read_activity();
+        self.shelf.selected_book_id = None;
+        self.shelf.focus_selected_book = true;
         self.start_sync();
     }
 
@@ -637,6 +646,7 @@ impl ShelfFeature {
     pub(crate) fn ui(&mut self, root_ui: &mut egui::Ui) {
         let ctx = root_ui.ctx().clone();
         self.dismiss_transient_messages_if_due(&ctx);
+        let focus_search = ctx.input_mut(|input| input.consume_shortcut(&self.search_shortcut));
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -649,7 +659,11 @@ impl ShelfFeature {
                     }),
             )
             .show(root_ui, |ui| {
-                self.shelf_header(ui);
+                let search_response = self.shelf_header(ui);
+                if focus_search {
+                    search_response.request_focus();
+                    self.shelf.focus_selected_book = false;
+                }
                 ui.add_space(26.0);
 
                 let query = self.shelf.query.trim().to_lowercase();
@@ -662,6 +676,20 @@ impl ShelfFeature {
                     .cloned()
                     .collect();
                 sort_shelf_books(&mut books, &self.read_activity);
+                if search_response.changed() {
+                    self.shelf.selected_book_id = books.first().map(|book| book.id.clone());
+                    // Keep the editor active while the user continues typing. The first result
+                    // remains the logical keyboard selection and Enter opens it.
+                    self.shelf.focus_selected_book = false;
+                } else if self
+                    .shelf
+                    .selected_book_id
+                    .as_ref()
+                    .is_none_or(|selected| !books.iter().any(|book| &book.id == selected))
+                {
+                    self.shelf.selected_book_id = books.first().map(|book| book.id.clone());
+                    self.shelf.focus_selected_book = !search_response.has_focus();
+                }
                 if books.is_empty() {
                     self.empty_shelf(ui, query.is_empty());
                 } else {
@@ -669,21 +697,21 @@ impl ShelfFeature {
                         ui.set_width(
                             (ui.available_width() - SHELF_SCROLLBAR_GUTTER).max(CARD_WIDTH),
                         );
-                        self.book_grid(ui, &books);
+                        self.book_grid(ui, &books, search_response.has_focus());
                     });
                 }
             });
         self.dialogs(&ctx);
     }
 
-    fn shelf_header(&mut self, ui: &mut egui::Ui) {
+    fn shelf_header(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let book_count = self.shelf.library.books().len();
         let search_hint = shelf_search_hint(self.language, book_count);
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), 44.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                shelf_search_field(ui, &mut self.shelf.query, &search_hint);
+                let search_response = shelf_search_field(ui, &mut self.shelf.query, &search_hint);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, Icon::Settings)
                         .on_hover_text(self.language.text("设置", "Settings"))
@@ -697,8 +725,10 @@ impl ShelfFeature {
                         self.import_task.begin(());
                     }
                 });
+                search_response
             },
-        );
+        )
+        .inner
     }
 
     fn empty_shelf(&mut self, ui: &mut egui::Ui, no_books: bool) {
@@ -734,33 +764,76 @@ impl ShelfFeature {
         );
     }
 
-    fn book_grid(&mut self, ui: &mut egui::Ui, books: &[LibraryBook]) {
-        let mut columns = 1_usize;
-        let mut occupied = CARD_WIDTH;
-        while occupied + 20.0 + CARD_WIDTH <= ui.available_width() {
-            columns += 1;
-            occupied += 20.0 + CARD_WIDTH;
+    fn book_grid(&mut self, ui: &mut egui::Ui, books: &[LibraryBook], search_has_focus: bool) {
+        let columns = shelf_grid_columns(ui.available_width());
+        let selected_index = self
+            .shelf
+            .selected_book_id
+            .as_ref()
+            .and_then(|selected| books.iter().position(|book| &book.id == selected))
+            .unwrap_or(0);
+        let keyboard_action = if self.shelf.remove_confirmation.is_none() {
+            shelf_keyboard_action(ui, search_has_focus)
+        } else {
+            None
+        };
+        let mut open_path = None;
+        match keyboard_action {
+            Some(ShelfKeyboardAction::Move(direction)) => {
+                let next_index =
+                    move_shelf_selection(selected_index, books.len(), columns, direction);
+                self.shelf.selected_book_id = Some(books[next_index].id.clone());
+                self.shelf.focus_selected_book = true;
+            }
+            Some(ShelfKeyboardAction::FocusSelection) => {
+                self.shelf.focus_selected_book = true;
+            }
+            Some(ShelfKeyboardAction::Open) => {
+                open_path = Some(books[selected_index].path.clone());
+            }
+            None => {}
         }
+        let selected_id = self.shelf.selected_book_id.clone();
+        let request_selected_focus = std::mem::take(&mut self.shelf.focus_selected_book);
         egui::Grid::new("shelf-grid")
             .num_columns(columns)
             .spacing(Vec2::new(20.0, 24.0))
             .show(ui, |ui| {
                 for (index, book) in books.iter().enumerate() {
-                    self.book_card(ui, book);
+                    let selected = selected_id.as_deref() == Some(book.id.as_str());
+                    if self.book_card(ui, book, selected, selected && request_selected_focus) {
+                        self.shelf.selected_book_id = Some(book.id.clone());
+                        open_path = Some(book.path.clone());
+                    }
                     if (index + 1) % columns == 0 {
                         ui.end_row();
                     }
                 }
             });
+        if let Some(path) = open_path {
+            self.open_book(&path);
+        }
     }
 
-    fn book_card(&mut self, ui: &mut egui::Ui, book: &LibraryBook) {
+    fn book_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        book: &LibraryBook,
+        selected: bool,
+        request_focus: bool,
+    ) -> bool {
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(CARD_WIDTH, CARD_HEIGHT), egui::Sense::click());
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if request_focus {
+            response.request_focus();
+            response.scroll_to_me(None);
+        }
         let texture = self.cover_texture(ui.ctx(), book);
         let painter = ui.painter();
-        if response.hovered() {
+        if selected {
+            painter.rect_filled(rect, 10.0, palette().accent_soft.gamma_multiply(0.65));
+        } else if response.hovered() {
             painter.rect_filled(rect, 10.0, palette().accent_soft.gamma_multiply(0.42));
         }
         let cover_rect = egui::Rect::from_min_size(
@@ -802,9 +875,7 @@ impl ShelfFeature {
             palette().text,
         );
 
-        if response.clicked() {
-            self.open_book(&book.path);
-        }
+        let clicked = response.clicked();
         response.context_menu(|ui| {
             if ui
                 .button(self.language.text("从书架移除", "Remove from library"))
@@ -818,6 +889,7 @@ impl ShelfFeature {
             }
         });
         response.on_hover_text(&book.title);
+        clicked
     }
 
     fn cover_texture(&mut self, ctx: &egui::Context, book: &LibraryBook) -> Option<TextureHandle> {
@@ -982,7 +1054,78 @@ fn single_line_card_text_job(
     job
 }
 
-fn shelf_search_field(ui: &mut egui::Ui, query: &mut String, hint: &str) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShelfSelectionDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShelfKeyboardAction {
+    Move(ShelfSelectionDirection),
+    FocusSelection,
+    Open,
+}
+
+fn shelf_grid_columns(available_width: f32) -> usize {
+    let mut columns = 1_usize;
+    let mut occupied = CARD_WIDTH;
+    while occupied + 20.0 + CARD_WIDTH <= available_width {
+        columns += 1;
+        occupied += 20.0 + CARD_WIDTH;
+    }
+    columns
+}
+
+fn shelf_keyboard_action(ui: &mut egui::Ui, search_has_focus: bool) -> Option<ShelfKeyboardAction> {
+    ui.input_mut(|input| {
+        if search_has_focus {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                return Some(ShelfKeyboardAction::FocusSelection);
+            }
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                return Some(ShelfKeyboardAction::Open);
+            }
+            return None;
+        }
+        if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+            Some(ShelfKeyboardAction::Move(ShelfSelectionDirection::Left))
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+            Some(ShelfKeyboardAction::Move(ShelfSelectionDirection::Right))
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+            Some(ShelfKeyboardAction::Move(ShelfSelectionDirection::Up))
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+            Some(ShelfKeyboardAction::Move(ShelfSelectionDirection::Down))
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+            Some(ShelfKeyboardAction::Open)
+        } else {
+            None
+        }
+    })
+}
+
+fn move_shelf_selection(
+    current: usize,
+    book_count: usize,
+    columns: usize,
+    direction: ShelfSelectionDirection,
+) -> usize {
+    if book_count == 0 {
+        return 0;
+    }
+    let current = current.min(book_count - 1);
+    let columns = columns.max(1);
+    match direction {
+        ShelfSelectionDirection::Left => current.saturating_sub(1),
+        ShelfSelectionDirection::Right => (current + 1).min(book_count - 1),
+        ShelfSelectionDirection::Up => current.saturating_sub(columns),
+        ShelfSelectionDirection::Down => (current + columns).min(book_count - 1),
+    }
+}
+
+fn shelf_search_field(ui: &mut egui::Ui, query: &mut String, hint: &str) -> egui::Response {
     let width = ui.available_width().clamp(180.0, 320.0);
     egui::Frame::new()
         .fill(palette().surface)
@@ -999,9 +1142,11 @@ fn shelf_search_field(ui: &mut egui::Ui, query: &mut String, hint: &str) {
                         .desired_width(ui.available_width())
                         .frame(egui::Frame::NONE)
                         .vertical_align(egui::Align::Center),
-                );
-            });
-        });
+                )
+            })
+            .inner
+        })
+        .inner
 }
 
 fn shelf_import_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -1218,6 +1363,42 @@ mod tests {
         assert_eq!(
             shelf_search_hint(AppLanguage::English, 27),
             "Search titles or authors in 27 books"
+        );
+    }
+
+    #[test]
+    fn shelf_selection_moves_within_the_current_grid() {
+        assert_eq!(
+            move_shelf_selection(0, 8, 3, ShelfSelectionDirection::Right),
+            1
+        );
+        assert_eq!(
+            move_shelf_selection(1, 8, 3, ShelfSelectionDirection::Down),
+            4
+        );
+        assert_eq!(
+            move_shelf_selection(4, 8, 3, ShelfSelectionDirection::Up),
+            1
+        );
+        assert_eq!(
+            move_shelf_selection(1, 8, 3, ShelfSelectionDirection::Left),
+            0
+        );
+    }
+
+    #[test]
+    fn shelf_selection_stays_inside_partial_last_rows() {
+        assert_eq!(
+            move_shelf_selection(5, 8, 3, ShelfSelectionDirection::Down),
+            7
+        );
+        assert_eq!(
+            move_shelf_selection(7, 8, 3, ShelfSelectionDirection::Right),
+            7
+        );
+        assert_eq!(
+            move_shelf_selection(0, 8, 3, ShelfSelectionDirection::Up),
+            0
         );
     }
 }
