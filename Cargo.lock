@@ -3806,7 +3806,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-desktop"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyrender",
  "atomicwrites",
@@ -3851,6 +3851,7 @@ dependencies = [
  "sys-locale",
  "tokio",
  "tracing",
+ "unicode-segmentation",
  "uuid",
  "vello",
  "wgpu",
@@ -3861,7 +3862,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-formats"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64",
  "crc32fast",
@@ -3883,7 +3884,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-html"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "rebook-publication",
  "roxmltree 0.21.1",
@@ -3892,7 +3893,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-inspect"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "rebook-formats",
  "rebook-publication",
@@ -3903,7 +3904,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-layout"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "icu_segmenter",
  "image",
@@ -3919,7 +3920,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-macos-open-file"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
@@ -3928,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-math"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ratex-layout",
  "ratex-parser",
@@ -3938,7 +3939,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-publication"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "percent-encoding",
  "serde",
@@ -3947,7 +3948,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-reader"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "rebook-layout",
  "rebook-publication",
@@ -3958,7 +3959,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-renderer"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyrender",
  "kurbo",
@@ -3970,7 +3971,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-windows-window-background"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "windows-sys 0.61.2",
 ]

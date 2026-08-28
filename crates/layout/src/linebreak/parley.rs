@@ -15,16 +15,26 @@ const MIXED_SCRIPT_SHRINK_EM: f32 = 0.125;
 
 /// A spacing delta applied to every shaped cluster in this byte range.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SpacingAdjustment {
+pub struct SpacingAdjustment {
     pub range: Range<usize>,
     pub amount: f32,
 }
 
 /// Breakpoints and range styles needed to reproduce an optimized paragraph.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ParagraphPlan {
+pub struct ParagraphPlan {
     pub lines: Vec<LineBreak>,
     pub adjustments: Vec<SpacingAdjustment>,
+}
+
+/// One renderer-shaped text cluster supplied to the shared paragraph optimizer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeasuredCluster {
+    pub range: Range<usize>,
+    pub advance: f32,
+    pub em: f32,
+    pub ordinary_baseline: bool,
+    pub footnote_reference: bool,
 }
 
 /// Reads exact shaped-cluster metrics, maps ICU4X UAX #14 boundaries onto
@@ -52,9 +62,6 @@ pub(crate) fn plan_optimized(
     if layout.len() != 1 {
         return None;
     }
-    let legal_breaks = LineSegmenter::new_auto(LineBreakOptions::default())
-        .segment_str(text)
-        .collect::<Vec<_>>();
     let line = layout.get(0)?;
     let mut clusters = Vec::new();
     for run in line.runs() {
@@ -67,30 +74,69 @@ pub(crate) fn plan_optimized(
                 return None;
             }
             let range = cluster.text_range();
-            let source = text.get(range.clone())?;
-            let mut characters = source.chars();
-            let first = characters.next()?;
-            let last = characters.last().unwrap_or(first);
             let brush = cluster.first_style().brush;
-            clusters.push(ShapedCluster {
+            clusters.push(MeasuredCluster {
                 range,
                 advance: cluster.advance(),
                 em,
-                first,
-                last,
-                is_space: cluster.is_space_or_nbsp(),
-                is_breakable_space: source.chars().all(is_breakable_space),
-                break_after: false,
                 ordinary_baseline: brush.baseline == TextBaseline::Normal,
                 footnote_reference: brush.footnote_reference,
             });
         }
     }
-    if clusters.is_empty() {
+
+    plan_measured_text(text, &clusters, column_width, first_line_indent, default_em)
+}
+
+/// Applies the same Unicode-aware Knuth--Plass paragraph optimization used by
+/// the reader to clusters measured by another renderer.
+#[must_use]
+pub fn plan_measured_text(
+    text: &str,
+    measured: &[MeasuredCluster],
+    column_width: f32,
+    first_line_indent: f32,
+    default_em: f32,
+) -> Option<ParagraphPlan> {
+    if text.is_empty()
+        || measured.is_empty()
+        || !column_width.is_finite()
+        || column_width <= 0.0
+        || !default_em.is_finite()
+        || default_em <= 0.0
+        || !is_supported_ltr_prose(text)
+    {
         return None;
     }
-    for cluster in &mut clusters {
-        cluster.break_after = legal_breaks.binary_search(&cluster.range.end).is_ok();
+    let legal_breaks = LineSegmenter::new_auto(LineBreakOptions::default())
+        .segment_str(text)
+        .collect::<Vec<_>>();
+    let mut expected_start = 0;
+    let mut clusters = Vec::with_capacity(measured.len());
+    for cluster in measured {
+        if cluster.range.start != expected_start || cluster.range.end <= cluster.range.start {
+            return None;
+        }
+        let source = text.get(cluster.range.clone())?;
+        let mut characters = source.chars();
+        let first = characters.next()?;
+        let last = characters.last().unwrap_or(first);
+        clusters.push(ShapedCluster {
+            range: cluster.range.clone(),
+            advance: cluster.advance,
+            em: cluster.em,
+            first,
+            last,
+            is_space: source.chars().all(|character| character.is_whitespace()),
+            is_breakable_space: source.chars().all(is_breakable_space),
+            break_after: legal_breaks.binary_search(&cluster.range.end).is_ok(),
+            ordinary_baseline: cluster.ordinary_baseline,
+            footnote_reference: cluster.footnote_reference,
+        });
+        expected_start = cluster.range.end;
+    }
+    if expected_start != text.len() {
+        return None;
     }
     clusters.last_mut()?.break_after = true;
 

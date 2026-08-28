@@ -48,6 +48,14 @@ const SEARCH_MARK_COLOR: Color = Color::from_rgba8(250, 204, 21, 89);
 const ASSISTANT_MARK_COLOR: Color = Color::from_rgba8(245, 158, 11, 56);
 const FOCUS_MINIMUM_PARAGRAPH_GAP: f32 = 12.0;
 const FOCUS_TABLE_BOTTOM_MARGIN: f32 = 24.0;
+
+const fn resolved_focus_cursor_hidden(default_hidden: bool, override_hidden: Option<bool>) -> bool {
+    match override_hidden {
+        Some(hidden) => hidden,
+        None => default_hidden,
+    }
+}
+
 static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CHAT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -320,6 +328,7 @@ pub(super) fn open_reader(
             plugin_settings,
             language: reader_preferences.language,
             reading_mode,
+            hide_cursor_in_focus_mode: reader_preferences.hide_cursor_in_focus_mode,
             selection_granularity: reader_preferences.selection_granularity,
             shortcuts: reader_preferences.shortcuts,
             sync_settings,
@@ -494,6 +503,8 @@ pub(super) struct DesktopReader {
     plugin_settings: PluginSettings,
     language: AppLanguage,
     reading_mode: ReadingMode,
+    hide_cursor_in_focus_mode: bool,
+    focus_cursor_hidden_override: Option<bool>,
     shortcuts: ShortcutPreferences,
     sync_settings: SyncSettings,
     sync_password: String,
@@ -2285,6 +2296,7 @@ struct DesktopReaderResources {
     plugin_settings: PluginSettings,
     language: AppLanguage,
     reading_mode: ReadingMode,
+    hide_cursor_in_focus_mode: bool,
     selection_granularity: SelectionGranularity,
     shortcuts: ShortcutPreferences,
     sync_settings: SyncSettings,
@@ -2765,6 +2777,8 @@ struct ReaderUiState {
     last_wheel_turn: Option<Instant>,
     expanded_toc: HashSet<String>,
     last_auto_scrolled_toc: Option<String>,
+    toc_keyboard_row: Option<usize>,
+    last_auto_scrolled_toc_keyboard_row: Option<usize>,
     focus_actions_visible: bool,
     focus_footnotes_visible: bool,
     focus_footnote_scroll_delta: f32,
@@ -2883,6 +2897,7 @@ impl DesktopReader {
             plugin_settings,
             language,
             reading_mode,
+            hide_cursor_in_focus_mode,
             selection_granularity,
             shortcuts,
             sync_settings,
@@ -3016,6 +3031,8 @@ impl DesktopReader {
                 last_wheel_turn: None,
                 expanded_toc,
                 last_auto_scrolled_toc: None,
+                toc_keyboard_row: None,
+                last_auto_scrolled_toc_keyboard_row: None,
                 focus_actions_visible: false,
                 focus_footnotes_visible: false,
                 focus_footnote_scroll_delta: 0.0,
@@ -3023,6 +3040,8 @@ impl DesktopReader {
             plugin_settings,
             language,
             reading_mode,
+            hide_cursor_in_focus_mode,
+            focus_cursor_hidden_override: None,
             shortcuts,
             sync_settings,
             sync_password,
@@ -4360,6 +4379,8 @@ mod tests {
             last_wheel_turn: None,
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
+            toc_keyboard_row: None,
+            last_auto_scrolled_toc_keyboard_row: None,
             focus_actions_visible: false,
             focus_footnotes_visible: false,
             focus_footnote_scroll_delta: 0.0,
@@ -4398,6 +4419,8 @@ mod tests {
             last_wheel_turn: None,
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
+            toc_keyboard_row: None,
+            last_auto_scrolled_toc_keyboard_row: None,
             focus_actions_visible: false,
             focus_footnotes_visible: false,
             focus_footnote_scroll_delta: 0.0,

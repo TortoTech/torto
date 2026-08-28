@@ -264,18 +264,55 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     shortcut_group(
         ui,
         state,
+        "system-shortcuts-grid",
+        language.text("系统", "System"),
+        &[
+            (
+                ShortcutAction::ToggleCursor,
+                language.text("鼠标开关", "Toggle cursor"),
+            ),
+            (
+                ShortcutAction::ImportBooks,
+                language.text("导入书籍", "Import books"),
+            ),
+            (
+                ShortcutAction::OpenSettings,
+                language.text("打开设置", "Open settings"),
+            ),
+            (
+                ShortcutAction::ReturnToShelf,
+                language.text("返回书架", "Back to library"),
+            ),
+        ],
+    );
+    ui.add_space(12.0);
+    shortcut_group(
+        ui,
+        state,
         "operation-shortcuts-grid",
         language.text("操作", "Actions"),
         &[
+            (
+                ShortcutAction::PreviousPageOrParagraph,
+                language.text("上一页/段", "Previous page/paragraph"),
+            ),
+            (
+                ShortcutAction::NextPageOrParagraph,
+                language.text("下一页/段", "Next page/paragraph"),
+            ),
+            (
+                ShortcutAction::PreviousSection,
+                language.text("上一节", "Previous section"),
+            ),
+            (
+                ShortcutAction::NextSection,
+                language.text("下一节", "Next section"),
+            ),
             (ShortcutAction::Search, language.text("搜索", "Search")),
             (ShortcutAction::Copy, language.text("复制", "Copy")),
             (
                 ShortcutAction::ToggleTranslation,
                 language.text("翻译开关", "Toggle translation"),
-            ),
-            (
-                ShortcutAction::ReturnToShelf,
-                language.text("返回书架", "Back to library"),
             ),
         ],
     );
@@ -391,8 +428,7 @@ fn shortcut_binding_button(ui: &mut egui::Ui, state: &mut SettingsFeature, actio
         let modifiers = ui.input(|input| canonical_shortcut_modifiers(input.modifiers));
         shortcut_capture_label(ui.ctx(), state.draft_language, modifiers)
     } else {
-        ui.ctx()
-            .format_shortcut(&action.binding(&state.draft_shortcuts))
+        shortcut_display_label(ui.ctx(), action.binding(&state.draft_shortcuts))
     };
     let response = ui
         .add_sized(
@@ -422,6 +458,42 @@ fn shortcut_binding_button(ui: &mut egui::Ui, state: &mut SettingsFeature, actio
         state.capturing_shortcut = if capturing { None } else { Some(action) };
         state.error = None;
     }
+}
+
+fn shortcut_display_label(ctx: &egui::Context, shortcut: egui::KeyboardShortcut) -> String {
+    let formatted = ctx.format_shortcut(&shortcut);
+    let Some(symbol) = shortcut_key_symbol(shortcut.logical_key) else {
+        return formatted;
+    };
+    let key_name = shortcut.logical_key.name();
+    let Some(prefix) = formatted.strip_suffix(key_name) else {
+        return formatted;
+    };
+    format!("{prefix}{symbol}")
+}
+
+fn shortcut_key_symbol(key: egui::Key) -> Option<&'static str> {
+    Some(match key {
+        egui::Key::Colon => ":",
+        egui::Key::Comma => ",",
+        egui::Key::Backslash => "\\",
+        egui::Key::Slash => "/",
+        egui::Key::Pipe => "|",
+        egui::Key::Questionmark => "?",
+        egui::Key::Exclamationmark => "!",
+        egui::Key::OpenBracket => "[",
+        egui::Key::CloseBracket => "]",
+        egui::Key::OpenCurlyBracket => "{",
+        egui::Key::CloseCurlyBracket => "}",
+        egui::Key::Backtick => "`",
+        egui::Key::Minus => "-",
+        egui::Key::Period => ".",
+        egui::Key::Plus => "+",
+        egui::Key::Equals => "=",
+        egui::Key::Semicolon => ";",
+        egui::Key::Quote => "'",
+        _ => return None,
+    })
 }
 
 fn shortcut_capture_label(
@@ -725,6 +797,7 @@ fn typography_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         language,
         &mut state.draft_reading_mode,
         &mut state.draft_spread,
+        &mut state.draft_hide_cursor_in_focus_mode,
         &mut state.draft_typography,
         &mut state.draft_typesetting,
         &state.available_reader_font_families,
@@ -736,6 +809,7 @@ fn reader_font_settings(
     language: AppLanguage,
     reading_mode: &mut ReadingMode,
     spread: &mut SpreadMode,
+    hide_cursor_in_focus_mode: &mut bool,
     typography: &mut rebook_layout::ReaderTypography,
     typesetting: &mut rebook_layout::ReaderTypesetting,
     font_families: &rebook_layout::ReaderFontFamilies,
@@ -855,6 +929,14 @@ fn reader_font_settings(
                     800,
                     100,
                 );
+
+                if *reading_mode == ReadingMode::Focus {
+                    settings_row_label(ui, language.text("隐藏鼠标", "Hide cursor"));
+                    settings_row_control_sized(ui, SETTINGS_SELECT_WIDTH, |ui| {
+                        toggle_switch(ui, hide_cursor_in_focus_mode);
+                    });
+                    ui.end_row();
+                }
             });
     });
 }
@@ -2330,6 +2412,33 @@ mod tests {
                     egui::Modifiers::CTRL | egui::Modifiers::SHIFT | egui::Modifiers::ALT,
                 ),
                 "最多支持三个按键"
+            );
+        });
+    }
+
+    #[test]
+    fn shortcut_labels_show_punctuation_symbols_instead_of_english_key_names() {
+        egui::__run_test_ui(|ui| {
+            assert_eq!(
+                shortcut_display_label(
+                    ui.ctx(),
+                    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Comma),
+                ),
+                "Ctrl+,"
+            );
+            assert_eq!(
+                shortcut_display_label(
+                    ui.ctx(),
+                    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Semicolon),
+                ),
+                "Ctrl+;"
+            );
+            assert_eq!(
+                shortcut_display_label(
+                    ui.ctx(),
+                    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Quote),
+                ),
+                "Ctrl+'"
             );
         });
     }

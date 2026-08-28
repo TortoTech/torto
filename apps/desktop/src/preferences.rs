@@ -108,6 +108,7 @@ pub(crate) struct ReaderPreferences {
     pub(crate) language: AppLanguage,
     pub(crate) spread: SpreadMode,
     pub(crate) reading_mode: ReadingMode,
+    pub(crate) hide_cursor_in_focus_mode: bool,
     pub(crate) theme: AppTheme,
     pub(crate) selection_granularity: SelectionGranularity,
     pub(crate) shortcuts: ShortcutPreferences,
@@ -122,6 +123,7 @@ impl Default for ReaderPreferences {
             language: AppLanguage::default(),
             spread: SpreadMode::Single,
             reading_mode: ReadingMode::Focus,
+            hide_cursor_in_focus_mode: false,
             theme: AppTheme::default(),
             selection_granularity: SelectionGranularity::Free,
             shortcuts: ShortcutPreferences::default(),
@@ -152,6 +154,20 @@ pub(crate) struct ShortcutPreferences {
     pub(crate) copy: egui::KeyboardShortcut,
     #[serde(default = "default_return_to_shelf_shortcut")]
     pub(crate) return_to_shelf: egui::KeyboardShortcut,
+    #[serde(default = "default_toggle_cursor_shortcut")]
+    pub(crate) toggle_cursor: egui::KeyboardShortcut,
+    #[serde(default = "default_open_settings_shortcut")]
+    pub(crate) open_settings: egui::KeyboardShortcut,
+    #[serde(default = "default_import_books_shortcut")]
+    pub(crate) import_books: egui::KeyboardShortcut,
+    #[serde(default = "default_previous_section_shortcut")]
+    pub(crate) previous_section: egui::KeyboardShortcut,
+    #[serde(default = "default_next_section_shortcut")]
+    pub(crate) next_section: egui::KeyboardShortcut,
+    #[serde(default = "default_previous_page_or_paragraph_shortcut")]
+    pub(crate) previous_page_or_paragraph: egui::KeyboardShortcut,
+    #[serde(default = "default_next_page_or_paragraph_shortcut")]
+    pub(crate) next_page_or_paragraph: egui::KeyboardShortcut,
     #[serde(default = "default_focus_actions_shortcut")]
     pub(crate) focus_actions: egui::KeyboardShortcut,
     #[serde(default = "default_focus_chat_shortcut")]
@@ -185,7 +201,7 @@ impl ShortcutPreferences {
             .any(|binding| shortcut_chord_key_count(binding.modifiers) > MAX_SHORTCUT_KEYS)
     }
 
-    fn bindings(&self) -> [egui::KeyboardShortcut; 15] {
+    fn bindings(&self) -> [egui::KeyboardShortcut; 22] {
         [
             self.fullscreen,
             self.toggle_left_sidebar,
@@ -194,6 +210,13 @@ impl ShortcutPreferences {
             self.search,
             self.copy,
             self.return_to_shelf,
+            self.toggle_cursor,
+            self.open_settings,
+            self.import_books,
+            self.previous_section,
+            self.next_section,
+            self.previous_page_or_paragraph,
+            self.next_page_or_paragraph,
             self.focus_actions,
             self.focus_chat,
             self.focus_highlight,
@@ -232,6 +255,13 @@ impl Default for ShortcutPreferences {
             search: default_search_shortcut(),
             copy: default_copy_shortcut(),
             return_to_shelf: default_return_to_shelf_shortcut(),
+            toggle_cursor: default_toggle_cursor_shortcut(),
+            open_settings: default_open_settings_shortcut(),
+            import_books: default_import_books_shortcut(),
+            previous_section: default_previous_section_shortcut(),
+            next_section: default_next_section_shortcut(),
+            previous_page_or_paragraph: default_previous_page_or_paragraph_shortcut(),
+            next_page_or_paragraph: default_next_page_or_paragraph_shortcut(),
             focus_actions: default_focus_actions_shortcut(),
             focus_chat: default_focus_chat_shortcut(),
             focus_highlight: default_focus_highlight_shortcut(),
@@ -270,6 +300,34 @@ const fn default_copy_shortcut() -> egui::KeyboardShortcut {
 
 const fn default_return_to_shelf_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Q)
+}
+
+const fn default_toggle_cursor_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::H)
+}
+
+const fn default_open_settings_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Comma)
+}
+
+const fn default_import_books_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::O)
+}
+
+const fn default_previous_section_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+}
+
+const fn default_next_section_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowRight)
+}
+
+const fn default_previous_page_or_paragraph_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowUp)
+}
+
+const fn default_next_page_or_paragraph_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowDown)
 }
 
 const fn default_focus_actions_shortcut() -> egui::KeyboardShortcut {
@@ -349,6 +407,8 @@ struct StoredReaderPreferences {
     spread: StoredSpreadMode,
     #[serde(default)]
     reading_mode: StoredReadingMode,
+    #[serde(default)]
+    hide_cursor_in_focus_mode: bool,
     #[serde(default)]
     selection_granularity: StoredSelectionGranularity,
     #[serde(default)]
@@ -524,6 +584,7 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
         language: stored.language,
         spread: stored.spread.into(),
         reading_mode: stored.reading_mode.into(),
+        hide_cursor_in_focus_mode: stored.hide_cursor_in_focus_mode,
         theme: stored.theme.into(),
         selection_granularity: stored.selection_granularity.into(),
         shortcuts: stored.shortcuts,
@@ -561,6 +622,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
         language: preferences.language,
         spread: preferences.spread.into(),
         reading_mode: preferences.reading_mode.into(),
+        hide_cursor_in_focus_mode: preferences.hide_cursor_in_focus_mode,
         theme: preferences.theme.into(),
         selection_granularity: preferences.selection_granularity.into(),
         shortcuts: preferences.shortcuts.clone(),
@@ -603,6 +665,7 @@ mod tests {
             language: AppLanguage::English,
             spread: SpreadMode::Single,
             reading_mode: ReadingMode::Focus,
+            hide_cursor_in_focus_mode: true,
             theme: AppTheme::Dark,
             selection_granularity: SelectionGranularity::Sentence,
             shortcuts: ShortcutPreferences {
@@ -632,6 +695,7 @@ mod tests {
         assert_eq!(loaded.language, AppLanguage::English);
         assert_eq!(loaded.spread, SpreadMode::Single);
         assert_eq!(loaded.reading_mode, ReadingMode::Focus);
+        assert!(loaded.hide_cursor_in_focus_mode);
         assert_eq!(loaded.theme, AppTheme::Dark);
         assert_eq!(loaded.selection_granularity, SelectionGranularity::Sentence);
         assert_eq!(
@@ -653,6 +717,7 @@ mod tests {
         assert_eq!(stored.typesetting.mode, TypesettingMode::Unified);
         assert!(matches!(stored.spread, StoredSpreadMode::Single));
         assert!(matches!(stored.reading_mode, StoredReadingMode::Focus));
+        assert!(!stored.hide_cursor_in_focus_mode);
         assert!(matches!(stored.theme, StoredAppTheme::System));
         assert!(matches!(
             stored.selection_granularity,
@@ -673,6 +738,34 @@ mod tests {
         assert_eq!(
             stored.shortcuts.copy,
             egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C)
+        );
+        assert_eq!(
+            stored.shortcuts.toggle_cursor,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::H)
+        );
+        assert_eq!(
+            stored.shortcuts.open_settings,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Comma)
+        );
+        assert_eq!(
+            stored.shortcuts.import_books,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::O)
+        );
+        assert_eq!(
+            stored.shortcuts.previous_section,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+        );
+        assert_eq!(
+            stored.shortcuts.next_section,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowRight)
+        );
+        assert_eq!(
+            stored.shortcuts.previous_page_or_paragraph,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowUp)
+        );
+        assert_eq!(
+            stored.shortcuts.next_page_or_paragraph,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowDown)
         );
         assert_eq!(
             stored.shortcuts.focus_extend_selection_previous,
@@ -747,6 +840,34 @@ mod tests {
         assert_eq!(
             shortcuts.return_to_shelf,
             egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Q)
+        );
+        assert_eq!(
+            shortcuts.toggle_cursor,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::H)
+        );
+        assert_eq!(
+            shortcuts.open_settings,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Comma)
+        );
+        assert_eq!(
+            shortcuts.import_books,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::O)
+        );
+        assert_eq!(
+            shortcuts.previous_section,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+        );
+        assert_eq!(
+            shortcuts.next_section,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowRight)
+        );
+        assert_eq!(
+            shortcuts.previous_page_or_paragraph,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowUp)
+        );
+        assert_eq!(
+            shortcuts.next_page_or_paragraph,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowDown)
         );
         assert_eq!(
             shortcuts.focus_footnotes,

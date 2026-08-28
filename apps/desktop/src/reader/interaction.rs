@@ -383,6 +383,10 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn set_sidebar_tab(&mut self, tab: SidebarTab) {
+        if self.ui.sidebar_tab != tab {
+            self.ui.toc_keyboard_row = None;
+            self.ui.last_auto_scrolled_toc_keyboard_row = None;
+        }
         self.ui.sidebar_tab = tab;
     }
 

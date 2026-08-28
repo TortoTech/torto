@@ -41,6 +41,17 @@ impl DesktopReader {
         self.settings_change_requested.take()
     }
 
+    pub(in crate::reader) fn toggle_focus_cursor_visibility(&mut self) {
+        if !self.is_focus_mode() {
+            return;
+        }
+        let hidden = super::resolved_focus_cursor_hidden(
+            self.hide_cursor_in_focus_mode,
+            self.focus_cursor_hidden_override,
+        );
+        self.focus_cursor_hidden_override = Some(!hidden);
+    }
+
     pub(crate) fn report_settings_error(&mut self, error: String) {
         self.error = Some(error);
     }
@@ -148,6 +159,10 @@ impl DesktopReader {
             Ok(snapshot) => {
                 self.plugin_settings = plugin_settings;
                 self.language = language;
+                if self.hide_cursor_in_focus_mode != settings.hide_cursor_in_focus_mode {
+                    self.focus_cursor_hidden_override = None;
+                }
+                self.hide_cursor_in_focus_mode = settings.hide_cursor_in_focus_mode;
                 self.shortcuts.clone_from(&settings.shortcuts);
                 if mode_changed {
                     self.ui.focus_footnotes_visible = false;

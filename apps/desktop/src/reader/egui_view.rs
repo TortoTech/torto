@@ -1,9 +1,12 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, Pos2, Rect, RichText, TextureId, Vec2};
+use rebook_layout::linebreak::{MeasuredCluster, SpacingAdjustment, plan_measured_text};
 use rebook_layout::{SpreadMode, reading_content_left, reading_content_width};
 use rebook_reader::{PageDirection, ReaderImage, SelectionGranularity};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, chat_reference_token, move_suggestion_index,
@@ -57,6 +60,209 @@ const IMAGE_PREVIEW_MAX_ZOOM: f32 = 8.0;
 const IMAGE_PREVIEW_WHEEL_SPEED: f32 = 0.0025;
 const IMAGE_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
 const IMAGE_LONG_PRESS_MAX_TRAVEL: f32 = 8.0;
+
+struct FootnoteTextLayout {
+    lines: Vec<FootnoteTextLine>,
+    height: f32,
+}
+
+struct FootnoteTextLine {
+    runs: Vec<FootnoteTextRun>,
+    height: f32,
+}
+
+struct FootnoteTextRun {
+    x: f32,
+    galley: Arc<egui::Galley>,
+}
+
+fn footnote_cluster_spacing(
+    adjustments: &[SpacingAdjustment],
+    range: &std::ops::Range<usize>,
+) -> f32 {
+    adjustments
+        .iter()
+        .find(|adjustment| {
+            adjustment.range.start <= range.start && adjustment.range.end >= range.end
+        })
+        .map_or(0.0, |adjustment| adjustment.amount)
+}
+
+fn optimized_footnote_text_layout(
+    ctx: &egui::Context,
+    text: &str,
+    font: &egui::FontId,
+    color: Color32,
+    width: f32,
+) -> FootnoteTextLayout {
+    ctx.fonts_mut(|fonts| {
+        let graphemes = text
+            .grapheme_indices(true)
+            .map(|(start, grapheme)| {
+                let range = start..start + grapheme.len();
+                let advance = fonts
+                    .layout_no_wrap(grapheme.to_owned(), font.clone(), color)
+                    .size()
+                    .x;
+                MeasuredCluster {
+                    range,
+                    advance,
+                    em: font.size,
+                    ordinary_baseline: true,
+                    footnote_reference: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        let Some(plan) = plan_measured_text(text, &graphemes, width, 0.0, font.size) else {
+            let galley = fonts.layout(text.to_owned(), font.clone(), color, width);
+            return FootnoteTextLayout {
+                height: galley.size().y,
+                lines: vec![FootnoteTextLine {
+                    height: galley.size().y,
+                    runs: vec![FootnoteTextRun { x: 0.0, galley }],
+                }],
+            };
+        };
+
+        let mut lines = Vec::with_capacity(plan.lines.len());
+        let mut cluster_start = 0;
+        for (line_index, line) in plan.lines.iter().enumerate() {
+            let cluster_end = cluster_start
+                + usize::try_from(line.cluster_count).unwrap_or(graphemes.len() - cluster_start);
+            let cluster_end = cluster_end.min(graphemes.len());
+            let mut visible_end = cluster_end;
+            if line_index + 1 < plan.lines.len() {
+                while visible_end > cluster_start
+                    && text[graphemes[visible_end - 1].range.clone()]
+                        .chars()
+                        .all(|character| character.is_whitespace() && character != '\u{00a0}')
+                {
+                    visible_end -= 1;
+                }
+            }
+            let mut x = 0.0;
+            let mut height = 0.0_f32;
+            let mut runs = Vec::with_capacity(visible_end.saturating_sub(cluster_start));
+            for cluster in &graphemes[cluster_start..visible_end] {
+                let galley = fonts.layout_no_wrap(
+                    text[cluster.range.clone()].to_owned(),
+                    font.clone(),
+                    color,
+                );
+                height = height.max(galley.size().y);
+                runs.push(FootnoteTextRun { x, galley });
+                x += cluster.advance + footnote_cluster_spacing(&plan.adjustments, &cluster.range);
+            }
+            if !runs.is_empty() {
+                lines.push(FootnoteTextLine {
+                    runs,
+                    height: height.max(font.size),
+                });
+            }
+            cluster_start = cluster_end;
+        }
+        if lines.is_empty() {
+            let galley = fonts.layout(text.to_owned(), font.clone(), color, width);
+            return FootnoteTextLayout {
+                height: galley.size().y,
+                lines: vec![FootnoteTextLine {
+                    height: galley.size().y,
+                    runs: vec![FootnoteTextRun { x: 0.0, galley }],
+                }],
+            };
+        }
+        FootnoteTextLayout {
+            height: lines.iter().map(|line| line.height).sum(),
+            lines,
+        }
+    })
+}
+
+fn paint_footnote_text_line(ui: &mut egui::Ui, line: &FootnoteTextLine, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(1.0), line.height),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    for run in &line.runs {
+        painter.galley(
+            Pos2::new(rect.left() + run.x, rect.top()),
+            Arc::clone(&run.galley),
+            color,
+        );
+    }
+}
+
+const fn should_hide_reader_cursor(
+    is_focus_mode: bool,
+    hide_cursor_in_focus_mode: bool,
+    interaction_blocked: bool,
+) -> bool {
+    is_focus_mode && hide_cursor_in_focus_mode && !interaction_blocked
+}
+
+const fn reader_menu_close_requested(overlay: ReaderOverlay, escape_pressed: bool) -> bool {
+    matches!(overlay, ReaderOverlay::Menu) && escape_pressed
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClassicNavigationAction {
+    PreviousReadingUnit,
+    NextReadingUnit,
+    PreviousPage,
+    NextPage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TocKeyboardAction {
+    Previous,
+    Next,
+    Activate,
+}
+
+fn next_toc_keyboard_row(
+    current: Option<usize>,
+    active: Option<usize>,
+    row_count: usize,
+    direction: PageDirection,
+) -> Option<usize> {
+    if row_count == 0 {
+        return None;
+    }
+    let base = match current {
+        Some(row) if row < row_count => Some(row),
+        _ => match active {
+            Some(row) if row < row_count => Some(row),
+            _ => None,
+        },
+    };
+    Some(match direction {
+        PageDirection::Previous => base.unwrap_or(row_count).saturating_sub(1),
+        PageDirection::Next => base.map_or(0, |row| row.saturating_add(1).min(row_count - 1)),
+    })
+}
+
+const fn classic_navigation_action(
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    page_up: bool,
+    page_down: bool,
+    space: bool,
+) -> Option<ClassicNavigationAction> {
+    if left {
+        Some(ClassicNavigationAction::PreviousReadingUnit)
+    } else if right {
+        Some(ClassicNavigationAction::NextReadingUnit)
+    } else if up || page_up {
+        Some(ClassicNavigationAction::PreviousPage)
+    } else if down || page_down || space {
+        Some(ClassicNavigationAction::NextPage)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Copy)]
 struct AssistantComposerKeys {
@@ -373,6 +579,17 @@ impl DesktopReader {
         self.feedback(&ctx);
         self.pdf_toc_review(&ctx);
 
+        if should_hide_reader_cursor(
+            self.is_focus_mode(),
+            super::resolved_focus_cursor_hidden(
+                self.hide_cursor_in_focus_mode,
+                self.focus_cursor_hidden_override,
+            ),
+            interaction_blocked,
+        ) {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+
         ReaderFramePlan {
             rect: page_rect,
             scene_id: self.scene_id,
@@ -684,6 +901,12 @@ impl DesktopReader {
     }
 
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
+        let escape_pressed = self.ui.overlay == ReaderOverlay::Menu
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if reader_menu_close_requested(self.ui.overlay, escape_pressed) {
+            self.close_overlay();
+            return;
+        }
         if self.is_focus_mode()
             && self.ui.focus_footnotes_visible
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
@@ -763,6 +986,9 @@ impl DesktopReader {
                 return;
             }
         }
+        if self.toc_keyboard_shortcut(ctx, interaction_blocked) {
+            return;
+        }
         if self.operation_shortcut(ctx, interaction_blocked) {
             return;
         }
@@ -815,6 +1041,74 @@ impl DesktopReader {
         self.reading_navigation_shortcuts(ctx);
     }
 
+    fn toc_keyboard_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
+        if interaction_blocked
+            || !self.ui.sidebar_open
+            || self.ui.sidebar_tab != SidebarTab::Toc
+            || self.ui.overlay_visible()
+            || self.image_preview.is_some()
+            || self.annotation_note_draft.is_some()
+            || ctx.text_edit_focused()
+        {
+            return false;
+        }
+        let action = ctx.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                Some(TocKeyboardAction::Previous)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                Some(TocKeyboardAction::Next)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                Some(TocKeyboardAction::Activate)
+            } else {
+                None
+            }
+        });
+        let Some(action) = action else {
+            return false;
+        };
+        let row_indices = self.visible_toc_row_indices();
+        let active_row = self.snapshot.active_toc_id.as_ref().and_then(|active| {
+            row_indices.iter().position(|&index| {
+                self.reader.toc_items().get(index).map(|row| &row.id) == Some(active)
+            })
+        });
+        match action {
+            TocKeyboardAction::Previous | TocKeyboardAction::Next => {
+                self.ui.toc_keyboard_row = next_toc_keyboard_row(
+                    self.ui.toc_keyboard_row,
+                    active_row,
+                    row_indices.len(),
+                    if action == TocKeyboardAction::Previous {
+                        PageDirection::Previous
+                    } else {
+                        PageDirection::Next
+                    },
+                );
+            }
+            TocKeyboardAction::Activate => {
+                let focused_row = self
+                    .ui
+                    .toc_keyboard_row
+                    .filter(|&row| row < row_indices.len())
+                    .or(active_row);
+                self.ui.toc_keyboard_row = focused_row;
+                let target = focused_row
+                    .and_then(|row| row_indices.get(row))
+                    .and_then(|&index| self.reader.toc_items().get(index))
+                    .and_then(|item| {
+                        item.target
+                            .as_ref()
+                            .map(|target| (item.id.clone(), target.clone()))
+                    });
+                if let Some((id, target)) = target {
+                    self.go_to_toc(&id, &target);
+                }
+            }
+        }
+        ctx.request_repaint();
+        true
+    }
+
     fn focus_footnote_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
         if !self.is_focus_mode()
             || !ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_footnotes))
@@ -864,11 +1158,15 @@ impl DesktopReader {
         {
             return false;
         }
+        let cursor_toggle_allowed = self.is_focus_mode();
         let action = ctx.input_mut(|input| {
             if input.consume_shortcut(&self.shortcuts.toggle_translation) {
                 Some(0)
             } else if input.consume_shortcut(&self.shortcuts.return_to_shelf) {
                 Some(1)
+            } else if cursor_toggle_allowed && input.consume_shortcut(&self.shortcuts.toggle_cursor)
+            {
+                Some(2)
             } else {
                 None
             }
@@ -876,6 +1174,7 @@ impl DesktopReader {
         match action {
             Some(0) => self.toggle_translation(),
             Some(1) => self.request_exit(),
+            Some(2) => self.toggle_focus_cursor_visibility(),
             Some(_) => unreachable!(),
             None => return false,
         }
@@ -927,10 +1226,10 @@ impl DesktopReader {
                 (
                     input.consume_shortcut(&self.shortcuts.focus_extend_selection_previous),
                     input.consume_shortcut(&self.shortcuts.focus_extend_selection_next),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                    input.consume_shortcut(&self.shortcuts.previous_page_or_paragraph),
+                    input.consume_shortcut(&self.shortcuts.next_page_or_paragraph),
+                    input.consume_shortcut(&self.shortcuts.previous_section),
+                    input.consume_shortcut(&self.shortcuts.next_section),
                 )
             });
             if extend_previous {
@@ -958,31 +1257,40 @@ impl DesktopReader {
             self.scroll_navigation_shortcuts(ctx);
             return;
         }
-        let (previous, next) = ctx.input_mut(|input| {
-            let left = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft);
-            let up = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp);
+        let action = ctx.input_mut(|input| {
+            let left = input.consume_shortcut(&self.shortcuts.previous_section);
+            let up = input.consume_shortcut(&self.shortcuts.previous_page_or_paragraph);
             let page_up = input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp);
-            let right = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight);
-            let down = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown);
+            let right = input.consume_shortcut(&self.shortcuts.next_section);
+            let down = input.consume_shortcut(&self.shortcuts.next_page_or_paragraph);
             let page_down = input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown);
             let space = input.consume_key(egui::Modifiers::NONE, egui::Key::Space);
-            (left || up || page_up, right || down || page_down || space)
+            classic_navigation_action(left, right, up, down, page_up, page_down, space)
         });
-        if previous {
-            self.turn_page(PageDirection::Previous);
-        }
-        if next {
-            self.turn_page(PageDirection::Next);
+        match action {
+            Some(ClassicNavigationAction::PreviousReadingUnit) => {
+                self.go_to_adjacent_section(PageDirection::Previous);
+            }
+            Some(ClassicNavigationAction::NextReadingUnit) => {
+                self.go_to_adjacent_section(PageDirection::Next);
+            }
+            Some(ClassicNavigationAction::PreviousPage) => {
+                self.turn_page(PageDirection::Previous);
+            }
+            Some(ClassicNavigationAction::NextPage) => {
+                self.turn_page(PageDirection::Next);
+            }
+            None => {}
         }
     }
 
     fn scroll_navigation_shortcuts(&mut self, ctx: &egui::Context) {
         let (previous, next, up, down, page_up, page_down) = ctx.input_mut(|input| {
             (
-                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
-                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
-                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                input.consume_shortcut(&self.shortcuts.previous_section),
+                input.consume_shortcut(&self.shortcuts.next_section),
+                input.consume_shortcut(&self.shortcuts.previous_page_or_paragraph),
+                input.consume_shortcut(&self.shortcuts.next_page_or_paragraph),
                 input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp),
                 input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown),
             )
@@ -1679,22 +1987,22 @@ impl DesktopReader {
             .max(1.0);
         let body_font = egui::TextStyle::Body.resolve(style.as_ref());
         let text_color = palette().text;
-        let measured_text_height = ctx.fonts_mut(|fonts| {
-            footnotes
-                .iter()
-                .map(|footnote| {
-                    fonts
-                        .layout(
-                            footnote.text.clone(),
-                            body_font.clone(),
-                            text_color,
-                            text_width,
-                        )
-                        .size()
-                        .y
-                })
-                .sum::<f32>()
-        });
+        let footnote_text_layouts = footnotes
+            .iter()
+            .map(|footnote| {
+                optimized_footnote_text_layout(
+                    ctx,
+                    &footnote.text,
+                    &body_font,
+                    text_color,
+                    text_width,
+                )
+            })
+            .collect::<Vec<_>>();
+        let measured_text_height = footnote_text_layouts
+            .iter()
+            .map(|layout| layout.height)
+            .sum::<f32>();
         // Each additional item has one separator plus the vertical spacing on
         // both sides. The small safety inset covers fractional glyph metrics.
         let separator_height = footnotes.len().saturating_sub(1) as f32 * 19.0;
@@ -1742,16 +2050,17 @@ impl DesktopReader {
                                     }
                                     ui.set_width((ui.available_width() - 8.0).max(1.0));
                                     ui.spacing_mut().item_spacing.y = 9.0;
-                                    for (index, footnote) in footnotes.iter().enumerate() {
+                                    for (index, layout) in footnote_text_layouts.iter().enumerate()
+                                    {
                                         if index > 0 {
                                             ui.separator();
                                         }
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&footnote.text).color(palette().text),
-                                            )
-                                            .wrap(),
-                                        );
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 0.0;
+                                            for line in &layout.lines {
+                                                paint_footnote_text_line(ui, line, text_color);
+                                            }
+                                        });
                                     }
                                 });
                         });
@@ -2094,6 +2403,7 @@ impl DesktopReader {
         visible_rows: std::ops::Range<usize>,
         row_indices: &[usize],
         active: Option<&String>,
+        keyboard_row: Option<usize>,
     ) -> Option<usize> {
         let mut navigated_row = None;
         let content_width = (ui.available_width() - 12.0).max(1.0);
@@ -2101,6 +2411,7 @@ impl DesktopReader {
         for visible_index in visible_rows {
             let row = self.reader.toc_items()[row_indices[visible_index]].clone();
             let selected = active == Some(&row.id);
+            let keyboard_focused = keyboard_row == Some(visible_index);
             let display_label = if self.translation.enabled && self.plugin_settings.translate_toc {
                 self.translation
                     .toc_labels
@@ -2116,13 +2427,21 @@ impl DesktopReader {
             let mut row_response = row_response.on_hover_cursor(egui::CursorIcon::PointingHand);
             let row_fill = if selected {
                 palette().accent_soft
-            } else if row_response.hovered() {
+            } else if keyboard_focused || row_response.hovered() {
                 ui.visuals().widgets.hovered.weak_bg_fill
             } else {
                 Color32::TRANSPARENT
             };
             if row_fill != Color32::TRANSPARENT {
                 ui.painter().rect_filled(row_rect, 6.0, row_fill);
+            }
+            if keyboard_focused {
+                ui.painter().rect_stroke(
+                    row_rect,
+                    6.0,
+                    egui::Stroke::new(1.0, palette().accent.gamma_multiply(0.72)),
+                    egui::StrokeKind::Inside,
+                );
             }
             let depth = u16::try_from(row.depth).unwrap_or(u16::MAX);
             let toggle_rect = Rect::from_min_size(
@@ -2139,7 +2458,7 @@ impl DesktopReader {
                     toggle_rect.center(),
                     &row.id,
                     expanded,
-                    selected,
+                    selected || keyboard_focused,
                     self.language.text("折叠", "Collapse"),
                     self.language.text("展开", "Expand"),
                 )
@@ -2147,7 +2466,7 @@ impl DesktopReader {
                 false
             };
             let label_rect = toc_label_rect(row_rect, toggle_rect);
-            if paint_toc_label(ui, label_rect, display_label, selected) {
+            if paint_toc_label(ui, label_rect, display_label, selected || keyboard_focused) {
                 row_response = row_response.on_hover_text(display_label);
             }
             row_response.widget_info(|| {
@@ -2159,6 +2478,7 @@ impl DesktopReader {
                 self.toggle_toc(&row.id);
             }
             if navigate && let Some(target) = row.target {
+                self.ui.toc_keyboard_row = Some(visible_index);
                 self.go_to_toc(&row.id, &target);
                 navigated_row = Some(visible_index);
             }
@@ -2176,6 +2496,13 @@ impl DesktopReader {
                 self.reader.toc_items().get(index).map(|row| &row.id) == Some(active)
             })
         });
+        let keyboard_row = self
+            .ui
+            .toc_keyboard_row
+            .filter(|&row| row < row_indices.len());
+        self.ui.toc_keyboard_row = keyboard_row;
+        let should_auto_scroll_keyboard =
+            keyboard_row != self.ui.last_auto_scrolled_toc_keyboard_row;
         let item_spacing = ui.spacing().item_spacing.y;
         let row_stride = TOC_ROW_HEIGHT + item_spacing;
         let content_height = toc_content_height(row_indices.len(), item_spacing);
@@ -2184,11 +2511,7 @@ impl DesktopReader {
             .auto_shrink([false, false]);
         let keyboard_scroll_delta = if self.is_focus_mode() && self.ui.sidebar_open {
             ui.input(|input| {
-                if input.key_pressed(egui::Key::ArrowUp) {
-                    TOC_ROW_HEIGHT
-                } else if input.key_pressed(egui::Key::ArrowDown) {
-                    -TOC_ROW_HEIGHT
-                } else if input.key_pressed(egui::Key::PageUp) {
+                if input.key_pressed(egui::Key::PageUp) {
                     ui.available_height() * 0.8
                 } else if input.key_pressed(egui::Key::PageDown) {
                     -ui.available_height() * 0.8
@@ -2207,8 +2530,15 @@ impl DesktopReader {
                 ui.scroll_with_delta(Vec2::new(0.0, keyboard_scroll_delta));
             }
 
-            if should_auto_scroll && let Some(active_row) = active_row {
-                let row_top = ui.max_rect().top() + toc_row_top(active_row, item_spacing);
+            let auto_scroll_row = if should_auto_scroll_keyboard {
+                keyboard_row
+            } else if should_auto_scroll {
+                active_row
+            } else {
+                None
+            };
+            if let Some(auto_scroll_row) = auto_scroll_row {
+                let row_top = ui.max_rect().top() + toc_row_top(auto_scroll_row, item_spacing);
                 let row_rect = Rect::from_min_size(
                     Pos2::new(ui.max_rect().left(), row_top),
                     Vec2::new(ui.max_rect().width(), TOC_ROW_HEIGHT),
@@ -2222,8 +2552,13 @@ impl DesktopReader {
             let visible_rect = Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
             ui.scope_builder(egui::UiBuilder::new().max_rect(visible_rect), |ui| {
                 ui.skip_ahead_auto_ids(visible_rows.start);
-                let navigated_row =
-                    self.paint_visible_toc_rows(ui, visible_rows, &row_indices, active.as_ref());
+                let navigated_row = self.paint_visible_toc_rows(
+                    ui,
+                    visible_rows,
+                    &row_indices,
+                    active.as_ref(),
+                    keyboard_row,
+                );
                 preserve_bottom_after_navigation = navigated_row.is_some_and(|row_index| {
                     toc_navigation_keeps_bottom_offset(
                         viewport,
@@ -2234,6 +2569,7 @@ impl DesktopReader {
                 });
             });
         });
+        self.ui.last_auto_scrolled_toc_keyboard_row = self.ui.toc_keyboard_row;
         update_toc_scroll_marker(
             &mut self.ui.last_auto_scrolled_toc,
             preserve_bottom_after_navigation,
@@ -4880,6 +5216,10 @@ mod reference_suggestion_label_tests {
             egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C)
         );
         assert_eq!(
+            shortcuts.toggle_cursor,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::H)
+        );
+        assert_eq!(
             shortcuts.focus_actions,
             egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Space)
         );
@@ -4904,6 +5244,22 @@ mod reference_suggestion_label_tests {
             egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::AltLeft)
         );
         assert_eq!(
+            shortcuts.previous_section,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+        );
+        assert_eq!(
+            shortcuts.next_section,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowRight)
+        );
+        assert_eq!(
+            shortcuts.previous_page_or_paragraph,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowUp)
+        );
+        assert_eq!(
+            shortcuts.next_page_or_paragraph,
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::ArrowDown)
+        );
+        assert_eq!(
             shortcuts.focus_extend_selection_previous,
             egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
         );
@@ -4911,6 +5267,86 @@ mod reference_suggestion_label_tests {
             shortcuts.focus_extend_selection_next,
             egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
         );
+    }
+
+    #[test]
+    fn classic_left_and_right_switch_reading_units() {
+        assert_eq!(
+            classic_navigation_action(true, false, false, false, false, false, false),
+            Some(ClassicNavigationAction::PreviousReadingUnit)
+        );
+        assert_eq!(
+            classic_navigation_action(false, true, false, false, false, false, false),
+            Some(ClassicNavigationAction::NextReadingUnit)
+        );
+    }
+
+    #[test]
+    fn classic_vertical_navigation_still_turns_pages() {
+        assert_eq!(
+            classic_navigation_action(false, false, true, false, false, false, false),
+            Some(ClassicNavigationAction::PreviousPage)
+        );
+        assert_eq!(
+            classic_navigation_action(false, false, false, true, false, false, false),
+            Some(ClassicNavigationAction::NextPage)
+        );
+    }
+
+    #[test]
+    fn toc_keyboard_navigation_starts_from_the_active_row_and_stays_in_bounds() {
+        assert_eq!(
+            next_toc_keyboard_row(None, Some(2), 5, PageDirection::Next),
+            Some(3)
+        );
+        assert_eq!(
+            next_toc_keyboard_row(None, Some(2), 5, PageDirection::Previous),
+            Some(1)
+        );
+        assert_eq!(
+            next_toc_keyboard_row(Some(4), Some(2), 5, PageDirection::Next),
+            Some(4)
+        );
+        assert_eq!(
+            next_toc_keyboard_row(Some(0), Some(2), 5, PageDirection::Previous),
+            Some(0)
+        );
+        assert_eq!(
+            next_toc_keyboard_row(None, None, 5, PageDirection::Next),
+            Some(0)
+        );
+        assert_eq!(
+            next_toc_keyboard_row(None, None, 5, PageDirection::Previous),
+            Some(4)
+        );
+        assert_eq!(
+            next_toc_keyboard_row(None, None, 0, PageDirection::Next),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_hiding_is_scoped_to_the_unblocked_focus_reader() {
+        assert!(crate::reader::resolved_focus_cursor_hidden(true, None));
+        assert!(!crate::reader::resolved_focus_cursor_hidden(
+            true,
+            Some(false)
+        ));
+        assert!(crate::reader::resolved_focus_cursor_hidden(
+            false,
+            Some(true)
+        ));
+        assert!(should_hide_reader_cursor(true, true, false));
+        assert!(!should_hide_reader_cursor(false, true, false));
+        assert!(!should_hide_reader_cursor(true, false, false));
+        assert!(!should_hide_reader_cursor(true, true, true));
+    }
+
+    #[test]
+    fn escape_only_requests_close_for_the_reader_menu() {
+        assert!(reader_menu_close_requested(ReaderOverlay::Menu, true));
+        assert!(!reader_menu_close_requested(ReaderOverlay::Menu, false));
+        assert!(!reader_menu_close_requested(ReaderOverlay::None, true));
     }
 
     #[test]

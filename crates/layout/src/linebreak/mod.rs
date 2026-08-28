@@ -6,3 +6,5 @@
 pub mod knuth_plass;
 
 pub(crate) mod parley;
+
+pub use parley::{MeasuredCluster, ParagraphPlan, SpacingAdjustment, plan_measured_text};

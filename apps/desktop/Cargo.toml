@@ -74,6 +74,7 @@ sys-locale.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+unicode-segmentation.workspace = true
 vello.workspace = true
 wgpu.workspace = true
 winit.workspace = true

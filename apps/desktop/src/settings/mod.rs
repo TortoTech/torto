@@ -25,6 +25,7 @@ use provider_models::{ProviderModelsRequest, fetch_provider_models};
 pub(crate) struct AppliedSettings {
     pub(crate) spread: SpreadMode,
     pub(crate) reading_mode: ReadingMode,
+    pub(crate) hide_cursor_in_focus_mode: bool,
     pub(crate) interface_typography: InterfaceTypography,
     pub(crate) typography: ReaderTypography,
     pub(crate) typesetting: ReaderTypesetting,
@@ -49,6 +50,7 @@ pub(crate) struct SettingsFeature {
     settings_tab: SettingsTab,
     draft_spread: SpreadMode,
     draft_reading_mode: ReadingMode,
+    draft_hide_cursor_in_focus_mode: bool,
     draft_interface_typography: InterfaceTypography,
     draft_typography: ReaderTypography,
     draft_typesetting: ReaderTypesetting,
@@ -102,6 +104,7 @@ impl SettingsFeature {
         let applied = AppliedSettings {
             spread: preferences.spread,
             reading_mode: preferences.reading_mode,
+            hide_cursor_in_focus_mode: preferences.hide_cursor_in_focus_mode,
             interface_typography: preferences.interface_typography,
             typography: preferences.typography,
             typesetting: preferences.typesetting,
@@ -117,6 +120,7 @@ impl SettingsFeature {
             settings_tab: SettingsTab::System,
             draft_spread: applied.spread,
             draft_reading_mode: applied.reading_mode,
+            draft_hide_cursor_in_focus_mode: applied.hide_cursor_in_focus_mode,
             draft_interface_typography: applied.interface_typography.clone(),
             draft_typography: applied.typography.clone(),
             draft_typesetting: applied.typesetting.clone(),
@@ -150,6 +154,7 @@ impl SettingsFeature {
         self.settings_tab = SettingsTab::System;
         self.draft_spread = self.applied.spread;
         self.draft_reading_mode = self.applied.reading_mode;
+        self.draft_hide_cursor_in_focus_mode = self.applied.hide_cursor_in_focus_mode;
         self.draft_interface_typography
             .clone_from(&self.applied.interface_typography);
         self.draft_typography.clone_from(&self.applied.typography);
@@ -266,6 +271,7 @@ impl SettingsFeature {
             language: self.applied.language,
             spread: self.applied.spread,
             reading_mode: self.applied.reading_mode,
+            hide_cursor_in_focus_mode: self.applied.hide_cursor_in_focus_mode,
             theme: self.applied.theme,
             selection_granularity: self.applied.selection_granularity,
             shortcuts: self.applied.shortcuts.clone(),
@@ -286,6 +292,7 @@ impl SettingsFeature {
         }
         let values_unchanged = preferences.spread == self.applied.spread
             && preferences.reading_mode == self.applied.reading_mode
+            && preferences.hide_cursor_in_focus_mode == self.applied.hide_cursor_in_focus_mode
             && preferences.theme == self.applied.theme
             && preferences.selection_granularity == self.applied.selection_granularity;
         if !reader_change_needs_apply(values_unchanged, layout_changed) {
@@ -303,10 +310,12 @@ impl SettingsFeature {
         }
         self.applied.spread = preferences.spread;
         self.applied.reading_mode = preferences.reading_mode;
+        self.applied.hide_cursor_in_focus_mode = preferences.hide_cursor_in_focus_mode;
         self.applied.theme = preferences.theme;
         self.applied.selection_granularity = preferences.selection_granularity;
         self.draft_spread = preferences.spread;
         self.draft_reading_mode = preferences.reading_mode;
+        self.draft_hide_cursor_in_focus_mode = preferences.hide_cursor_in_focus_mode;
         self.draft_theme = preferences.theme;
         if layout_changed {
             self.revision = self.revision.wrapping_add(1);
@@ -331,6 +340,7 @@ impl SettingsFeature {
         AppliedSettings {
             spread: self.draft_spread,
             reading_mode: self.draft_reading_mode,
+            hide_cursor_in_focus_mode: self.draft_hide_cursor_in_focus_mode,
             interface_typography: self.draft_interface_typography.clone(),
             typography: self.draft_typography.clone(),
             typesetting: self.draft_typesetting.clone(),
@@ -391,6 +401,7 @@ impl SettingsFeature {
             theme,
             spread: self.draft_spread,
             reading_mode: self.draft_reading_mode,
+            hide_cursor_in_focus_mode: self.draft_hide_cursor_in_focus_mode,
             selection_granularity: self.applied.selection_granularity,
             shortcuts: self.draft_shortcuts.clone(),
         };
@@ -411,6 +422,7 @@ impl SettingsFeature {
         let next_applied = AppliedSettings {
             spread: self.draft_spread,
             reading_mode: self.draft_reading_mode,
+            hide_cursor_in_focus_mode: self.draft_hide_cursor_in_focus_mode,
             interface_typography,
             typography,
             typesetting,
@@ -520,6 +532,13 @@ enum ShortcutAction {
     Search,
     Copy,
     ReturnToShelf,
+    ToggleCursor,
+    OpenSettings,
+    ImportBooks,
+    PreviousSection,
+    NextSection,
+    PreviousPageOrParagraph,
+    NextPageOrParagraph,
     FocusActions,
     FocusChat,
     FocusHighlight,
@@ -540,6 +559,13 @@ impl ShortcutAction {
             Self::Search => shortcuts.search,
             Self::Copy => shortcuts.copy,
             Self::ReturnToShelf => shortcuts.return_to_shelf,
+            Self::ToggleCursor => shortcuts.toggle_cursor,
+            Self::OpenSettings => shortcuts.open_settings,
+            Self::ImportBooks => shortcuts.import_books,
+            Self::PreviousSection => shortcuts.previous_section,
+            Self::NextSection => shortcuts.next_section,
+            Self::PreviousPageOrParagraph => shortcuts.previous_page_or_paragraph,
+            Self::NextPageOrParagraph => shortcuts.next_page_or_paragraph,
             Self::FocusActions => shortcuts.focus_actions,
             Self::FocusChat => shortcuts.focus_chat,
             Self::FocusHighlight => shortcuts.focus_highlight,
@@ -560,6 +586,13 @@ impl ShortcutAction {
             Self::Search => shortcuts.search = binding,
             Self::Copy => shortcuts.copy = binding,
             Self::ReturnToShelf => shortcuts.return_to_shelf = binding,
+            Self::ToggleCursor => shortcuts.toggle_cursor = binding,
+            Self::OpenSettings => shortcuts.open_settings = binding,
+            Self::ImportBooks => shortcuts.import_books = binding,
+            Self::PreviousSection => shortcuts.previous_section = binding,
+            Self::NextSection => shortcuts.next_section = binding,
+            Self::PreviousPageOrParagraph => shortcuts.previous_page_or_paragraph = binding,
+            Self::NextPageOrParagraph => shortcuts.next_page_or_paragraph = binding,
             Self::FocusActions => shortcuts.focus_actions = binding,
             Self::FocusChat => shortcuts.focus_chat = binding,
             Self::FocusHighlight => shortcuts.focus_highlight = binding,
@@ -600,6 +633,7 @@ mod tests {
         let applied = AppliedSettings {
             spread: preferences.spread,
             reading_mode: preferences.reading_mode,
+            hide_cursor_in_focus_mode: preferences.hide_cursor_in_focus_mode,
             interface_typography: preferences.interface_typography,
             typography: preferences.typography,
             typesetting: preferences.typesetting,

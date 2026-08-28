@@ -26,6 +26,9 @@ impl DesktopReader {
         if open {
             self.ui.focus_footnotes_visible = false;
             self.ui.focus_footnote_scroll_delta = 0.0;
+        } else {
+            self.ui.toc_keyboard_row = None;
+            self.ui.last_auto_scrolled_toc_keyboard_row = None;
         }
         self.ui.sidebar_open = open;
         if self

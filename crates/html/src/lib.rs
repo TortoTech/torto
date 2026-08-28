@@ -1301,10 +1301,14 @@ impl<'a> ReadingIrParser<'a> {
         &mut self,
         node: Node<'_, '_>,
         kind: TextBlockKind,
-        style: BlockStyle,
+        mut style: BlockStyle,
     ) -> Result<(), HtmlError> {
         let node_id = self.allocate_node();
         self.queue_descendant_anchors(node);
+        if let Some(alignment) = self.styles.sole_content_block_alignment(node) {
+            style.align = alignment;
+            style.authored_alignment = Some(alignment);
+        }
         let mut collector = InlineCollector::new(matches!(kind, TextBlockKind::Preformatted));
         collect_inline(
             node,
@@ -2667,6 +2671,33 @@ impl StyleSheet {
             .or_else(|| attribute_local(node, "align").and_then(parse_text_alignment))
     }
 
+    fn sole_content_block_alignment(&self, node: Node<'_, '_>) -> Option<TextAlignment> {
+        let mut container = node;
+        loop {
+            let mut sole_element = None;
+            for child in container.children() {
+                if child.is_text() && child.text().is_some_and(|text| !text.trim().is_empty()) {
+                    return None;
+                }
+                if child.is_element() && sole_element.replace(child).is_some() {
+                    return None;
+                }
+            }
+            let child = sole_element?;
+            let properties = self.cascaded_properties(child);
+            let establishes_block_box = properties.get("display").is_some_and(|display| {
+                matches!(
+                    display.split_ascii_whitespace().next(),
+                    Some("block" | "inline-block" | "flow-root" | "list-item" | "table-cell")
+                )
+            });
+            if establishes_block_box {
+                return self.inherited_text_alignment(child);
+            }
+            container = child;
+        }
+    }
+
     fn has_visual_boundary(&self, node: Node<'_, '_>) -> bool {
         let properties = self.cascaded_properties(node);
         let visible_paint = |value: &str| {
@@ -3450,6 +3481,35 @@ mod tests {
         assert_eq!(image.style.width, Some(ImageLength::Fraction(0.8)));
         assert_eq!(image.style.max_width, Some(ImageLength::Pixels(420.0)));
         assert_eq!(image.style.max_height, Some(ImageLength::Fraction(0.6)));
+    }
+
+    #[test]
+    fn preserves_alignment_from_a_sole_block_inline_wrapper() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+            <head><style>
+                .signature { display: block; text-align: right; }
+            </style></head>
+            <body>
+                <p><span><span class="signature">Visual memo no. 100</span></span></p>
+                <p>Following prose</p>
+            </body>
+        </html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| None).unwrap();
+        let blocks = all_text_blocks(&section);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].style.align, TextAlignment::End);
+        assert_eq!(blocks[0].style.authored_alignment, Some(TextAlignment::End));
+        assert_eq!(blocks[1].style.align, TextAlignment::Start);
+        assert_eq!(blocks[1].style.authored_alignment, None);
     }
 
     #[test]

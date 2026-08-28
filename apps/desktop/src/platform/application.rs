@@ -6,6 +6,8 @@ use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 #[cfg(target_os = "windows")]
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+#[cfg(target_os = "windows")]
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(not(target_os = "windows"))]
 use winit::window::Fullscreen;
@@ -20,6 +22,8 @@ const INITIAL_WIDTH: u32 = 1200;
 const INITIAL_HEIGHT: u32 = 800;
 #[cfg(target_os = "windows")]
 const FULLSCREEN_COMPOSITOR_OVERSCAN: u32 = 1;
+#[cfg(target_os = "windows")]
+const IME_SHORTCUT_MODIFIER_RELEASE_GRACE: Duration = Duration::from_millis(300);
 fn app_icon() -> Option<Icon> {
     let image = image::load_from_memory(include_bytes!("../../../../assets/windows/torto-256.png"))
         .ok()?
@@ -140,6 +144,60 @@ const fn native_window_theme(theme: AppTheme) -> Option<Theme> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn native_shortcut_modifiers_match(
+    modifiers: ModifiersState,
+    shortcut: egui::KeyboardShortcut,
+) -> bool {
+    let modifiers = egui::Modifiers {
+        alt: modifiers.alt_key(),
+        ctrl: modifiers.control_key(),
+        shift: modifiers.shift_key(),
+        mac_cmd: false,
+        command: modifiers.control_key(),
+    };
+    modifiers.matches_logically(shortcut.modifiers)
+}
+
+#[cfg(target_os = "windows")]
+fn native_open_settings_key_matches(
+    key_code: KeyCode,
+    repeat: bool,
+    modifiers: ModifiersState,
+    modifiers_were_just_released: bool,
+    shortcut: egui::KeyboardShortcut,
+) -> bool {
+    if key_code != KeyCode::Comma || shortcut.logical_key != egui::Key::Comma || repeat {
+        return false;
+    }
+    native_shortcut_modifiers_match(modifiers, shortcut) || modifiers_were_just_released
+}
+
+#[cfg(target_os = "windows")]
+fn native_open_settings_shortcut_matches(
+    event: &WindowEvent,
+    modifiers: ModifiersState,
+    modifiers_were_just_released: bool,
+    shortcut: egui::KeyboardShortcut,
+) -> bool {
+    let WindowEvent::KeyboardInput { event, .. } = event else {
+        return false;
+    };
+    let PhysicalKey::Code(key_code) = event.physical_key else {
+        return false;
+    };
+    // WeType 2.1 can suppress comma key-down while still emitting key-up.
+    // Do not filter by event.state: opening settings is idempotent, so both
+    // the normal key-down and the compatibility key-up are safe to accept.
+    native_open_settings_key_matches(
+        key_code,
+        event.repeat,
+        modifiers,
+        modifiers_were_just_released,
+        shortcut,
+    )
+}
+
 struct WindowState {
     window: Arc<Window>,
     #[cfg(target_os = "windows")]
@@ -165,6 +223,10 @@ struct Application {
     fatal_error: Option<String>,
     proxy: EventLoopProxy<UserEvent>,
     runtime: tokio::runtime::Runtime,
+    #[cfg(target_os = "windows")]
+    modifiers: ModifiersState,
+    #[cfg(target_os = "windows")]
+    open_settings_modifiers_released_at: Option<Instant>,
 }
 
 impl Application {
@@ -189,6 +251,10 @@ impl Application {
             fatal_error: None,
             proxy,
             runtime,
+            #[cfg(target_os = "windows")]
+            modifiers: ModifiersState::default(),
+            #[cfg(target_os = "windows")]
+            open_settings_modifiers_released_at: None,
         }
     }
 
@@ -385,6 +451,46 @@ impl ApplicationHandler<UserEvent> for Application {
         if state.window.id() != window_id {
             return;
         }
+        #[cfg(target_os = "windows")]
+        {
+            let open_settings_shortcut = self.app.open_settings_shortcut();
+            if let WindowEvent::ModifiersChanged(modifiers) = &event {
+                let matched_before =
+                    native_shortcut_modifiers_match(self.modifiers, open_settings_shortcut);
+                self.modifiers = modifiers.state();
+                let matches_now =
+                    native_shortcut_modifiers_match(self.modifiers, open_settings_shortcut);
+                if open_settings_shortcut.logical_key == egui::Key::Comma
+                    && open_settings_shortcut.modifiers != egui::Modifiers::NONE
+                    && matched_before
+                    && !matches_now
+                {
+                    self.open_settings_modifiers_released_at = Some(Instant::now());
+                } else if matches_now {
+                    self.open_settings_modifiers_released_at = None;
+                }
+            }
+            let modifiers_were_just_released = self
+                .open_settings_modifiers_released_at
+                .is_some_and(|released_at| {
+                    released_at.elapsed() <= IME_SHORTCUT_MODIFIER_RELEASE_GRACE
+                });
+            if self.open_settings_modifiers_released_at.is_some() && !modifiers_were_just_released {
+                self.open_settings_modifiers_released_at = None;
+            }
+            if native_open_settings_shortcut_matches(
+                &event,
+                self.modifiers,
+                modifiers_were_just_released,
+                open_settings_shortcut,
+            ) {
+                // Handle this before egui so WeType's missing key-down can fall
+                // back to the physical comma key-up event.
+                self.app.open_settings();
+                self.open_settings_modifiers_released_at = None;
+                state.window.request_redraw();
+            }
+        }
         let response = state.egui_state.on_window_event(&state.window, &event);
         if response.repaint {
             state.window.request_redraw();
@@ -511,6 +617,49 @@ mod tests {
         assert_eq!(native_window_theme(AppTheme::System), None);
         assert_eq!(native_window_theme(AppTheme::Light), Some(Theme::Light));
         assert_eq!(native_window_theme(AppTheme::Dark), Some(Theme::Dark));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_comma_shortcut_bypasses_ime_processed_logical_keys() {
+        let shortcut = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Comma);
+        let modifiers = ModifiersState::CONTROL;
+
+        assert!(native_open_settings_key_matches(
+            KeyCode::Comma,
+            false,
+            modifiers,
+            false,
+            shortcut,
+        ));
+        assert!(!native_open_settings_key_matches(
+            KeyCode::Period,
+            false,
+            modifiers,
+            false,
+            shortcut,
+        ));
+        assert!(!native_open_settings_key_matches(
+            KeyCode::Comma,
+            false,
+            ModifiersState::empty(),
+            false,
+            shortcut,
+        ));
+        assert!(native_open_settings_key_matches(
+            KeyCode::Comma,
+            false,
+            ModifiersState::empty(),
+            true,
+            shortcut,
+        ));
+        assert!(!native_open_settings_key_matches(
+            KeyCode::Period,
+            false,
+            ModifiersState::empty(),
+            true,
+            shortcut,
+        ));
     }
 
     #[test]

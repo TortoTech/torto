@@ -83,6 +83,7 @@ pub(crate) struct ShelfFeature {
     sync: SyncUiState,
     language: AppLanguage,
     search_shortcut: egui::KeyboardShortcut,
+    import_books_shortcut: egui::KeyboardShortcut,
     settings_requested: bool,
     cover_textures: HashMap<String, TextureHandle>,
     read_activity: HashMap<String, u64>,
@@ -206,6 +207,7 @@ impl ShelfFeature {
             },
             language,
             search_shortcut: egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F),
+            import_books_shortcut: egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::O),
             settings_requested: false,
             cover_textures: HashMap::new(),
             read_activity: HashMap::new(),
@@ -349,6 +351,7 @@ impl ShelfFeature {
     pub(crate) fn apply_global_settings(&mut self, settings: &AppliedSettings) {
         self.language = settings.language;
         self.search_shortcut = settings.shortcuts.search;
+        self.import_books_shortcut = settings.shortcuts.import_books;
         self.sync.settings.clone_from(&settings.sync_settings);
         self.sync.password.clone_from(&settings.sync_password);
         self.start_sync();
@@ -643,10 +646,16 @@ impl ShelfFeature {
         Ok(())
     }
 
-    pub(crate) fn ui(&mut self, root_ui: &mut egui::Ui) {
+    pub(crate) fn ui(&mut self, root_ui: &mut egui::Ui, interaction_blocked: bool) {
         let ctx = root_ui.ctx().clone();
         self.dismiss_transient_messages_if_due(&ctx);
-        let focus_search = ctx.input_mut(|input| input.consume_shortcut(&self.search_shortcut));
+        let focus_search = !interaction_blocked
+            && ctx.input_mut(|input| input.consume_shortcut(&self.search_shortcut));
+        let import_books = !interaction_blocked
+            && ctx.input_mut(|input| input.consume_shortcut(&self.import_books_shortcut));
+        if import_books && !self.import_task.is_pending() {
+            self.import_task.begin(());
+        }
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -659,7 +668,10 @@ impl ShelfFeature {
                     }),
             )
             .show(root_ui, |ui| {
-                let search_response = self.shelf_header(ui);
+                let search_response = self.shelf_header(ui, interaction_blocked);
+                if interaction_blocked && search_response.has_focus() {
+                    search_response.surrender_focus();
+                }
                 if focus_search {
                     search_response.request_focus();
                     self.shelf.focus_selected_book = false;
@@ -697,14 +709,21 @@ impl ShelfFeature {
                         ui.set_width(
                             (ui.available_width() - SHELF_SCROLLBAR_GUTTER).max(CARD_WIDTH),
                         );
-                        self.book_grid(ui, &books, search_response.has_focus());
+                        self.book_grid(
+                            ui,
+                            &books,
+                            search_response.has_focus(),
+                            interaction_blocked,
+                        );
                     });
                 }
             });
-        self.dialogs(&ctx);
+        if !interaction_blocked {
+            self.dialogs(&ctx);
+        }
     }
 
-    fn shelf_header(&mut self, ui: &mut egui::Ui) -> egui::Response {
+    fn shelf_header(&mut self, ui: &mut egui::Ui, interaction_blocked: bool) -> egui::Response {
         let book_count = self.shelf.library.books().len();
         let search_hint = shelf_search_hint(self.language, book_count);
         ui.allocate_ui_with_layout(
@@ -713,15 +732,17 @@ impl ShelfFeature {
             |ui| {
                 let search_response = shelf_search_field(ui, &mut self.shelf.query, &search_hint);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icon_button(ui, Icon::Settings)
-                        .on_hover_text(self.language.text("设置", "Settings"))
-                        .clicked()
-                    {
-                        self.settings_requested = true;
+                    let settings = icon_button(ui, Icon::Settings);
+                    if !interaction_blocked {
+                        if settings
+                            .on_hover_text(self.language.text("设置", "Settings"))
+                            .clicked()
+                        {
+                            self.settings_requested = true;
+                        }
                     }
-                    if shelf_import_button(ui, self.language.text("导入", "Import")).clicked()
-                        && !self.import_task.is_pending()
-                    {
+                    let import = shelf_import_button(ui, self.language.text("导入", "Import"));
+                    if !interaction_blocked && import.clicked() && !self.import_task.is_pending() {
                         self.import_task.begin(());
                     }
                 });
@@ -764,7 +785,13 @@ impl ShelfFeature {
         );
     }
 
-    fn book_grid(&mut self, ui: &mut egui::Ui, books: &[LibraryBook], search_has_focus: bool) {
+    fn book_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        books: &[LibraryBook],
+        search_has_focus: bool,
+        interaction_blocked: bool,
+    ) {
         let columns = shelf_grid_columns(ui.available_width());
         let selected_index = self
             .shelf
@@ -772,7 +799,7 @@ impl ShelfFeature {
             .as_ref()
             .and_then(|selected| books.iter().position(|book| &book.id == selected))
             .unwrap_or(0);
-        let keyboard_action = if self.shelf.remove_confirmation.is_none() {
+        let keyboard_action = if !interaction_blocked && self.shelf.remove_confirmation.is_none() {
             shelf_keyboard_action(ui, search_has_focus)
         } else {
             None
@@ -801,7 +828,13 @@ impl ShelfFeature {
             .show(ui, |ui| {
                 for (index, book) in books.iter().enumerate() {
                     let selected = selected_id.as_deref() == Some(book.id.as_str());
-                    if self.book_card(ui, book, selected, selected && request_selected_focus) {
+                    if self.book_card(
+                        ui,
+                        book,
+                        selected,
+                        selected && request_selected_focus,
+                        interaction_blocked,
+                    ) {
                         self.shelf.selected_book_id = Some(book.id.clone());
                         open_path = Some(book.path.clone());
                     }
@@ -821,19 +854,29 @@ impl ShelfFeature {
         book: &LibraryBook,
         selected: bool,
         request_focus: bool,
+        interaction_blocked: bool,
     ) -> bool {
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(CARD_WIDTH, CARD_HEIGHT), egui::Sense::click());
-        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-        if request_focus {
+        let response = if interaction_blocked {
+            response
+        } else {
+            response.on_hover_cursor(egui::CursorIcon::PointingHand)
+        };
+        if request_focus && !interaction_blocked {
             response.request_focus();
             response.scroll_to_me(None);
+        }
+        if response.has_focus() && !interaction_blocked {
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(response.id, shelf_book_focus_filter());
+            });
         }
         let texture = self.cover_texture(ui.ctx(), book);
         let painter = ui.painter();
         if selected {
             painter.rect_filled(rect, 10.0, palette().accent_soft.gamma_multiply(0.65));
-        } else if response.hovered() {
+        } else if !interaction_blocked && response.hovered() {
             painter.rect_filled(rect, 10.0, palette().accent_soft.gamma_multiply(0.42));
         }
         let cover_rect = egui::Rect::from_min_size(
@@ -875,20 +918,22 @@ impl ShelfFeature {
             palette().text,
         );
 
-        let clicked = response.clicked();
-        response.context_menu(|ui| {
-            if ui
-                .button(self.language.text("从书架移除", "Remove from library"))
-                .clicked()
-            {
-                self.shelf.remove_confirmation = Some(ShelfRemoveConfirmation {
-                    id: book.id.clone(),
-                    title: book.title.clone(),
-                });
-                ui.close();
-            }
-        });
-        response.on_hover_text(&book.title);
+        let clicked = !interaction_blocked && response.clicked();
+        if !interaction_blocked {
+            response.context_menu(|ui| {
+                if ui
+                    .button(self.language.text("从书架移除", "Remove from library"))
+                    .clicked()
+                {
+                    self.shelf.remove_confirmation = Some(ShelfRemoveConfirmation {
+                        id: book.id.clone(),
+                        title: book.title.clone(),
+                    });
+                    ui.close();
+                }
+            });
+            response.on_hover_text(&book.title);
+        }
         clicked
     }
 
@@ -1067,6 +1112,15 @@ enum ShelfKeyboardAction {
     Move(ShelfSelectionDirection),
     FocusSelection,
     Open,
+}
+
+const fn shelf_book_focus_filter() -> egui::EventFilter {
+    egui::EventFilter {
+        tab: false,
+        horizontal_arrows: true,
+        vertical_arrows: true,
+        escape: false,
+    }
 }
 
 fn shelf_grid_columns(available_width: f32) -> usize {
@@ -1400,5 +1454,15 @@ mod tests {
             move_shelf_selection(0, 8, 3, ShelfSelectionDirection::Up),
             0
         );
+    }
+
+    #[test]
+    fn shelf_book_focus_keeps_arrow_keys_inside_the_grid() {
+        let filter = shelf_book_focus_filter();
+
+        assert!(filter.horizontal_arrows);
+        assert!(filter.vertical_arrows);
+        assert!(!filter.tab);
+        assert!(!filter.escape);
     }
 }

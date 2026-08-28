@@ -60,11 +60,19 @@ impl DesktopApp {
         page_texture: Option<ReaderPageTexture>,
     ) -> Option<ReaderFramePlan> {
         self.reconcile_state(ui.ctx());
+        let open_settings_shortcut = self.settings.applied().shortcuts.open_settings;
+        if !self.settings.is_open()
+            && ui
+                .ctx()
+                .input_mut(|input| input.consume_shortcut(&open_settings_shortcut))
+        {
+            self.settings.open();
+        }
         let interaction_blocked = self.settings.is_open();
         let plan = if let Some(reader) = self.reader.as_mut() {
             Some(reader.ui(ui, page_texture, interaction_blocked))
         } else {
-            self.shelf.ui(ui);
+            self.shelf.ui(ui, interaction_blocked);
             None
         };
 
@@ -107,6 +115,16 @@ impl DesktopApp {
 
     pub(crate) fn take_fullscreen_toggle_request(&mut self) -> bool {
         std::mem::take(&mut self.fullscreen_toggle_requested)
+    }
+
+    pub(crate) fn open_settings_shortcut(&self) -> egui::KeyboardShortcut {
+        self.settings.applied().shortcuts.open_settings
+    }
+
+    pub(crate) fn open_settings(&mut self) {
+        if !self.settings.is_open() {
+            self.settings.open();
+        }
     }
 
     pub(crate) fn reader_scene(&mut self) -> Option<ReaderScene> {
