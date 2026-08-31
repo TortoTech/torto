@@ -187,6 +187,7 @@ pub(crate) fn text_block_text(block: &TextBlock) -> String {
         .map(|inline| match inline {
             Inline::Text(run) => run.text.as_str(),
             Inline::Math(run) => run.latex.as_str(),
+            Inline::Image(_) => "",
             Inline::Break => "\n",
         })
         .collect()

@@ -402,7 +402,7 @@ impl BookSource for TranslationBookSource {
                         .iter()
                         .find_map(|inline| match inline {
                             Inline::Text(run) => Some(run.style),
-                            Inline::Math(_) | Inline::Break => None,
+                            Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
                         })
                         .unwrap_or_default();
                     match mode {
@@ -524,7 +524,7 @@ fn translated_table(
             .iter()
             .find_map(|inline| match inline {
                 Inline::Text(run) => Some(run.style),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .unwrap_or_default();
         if mode == TranslationMode::Replace {
@@ -576,7 +576,7 @@ fn translated_quote_text(
         .iter()
         .find_map(|inline| match inline {
             Inline::Text(run) => Some(run.style),
-            Inline::Math(_) | Inline::Break => None,
+            Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
         })
         .unwrap_or_default();
     if mode == TranslationMode::Replace {
@@ -607,7 +607,7 @@ fn translated_figure(
             .iter()
             .find_map(|inline| match inline {
                 Inline::Text(run) => Some(run.style),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .unwrap_or_default();
         let original = caption.content.clone();
@@ -933,6 +933,7 @@ fn translation_text(block: &TextBlock) -> String {
                 push_math_placeholder(&mut text, math_index);
                 math_index += 1;
             }
+            Inline::Image(_) => {}
             Inline::Break => text.push('\n'),
         }
     }
@@ -1046,7 +1047,7 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
         .iter()
         .filter_map(|inline| match inline {
             Inline::Math(run) => Some(run.clone()),
-            Inline::Text(_) | Inline::Break => None,
+            Inline::Text(_) | Inline::Image(_) | Inline::Break => None,
         })
         .collect::<Vec<_>>();
     if !math.is_empty() && validate_math_placeholder_count(&text, math.len()).is_err() {
@@ -1062,7 +1063,71 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
     for (text, style) in styled {
         append_translated_span(&mut content, &text, style, original, &math);
     }
+    restore_inline_images(&mut content, original);
     content
+}
+
+fn restore_inline_images(content: &mut Vec<Inline>, original: &[Inline]) {
+    let original_length = original.iter().map(inline_translation_units).sum::<usize>();
+    let translated_length = content.iter().map(inline_translation_units).sum::<usize>();
+    let mut cursor = 0usize;
+    let mut images = Vec::new();
+    for inline in original {
+        if let Inline::Image(run) = inline {
+            let target = if original_length == 0 {
+                0
+            } else {
+                cursor.saturating_mul(translated_length) / original_length
+            };
+            images.push((target, run.clone()));
+        } else {
+            cursor += inline_translation_units(inline);
+        }
+    }
+    for (target, image) in images.into_iter().rev() {
+        insert_inline_at_offset(content, target, Inline::Image(image));
+    }
+}
+
+fn inline_translation_units(inline: &Inline) -> usize {
+    match inline {
+        Inline::Text(run) => run.text.chars().count(),
+        Inline::Math(_) | Inline::Break => 1,
+        Inline::Image(_) => 0,
+    }
+}
+
+fn insert_inline_at_offset(content: &mut Vec<Inline>, offset: usize, value: Inline) {
+    let mut cursor = 0;
+    for index in 0..content.len() {
+        let len = inline_translation_units(&content[index]);
+        if offset <= cursor {
+            content.insert(index, value);
+            return;
+        }
+        if let Inline::Text(run) = &content[index]
+            && offset < cursor + len
+        {
+            let split = offset - cursor;
+            let mut trailing = run.clone();
+            let leading = run.text.chars().take(split).collect::<String>();
+            trailing.text = run.text.chars().skip(split).collect();
+            let mut replacement = Vec::with_capacity(3);
+            if !leading.is_empty() {
+                let mut leading_run = run.clone();
+                leading_run.text = leading;
+                replacement.push(Inline::Text(leading_run));
+            }
+            replacement.push(value);
+            if !trailing.text.is_empty() {
+                replacement.push(Inline::Text(trailing));
+            }
+            content.splice(index..=index, replacement);
+            return;
+        }
+        cursor += len;
+    }
+    content.push(value);
 }
 
 fn validate_math_placeholder_count(text: &str, math_count: usize) -> Result<(), ()> {
@@ -1142,7 +1207,7 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
         .iter()
         .find_map(|inline| match inline {
             Inline::Text(run) if run.style.baseline == TextBaseline::Normal => Some(run.style),
-            Inline::Text(_) | Inline::Math(_) | Inline::Break => None,
+            Inline::Text(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
         })
         .unwrap_or(fallback);
     style.bold = false;
@@ -1367,7 +1432,7 @@ fn restore_original_baselines(
         .map(|inline| match inline {
             Inline::Text(run) => run.text.chars().count(),
             Inline::Break => 1,
-            Inline::Math(_) => 0,
+            Inline::Math(_) | Inline::Image(_) => 0,
         })
         .sum::<usize>()
         .max(1);
@@ -1392,7 +1457,7 @@ fn restore_original_baselines(
                 original_offset += 1;
                 None
             }
-            Inline::Math(_) => None,
+            Inline::Math(_) | Inline::Image(_) => None,
         })
         .collect::<Vec<_>>();
     if markers.is_empty() {
@@ -1620,6 +1685,45 @@ mod tests {
     }
 
     #[test]
+    fn replacement_preserves_inline_heading_images_at_their_relative_position() {
+        let image = rebook_publication::InlineImageRun {
+            image: ImageBlock {
+                href: PublicationUrl::parse("images/chapter-icon.jpg").unwrap(),
+                alt: String::new(),
+                style: ImageStyle::default(),
+                source: None,
+                text_layer: None,
+            },
+            size_scale: 1.0,
+            presentation: true,
+        };
+        let original = vec![
+            Inline::Image(Box::new(image.clone())),
+            Inline::Text(TextRun {
+                text: "Why Goal Setting Is Broken".into(),
+                style: TextStyle::default(),
+                link: None,
+            }),
+        ];
+
+        assert_eq!(
+            translation_text(&TextBlock {
+                kind: TextBlockKind::Heading(1),
+                content: original.clone(),
+                style: BlockStyle::default(),
+                source: None,
+            }),
+            "Why Goal Setting Is Broken"
+        );
+        let translated =
+            replacement_content("目标设定的致命缺陷", TextStyle::default(), Some(&original));
+        assert!(matches!(translated.first(), Some(Inline::Image(run)) if run.as_ref() == &image));
+        assert!(
+            matches!(translated.get(1), Some(Inline::Text(run)) if run.text == "目标设定的致命缺陷")
+        );
+    }
+
+    #[test]
     fn translation_preserves_and_restores_baseline_markers() {
         let footnote_target = PublicationUrl::parse("notes.xhtml#note-4").unwrap();
         let superscript = TextStyle {
@@ -1676,7 +1780,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<String>();
         assert_eq!(rendered, "这是主要优势。4");
@@ -1737,7 +1841,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Math(run) => Some(run),
-                Inline::Text(_) | Inline::Break => None,
+                Inline::Text(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(formulas, [&second, &first]);
@@ -1967,7 +2071,7 @@ mod tests {
         );
         assert!(cached.iter().all(|inline| match inline {
             Inline::Text(run) => !run.style.bold && !run.style.italic,
-            Inline::Math(_) | Inline::Break => true,
+            Inline::Math(_) | Inline::Image(_) | Inline::Break => true,
         }));
     }
 

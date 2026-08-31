@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 
 use rebook_publication::{
     Block, BlockStyle, CaptionPosition, FigureBlock, ImageBlock, ImageLength, ImageStyle, Inline,
-    InlineRole, LinkRole, MathRun, NoteBlock, NoteBlockKind, PublicationUrl, QuoteBlock, Rgba,
-    Section, SectionAnchor, SeparatorBlock, SourceAnchor, SourceRange, SpineItem, SpineItemId,
-    TableBlock, TableCell, TableRow, TextAlignment, TextBaseline, TextBlock, TextBlockKind,
-    TextRun, TextStyle,
+    InlineImageRun, InlineRole, LinkRole, MathRun, NoteBlock, NoteBlockKind, PublicationUrl,
+    QuoteBlock, Rgba, Section, SectionAnchor, SeparatorBlock, SourceAnchor, SourceRange, SpineItem,
+    SpineItemId, TableBlock, TableCell, TableRow, TextAlignment, TextBaseline, TextBlock,
+    TextBlockKind, TextRun, TextStyle,
 };
 use roxmltree::{Document, Node};
 use thiserror::Error;
@@ -1177,6 +1177,7 @@ impl<'a> ReadingIrParser<'a> {
                     .map(|inline| match inline {
                         Inline::Text(run) => run.text.chars().count() as u64,
                         Inline::Math(_) => 0,
+                        Inline::Image(_) => 0,
                         Inline::Break => 1,
                     })
                     .sum();
@@ -1309,12 +1310,19 @@ impl<'a> ReadingIrParser<'a> {
             style.align = alignment;
             style.authored_alignment = Some(alignment);
         }
+        let inline_heading_images = matches!(kind, TextBlockKind::Heading(_))
+            && node
+                .descendants()
+                .filter(Node::is_text)
+                .filter_map(|text| text.text())
+                .any(|text| !text.trim().is_empty());
         let mut collector = InlineCollector::new(matches!(kind, TextBlockKind::Preformatted));
         collect_inline(
             node,
             self.styles.text_style_for_block(node, kind),
             None,
-            &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links),
+            &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
+                .with_inline_heading_images(inline_heading_images),
             &mut collector,
         );
         collector.finish();
@@ -1329,6 +1337,7 @@ impl<'a> ReadingIrParser<'a> {
             .map(|inline| match inline {
                 Inline::Text(run) => run.text.chars().count() as u64,
                 Inline::Math(_) => 0,
+                Inline::Image(_) => 0,
                 Inline::Break => 1,
             })
             .sum();
@@ -1353,6 +1362,8 @@ impl<'a> ReadingIrParser<'a> {
                         "img" | "image"
                     )
                     && !image_is_footnote_reference(*descendant, &self.footnote_links)
+                    && !(inline_heading_images
+                        && inline_presentation_image_scale(*descendant, &self.styles).is_some())
             })
             .collect::<Vec<_>>();
         let image_count = images.len();
@@ -1383,6 +1394,7 @@ impl<'a> ReadingIrParser<'a> {
             .map(|inline| match inline {
                 Inline::Text(run) => run.text.chars().count() as u64,
                 Inline::Math(_) => 0,
+                Inline::Image(_) => 0,
                 Inline::Break => 1,
             })
             .sum();
@@ -2000,6 +2012,11 @@ impl InlineCollector {
         self.last_was_space = false;
     }
 
+    fn push_image(&mut self, image: InlineImageRun) {
+        self.content.push(Inline::Image(Box::new(image)));
+        self.last_was_space = false;
+    }
+
     fn finish(&mut self) {
         if let Some(Inline::Text(run)) = self.content.last_mut() {
             while run.text.ends_with(' ') {
@@ -2050,6 +2067,7 @@ struct InlineParseContext<'a> {
     base: &'a PublicationUrl,
     styles: &'a StyleSheet,
     footnote_links: &'a HashMap<usize, LinkRole>,
+    inline_heading_images: bool,
 }
 
 impl<'a> InlineParseContext<'a> {
@@ -2062,8 +2080,55 @@ impl<'a> InlineParseContext<'a> {
             base,
             styles,
             footnote_links,
+            inline_heading_images: false,
         }
     }
+
+    const fn with_inline_heading_images(mut self, enabled: bool) -> Self {
+        self.inline_heading_images = enabled;
+        self
+    }
+}
+
+fn inline_presentation_image_scale(node: Node<'_, '_>, styles: &StyleSheet) -> Option<f32> {
+    let presentation =
+        attribute_local(node, "role").is_some_and(|role| role.eq_ignore_ascii_case("presentation"));
+    let empty_alt = attribute_local(node, "alt").is_none_or(|alt| alt.trim().is_empty());
+    if !presentation && !empty_alt {
+        return None;
+    }
+    styles
+        .inline_image_height_em(node)
+        .filter(|scale| (0.25..=3.0).contains(scale))
+}
+
+fn inline_presentation_image(
+    node: Node<'_, '_>,
+    inherited: TextStyle,
+    context: &InlineParseContext<'_>,
+) -> Option<InlineImageRun> {
+    if !context.inline_heading_images {
+        return None;
+    }
+    let size_scale = inline_presentation_image_scale(node, context.styles)? * inherited.size_scale;
+    let src = attribute_local(node, "src")
+        .or_else(|| attribute_local(node, "href"))?
+        .trim();
+    if src.is_empty() {
+        return None;
+    }
+    Some(InlineImageRun {
+        image: ImageBlock {
+            href: context.base.resolve(src).ok()?.resource_url(),
+            alt: attribute_local(node, "alt").unwrap_or_default().to_owned(),
+            style: context.styles.image_style(node),
+            source: None,
+            text_layer: None,
+        },
+        size_scale,
+        presentation: attribute_local(node, "role")
+            .is_some_and(|role| role.eq_ignore_ascii_case("presentation")),
+    })
 }
 
 fn image_is_footnote_reference(
@@ -2178,6 +2243,8 @@ fn collect_inline_node_with_block_boundaries(
                 inherited,
                 link.cloned(),
             );
+        } else if let Some(image) = inline_presentation_image(node, inherited, context) {
+            collector.push_image(image);
         }
         return;
     }
@@ -2435,7 +2502,7 @@ fn strip_authored_list_marker(content: &mut Vec<Inline>) {
             .chars()
             .next()
             .is_some_and(is_semantic_bullet_char),
-        Inline::Math(_) | Inline::Break => false,
+        Inline::Math(_) | Inline::Image(_) | Inline::Break => false,
     }) else {
         return;
     };
@@ -2845,6 +2912,15 @@ impl StyleSheet {
             self.apply_text_node(ancestor, &mut style, inherited_size);
         }
         style
+    }
+
+    fn inline_image_height_em(&self, node: Node<'_, '_>) -> Option<f32> {
+        let properties = self.cascaded_properties(node);
+        properties
+            .get("height")
+            .map(String::as_str)
+            .or_else(|| attribute_local(node, "height"))
+            .and_then(inline_em_length)
     }
 
     fn image_style(&self, node: Node<'_, '_>) -> ImageStyle {
@@ -3326,6 +3402,15 @@ fn image_length(value: &str) -> Option<ImageLength> {
         .then_some(ImageLength::Pixels(pixels.max(0.0)))
 }
 
+fn inline_em_length(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value.ends_with("rem") {
+        return None;
+    }
+    let em = value.strip_suffix("em")?.trim().parse::<f32>().ok()?;
+    em.is_finite().then_some(em.max(0.0))
+}
+
 fn attribute_local<'a>(node: Node<'a, '_>, name: &str) -> Option<&'a str> {
     node.attributes()
         .find(|attribute| attribute.name().eq_ignore_ascii_case(name))
@@ -3359,6 +3444,7 @@ mod tests {
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
                 Inline::Math(run) => Some(run.latex.as_str()),
+                Inline::Image(_) => None,
                 Inline::Break => Some("\n"),
             })
             .collect()
@@ -3577,7 +3663,7 @@ mod tests {
             .map(|inline| match inline {
                 Inline::Text(run) => run.text.as_str(),
                 Inline::Break => "\n",
-                Inline::Math(_) => "",
+                Inline::Math(_) | Inline::Image(_) => "",
             })
             .collect::<String>();
 
@@ -3609,7 +3695,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some((run.text.trim(), run.style)),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
 
@@ -3653,7 +3739,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<String>();
         assert_eq!(text, "2015年，Dark\u{00a0}Reading 报道");
@@ -3683,7 +3769,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some((run.text.trim(), run.style.inline_role)),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
 
@@ -3715,7 +3801,7 @@ mod tests {
             .flatten()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
 
@@ -3783,7 +3869,7 @@ mod tests {
                 Inline::Text(run) if run.style.link_role == LinkRole::FootnoteReference => {
                     Some(run)
                 }
-                Inline::Text(_) | Inline::Math(_) | Inline::Break => None,
+                Inline::Text(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .expect("image-backed footnote reference");
         assert_eq!(reference.text, "译");
@@ -3802,7 +3888,7 @@ mod tests {
             .flat_map(|block| &block.content)
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<String>();
         assert!(paragraph_text.contains("网站译以及"));
@@ -3831,7 +3917,7 @@ mod tests {
             .flatten()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
 
@@ -3868,7 +3954,7 @@ mod tests {
             .flatten()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
 
@@ -4072,6 +4158,37 @@ mod tests {
     }
 
     #[test]
+    fn keeps_em_sized_presentation_images_inline_with_heading_text() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OEBPS/xhtml/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+            <head><style>
+                img.height_1em { height: 1em; vertical-align: middle; margin-right: .25em; }
+            </style></head>
+            <body><h2><img alt="" class="height_1em" role="presentation"
+                src="../images/chapter-icon.jpg"/>Why Goal Setting Is Broken</h2></body>
+        </html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Text(heading)] = section.blocks.as_slice() else {
+            panic!("expected one heading block with no standalone image");
+        };
+        assert!(matches!(heading.kind, TextBlockKind::Heading(2)));
+        let [Inline::Image(image), Inline::Text(text)] = heading.content.as_slice() else {
+            panic!("expected the chapter icon before the heading text");
+        };
+        assert_eq!(image.image.href.path(), "OEBPS/images/chapter-icon.jpg");
+        assert!(image.presentation);
+        assert_close(image.size_scale, text.style.size_scale);
+        assert_eq!(text.text, "Why Goal Setting Is Broken");
+    }
+
+    #[test]
     fn parses_figure_image_and_caption_as_one_semantic_block() {
         let descriptor = SpineItem {
             id: SpineItemId::new("chapter").unwrap(),
@@ -4102,7 +4219,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<String>();
         assert_eq!(caption_text, "Figure 1. New growth.");
@@ -4240,7 +4357,7 @@ mod tests {
                     .iter()
                     .filter_map(|inline| match inline {
                         Inline::Text(run) => Some(run.text.as_str()),
-                        Inline::Math(_) | Inline::Break => None,
+                        Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
                     })
                     .collect::<String>(),
                 _ => panic!("expected only text blocks"),
@@ -4318,7 +4435,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<String>();
         assert_eq!(text, "A semantic item");
@@ -4480,7 +4597,7 @@ mod tests {
                     .iter()
                     .filter_map(|inline| match inline {
                         Inline::Text(run) => Some(run.text.as_str()),
-                        Inline::Math(_) | Inline::Break => None,
+                        Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
                     })
                     .collect::<String>()
             })
@@ -4568,7 +4685,7 @@ mod tests {
                         .iter()
                         .filter_map(|inline| match inline {
                             Inline::Text(run) => Some(run.text.as_str()),
-                            Inline::Math(_) | Inline::Break => None,
+                            Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
                         })
                         .collect::<String>(),
                 ),
@@ -4681,7 +4798,7 @@ mod tests {
                         .iter()
                         .filter_map(|inline| match inline {
                             Inline::Text(run) => Some(run.text.as_str()),
-                            Inline::Math(_) | Inline::Break => None,
+                            Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
                         })
                         .collect::<String>(),
                 ),
@@ -4777,7 +4894,7 @@ mod tests {
                         .iter()
                         .filter_map(|inline| match inline {
                             Inline::Text(run) => Some(run.text.as_str()),
-                            Inline::Math(_) | Inline::Break => None,
+                            Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
                         })
                         .collect::<String>(),
                 )),

@@ -220,6 +220,26 @@ enum TocKeyboardAction {
     Activate,
 }
 
+const fn toc_keyboard_navigation_enabled(is_focus_mode: bool, sidebar_pinned: bool) -> bool {
+    is_focus_mode || !sidebar_pinned
+}
+
+fn shortcut_has_fresh_press(input: &egui::InputState, shortcut: &egui::KeyboardShortcut) -> bool {
+    input.raw.events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } if *key == shortcut.logical_key
+                && modifiers.matches_logically(shortcut.modifiers)
+        )
+    })
+}
+
 fn next_toc_keyboard_row(
     current: Option<usize>,
     active: Option<usize>,
@@ -1045,6 +1065,7 @@ impl DesktopReader {
         if interaction_blocked
             || !self.ui.sidebar_open
             || self.ui.sidebar_tab != SidebarTab::Toc
+            || !toc_keyboard_navigation_enabled(self.is_focus_mode(), self.ui.sidebar_pinned)
             || self.ui.overlay_visible()
             || self.image_preview.is_some()
             || self.annotation_note_draft.is_some()
@@ -1219,15 +1240,23 @@ impl DesktopReader {
                 extend_previous,
                 extend_next,
                 previous_unit,
+                previous_unit_fresh,
                 next_unit,
+                next_unit_fresh,
                 previous_section,
                 next_section,
             ) = ctx.input_mut(|input| {
+                let previous_unit_fresh =
+                    shortcut_has_fresh_press(input, &self.shortcuts.previous_page_or_paragraph);
+                let next_unit_fresh =
+                    shortcut_has_fresh_press(input, &self.shortcuts.next_page_or_paragraph);
                 (
                     input.consume_shortcut(&self.shortcuts.focus_extend_selection_previous),
                     input.consume_shortcut(&self.shortcuts.focus_extend_selection_next),
                     input.consume_shortcut(&self.shortcuts.previous_page_or_paragraph),
+                    previous_unit_fresh,
                     input.consume_shortcut(&self.shortcuts.next_page_or_paragraph),
+                    next_unit_fresh,
                     input.consume_shortcut(&self.shortcuts.previous_section),
                     input.consume_shortcut(&self.shortcuts.next_section),
                 )
@@ -1238,12 +1267,14 @@ impl DesktopReader {
                 self.extend_focus_selection(PageDirection::Next);
             } else if previous_unit {
                 self.cancel_text_selection();
-                if !self.scroll_within_tall_focus_unit(PageDirection::Previous) {
+                if !self.scroll_within_tall_focus_unit(PageDirection::Previous)
+                    && previous_unit_fresh
+                {
                     self.move_focus_unit(PageDirection::Previous);
                 }
             } else if next_unit {
                 self.cancel_text_selection();
-                if !self.scroll_within_tall_focus_unit(PageDirection::Next) {
+                if !self.scroll_within_tall_focus_unit(PageDirection::Next) && next_unit_fresh {
                     self.move_focus_unit(PageDirection::Next);
                 }
             } else if previous_section {
@@ -5323,6 +5354,13 @@ mod reference_suggestion_label_tests {
             next_toc_keyboard_row(None, None, 0, PageDirection::Next),
             None
         );
+    }
+
+    #[test]
+    fn pinned_classic_toc_leaves_vertical_navigation_to_the_reader() {
+        assert!(!toc_keyboard_navigation_enabled(false, true));
+        assert!(toc_keyboard_navigation_enabled(false, false));
+        assert!(toc_keyboard_navigation_enabled(true, true));
     }
 
     #[test]

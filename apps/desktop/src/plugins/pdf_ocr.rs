@@ -2131,7 +2131,8 @@ fn markdown_to_html_with_toc_anchors(markdown: &str, anchors: &[OcrTocAnchor]) -
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_MATH;
     let normalized = normalize_ocr_math_delimiters(markdown);
-    let events = Parser::new_ext(&normalized, options).collect::<Vec<_>>();
+    let mut events = Parser::new_ext(&normalized, options).collect::<Vec<_>>();
+    normalize_plain_ocr_hard_breaks(&mut events);
     let mut anchors_at_event = HashMap::<usize, String>::new();
     let mut matched = vec![false; anchors.len()];
     let mut cursor = 0;
@@ -2205,6 +2206,122 @@ fn markdown_to_html_with_toc_anchors(markdown: &str, anchors: &[OcrTocAnchor]) -
     let mut output = String::new();
     html::push_html(&mut output, parser);
     output
+}
+
+fn normalize_plain_ocr_hard_breaks(events: &mut [Event<'_>]) {
+    let mut excluded_depth = 0usize;
+    let mut paragraph_start = None;
+    let mut candidates = Vec::<Range<usize>>::new();
+
+    for (index, event) in events.iter().enumerate() {
+        match event {
+            Event::Start(tag) => {
+                if is_non_plain_ocr_container_start(tag) {
+                    excluded_depth += 1;
+                } else if matches!(tag, Tag::Paragraph) && excluded_depth == 0 {
+                    paragraph_start = Some(index + 1);
+                }
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if let Some(start) = paragraph_start.take()
+                    && plain_ocr_paragraph_has_safe_hard_breaks(&events[start..index])
+                {
+                    candidates.push(start..index);
+                }
+            }
+            Event::End(tag) if is_non_plain_ocr_container_end(tag) => {
+                excluded_depth = excluded_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    for range in candidates {
+        for event in &mut events[range] {
+            if matches!(event, Event::HardBreak) {
+                *event = Event::SoftBreak;
+            }
+        }
+    }
+}
+
+fn is_non_plain_ocr_container_start(tag: &Tag<'_>) -> bool {
+    matches!(
+        tag,
+        Tag::BlockQuote(_)
+            | Tag::CodeBlock(_)
+            | Tag::List(_)
+            | Tag::Item
+            | Tag::FootnoteDefinition(_)
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::TableRow
+            | Tag::TableCell
+            | Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition
+    )
+}
+
+fn is_non_plain_ocr_container_end(tag: &TagEnd) -> bool {
+    matches!(
+        tag,
+        TagEnd::BlockQuote(_)
+            | TagEnd::CodeBlock
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::FootnoteDefinition
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+    )
+}
+
+fn plain_ocr_paragraph_has_safe_hard_breaks(events: &[Event<'_>]) -> bool {
+    if events.iter().any(|event| {
+        matches!(
+            event,
+            Event::Html(_)
+                | Event::InlineHtml(_)
+                | Event::DisplayMath(_)
+                | Event::Rule
+                | Event::Start(Tag::Image { .. })
+        )
+    }) {
+        return false;
+    }
+
+    let mut line_lengths = vec![0usize];
+    let mut visible_characters = 0usize;
+    let mut has_hard_break = false;
+    for event in events {
+        match event {
+            Event::Text(value) | Event::Code(value) | Event::InlineMath(value) => {
+                let count = value
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .count();
+                *line_lengths.last_mut().expect("line length exists") += count;
+                visible_characters += count;
+            }
+            Event::HardBreak => {
+                has_hard_break = true;
+                line_lengths.push(0);
+            }
+            _ => {}
+        }
+    }
+
+    has_hard_break
+        && visible_characters >= 48
+        && line_lengths
+            .iter()
+            .take(line_lengths.len().saturating_sub(1))
+            .any(|length| *length >= 24)
 }
 
 fn markdown_heading_keys(markdown: &str) -> Vec<String> {
@@ -3944,5 +4061,29 @@ mod tests {
                 .map(|item| item.label.as_str());
             println!("TOC={label:?} TARGET={before:?} ACTIVE={active:?}");
         }
+    }
+
+    #[test]
+    fn ordinary_ocr_prose_collapses_safe_markdown_hard_breaks() {
+        let html = markdown_to_html(
+            "An ordinary OCR paragraph can contain line endings copied from the physical page,  \n\
+             even though those endings are not semantic paragraph boundaries and should wrap naturally.  \n\
+             The final source line remains part of the same prose paragraph.",
+        );
+
+        assert!(!html.contains("<br"), "{html}");
+        assert!(html.contains("physical page,\neven though"), "{html}");
+    }
+
+    #[test]
+    fn short_display_lines_and_nested_blocks_keep_hard_breaks() {
+        let short = markdown_to_html("BOOK TITLE  \nA subtitle");
+        let quote = markdown_to_html(
+            "> A deliberately long quoted line keeps its explicit Markdown break for semantics.  \n\
+             > The second quoted line must not be flattened into ordinary OCR prose.",
+        );
+
+        assert!(short.contains("<br"), "{short}");
+        assert!(quote.contains("<br"), "{quote}");
     }
 }

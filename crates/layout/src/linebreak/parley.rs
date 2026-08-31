@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use icu_segmenter::{LineSegmenter, options::LineBreakOptions};
-use parley::Layout;
+use parley::{InlineBox, InlineBoxKind, Layout};
 use unicode_script::{Script, UnicodeScript};
 
 use crate::{TextBaseline, TextBrush};
@@ -46,13 +46,16 @@ pub(crate) fn plan_optimized(
     first_line_indent: f32,
     default_em: f32,
 ) -> Option<ParagraphPlan> {
-    if text.is_empty()
+    let has_in_flow_box = layout
+        .inline_boxes()
+        .iter()
+        .any(|inline_box| inline_box.kind == InlineBoxKind::InFlow);
+    if (text.is_empty() && !has_in_flow_box)
         || !column_width.is_finite()
         || column_width <= 0.0
         || !default_em.is_finite()
         || default_em <= 0.0
         || !is_supported_ltr_prose(text)
-        || !layout.inline_boxes().is_empty()
         || layout.is_rtl()
     {
         return None;
@@ -85,7 +88,14 @@ pub(crate) fn plan_optimized(
         }
     }
 
-    plan_measured_text(text, &clusters, column_width, first_line_indent, default_em)
+    plan_measured_content(
+        text,
+        &clusters,
+        layout.inline_boxes(),
+        column_width,
+        first_line_indent,
+        default_em,
+    )
 }
 
 /// Applies the same Unicode-aware Knuth--Plass paragraph optimization used by
@@ -98,8 +108,31 @@ pub fn plan_measured_text(
     first_line_indent: f32,
     default_em: f32,
 ) -> Option<ParagraphPlan> {
-    if text.is_empty()
-        || measured.is_empty()
+    plan_measured_content(
+        text,
+        measured,
+        &[],
+        column_width,
+        first_line_indent,
+        default_em,
+    )
+}
+
+fn plan_measured_content(
+    text: &str,
+    measured: &[MeasuredCluster],
+    inline_boxes: &[InlineBox],
+    column_width: f32,
+    first_line_indent: f32,
+    default_em: f32,
+) -> Option<ParagraphPlan> {
+    let mut in_flow_boxes = inline_boxes
+        .iter()
+        .filter(|inline_box| inline_box.kind == InlineBoxKind::InFlow)
+        .collect::<Vec<_>>();
+    in_flow_boxes.sort_by_key(|inline_box| inline_box.index);
+    if (text.is_empty() && in_flow_boxes.is_empty())
+        || (measured.is_empty() && in_flow_boxes.is_empty())
         || !column_width.is_finite()
         || column_width <= 0.0
         || !default_em.is_finite()
@@ -112,7 +145,7 @@ pub fn plan_measured_text(
         .segment_str(text)
         .collect::<Vec<_>>();
     let mut expected_start = 0;
-    let mut clusters = Vec::with_capacity(measured.len());
+    let mut text_clusters = Vec::with_capacity(measured.len());
     for cluster in measured {
         if cluster.range.start != expected_start || cluster.range.end <= cluster.range.start {
             return None;
@@ -121,7 +154,7 @@ pub fn plan_measured_text(
         let mut characters = source.chars();
         let first = characters.next()?;
         let last = characters.last().unwrap_or(first);
-        clusters.push(ShapedCluster {
+        text_clusters.push(ShapedCluster {
             range: cluster.range.clone(),
             advance: cluster.advance,
             em: cluster.em,
@@ -132,12 +165,45 @@ pub fn plan_measured_text(
             break_after: legal_breaks.binary_search(&cluster.range.end).is_ok(),
             ordinary_baseline: cluster.ordinary_baseline,
             footnote_reference: cluster.footnote_reference,
+            inline_box: false,
         });
         expected_start = cluster.range.end;
     }
     if expected_start != text.len() {
         return None;
     }
+
+    let mut clusters = Vec::with_capacity(text_clusters.len() + in_flow_boxes.len());
+    let mut text_clusters = text_clusters.into_iter().peekable();
+    for inline_box in in_flow_boxes {
+        if inline_box.index > text.len()
+            || !text.is_char_boundary(inline_box.index)
+            || !inline_box.width.is_finite()
+            || inline_box.width < 0.0
+        {
+            return None;
+        }
+        while text_clusters
+            .peek()
+            .is_some_and(|cluster| cluster.range.end <= inline_box.index)
+        {
+            clusters.push(text_clusters.next()?);
+        }
+        clusters.push(ShapedCluster {
+            range: inline_box.index..inline_box.index,
+            advance: inline_box.width,
+            em: default_em,
+            first: '\u{fffc}',
+            last: '\u{fffc}',
+            is_space: false,
+            is_breakable_space: false,
+            break_after: legal_breaks.binary_search(&inline_box.index).is_ok(),
+            ordinary_baseline: false,
+            footnote_reference: false,
+            inline_box: true,
+        });
+    }
+    clusters.extend(text_clusters);
     clusters.last_mut()?.break_after = true;
 
     let items = shaped_cluster_items(&clusters)?;
@@ -193,6 +259,7 @@ struct ShapedCluster {
     break_after: bool,
     ordinary_baseline: bool,
     footnote_reference: bool,
+    inline_box: bool,
 }
 
 fn shaped_cluster_items(clusters: &[ShapedCluster]) -> Option<Vec<ClusterItem>> {
@@ -253,7 +320,7 @@ fn merge_spacing_adjustments(
     const EPSILON: f32 = 0.000_1;
     let mut merged: Vec<SpacingAdjustment> = Vec::new();
     for (cluster, amount) in clusters.iter().zip(adjustments.iter().copied()) {
-        if amount.abs() <= EPSILON {
+        if cluster.inline_box || cluster.range.is_empty() || amount.abs() <= EPSILON {
             continue;
         }
         if let Some(previous) = merged.last_mut()
@@ -284,6 +351,9 @@ impl PunctuationMetrics {
 }
 
 fn punctuation_metrics(cluster: &ShapedCluster) -> PunctuationMetrics {
+    if cluster.inline_box {
+        return PunctuationMetrics::default();
+    }
     // Curly quotes in proportional Latin fonts should not be treated as
     // full-width CJK punctuation merely because they share a code point.
     let full_width_quote = cluster.advance >= cluster.em * 0.75;
@@ -305,7 +375,9 @@ fn punctuation_metrics(cluster: &ShapedCluster) -> PunctuationMetrics {
 }
 
 fn should_add_mixed_script_spacing(left: &ShapedCluster, right: &ShapedCluster) -> bool {
-    if !left.ordinary_baseline
+    if left.inline_box
+        || right.inline_box
+        || !left.ordinary_baseline
         || !right.ordinary_baseline
         || left.footnote_reference
         || right.footnote_reference
@@ -421,7 +493,7 @@ fn is_rtl_codepoint(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parley::{FontContext, LayoutContext, StyleProperty};
+    use parley::{FontContext, InlineBox, InlineBoxKind, LayoutContext, StyleProperty};
 
     fn layout_for(text: &str, font_size: f32) -> Layout<TextBrush> {
         let mut font_context = FontContext::new();
@@ -527,6 +599,40 @@ mod tests {
                 .iter()
                 .all(|line| line.breakpoint != nbsp_cluster)
         );
+    }
+
+    #[test]
+    fn optimized_breaks_count_inline_boxes_as_indivisible_items() {
+        let text = "中文排版需要正确的断行机会";
+        let mut font_context = FontContext::new();
+        let mut layout_context = LayoutContext::<TextBrush>::new();
+        let mut builder = layout_context.ranged_builder(&mut font_context, text, 1.0, false);
+        builder.push_default(StyleProperty::FontSize(18.0));
+        builder.push_inline_box(InlineBox {
+            id: 7,
+            kind: InlineBoxKind::InFlow,
+            index: "中文排版".len(),
+            width: 36.0,
+            height: 18.0,
+        });
+        let mut layout = builder.build(text);
+        let plan = plan_optimized(&mut layout, text, 75.0, 0.0, 18.0)
+            .expect("inline boxes should remain optimizable");
+
+        assert!(plan.lines.len() > 1);
+        assert_eq!(
+            plan.lines
+                .iter()
+                .map(|line| line.cluster_count)
+                .sum::<u32>(),
+            u32::try_from(text.chars().count()).unwrap() + 1
+        );
+        assert!(
+            plan.adjustments
+                .iter()
+                .all(|adjustment| !adjustment.range.is_empty())
+        );
+        apply_breaks(&mut layout, &plan.lines, 75.0).expect("breaks should include the inline box");
     }
 
     #[test]

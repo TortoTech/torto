@@ -615,8 +615,23 @@ pub enum Inline {
     Text(TextRun),
     /// LaTeX formula kept as semantic inline content for native layout.
     Math(MathRun),
+    /// A small authored image that participates in the surrounding text line.
+    Image(Box<InlineImageRun>),
     /// Forced line break.
     Break,
+}
+
+/// Raster or vector image kept at its authored position inside a text block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InlineImageRun {
+    /// Publication resource and portable image constraints.
+    pub image: ImageBlock,
+    /// Height relative to the reader's base font size. Layout preserves the
+    /// intrinsic aspect ratio and scales this value with the surrounding text.
+    pub size_scale: f32,
+    /// Whether the source explicitly marked this image as presentational.
+    #[serde(default)]
+    pub presentation: bool,
 }
 
 /// A LaTeX formula embedded in a text block.

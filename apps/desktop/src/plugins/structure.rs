@@ -170,9 +170,13 @@ fn paragraph_atoms_for_content(content: &[Inline]) -> Vec<ParagraphAtom> {
             }
             Inline::Math(run) => {
                 let len = run.latex.chars().count();
+                if is_ocr_superscript_reference(run.display, &run.latex) && len > 0 {
+                    footnotes.push(cursor..cursor + len);
+                }
                 protected.extend((cursor + 1)..(cursor + len));
                 len
             }
+            Inline::Image(_) => 0,
             Inline::Break => 1,
         };
         cursor += len;
@@ -191,6 +195,20 @@ fn is_focus_footnote(run: &TextRun) -> bool {
             && (run.style.link_role == LinkRole::FootnoteReference
                 || (run.style.link_role == LinkRole::Normal
                     && run.style.baseline == TextBaseline::Superscript)))
+}
+
+fn is_ocr_superscript_reference(display: bool, latex: &str) -> bool {
+    if display {
+        return false;
+    }
+    let latex = latex.trim();
+    let Some(marker) = latex
+        .strip_prefix("^{")
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return false;
+    };
+    !marker.is_empty() && marker.chars().all(|character| character.is_ascii_digit())
 }
 
 fn attach_paired_punctuation_atoms(atoms: Vec<ParagraphAtom>, text: &str) -> Vec<ParagraphAtom> {
@@ -365,7 +383,16 @@ fn attach_footnote_atoms(
             footnotes
                 .iter()
                 .find(|range| range.start <= boundary && boundary < range.end)
-                .map_or(boundary, |range| range.end)
+                .map_or(boundary, |range| {
+                    let mut end = range.end;
+                    while chars
+                        .get(end)
+                        .is_some_and(|character| character.is_whitespace() && *character != '\n')
+                    {
+                        end += 1;
+                    }
+                    end
+                })
         })
         .collect::<Vec<_>>();
     let normalized = atoms_from_boundaries(boundaries, &chars, atoms.len());
@@ -444,6 +471,7 @@ fn inline_text(content: &[Inline]) -> String {
         .map(|inline| match inline {
             Inline::Text(run) => run.text.as_str(),
             Inline::Math(run) => run.latex.as_str(),
+            Inline::Image(_) => "",
             Inline::Break => "\n",
         })
         .collect()
@@ -474,11 +502,18 @@ fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
         let len = match inline {
             Inline::Text(run) => run.text.chars().count(),
             Inline::Math(run) => run.latex.chars().count(),
+            Inline::Image(_) => 0,
             Inline::Break => 1,
         };
         let inline_start = cursor;
         let inline_end = cursor + len;
         cursor = inline_end;
+        if let Inline::Image(run) = inline {
+            if inline_start >= start && inline_start < end {
+                sliced.push(Inline::Image(run.clone()));
+            }
+            continue;
+        }
         if inline_end <= start || inline_start >= end {
             continue;
         }
@@ -501,6 +536,7 @@ fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                 }
             }
             Inline::Math(run) => sliced.push(Inline::Math(run.clone())),
+            Inline::Image(_) => unreachable!("inline images are handled before range slicing"),
             Inline::Break => sliced.push(Inline::Break),
         }
     }
@@ -683,6 +719,52 @@ mod tests {
             inline_text(&block.content),
             "他说：“唯女子与小人为难养也。近之则不孙，远之则怨。”（《论语》卷十七）【5】\n\n话讲得机智却相当刻薄。\n\n无论如何，妇女的地位非常低下。"
         );
+    }
+
+    #[test]
+    fn ocr_superscript_math_reference_stays_with_the_preceding_sentence() {
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "Literature creates, as Ryan puts it, “possible worlds.” ".to_owned(),
+                    style: Default::default(),
+                    link: None,
+                }),
+                Inline::Math(rebook_publication::MathRun {
+                    latex: "^{11}".to_owned(),
+                    display: false,
+                    size_scale: 1.0,
+                }),
+                Inline::Text(TextRun {
+                    text: " Kittler’s proposition follows. Another sentence follows.".to_owned(),
+                    style: Default::default(),
+                    link: None,
+                }),
+            ],
+            style: Default::default(),
+            source: None,
+        };
+
+        apply_sentence_structure(&mut block);
+
+        assert_eq!(
+            inline_text(&block.content),
+            "Literature creates, as Ryan puts it, “possible worlds.” ^{11} \n\nKittler’s proposition follows. \n\nAnother sentence follows."
+        );
+        let formula = block
+            .content
+            .iter()
+            .position(|inline| matches!(inline, Inline::Math(_)))
+            .unwrap();
+        let first_break = block
+            .content
+            .iter()
+            .position(|inline| matches!(inline, Inline::Break))
+            .unwrap();
+        assert!(formula < first_break);
+        assert!(!is_ocr_superscript_reference(false, "x^{11}"));
+        assert!(!is_ocr_superscript_reference(true, "^{11}"));
     }
 
     #[test]

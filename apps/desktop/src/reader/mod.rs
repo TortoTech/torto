@@ -918,6 +918,7 @@ fn text_block_focus_text(block: &TextBlock) -> String {
             Inline::Text(run) if run.style.inline_role == InlineRole::Footnote => None,
             Inline::Text(run) => Some(run.text.as_str()),
             Inline::Math(run) => Some(run.latex.as_str()),
+            Inline::Image(_) => None,
             Inline::Break => Some("\n"),
         })
         .collect()
@@ -1323,24 +1324,48 @@ fn focus_unit_container_center_y(rect: egui::Rect) -> f32 {
     rect.top() + rect.height().max(FOCUS_UNIT_MIN_HEIGHT) / 2.0
 }
 
-fn focus_unit_scroll_bounds(
+fn focus_reading_window(viewport_height: f32) -> (f32, f32) {
+    let height = viewport_height.min(FOCUS_UNIT_MIN_HEIGHT).max(0.0);
+    let top = (viewport_height - height).max(0.0) / 2.0;
+    (top, top + height)
+}
+
+fn oversized_focus_unit_scroll_bounds(
     rect: egui::Rect,
     viewport_height: f32,
     content_padding: f32,
-) -> (f32, f32) {
-    let top = (rect.top() + content_padding).max(0.0);
-    let bottom = (rect.bottom() + content_padding - viewport_height).max(top);
-    (top, bottom)
+) -> Option<(f32, f32)> {
+    if rect.height() <= viewport_height + MOTION_EPSILON {
+        return None;
+    }
+    let (window_top, window_bottom) = focus_reading_window(viewport_height);
+    let top = (rect.top() + content_padding - window_top).max(0.0);
+    let bottom = (rect.bottom() + content_padding - window_bottom).max(top);
+    Some((top, bottom))
 }
 
 fn focus_unit_target_offset_for_rect(rect: egui::Rect, viewport_height: f32) -> f32 {
     let padding = viewport_height * 0.5;
-    let (top, bottom) = focus_unit_scroll_bounds(rect, viewport_height, padding);
-    if bottom > top {
+    if let Some((top, _)) = oversized_focus_unit_scroll_bounds(rect, viewport_height, padding) {
         top
     } else {
         (focus_unit_container_center_y(rect) + padding - viewport_height / 2.0).max(0.0)
     }
+}
+
+fn focus_offset_after_viewport_resize(
+    rect: egui::Rect,
+    previous_viewport_height: f32,
+    viewport_height: f32,
+    current_offset: f32,
+) -> f32 {
+    let padding = viewport_height * 0.5;
+    let Some((top, bottom)) = oversized_focus_unit_scroll_bounds(rect, viewport_height, padding)
+    else {
+        return focus_unit_target_offset_for_rect(rect, viewport_height);
+    };
+    let padding_delta = (viewport_height - previous_viewport_height) * 0.5;
+    (current_offset + padding_delta).clamp(top, bottom)
 }
 
 fn focus_scroll_content_height(content_height: f32, viewport_height: f32) -> f32 {
@@ -1363,6 +1388,24 @@ fn focus_unit_screen_center_y(
 fn focus_scroll_duration(distance: f32) -> Duration {
     let duration = Duration::from_secs_f32(distance.abs() / FOCUS_SCROLL_POINTS_PER_SECOND);
     duration.clamp(FOCUS_SCROLL_MIN_DURATION, FOCUS_SCROLL_MAX_DURATION)
+}
+
+fn focus_scroll_target(
+    current: f32,
+    top: f32,
+    bottom: f32,
+    step: f32,
+    direction: PageDirection,
+) -> Option<f32> {
+    match direction {
+        PageDirection::Previous if current > top + MOTION_EPSILON => {
+            Some((current - step).max(top))
+        }
+        PageDirection::Next if current < bottom - MOTION_EPSILON => {
+            Some((current + step).min(bottom))
+        }
+        PageDirection::Previous | PageDirection::Next => None,
+    }
 }
 
 impl ScrollSectionLayout {
@@ -1919,10 +1962,11 @@ impl DesktopReader {
             return false;
         };
         let padding = self.scroll_content_padding(viewport.size.y);
-        let (top, bottom) = focus_unit_scroll_bounds(unit.rect, viewport.size.y, padding);
-        if bottom <= top {
+        let Some((top, bottom)) =
+            oversized_focus_unit_scroll_bounds(unit.rect, viewport.size.y, padding)
+        else {
             return false;
-        }
+        };
         if self.ui.focus_scroll_motion.is_some_and(|motion| {
             motion.is_animating()
                 && match direction {
@@ -1939,13 +1983,10 @@ impl DesktopReader {
             .focus_scroll_motion
             .map_or(viewport.offset_y, |motion| motion.target)
             .clamp(top, bottom);
-        let step = (viewport.size.y * 0.8).max(FOCUS_UNIT_MIN_HEIGHT);
-        let target = match direction {
-            PageDirection::Previous if current > top + MOTION_EPSILON => (current - step).max(top),
-            PageDirection::Next if current < bottom - MOTION_EPSILON => {
-                (current + step).min(bottom)
-            }
-            _ => return false,
+        let (window_top, window_bottom) = focus_reading_window(viewport.size.y);
+        let step = (window_bottom - window_top).max(1.0);
+        let Some(target) = focus_scroll_target(current, top, bottom, step, direction) else {
+            return false;
         };
         self.animate_focus_scroll_to(target);
         true
@@ -2122,12 +2163,32 @@ impl DesktopReader {
     }
 
     fn update_scroll_viewport(&mut self, ctx: &egui::Context, viewport: ScrollViewportState) {
-        let changed = self.scroll_viewport.is_none_or(|previous| {
+        let previous_viewport = self.scroll_viewport;
+        let size_changed = previous_viewport.is_some_and(|previous| previous.size != viewport.size);
+        let changed = previous_viewport.is_none_or(|previous| {
             (previous.offset_y - viewport.offset_y).abs() > 0.1 || previous.size != viewport.size
         });
         self.scroll_viewport = Some(viewport);
         if changed {
             self.bump_scene_revision();
+        }
+        if self.is_focus_mode()
+            && size_changed
+            && let Some(previous) = previous_viewport
+            && let Some(unit) = self.focus_units.get(self.focus_unit_index)
+        {
+            let current_offset = self
+                .ui
+                .focus_scroll_motion
+                .map_or(previous.offset_y, |motion| motion.value);
+            self.focus_target_offset = Some(focus_offset_after_viewport_resize(
+                unit.rect,
+                previous.size.y,
+                viewport.size.y,
+                current_offset,
+            ));
+            self.ui.focus_scroll_motion = None;
+            ctx.request_repaint();
         }
 
         let (visible_position, placeholder_positions) = if self.is_focus_mode() {
@@ -3141,21 +3202,22 @@ mod tests {
     use super::navigation::snapshot_reanchors_focus;
     use super::{
         BookDisplayMetadata, Duration, FOCUS_SCROLL_MAX_DURATION, FOCUS_SCROLL_MIN_DURATION,
-        FocusFootnote, FocusFootnoteSource, FocusNavigationDestination, FocusUnit, FollowUp,
-        HashSet, Instant, MOTION_DURATION, Motion, MotionCurve, NOTICE_AUTO_DISMISS_DELAY,
-        ReaderOverlay, ReaderUiState, ScrollSectionLayout, SidebarTab, SnapshotEffects,
-        TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState,
-        allowed_reading_mode, block_is_footnote_definition, embedded_toc_is_page_index,
-        focus_block_paint_ranges, focus_footnote_text, focus_footnote_text_in_section,
-        focus_list_descendant_root, focus_navigation_destination, focus_scroll_content_height,
-        focus_scroll_duration, focus_unit_container_center_y, focus_unit_contains_source_range,
+        FOCUS_UNIT_MIN_HEIGHT, FocusFootnote, FocusFootnoteSource, FocusNavigationDestination,
+        FocusUnit, FollowUp, HashSet, Instant, MOTION_DURATION, Motion, MotionCurve,
+        NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, ScrollSectionLayout, SidebarTab,
+        SnapshotEffects, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer,
+        TranslationUiState, allowed_reading_mode, block_is_footnote_definition,
+        embedded_toc_is_page_index, focus_block_paint_ranges, focus_footnote_text,
+        focus_footnote_text_in_section, focus_list_descendant_root, focus_navigation_destination,
+        focus_offset_after_viewport_resize, focus_reading_window, focus_scroll_content_height,
+        focus_scroll_duration, focus_scroll_target, focus_unit_contains_source_range,
         focus_unit_geometry_ranges, focus_unit_matches_highlight_ranges,
-        focus_unit_screen_center_y, focus_unit_scroll_bounds, focus_unit_target_offset_for_rect,
+        focus_unit_screen_center_y, focus_unit_target_offset_for_rect,
         legacy_translated_paragraph_range, logical_dimension, merge_focus_list_descendant,
         merge_inferred_caption_focus_unit, ordered_focus_selection_bounds,
-        resolve_book_display_metadata, resolved_focus_unit_index, source_range_contains_anchor,
-        table_block_markdown, text_block_focus_footnotes, text_block_focus_text,
-        text_block_footnote_references,
+        oversized_focus_unit_scroll_bounds, resolve_book_display_metadata,
+        resolved_focus_unit_index, source_range_contains_anchor, table_block_markdown,
+        text_block_focus_footnotes, text_block_focus_text, text_block_footnote_references,
     };
     use crate::plugins::PdfOcrViewMode;
     use crate::preferences::ReadingMode;
@@ -4219,45 +4281,84 @@ mod tests {
     }
 
     #[test]
-    fn short_focus_units_share_a_stable_top_inside_the_centered_container() {
-        let short = egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 48.0));
-        let medium = egui::Rect::from_min_size(egui::pos2(20.0, 900.0), egui::vec2(600.0, 180.0));
+    fn focus_reading_window_is_centered_and_uses_the_virtual_container_height() {
+        let (top, bottom) = focus_reading_window(800.0);
 
-        assert!((focus_unit_container_center_y(short) - short.top() - 120.0).abs() < f32::EPSILON);
-        assert!(
-            (focus_unit_container_center_y(medium) - medium.top() - 120.0).abs() < f32::EPSILON
-        );
+        assert!((top - 280.0).abs() < f32::EPSILON);
+        assert!((bottom - 520.0).abs() < f32::EPSILON);
+        assert!((bottom - top - FOCUS_UNIT_MIN_HEIGHT).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn tall_focus_units_expand_the_centered_container() {
-        let tall = egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 360.0));
-
-        assert!((focus_unit_container_center_y(tall) - tall.center().y).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn oversized_focus_units_start_at_the_top_and_expose_their_full_scroll_range() {
+    fn oversized_focus_units_align_their_top_and_bottom_to_the_reading_window() {
         let table =
             egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(1_200.0, 2_400.0));
         let viewport_height = 800.0;
         let padding = viewport_height * 0.5;
 
-        let (top, bottom) = focus_unit_scroll_bounds(table, viewport_height, padding);
+        let (top, bottom) =
+            oversized_focus_unit_scroll_bounds(table, viewport_height, padding).unwrap();
 
         assert!(
             (focus_unit_target_offset_for_rect(table, viewport_height) - top).abs() < f32::EPSILON
         );
-        assert!((top - 900.0).abs() < f32::EPSILON);
-        assert!((bottom - 2_500.0).abs() < f32::EPSILON);
+        assert!((top - 620.0).abs() < f32::EPSILON);
+        assert!((bottom - 2_780.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn tall_focus_unit_scrolls_by_one_reading_window_and_clamps_at_its_edges() {
+        let top = 620.0;
+        let bottom = 2_780.0;
+        let step = FOCUS_UNIT_MIN_HEIGHT;
+
+        assert_eq!(
+            focus_scroll_target(top, top, bottom, step, PageDirection::Next),
+            Some(860.0)
+        );
+        assert_eq!(
+            focus_scroll_target(2_700.0, top, bottom, step, PageDirection::Next),
+            Some(bottom)
+        );
+        assert_eq!(
+            focus_scroll_target(bottom, top, bottom, step, PageDirection::Next),
+            None
+        );
+        assert_eq!(
+            focus_scroll_target(700.0, top, bottom, step, PageDirection::Previous),
+            Some(top)
+        );
     }
 
     #[test]
     fn focus_units_that_fit_the_viewport_remain_centered() {
         let paragraph =
             egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 180.0));
+        let tall_but_visible =
+            egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 360.0));
 
         assert!((focus_unit_target_offset_for_rect(paragraph, 800.0) - 620.0).abs() < f32::EPSILON);
+        assert!(
+            (focus_unit_target_offset_for_rect(tall_but_visible, 800.0) - 680.0).abs()
+                < f32::EPSILON
+        );
+        assert!(oversized_focus_unit_scroll_bounds(tall_but_visible, 800.0, 400.0).is_none());
+    }
+
+    #[test]
+    fn resizing_reclassifies_oversized_focus_units_and_preserves_visible_content() {
+        let unit = egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 600.0));
+
+        assert!(oversized_focus_unit_scroll_bounds(unit, 800.0, 400.0).is_none());
+        assert!(oversized_focus_unit_scroll_bounds(unit, 500.0, 250.0).is_some());
+        assert!(
+            (focus_offset_after_viewport_resize(unit, 800.0, 500.0, 800.0) - 650.0).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (focus_offset_after_viewport_resize(unit, 500.0, 800.0, 650.0) - 800.0).abs()
+                < f32::EPSILON
+        );
     }
 
     #[test]
@@ -4279,14 +4380,12 @@ mod tests {
         let page_rect = egui::Rect::from_min_size(egui::pos2(40.0, 80.0), egui::vec2(800.0, 600.0));
         let unit = egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 48.0));
         let padding = 300.0;
-        let centered_offset =
-            focus_unit_container_center_y(unit) + padding - page_rect.height() / 2.0;
+        let centered_offset = focus_unit_target_offset_for_rect(unit, page_rect.height());
 
         let anchored = focus_unit_screen_center_y(unit, centered_offset, padding, page_rect);
         let moving = focus_unit_screen_center_y(unit, centered_offset - 75.0, padding, page_rect);
-        let expected = page_rect.center().y + unit.center().y - focus_unit_container_center_y(unit);
 
-        assert!((anchored - expected).abs() < f32::EPSILON);
+        assert!((anchored - 284.0).abs() < f32::EPSILON);
         assert!((moving - anchored - 75.0).abs() < f32::EPSILON);
     }
 

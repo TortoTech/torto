@@ -151,7 +151,7 @@ impl BookSource for RewriteBookSource {
             };
             let style = block.content.iter().find_map(|inline| match inline {
                 Inline::Text(run) => Some(run.style),
-                Inline::Math(_) | Inline::Break => None,
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             });
             block.content = replacement_content(text, style.unwrap_or_default());
             source.end.spine = source.start.spine.clone();
@@ -307,6 +307,7 @@ mod tests {
                 .map(|inline| match inline {
                     Inline::Text(run) => run.text.as_str(),
                     Inline::Math(run) => run.latex.as_str(),
+                    Inline::Image(_) => "",
                     Inline::Break => "\n",
                 })
                 .collect::<String>(),

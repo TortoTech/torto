@@ -141,6 +141,7 @@ fn normalized_text_block(block: &TextBlock) -> String {
         match inline {
             Inline::Text(run) => text.push_str(&run.text),
             Inline::Math(run) => text.push_str(&run.latex),
+            Inline::Image(_) => {}
             Inline::Break => text.push(' '),
         }
     }

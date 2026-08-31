@@ -890,7 +890,12 @@ impl LayoutEngine {
             match block {
                 Block::Text(block) => {
                     let resolved = resolve_text_block(block, reader_style, TextContext::Flow);
-                    let prepared = self.shape_text(&resolved, reader_style, content_width);
+                    let prepared = self.shape_text_from_source(
+                        source,
+                        &resolved,
+                        reader_style,
+                        content_width,
+                    )?;
                     paginator.push_text(&prepared, &resolved)?;
                 }
                 Block::Quote(quote) => {
@@ -1201,6 +1206,29 @@ impl LayoutEngine {
         self.shape_text_with_min_width(block, reader_style, content_width, 40.0)
     }
 
+    fn shape_text_from_source(
+        &mut self,
+        source: &dyn BookSource,
+        block: &TextBlock,
+        reader_style: &ReaderStyle,
+        content_width: f32,
+    ) -> Result<PreparedText, LayoutError> {
+        let mut rasters = Vec::with_capacity(block.content.len());
+        for inline in &block.content {
+            rasters.push(match inline {
+                Inline::Image(run) => Some(load_raster_image(source, &run.image)?),
+                Inline::Text(_) | Inline::Math(_) | Inline::Break => None,
+            });
+        }
+        Ok(self.shape_text_with_min_width_and_rasters(
+            block,
+            reader_style,
+            content_width,
+            40.0,
+            &rasters,
+        ))
+    }
+
     fn shape_figure_caption<'a>(
         &mut self,
         caption: &'a TextBlock,
@@ -1368,6 +1396,23 @@ impl LayoutEngine {
         content_width: f32,
         minimum_width: f32,
     ) -> PreparedText {
+        self.shape_text_with_min_width_and_rasters(
+            block,
+            reader_style,
+            content_width,
+            minimum_width,
+            &[],
+        )
+    }
+
+    fn shape_text_with_min_width_and_rasters(
+        &mut self,
+        block: &TextBlock,
+        reader_style: &ReaderStyle,
+        content_width: f32,
+        minimum_width: f32,
+        inline_rasters: &[Option<RasterImage>],
+    ) -> PreparedText {
         let (start_offset, available_width, first_line_indent) =
             resolve_text_measure(block, content_width, minimum_width);
         let typography = &reader_style.typography;
@@ -1378,6 +1423,7 @@ impl LayoutEngine {
             available_width,
             &self.svg_options,
             reader_style.focus_footnote_icons,
+            inline_rasters,
         );
         let font_stack = if block.kind == TextBlockKind::Preformatted {
             typography.monospace_stack()
@@ -1841,6 +1887,7 @@ fn resolve_text_block<'a>(
                 }
             }
             Inline::Math(run) => run.size_scale = scale,
+            Inline::Image(run) => run.size_scale = scale,
             Inline::Break => {}
         }
     }
@@ -1853,7 +1900,7 @@ fn text_block_supports_space_justification(block: &TextBlock) -> bool {
             .text
             .chars()
             .all(|character| character != '\u{00a0}' && !linebreak::parley::is_cjk(character)),
-        Inline::Math(_) | Inline::Break => true,
+        Inline::Math(_) | Inline::Image(_) | Inline::Break => true,
     })
 }
 
@@ -2253,6 +2300,7 @@ fn prepare_inline_content(
     available_width: f32,
     svg_options: &resvg::usvg::Options<'_>,
     focus_footnote_icons: bool,
+    inline_rasters: &[Option<RasterImage>],
 ) -> (String, Vec<StyledRange>, Vec<PreparedInlineImage>, usize) {
     let mut text = String::new();
     let mut spans = Vec::new();
@@ -2273,7 +2321,7 @@ fn prepare_inline_content(
     }
     let source_text_start = text.len();
 
-    for inline in &block.content {
+    for (inline_index, inline) in block.content.iter().enumerate() {
         match inline {
             Inline::Text(run) => {
                 let start = text.len();
@@ -2339,6 +2387,29 @@ fn prepare_inline_content(
                         footnote_reference_group: 0,
                     });
                 }
+            }
+            Inline::Image(run) => {
+                let Some(image) = inline_rasters
+                    .get(inline_index)
+                    .and_then(|image| image.clone())
+                else {
+                    continue;
+                };
+                let intrinsic_width = image.width.max(1) as f32;
+                let intrinsic_height = image.height.max(1) as f32;
+                let aspect_ratio = intrinsic_width / intrinsic_height;
+                let requested_height =
+                    (typography.font_size * run.size_scale.clamp(0.25, 3.0)).max(1.0);
+                let requested_width = requested_height * aspect_ratio;
+                let width_scale = (available_width / requested_width).min(1.0);
+                let id = u64::try_from(inline_images.len()).unwrap_or(u64::MAX);
+                inline_images.push(PreparedInlineImage {
+                    id,
+                    index: text.len(),
+                    image,
+                    width: (requested_width * width_scale).max(1.0),
+                    height: (requested_height * width_scale).max(1.0),
+                });
             }
             Inline::Break => {
                 let compact_gap = text
@@ -3346,6 +3417,7 @@ mod tests {
             320.0,
             &svg_options,
             true,
+            &[],
         );
         assert_eq!(
             spans
@@ -3370,6 +3442,7 @@ mod tests {
             320.0,
             &svg_options,
             false,
+            &[],
         );
         assert!(
             disabled_spans
@@ -3377,6 +3450,58 @@ mod tests {
                 .all(|span| span.footnote_reference_group == 0)
         );
         assert_eq!(classic_text, "123[4][5]inline note");
+    }
+
+    #[test]
+    fn prepares_semantic_inline_images_at_their_text_position() {
+        let block = TextBlock {
+            kind: TextBlockKind::Heading(1),
+            content: vec![
+                Inline::Image(Box::new(rebook_publication::InlineImageRun {
+                    image: ImageBlock {
+                        href: PublicationUrl::parse("images/chapter-icon.jpg").unwrap(),
+                        alt: String::new(),
+                        style: ImageStyle::default(),
+                        source: None,
+                        text_layer: None,
+                    },
+                    size_scale: 1.0,
+                    presentation: true,
+                })),
+                Inline::Text(TextRun {
+                    text: "Chapter title".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                }),
+            ],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let raster = RasterImage {
+            width: 200,
+            height: 100,
+            pixels: vec![0; 200 * 100 * 4].into(),
+        };
+        let typography = ReaderTypography::default();
+        let svg_options = resvg::usvg::Options::default();
+
+        let (text, _, images, _) = prepare_inline_content(
+            &block,
+            Rgba::BLACK,
+            &typography,
+            320.0,
+            &svg_options,
+            false,
+            &[Some(raster), None],
+        );
+
+        assert_eq!(text, "Chapter title");
+        let [image] = images.as_slice() else {
+            panic!("expected one prepared inline image");
+        };
+        assert_eq!(image.index, 0);
+        assert!((image.height - typography.font_size).abs() < f32::EPSILON);
+        assert!((image.width - typography.font_size * 2.0).abs() < f32::EPSILON);
     }
 
     #[test]

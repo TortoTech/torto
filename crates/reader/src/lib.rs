@@ -3424,6 +3424,7 @@ fn split_inline_content(content: Vec<Inline>) -> Vec<(Vec<Inline>, usize)> {
                 }
             }
             Inline::Math(run) => current.push(Inline::Math(run)),
+            Inline::Image(run) => current.push(Inline::Image(run)),
         }
     }
     flush(&mut current, &mut current_len, &mut parts);
@@ -3468,6 +3469,7 @@ fn inline_content_len(content: &[Inline]) -> usize {
         .map(|inline| match inline {
             Inline::Text(run) => run.text.chars().count(),
             Inline::Math(_) => 0,
+            Inline::Image(_) => 0,
             Inline::Break => 1,
         })
         .sum()
