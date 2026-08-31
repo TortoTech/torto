@@ -41,6 +41,8 @@ mod tests {
     fn embedded_fonts_register_with_reader_family_names() {
         let fonts = embedded_reader_fonts();
         let mut engine = LayoutEngine::with_fonts(fonts.iter().cloned());
+        #[cfg(target_os = "windows")]
+        let discovered = engine.available_font_families();
         let mut families = engine.available_reader_font_families();
         families.include_configured(&rebook_layout::ReaderTypography::default());
 
@@ -62,6 +64,16 @@ mod tests {
         assert!(!families.chinese.iter().any(|family| family == "Bitter"));
         assert!(!families.chinese.iter().any(|family| family == "Roboto"));
         #[cfg(target_os = "windows")]
-        assert!(families.monospace.iter().any(|family| family == "Consolas"));
+        {
+            assert!(families.monospace.iter().any(|family| family == "Consolas"));
+            for simsun_alias in ["SimSun", "宋体", "NSimSun", "新宋体"] {
+                if discovered.iter().any(|family| family == simsun_alias) {
+                    assert!(
+                        !families.all.iter().any(|family| family == simsun_alias),
+                        "Vello-incompatible embedded-bitmap font leaked into reader options"
+                    );
+                }
+            }
+        }
     }
 }

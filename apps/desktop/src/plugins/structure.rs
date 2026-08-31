@@ -5,7 +5,7 @@ use rebook_publication::{
     Block, Book, BookSource, Inline, InlineRole, LinkRole, PublicationError, PublicationUrl,
     RasterResource, Resource, Section, TextBaseline, TextBlock, TextBlockKind, TextRun,
 };
-use rebook_reader::sentence_byte_ranges;
+use rebook_reader::sentence_char_ranges;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ParagraphStructureKey {
@@ -29,13 +29,21 @@ struct StructureState {
 /// source text and source ranges remain owned by the publication.
 pub(crate) struct ParagraphStructureSource {
     inner: Arc<dyn BookSource>,
+    language_hint: String,
     state: RwLock<StructureState>,
 }
 
 impl ParagraphStructureSource {
     pub(crate) fn new(inner: Arc<dyn BookSource>) -> Self {
+        let language_hint = inner
+            .book()
+            .metadata
+            .languages
+            .first()
+            .map_or_else(|| "en".to_owned(), Clone::clone);
         Self {
             inner,
+            language_hint,
             state: RwLock::new(StructureState::default()),
         }
     }
@@ -83,7 +91,7 @@ impl ParagraphStructureSource {
         if primary.kind != TextBlockKind::Paragraph {
             return Ok(false);
         }
-        Ok(paragraph_atoms_for_content(&primary.content).len() >= 2)
+        Ok(paragraph_atoms_for_content(&primary.content, &self.language_hint).len() >= 2)
     }
 }
 
@@ -122,13 +130,13 @@ impl BookSource for ParagraphStructureSource {
             if let Block::Text(primary) = &mut section.blocks[block_index]
                 && primary.kind == TextBlockKind::Paragraph
             {
-                apply_sentence_structure(primary);
+                apply_sentence_structure(primary, &self.language_hint);
             }
             if let Some(Block::Text(companion)) = section.blocks.get_mut(block_index + 1)
                 && companion.source.is_none()
                 && companion.kind == TextBlockKind::Paragraph
             {
-                apply_sentence_structure(companion);
+                apply_sentence_structure(companion, &self.language_hint);
             }
             block_index += 1;
         }
@@ -154,7 +162,7 @@ impl BookSource for ParagraphStructureSource {
     }
 }
 
-fn paragraph_atoms_for_content(content: &[Inline]) -> Vec<ParagraphAtom> {
+fn paragraph_atoms_for_content(content: &[Inline], language_hint: &str) -> Vec<ParagraphAtom> {
     let text = inline_text(content);
     let mut cursor = 0;
     let mut protected = Vec::new();
@@ -164,7 +172,9 @@ fn paragraph_atoms_for_content(content: &[Inline]) -> Vec<ParagraphAtom> {
             Inline::Text(run) => {
                 let len = run.text.chars().count();
                 if is_focus_footnote(run) && len > 0 {
-                    footnotes.push(cursor..cursor + len);
+                    let range = cursor..cursor + len;
+                    footnotes.push(range.clone());
+                    protected.push(range);
                 }
                 len
             }
@@ -173,7 +183,9 @@ fn paragraph_atoms_for_content(content: &[Inline]) -> Vec<ParagraphAtom> {
                 if is_ocr_superscript_reference(run.display, &run.latex) && len > 0 {
                     footnotes.push(cursor..cursor + len);
                 }
-                protected.extend((cursor + 1)..(cursor + len));
+                if len > 0 {
+                    protected.push(cursor..cursor + len);
+                }
                 len
             }
             Inline::Image(_) => 0,
@@ -181,7 +193,7 @@ fn paragraph_atoms_for_content(content: &[Inline]) -> Vec<ParagraphAtom> {
         };
         cursor += len;
     }
-    let atoms = paragraph_atoms_with_protected_boundaries(&text, &protected);
+    let atoms = paragraph_atoms_with_protected_ranges(&text, &protected, language_hint);
     let atoms = attach_paired_punctuation_atoms(atoms, &text);
     attach_footnote_atoms(atoms, &text, &footnotes)
 }
@@ -249,7 +261,59 @@ fn attach_paired_punctuation_atoms(atoms: Vec<ParagraphAtom>, text: &str) -> Vec
             attached.push(atom);
         }
     }
-    attached
+    attach_leading_parenthetical_suffixes(attached, &chars, &pairs)
+}
+
+fn attach_leading_parenthetical_suffixes(
+    mut atoms: Vec<ParagraphAtom>,
+    chars: &[char],
+    pairs: &[std::ops::Range<usize>],
+) -> Vec<ParagraphAtom> {
+    for index in 1..atoms.len() {
+        let previous_ends_with_quote = (atoms[index - 1].start..atoms[index - 1].end)
+            .rev()
+            .find(|position| !chars[*position].is_whitespace())
+            .and_then(|position| chars.get(position))
+            .is_some_and(|character| matches!(character, '”' | '’' | '」' | '』'));
+        if !previous_ends_with_quote {
+            continue;
+        }
+        let current_start = atoms[index].start;
+        let prefix_start = (current_start..atoms[index].end)
+            .find(|position| !chars[*position].is_whitespace())
+            .unwrap_or(atoms[index].end);
+        let Some(prefix_end) = pairs
+            .iter()
+            .find(|range| {
+                range.start == prefix_start
+                    && matches!(chars.get(range.start), Some('（' | '(' | '【' | '[' | '〔'))
+            })
+            .map(|range| range.end)
+        else {
+            continue;
+        };
+        move_atom_prefix_to_previous(&mut atoms, index, prefix_end, chars);
+    }
+    atoms
+}
+
+fn move_atom_prefix_to_previous(
+    atoms: &mut [ParagraphAtom],
+    index: usize,
+    prefix_end: usize,
+    chars: &[char],
+) {
+    let current_start = atoms[index].start;
+    let current_end = atoms[index].end;
+    if index == 0 || prefix_end <= current_start || prefix_end >= current_end {
+        return;
+    }
+    let prefix = chars[current_start..prefix_end].iter().collect::<String>();
+    let remainder = chars[prefix_end..current_end].iter().collect::<String>();
+    atoms[index - 1].text.push_str(&prefix);
+    atoms[index - 1].end = prefix_end;
+    atoms[index].text = remainder;
+    atoms[index].start = prefix_end;
 }
 
 fn paired_punctuation_ranges(chars: &[char]) -> Vec<std::ops::Range<usize>> {
@@ -420,19 +484,25 @@ fn attach_footnote_atoms(
     attached
 }
 
-fn paragraph_atoms_with_protected_boundaries(
+fn paragraph_atoms_with_protected_ranges(
     text: &str,
-    protected_boundaries: &[usize],
+    protected_ranges: &[std::ops::Range<usize>],
+    language: &str,
 ) -> Vec<ParagraphAtom> {
     let chars = text.chars().collect::<Vec<_>>();
+    let mut segmentation_chars = chars.clone();
+    for range in protected_ranges {
+        for index in range.clone() {
+            if let Some(character) = segmentation_chars.get_mut(index) {
+                *character = ' ';
+            }
+        }
+    }
+    let segmentation_text = segmentation_chars.iter().collect::<String>();
     let mut atoms: Vec<ParagraphAtom> = Vec::new();
     let mut start = 0;
-    let mut end = 0;
-    for range in sentence_byte_ranges(text) {
-        end += text[range].chars().count();
-        if protected_boundaries.contains(&end) {
-            continue;
-        }
+    for range in sentence_char_ranges(&segmentation_text, language) {
+        let end = range.end;
         let value = chars[start..end].iter().collect::<String>();
         if value.trim().is_empty() {
             if let Some(last) = atoms.last_mut() {
@@ -477,8 +547,8 @@ fn inline_text(content: &[Inline]) -> String {
         .collect()
 }
 
-fn apply_sentence_structure(block: &mut TextBlock) {
-    let atoms = paragraph_atoms_for_content(&block.content);
+fn apply_sentence_structure(block: &mut TextBlock, language_hint: &str) {
+    let atoms = paragraph_atoms_for_content(&block.content, language_hint);
     if atoms.len() < 2 {
         return;
     }
@@ -550,7 +620,7 @@ mod tests {
     #[test]
     fn atoms_cover_cjk_and_latin_sentences_without_rewriting() {
         let text = "首先，观察系统。其次，比较反馈；Finally, decide.";
-        let atoms = paragraph_atoms_with_protected_boundaries(text, &[]);
+        let atoms = paragraph_atoms_with_protected_ranges(text, &[], "zh");
         assert_eq!(
             atoms
                 .iter()
@@ -574,12 +644,34 @@ mod tests {
             style: Default::default(),
             source: None,
         };
-        apply_sentence_structure(&mut block);
+        apply_sentence_structure(&mut block, "zh");
         assert_eq!(
             inline_text(&block.content),
             "第一句。\n\n第二句！\n\n第三句？"
         );
         assert_eq!(block.style.subparagraph_gap_em, Some(0.3));
+    }
+
+    #[test]
+    fn sentence_leading_quoted_term_is_not_attached_to_the_previous_sentence() {
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "本书的核心关注点是现代纯粹数学，这一决定需要作一些说明。“现代”一词很简单，正如上文所述。然后继续。"
+                    .to_owned(),
+                style: Default::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        };
+
+        apply_sentence_structure(&mut block, "en");
+
+        assert_eq!(
+            inline_text(&block.content),
+            "本书的核心关注点是现代纯粹数学，这一决定需要作一些说明。\n\n“现代”一词很简单，正如上文所述。\n\n然后继续。"
+        );
     }
 
     #[test]
@@ -601,7 +693,7 @@ mod tests {
                 link: None,
             }),
         ];
-        let atoms = paragraph_atoms_for_content(&content);
+        let atoms = paragraph_atoms_for_content(&content, "zh");
         assert_eq!(atoms.len(), 2);
         assert_eq!(atoms[0].text, "公式f(x,y):=x+y。");
     }
@@ -631,7 +723,7 @@ mod tests {
             source: None,
         };
 
-        apply_sentence_structure(&mut block);
+        apply_sentence_structure(&mut block, "zh");
 
         assert_eq!(inline_text(&block.content), "第一句。\n\n第二句。54");
     }
@@ -666,7 +758,7 @@ mod tests {
             source: None,
         };
 
-        apply_sentence_structure(&mut block);
+        apply_sentence_structure(&mut block, "zh");
 
         assert_eq!(
             block
@@ -713,7 +805,7 @@ mod tests {
             source: None,
         };
 
-        apply_sentence_structure(&mut block);
+        apply_sentence_structure(&mut block, "zh");
 
         assert_eq!(
             inline_text(&block.content),
@@ -746,7 +838,7 @@ mod tests {
             source: None,
         };
 
-        apply_sentence_structure(&mut block);
+        apply_sentence_structure(&mut block, "en");
 
         assert_eq!(
             inline_text(&block.content),
@@ -795,7 +887,7 @@ mod tests {
             source: None,
         };
 
-        apply_sentence_structure(&mut block);
+        apply_sentence_structure(&mut block, "zh");
 
         assert_eq!(
             inline_text(&block.content),

@@ -43,16 +43,55 @@ pub enum SelectionGranularity {
     Paragraph,
 }
 
-/// Returns the contiguous Unicode sentence ranges in `text`.
-///
-/// Ranges are byte offsets and retain the boundary whitespace supplied by
-/// `unicode-segmentation`, so consumers can reconstruct the source text
-/// without rewriting it. Semantic selection trims a chosen range only when it
-/// presents that range to the user.
+/// Returns contiguous sentence ranges in `text` using the shared multilingual
+/// reader segmenter and a generic language fallback.
 pub fn sentence_byte_ranges(text: &str) -> Vec<Range<usize>> {
-    text.split_sentence_bound_indices()
-        .map(|(start, sentence)| start..start + sentence.len())
+    sentence_byte_ranges_with_language(text, "en")
+}
+
+/// Returns sentence ranges as UTF-8 byte offsets while preserving every source
+/// character, including boundary whitespace and punctuation.
+pub fn sentence_byte_ranges_with_language(text: &str, language_hint: &str) -> Vec<Range<usize>> {
+    let language = sentence_language_for_text(text, language_hint);
+    sentencex::get_sentence_boundaries(&language, text)
+        .into_iter()
+        .map(|boundary| boundary.start_byte..boundary.end_byte)
         .collect()
+}
+
+/// Returns sentence ranges as Unicode scalar indices. This is used by derived
+/// Inline views whose diagnostic text keeps the same character count as the
+/// original source but may intentionally mask formulas or footnotes.
+pub fn sentence_char_ranges(text: &str, language_hint: &str) -> Vec<Range<usize>> {
+    let language = sentence_language_for_text(text, language_hint);
+    sentencex::get_sentence_boundaries(&language, text)
+        .into_iter()
+        .map(|boundary| boundary.start_index..boundary.end_index)
+        .collect()
+}
+
+fn sentence_language_for_text(text: &str, language_hint: &str) -> String {
+    if text
+        .chars()
+        .any(|character| matches!(character, '\u{3040}'..='\u{30ff}'))
+    {
+        return "ja".to_owned();
+    }
+    if text.chars().any(|character| {
+        matches!(
+            character,
+            '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '。' | '！' | '？'
+        )
+    }) {
+        return "zh".to_owned();
+    }
+    language_hint
+        .split(['-', '_'])
+        .next()
+        .map(str::trim)
+        .filter(|language| !language.is_empty())
+        .unwrap_or("en")
+        .to_ascii_lowercase()
 }
 
 /// Stable current position exposed to the application shell.
@@ -636,6 +675,9 @@ impl ReaderSession {
         let fixed_reading_units =
             build_fixed_reading_units(source.as_ref(), &toc_items, &section_indices_by_path);
         let repository = Arc::new(SectionRepository::new(Arc::clone(&source)));
+        let mut layout_engine = LayoutEngine::with_fonts(fonts.iter().cloned());
+        let available_fonts = layout_engine.available_reader_font_families();
+        available_fonts.repair_typography(&mut style.typography);
         let prefetch_worker = PrefetchWorker::spawn(
             Arc::clone(&source),
             Arc::clone(&repository),
@@ -646,7 +688,7 @@ impl ReaderSession {
         Ok(Self {
             source,
             repository,
-            layout_engine: LayoutEngine::with_fonts(fonts.iter().cloned()),
+            layout_engine,
             fonts,
             display_compiler: DisplayListCompiler,
             viewport,
@@ -1615,16 +1657,40 @@ impl ReaderSession {
             )
         };
         if granularity != SelectionGranularity::Free {
-            let start_range =
-                semantic_source_range(&pages[start.page].1, start_hit, granularity, false);
-            let end_range = semantic_source_range(&pages[end.page].1, end_hit, granularity, false);
+            let language_hint = self
+                .source
+                .book()
+                .metadata
+                .languages
+                .first()
+                .map_or("en", String::as_str);
+            let start_range = semantic_source_range(
+                &pages[start.page].1,
+                start_hit,
+                granularity,
+                false,
+                language_hint,
+            );
+            let end_range = semantic_source_range(
+                &pages[end.page].1,
+                end_hit,
+                granularity,
+                false,
+                language_hint,
+            );
             let (Some(start_range), Some(end_range)) = (start_range, end_range) else {
                 return Ok(None);
             };
             let end_range = if granularity == SelectionGranularity::Word && start_range != end_range
             {
-                semantic_source_range(&pages[end.page].1, end_hit, granularity, true)
-                    .unwrap_or(end_range)
+                semantic_source_range(
+                    &pages[end.page].1,
+                    end_hit,
+                    granularity,
+                    true,
+                    language_hint,
+                )
+                .unwrap_or(end_range)
             } else {
                 end_range
             };
@@ -3582,12 +3648,15 @@ fn semantic_source_range(
     hit: &ReaderTextHit,
     granularity: SelectionGranularity,
     include_trailing_boundary_punctuation: bool,
+    language_hint: &str,
 ) -> Option<SourceRange> {
     let text = page.text_region_text(hit.region_index)?;
     let selectable = page.text_region_selectable_range(hit.region_index)?;
-    let mut byte_range = semantic_byte_range(text, selectable.clone(), hit, granularity)?;
+    let mut byte_range =
+        semantic_byte_range(text, selectable.clone(), hit, granularity, language_hint)?;
     if include_trailing_boundary_punctuation && granularity == SelectionGranularity::Word {
-        byte_range = extend_word_to_sentence_or_paragraph_end(text, selectable, byte_range);
+        byte_range =
+            extend_word_to_sentence_or_paragraph_end(text, selectable, byte_range, language_hint);
     }
     page.text_region_source_range(hit.region_index, byte_range)
 }
@@ -3596,6 +3665,7 @@ fn extend_word_to_sentence_or_paragraph_end(
     text: &str,
     selectable: Range<usize>,
     word: Range<usize>,
+    language_hint: &str,
 ) -> Range<usize> {
     let Some(source_text) = text.get(selectable.clone()) else {
         return word;
@@ -3616,7 +3686,7 @@ fn extend_word_to_sentence_or_paragraph_end(
     if punctuation_end > word.end && has_sentence_terminal {
         return word.start..punctuation_end;
     }
-    let sentence_end = sentence_byte_ranges(source_text)
+    let sentence_end = sentence_byte_ranges_with_language(source_text, language_hint)
         .into_iter()
         .find_map(|range| {
             let sentence_range = selectable.start + range.start..selectable.start + range.end;
@@ -3698,6 +3768,7 @@ fn semantic_byte_range(
     selectable: Range<usize>,
     hit: &ReaderTextHit,
     granularity: SelectionGranularity,
+    language_hint: &str,
 ) -> Option<Range<usize>> {
     let source_text = text.get(selectable.clone())?;
     if source_text.is_empty() {
@@ -3711,15 +3782,17 @@ fn semantic_byte_range(
             .unicode_word_indices()
             .map(|(start, word)| selectable.start + start..selectable.start + start + word.len())
             .collect::<Vec<_>>(),
-        SelectionGranularity::Sentence => sentence_byte_ranges(source_text)
-            .into_iter()
-            .filter_map(|range| {
-                trim_whitespace_range(
-                    text,
-                    selectable.start + range.start..selectable.start + range.end,
-                )
-            })
-            .collect::<Vec<_>>(),
+        SelectionGranularity::Sentence => {
+            sentence_byte_ranges_with_language(source_text, language_hint)
+                .into_iter()
+                .filter_map(|range| {
+                    trim_whitespace_range(
+                        text,
+                        selectable.start + range.start..selectable.start + range.end,
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
         SelectionGranularity::Free | SelectionGranularity::Paragraph => return None,
     };
     nearest_semantic_range(
@@ -4797,16 +4870,63 @@ mod tests {
         };
 
         assert_eq!(
-            semantic_byte_range(text, 0..text.len(), &hit, SelectionGranularity::Word),
+            semantic_byte_range(text, 0..text.len(), &hit, SelectionGranularity::Word, "en"),
             Some(word_start..word_start + "world".len())
         );
         assert_eq!(
-            semantic_byte_range(text, 0..text.len(), &hit, SelectionGranularity::Sentence),
+            semantic_byte_range(
+                text,
+                0..text.len(),
+                &hit,
+                SelectionGranularity::Sentence,
+                "en",
+            ),
             Some(0.."Hello, world!".len())
         );
         assert_eq!(
-            semantic_byte_range(text, 0..text.len(), &hit, SelectionGranularity::Paragraph),
+            semantic_byte_range(
+                text,
+                0..text.len(),
+                &hit,
+                SelectionGranularity::Paragraph,
+                "en",
+            ),
             Some(0..text.len())
+        );
+    }
+
+    #[test]
+    fn sentence_selection_keeps_a_leading_quoted_term_with_the_next_sentence() {
+        let text = "本书需要作一些说明。“现代”一词很简单。然后继续。";
+        let modern = text.find("现代").unwrap();
+        let hit = ReaderTextHit {
+            position: ReaderPosition {
+                section_index: 0,
+                segment_index: 0,
+                page_index: 0,
+            },
+            region_index: 0,
+            byte_index: modern,
+            cluster_start: modern,
+            cluster_end: modern + "现".len(),
+        };
+
+        let range = semantic_byte_range(
+            text,
+            0..text.len(),
+            &hit,
+            SelectionGranularity::Sentence,
+            "en",
+        )
+        .unwrap();
+
+        assert_eq!(&text[range], "“现代”一词很简单。");
+        assert_eq!(
+            sentence_byte_ranges_with_language(text, "en")
+                .into_iter()
+                .map(|range| &text[range])
+                .collect::<String>(),
+            text
         );
     }
 
@@ -4819,6 +4939,7 @@ mod tests {
                 sentence,
                 0..sentence.len(),
                 beta..beta + "beta".len(),
+                "en",
             ),
             beta..beta + "beta!".len()
         );
@@ -4830,13 +4951,19 @@ mod tests {
                 middle,
                 0..middle.len(),
                 beta..beta + "beta".len(),
+                "en",
             ),
             beta..beta + "beta".len()
         );
 
         let quoted = "内容。” 下一句。";
         assert_eq!(
-            extend_word_to_sentence_or_paragraph_end(quoted, 0..quoted.len(), 0.."内容".len(),),
+            extend_word_to_sentence_or_paragraph_end(
+                quoted,
+                0..quoted.len(),
+                0.."内容".len(),
+                "zh",
+            ),
             0.."内容。”".len()
         );
     }

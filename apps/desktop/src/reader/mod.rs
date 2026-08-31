@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use peniko::{Blob, Color};
 use rebook_formats::{BookFormat, open_file_for_reading as open_publication_file_for_reading};
-use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
+use rebook_layout::{LayoutViewport, ReaderStyle, ReaderTypesetting, SpreadMode};
 use rebook_publication::{
     Block, BookSource, Inline, InlineRole, LinkRole, PublicationUrl, RenditionLayout, Rgba,
     Section, SourceAnchor, SourceRange, TableBlock, TableOfContentsOrigin, TextBaseline, TextBlock,
@@ -46,7 +46,6 @@ const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const MOTION_EPSILON: f32 = 0.001;
 const SEARCH_MARK_COLOR: Color = Color::from_rgba8(250, 204, 21, 89);
 const ASSISTANT_MARK_COLOR: Color = Color::from_rgba8(245, 158, 11, 56);
-const FOCUS_MINIMUM_PARAGRAPH_GAP: f32 = 12.0;
 const FOCUS_TABLE_BOTTOM_MARGIN: f32 = 24.0;
 
 const fn resolved_focus_cursor_hidden(default_hidden: bool, override_hidden: Option<bool>) -> bool {
@@ -230,14 +229,9 @@ pub(super) fn open_reader(
         },
         focus_footnote_icons: !fixed_page,
         typography: reader_preferences.typography.clone(),
-        typesetting: reader_preferences.typesetting.clone(),
+        typesetting: effective_typesetting(reading_mode, &reader_preferences.typesetting),
         ..ReaderStyle::default()
     };
-    if reading_mode == ReadingMode::Focus
-        && reader_preferences.typesetting.mode == rebook_layout::TypesettingMode::Book
-    {
-        style.minimum_paragraph_gap = FOCUS_MINIMUM_PARAGRAPH_GAP;
-    }
     if fixed_page {
         style.column_gap = 0.0;
     }
@@ -1368,6 +1362,10 @@ fn focus_offset_after_viewport_resize(
     (current_offset + padding_delta).clamp(top, bottom)
 }
 
+fn focus_viewport_height_changed(previous: egui::Vec2, current: egui::Vec2) -> bool {
+    (previous.y - current.y).abs() > MOTION_EPSILON
+}
+
 fn focus_scroll_content_height(content_height: f32, viewport_height: f32) -> f32 {
     // Focus units shorter than `FOCUS_UNIT_MIN_HEIGHT` use a virtual container
     // whose center sits up to half that minimum height below the final content
@@ -1397,12 +1395,22 @@ fn focus_scroll_target(
     step: f32,
     direction: PageDirection,
 ) -> Option<f32> {
+    let distance = (bottom - top).max(0.0);
+    let step_count = (distance / step.max(1.0)).ceil().max(1.0);
+    let balanced_step = distance / step_count;
+    let current_anchor = if balanced_step <= MOTION_EPSILON {
+        0.0
+    } else {
+        ((current - top) / balanced_step)
+            .round()
+            .clamp(0.0, step_count)
+    };
     match direction {
         PageDirection::Previous if current > top + MOTION_EPSILON => {
-            Some((current - step).max(top))
+            Some((top + (current_anchor - 1.0).max(0.0) * balanced_step).max(top))
         }
         PageDirection::Next if current < bottom - MOTION_EPSILON => {
-            Some((current + step).min(bottom))
+            Some((top + (current_anchor + 1.0).min(step_count) * balanced_step).min(bottom))
         }
         PageDirection::Previous | PageDirection::Next => None,
     }
@@ -2164,7 +2172,8 @@ impl DesktopReader {
 
     fn update_scroll_viewport(&mut self, ctx: &egui::Context, viewport: ScrollViewportState) {
         let previous_viewport = self.scroll_viewport;
-        let size_changed = previous_viewport.is_some_and(|previous| previous.size != viewport.size);
+        let height_changed = previous_viewport
+            .is_some_and(|previous| focus_viewport_height_changed(previous.size, viewport.size));
         let changed = previous_viewport.is_none_or(|previous| {
             (previous.offset_y - viewport.offset_y).abs() > 0.1 || previous.size != viewport.size
         });
@@ -2173,7 +2182,7 @@ impl DesktopReader {
             self.bump_scene_revision();
         }
         if self.is_focus_mode()
-            && size_changed
+            && height_changed
             && let Some(previous) = previous_viewport
             && let Some(unit) = self.focus_units.get(self.focus_unit_index)
         {
@@ -2334,6 +2343,17 @@ fn allowed_reading_mode(
         ReadingMode::Classic
     } else {
         requested
+    }
+}
+
+fn effective_typesetting(
+    reading_mode: ReadingMode,
+    configured: &ReaderTypesetting,
+) -> ReaderTypesetting {
+    if reading_mode == ReadingMode::Focus {
+        ReaderTypesetting::unified()
+    } else {
+        configured.clone()
     }
 }
 
@@ -3207,12 +3227,13 @@ mod tests {
         NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, ScrollSectionLayout, SidebarTab,
         SnapshotEffects, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer,
         TranslationUiState, allowed_reading_mode, block_is_footnote_definition,
-        embedded_toc_is_page_index, focus_block_paint_ranges, focus_footnote_text,
-        focus_footnote_text_in_section, focus_list_descendant_root, focus_navigation_destination,
-        focus_offset_after_viewport_resize, focus_reading_window, focus_scroll_content_height,
-        focus_scroll_duration, focus_scroll_target, focus_unit_contains_source_range,
-        focus_unit_geometry_ranges, focus_unit_matches_highlight_ranges,
-        focus_unit_screen_center_y, focus_unit_target_offset_for_rect,
+        effective_typesetting, embedded_toc_is_page_index, focus_block_paint_ranges,
+        focus_footnote_text, focus_footnote_text_in_section, focus_list_descendant_root,
+        focus_navigation_destination, focus_offset_after_viewport_resize, focus_reading_window,
+        focus_scroll_content_height, focus_scroll_duration, focus_scroll_target,
+        focus_unit_contains_source_range, focus_unit_geometry_ranges,
+        focus_unit_matches_highlight_ranges, focus_unit_screen_center_y,
+        focus_unit_target_offset_for_rect, focus_viewport_height_changed,
         legacy_translated_paragraph_range, logical_dimension, merge_focus_list_descendant,
         merge_inferred_caption_focus_unit, ordered_focus_selection_bounds,
         oversized_focus_unit_scroll_bounds, resolve_book_display_metadata,
@@ -3593,6 +3614,20 @@ mod tests {
             ),
             ReadingMode::Focus
         );
+    }
+
+    #[test]
+    fn focus_mode_uses_unified_typesetting_without_overwriting_the_classic_preference() {
+        let configured = rebook_layout::ReaderTypesetting::default();
+        assert_eq!(configured.mode, rebook_layout::TypesettingMode::Book);
+
+        let focus = effective_typesetting(ReadingMode::Focus, &configured);
+        let classic = effective_typesetting(ReadingMode::Classic, &configured);
+        let classic_again = effective_typesetting(ReadingMode::Classic, &configured);
+
+        assert_eq!(focus, rebook_layout::ReaderTypesetting::unified());
+        assert_eq!(classic, configured);
+        assert_eq!(classic_again, configured);
     }
 
     #[test]
@@ -4331,6 +4366,51 @@ mod tests {
     }
 
     #[test]
+    fn tall_focus_unit_uses_uniform_anchors_when_the_range_has_a_short_tail() {
+        let top = 3_102.92;
+        let bottom = 3_877.92;
+        let preferred_step = FOCUS_UNIT_MIN_HEIGHT;
+        let expected_step = (bottom - top) / 4.0;
+        let mut current = top;
+        let mut forward_distances = Vec::new();
+
+        while let Some(target) =
+            focus_scroll_target(current, top, bottom, preferred_step, PageDirection::Next)
+        {
+            forward_distances.push(target - current);
+            current = target;
+        }
+
+        assert_eq!(forward_distances.len(), 4);
+        assert!((current - bottom).abs() < 0.01);
+        assert!(
+            forward_distances
+                .iter()
+                .all(|distance| (*distance - expected_step).abs() < 0.01)
+        );
+
+        let mut reverse_distances = Vec::new();
+        while let Some(target) = focus_scroll_target(
+            current,
+            top,
+            bottom,
+            preferred_step,
+            PageDirection::Previous,
+        ) {
+            reverse_distances.push(current - target);
+            current = target;
+        }
+
+        assert_eq!(reverse_distances.len(), 4);
+        assert!((current - top).abs() < 0.01);
+        assert!(
+            reverse_distances
+                .iter()
+                .all(|distance| (*distance - expected_step).abs() < 0.01)
+        );
+    }
+
+    #[test]
     fn focus_units_that_fit_the_viewport_remain_centered() {
         let paragraph =
             egui::Rect::from_min_size(egui::pos2(20.0, 500.0), egui::vec2(600.0, 180.0));
@@ -4359,6 +4439,20 @@ mod tests {
             (focus_offset_after_viewport_resize(unit, 500.0, 800.0, 650.0) - 800.0).abs()
                 < f32::EPSILON
         );
+    }
+
+    #[test]
+    fn width_only_viewport_changes_do_not_interrupt_vertical_focus_scrolling() {
+        let previous = egui::vec2(1_100.0, 775.5);
+
+        assert!(!focus_viewport_height_changed(
+            previous,
+            egui::vec2(1_084.0, 775.5)
+        ));
+        assert!(focus_viewport_height_changed(
+            previous,
+            egui::vec2(1_100.0, 760.0)
+        ));
     }
 
     #[test]

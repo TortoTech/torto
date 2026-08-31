@@ -1,6 +1,6 @@
 # 核心依赖已知问题
 
-- 最近更新：2026-08-26
+- 最近更新：2026-08-31
 - 记录范围：已经在 Torto 中复现、确认与上游依赖、Windows 图形栈或渲染帧时序有关，并需要本地兼容代码或长期回归检查的问题
 
 依赖升级时应逐项检查本文。只有在上游修复已经进入当前版本，并且移除本地兼容代码后相关回归测试仍能通过，才删除对应兼容代码和本文条目。
@@ -32,6 +32,34 @@ Vello 的持久图片图集会缓存 `ImageData` 与 GPU 纹理上传状态。�
 3. 在同一张图片上分别以经典翻页、经典滚动和专注模式连续往返，跨小节往返并退出后重新进入，确认正文图片和放大预览始终一致。
 4. 检查长时间阅读时的 GPU 内存占用，确认上游修复没有以保留所有图片纹理为代价。
 5. 全部通过后删除本地图片图集刷新兼容逻辑，并删除本条记录。
+
+## Vello/Skrifa：Windows 宋体等嵌入点阵字体的字形不显示
+
+- 影响版本：`vello 0.10.0`、`skrifa 0.44.0`，Windows 自带 `simsun.ttc`（`SimSun`/`宋体`、`NSimSun`/`新宋体`）
+- 上游状态：截至 2026-08-31，Vello 尚无完全对应的独立 issue，当前源码仍明确拒绝 unpacked bitmap mask；Fontations 的 EBDT/EBLC 跟踪问题仍为 Open
+- 相关上游记录：[linebender/vello#641](https://github.com/linebender/vello/pull/641)、[googlefonts/fontations#1639](https://github.com/googlefonts/fontations/issues/1639)、[googlefonts/fontations#1839](https://github.com/googlefonts/fontations/pull/1839)，以及 [Vello 当前的未支持分支](https://github.com/linebender/vello/blob/7df2f0c5bf4dfbdeeb7515da9d563671773dfb3b/vello/src/scene.rs)
+- 本地位置：`crates/layout/src/lib.rs` 中的 `has_embedded_bitmap_glyphs`、`LayoutEngine::available_reader_font_families` 和 `ReaderFontFamilies::repair_typography`；设置初始化与阅读会话打开时分别再次修复旧配置
+- 回归测试：`unavailable_cjk_preference_is_repaired_to_a_validated_family`、`embedded_fonts_register_with_reader_family_names`，并需在 Windows 开发预览中检查中文正文
+
+### 表现
+
+在排版设置中选择“宋体”后，中文正文、标题等字形会全部消失，但英文、数字和部分标点仍可显示。Parley 的排版结果仍包含完整的中文 glyph id、advance 和选区几何，问题只出现在 Vello 绘制阶段。`宋体` 与规范族名 `SimSun` 都会复现，因此不是中文显示名或 TTC family alias 匹配失败。
+
+### 原因
+
+Windows 的 `simsun.ttc` 含有 EBDT/EBLC 嵌入点阵表。Vello 在检测到字体带位图 strike 后，会优先按当前字号读取 bitmap glyph；其 0.10 实现遇到不支持的 unpacked mask 会直接跳过该字形，不会继续使用同一字体中存在的矢量 outline。Fontations #1839 已为 Skrifa 增加 packed 与 byte-aligned mask 的统一解码能力，但 Vello 0.10 尚未接入该接口，源码仍保留 `Unpacked mask data in font not yet supported` 分支。关闭 Vello hinting 不会改变该选择路径，因而不能解决问题。
+
+### 当前规避方案
+
+正文字体枚举不再仅检查 family name、PANOSE 分类和中文 charmap。凡默认 face 包含 EBDT/EBLC、CBDT/CBLC 或 Apple 旧式 `bdat`/`bloc` 嵌入点阵表的字体，均保守地从排版页的衬线、无衬线、中文和代码字体选项中排除。已经保存的不兼容或当前不可用字体会按对应类别恢复到经过验证的内置默认字体；阅读会话还会在首次分页前再次修复，避免旧配置直接产生空白正文。界面字体走 egui 自身的字体管线，不受此排版字体筛选影响。
+
+### 升级检查
+
+1. 检查 Fontations #1639 是否关闭，以及 #1839 的 mask 解码 API 是否已经进入 Vello 使用的 Skrifa 版本。
+2. 检查 Vello 的 bitmap glyph 路径是否移除了 unpacked mask 拒绝分支，并在位图解码失败时回退到 outline。
+3. 升级后临时移除 `has_embedded_bitmap_glyphs` 过滤，分别选择 `宋体`、`SimSun`、`新宋体` 和其他带 EBDT/EBLC 的系统字体。
+4. 在 12–28 px 的全部可配置字号、浅色/深色主题及经典/专注模式下检查中英文、标点、粗体和斜体。
+5. 所有字体均能绘制且不再出现空白字形后，才删除保守过滤与旧配置修复逻辑，并更新或删除本条记录。
 
 ## Torto/egui：专注模式滚轮跨小节时短暂闪现目标小节首图
 

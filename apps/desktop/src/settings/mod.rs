@@ -81,7 +81,7 @@ pub(crate) struct SettingsFeature {
 
 impl SettingsFeature {
     pub(crate) fn new(reader_fonts: &[Blob<u8>]) -> Self {
-        let preferences = preferences::load_reader_preferences().unwrap_or_else(|error| {
+        let mut preferences = preferences::load_reader_preferences().unwrap_or_else(|error| {
             tracing::warn!(%error, "failed to load reader preferences; using defaults");
             ReaderPreferences::default()
         });
@@ -100,6 +100,15 @@ impl SettingsFeature {
         let mut available_reader_font_families =
             LayoutEngine::with_fonts(reader_fonts.iter().cloned()).available_reader_font_families();
         available_reader_font_families.include_configured(&preferences.typography);
+        if available_reader_font_families.repair_typography(&mut preferences.typography) {
+            tracing::warn!(
+                family = %preferences.typography.default_cjk_font,
+                "replaced reader fonts that the native renderer cannot paint"
+            );
+            if let Err(error) = preferences::save_reader_preferences(&preferences) {
+                tracing::warn!(%error, "failed to persist repaired reader font preferences");
+            }
+        }
         let available_interface_font_families = crate::ui::available_interface_font_families();
         let applied = AppliedSettings {
             spread: preferences.spread,

@@ -1015,9 +1015,22 @@ fn push_translation_style_markup(output: &mut String, run: &TextRun) {
         output.push_str("<strong>");
         closing.push("</strong>");
     }
-    if run.style.italic {
+    if run.style.emphasis {
         output.push_str("<em>");
         closing.push("</em>");
+    }
+    if run.style.alternate_voice {
+        output.push_str("<i>");
+        closing.push("</i>");
+    }
+    if run.style.citation {
+        output.push_str("<cite>");
+        closing.push("</cite>");
+    }
+    if run.style.italic && !run.style.emphasis && !run.style.alternate_voice && !run.style.citation
+    {
+        output.push_str("<torto-italic>");
+        closing.push("</torto-italic>");
     }
     if run.style.underline {
         output.push_str("<u>");
@@ -1212,6 +1225,9 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
         .unwrap_or(fallback);
     style.bold = false;
     style.italic = false;
+    style.emphasis = false;
+    style.alternate_voice = false;
+    style.citation = false;
     style.underline = false;
     style.baseline = TextBaseline::Normal;
     style.link_role = LinkRole::Normal;
@@ -1313,7 +1329,10 @@ fn is_cjk(character: char) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TranslationStyleTag {
     Bold,
-    Italic,
+    Emphasis,
+    AlternateVoice,
+    Citation,
+    PresentationItalic,
     Underline,
     Superscript,
     Subscript,
@@ -1362,10 +1381,22 @@ fn next_translation_style_tag(
         ("</strong>", TranslationStyleTag::Bold, false),
         ("<b>", TranslationStyleTag::Bold, true),
         ("</b>", TranslationStyleTag::Bold, false),
-        ("<em>", TranslationStyleTag::Italic, true),
-        ("</em>", TranslationStyleTag::Italic, false),
-        ("<i>", TranslationStyleTag::Italic, true),
-        ("</i>", TranslationStyleTag::Italic, false),
+        ("<em>", TranslationStyleTag::Emphasis, true),
+        ("</em>", TranslationStyleTag::Emphasis, false),
+        ("<i>", TranslationStyleTag::AlternateVoice, true),
+        ("</i>", TranslationStyleTag::AlternateVoice, false),
+        ("<cite>", TranslationStyleTag::Citation, true),
+        ("</cite>", TranslationStyleTag::Citation, false),
+        (
+            "<torto-italic>",
+            TranslationStyleTag::PresentationItalic,
+            true,
+        ),
+        (
+            "</torto-italic>",
+            TranslationStyleTag::PresentationItalic,
+            false,
+        ),
         ("<u>", TranslationStyleTag::Underline, true),
         ("</u>", TranslationStyleTag::Underline, false),
         ("<sup>", TranslationStyleTag::Superscript, true),
@@ -1395,7 +1426,19 @@ fn next_translation_style_tag(
 fn apply_translation_style_tag(mut style: TextStyle, tag: TranslationStyleTag) -> TextStyle {
     match tag {
         TranslationStyleTag::Bold => style.bold = true,
-        TranslationStyleTag::Italic => style.italic = true,
+        TranslationStyleTag::Emphasis => {
+            style.italic = true;
+            style.emphasis = true;
+        }
+        TranslationStyleTag::AlternateVoice => {
+            style.italic = true;
+            style.alternate_voice = true;
+        }
+        TranslationStyleTag::Citation => {
+            style.italic = true;
+            style.citation = true;
+        }
+        TranslationStyleTag::PresentationItalic => style.italic = true,
         TranslationStyleTag::Underline => style.underline = true,
         TranslationStyleTag::Superscript => {
             style = baseline_style(style, TextBaseline::Superscript);
@@ -2004,6 +2047,126 @@ mod tests {
     }
 
     #[test]
+    fn translation_preserves_cite_separately_from_ordinary_emphasis() {
+        let citation = TextStyle {
+            italic: true,
+            citation: true,
+            ..TextStyle::default()
+        };
+        let original = vec![
+            Inline::Text(TextRun {
+                text: "Read ".into(),
+                style: TextStyle::default(),
+                link: None,
+            }),
+            Inline::Text(TextRun {
+                text: "Rolling Stone".into(),
+                style: citation,
+                link: None,
+            }),
+            Inline::Text(TextRun {
+                text: " today.".into(),
+                style: TextStyle::default(),
+                link: None,
+            }),
+        ];
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: original.clone(),
+            style: BlockStyle::default(),
+            source: None,
+        };
+
+        assert_eq!(
+            translation_text(&block),
+            "Read <cite>Rolling Stone</cite> today."
+        );
+        let translated = replacement_content(
+            "阅读<cite>《滚石》</cite>杂志。",
+            TextStyle::default(),
+            Some(&original),
+        );
+        assert!(translated.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run)
+                if run.text == "《滚石》" && run.style.citation && run.style.italic
+        )));
+        assert!(translated.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run) if run.text == "阅读" && !run.style.citation && !run.style.italic
+        )));
+    }
+
+    #[test]
+    fn translation_keeps_em_i_and_presentation_italic_as_distinct_marks() {
+        let emphasis = TextStyle {
+            italic: true,
+            emphasis: true,
+            ..TextStyle::default()
+        };
+        let alternate_voice = TextStyle {
+            italic: true,
+            alternate_voice: true,
+            ..TextStyle::default()
+        };
+        let presentation_italic = TextStyle {
+            italic: true,
+            ..TextStyle::default()
+        };
+        let original = vec![
+            Inline::Text(TextRun {
+                text: "emphasis".into(),
+                style: emphasis,
+                link: None,
+            }),
+            Inline::Text(TextRun {
+                text: " alternate".into(),
+                style: alternate_voice,
+                link: None,
+            }),
+            Inline::Text(TextRun {
+                text: " visual".into(),
+                style: presentation_italic,
+                link: None,
+            }),
+        ];
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: original.clone(),
+            style: BlockStyle::default(),
+            source: None,
+        };
+
+        assert_eq!(
+            translation_text(&block),
+            "<em>emphasis</em><i> alternate</i><torto-italic> visual</torto-italic>"
+        );
+        let translated = replacement_content(
+            "<em>强调</em><i>术语</i><torto-italic>视觉斜体</torto-italic>",
+            TextStyle::default(),
+            Some(&original),
+        );
+        assert!(translated.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run) if run.text == "强调" && run.style.emphasis && run.style.italic
+        )));
+        assert!(translated.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run)
+                if run.text == "术语" && run.style.alternate_voice && run.style.italic
+        )));
+        assert!(translated.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run)
+                if run.text == "视觉斜体"
+                    && !run.style.emphasis
+                    && !run.style.alternate_voice
+                    && !run.style.citation
+                    && run.style.italic
+        )));
+    }
+
+    #[test]
     fn translation_scopes_bold_and_italic_to_the_corresponding_text() {
         let emphasized = TextStyle {
             bold: true,
@@ -2040,11 +2203,11 @@ mod tests {
         };
         assert_eq!(
             translation_text(&block),
-            "<strong><em>Look at this sentence</em></strong>. The rest is normal.<sup>54</sup>"
+            "<strong><torto-italic>Look at this sentence</torto-italic></strong>. The rest is normal.<sup>54</sup>"
         );
 
         let translated = replacement_content(
-            "<strong><em>看看这个句子</em></strong>。其余内容正常。<sup>54</sup>",
+            "<strong><torto-italic>看看这个句子</torto-italic></strong>。其余内容正常。<sup>54</sup>",
             emphasized,
             Some(&original),
         );

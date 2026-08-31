@@ -22,6 +22,8 @@ use rebook_publication::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use unicode_script::{Script, UnicodeScript as _};
+use unicode_segmentation::UnicodeSegmentation as _;
 
 const QUOTE_VERTICAL_PADDING: f32 = 12.0;
 
@@ -432,6 +434,15 @@ fn supports_common_chinese(charmap: &parley::fontique::Charmap<'_>) -> bool {
         .all(|character| charmap.map(character).is_some())
 }
 
+fn has_embedded_bitmap_glyphs(font: &FontRef<'_>) -> bool {
+    const BITMAP_TABLES: [[u8; 4]; 6] =
+        [*b"EBDT", *b"EBLC", *b"CBDT", *b"CBLC", *b"bdat", *b"bloc"];
+    font.table_directory()
+        .table_records()
+        .iter()
+        .any(|record| BITMAP_TABLES.contains(&record.tag().to_be_bytes()))
+}
+
 /// Brush carried through Parley without coupling layout to a paint backend.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TextBrush {
@@ -640,6 +651,50 @@ impl ReaderFontFamilies {
         include_available_family(&self.all, &mut self.sans_serif, &typography.sans_serif_font);
         include_available_family(&self.all, &mut self.monospace, &typography.monospace_font);
     }
+
+    /// Replaces persisted reader families that the native renderer cannot
+    /// safely paint with the matching bundled default (or a validated fallback).
+    pub fn repair_typography(&self, typography: &mut ReaderTypography) -> bool {
+        typography.normalize();
+        let defaults = ReaderTypography::default();
+        repair_available_family(
+            &self.chinese,
+            &mut typography.default_cjk_font,
+            &defaults.default_cjk_font,
+        ) | repair_available_family(
+            &self.serif,
+            &mut typography.serif_font,
+            &defaults.serif_font,
+        ) | repair_available_family(
+            &self.sans_serif,
+            &mut typography.sans_serif_font,
+            &defaults.sans_serif_font,
+        ) | repair_available_family(
+            &self.monospace,
+            &mut typography.monospace_font,
+            &defaults.monospace_font,
+        )
+    }
+}
+
+fn repair_available_family(available: &[String], current: &mut String, default: &str) -> bool {
+    let replacement = available
+        .iter()
+        .find(|family| family.eq_ignore_ascii_case(current))
+        .or_else(|| {
+            available
+                .iter()
+                .find(|family| family.eq_ignore_ascii_case(default))
+        })
+        .or_else(|| available.first());
+    let Some(replacement) = replacement else {
+        return false;
+    };
+    if replacement == current {
+        return false;
+    }
+    current.clone_from(replacement);
+    true
 }
 
 fn include_available_family(all: &[String], category: &mut Vec<String>, family: &str) {
@@ -696,12 +751,9 @@ impl LayoutEngine {
     }
 
     pub fn available_reader_font_families(&mut self) -> ReaderFontFamilies {
-        let all = self.available_font_families();
-        let mut families = ReaderFontFamilies {
-            all,
-            ..ReaderFontFamilies::default()
-        };
-        for family_name in &families.all {
+        let discovered = self.available_font_families();
+        let mut families = ReaderFontFamilies::default();
+        for family_name in &discovered {
             let font_info = self
                 .font_context
                 .collection
@@ -713,16 +765,25 @@ impl LayoutEngine {
             let Some(data) = font_info.load(None) else {
                 continue;
             };
-            if font_info
+            let supports_chinese = font_info
                 .charmap_index()
                 .charmap(data.as_ref())
-                .is_some_and(|charmap| supports_common_chinese(&charmap))
-            {
-                families.chinese.push(family_name.clone());
-            }
+                .is_some_and(|charmap| supports_common_chinese(&charmap));
             let Ok(font) = FontRef::from_index(data.as_ref(), font_info.index()) else {
                 continue;
             };
+            // Vello 0.10 prefers a matching embedded bitmap strike over the
+            // outline. Several Windows fonts (notably SimSun/宋体) expose EBDT
+            // masks that Vello cannot paint and does not fall back from,
+            // leaving matching glyphs blank. Keep such families out of every
+            // reader selector until the renderer supports that bitmap format.
+            if has_embedded_bitmap_glyphs(&font) {
+                continue;
+            }
+            families.all.push(family_name.clone());
+            if supports_chinese {
+                families.chinese.push(family_name.clone());
+            }
             let fixed_pitch = font
                 .post()
                 .ok()
@@ -1891,7 +1952,147 @@ fn resolve_text_block<'a>(
             Inline::Break => {}
         }
     }
+    resolve_semantic_inline_presentation(&mut resolved.content, reader_style.writing_system);
     Cow::Owned(resolved)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SemanticScriptClass {
+    Cjk,
+    ItalicFriendly,
+    Neutral,
+}
+
+fn resolve_semantic_inline_presentation(
+    content: &mut Vec<Inline>,
+    fallback_writing_system: WritingSystem,
+) {
+    let original = std::mem::take(content);
+    for inline in original {
+        let Inline::Text(run) = inline else {
+            content.push(inline);
+            continue;
+        };
+        if !run.style.emphasis && !run.style.alternate_voice && !run.style.citation {
+            content.push(Inline::Text(run));
+            continue;
+        }
+        let spans = semantic_script_spans(&run.text, fallback_writing_system);
+        if spans.is_empty() {
+            content.push(Inline::Text(run));
+            continue;
+        }
+        for (range, script) in spans {
+            let mut style = run.style;
+            let emphasized = style.emphasis || style.alternate_voice;
+            match script {
+                SemanticScriptClass::Cjk => {
+                    if emphasized {
+                        style.bold = true;
+                    }
+                    style.italic = false;
+                }
+                SemanticScriptClass::ItalicFriendly | SemanticScriptClass::Neutral => {
+                    if emphasized || style.citation {
+                        style.italic = true;
+                    }
+                }
+            }
+            content.push(Inline::Text(TextRun {
+                text: run.text[range].to_owned(),
+                style,
+                link: run.link.clone(),
+            }));
+        }
+    }
+}
+
+fn semantic_script_spans(
+    text: &str,
+    fallback_writing_system: WritingSystem,
+) -> Vec<(Range<usize>, SemanticScriptClass)> {
+    let mut clusters = text
+        .grapheme_indices(true)
+        .map(|(start, grapheme)| {
+            (
+                start..start + grapheme.len(),
+                semantic_grapheme_script(grapheme),
+                grapheme.chars().next(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if clusters.is_empty() {
+        return Vec::new();
+    }
+    let fallback = if fallback_writing_system == WritingSystem::Cjk {
+        SemanticScriptClass::Cjk
+    } else {
+        SemanticScriptClass::ItalicFriendly
+    };
+    let mut next_strong = vec![None; clusters.len()];
+    let mut next = None;
+    for index in (0..clusters.len()).rev() {
+        next_strong[index] = next;
+        if clusters[index].1 != SemanticScriptClass::Neutral {
+            next = Some(clusters[index].1);
+        }
+    }
+    let mut previous = None;
+    for (index, (_, script, first)) in clusters.iter_mut().enumerate() {
+        if *script == SemanticScriptClass::Neutral {
+            let right = next_strong[index];
+            *script = if first.is_some_and(is_semantic_opening_punctuation) {
+                right.or(previous).unwrap_or(fallback)
+            } else if first.is_some_and(is_semantic_closing_punctuation) {
+                previous.or(right).unwrap_or(fallback)
+            } else {
+                previous.or(right).unwrap_or(fallback)
+            };
+        }
+        previous = Some(*script);
+    }
+
+    let mut spans: Vec<(Range<usize>, SemanticScriptClass)> = Vec::new();
+    for (range, script, _) in clusters {
+        if let Some((previous_range, previous_script)) = spans.last_mut()
+            && *previous_script == script
+            && previous_range.end == range.start
+        {
+            previous_range.end = range.end;
+        } else {
+            spans.push((range, script));
+        }
+    }
+    spans
+}
+
+fn semantic_grapheme_script(grapheme: &str) -> SemanticScriptClass {
+    for character in grapheme.chars() {
+        match character.script() {
+            Script::Han | Script::Hiragana | Script::Katakana | Script::Hangul => {
+                return SemanticScriptClass::Cjk;
+            }
+            Script::Latin | Script::Greek | Script::Cyrillic => {
+                return SemanticScriptClass::ItalicFriendly;
+            }
+            _ => {}
+        }
+    }
+    SemanticScriptClass::Neutral
+}
+
+fn is_semantic_opening_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '《' | '〈' | '（' | '(' | '【' | '[' | '「' | '『' | '“' | '‘'
+    )
+}
+
+fn is_semantic_closing_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '》' | '〉' | '）' | ')' | '】' | ']' | '」' | '』' | '”' | '’'
+    )
 }
 
 fn text_block_supports_space_justification(block: &TextBlock) -> bool {
@@ -3274,6 +3475,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unified_semantic_styles_follow_each_mixed_script_span() {
+        let emphasis = TextStyle {
+            italic: true,
+            emphasis: true,
+            ..TextStyle::default()
+        };
+        let citation = TextStyle {
+            italic: true,
+            citation: true,
+            ..TextStyle::default()
+        };
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "重点 important 结论".into(),
+                    style: emphasis,
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: "《Rolling Stone》杂志".into(),
+                    style: citation,
+                    link: None,
+                }),
+            ],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let reader_style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            writing_system: WritingSystem::Cjk,
+            ..ReaderStyle::default()
+        };
+
+        let resolved = resolve_text_block(&block, &reader_style, TextContext::Flow);
+        let runs = resolved
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            runs.iter()
+                .any(|run| { run.text.contains("重点") && run.style.bold && !run.style.italic })
+        );
+        assert!(
+            runs.iter().any(|run| {
+                run.text.contains("important") && !run.style.bold && run.style.italic
+            })
+        );
+        assert!(
+            runs.iter()
+                .any(|run| { run.text.contains("结论") && run.style.bold && !run.style.italic })
+        );
+        assert!(runs.iter().any(|run| {
+            run.text.contains("Rolling Stone") && run.style.citation && run.style.italic
+        }));
+        assert!(
+            runs.iter().any(|run| {
+                run.text.contains("杂志") && run.style.citation && !run.style.italic
+            })
+        );
+    }
+
+    #[test]
+    fn book_typesetting_keeps_authored_semantic_tag_presentation() {
+        let style = TextStyle {
+            italic: true,
+            emphasis: true,
+            ..TextStyle::default()
+        };
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "中文强调".into(),
+                style,
+                link: None,
+            })],
+            style: BlockStyle::default(),
+            source: None,
+        };
+
+        let resolved = resolve_text_block(&block, &ReaderStyle::default(), TextContext::Flow);
+
+        assert!(matches!(resolved, Cow::Borrowed(_)));
+        let Inline::Text(run) = &resolved.content[0] else {
+            panic!("expected text run");
+        };
+        assert!(run.style.italic);
+        assert!(!run.style.bold);
+    }
+
+    #[test]
     fn focus_layout_omits_semantic_footnote_definitions_from_the_main_flow() {
         let block = Block::Text(TextBlock {
             kind: TextBlockKind::FootnoteDefinition,
@@ -4328,6 +4625,37 @@ mod tests {
         typography.default_cjk_font = "LXGW WenKai".into();
         typography.normalize();
         assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
+    }
+
+    #[test]
+    fn unavailable_cjk_preference_is_repaired_to_a_validated_family() {
+        let families = ReaderFontFamilies {
+            all: vec![
+                "LXGW WenKai GB Screen".into(),
+                "Bitter".into(),
+                "Roboto".into(),
+                "Consolas".into(),
+            ],
+            chinese: vec!["LXGW WenKai GB Screen".into()],
+            serif: vec!["Bitter".into()],
+            sans_serif: vec!["Roboto".into()],
+            monospace: vec!["Consolas".into()],
+            ..ReaderFontFamilies::default()
+        };
+        let mut typography = ReaderTypography {
+            default_cjk_font: "宋体".into(),
+            serif_font: "Unavailable Serif".into(),
+            sans_serif_font: "Unavailable Sans".into(),
+            monospace_font: "Unavailable Mono".into(),
+            ..ReaderTypography::default()
+        };
+
+        assert!(families.repair_typography(&mut typography));
+        assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
+        assert_eq!(typography.serif_font, "Bitter");
+        assert_eq!(typography.sans_serif_font, "Roboto");
+        assert_eq!(typography.monospace_font, "Consolas");
+        assert!(!families.repair_typography(&mut typography));
     }
 
     #[test]

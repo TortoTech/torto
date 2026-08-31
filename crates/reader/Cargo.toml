@@ -10,6 +10,7 @@ license.workspace = true
 rebook-layout = { path = "../layout" }
 rebook-publication = { path = "../publication" }
 rebook-renderer = { path = "../renderer" }
+sentencex.workspace = true
 thiserror.workspace = true
 unicode-segmentation.workspace = true
 

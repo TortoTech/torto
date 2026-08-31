@@ -814,7 +814,6 @@ fn reader_font_settings(
     typesetting: &mut rebook_layout::ReaderTypesetting,
     font_families: &rebook_layout::ReaderFontFamilies,
 ) {
-    enforce_focus_typesetting_mode(*reading_mode, typesetting);
     settings_card(ui, |ui| {
         egui::Grid::new("typography-settings-grid")
             .num_columns(2)
@@ -826,7 +825,6 @@ fn reader_font_settings(
                     if choice_button(ui, language.text("专注模式", "Focus mode"), focus).clicked()
                     {
                         *reading_mode = ReadingMode::Focus;
-                        enforce_focus_typesetting_mode(*reading_mode, typesetting);
                     }
                     let classic = *reading_mode == ReadingMode::Classic;
                     if choice_button(ui, language.text("经典模式", "Classic mode"), classic)
@@ -939,15 +937,6 @@ fn reader_font_settings(
                 }
             });
     });
-}
-
-fn enforce_focus_typesetting_mode(
-    reading_mode: ReadingMode,
-    typesetting: &mut rebook_layout::ReaderTypesetting,
-) {
-    if reading_mode == ReadingMode::Focus {
-        typesetting.mode = TypesettingMode::Unified;
-    }
 }
 
 fn classic_content_settings_visible(reading_mode: ReadingMode) -> bool {
@@ -2213,13 +2202,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn focus_mode_forces_unified_typesetting_and_locks_the_content_style() {
+    fn focus_mode_hides_content_style_without_overwriting_the_classic_preference() {
         let mut typesetting = rebook_layout::ReaderTypesetting::default();
         typesetting.mode = TypesettingMode::Book;
 
-        enforce_focus_typesetting_mode(ReadingMode::Focus, &mut typesetting);
-
-        assert_eq!(typesetting.mode, TypesettingMode::Unified);
+        assert_eq!(typesetting.mode, TypesettingMode::Book);
         assert!(!classic_content_settings_visible(ReadingMode::Focus));
         assert!(classic_content_settings_visible(ReadingMode::Classic));
     }
@@ -2228,8 +2215,6 @@ mod tests {
     fn classic_mode_preserves_the_selected_typesetting_mode() {
         let mut typesetting = rebook_layout::ReaderTypesetting::default();
         typesetting.mode = TypesettingMode::Book;
-
-        enforce_focus_typesetting_mode(ReadingMode::Classic, &mut typesetting);
 
         assert_eq!(typesetting.mode, TypesettingMode::Book);
     }

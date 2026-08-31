@@ -810,6 +810,17 @@ impl Default for Rgba {
 pub struct TextStyle {
     pub bold: bool,
     pub italic: bool,
+    /// Semantic stress emphasis originating from HTML `<em>`.
+    #[serde(default)]
+    pub emphasis: bool,
+    /// Semantic alternate voice or term originating from HTML `<i>`.
+    #[serde(default)]
+    pub alternate_voice: bool,
+    /// Authored work-title or citation semantics, usually originating from
+    /// HTML `<cite>`. This remains independent from italic presentation so it
+    /// can survive translation and CSS normalization.
+    #[serde(default)]
+    pub citation: bool,
     pub underline: bool,
     /// Scale relative to the reader's base font size.
     pub size_scale: f32,
@@ -830,6 +841,9 @@ impl Default for TextStyle {
         Self {
             bold: false,
             italic: false,
+            emphasis: false,
+            alternate_voice: false,
+            citation: false,
             underline: false,
             size_scale: 1.0,
             color: Rgba::BLACK,

@@ -427,10 +427,13 @@ impl DesktopReader {
                 };
                 let leave_focus_mode = fixed_page && self.is_focus_mode();
                 if leave_focus_mode {
-                    style.spread = crate::preferences::load_reader_preferences()
-                        .map_or(rebook_layout::SpreadMode::Double, |settings| {
-                            settings.spread
-                        });
+                    let preferences = crate::preferences::load_reader_preferences()
+                        .unwrap_or_else(|_| crate::preferences::ReaderPreferences::default());
+                    style.spread = preferences.spread;
+                    style.typesetting = super::effective_typesetting(
+                        crate::preferences::ReadingMode::Classic,
+                        &preferences.typesetting,
+                    );
                     style.minimum_paragraph_gap = 0.0;
                 }
                 match self

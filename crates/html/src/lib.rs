@@ -901,9 +901,17 @@ impl<'a> ReadingIrParser<'a> {
         self.inside_quote = previously_inside_quote;
         parse_result?;
         let mut parsed = self.blocks.drain(start..).collect::<Vec<_>>();
-        let attribution = attribution_node.and_then(|_| match parsed.pop() {
+        let attribution = attribution_node.and_then(|node| match parsed.pop() {
             Some(Block::Text(mut block)) => {
                 block.kind = TextBlockKind::QuoteAttribution;
+                if node.tag_name().name().eq_ignore_ascii_case("cite") {
+                    for inline in &mut block.content {
+                        if let Inline::Text(run) = inline {
+                            run.style.italic = true;
+                            run.style.citation = true;
+                        }
+                    }
+                }
                 Some(block)
             }
             Some(block) => {
@@ -2258,7 +2266,18 @@ fn collect_inline_node_with_block_boundaries(
     let mut style = inherited;
     match name.as_str() {
         "strong" | "b" => style.bold = true,
-        "em" | "i" | "cite" => style.italic = true,
+        "em" => {
+            style.italic = true;
+            style.emphasis = true;
+        }
+        "i" => {
+            style.italic = true;
+            style.alternate_voice = true;
+        }
+        "cite" => {
+            style.italic = true;
+            style.citation = true;
+        }
         "u" => style.underline = true,
         "small" => style.size_scale *= 0.85,
         "big" => style.size_scale *= 1.2,
@@ -5398,6 +5417,57 @@ mod tests {
             quote.attribution.as_ref().map(|block| block.kind),
             Some(TextBlockKind::QuoteAttribution)
         );
+        let attribution = quote.attribution.as_ref().unwrap();
+        let citation = attribution.content.iter().find_map(|inline| match inline {
+            Inline::Text(run) if run.text.contains("The source") => Some(run),
+            _ => None,
+        });
+        assert!(citation.is_some_and(|run| run.style.citation && run.style.italic));
+    }
+
+    #[test]
+    fn inline_cite_keeps_citation_semantics_separate_from_ordinary_emphasis() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p>Fred Woodward designed <cite>Rolling Stone</cite>, <em>other work</em>, and <i>technical terms</i>.</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Text(block)] = section.blocks.as_slice() else {
+            panic!("expected one text block");
+        };
+        let citation = block.content.iter().find_map(|inline| match inline {
+            Inline::Text(run) if run.text == "Rolling Stone" => Some(run),
+            _ => None,
+        });
+        let emphasis = block.content.iter().find_map(|inline| match inline {
+            Inline::Text(run) if run.text == "other work" => Some(run),
+            _ => None,
+        });
+        let alternate_voice = block.content.iter().find_map(|inline| match inline {
+            Inline::Text(run) if run.text == "technical terms" => Some(run),
+            _ => None,
+        });
+
+        assert!(citation.is_some_and(|run| run.style.citation && run.style.italic));
+        assert!(emphasis.is_some_and(|run| {
+            run.style.emphasis
+                && !run.style.alternate_voice
+                && !run.style.citation
+                && run.style.italic
+        }));
+        assert!(alternate_voice.is_some_and(|run| {
+            run.style.alternate_voice
+                && !run.style.emphasis
+                && !run.style.citation
+                && run.style.italic
+        }));
     }
 
     #[test]
