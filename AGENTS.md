@@ -4,6 +4,9 @@
 
 - Write release notes in English first, followed by the Simplified Chinese translation inside an HTML `<details>` block.
 - The summary tag must be exactly `<summary>中文更新说明</summary>`. Do not rename it or add attributes; the desktop updater uses this exact marker to select notes for the current interface language.
+- Write for ordinary users. Lead with what changed in their experience and why it is useful, rather than how it was implemented.
+- Prefer plain language and avoid library names, code symbols, architecture details, and other technical terminology unless users need them to understand compatibility or take action.
+- Keep the notes concise. Use one short sentence per entry, combine closely related changes, and omit internal maintenance that has no meaningful user-facing effect.
 - Classify changes under these headings and keep this order in both language sections:
   1. `## Feature` for new user-facing capabilities.
   2. `## Improvement` for enhancements to existing behavior, usability, performance, or quality.
