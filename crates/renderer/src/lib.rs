@@ -14,6 +14,10 @@ use rebook_layout::{
 };
 use rebook_publication::{Rgba, SourceAnchor, SourceRange, TextBaseline};
 
+// Vello expands already-positioned outlines in display units, so this does not
+// alter Parley's advances or chosen line breaks.
+const SYNTHETIC_EMBOLDEN_EM: f64 = 0.025;
+
 /// Pointer hit inside one retained text placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageTextHit {
@@ -1427,7 +1431,7 @@ impl DisplayCommand {
                 command.font_size,
                 true,
                 &command.normalized_coords,
-                Vec2::ZERO,
+                command.embolden,
                 Fill::NonZero,
                 command.color,
                 1.0,
@@ -1467,6 +1471,7 @@ struct GlyphCommand {
     font: FontData,
     font_size: f32,
     normalized_coords: Arc<[NormalizedCoord]>,
+    embolden: Vec2,
     color: Color,
     transform: Affine,
     glyph_transform: Option<Affine>,
@@ -1982,6 +1987,7 @@ fn compile_text_commands(
                 continue;
             }
             let synthesis = run.synthesis();
+            let embolden = synthetic_embolden(synthesis.embolden(), run.font_size());
             let glyph_transform = synthesis
                 .skew()
                 .map(|angle| Affine::skew(f64::from(angle.to_radians().tan()), 0.0));
@@ -1998,6 +2004,7 @@ fn compile_text_commands(
                 font: run.font().clone(),
                 font_size: run.font_size(),
                 normalized_coords: run.normalized_coords().to_vec().into(),
+                embolden,
                 color: color(brush.color),
                 transform,
                 glyph_transform,
@@ -2022,6 +2029,14 @@ fn compile_text_commands(
     }
 }
 
+fn synthetic_embolden(enabled: bool, font_size: f32) -> Vec2 {
+    if !enabled || !font_size.is_finite() || font_size <= 0.0 {
+        return Vec2::ZERO;
+    }
+    let amount = f64::from(font_size) * SYNTHETIC_EMBOLDEN_EM;
+    Vec2::new(amount, amount)
+}
+
 fn color(value: Rgba) -> Color {
     Color::from_rgba8(value.red, value.green, value.blue, value.alpha)
 }
@@ -2035,6 +2050,18 @@ mod tests {
         ImagePlacement, InlineImage, LayoutViewport, PageItem, PageLayout, QuotePlacement,
         RasterImage, SeparatorPlacement, TextBrush, TextPlacement,
     };
+
+    #[test]
+    fn synthetic_bold_uses_two_and_a_half_percent_em_outline_expansion() {
+        let regular = synthetic_embolden(false, 20.0);
+        let bold = synthetic_embolden(true, 20.0);
+
+        assert_eq!(regular, Vec2::ZERO);
+        assert!((bold.x - 0.5).abs() < f64::EPSILON);
+        assert!((bold.y - 0.5).abs() < f64::EPSILON);
+        assert_eq!(synthetic_embolden(true, 0.0), Vec2::ZERO);
+        assert_eq!(synthetic_embolden(true, f32::NAN), Vec2::ZERO);
+    }
 
     #[test]
     fn rounded_quote_decorations_are_painted_below_source_overlays() {

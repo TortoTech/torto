@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use anyrender::{Filter, NormalizedCoord, Paint, PaintRef, PaintScene, RenderContext};
-use kurbo::{Affine, Rect, Shape, Stroke, Vec2};
+use kurbo::{Affine, Diagonal2, Rect, Shape, Stroke, Vec2};
 use peniko::{BlendMode, Color, Fill, FontData, StyleRef};
-use vello::{Glyph, Scene};
+use vello::{FontEmbolden, Glyph, Scene};
 
 pub struct VelloScene<'a> {
     scene: &'a mut Scene,
@@ -101,7 +101,7 @@ impl PaintScene for VelloScene<'_> {
         font_size: f32,
         hint: bool,
         normalized_coords: &'a [NormalizedCoord],
-        _embolden: Vec2,
+        embolden: Vec2,
         style: impl Into<StyleRef<'a>>,
         paint: impl Into<PaintRef<'a>>,
         brush_alpha: f32,
@@ -116,6 +116,7 @@ impl PaintScene for VelloScene<'_> {
             .font_size(font_size)
             .hint(hint)
             .normalized_coords(normalized_coords)
+            .font_embolden(FontEmbolden::new(Diagonal2::new(embolden.x, embolden.y)))
             .brush(solid_brush(&paint))
             .brush_alpha(brush_alpha)
             .transform(transform)
