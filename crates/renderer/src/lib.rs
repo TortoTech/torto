@@ -963,6 +963,7 @@ impl ShapedTextRegion {
         if byte_range.end <= byte_range.start {
             return Vec::new();
         }
+        let shared_wrapped_end = shared_wrapped_content_end(&self.layout);
         let selection = Selection::new(
             Cursor::from_byte_index(&self.layout, byte_range.start, Affinity::Downstream),
             Cursor::from_byte_index(&self.layout, byte_range.end, Affinity::Upstream),
@@ -976,11 +977,11 @@ impl ShapedTextRegion {
                 let mut x0 = rect.x0;
                 let mut x1 = rect.x1;
 
-                // Parley 0.10 does not include the extra whitespace advance added by
-                // justified alignment in LineMetrics::advance. Its selection geometry
-                // uses that stale value for fully selected middle lines, leaving the
-                // right-hand end of those lines unpainted. Reconstruct the visual
-                // advance from the adjusted clusters until the upstream issue is fixed:
+                // Parley selection geometry can use a stale reported measure for fully
+                // selected justified lines. Keep every soft-wrapped line on one shared
+                // right edge, but derive that edge from both the reported measure and
+                // the actual positioned content so the background never ends inside a
+                // rendered word:
                 // https://github.com/linebender/parley/issues/396
                 if let Some(line) = self.layout.get(line_index) {
                     let line_text = line.text_range();
@@ -1001,11 +1002,11 @@ impl ShapedTextRegion {
                             // even when an unbreakable Latin word leaves visible space at
                             // its end. Keep the final/explicit line content-sized, but make
                             // every wrapped line's active highlight share one right edge.
-                            // `inline_max_coord` is already expressed in the line's
-                            // paragraph coordinate space. A hanging indent is carried
-                            // separately by `offset`; adding it here a second time makes
-                            // list highlights protrude past the paragraph's right edge.
-                            f64::from(line.metrics().inline_max_coord)
+                            // The shared value is already expressed in the paragraph
+                            // coordinate space. A hanging indent is carried separately
+                            // by `offset`; adding it here a second time makes list
+                            // highlights protrude past the paragraph's right edge.
+                            f64::from(shared_wrapped_end)
                         } else {
                             let text_advance = line
                                 .runs()
@@ -1145,6 +1146,35 @@ impl ShapedTextRegion {
             .and_then(|range| self.source_range_for_bytes(range))
             .is_some_and(|range| source_range_contains(&range, anchor))
     }
+}
+
+fn positioned_line_content_end(line: parley::layout::Line<'_, TextBrush>) -> f32 {
+    let mut glyph_end = 0.0_f32;
+    let mut inline_end = 0.0_f32;
+    for item in line.items() {
+        match item {
+            PositionedLayoutItem::GlyphRun(glyph_run) => {
+                glyph_end = glyph_end.max(glyph_run.offset() + glyph_run.advance());
+            }
+            PositionedLayoutItem::InlineBox(inline_box) => {
+                inline_end = inline_end.max(inline_box.x + inline_box.width);
+            }
+        }
+    }
+    (glyph_end - line.metrics().trailing_whitespace)
+        .max(inline_end)
+        .max(0.0)
+}
+
+fn shared_wrapped_content_end(layout: &Layout<TextBrush>) -> f32 {
+    layout
+        .lines()
+        .filter(|line| line.break_reason() == BreakReason::Regular)
+        .fold(0.0_f32, |right, line| {
+            right
+                .max(line.metrics().inline_max_coord)
+                .max(positioned_line_content_end(line))
+        })
 }
 
 fn scale_text_offset_to_source(
@@ -2662,7 +2692,7 @@ mod tests {
         layout.break_all_lines(Some(150.0));
         layout.align(Alignment::Justify, AlignmentOptions::default());
 
-        let (line_y, expected_right) = layout
+        let line_y = layout
             .lines()
             .skip(1)
             .take(layout.len().saturating_sub(2))
@@ -2675,12 +2705,11 @@ mod tests {
                             .sum::<f32>()
                     })
                     .sum::<f32>();
-                (visual_advance > line.metrics().advance + 1.0).then_some((
-                    line.metrics().block_min_coord,
-                    line.metrics().offset + line.metrics().inline_max_coord,
-                ))
+                (visual_advance > line.metrics().advance + 1.0)
+                    .then_some(line.metrics().block_min_coord)
             })
             .expect("the fixture should contain a justified middle line");
+        let expected_right = shared_wrapped_content_end(&layout);
 
         let spine = SpineItemId::new("chapter-1").unwrap();
         let source = SourceRange {
@@ -2756,7 +2785,7 @@ mod tests {
         layout.align(Alignment::Justify, AlignmentOptions::default());
         let first = layout.get(0).expect("fixture should have a first line");
         let continuation = layout.get(1).expect("fixture should wrap");
-        let expected_right = continuation.metrics().inline_max_coord;
+        let expected_right = shared_wrapped_content_end(&layout);
         let first_y = first.metrics().block_min_coord;
         let continuation_y = continuation.metrics().block_min_coord;
 
@@ -2837,7 +2866,7 @@ mod tests {
         let last = layout.get(layout.len() - 1).unwrap();
         assert!(matches!(first.break_reason(), BreakReason::Regular));
         assert_eq!(last.break_reason(), BreakReason::None);
-        let expected_wrapped_right = first.metrics().offset + first.metrics().inline_max_coord;
+        let expected_wrapped_right = shared_wrapped_content_end(&layout);
         let last_content_right = last.metrics().offset
             + last.metrics().inline_min_coord
             + last

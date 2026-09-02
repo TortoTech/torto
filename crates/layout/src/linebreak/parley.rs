@@ -246,6 +246,25 @@ pub(crate) fn apply_breaks(
     (layout.len() == lines.len()).then_some(())
 }
 
+#[cfg(test)]
+pub(crate) fn positioned_line_content_end(line: parley::layout::Line<'_, TextBrush>) -> f32 {
+    let mut glyph_end = 0.0_f32;
+    let mut inline_end = 0.0_f32;
+    for item in line.items() {
+        match item {
+            parley::PositionedLayoutItem::GlyphRun(glyph_run) => {
+                glyph_end = glyph_end.max(glyph_run.offset() + glyph_run.advance());
+            }
+            parley::PositionedLayoutItem::InlineBox(inline_box) => {
+                inline_end = inline_end.max(inline_box.x + inline_box.width);
+            }
+        }
+    }
+    (glyph_end - line.metrics().trailing_whitespace)
+        .max(inline_end)
+        .max(0.0)
+}
+
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]
 struct ShapedCluster {

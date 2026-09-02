@@ -9,9 +9,9 @@ use rebook_publication::{Block, BookSource};
 use reqwest::Client;
 use serde_json::{Value, json};
 
-use super::AiProvider;
 use super::ai::{message_content, request_completion};
 use super::llm_json;
+use super::{AiProvider, ReasoningEffort};
 
 pub(super) const PAGE_IMAGE_MAX_DIMENSION: u32 = 1_600;
 const VISION_RESPONSE_RETRIES: usize = 1;
@@ -37,6 +37,7 @@ pub(super) async fn request_vision_json(
             &messages,
             None,
             None,
+            ReasoningEffort::Default,
             Some(&extra_body),
         )
         .await

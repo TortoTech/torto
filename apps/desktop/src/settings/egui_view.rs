@@ -4,7 +4,7 @@ use rebook_layout::{ReaderDefaultFont, SpreadMode, TypesettingMode};
 use super::{ProviderModelsRequest, SettingsFeature, SettingsTab, ShortcutAction};
 use crate::plugins::{
     AiModelConfig, AiProviderKind, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN,
-    CHAT_TOOL_STEPS_MAX, CHAT_TOOL_STEPS_MIN, PdfOcrProviderKind, PluginSettings,
+    CHAT_TOOL_STEPS_MAX, CHAT_TOOL_STEPS_MIN, PdfOcrProviderKind, PluginSettings, ReasoningEffort,
     TARGET_LANGUAGE_ENGLISH, TARGET_LANGUAGE_SIMPLIFIED_CHINESE, TARGET_LANGUAGE_SYSTEM,
     TranslationMode,
 };
@@ -1191,6 +1191,16 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 });
                 ui.end_row();
 
+                settings_row_label(ui, language.text("思考等级", "Reasoning effort"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    reasoning_effort_selector(
+                        ui,
+                        "chat-reasoning-effort",
+                        &mut settings.chat_reasoning_effort,
+                    );
+                });
+                ui.end_row();
+
                 settings_u16_slider_row(
                     ui,
                     language.text("工具调用轮数", "Tool call steps"),
@@ -1382,6 +1392,16 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 });
                 ui.end_row();
 
+                settings_row_label(ui, language.text("思考等级", "Reasoning effort"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    reasoning_effort_selector(
+                        ui,
+                        "translation-reasoning-effort",
+                        &mut settings.translation_reasoning_effort,
+                    );
+                });
+                ui.end_row();
+
                 settings_row_label(ui, language.text("翻译为", "Translate to"));
                 settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
                     let selected_language =
@@ -1429,6 +1449,21 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 ui.end_row();
             });
     });
+}
+
+fn reasoning_effort_selector(
+    ui: &mut egui::Ui,
+    id_salt: &'static str,
+    selected: &mut ReasoningEffort,
+) {
+    egui::ComboBox::from_id_salt(id_salt)
+        .width(SETTINGS_MODEL_SELECT_WIDTH)
+        .selected_text(selected.label())
+        .show_ui(ui, |ui| {
+            for effort in ReasoningEffort::ALL {
+                ui.selectable_value(selected, effort, effort.label());
+            }
+        });
 }
 
 fn configured_model_options(settings: &PluginSettings) -> Vec<ConfiguredModel> {

@@ -168,6 +168,51 @@ impl AiModelConfig {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    #[default]
+    Default,
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Default,
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub(crate) const fn api_value(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::None => Some("none"),
+            Self::Minimal => Some("minimal"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TranslationMode {
     #[default]
     Replace,
@@ -210,6 +255,8 @@ pub struct PluginSettings {
     pub providers: Vec<AiProvider>,
     pub chat_provider: String,
     pub chat_model: String,
+    #[serde(default)]
+    pub chat_reasoning_effort: ReasoningEffort,
     pub chat_max_tool_steps: u16,
     pub chat_history_turns: u16,
     pub ocr_enabled: bool,
@@ -226,6 +273,8 @@ pub struct PluginSettings {
     pub mineru_token: String,
     pub translation_provider: String,
     pub translation_model: String,
+    #[serde(default)]
+    pub translation_reasoning_effort: ReasoningEffort,
     pub target_language: String,
     pub translation_mode: TranslationMode,
     pub translate_toc: bool,
@@ -245,6 +294,7 @@ impl Default for PluginSettings {
             providers: vec![AiProvider::default()],
             chat_provider: DEFAULT_PROVIDER_ID.into(),
             chat_model: DEFAULT_MODEL.into(),
+            chat_reasoning_effort: ReasoningEffort::Default,
             chat_max_tool_steps: DEFAULT_CHAT_MAX_TOOL_STEPS,
             chat_history_turns: DEFAULT_CHAT_HISTORY_TURNS,
             ocr_enabled: true,
@@ -259,6 +309,7 @@ impl Default for PluginSettings {
             mineru_token: String::new(),
             translation_provider: DEFAULT_PROVIDER_ID.into(),
             translation_model: DEFAULT_MODEL.into(),
+            translation_reasoning_effort: ReasoningEffort::Default,
             target_language: TARGET_LANGUAGE_SYSTEM.into(),
             translation_mode: TranslationMode::Replace,
             translate_toc: true,
@@ -815,6 +866,20 @@ mod tests {
         let restored: PluginSettings = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.translation_mode, TranslationMode::Replace);
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_and_option_order_match_the_settings_contract() {
+        let settings: PluginSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.chat_reasoning_effort, ReasoningEffort::Default);
+        assert_eq!(
+            settings.translation_reasoning_effort,
+            ReasoningEffort::Default
+        );
+        assert_eq!(
+            ReasoningEffort::ALL.map(ReasoningEffort::label),
+            ["default", "none", "minimal", "low", "medium", "high"]
+        );
     }
 
     #[test]

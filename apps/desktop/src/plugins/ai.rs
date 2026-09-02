@@ -26,7 +26,8 @@ use super::search::{search_book, search_section, section_title, text_block_kind,
 use super::translation::validate_translation_math_placeholders;
 use super::{
     AiProvider, BlockTranslation, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN,
-    CHAT_TOOL_STEPS_MAX, CHAT_TOOL_STEPS_MIN, PluginSettings, TranslationBlockInput,
+    CHAT_TOOL_STEPS_MAX, CHAT_TOOL_STEPS_MIN, PluginSettings, ReasoningEffort,
+    TranslationBlockInput,
 };
 
 const MAX_TRANSLATION_CHARS: usize = 2_000;
@@ -205,6 +206,7 @@ pub async fn chat_with_book(
     let direct_pdf_summary = format == BookFormat::Pdf
         && source.book().metadata.layout == RenditionLayout::PrePaginated
         && kind == ChatRequestKind::ChapterSummary;
+    let reasoning_effort = settings.chat_reasoning_effort;
     let (provider, model) = settings.chat_endpoint()?;
     let max_tool_steps = usize::from(
         settings
@@ -260,10 +262,17 @@ pub async fn chat_with_book(
             }
         }
         messages.push(json!({ "role": "user", "content": input.content }));
-        let message =
-            request_streaming_completion(&client, provider, model, &messages, None, &mut on_stream)
-                .await
-                .map_err(|error| direct_pdf_summary_error(&error, input.has_images))?;
+        let message = request_streaming_completion(
+            &client,
+            provider,
+            model,
+            &messages,
+            None,
+            reasoning_effort,
+            &mut on_stream,
+        )
+        .await
+        .map_err(|error| direct_pdf_summary_error(&error, input.has_images))?;
         let content = message_content(&message)
             .filter(|content| !content.trim().is_empty())
             .ok_or_else(|| "AI 返回了空内容".to_owned())?;
@@ -285,6 +294,7 @@ pub async fn chat_with_book(
             model,
             &messages,
             Some(&tools),
+            reasoning_effort,
             &mut on_stream,
         )
         .await
@@ -562,6 +572,7 @@ pub async fn translate_blocks_incremental<F>(
 where
     F: FnMut(Vec<BlockTranslation>),
 {
+    let reasoning_effort = settings.translation_reasoning_effort;
     let (provider, model) = settings.translation_endpoint()?;
     if blocks.is_empty() {
         return Ok(());
@@ -577,6 +588,7 @@ where
             provider,
             model,
             settings.target_language.trim(),
+            reasoning_effort,
             &batch,
         )
         .await?;
@@ -590,6 +602,7 @@ async fn translate_block_batch(
     provider: &AiProvider,
     model: &str,
     target_language: &str,
+    reasoning_effort: ReasoningEffort,
     blocks: &[TranslationBlockInput],
 ) -> Result<Vec<BlockTranslation>, String> {
     let keys = (0..blocks.len())
@@ -610,28 +623,36 @@ async fn translate_block_batch(
         let messages = vec![
             json!({
                 "role": "system",
-                "content": format!(
-                    "你是一名专业图书翻译。请把输入 JSON 对象中的每个值翻译为{target_language}，忠实保留原文语气、专有名词与段落结构。每个 JSON 值都是独立正文块：原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时则保持相同类型。文本中的 <strong>、<em>、<i>、<cite>、<torto-italic>、<u>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记：必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。形如 <torto-math-0/>、<torto-math-1/> 的自闭合标签是不可修改的公式占位符：可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。{fixed_page_hint}只返回一个 JSON 对象，必须保留完全相同的键，每个值只能是对应译文字符串。"
-                ),
+                "content": translation_system_prompt(target_language, fixed_page_hint),
             }),
             json!({ "role": "user", "content": Value::Object(input.clone()).to_string() }),
         ];
-        let content =
-            match request_completion(client, provider, model, &messages, None, None, None).await {
-                Ok(message) => {
-                    let Some(content) =
-                        message_content(&message).filter(|content| !content.trim().is_empty())
-                    else {
-                        last_error = Some("翻译服务返回了空内容".to_owned());
-                        continue;
-                    };
-                    content
-                }
-                Err(error) => {
-                    last_error = Some(error);
+        let content = match request_completion(
+            client,
+            provider,
+            model,
+            &messages,
+            None,
+            None,
+            reasoning_effort,
+            None,
+        )
+        .await
+        {
+            Ok(message) => {
+                let Some(content) =
+                    message_content(&message).filter(|content| !content.trim().is_empty())
+                else {
+                    last_error = Some("翻译服务返回了空内容".to_owned());
                     continue;
-                }
-            };
+                };
+                content
+            }
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
         match parse_translation_object(&content, &keys) {
             Ok(values) => {
                 if let Some(error) = blocks.iter().zip(&values).find_map(|(block, translation)| {
@@ -658,6 +679,33 @@ async fn translate_block_batch(
         }
     }
     Err(last_error.unwrap_or_else(|| "翻译结果格式无效".to_owned()))
+}
+
+fn translation_system_prompt(target_language: &str, fixed_page_hint: &str) -> String {
+    let fixed_page_section = if fixed_page_hint.is_empty() {
+        String::new()
+    } else {
+        format!("\n# PDF 文字层\n- {fixed_page_hint}\n")
+    };
+    format!(
+        r#"你是一名专业图书翻译。
+
+# 翻译任务
+- 把输入 JSON 对象中的每个值翻译为{target_language}。
+- 忠实保留原文语气、事实、专名所指与段落结构。
+
+# 中文表达（目标语言为中文时）
+- 人名、地名、书名、机构名、专业术语等外文专名，显示译名即可，不需要用括号附原文。
+- 尽量不保留破折号句式，仅当用于话语中断作用时才保留。
+
+# 正文结构
+- 每个 JSON 值都是独立正文块。原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时保持相同类型。
+- <strong>、<em>、<i>、<cite>、<torto-italic>、<u>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记。必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。
+- <torto-math-0/>、<torto-math-1/> 等自闭合标签是不可修改的公式占位符。可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。
+{fixed_page_section}
+# 输出格式
+- 只返回一个 JSON 对象，保留完全相同的键；每个值只能是对应译文字符串。"#
+    )
 }
 
 fn translation_batches(
@@ -748,6 +796,12 @@ fn parse_translation_object(content: &str, keys: &[String]) -> Result<Vec<String
         .collect()
 }
 
+fn apply_reasoning_effort(body: &mut Value, reasoning_effort: ReasoningEffort) {
+    if let Some(value) = reasoning_effort.api_value() {
+        body["reasoning_effort"] = Value::String(value.into());
+    }
+}
+
 pub(super) async fn request_completion(
     client: &Client,
     provider: &AiProvider,
@@ -755,6 +809,7 @@ pub(super) async fn request_completion(
     messages: &[Value],
     tools: Option<&Value>,
     max_tokens: Option<u32>,
+    reasoning_effort: ReasoningEffort,
     extra_body: Option<&Value>,
 ) -> Result<Value, String> {
     let mut body = json!({
@@ -769,6 +824,7 @@ pub(super) async fn request_completion(
     if let Some(max_tokens) = max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }
+    apply_reasoning_effort(&mut body, reasoning_effort);
     if let Some(extra_body) = extra_body.and_then(Value::as_object) {
         let body = body
             .as_object_mut()
@@ -810,6 +866,7 @@ pub(super) async fn request_streaming_completion<F>(
     model: &str,
     messages: &[Value],
     tools: Option<&Value>,
+    reasoning_effort: ReasoningEffort,
     on_content: &mut F,
 ) -> Result<Value, String>
 where
@@ -825,6 +882,7 @@ where
         body["tools"] = tools.clone();
         body["tool_choice"] = Value::String("auto".into());
     }
+    apply_reasoning_effort(&mut body, reasoning_effort);
     let mut response = client
         .post(chat_completions_url(&provider.base_url))
         .bearer_auth(provider.api_key.trim())
@@ -2569,6 +2627,42 @@ mod tests {
         assert_eq!(clip_text("系统思考", 2), "系统\n…（内容已截断）");
         assert_eq!(clip_text("short", 8), "short");
     }
+    #[test]
+    fn translation_prompt_uses_structured_chinese_style_rules() {
+        let prompt = translation_system_prompt("简体中文", "PDF 提示。");
+
+        for heading in ["# 翻译任务", "# 中文表达", "# 正文结构", "# 输出格式"] {
+            assert!(prompt.contains(heading));
+        }
+        assert!(prompt.contains(
+            "人名、地名、书名、机构名、专业术语等外文专名，显示译名即可，不需要用括号附原文"
+        ));
+        assert!(prompt.contains("尽量不保留破折号句式，仅当用于话语中断作用时才保留"));
+        assert!(!prompt.contains("A—B—C"));
+        assert!(prompt.contains("PDF 提示。"));
+    }
+
+    #[test]
+    fn default_reasoning_effort_is_omitted_and_explicit_levels_are_sent() {
+        let mut default_body = json!({ "model": "test" });
+        apply_reasoning_effort(&mut default_body, ReasoningEffort::Default);
+        assert!(default_body.get("reasoning_effort").is_none());
+
+        for effort in [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ] {
+            let mut body = json!({ "model": "test" });
+            apply_reasoning_effort(&mut body, effort);
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                effort.api_value()
+            );
+        }
+    }
 
     #[test]
     fn translation_batches_preserve_block_identity() {
@@ -3302,6 +3396,7 @@ mod tests {
             let request = String::from_utf8(request).unwrap();
             assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
             assert!(request.contains("authorization: Bearer secret-key"));
+            assert!(request.contains(r#""reasoning_effort":"minimal""#));
 
             let body =
                 r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"你好\"}"}}]}"#;
@@ -3317,6 +3412,7 @@ mod tests {
         settings.providers[0].base_url = format!("http://{address}/v1");
         settings.providers[0].api_key = "secret-key".into();
         settings.target_language = "简体中文".into();
+        settings.translation_reasoning_effort = ReasoningEffort::Minimal;
         let mut batches = Vec::new();
         tokio::runtime::Runtime::new()
             .unwrap()
@@ -3381,6 +3477,7 @@ mod tests {
                 &provider,
                 "test-model",
                 "简体中文",
+                ReasoningEffort::Default,
                 &[TranslationBlockInput {
                     block_index: 7,
                     segment_index: None,
@@ -3432,6 +3529,7 @@ mod tests {
                 &provider,
                 "test-model",
                 "简体中文",
+                ReasoningEffort::Default,
                 &[TranslationBlockInput {
                     block_index: 8,
                     segment_index: None,

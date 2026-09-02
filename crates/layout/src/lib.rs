@@ -5923,6 +5923,13 @@ mod tests {
                 .all(|line| (line.metrics().inline_max_coord - 180.0).abs() < 0.01),
             "multi-line caption should use optimized full-measure breaks"
         );
+        assert!(
+            long.layout
+                .lines()
+                .take(long.layout.len().saturating_sub(1))
+                .all(|line| linebreak::parley::positioned_line_content_end(line) >= 179.0),
+            "optimized caption lines should visually fill the shared measure"
+        );
     }
 
     #[test]
