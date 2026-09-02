@@ -853,6 +853,80 @@ fn focus_footnote_text_in_section(
     normalize_resolved_footnote_text(&block_focus_text(block), marker)
 }
 
+fn focus_footnote_translation_ranges_in_section(
+    section: &Section,
+    target: &PublicationUrl,
+) -> Vec<SourceRange> {
+    let Some(fragment) = target.fragment() else {
+        return Vec::new();
+    };
+    let Some(anchor) = section
+        .anchors
+        .iter()
+        .find(|anchor| anchor.fragment == fragment)
+        .map(|anchor| &anchor.source)
+    else {
+        return Vec::new();
+    };
+    let target_block = section
+        .blocks
+        .iter()
+        .find_map(|block| note_definition_containing_anchor(block, anchor))
+        .or_else(|| {
+            section
+                .blocks
+                .iter()
+                .find_map(|block| find_block_containing_anchor(block, anchor))
+        });
+    let Some(target_block) = target_block else {
+        return Vec::new();
+    };
+    let mut ranges = Vec::new();
+    collect_focus_footnote_translation_ranges(target_block, &mut ranges);
+    ranges
+}
+
+fn collect_focus_footnote_translation_ranges(block: &Block, ranges: &mut Vec<SourceRange>) {
+    let mut push_text = |text: &TextBlock| {
+        if let Some(range) = &text.source
+            && !ranges.contains(range)
+        {
+            ranges.push(range.clone());
+        }
+    };
+    match block {
+        Block::Text(text) => push_text(text),
+        Block::Quote(quote) => {
+            for text in quote.body.iter().chain(quote.attribution.iter()) {
+                push_text(text);
+            }
+        }
+        Block::Table(table) => {
+            for cell in table.rows.iter().flat_map(|row| &row.cells) {
+                push_text(&cell.text);
+            }
+        }
+        Block::Figure(figure) => {
+            for caption in &figure.captions {
+                push_text(caption);
+            }
+        }
+        Block::Note(note) => {
+            for child in &note.blocks {
+                collect_focus_footnote_translation_ranges(child, ranges);
+            }
+        }
+        Block::Image(image) => {
+            if let Some(range) = &image.source
+                && !ranges.contains(range)
+            {
+                ranges.push(range.clone());
+            }
+        }
+        Block::Separator(_) | Block::LineBreak | Block::PageBreak => {}
+    }
+}
+
 fn find_block_containing_anchor<'a>(block: &'a Block, anchor: &SourceAnchor) -> Option<&'a Block> {
     if let Block::Note(note) = block {
         return note
@@ -3228,7 +3302,8 @@ mod tests {
         SnapshotEffects, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TransientMessageTimer,
         TranslationUiState, allowed_reading_mode, block_is_footnote_definition,
         effective_typesetting, embedded_toc_is_page_index, focus_block_paint_ranges,
-        focus_footnote_text, focus_footnote_text_in_section, focus_list_descendant_root,
+        focus_footnote_text, focus_footnote_text_in_section,
+        focus_footnote_translation_ranges_in_section, focus_list_descendant_root,
         focus_navigation_destination, focus_offset_after_viewport_resize, focus_reading_window,
         focus_scroll_content_height, focus_scroll_duration, focus_scroll_target,
         focus_unit_contains_source_range, focus_unit_geometry_ranges,
@@ -3446,13 +3521,13 @@ mod tests {
                             link: None,
                         })],
                         style: BlockStyle::default(),
-                        source: Some(continuation_source),
+                        source: Some(continuation_source.clone()),
                     }),
                 ],
             })],
             anchors: vec![SectionAnchor {
                 fragment: "note-1".into(),
-                source: first_source.start,
+                source: first_source.start.clone(),
             }],
         };
 
@@ -3464,6 +3539,13 @@ mod tests {
             )
             .as_deref(),
             Some("First paragraph\n\nContinuation paragraph")
+        );
+        assert_eq!(
+            focus_footnote_translation_ranges_in_section(
+                &section,
+                &PublicationUrl::parse("notes.xhtml#note-1").unwrap(),
+            ),
+            vec![first_source, continuation_source]
         );
     }
 

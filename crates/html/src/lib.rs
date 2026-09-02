@@ -50,7 +50,7 @@ fn classify_footnote_links(
         .collect::<Vec<_>>();
 
     for (index, node) in anchors.iter().copied().enumerate() {
-        let Some(source_fragment) = node_fragment(node) else {
+        let Some(source_fragment) = footnote_reference_fragment(node) else {
             continue;
         };
         let Some(target) = targets[index].as_ref() else {
@@ -99,6 +99,25 @@ fn classify_footnote_links(
             .or_insert(LinkRole::FootnoteBacklink);
     }
     roles
+}
+
+fn footnote_reference_fragment<'a>(node: Node<'a, '_>) -> Option<&'a str> {
+    if let Some(fragment) = node_fragment(node) {
+        return Some(fragment);
+    }
+    let mut sibling = node.prev_sibling();
+    while let Some(candidate) = sibling {
+        if candidate.is_text() && candidate.text().is_some_and(|text| text.trim().is_empty()) {
+            sibling = candidate.prev_sibling();
+            continue;
+        }
+        let is_empty_anchor = candidate.is_element()
+            && candidate.tag_name().name().eq_ignore_ascii_case("a")
+            && attribute_local(candidate, "href").is_none()
+            && node_text(candidate).trim().is_empty();
+        return is_empty_anchor.then(|| node_fragment(candidate)).flatten();
+    }
+    None
 }
 
 fn explicit_link_role(node: Node<'_, '_>) -> Option<LinkRole> {
@@ -3983,6 +4002,70 @@ mod tests {
         assert!(runs.iter().any(|run| {
             run.text.trim() == "[5]" && run.style.link_role == LinkRole::FootnoteBacklink
         }));
+    }
+
+    #[test]
+    fn classifies_reciprocal_footnote_with_split_reference_anchor() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p>Authored prose.<a id="ref-1"/><a href="#note-1"><sup>*</sup></a></p>
+            <div><p id="note-1"><a href="#ref-1"><sup>*</sup></a>Footnote definition.</p></div>
+        </body></html>"##;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let runs = all_text_blocks(&section)
+            .into_iter()
+            .flat_map(|block| &block.content)
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run),
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            runs.iter().any(|run| {
+                run.text == "*" && run.style.link_role == LinkRole::FootnoteReference
+            })
+        );
+        assert!(
+            runs.iter().any(|run| {
+                run.text == "*" && run.style.link_role == LinkRole::FootnoteBacklink
+            })
+        );
+        assert!(section.blocks.iter().any(|block| matches!(
+            block,
+            Block::Note(note) if note.kind == NoteBlockKind::Definition
+        )));
+    }
+
+    #[test]
+    fn split_heading_reference_hides_an_image_bearing_footnote() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <h1>12<br/>Lucy to LuLu to Rose<a id="ref-1"/><a href="#note-1"><sup>*</sup></a></h1>
+            <p>Chapter content.</p>
+            <div><p id="note-1"><a href="#ref-1"><sup>*</sup></a>Footnote text.<br/>
+                <img alt="" src="images/diagram.jpg"/></p></div>
+        </body></html>"##;
+
+        let section = parse_section(xml, &descriptor, |_| None).unwrap();
+
+        assert!(section.blocks.iter().any(|block| matches!(
+            block,
+            Block::Note(note) if note.kind == NoteBlockKind::Definition
+        )));
     }
 
     #[test]

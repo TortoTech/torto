@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,9 +11,10 @@ use super::chat_autocomplete::{
 };
 use super::{
     AssistantPanel, ChatStreamMessage, ChatStreamingState, ChatTask, ChatTaskMessage,
-    DesktopReader, FocusedMark, MarkRetention, PdfMetadataUpdate, PdfOcrTask, PdfOcrTaskMessage,
-    PdfTocTask, PdfTocTaskMessage, SearchTask, SearchTaskMessage, SidebarTab, SnapshotEffects,
-    TocTranslationTask, TocTranslationTaskMessage, TranslationTask, TranslationTaskMessage,
+    DesktopReader, FocusFootnoteSource, FocusedMark, MarkRetention, PdfMetadataUpdate, PdfOcrTask,
+    PdfOcrTaskMessage, PdfTocTask, PdfTocTaskMessage, SearchTask, SearchTaskMessage, SidebarTab,
+    SnapshotEffects, TocTranslationTask, TocTranslationTaskMessage, TranslationTask,
+    TranslationTaskMessage, block_focus_footnotes, focus_footnote_translation_ranges_in_section,
 };
 use crate::platform::UserEvent;
 use crate::plugins::{
@@ -1816,6 +1818,7 @@ impl DesktopReader {
                 sections.push((section_index, vec![fragment.range]));
             }
         }
+        append_linked_footnote_translation_ranges(self.source.as_ref(), &mut sections);
         Ok(sections)
     }
 
@@ -1830,6 +1833,83 @@ impl DesktopReader {
         self.translation.render_enabled = enabled;
         true
     }
+}
+
+fn append_linked_footnote_translation_ranges(
+    source: &dyn BookSource,
+    sections: &mut Vec<(usize, Vec<SourceRange>)>,
+) {
+    let visible_sections = sections.clone();
+    let mut parsed_sections = HashMap::new();
+    let mut footnote_targets = Vec::new();
+    for (section_index, ranges) in &visible_sections {
+        let Ok(section) = source.parse_section(*section_index) else {
+            continue;
+        };
+        for block in &section.blocks {
+            let visible = block_source_range(block).is_some_and(|source| {
+                ranges
+                    .iter()
+                    .any(|range| translation_ranges_overlap(source, range))
+            });
+            if !visible {
+                continue;
+            }
+            for footnote in block_focus_footnotes(block) {
+                if let FocusFootnoteSource::Reference { target, .. } = footnote
+                    && !footnote_targets.contains(&target)
+                {
+                    footnote_targets.push(target);
+                }
+            }
+        }
+        parsed_sections.insert(*section_index, section);
+    }
+    for target in footnote_targets {
+        let Some(section_index) = source
+            .book()
+            .sections
+            .iter()
+            .position(|section| section.href.path() == target.path())
+        else {
+            continue;
+        };
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            parsed_sections.entry(section_index)
+        {
+            let Ok(section) = source.parse_section(section_index) else {
+                continue;
+            };
+            entry.insert(section);
+        }
+        let Some(section) = parsed_sections.get(&section_index) else {
+            continue;
+        };
+        let footnote_ranges = focus_footnote_translation_ranges_in_section(section, &target);
+        if footnote_ranges.is_empty() {
+            continue;
+        }
+        if let Some((_, ranges)) = sections
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == section_index)
+        {
+            for range in footnote_ranges {
+                if !ranges.contains(&range) {
+                    ranges.push(range);
+                }
+            }
+        } else {
+            sections.push((section_index, footnote_ranges));
+        }
+    }
+}
+
+fn translation_ranges_overlap(left: &SourceRange, right: &SourceRange) -> bool {
+    left.start.spine == right.start.spine
+        && (left.start.node == right.start.node
+            || left.start.node == right.end.node
+            || left.end.node == right.start.node
+            || left.end.node == right.end.node)
 }
 
 fn paragraph_reference(
@@ -2000,6 +2080,33 @@ fn translated_toc_labels(
 mod tests {
     use super::*;
     use crate::plugins::BlockTranslation;
+    use rebook_publication::{
+        BlockStyle, Book, Inline, LinkRole, Metadata, NoteBlock, NoteBlockKind, PublicationError,
+        PublicationId, PublicationUrl, Resource, Section, SectionAnchor, SourceAnchor, SpineItem,
+        SpineItemId, TextBlock, TextBlockKind, TextRun, TextStyle,
+    };
+
+    struct FootnoteTranslationSource {
+        book: Book,
+        sections: Vec<Section>,
+    }
+
+    impl BookSource for FootnoteTranslationSource {
+        fn book(&self) -> &Book {
+            &self.book
+        }
+
+        fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+            self.sections
+                .get(index)
+                .cloned()
+                .ok_or_else(|| PublicationError::ResourceNotFound(format!("section {index}")))
+        }
+
+        fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+            Err(PublicationError::ResourceNotFound(href.to_string()))
+        }
+    }
 
     #[test]
     fn toc_translations_are_mapped_by_their_stable_row_ids() {
@@ -2040,5 +2147,128 @@ mod tests {
             focus_structure_activation(&[(key("one"), true), (key("two"), true)]),
             Some(false)
         );
+    }
+
+    #[test]
+    fn visible_references_add_linked_note_ranges_to_the_translation_window() {
+        let body_id = SpineItemId::new("body").unwrap();
+        let notes_id = SpineItemId::new("notes").unwrap();
+        let body_href = PublicationUrl::parse("body.xhtml").unwrap();
+        let notes_href = PublicationUrl::parse("notes.xhtml").unwrap();
+        let body_range = SourceRange {
+            start: SourceAnchor {
+                spine: body_id.clone(),
+                node: "paragraph".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: body_id.clone(),
+                node: "paragraph".into(),
+                text_offset: 6,
+            },
+        };
+        let first_note_range = SourceRange {
+            start: SourceAnchor {
+                spine: notes_id.clone(),
+                node: "note-1".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: notes_id.clone(),
+                node: "note-1".into(),
+                text_offset: 10,
+            },
+        };
+        let second_note_range = SourceRange {
+            start: SourceAnchor {
+                spine: notes_id.clone(),
+                node: "note-1-more".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: notes_id.clone(),
+                node: "note-1-more".into(),
+                text_offset: 9,
+            },
+        };
+        let text_block = |text: &str, source: SourceRange| TextBlock {
+            kind: TextBlockKind::FootnoteDefinition,
+            content: vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: BlockStyle::default(),
+            source: Some(source),
+        };
+        let body = Section {
+            id: body_id.clone(),
+            href: body_href.clone(),
+            blocks: vec![Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![
+                    Inline::Text(TextRun {
+                        text: "Body".into(),
+                        style: TextStyle::default(),
+                        link: None,
+                    }),
+                    Inline::Text(TextRun {
+                        text: "1".into(),
+                        style: TextStyle {
+                            link_role: LinkRole::FootnoteReference,
+                            ..TextStyle::default()
+                        },
+                        link: Some(PublicationUrl::parse("notes.xhtml#note-1").unwrap()),
+                    }),
+                ],
+                style: BlockStyle::default(),
+                source: Some(body_range.clone()),
+            })],
+            anchors: Vec::new(),
+        };
+        let notes = Section {
+            id: notes_id.clone(),
+            href: notes_href.clone(),
+            blocks: vec![Block::Note(NoteBlock {
+                kind: NoteBlockKind::Definition,
+                blocks: vec![
+                    Block::Text(text_block("1 First note", first_note_range.clone())),
+                    Block::Text(text_block("More note", second_note_range.clone())),
+                ],
+                source: Some(SourceRange {
+                    start: first_note_range.start.clone(),
+                    end: second_note_range.end.clone(),
+                }),
+            })],
+            anchors: vec![SectionAnchor {
+                fragment: "note-1".into(),
+                source: first_note_range.start.clone(),
+            }],
+        };
+        let source = FootnoteTranslationSource {
+            book: Book {
+                id: PublicationId::new("footnote-translation-window").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: [(&body_id, &body_href), (&notes_id, &notes_href)]
+                    .into_iter()
+                    .map(|(id, href)| SpineItem {
+                        id: id.clone(),
+                        href: href.clone(),
+                        media_type: "application/xhtml+xml".into(),
+                        linear: true,
+                        properties: Vec::new(),
+                    })
+                    .collect(),
+                table_of_contents: Vec::new(),
+            },
+            sections: vec![body, notes],
+        };
+        let mut ranges = vec![(0, vec![body_range])];
+
+        append_linked_footnote_translation_ranges(&source, &mut ranges);
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[1], (1, vec![first_note_range, second_note_range]));
     }
 }

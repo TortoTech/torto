@@ -5,8 +5,8 @@ use std::sync::{Arc, RwLock};
 use rebook_publication::{
     Block, BlockStyle, Book, BookSource, FigureBlock, FixedPageTextLayer, FixedPageTextRect,
     FixedPageTextReplacement, FixedPageTextReplacementSegment, Inline, InlineRole, LinkRole,
-    PublicationError, PublicationUrl, RasterResource, RenditionLayout, Resource, Section,
-    SourceRange, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
+    NoteBlock, PublicationError, PublicationUrl, RasterResource, RenditionLayout, Resource,
+    Section, SourceRange, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 
 use super::TranslationMode;
@@ -289,10 +289,163 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
                     },
                 ));
             }
-            Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {}
+            Block::Note(note) => {
+                let mut segment_index = 0;
+                for child in &note.blocks {
+                    visit_note_text_blocks(child, &mut segment_index, &mut |index, text_block| {
+                        if let Some(text) = translatable_text(text_block) {
+                            blocks.push(TranslationBlockInput {
+                                block_index,
+                                segment_index: Some(index),
+                                text,
+                            });
+                        }
+                    });
+                }
+            }
+            Block::Separator(_) | Block::LineBreak | Block::PageBreak => {}
         }
     }
     blocks
+}
+
+fn visit_note_text_blocks(
+    block: &Block,
+    segment_index: &mut usize,
+    visit: &mut impl FnMut(usize, &TextBlock),
+) {
+    match block {
+        Block::Text(text) => {
+            visit(*segment_index, text);
+            *segment_index += 1;
+        }
+        Block::Quote(quote) => {
+            for text in &quote.body {
+                visit(*segment_index, text);
+                *segment_index += 1;
+            }
+            if let Some(text) = &quote.attribution {
+                visit(*segment_index, text);
+                *segment_index += 1;
+            }
+        }
+        Block::Table(table) => {
+            for cell in table.rows.iter().flat_map(|row| &row.cells) {
+                visit(*segment_index, &cell.text);
+                *segment_index += 1;
+            }
+        }
+        Block::Figure(figure) => {
+            for caption in &figure.captions {
+                visit(*segment_index, caption);
+                *segment_index += 1;
+            }
+        }
+        Block::Note(note) => {
+            for child in &note.blocks {
+                visit_note_text_blocks(child, segment_index, visit);
+            }
+        }
+        Block::Image(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {}
+    }
+}
+
+fn visit_note_text_blocks_mut(
+    block: &mut Block,
+    segment_index: &mut usize,
+    visit: &mut impl FnMut(usize, &mut TextBlock),
+) {
+    match block {
+        Block::Text(text) => {
+            visit(*segment_index, text);
+            *segment_index += 1;
+        }
+        Block::Quote(quote) => {
+            for text in &mut quote.body {
+                visit(*segment_index, text);
+                *segment_index += 1;
+            }
+            if let Some(text) = &mut quote.attribution {
+                visit(*segment_index, text);
+                *segment_index += 1;
+            }
+        }
+        Block::Table(table) => {
+            for cell in table.rows.iter_mut().flat_map(|row| &mut row.cells) {
+                visit(*segment_index, &mut cell.text);
+                *segment_index += 1;
+            }
+        }
+        Block::Figure(figure) => {
+            for caption in &mut figure.captions {
+                visit(*segment_index, caption);
+                *segment_index += 1;
+            }
+        }
+        Block::Note(note) => {
+            for child in &mut note.blocks {
+                visit_note_text_blocks_mut(child, segment_index, visit);
+            }
+        }
+        Block::Image(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {}
+    }
+}
+
+fn note_text_source_range_at(note: &NoteBlock, target_index: usize) -> Option<&SourceRange> {
+    fn find_in_block<'a>(
+        block: &'a Block,
+        target_index: usize,
+        segment_index: &mut usize,
+    ) -> Option<&'a SourceRange> {
+        let mut find_text = |text: &'a TextBlock| {
+            let found = (*segment_index == target_index)
+                .then_some(text.source.as_ref())
+                .flatten();
+            *segment_index += 1;
+            found
+        };
+        match block {
+            Block::Text(text) => find_text(text),
+            Block::Quote(quote) => {
+                for text in quote.body.iter().chain(quote.attribution.iter()) {
+                    if let Some(range) = find_text(text) {
+                        return Some(range);
+                    }
+                }
+                None
+            }
+            Block::Table(table) => {
+                for cell in table.rows.iter().flat_map(|row| &row.cells) {
+                    if let Some(range) = find_text(&cell.text) {
+                        return Some(range);
+                    }
+                }
+                None
+            }
+            Block::Figure(figure) => {
+                for caption in &figure.captions {
+                    if let Some(range) = find_text(caption) {
+                        return Some(range);
+                    }
+                }
+                None
+            }
+            Block::Note(note) => {
+                for child in &note.blocks {
+                    if let Some(range) = find_in_block(child, target_index, segment_index) {
+                        return Some(range);
+                    }
+                }
+                None
+            }
+            Block::Image(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => None,
+        }
+    }
+
+    let mut segment_index = 0;
+    note.blocks
+        .iter()
+        .find_map(|block| find_in_block(block, target_index, &mut segment_index))
 }
 
 fn merge_translations(
@@ -330,6 +483,9 @@ fn translation_input_source_range(
     block: &Block,
     segment_index: Option<usize>,
 ) -> Option<&SourceRange> {
+    if let (Block::Note(note), Some(target_index)) = (block, segment_index) {
+        return note_text_source_range_at(note, target_index).or(note.source.as_ref());
+    }
     if let (Block::Table(table), Some(segment_index)) = (block, segment_index) {
         return table
             .rows
@@ -468,6 +624,10 @@ impl BookSource for TranslationBookSource {
                         mode,
                     )));
                 }
+                Block::Note(mut note) if !translation.segments.is_empty() => {
+                    apply_note_translation(&mut note, &translation.segments, mode);
+                    rendered.push(Block::Note(note));
+                }
                 other => rendered.push(other),
             }
         }
@@ -491,6 +651,38 @@ impl BookSource for TranslationBookSource {
         section_index: usize,
     ) -> Result<Option<rebook_publication::FixedPageDimensions>, PublicationError> {
         self.inner.fixed_page_dimensions(section_index)
+    }
+}
+
+fn apply_note_translation(
+    note: &mut NoteBlock,
+    translations: &HashMap<usize, String>,
+    mode: TranslationMode,
+) {
+    let mut segment_index = 0;
+    for child in &mut note.blocks {
+        visit_note_text_blocks_mut(child, &mut segment_index, &mut |index, text_block| {
+            let Some(translation) = translations.get(&index) else {
+                return;
+            };
+            let style = text_block
+                .content
+                .iter()
+                .find_map(|inline| match inline {
+                    Inline::Text(run) => Some(run.style),
+                    Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                })
+                .unwrap_or_default();
+            let original = text_block.content.clone();
+            if mode == TranslationMode::Replace {
+                text_block.content = replacement_content(translation, style, Some(&original));
+            } else {
+                text_block.content.push(Inline::Break);
+                text_block
+                    .content
+                    .extend(replacement_content(translation, style, Some(&original)));
+            }
+        });
     }
 }
 
@@ -1562,8 +1754,9 @@ fn best_marker_match(
 mod tests {
     use rebook_publication::{
         BlockStyle, FigureBlock, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan,
-        ImageBlock, ImageStyle, Metadata, PublicationId, QuoteBlock, RenditionLayout, SourceAnchor,
-        SourceRange, SpineItem, SpineItemId, TextBlock, TextBlockKind,
+        ImageBlock, ImageStyle, Metadata, NoteBlockKind, PublicationId, QuoteBlock,
+        RenditionLayout, SourceAnchor, SourceRange, SpineItem, SpineItemId, TextBlock,
+        TextBlockKind,
     };
 
     use super::*;
@@ -2044,6 +2237,87 @@ mod tests {
                     && run.style.inline_role == InlineRole::Footnote
                     && run.link.is_none()
         )));
+    }
+
+    #[test]
+    fn note_definition_children_are_translated_from_their_source_ranges() {
+        let spine = SpineItemId::new("notes").unwrap();
+        let href = PublicationUrl::parse("notes.xhtml").unwrap();
+        let source_range = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "note-1".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: "note-1".into(),
+                text_offset: 15,
+            },
+        };
+        let source: Arc<dyn BookSource> = Arc::new(TestSource {
+            book: Book {
+                id: PublicationId::new("footnote-translation-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: vec![SpineItem {
+                    id: spine.clone(),
+                    href: href.clone(),
+                    media_type: "application/xhtml+xml".into(),
+                    linear: true,
+                    properties: Vec::new(),
+                }],
+                table_of_contents: Vec::new(),
+            },
+            section: Section {
+                id: spine,
+                href,
+                blocks: vec![Block::Note(NoteBlock {
+                    kind: NoteBlockKind::Definition,
+                    blocks: vec![Block::Text(TextBlock {
+                        kind: TextBlockKind::FootnoteDefinition,
+                        content: vec![Inline::Text(TextRun {
+                            text: "1 Original note".into(),
+                            style: TextStyle::default(),
+                            link: None,
+                        })],
+                        style: BlockStyle::default(),
+                        source: Some(source_range.clone()),
+                    })],
+                    source: Some(source_range.clone()),
+                })],
+                anchors: Vec::new(),
+            },
+        });
+        let overlay = TranslationBookSource::new(source, TranslationMode::Replace);
+
+        let inputs = overlay
+            .untranslated_blocks_for_ranges(0, std::slice::from_ref(&source_range))
+            .unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].block_index, 0);
+        assert_eq!(inputs[0].segment_index, Some(0));
+        assert_eq!(inputs[0].text, "1 Original note");
+
+        overlay
+            .store_section(
+                0,
+                &[BlockTranslation {
+                    block_index: 0,
+                    segment_index: Some(0),
+                    text: "1 已翻译脚注".into(),
+                }],
+            )
+            .unwrap();
+        overlay.set_enabled(true).unwrap();
+        let translated = overlay.parse_section(0).unwrap();
+        let Block::Note(note) = &translated.blocks[0] else {
+            panic!("expected translated note block");
+        };
+        let Block::Text(note_text) = &note.blocks[0] else {
+            panic!("expected translated note text");
+        };
+        assert_eq!(text_block_text(note_text), "1已翻译脚注");
     }
 
     #[test]
