@@ -3,22 +3,23 @@
 pub mod linebreak;
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
 use image::ImageError;
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight, IndentOptions,
-    InlineBox as ParleyInlineBox, InlineBoxKind, Layout, LayoutContext, LineHeight, StyleProperty,
+    InlineBox as ParleyInlineBox, InlineBoxKind, Layout, LayoutContext, LineHeight,
+    PositionedLayoutItem, StyleProperty,
 };
 use read_fonts::{FontRef, TableProvider as _};
 use rebook_publication::{
     Block, BlockStyle, BookSource, CaptionPosition, FixedPageDimensions, FixedPageTextLayer,
-    FixedPageTextRect, ImageBlock, ImageStyle, Inline, InlineRole, LinkRole, MathRun,
-    NoteBlockKind, PublicationError, PublicationUrl, RenditionLayout, Rgba, Section, SeparatorKind,
-    SourceRange, TableBlock, TableCell, TextAlignment, TextBaseline, TextBlock, TextBlockKind,
-    TextRun, TextStyle, WritingSystem,
+    FixedPageTextRect, ImageBlock, ImageLength, ImageStyle, Inline, InlineImageAlignment,
+    InlineRole, LinkRole, MathRun, NoteBlockKind, PublicationError, PublicationUrl,
+    RenditionLayout, Rgba, Section, SeparatorKind, SourceRange, TableBlock, TableCell,
+    TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle, WritingSystem,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -563,6 +564,8 @@ pub struct InlineImage {
     pub image: RasterImage,
     pub width: f32,
     pub height: f32,
+    /// Paint offset relative to Parley's baseline-aligned inline box.
+    pub offset_y: f32,
 }
 
 /// Decoded RGBA image ready for upload by the renderer.
@@ -608,6 +611,7 @@ pub struct LayoutEngine {
     font_context: FontContext,
     layout_context: LayoutContext<TextBrush>,
     svg_options: resvg::usvg::Options<'static>,
+    publication_languages: Vec<String>,
 }
 
 fn should_layout_flow_block(block: &Block, reader_style: &ReaderStyle) -> bool {
@@ -727,6 +731,7 @@ impl LayoutEngine {
             font_context: FontContext::new(),
             layout_context: LayoutContext::new(),
             svg_options,
+            publication_languages: Vec::new(),
         }
     }
 
@@ -892,6 +897,8 @@ impl LayoutEngine {
         viewport: LayoutViewport,
         reader_style: &ReaderStyle,
     ) -> Result<SectionLayout, LayoutError> {
+        self.publication_languages
+            .clone_from(&source.book().metadata.languages);
         let page_width = viewport.width as f32;
         let page_height = viewport.height as f32;
         let geometry = resolve_page_geometry(page_width, page_height, reader_style);
@@ -1466,6 +1473,7 @@ impl LayoutEngine {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn shape_text_with_min_width_and_rasters(
         &mut self,
         block: &TextBlock,
@@ -1510,11 +1518,36 @@ impl LayoutEngine {
         );
         let should_optimize = reader_style.typesetting.line_break_strategy
             == LineBreakStrategy::Optimized
-            && ((block.kind == TextBlockKind::Paragraph
-                && block.style.align == TextAlignment::Justify)
-                || (reader_style.typesetting.mode == TypesettingMode::Unified
-                    && block.kind == TextBlockKind::Caption
-                    && block.style.align == TextAlignment::Start));
+            && matches!(
+                block.style.align,
+                TextAlignment::Start | TextAlignment::Justify
+            )
+            && matches!(
+                block.kind,
+                TextBlockKind::Paragraph
+                    | TextBlockKind::Blockquote
+                    | TextBlockKind::Caption
+                    | TextBlockKind::ListItem { .. }
+                    | TextBlockKind::DefinitionDescription { .. }
+            );
+        let candidate_hyphens = if should_optimize {
+            self.prepare_hyphen_candidates(
+                &text,
+                &spans,
+                &inline_images,
+                &font_stack,
+                typography,
+                block.style.line_height,
+                reader_style.foreground,
+            )
+        } else {
+            HashMap::new()
+        };
+        let hyphen_widths = candidate_hyphens
+            .iter()
+            .map(|(offset, glyph)| (*offset, glyph.width))
+            .collect::<HashMap<_, _>>();
+        let mut selected_hyphens = Vec::new();
         let optimized = should_optimize
             && linebreak::parley::plan_optimized(
                 &mut layout,
@@ -1522,6 +1555,7 @@ impl LayoutEngine {
                 available_width,
                 first_line_indent,
                 typography.font_size,
+                &hyphen_widths,
             )
             .and_then(|plan| {
                 let mut adjusted = self.build_text_layout(
@@ -1542,6 +1576,15 @@ impl LayoutEngine {
                     first_line_indent,
                 );
                 linebreak::parley::apply_breaks(&mut adjusted, &plan.lines, available_width)?;
+                selected_hyphens = plan
+                    .hyphen_offsets
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(line_index, offset)| {
+                        let glyph = candidate_hyphens.get(offset.as_ref()?)?.clone();
+                        Some(PreparedHyphen { line_index, glyph })
+                    })
+                    .collect();
                 layout = adjusted;
                 Some(())
             })
@@ -1568,10 +1611,101 @@ impl LayoutEngine {
                     image: image.image,
                     width: image.width,
                     height: image.height,
+                    offset_y: image.offset_y,
                 })
                 .collect::<Vec<_>>()
                 .into(),
+            hyphens: selected_hyphens.into(),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_hyphen_candidates(
+        &mut self,
+        text: &str,
+        spans: &[StyledRange],
+        inline_images: &[PreparedInlineImage],
+        font_stack: &str,
+        typography: &ReaderTypography,
+        line_height: f32,
+        foreground: Rgba,
+    ) -> HashMap<usize, PreparedHyphenGlyph> {
+        let hyphenation_spans = spans
+            .iter()
+            .filter(|span| !span.range.is_empty())
+            .map(|span| linebreak::hyphenation::HyphenationSpan {
+                range: span.range.clone(),
+                language: span.style.language,
+                mode: span.style.hyphenation,
+                suppress: span.hyphenation_suppressed,
+            })
+            .collect::<Vec<_>>();
+        let blockers = inline_images
+            .iter()
+            .map(|image| image.index)
+            .collect::<Vec<_>>();
+        let mut opportunities = linebreak::hyphenation::break_opportunities(
+            text,
+            &hyphenation_spans,
+            &self.publication_languages,
+            &blockers,
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
+        opportunities.sort_unstable();
+
+        let hyphen_text: Arc<str> = Arc::from("\u{2010}");
+        let mut style_cache = Vec::<(TextStyle, PreparedHyphenGlyph)>::new();
+        let mut prepared = HashMap::new();
+        for offset in opportunities {
+            let Some(style) = spans
+                .iter()
+                .find(|span| {
+                    span.range.start < offset
+                        && offset <= span.range.end
+                        && !span.hyphenation_suppressed
+                })
+                .map(|span| span.style)
+            else {
+                continue;
+            };
+            if let Some((_, glyph)) = style_cache.iter().find(|(cached, _)| *cached == style) {
+                prepared.insert(offset, glyph.clone());
+                continue;
+            }
+            let hyphen_span = StyledRange {
+                range: 0..hyphen_text.len(),
+                style,
+                footnote_reference_group: 0,
+                hyphenation_suppressed: true,
+            };
+            let mut layout = self.build_text_layout(
+                &hyphen_text,
+                std::slice::from_ref(&hyphen_span),
+                &[],
+                font_stack,
+                typography,
+                line_height,
+                foreground,
+                &[],
+            );
+            layout.break_all_lines(None);
+            let Some(line) = layout.get(0) else {
+                continue;
+            };
+            let width = positioned_line_content_end(line);
+            if !width.is_finite() || width <= 0.0 {
+                continue;
+            }
+            let glyph = PreparedHyphenGlyph {
+                layout: Arc::new(layout),
+                text: Arc::clone(&hyphen_text),
+                width,
+            };
+            style_cache.push((style, glyph.clone()));
+            prepared.insert(offset, glyph);
+        }
+        prepared
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1644,7 +1778,7 @@ impl LayoutEngine {
                 kind: InlineBoxKind::InFlow,
                 index: image.index,
                 width: image.width,
-                height: image.height,
+                height: image.box_height,
             });
         }
         builder.build(text)
@@ -2290,6 +2424,7 @@ struct StyledRange {
     range: Range<usize>,
     style: TextStyle,
     footnote_reference_group: u32,
+    hyphenation_suppressed: bool,
 }
 
 struct PreparedText {
@@ -2299,6 +2434,20 @@ struct PreparedText {
     start_offset: f32,
     available_width: f32,
     inline_images: Arc<[InlineImage]>,
+    hyphens: Arc<[PreparedHyphen]>,
+}
+
+#[derive(Clone)]
+struct PreparedHyphenGlyph {
+    layout: Arc<Layout<TextBrush>>,
+    text: Arc<str>,
+    width: f32,
+}
+
+#[derive(Clone)]
+struct PreparedHyphen {
+    line_index: usize,
+    glyph: PreparedHyphenGlyph,
 }
 
 struct PreparedTable {
@@ -2412,6 +2561,8 @@ struct PreparedInlineImage {
     image: RasterImage,
     width: f32,
     height: f32,
+    box_height: f32,
+    offset_y: f32,
 }
 
 struct FixedPageReplacementRequest {
@@ -2518,6 +2669,7 @@ fn prepare_inline_content(
                 ..TextStyle::default()
             },
             footnote_reference_group: 0,
+            hyphenation_suppressed: true,
         });
     }
     let source_text_start = text.len();
@@ -2555,6 +2707,10 @@ fn prepare_inline_content(
                     range: start..text.len(),
                     style,
                     footnote_reference_group,
+                    hyphenation_suppressed: run.link.is_some()
+                        || footnote_reference
+                        || run.style.baseline != TextBaseline::Normal
+                        || run.style.inline_role != InlineRole::Normal,
                 });
             }
             Inline::Math(run) => {
@@ -2571,6 +2727,8 @@ fn prepare_inline_content(
                         index: text.len(),
                         width: image.1,
                         height: image.2,
+                        box_height: image.2,
+                        offset_y: 0.0,
                         image: image.0,
                     });
                 } else {
@@ -2586,31 +2744,23 @@ fn prepare_inline_content(
                             ..TextStyle::default()
                         },
                         footnote_reference_group: 0,
+                        hyphenation_suppressed: true,
                     });
                 }
             }
             Inline::Image(run) => {
-                let Some(image) = inline_rasters
-                    .get(inline_index)
-                    .and_then(|image| image.clone())
-                else {
+                let Some(image) = inline_rasters.get(inline_index).and_then(Clone::clone) else {
                     continue;
                 };
-                let intrinsic_width = image.width.max(1) as f32;
-                let intrinsic_height = image.height.max(1) as f32;
-                let aspect_ratio = intrinsic_width / intrinsic_height;
-                let requested_height =
-                    (typography.font_size * run.size_scale.clamp(0.25, 3.0)).max(1.0);
-                let requested_width = requested_height * aspect_ratio;
-                let width_scale = (available_width / requested_width).min(1.0);
                 let id = u64::try_from(inline_images.len()).unwrap_or(u64::MAX);
-                inline_images.push(PreparedInlineImage {
-                    id,
-                    index: text.len(),
+                inline_images.push(prepare_inline_raster(
+                    run,
                     image,
-                    width: (requested_width * width_scale).max(1.0),
-                    height: (requested_height * width_scale).max(1.0),
-                });
+                    typography,
+                    available_width,
+                    id,
+                    text.len(),
+                ));
             }
             Inline::Break => {
                 let compact_gap = text
@@ -2629,6 +2779,7 @@ fn prepare_inline_content(
                             ..TextStyle::default()
                         },
                         footnote_reference_group: 0,
+                        hyphenation_suppressed: true,
                     });
                 } else {
                     text.push('\n');
@@ -2637,6 +2788,116 @@ fn prepare_inline_content(
         }
     }
     (text, spans, inline_images, source_text_start)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn prepare_inline_raster(
+    run: &rebook_publication::InlineImageRun,
+    image: RasterImage,
+    typography: &ReaderTypography,
+    available_width: f32,
+    id: u64,
+    index: usize,
+) -> PreparedInlineImage {
+    let intrinsic_width = image.width.max(1) as f32;
+    let intrinsic_height = image.height.max(1) as f32;
+    let aspect_ratio = intrinsic_width / intrinsic_height;
+    let surrounding_scale = run.size_scale.max(0.1);
+    let authored_height = run.image.style.height.map(|height| match height {
+        ImageLength::Pixels(pixels) => typography.font_size * surrounding_scale * pixels / 16.0,
+        ImageLength::Fraction(fraction) => typography.font_size * surrounding_scale * fraction,
+    });
+    let authored_width = run.image.style.width.map(|width| match width {
+        ImageLength::Pixels(pixels) => typography.font_size * surrounding_scale * pixels / 16.0,
+        ImageLength::Fraction(fraction) => available_width * fraction,
+    });
+    let (mut requested_width, mut requested_height) = if run.intrinsic_sizing {
+        if let Some(height) = authored_height {
+            (height * aspect_ratio, height)
+        } else if let Some(width) = authored_width {
+            (width, width / aspect_ratio)
+        } else {
+            let height = typography.font_size * surrounding_scale * intrinsic_height / 16.0;
+            (height * aspect_ratio, height)
+        }
+    } else {
+        let height = typography.font_size * run.size_scale;
+        (height * aspect_ratio, height)
+    };
+    let minimum_height = typography.font_size * 0.2;
+    let maximum_height = typography.font_size * 4.0;
+    let height_scale =
+        requested_height.clamp(minimum_height, maximum_height) / requested_height.max(1.0);
+    requested_width *= height_scale;
+    requested_height *= height_scale;
+    let width_scale = (available_width / requested_width).min(1.0);
+    let display_width = (requested_width * width_scale).max(1.0);
+    let display_height = (requested_height * width_scale).max(1.0);
+    let (box_height, offset_y) = inline_image_vertical_metrics(
+        run.vertical_align,
+        display_height,
+        typography.font_size * surrounding_scale,
+    );
+    PreparedInlineImage {
+        id,
+        index,
+        image,
+        width: display_width,
+        height: display_height,
+        box_height,
+        offset_y,
+    }
+}
+
+fn inline_image_vertical_metrics(
+    alignment: InlineImageAlignment,
+    image_height: f32,
+    surrounding_em: f32,
+) -> (f32, f32) {
+    let baseline_shift = match alignment {
+        InlineImageAlignment::Baseline => 0.0,
+        // Formula rasters in legacy EPUBs commonly use `vertical-align: middle`
+        // to request optical centering in the text band. Center the image between
+        // the same 0.8-em ascent and 0.2-em descent used below instead of applying
+        // CSS's x-height offset, which places tightly cropped formula glyphs too low.
+        InlineImageAlignment::Middle => image_height * 0.5 - surrounding_em * 0.3,
+        InlineImageAlignment::TextTop | InlineImageAlignment::Top => {
+            image_height - surrounding_em * 0.8
+        }
+        InlineImageAlignment::TextBottom
+        | InlineImageAlignment::Bottom
+        | InlineImageAlignment::Sub => surrounding_em * 0.2,
+        InlineImageAlignment::Super => -surrounding_em * 0.35,
+    };
+    // Parley positions inline boxes with their bottom on the baseline. Reserve
+    // the complete ascent/descent envelope, then paint the raster inside that
+    // box at the authored baseline shift. This prevents a middle/sub-aligned
+    // formula from visually colliding with the following line.
+    let ascent = surrounding_em * 0.8;
+    let descent = surrounding_em * 0.2;
+    let above_baseline = (image_height - baseline_shift).max(0.0).max(ascent);
+    let below_baseline = baseline_shift.max(0.0).max(descent);
+    let box_height = (above_baseline + below_baseline).max(image_height);
+    let paint_offset = box_height - image_height + baseline_shift;
+    (box_height, paint_offset)
+}
+
+fn positioned_line_content_end(line: parley::layout::Line<'_, TextBrush>) -> f32 {
+    let mut glyph_end = 0.0_f32;
+    let mut inline_end = 0.0_f32;
+    for item in line.items() {
+        match item {
+            PositionedLayoutItem::GlyphRun(run) => {
+                glyph_end = glyph_end.max(run.offset() + run.advance());
+            }
+            PositionedLayoutItem::InlineBox(inline_box) => {
+                inline_end = inline_end.max(inline_box.x + inline_box.width);
+            }
+        }
+    }
+    (glyph_end - line.metrics().trailing_whitespace)
+        .max(inline_end)
+        .max(0.0)
 }
 
 /// Reserves one compact glyph slot for a semantic footnote while retaining the
@@ -2941,17 +3202,45 @@ impl Paginator {
             // this column. Otherwise a page boundary can retain an orphaned
             // accent bar above the actual quotation.
             self.ensure_quote_decoration();
+            let origin_x = self.column_left() + prepared.start_offset;
+            let origin_y = self.cursor_y - first_top;
             self.items.push(PageItem::Text(TextPlacement {
                 layout: Arc::clone(&prepared.layout),
                 text: Arc::clone(&prepared.text),
                 source_text_start: prepared.source_text_start,
                 lines: line_start..line_end,
-                origin_x: self.column_left() + prepared.start_offset,
-                origin_y: self.cursor_y - first_top,
+                origin_x,
+                origin_y,
                 available_width: prepared.available_width,
                 source: block.source.clone(),
                 inline_images: Arc::clone(&prepared.inline_images),
             }));
+            for hyphen in prepared
+                .hyphens
+                .iter()
+                .filter(|hyphen| (line_start..line_end).contains(&hyphen.line_index))
+            {
+                let line = prepared
+                    .layout
+                    .get(hyphen.line_index)
+                    .ok_or(LayoutError::InvalidLayout)?;
+                let glyph_line = hyphen
+                    .glyph
+                    .layout
+                    .get(0)
+                    .ok_or(LayoutError::InvalidLayout)?;
+                self.items.push(PageItem::Text(TextPlacement {
+                    layout: Arc::clone(&hyphen.glyph.layout),
+                    text: Arc::clone(&hyphen.glyph.text),
+                    source_text_start: 0,
+                    lines: 0..1,
+                    origin_x: origin_x + positioned_line_content_end(line),
+                    origin_y: origin_y + line.metrics().baseline - glyph_line.metrics().baseline,
+                    available_width: hyphen.glyph.width,
+                    source: None,
+                    inline_images: Arc::from([]),
+                }));
+            }
             self.pending_leading_gap = 0.0;
             self.column_has_content = true;
             self.cursor_y += slice_height;
@@ -3763,6 +4052,8 @@ mod tests {
                         text_layer: None,
                     },
                     size_scale: 1.0,
+                    intrinsic_sizing: false,
+                    vertical_align: InlineImageAlignment::Middle,
                     presentation: true,
                 })),
                 Inline::Text(TextRun {
@@ -3799,6 +4090,59 @@ mod tests {
         assert_eq!(image.index, 0);
         assert!((image.height - typography.font_size).abs() < f32::EPSILON);
         assert!((image.width - typography.font_size * 2.0).abs() < f32::EPSILON);
+        assert!(image.offset_y > 0.0);
+    }
+
+    #[test]
+    fn scales_unstyled_inline_images_from_intrinsic_css_pixels() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Image(Box::new(
+                rebook_publication::InlineImageRun {
+                    image: ImageBlock {
+                        href: PublicationUrl::parse("images/pi.jpg").unwrap(),
+                        alt: "Image".into(),
+                        style: ImageStyle::default(),
+                        source: None,
+                        text_layer: None,
+                    },
+                    size_scale: 1.0,
+                    intrinsic_sizing: true,
+                    vertical_align: InlineImageAlignment::Middle,
+                    presentation: false,
+                },
+            ))],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let raster = RasterImage {
+            width: 12,
+            height: 12,
+            pixels: vec![0; 12 * 12 * 4].into(),
+        };
+        let typography = ReaderTypography::default();
+        let svg_options = resvg::usvg::Options::default();
+
+        let (_, _, images, _) = prepare_inline_content(
+            &block,
+            Rgba::BLACK,
+            &typography,
+            320.0,
+            &svg_options,
+            false,
+            &[Some(raster)],
+        );
+
+        let [image] = images.as_slice() else {
+            panic!("expected one prepared inline image");
+        };
+        let expected = typography.font_size * 12.0 / 16.0;
+        assert!((image.height - expected).abs() < f32::EPSILON);
+        assert!((image.width - expected).abs() < f32::EPSILON);
+        assert!(image.offset_y > 0.0);
+        assert!(image.offset_y < image.height * 0.5);
+        let visual_center_from_baseline = -image.box_height + image.offset_y + image.height * 0.5;
+        assert!((visual_center_from_baseline + typography.font_size * 0.3).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -4778,6 +5122,49 @@ mod tests {
         let continuation_x = prepared.layout.get(1).unwrap().metrics().offset;
         assert!((continuation_x - marker_width).abs() < 0.01);
     }
+
+    #[test]
+    fn optimized_english_paragraph_prepares_only_selected_line_hyphens() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "Extraordinary typographical considerations improve international readability and representation.".into(),
+                style: TextStyle {
+                    language: rebook_publication::TextLanguage::EnglishUs,
+                    ..TextStyle::default()
+                },
+                link: None,
+            })],
+            style: BlockStyle {
+                align: TextAlignment::Justify,
+                ..BlockStyle::default()
+            },
+            source: None,
+        };
+        let mut engine = LayoutEngine::new();
+        engine.publication_languages = vec!["en-US".into()];
+        let reader_style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let prepared = (100_u16..=240)
+            .step_by(5)
+            .map(|width| {
+                engine.shape_text_with_min_width(&block, &reader_style, f32::from(width), 40.0)
+            })
+            .find(|prepared| !prepared.hyphens.is_empty())
+            .expect("at least one narrow measure should select a dictionary break");
+
+        assert!(prepared.layout.len() > 1);
+        assert!(
+            prepared
+                .hyphens
+                .iter()
+                .all(|hyphen| hyphen.line_index + 1 < prepared.layout.len())
+        );
+        assert!(!prepared.text.contains('\u{2010}'));
+    }
     use rebook_publication::{
         Book, FixedPageTextReplacement, FixedPageTextReplacementSegment, FixedPageTextSpan,
         ImageBlock, ImageLength, Metadata, PublicationId, PublicationUrl, QuoteBlock,
@@ -4849,6 +5236,62 @@ mod tests {
             )
             .unwrap();
         assert!(layout.pages.len() > 1);
+    }
+
+    #[test]
+    fn selected_hyphens_are_emitted_as_source_free_text_items() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("hyphenation-test").unwrap(),
+                metadata: Metadata {
+                    languages: vec!["en-US".into()],
+                    ..Metadata::default()
+                },
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: "Extraordinary typographical considerations improve international readability and representation.".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: None,
+            })],
+            anchors: Vec::new(),
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            horizontal_margin: 0.0,
+            ..ReaderStyle::default()
+        };
+        let mut engine = LayoutEngine::new();
+        let found = (100_u16..=240).step_by(5).find_map(|width| {
+            let layout = engine
+                .layout_section(
+                    &source,
+                    &section,
+                    LayoutViewport::new(u32::from(width), 800).unwrap(),
+                    &style,
+                )
+                .ok()?;
+            layout.pages.iter().find_map(|page| {
+                page.items.iter().find_map(|item| match item {
+                    PageItem::Text(text) if text.text.as_ref() == "\u{2010}" => Some(text),
+                    _ => None,
+                })
+            })?;
+            Some(())
+        });
+
+        assert!(found.is_some());
     }
 
     #[test]

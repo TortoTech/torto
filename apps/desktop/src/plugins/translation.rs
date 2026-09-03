@@ -6,7 +6,7 @@ use rebook_publication::{
     Block, BlockStyle, Book, BookSource, FigureBlock, FixedPageTextLayer, FixedPageTextRect,
     FixedPageTextReplacement, FixedPageTextReplacementSegment, Inline, InlineRole, LinkRole,
     NoteBlock, PublicationError, PublicationUrl, RasterResource, RenditionLayout, Resource,
-    Section, SourceRange, TextBaseline, TextBlock, TextBlockKind, TextRun, TextStyle,
+    Section, SourceRange, TextBaseline, TextBlock, TextBlockKind, TextLanguage, TextRun, TextStyle,
 };
 
 use super::TranslationMode;
@@ -1424,6 +1424,8 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
     style.baseline = TextBaseline::Normal;
     style.link_role = LinkRole::Normal;
     style.inline_role = InlineRole::Normal;
+    style.language = TextLanguage::Unspecified;
+    style.hyphenation = rebook_publication::HyphenationMode::Auto;
     style
 }
 
@@ -1931,6 +1933,8 @@ mod tests {
                 text_layer: None,
             },
             size_scale: 1.0,
+            intrinsic_sizing: false,
+            vertical_align: rebook_publication::InlineImageAlignment::Baseline,
             presentation: true,
         };
         let original = vec![

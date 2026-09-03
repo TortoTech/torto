@@ -1952,7 +1952,7 @@ fn compile_text_commands(
                     continue;
                 };
                 let x = text.origin_x + inline_box.x;
-                let y = text.origin_y + inline_box.y;
+                let y = text.origin_y + inline_box.y + image.offset_y;
                 let image_transform = Affine::translate((f64::from(x), f64::from(y)))
                     * Affine::scale_non_uniform(
                         f64::from(image.width) / f64::from(image.image.width.max(1)),
@@ -2585,6 +2585,7 @@ mod tests {
                     },
                     width: 220.0,
                     height: 60.0,
+                    offset_y: 0.0,
                 }]),
             })],
         };
@@ -2661,6 +2662,7 @@ mod tests {
                     },
                     width: 180.0,
                     height: 44.0,
+                    offset_y: 0.0,
                 }]),
             })],
         };

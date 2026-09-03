@@ -629,9 +629,33 @@ pub struct InlineImageRun {
     /// Height relative to the reader's base font size. Layout preserves the
     /// intrinsic aspect ratio and scales this value with the surrounding text.
     pub size_scale: f32,
+    /// Whether layout should derive the authored height from CSS pixel sizing or
+    /// the resource's intrinsic pixel height. This keeps unstyled formula glyphs
+    /// proportional to the surrounding reader font instead of assigning every
+    /// image the same one-em height.
+    #[serde(default)]
+    pub intrinsic_sizing: bool,
+    /// Authored vertical alignment inside the surrounding text line.
+    #[serde(default)]
+    pub vertical_align: InlineImageAlignment,
     /// Whether the source explicitly marked this image as presentational.
     #[serde(default)]
     pub presentation: bool,
+}
+
+/// Portable subset of CSS `vertical-align` for inline replaced elements.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InlineImageAlignment {
+    #[default]
+    Baseline,
+    Middle,
+    TextTop,
+    TextBottom,
+    Top,
+    Bottom,
+    Super,
+    Sub,
 }
 
 /// A LaTeX formula embedded in a text block.
@@ -834,6 +858,12 @@ pub struct TextStyle {
     /// Semantic role carried by inline content independently of links.
     #[serde(default)]
     pub inline_role: InlineRole,
+    /// Nearest authored language relevant to language-sensitive typography.
+    #[serde(default)]
+    pub language: TextLanguage,
+    /// Authored CSS hyphenation policy inherited by this run.
+    #[serde(default)]
+    pub hyphenation: HyphenationMode,
 }
 
 impl Default for TextStyle {
@@ -850,8 +880,61 @@ impl Default for TextStyle {
             baseline: TextBaseline::Normal,
             link_role: LinkRole::Normal,
             inline_role: InlineRole::Normal,
+            language: TextLanguage::Unspecified,
+            hyphenation: HyphenationMode::Auto,
         }
     }
+}
+
+/// Compact language hint used by the first dictionary-backed hyphenation pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TextLanguage {
+    #[default]
+    Unspecified,
+    English,
+    EnglishUs,
+    EnglishGb,
+    Other,
+}
+
+impl TextLanguage {
+    #[must_use]
+    pub fn from_bcp47(tag: &str) -> Self {
+        let normalized = tag.trim().replace('_', "-").to_ascii_lowercase();
+        let mut subtags = normalized.split('-').filter(|subtag| !subtag.is_empty());
+        let Some(language) = subtags.next() else {
+            return Self::Unspecified;
+        };
+        if !matches!(language, "en" | "eng") {
+            return Self::Other;
+        }
+        let mut region = None;
+        for subtag in subtags {
+            if subtag == "us" {
+                region = Some(Self::EnglishUs);
+                break;
+            }
+            if matches!(subtag, "gb" | "uk") {
+                region = Some(Self::EnglishGb);
+                break;
+            }
+            if subtag.len() == 2 && subtag != "latn" {
+                return Self::Other;
+            }
+        }
+        region.unwrap_or(Self::English)
+    }
+}
+
+/// CSS-compatible automatic hyphenation policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HyphenationMode {
+    None,
+    Manual,
+    #[default]
+    Auto,
 }
 
 /// Semantic role carried by inline publication content.

@@ -3,11 +3,12 @@
 use std::collections::{HashMap, HashSet};
 
 use rebook_publication::{
-    Block, BlockStyle, CaptionPosition, FigureBlock, ImageBlock, ImageLength, ImageStyle, Inline,
-    InlineImageRun, InlineRole, LinkRole, MathRun, NoteBlock, NoteBlockKind, PublicationUrl,
-    QuoteBlock, Rgba, Section, SectionAnchor, SeparatorBlock, SourceAnchor, SourceRange, SpineItem,
-    SpineItemId, TableBlock, TableCell, TableRow, TextAlignment, TextBaseline, TextBlock,
-    TextBlockKind, TextRun, TextStyle,
+    Block, BlockStyle, CaptionPosition, FigureBlock, HyphenationMode, ImageBlock, ImageLength,
+    ImageStyle, Inline, InlineImageAlignment, InlineImageRun, InlineRole, LinkRole, MathRun,
+    NoteBlock, NoteBlockKind, PublicationUrl, QuoteBlock, Rgba, Section, SectionAnchor,
+    SeparatorBlock, SourceAnchor, SourceRange, SpineItem, SpineItemId, TableBlock, TableCell,
+    TableRow, TextAlignment, TextBaseline, TextBlock, TextBlockKind, TextLanguage, TextRun,
+    TextStyle,
 };
 use roxmltree::{Document, Node};
 use thiserror::Error;
@@ -1106,6 +1107,7 @@ impl<'a> ReadingIrParser<'a> {
         }
 
         let text_style = self.styles.text_style_for_block(node, kind);
+        let inline_images = node_has_visible_text(node);
         let mut collector = InlineCollector::new(false);
         for child in node.children() {
             if is_structured_container(child) {
@@ -1115,7 +1117,8 @@ impl<'a> ReadingIrParser<'a> {
                 child,
                 text_style,
                 None,
-                &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links),
+                &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
+                    .with_inline_images(inline_images),
                 &mut collector,
             );
         }
@@ -1134,6 +1137,7 @@ impl<'a> ReadingIrParser<'a> {
                     )
                     && !has_nested_structured_container_ancestor(*descendant, node)
                     && !image_is_footnote_reference(*descendant, &self.footnote_links)
+                    && (!inline_images || self.styles.image_establishes_block_layout(*descendant))
             })
             .collect::<Vec<_>>();
         let image_count = images.len();
@@ -1194,7 +1198,8 @@ impl<'a> ReadingIrParser<'a> {
                         &self.section_href,
                         &self.styles,
                         &self.footnote_links,
-                    ),
+                    )
+                    .with_inline_images(node_has_visible_text(cell)),
                     &mut collector,
                 );
                 collector.finish();
@@ -1337,19 +1342,18 @@ impl<'a> ReadingIrParser<'a> {
             style.align = alignment;
             style.authored_alignment = Some(alignment);
         }
-        let inline_heading_images = matches!(kind, TextBlockKind::Heading(_))
-            && node
-                .descendants()
-                .filter(Node::is_text)
-                .filter_map(|text| text.text())
-                .any(|text| !text.trim().is_empty());
+        // HTML images are inline replaced elements by default. Keep them in the
+        // authored text flow whenever this container also carries prose; an
+        // image-only paragraph remains a semantic block even when the resource
+        // itself is only a few pixels high (a common display-equation pattern).
+        let inline_images = node_has_visible_text(node);
         let mut collector = InlineCollector::new(matches!(kind, TextBlockKind::Preformatted));
         collect_inline(
             node,
             self.styles.text_style_for_block(node, kind),
             None,
             &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
-                .with_inline_heading_images(inline_heading_images),
+                .with_inline_images(inline_images),
             &mut collector,
         );
         collector.finish();
@@ -1389,8 +1393,7 @@ impl<'a> ReadingIrParser<'a> {
                         "img" | "image"
                     )
                     && !image_is_footnote_reference(*descendant, &self.footnote_links)
-                    && !(inline_heading_images
-                        && inline_presentation_image_scale(*descendant, &self.styles).is_some())
+                    && (!inline_images || self.styles.image_establishes_block_layout(*descendant))
             })
             .collect::<Vec<_>>();
         let image_count = images.len();
@@ -2094,7 +2097,7 @@ struct InlineParseContext<'a> {
     base: &'a PublicationUrl,
     styles: &'a StyleSheet,
     footnote_links: &'a HashMap<usize, LinkRole>,
-    inline_heading_images: bool,
+    inline_images: bool,
 }
 
 impl<'a> InlineParseContext<'a> {
@@ -2107,37 +2110,35 @@ impl<'a> InlineParseContext<'a> {
             base,
             styles,
             footnote_links,
-            inline_heading_images: false,
+            inline_images: false,
         }
     }
 
-    const fn with_inline_heading_images(mut self, enabled: bool) -> Self {
-        self.inline_heading_images = enabled;
+    const fn with_inline_images(mut self, enabled: bool) -> Self {
+        self.inline_images = enabled;
         self
     }
 }
 
-fn inline_presentation_image_scale(node: Node<'_, '_>, styles: &StyleSheet) -> Option<f32> {
-    let presentation =
-        attribute_local(node, "role").is_some_and(|role| role.eq_ignore_ascii_case("presentation"));
-    let empty_alt = attribute_local(node, "alt").is_none_or(|alt| alt.trim().is_empty());
-    if !presentation && !empty_alt {
-        return None;
-    }
-    styles
-        .inline_image_height_em(node)
-        .filter(|scale| (0.25..=3.0).contains(scale))
+fn node_has_visible_text(node: Node<'_, '_>) -> bool {
+    node.descendants()
+        .filter(Node::is_text)
+        .filter_map(|text| text.text())
+        .any(|text| !text.trim().is_empty())
 }
 
-fn inline_presentation_image(
+fn image_should_be_inline(node: Node<'_, '_>, context: &InlineParseContext<'_>) -> bool {
+    context.inline_images && !context.styles.image_establishes_block_layout(node)
+}
+
+fn inline_image(
     node: Node<'_, '_>,
     inherited: TextStyle,
     context: &InlineParseContext<'_>,
 ) -> Option<InlineImageRun> {
-    if !context.inline_heading_images {
+    if !image_should_be_inline(node, context) {
         return None;
     }
-    let size_scale = inline_presentation_image_scale(node, context.styles)? * inherited.size_scale;
     let src = attribute_local(node, "src")
         .or_else(|| attribute_local(node, "href"))?
         .trim();
@@ -2152,7 +2153,12 @@ fn inline_presentation_image(
             source: None,
             text_layer: None,
         },
-        size_scale,
+        size_scale: context
+            .styles
+            .inline_image_height_em(node)
+            .map_or(inherited.size_scale, |height| height * inherited.size_scale),
+        intrinsic_sizing: context.styles.inline_image_height_em(node).is_none(),
+        vertical_align: context.styles.inline_image_alignment(node),
         presentation: attribute_local(node, "role")
             .is_some_and(|role| role.eq_ignore_ascii_case("presentation")),
     })
@@ -2270,7 +2276,7 @@ fn collect_inline_node_with_block_boundaries(
                 inherited,
                 link.cloned(),
             );
-        } else if let Some(image) = inline_presentation_image(node, inherited, context) {
+        } else if let Some(image) = inline_image(node, inherited, context) {
             collector.push_image(image);
         }
         return;
@@ -2961,6 +2967,66 @@ impl StyleSheet {
             .and_then(inline_em_length)
     }
 
+    fn image_establishes_block_layout(&self, node: Node<'_, '_>) -> bool {
+        let properties = self.cascaded_properties(node);
+        let display = properties
+            .get("display")
+            .and_then(|value| value.split_ascii_whitespace().next());
+        if matches!(display, Some("inline" | "inline-block")) {
+            return false;
+        }
+        if matches!(
+            display,
+            Some(
+                "block"
+                    | "flow-root"
+                    | "flex"
+                    | "grid"
+                    | "list-item"
+                    | "table"
+                    | "table-row"
+                    | "table-cell"
+            )
+        ) {
+            return true;
+        }
+        if properties
+            .get("float")
+            .is_some_and(|value| !matches!(value.trim(), "none" | "initial" | "unset"))
+            || properties
+                .get("position")
+                .is_some_and(|value| matches!(value.trim(), "absolute" | "fixed"))
+        {
+            return true;
+        }
+
+        // Size is deliberately only a fallback. A near-column-width authored
+        // image without an explicit display value is almost certainly a figure,
+        // while small and tall formula rasters remain governed by text context.
+        properties
+            .get("width")
+            .and_then(|value| image_length(value))
+            .is_some_and(|width| matches!(width, ImageLength::Fraction(value) if value >= 0.8))
+    }
+
+    fn inline_image_alignment(&self, node: Node<'_, '_>) -> InlineImageAlignment {
+        let properties = self.cascaded_properties(node);
+        match properties
+            .get("vertical-align")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("middle") => InlineImageAlignment::Middle,
+            Some("text-top") => InlineImageAlignment::TextTop,
+            Some("text-bottom") => InlineImageAlignment::TextBottom,
+            Some("top") => InlineImageAlignment::Top,
+            Some("bottom") => InlineImageAlignment::Bottom,
+            Some("super") => InlineImageAlignment::Super,
+            Some("sub") => InlineImageAlignment::Sub,
+            _ => InlineImageAlignment::Baseline,
+        }
+    }
+
     fn image_style(&self, node: Node<'_, '_>) -> ImageStyle {
         let mut style = ImageStyle {
             width: attribute_local(node, "width").and_then(image_length),
@@ -3010,6 +3076,9 @@ impl StyleSheet {
     fn apply_text_node(&self, node: Node<'_, '_>, style: &mut TextStyle, inherited_size: f32) {
         let properties = self.cascaded_properties(node);
         apply_text_properties(style, &properties, inherited_size);
+        if let Some(language) = attribute_local(node, "lang") {
+            style.language = TextLanguage::from_bcp47(language);
+        }
     }
 
     fn cascaded_properties(&self, node: Node<'_, '_>) -> HashMap<String, String> {
@@ -3216,6 +3285,14 @@ fn apply_text_properties(
             "sub" => TextBaseline::Subscript,
             "baseline" => TextBaseline::Normal,
             _ => style.baseline,
+        };
+    }
+    if let Some(value) = properties.get("hyphens") {
+        style.hyphenation = match value.trim().to_ascii_lowercase().as_str() {
+            "none" => HyphenationMode::None,
+            "manual" => HyphenationMode::Manual,
+            "auto" => HyphenationMode::Auto,
+            _ => style.hyphenation,
         };
     }
 }
@@ -4286,8 +4363,113 @@ mod tests {
         };
         assert_eq!(image.image.href.path(), "OEBPS/images/chapter-icon.jpg");
         assert!(image.presentation);
+        assert!(!image.intrinsic_sizing);
+        assert_eq!(image.vertical_align, InlineImageAlignment::Middle);
         assert_close(image.size_scale, text.style.size_scale);
         assert_eq!(text.text, "Why Goal Setting Is Broken");
+    }
+
+    #[test]
+    fn keeps_formula_rasters_inline_by_text_context_not_class_or_alt() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+            <head><style>img.block { vertical-align: middle; }</style></head>
+            <body><p class="para">Compare <img class="block" alt="Image"
+                src="images/pv.jpg"/> versus <img class="block" alt="Image"
+                src="images/nv.jpg"/> today.</p></body>
+        </html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Text(paragraph)] = section.blocks.as_slice() else {
+            panic!("expected formula rasters to remain in one text block");
+        };
+        assert_eq!(paragraph.content.len(), 5);
+        let inline_images = paragraph
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Image(image) => Some(image.as_ref()),
+                Inline::Text(_) | Inline::Math(_) | Inline::Break => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inline_images.len(), 2);
+        assert!(inline_images.iter().all(|image| image.intrinsic_sizing));
+        assert!(
+            inline_images
+                .iter()
+                .all(|image| image.vertical_align == InlineImageAlignment::Middle)
+        );
+        assert_eq!(inline_images[0].image.alt, "Image");
+        assert_eq!(inline_images[0].image.href.path(), "OPS/images/pv.jpg");
+        assert_eq!(inline_images[1].image.href.path(), "OPS/images/nv.jpg");
+    }
+
+    #[test]
+    fn preserves_inherited_language_and_hyphenation_policy() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en-US">
+            <head><style>.manual { hyphens: manual; }</style></head>
+            <body><p>American <span lang="en-GB">British</span>
+                <span class="manual">manual</span> <span lang="fr">français</span></p></body>
+        </html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Text(paragraph)] = section.blocks.as_slice() else {
+            panic!("expected one language-bearing paragraph");
+        };
+        let runs = paragraph
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run),
+                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+            })
+            .collect::<Vec<_>>();
+        let run = |needle: &str| {
+            runs.iter()
+                .copied()
+                .find(|run| run.text.contains(needle))
+                .unwrap()
+        };
+        assert_eq!(run("American").style.language, TextLanguage::EnglishUs);
+        assert_eq!(run("British").style.language, TextLanguage::EnglishGb);
+        assert_eq!(run("manual").style.hyphenation, HyphenationMode::Manual);
+        assert_eq!(run("français").style.language, TextLanguage::Other);
+    }
+
+    #[test]
+    fn keeps_short_image_only_equations_as_blocks() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p class="image"><img alt="Equation" height="17" width="255"
+                src="images/display-equation.jpg"/></p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Image(image)] = section.blocks.as_slice() else {
+            panic!("expected an image-only equation to remain a block");
+        };
+        assert_eq!(image.href.path(), "OPS/images/display-equation.jpg");
+        assert_eq!(image.style.height, Some(ImageLength::Pixels(17.0)));
+        assert_eq!(image.style.width, Some(ImageLength::Pixels(255.0)));
     }
 
     #[test]

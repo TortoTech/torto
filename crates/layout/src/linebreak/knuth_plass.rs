@@ -91,6 +91,8 @@ pub struct LineBreak {
     pub badness: f32,
     /// Natural width excluding whitespace discarded at the line ending.
     pub natural_width: f32,
+    /// Whether this line ends at a discretionary dictionary/manual hyphen.
+    pub hyphenated: bool,
 }
 
 /// One shaped cluster in the Unicode-aware paragraph model.
@@ -106,6 +108,8 @@ pub struct ClusterItem {
     pub boundary_width_after: f32,
     pub boundary_shrink_after: f32,
     pub line_end_adjustment: f32,
+    /// Width painted only when this boundary is selected as a line ending.
+    pub hyphen_width_after: f32,
     pub clusters: u32,
     pub break_after: bool,
     pub trimmable: bool,
@@ -167,6 +171,7 @@ struct ClusterCandidateLine {
     shrink: f32,
     justifiable_boundaries: f32,
     is_last: bool,
+    hyphenated: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,7 +213,7 @@ pub fn optimize_clusters(
 
     let mut best = vec![f64::INFINITY; candidates.len()];
     let mut predecessor = vec![None; candidates.len()];
-    let mut selected_line = vec![None; candidates.len()];
+    let mut selected_line: Vec<Option<ClusterCandidateLine>> = vec![None; candidates.len()];
     best[0] = 0.0;
 
     for end_candidate in 1..candidates.len() {
@@ -228,7 +233,13 @@ pub fn optimize_clusters(
             if !best[start_candidate].is_finite() {
                 continue;
             }
-            let demerit = f64::from((options.line_penalty + line.badness).powi(2));
+            let mut demerit = f64::from((options.line_penalty + line.badness).powi(2));
+            if line.hyphenated {
+                demerit += 2_500.0;
+                if selected_line[start_candidate].is_some_and(|previous| previous.hyphenated) {
+                    demerit += 2_500.0;
+                }
+            }
             let total = best[start_candidate] + demerit;
             if total < best[end_candidate] {
                 best[end_candidate] = total;
@@ -261,6 +272,7 @@ pub fn optimize_clusters(
             adjustment_ratio: line.ratio,
             badness: line.badness,
             natural_width: line.natural_width,
+            hyphenated: line.hyphenated,
         })
         .collect();
     Some(ParagraphLayout { lines, adjustments })
@@ -292,6 +304,8 @@ fn cluster_items_are_valid(items: &[ClusterItem]) -> bool {
             && item.boundary_shrink_after.is_finite()
             && item.boundary_shrink_after >= 0.0
             && item.line_end_adjustment.is_finite()
+            && item.hyphen_width_after.is_finite()
+            && item.hyphen_width_after >= 0.0
             && item.clusters > 0
             // Required by the predecessor-pruning proof: adding a cluster and
             // its following internal boundary must not reduce the line's
@@ -376,7 +390,13 @@ fn measure_cluster_line(
     let item_width = prefix[measured_end].width - prefix[start].width;
     let boundary_width =
         internal_boundary_sum(prefix, start, measured_end, |sum| sum.boundary_width);
-    let natural_width = item_width + boundary_width + items[measured_end - 1].line_end_adjustment;
+    let hyphen_width = if measured_end == end && end < items.len() {
+        items[measured_end - 1].hyphen_width_after
+    } else {
+        0.0
+    };
+    let natural_width =
+        item_width + boundary_width + items[measured_end - 1].line_end_adjustment + hyphen_width;
     let stretch = prefix[measured_end].stretch - prefix[start].stretch;
     let shrink = prefix[measured_end].shrink - prefix[start].shrink
         + internal_boundary_sum(prefix, start, measured_end, |sum| sum.boundary_shrink);
@@ -423,6 +443,7 @@ fn measure_cluster_line(
         shrink,
         justifiable_boundaries,
         is_last,
+        hyphenated: hyphen_width > 0.0,
     })
 }
 
@@ -604,6 +625,7 @@ pub fn optimize(items: &[Item], options: Options) -> Option<Vec<LineBreak>> {
             adjustment_ratio: line.ratio,
             badness: line.badness,
             natural_width: line.natural_width,
+            hyphenated: false,
         });
         cursor = predecessor[cursor]?;
     }
@@ -794,6 +816,7 @@ mod tests {
                 boundary_width_after: 0.0,
                 boundary_shrink_after: 0.0,
                 line_end_adjustment: 0.0,
+                hyphen_width_after: 0.0,
                 clusters: 1,
                 break_after: true,
                 trimmable: false,
@@ -826,6 +849,7 @@ mod tests {
                 boundary_width_after: 5.0,
                 boundary_shrink_after: 2.5,
                 line_end_adjustment: 0.0,
+                hyphen_width_after: 0.0,
                 clusters: 1,
                 break_after: false,
                 trimmable: false,
@@ -838,6 +862,7 @@ mod tests {
                 boundary_width_after: 0.0,
                 boundary_shrink_after: 0.0,
                 line_end_adjustment: 0.0,
+                hyphen_width_after: 0.0,
                 clusters: 1,
                 break_after: true,
                 trimmable: false,
@@ -851,6 +876,33 @@ mod tests {
         assert_eq!(result.lines.len(), 1);
         assert!((result.adjustments[0] - 3.0).abs() < 0.001);
         assert!(result.lines[0].adjustment_ratio < 0.0);
+    }
+
+    #[test]
+    fn cluster_optimizer_accounts_for_discretionary_hyphen_width() {
+        let items = (0..10)
+            .map(|index| ClusterItem {
+                width: 10.0,
+                stretch: 0.0,
+                shrink: 0.0,
+                boundary_width_after: 0.0,
+                boundary_shrink_after: 0.0,
+                line_end_adjustment: 0.0,
+                hyphen_width_after: if index == 4 { 5.0 } else { 0.0 },
+                clusters: 1,
+                break_after: matches!(index, 4 | 9),
+                trimmable: false,
+                justifiable_after: false,
+            })
+            .collect::<Vec<_>>();
+
+        let result = optimize_clusters(&items, ParagraphOptions::new(55.0, 20.0))
+            .expect("the discretionary hyphen should make the word fit");
+
+        assert_eq!(result.lines.len(), 2);
+        assert!(result.lines[0].hyphenated);
+        assert!((result.lines[0].natural_width - 55.0).abs() < f32::EPSILON);
+        assert!(!result.lines[1].hyphenated);
     }
 
     fn greedy_lines_for_test(items: &[Item], options: Options) -> Option<Vec<LineBreak>> {
@@ -898,6 +950,7 @@ mod tests {
                 adjustment_ratio: measured.ratio,
                 badness: measured.badness,
                 natural_width: measured.natural_width,
+                hyphenated: false,
             });
             start = end;
         }

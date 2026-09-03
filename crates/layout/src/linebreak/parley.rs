@@ -1,5 +1,6 @@
 //! Adapter between Parley's shaped clusters and the paragraph optimizer.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use icu_segmenter::{LineSegmenter, options::LineBreakOptions};
@@ -25,6 +26,7 @@ pub struct SpacingAdjustment {
 pub struct ParagraphPlan {
     pub lines: Vec<LineBreak>,
     pub adjustments: Vec<SpacingAdjustment>,
+    pub hyphen_offsets: Vec<Option<usize>>,
 }
 
 /// One renderer-shaped text cluster supplied to the shared paragraph optimizer.
@@ -45,6 +47,7 @@ pub(crate) fn plan_optimized(
     column_width: f32,
     first_line_indent: f32,
     default_em: f32,
+    hyphen_breaks: &HashMap<usize, f32>,
 ) -> Option<ParagraphPlan> {
     let has_in_flow_box = layout
         .inline_boxes()
@@ -95,6 +98,7 @@ pub(crate) fn plan_optimized(
         column_width,
         first_line_indent,
         default_em,
+        hyphen_breaks,
     )
 }
 
@@ -115,9 +119,11 @@ pub fn plan_measured_text(
         column_width,
         first_line_indent,
         default_em,
+        &HashMap::new(),
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn plan_measured_content(
     text: &str,
     measured: &[MeasuredCluster],
@@ -125,6 +131,7 @@ fn plan_measured_content(
     column_width: f32,
     first_line_indent: f32,
     default_em: f32,
+    hyphen_breaks: &HashMap<usize, f32>,
 ) -> Option<ParagraphPlan> {
     let mut in_flow_boxes = inline_boxes
         .iter()
@@ -154,6 +161,7 @@ fn plan_measured_content(
         let mut characters = source.chars();
         let first = characters.next()?;
         let last = characters.last().unwrap_or(first);
+        let ordinary_break = legal_breaks.binary_search(&cluster.range.end).is_ok();
         text_clusters.push(ShapedCluster {
             range: cluster.range.clone(),
             advance: cluster.advance,
@@ -162,10 +170,18 @@ fn plan_measured_content(
             last,
             is_space: source.chars().all(|character| character.is_whitespace()),
             is_breakable_space: source.chars().all(is_breakable_space),
-            break_after: legal_breaks.binary_search(&cluster.range.end).is_ok(),
+            break_after: ordinary_break || hyphen_breaks.contains_key(&cluster.range.end),
             ordinary_baseline: cluster.ordinary_baseline,
             footnote_reference: cluster.footnote_reference,
             inline_box: false,
+            hyphen_width_after: if ordinary_break {
+                0.0
+            } else {
+                hyphen_breaks
+                    .get(&cluster.range.end)
+                    .copied()
+                    .unwrap_or(0.0)
+            },
         });
         expected_start = cluster.range.end;
     }
@@ -201,6 +217,7 @@ fn plan_measured_content(
             ordinary_baseline: false,
             footnote_reference: false,
             inline_box: true,
+            hyphen_width_after: 0.0,
         });
     }
     clusters.extend(text_clusters);
@@ -221,9 +238,21 @@ fn plan_measured_content(
         return None;
     }
     let adjustments = merge_spacing_adjustments(&clusters, &optimized.adjustments);
+    let hyphen_offsets = optimized
+        .lines
+        .iter()
+        .map(|line| {
+            if !line.hyphenated {
+                return Some(None);
+            }
+            let index = usize::try_from(line.breakpoint).ok()?.checked_sub(1)?;
+            Some(Some(clusters.get(index)?.range.end))
+        })
+        .collect::<Option<Vec<_>>>()?;
     Some(ParagraphPlan {
         lines: optimized.lines,
         adjustments,
+        hyphen_offsets,
     })
 }
 
@@ -279,6 +308,7 @@ struct ShapedCluster {
     ordinary_baseline: bool,
     footnote_reference: bool,
     inline_box: bool,
+    hyphen_width_after: f32,
 }
 
 fn shaped_cluster_items(clusters: &[ShapedCluster]) -> Option<Vec<ClusterItem>> {
@@ -323,6 +353,7 @@ fn shaped_cluster_items(clusters: &[ShapedCluster]) -> Option<Vec<ClusterItem>> 
             boundary_width_after,
             boundary_shrink_after,
             line_end_adjustment: -punctuation.trailing,
+            hyphen_width_after: cluster.hyphen_width_after,
             clusters: 1,
             break_after: cluster.break_after,
             trimmable: cluster.is_breakable_space,
@@ -498,7 +529,8 @@ fn is_supported_ltr_prose(text: &str) -> bool {
     text.chars().all(|character| {
         !matches!(character, '\n' | '\r' | '\t')
             && !is_rtl_codepoint(character)
-            && (!character.is_control() || matches!(character, '\u{200b}' | '\u{2060}'))
+            && (!character.is_control()
+                || matches!(character, '\u{00ad}' | '\u{200b}' | '\u{2060}'))
     })
 }
 
@@ -526,7 +558,7 @@ mod tests {
     fn accepts_cjk_and_uses_unicode_line_boundaries() {
         let text = "\u{4e2d}\u{6587}\u{6392}\u{7248}\u{9700}\u{8981}\u{6b63}\u{786e}\u{7684}\u{65ad}\u{884c}\u{673a}\u{4f1a}";
         let mut layout = layout_for(text, 18.0);
-        let plan = plan_optimized(&mut layout, text, 75.0, 0.0, 18.0)
+        let plan = plan_optimized(&mut layout, text, 75.0, 0.0, 18.0, &HashMap::new())
             .expect("CJK prose should use optimized line breaking");
 
         assert!(plan.lines.len() > 1);
@@ -544,7 +576,7 @@ mod tests {
     fn adds_spacing_at_cjk_western_boundaries() {
         let text = "\u{4e2d}\u{6587}abc\u{4e2d}\u{6587}";
         let mut layout = layout_for(text, 18.0);
-        let plan = plan_optimized(&mut layout, text, 400.0, 0.0, 18.0)
+        let plan = plan_optimized(&mut layout, text, 400.0, 0.0, 18.0, &HashMap::new())
             .expect("mixed prose should produce a plan");
 
         assert_eq!(plan.lines.len(), 1);
@@ -562,7 +594,7 @@ mod tests {
         let text = "\u{4e2d}\u{6587}\u{6392}\u{7248}\u{9700}\u{8981}\u{6b63}\u{786e}\u{7684}\u{65ad}\u{884c}\u{673a}\u{4f1a}";
         let width = 75.0;
         let mut natural = layout_for(text, 18.0);
-        let plan = plan_optimized(&mut natural, text, width, 0.0, 18.0)
+        let plan = plan_optimized(&mut natural, text, width, 0.0, 18.0, &HashMap::new())
             .expect("CJK prose should produce a plan");
 
         let mut font_context = FontContext::new();
@@ -591,7 +623,7 @@ mod tests {
     fn compresses_cjk_punctuation_without_rewriting_text() {
         let text = "\u{4e2d}\u{6587}\u{ff0c}\u{3002}\u{6b63}\u{6587}";
         let mut layout = layout_for(text, 18.0);
-        let plan = plan_optimized(&mut layout, text, 400.0, 0.0, 18.0)
+        let plan = plan_optimized(&mut layout, text, 400.0, 0.0, 18.0, &HashMap::new())
             .expect("CJK punctuation should remain optimizable");
 
         assert!(plan.adjustments.iter().any(|item| item.amount < 0.0));
@@ -608,7 +640,7 @@ mod tests {
     fn keeps_non_breaking_spaces_out_of_break_candidates() {
         let text = "keep\u{00a0}together across ordinary words";
         let mut layout = layout_for(text, 18.0);
-        let plan = plan_optimized(&mut layout, text, 180.0, 0.0, 18.0)
+        let plan = plan_optimized(&mut layout, text, 180.0, 0.0, 18.0, &HashMap::new())
             .expect("NBSP prose should remain optimizable");
         let nbsp_cluster =
             u32::try_from(text[..text.find('\u{00a0}').unwrap()].chars().count()).unwrap() + 1;
@@ -618,6 +650,39 @@ mod tests {
                 .iter()
                 .all(|line| line.breakpoint != nbsp_cluster)
         );
+    }
+
+    #[test]
+    fn maps_selected_discretionary_hyphens_back_to_source_offsets() {
+        let text = "hyphenation";
+        let offset = 6;
+        let mut layout = layout_for(text, 18.0);
+        layout.break_all_lines(None);
+        let line = layout.get(0).unwrap();
+        let mut prefix_width = 0.0;
+        for run in line.runs() {
+            for cluster in run.clusters() {
+                if cluster.text_range().end > offset {
+                    break;
+                }
+                prefix_width += cluster.advance();
+            }
+        }
+        let hyphen_width = 5.0;
+        let breaks = HashMap::from([(offset, hyphen_width)]);
+
+        let plan = plan_optimized(
+            &mut layout,
+            text,
+            prefix_width + hyphen_width,
+            0.0,
+            18.0,
+            &breaks,
+        )
+        .expect("the discretionary break should be selected");
+
+        assert_eq!(plan.hyphen_offsets, [Some(offset), None]);
+        assert!(plan.lines[0].hyphenated);
     }
 
     #[test]
@@ -635,7 +700,7 @@ mod tests {
             height: 18.0,
         });
         let mut layout = builder.build(text);
-        let plan = plan_optimized(&mut layout, text, 75.0, 0.0, 18.0)
+        let plan = plan_optimized(&mut layout, text, 75.0, 0.0, 18.0, &HashMap::new())
             .expect("inline boxes should remain optimizable");
 
         assert!(plan.lines.len() > 1);
