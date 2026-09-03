@@ -1,5 +1,5 @@
 use egui::{Align2, Color32, Response, RichText, Vec2};
-use rebook_layout::{ReaderDefaultFont, SpreadMode, TypesettingMode};
+use rebook_layout::{ReaderDefaultFont, ReaderFontChoice, SpreadMode, TypesettingMode};
 
 use super::{ProviderModelsRequest, SettingsFeature, SettingsTab, ShortcutAction};
 use crate::plugins::{
@@ -876,20 +876,58 @@ fn reader_font_settings(
                     ui.end_row();
                 }
 
-                settings_row_label(ui, language.text("默认字体", "Default font"));
+                settings_module_row_label(ui, language.text("中日韩", "CJK"));
+                ui.label("");
+                ui.end_row();
+
+                font_family_row(
+                    ui,
+                    language.text("主要字体", "Primary font"),
+                    "settings-cjk-primary-font",
+                    &mut typography.default_cjk_font,
+                    &font_families.chinese,
+                    None,
+                );
+
+                settings_row_label(
+                    ui,
+                    language.text("默认字体（英文、数字）", "Default font (Latin & digits)"),
+                );
+                settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
+                    inherited_western_font_selector(
+                        ui,
+                        language,
+                        &mut typography.cjk_default_font,
+                        font_families,
+                    );
+                });
+                ui.end_row();
+
+                settings_module_row_label(ui, language.text("拉丁文字", "Latin"));
+                ui.label("");
+                ui.end_row();
+
+                settings_row_label(ui, language.text("主要字体", "Primary font"));
                 settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
                     default_font_selector(ui, language, typography, font_families);
                 });
                 ui.end_row();
 
-                font_family_row(
-                    ui,
-                    language.text("中文字体", "CJK font"),
-                    "settings-cjk-font",
-                    &mut typography.default_cjk_font,
-                    &font_families.chinese,
-                    None,
-                );
+                settings_row_label(ui, language.text("CJK 字体", "CJK font"));
+                settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
+                    inherited_cjk_font_selector(
+                        ui,
+                        language,
+                        &mut typography.latin_cjk_font,
+                        &font_families.chinese,
+                    );
+                });
+                ui.end_row();
+
+                settings_module_row_label(ui, language.text("通用", "General"));
+                ui.label("");
+                ui.end_row();
+
                 font_family_row(
                     ui,
                     language.text("代码字体", "Code font"),
@@ -1662,6 +1700,94 @@ fn default_font_submenu(
                 }
             });
     });
+}
+
+fn inherited_western_font_selector(
+    ui: &mut egui::Ui,
+    language: AppLanguage,
+    selected: &mut Option<ReaderFontChoice>,
+    font_families: &rebook_layout::ReaderFontFamilies,
+) {
+    let inherited = language.text("跟随拉丁主要字体", "Follow Latin primary font");
+    let selected_text = selected.as_ref().map_or_else(
+        || inherited.to_owned(),
+        |choice| {
+            let category = match choice.category {
+                ReaderDefaultFont::Serif => language.text("衬线", "Serif"),
+                ReaderDefaultFont::SansSerif => language.text("无衬线", "Sans serif"),
+            };
+            format!("{category} · {}", choice.family)
+        },
+    );
+    egui::ComboBox::from_id_salt("settings-cjk-default-font")
+        .width(SETTINGS_FONT_SELECT_WIDTH)
+        .truncate()
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(selected.is_none(), inherited).clicked() {
+                *selected = None;
+                ui.close();
+            }
+            ui.separator();
+            for (category, label, families) in [
+                (
+                    ReaderDefaultFont::Serif,
+                    language.text("衬线", "Serif"),
+                    font_families.serif.as_slice(),
+                ),
+                (
+                    ReaderDefaultFont::SansSerif,
+                    language.text("无衬线", "Sans serif"),
+                    font_families.sans_serif.as_slice(),
+                ),
+            ] {
+                ui.weak(label);
+                for family in families {
+                    let value = ReaderFontChoice {
+                        category,
+                        family: family.clone(),
+                    };
+                    if ui
+                        .selectable_label(selected.as_ref() == Some(&value), family)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        *selected = Some(value);
+                        ui.close();
+                    }
+                }
+            }
+        });
+}
+
+fn inherited_cjk_font_selector(
+    ui: &mut egui::Ui,
+    language: AppLanguage,
+    selected: &mut Option<String>,
+    font_families: &[String],
+) {
+    let inherited = language.text("跟随中日韩主要字体", "Follow CJK primary font");
+    egui::ComboBox::from_id_salt("settings-latin-cjk-font")
+        .width(SETTINGS_FONT_SELECT_WIDTH)
+        .truncate()
+        .selected_text(selected.as_deref().unwrap_or(inherited))
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(selected.is_none(), inherited).clicked() {
+                *selected = None;
+                ui.close();
+            }
+            ui.separator();
+            for family in font_families {
+                if ui
+                    .selectable_label(selected.as_ref() == Some(family), family)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    *selected = Some(family.clone());
+                    ui.close();
+                }
+            }
+        });
 }
 
 fn font_family_selector(

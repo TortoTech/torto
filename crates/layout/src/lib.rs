@@ -218,6 +218,13 @@ pub enum ReaderDefaultFont {
     SansSerif,
 }
 
+/// One explicit Western font selection used by a language profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReaderFontChoice {
+    pub category: ReaderDefaultFont,
+    pub family: String,
+}
+
 /// Readest-compatible native typography preferences.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -226,6 +233,12 @@ pub struct ReaderTypography {
     pub default_cjk_font: String,
     pub serif_font: String,
     pub sans_serif_font: String,
+    /// Western letters and digits used in CJK-primary books. `None` inherits
+    /// the Latin profile's primary selection.
+    pub cjk_default_font: Option<ReaderFontChoice>,
+    /// CJK fallback used in Latin-primary books. `None` inherits the CJK
+    /// profile's primary family.
+    pub latin_cjk_font: Option<String>,
     pub monospace_font: String,
     pub font_size: f32,
     pub minimum_font_size: f32,
@@ -242,6 +255,18 @@ impl ReaderTypography {
         }
         normalize_family(&mut self.serif_font, &defaults.serif_font);
         normalize_family(&mut self.sans_serif_font, &defaults.sans_serif_font);
+        if let Some(choice) = &mut self.cjk_default_font {
+            choice.family = choice.family.trim().to_owned();
+            if choice.family.is_empty() {
+                self.cjk_default_font = None;
+            }
+        }
+        if let Some(family) = &mut self.latin_cjk_font {
+            *family = family.trim().to_owned();
+            if family.is_empty() {
+                self.latin_cjk_font = None;
+            }
+        }
         normalize_family(&mut self.monospace_font, &defaults.monospace_font);
         self.minimum_font_size = finite_clamp(self.minimum_font_size, 1.0, 120.0, 12.0);
         self.font_size = finite_clamp(self.font_size, self.minimum_font_size, 120.0, 20.0);
@@ -250,45 +275,90 @@ impl ReaderTypography {
 
     #[must_use]
     pub fn default_stack(&self) -> String {
-        match self.default_font {
-            ReaderDefaultFont::Serif => self.serif_stack(),
-            ReaderDefaultFont::SansSerif => self.sans_serif_stack(),
+        self.default_stack_for(WritingSystem::Unknown)
+    }
+
+    #[must_use]
+    pub fn default_stack_for(&self, writing_system: WritingSystem) -> String {
+        match writing_system {
+            WritingSystem::Cjk => {
+                let (category, family) = self.cjk_default_font.as_ref().map_or_else(
+                    || (self.default_font, self.default_western_family()),
+                    |choice| (choice.category, choice.family.as_str()),
+                );
+                self.reading_stack(category, family, &self.default_cjk_font)
+            }
+            WritingSystem::Latin | WritingSystem::Other | WritingSystem::Unknown => self
+                .reading_stack(
+                    self.default_font,
+                    self.default_western_family(),
+                    self.latin_cjk_font
+                        .as_deref()
+                        .unwrap_or(&self.default_cjk_font),
+                ),
         }
     }
 
     #[must_use]
     pub fn serif_stack(&self) -> String {
-        font_stack(
-            [
-                self.serif_font.as_str(),
-                self.default_cjk_font.as_str(),
-                "LXGW WenKai GB Screen",
-                "Noto Serif SC",
-                "Source Han Serif SC",
-                "Songti SC",
-                "SimSun",
-                "Georgia",
-                "Times New Roman",
-            ],
-            "serif",
+        self.reading_stack(
+            ReaderDefaultFont::Serif,
+            &self.serif_font,
+            &self.default_cjk_font,
         )
+    }
+
+    fn default_western_family(&self) -> &str {
+        match self.default_font {
+            ReaderDefaultFont::Serif => &self.serif_font,
+            ReaderDefaultFont::SansSerif => &self.sans_serif_font,
+        }
+    }
+
+    fn reading_stack(
+        &self,
+        category: ReaderDefaultFont,
+        western_family: &str,
+        cjk_family: &str,
+    ) -> String {
+        match category {
+            ReaderDefaultFont::Serif => font_stack(
+                [
+                    western_family,
+                    cjk_family,
+                    "LXGW WenKai GB Screen",
+                    "Noto Serif SC",
+                    "Source Han Serif SC",
+                    "Songti SC",
+                    "SimSun",
+                    "Georgia",
+                    "Times New Roman",
+                ],
+                "serif",
+            ),
+            ReaderDefaultFont::SansSerif => font_stack(
+                [
+                    western_family,
+                    cjk_family,
+                    "LXGW WenKai GB Screen",
+                    "Noto Sans SC",
+                    "Source Han Sans SC",
+                    "PingFang SC",
+                    "Microsoft YaHei",
+                    "Roboto",
+                    "Arial",
+                ],
+                "sans-serif",
+            ),
+        }
     }
 
     #[must_use]
     pub fn sans_serif_stack(&self) -> String {
-        font_stack(
-            [
-                self.sans_serif_font.as_str(),
-                self.default_cjk_font.as_str(),
-                "LXGW WenKai GB Screen",
-                "Noto Sans SC",
-                "Source Han Sans SC",
-                "PingFang SC",
-                "Microsoft YaHei",
-                "Roboto",
-                "Arial",
-            ],
-            "sans-serif",
+        self.reading_stack(
+            ReaderDefaultFont::SansSerif,
+            &self.sans_serif_font,
+            &self.default_cjk_font,
         )
     }
 
@@ -312,6 +382,8 @@ impl Default for ReaderTypography {
             default_cjk_font: "LXGW WenKai GB Screen".into(),
             serif_font: "Bitter".into(),
             sans_serif_font: "Roboto".into(),
+            cjk_default_font: None,
+            latin_cjk_font: None,
             monospace_font: "Consolas".into(),
             font_size: 20.0,
             minimum_font_size: 12.0,
@@ -654,6 +726,16 @@ impl ReaderFontFamilies {
         include_available_family(&self.all, &mut self.serif, &typography.serif_font);
         include_available_family(&self.all, &mut self.sans_serif, &typography.sans_serif_font);
         include_available_family(&self.all, &mut self.monospace, &typography.monospace_font);
+        if let Some(choice) = &typography.cjk_default_font {
+            let category = match choice.category {
+                ReaderDefaultFont::Serif => &mut self.serif,
+                ReaderDefaultFont::SansSerif => &mut self.sans_serif,
+            };
+            include_available_family(&self.all, category, &choice.family);
+        }
+        if let Some(family) = &typography.latin_cjk_font {
+            include_available_family(&self.all, &mut self.chinese, family);
+        }
     }
 
     /// Replaces persisted reader families that the native renderer cannot
@@ -661,7 +743,7 @@ impl ReaderFontFamilies {
     pub fn repair_typography(&self, typography: &mut ReaderTypography) -> bool {
         typography.normalize();
         let defaults = ReaderTypography::default();
-        repair_available_family(
+        let repaired = repair_available_family(
             &self.chinese,
             &mut typography.default_cjk_font,
             &defaults.default_cjk_font,
@@ -677,8 +759,52 @@ impl ReaderFontFamilies {
             &self.monospace,
             &mut typography.monospace_font,
             &defaults.monospace_font,
-        )
+        );
+        let cjk_default_repaired = typography.cjk_default_font.as_mut().is_some_and(|choice| {
+            let available = match choice.category {
+                ReaderDefaultFont::Serif => &self.serif,
+                ReaderDefaultFont::SansSerif => &self.sans_serif,
+            };
+            repair_optional_family(available, &mut choice.family)
+        });
+        if typography
+            .cjk_default_font
+            .as_ref()
+            .is_some_and(|choice| choice.family.is_empty())
+        {
+            typography.cjk_default_font = None;
+        }
+        let latin_cjk_repaired =
+            repair_optional_family_option(&self.chinese, &mut typography.latin_cjk_font);
+        repaired | cjk_default_repaired | latin_cjk_repaired
     }
+}
+
+fn repair_optional_family(available: &[String], current: &mut String) -> bool {
+    let Some(matching) = available
+        .iter()
+        .find(|family| family.eq_ignore_ascii_case(current))
+    else {
+        current.clear();
+        return true;
+    };
+    if matching == current {
+        false
+    } else {
+        current.clone_from(matching);
+        true
+    }
+}
+
+fn repair_optional_family_option(available: &[String], current: &mut Option<String>) -> bool {
+    let Some(family) = current else {
+        return false;
+    };
+    let repaired = repair_optional_family(available, family);
+    if family.is_empty() {
+        *current = None;
+    }
+    repaired
 }
 
 fn repair_available_family(available: &[String], current: &mut String, default: &str) -> bool {
@@ -1497,7 +1623,7 @@ impl LayoutEngine {
         let font_stack = if block.kind == TextBlockKind::Preformatted {
             typography.monospace_stack()
         } else {
-            typography.default_stack()
+            typography.default_stack_for(reader_style.writing_system)
         };
         let mut layout = self.build_text_layout(
             &text,
@@ -1514,6 +1640,7 @@ impl LayoutEngine {
             block,
             &text[..source_text_start],
             typography,
+            &font_stack,
             first_line_indent,
         );
         let should_optimize = reader_style.typesetting.line_break_strategy
@@ -1573,6 +1700,7 @@ impl LayoutEngine {
                     block,
                     &text[..source_text_start],
                     typography,
+                    &font_stack,
                     first_line_indent,
                 );
                 linebreak::parley::apply_breaks(&mut adjusted, &plan.lines, available_width)?;
@@ -1790,6 +1918,7 @@ impl LayoutEngine {
         block: &TextBlock,
         marker: &str,
         typography: &ReaderTypography,
+        font_stack: &str,
         first_line_indent: f32,
     ) {
         if first_line_indent.abs() > f32::EPSILON {
@@ -1801,7 +1930,7 @@ impl LayoutEngine {
                 },
             );
         }
-        self.apply_list_indent(layout, block.kind, marker, typography);
+        self.apply_list_indent(layout, block.kind, marker, typography, font_stack);
     }
 
     fn measure_list_marker_width(
@@ -1829,12 +1958,12 @@ impl LayoutEngine {
         kind: TextBlockKind,
         marker: &str,
         typography: &ReaderTypography,
+        font_stack: &str,
     ) {
         if marker.is_empty() {
             return;
         }
-        let font_stack = typography.default_stack();
-        let marker_width = self.measure_list_marker_width(marker, &font_stack, typography);
+        let marker_width = self.measure_list_marker_width(marker, font_stack, typography);
         apply_list_hanging_indent(layout, kind, marker_width);
     }
 
@@ -4925,6 +5054,8 @@ mod tests {
         assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
         assert_eq!(typography.serif_font, "Bitter");
         assert_eq!(typography.sans_serif_font, "Roboto");
+        assert!(typography.cjk_default_font.is_none());
+        assert!(typography.latin_cjk_font.is_none());
         assert_eq!(typography.monospace_font, "Consolas");
         assert!((typography.font_size - 20.0).abs() < f32::EPSILON);
         assert!((typography.minimum_font_size - 12.0).abs() < f32::EPSILON);
@@ -4946,11 +5077,46 @@ mod tests {
     }
 
     #[test]
+    fn typography_selects_independent_cjk_and_latin_book_stacks() {
+        let typography = ReaderTypography {
+            default_font: ReaderDefaultFont::Serif,
+            default_cjk_font: "CJK Primary".into(),
+            serif_font: "Latin Primary".into(),
+            cjk_default_font: Some(ReaderFontChoice {
+                category: ReaderDefaultFont::SansSerif,
+                family: "CJK Western".into(),
+            }),
+            latin_cjk_font: Some("Latin CJK Fallback".into()),
+            ..ReaderTypography::default()
+        };
+
+        assert!(
+            typography
+                .default_stack_for(WritingSystem::Cjk)
+                .starts_with("\"CJK Western\", \"CJK Primary\"")
+        );
+        assert!(
+            typography
+                .default_stack_for(WritingSystem::Latin)
+                .starts_with("\"Latin Primary\", \"Latin CJK Fallback\"")
+        );
+        assert_eq!(
+            typography.default_stack_for(WritingSystem::Unknown),
+            typography.default_stack_for(WritingSystem::Latin)
+        );
+    }
+
+    #[test]
     fn reader_typography_normalizes_persisted_values() {
         let mut typography = ReaderTypography {
             default_cjk_font: "  ".into(),
             serif_font: "  Georgia  ".into(),
             sans_serif_font: String::new(),
+            cjk_default_font: Some(ReaderFontChoice {
+                category: ReaderDefaultFont::Serif,
+                family: "  ".into(),
+            }),
+            latin_cjk_font: Some("  ".into()),
             monospace_font: String::new(),
             font_size: f32::NAN,
             minimum_font_size: -4.0,
@@ -4961,6 +5127,8 @@ mod tests {
         assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
         assert_eq!(typography.serif_font, "Georgia");
         assert_eq!(typography.sans_serif_font, "Roboto");
+        assert!(typography.cjk_default_font.is_none());
+        assert!(typography.latin_cjk_font.is_none());
         assert_eq!(typography.monospace_font, "Consolas");
         assert!((typography.font_size - 20.0).abs() < f32::EPSILON);
         assert!((typography.minimum_font_size - 1.0).abs() < f32::EPSILON);
@@ -4990,6 +5158,11 @@ mod tests {
             default_cjk_font: "宋体".into(),
             serif_font: "Unavailable Serif".into(),
             sans_serif_font: "Unavailable Sans".into(),
+            cjk_default_font: Some(ReaderFontChoice {
+                category: ReaderDefaultFont::Serif,
+                family: "Unavailable CJK Western".into(),
+            }),
+            latin_cjk_font: Some("Unavailable CJK".into()),
             monospace_font: "Unavailable Mono".into(),
             ..ReaderTypography::default()
         };
@@ -4998,6 +5171,8 @@ mod tests {
         assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
         assert_eq!(typography.serif_font, "Bitter");
         assert_eq!(typography.sans_serif_font, "Roboto");
+        assert!(typography.cjk_default_font.is_none());
+        assert!(typography.latin_cjk_font.is_none());
         assert_eq!(typography.monospace_font, "Consolas");
         assert!(!families.repair_typography(&mut typography));
     }

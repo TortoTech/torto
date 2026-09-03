@@ -634,7 +634,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rebook_layout::ReaderDefaultFont;
+    use rebook_layout::{ReaderDefaultFont, ReaderFontChoice};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -645,6 +645,11 @@ mod tests {
             default_cjk_font: "  Microsoft YaHei  ".into(),
             serif_font: "Literata".into(),
             sans_serif_font: "Noto Sans".into(),
+            cjk_default_font: Some(ReaderFontChoice {
+                category: ReaderDefaultFont::Serif,
+                family: "  Georgia  ".into(),
+            }),
+            latin_cjk_font: Some("  Noto Serif SC  ".into()),
             monospace_font: "Fira Code".into(),
             font_size: 18.0,
             minimum_font_size: 9.0,
@@ -686,6 +691,17 @@ mod tests {
         );
         assert!((loaded.interface_typography.font_size - 15.0).abs() < f32::EPSILON);
         assert_eq!(loaded.typography.default_cjk_font, "Microsoft YaHei");
+        assert_eq!(
+            loaded.typography.cjk_default_font,
+            Some(ReaderFontChoice {
+                category: ReaderDefaultFont::Serif,
+                family: "Georgia".into(),
+            })
+        );
+        assert_eq!(
+            loaded.typography.latin_cjk_font.as_deref(),
+            Some("Noto Serif SC")
+        );
         assert!((loaded.typography.font_size - 18.0).abs() < f32::EPSILON);
         assert!((loaded.typography.minimum_font_size - 9.0).abs() < f32::EPSILON);
         assert_eq!(loaded.typography.font_weight, 600);
