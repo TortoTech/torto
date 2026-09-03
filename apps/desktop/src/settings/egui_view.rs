@@ -814,8 +814,30 @@ fn reader_font_settings(
     typesetting: &mut rebook_layout::ReaderTypesetting,
     font_families: &rebook_layout::ReaderFontFamilies,
 ) {
+    reader_layout_settings(
+        ui,
+        language,
+        reading_mode,
+        spread,
+        hide_cursor_in_focus_mode,
+        typesetting,
+    );
+    ui.add_space(12.0);
+    reader_typeface_settings(ui, language, typography, font_families);
+}
+
+fn reader_layout_settings(
+    ui: &mut egui::Ui,
+    language: AppLanguage,
+    reading_mode: &mut ReadingMode,
+    spread: &mut SpreadMode,
+    hide_cursor_in_focus_mode: &mut bool,
+    typesetting: &mut rebook_layout::ReaderTypesetting,
+) {
     settings_card(ui, |ui| {
-        egui::Grid::new("typography-settings-grid")
+        settings_module_label(ui, language.text("布局", "Layout"));
+        ui.add_space(4.0);
+        egui::Grid::new("typography-layout-settings-grid")
             .num_columns(2)
             .spacing([24.0, 16.0])
             .show(ui, |ui| {
@@ -876,7 +898,31 @@ fn reader_font_settings(
                     ui.end_row();
                 }
 
-                settings_module_row_label(ui, language.text("中日韩", "CJK"));
+                if *reading_mode == ReadingMode::Focus {
+                    settings_row_label(ui, language.text("隐藏鼠标", "Hide cursor"));
+                    settings_row_control_sized(ui, SETTINGS_SELECT_WIDTH, |ui| {
+                        toggle_switch(ui, hide_cursor_in_focus_mode);
+                    });
+                    ui.end_row();
+                }
+            });
+    });
+}
+
+fn reader_typeface_settings(
+    ui: &mut egui::Ui,
+    language: AppLanguage,
+    typography: &mut rebook_layout::ReaderTypography,
+    font_families: &rebook_layout::ReaderFontFamilies,
+) {
+    settings_card(ui, |ui| {
+        settings_module_label(ui, language.text("字体", "Fonts"));
+        ui.add_space(4.0);
+        egui::Grid::new("typography-font-settings-grid")
+            .num_columns(2)
+            .spacing([24.0, 16.0])
+            .show(ui, |ui| {
+                settings_subgroup_row_label(ui, language.text("中日韩书籍", "CJK books"));
                 ui.label("");
                 ui.end_row();
 
@@ -889,10 +935,7 @@ fn reader_font_settings(
                     None,
                 );
 
-                settings_row_label(
-                    ui,
-                    language.text("默认字体（英文、数字）", "Default font (Latin & digits)"),
-                );
+                settings_row_label(ui, language.text("拉丁字体", "Latin font"));
                 settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
                     inherited_western_font_selector(
                         ui,
@@ -903,7 +946,10 @@ fn reader_font_settings(
                 });
                 ui.end_row();
 
-                settings_module_row_label(ui, language.text("拉丁文字", "Latin"));
+                settings_subgroup_row_label(
+                    ui,
+                    language.text("其他语言书籍", "Other-language books"),
+                );
                 ui.label("");
                 ui.end_row();
 
@@ -913,7 +959,7 @@ fn reader_font_settings(
                 });
                 ui.end_row();
 
-                settings_row_label(ui, language.text("CJK 字体", "CJK font"));
+                settings_row_label(ui, language.text("中日韩字体", "CJK font"));
                 settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
                     inherited_cjk_font_selector(
                         ui,
@@ -924,7 +970,7 @@ fn reader_font_settings(
                 });
                 ui.end_row();
 
-                settings_module_row_label(ui, language.text("通用", "General"));
+                settings_subgroup_row_label(ui, language.text("通用", "General"));
                 ui.label("");
                 ui.end_row();
 
@@ -965,14 +1011,6 @@ fn reader_font_settings(
                     800,
                     100,
                 );
-
-                if *reading_mode == ReadingMode::Focus {
-                    settings_row_label(ui, language.text("隐藏鼠标", "Hide cursor"));
-                    settings_row_control_sized(ui, SETTINGS_SELECT_WIDTH, |ui| {
-                        toggle_switch(ui, hide_cursor_in_focus_mode);
-                    });
-                    ui.end_row();
-                }
             });
     });
 }
@@ -1597,6 +1635,7 @@ fn default_font_selector(
             language.text("无衬线", "Sans serif"),
             &typography.sans_serif_font,
         ),
+        ReaderDefaultFont::Other => (language.text("其他", "Other"), &typography.other_font),
     };
     let selected_text = format!("{category} · {family}");
     let arrow_id = ui.make_persistent_id("settings-default-font-arrow");
@@ -1610,7 +1649,7 @@ fn default_font_selector(
     .truncate()
     .corner_radius(6);
     let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
-        ui.set_min_width(SETTINGS_SELECT_WIDTH);
+        ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
         default_font_submenu(
             ui,
             language.text("衬线", "Serif"),
@@ -1625,6 +1664,14 @@ fn default_font_selector(
             ReaderDefaultFont::SansSerif,
             typography,
             &font_families.sans_serif,
+            language,
+        );
+        default_font_submenu(
+            ui,
+            language.text("其他", "Other"),
+            ReaderDefaultFont::Other,
+            typography,
+            &font_families.other,
             language,
         );
     });
@@ -1675,6 +1722,7 @@ fn default_font_submenu(
                     let selected_family = match category {
                         ReaderDefaultFont::Serif => &typography.serif_font,
                         ReaderDefaultFont::SansSerif => &typography.sans_serif_font,
+                        ReaderDefaultFont::Other => &typography.other_font,
                     };
                     let selected = current_category && selected_family == family;
                     let row_width = ui.available_width();
@@ -1694,6 +1742,7 @@ fn default_font_submenu(
                             ReaderDefaultFont::SansSerif => {
                                 typography.sans_serif_font.clone_from(family);
                             }
+                            ReaderDefaultFont::Other => typography.other_font.clone_from(family),
                         }
                         ui.close();
                     }
@@ -1715,40 +1764,115 @@ fn inherited_western_font_selector(
             let category = match choice.category {
                 ReaderDefaultFont::Serif => language.text("衬线", "Serif"),
                 ReaderDefaultFont::SansSerif => language.text("无衬线", "Sans serif"),
+                ReaderDefaultFont::Other => language.text("其他", "Other"),
             };
             format!("{category} · {}", choice.family)
         },
     );
-    egui::ComboBox::from_id_salt("settings-cjk-default-font")
-        .width(SETTINGS_FONT_SELECT_WIDTH)
-        .truncate()
-        .selected_text(selected_text)
-        .show_ui(ui, |ui| {
-            if ui.selectable_label(selected.is_none(), inherited).clicked() {
-                *selected = None;
-                ui.close();
-            }
-            ui.separator();
-            for (category, label, families) in [
-                (
-                    ReaderDefaultFont::Serif,
-                    language.text("衬线", "Serif"),
-                    font_families.serif.as_slice(),
-                ),
-                (
-                    ReaderDefaultFont::SansSerif,
-                    language.text("无衬线", "Sans serif"),
-                    font_families.sans_serif.as_slice(),
-                ),
-            ] {
-                ui.weak(label);
-                for family in families {
+    let arrow_id = ui.make_persistent_id("settings-cjk-default-font-arrow");
+    let arrow_size = 14.0;
+    let button = egui::Button::new((
+        selected_text,
+        egui::Atom::grow(),
+        egui::Atom::custom(arrow_id, Vec2::splat(arrow_size)),
+    ))
+    .min_size(Vec2::new(SETTINGS_FONT_SELECT_WIDTH, 0.0))
+    .truncate()
+    .corner_radius(6);
+    let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+        ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
+        let row_width = ui.available_width();
+        if ui
+            .add(
+                egui::Button::selectable(selected.is_none(), inherited)
+                    .min_size(Vec2::new(row_width, 0.0))
+                    .truncate(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            *selected = None;
+            ui.close();
+        }
+        ui.separator();
+        for (category, label, families) in [
+            (
+                ReaderDefaultFont::Serif,
+                language.text("衬线", "Serif"),
+                font_families.serif.as_slice(),
+            ),
+            (
+                ReaderDefaultFont::SansSerif,
+                language.text("无衬线", "Sans serif"),
+                font_families.sans_serif.as_slice(),
+            ),
+            (
+                ReaderDefaultFont::Other,
+                language.text("其他", "Other"),
+                font_families.other.as_slice(),
+            ),
+        ] {
+            inherited_western_font_submenu(ui, label, category, selected, families, language);
+        }
+    });
+    if ui.is_rect_visible(response.rect) {
+        let padding = ui.spacing().button_padding;
+        let arrow_rect = egui::Rect::from_center_size(
+            egui::pos2(
+                response.rect.right() - padding.x - arrow_size / 2.0,
+                response.rect.center().y,
+            ),
+            Vec2::splat(arrow_size),
+        );
+        paint_icon(
+            ui,
+            arrow_rect,
+            Icon::ChevronDown,
+            ui.style().interact(&response).fg_stroke.color,
+        );
+    }
+}
+
+fn inherited_western_font_submenu(
+    ui: &mut egui::Ui,
+    label: &str,
+    category: ReaderDefaultFont,
+    selected: &mut Option<ReaderFontChoice>,
+    font_families: &[String],
+    language: AppLanguage,
+) {
+    let current_category = selected
+        .as_ref()
+        .is_some_and(|choice| choice.category == category);
+    let label = RichText::new(label).color(if current_category {
+        palette().accent
+    } else {
+        palette().text
+    });
+    ui.menu_button(label, |ui| {
+        ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
+                if font_families.is_empty() {
+                    ui.weak(language.text("没有可用字体", "No available fonts"));
+                    return;
+                }
+                for family in font_families {
                     let value = ReaderFontChoice {
                         category,
                         family: family.clone(),
                     };
+                    let row_width = ui.available_width();
                     if ui
-                        .selectable_label(selected.as_ref() == Some(&value), family)
+                        .add(
+                            egui::Button::selectable(selected.as_ref() == Some(&value), family)
+                                .min_size(Vec2::new(row_width, 0.0))
+                                .truncate(),
+                        )
+                        .on_hover_text(family)
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
                     {
@@ -1756,8 +1880,8 @@ fn inherited_western_font_selector(
                         ui.close();
                     }
                 }
-            }
-        });
+            });
+    });
 }
 
 fn inherited_cjk_font_selector(
@@ -2142,6 +2266,16 @@ fn settings_module_label(ui: &mut egui::Ui, text: &str) {
 
 fn settings_module_row_label(ui: &mut egui::Ui, text: &str) {
     settings_row_control(ui, |ui| settings_module_label(ui, text));
+}
+
+fn settings_subgroup_row_label(ui: &mut egui::Ui, text: &str) {
+    settings_row_control(ui, |ui| {
+        ui.label(
+            RichText::new(text)
+                .size(crate::ui::scaled_font_size(14.0))
+                .color(palette().text),
+        );
+    });
 }
 
 fn settings_row_label(ui: &mut egui::Ui, text: &str) {

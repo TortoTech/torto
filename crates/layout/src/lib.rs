@@ -216,6 +216,7 @@ pub enum ReaderDefaultFont {
     #[default]
     Serif,
     SansSerif,
+    Other,
 }
 
 /// One explicit Western font selection used by a language profile.
@@ -233,6 +234,7 @@ pub struct ReaderTypography {
     pub default_cjk_font: String,
     pub serif_font: String,
     pub sans_serif_font: String,
+    pub other_font: String,
     /// Western letters and digits used in CJK-primary books. `None` inherits
     /// the Latin profile's primary selection.
     pub cjk_default_font: Option<ReaderFontChoice>,
@@ -255,6 +257,7 @@ impl ReaderTypography {
         }
         normalize_family(&mut self.serif_font, &defaults.serif_font);
         normalize_family(&mut self.sans_serif_font, &defaults.sans_serif_font);
+        self.other_font = self.other_font.trim().to_owned();
         if let Some(choice) = &mut self.cjk_default_font {
             choice.family = choice.family.trim().to_owned();
             if choice.family.is_empty() {
@@ -312,6 +315,7 @@ impl ReaderTypography {
         match self.default_font {
             ReaderDefaultFont::Serif => &self.serif_font,
             ReaderDefaultFont::SansSerif => &self.sans_serif_font,
+            ReaderDefaultFont::Other => &self.other_font,
         }
     }
 
@@ -337,6 +341,20 @@ impl ReaderTypography {
                 "serif",
             ),
             ReaderDefaultFont::SansSerif => font_stack(
+                [
+                    western_family,
+                    cjk_family,
+                    "LXGW WenKai GB Screen",
+                    "Noto Sans SC",
+                    "Source Han Sans SC",
+                    "PingFang SC",
+                    "Microsoft YaHei",
+                    "Roboto",
+                    "Arial",
+                ],
+                "sans-serif",
+            ),
+            ReaderDefaultFont::Other => font_stack(
                 [
                     western_family,
                     cjk_family,
@@ -378,11 +396,15 @@ impl ReaderTypography {
 impl Default for ReaderTypography {
     fn default() -> Self {
         Self {
-            default_font: ReaderDefaultFont::Serif,
+            default_font: ReaderDefaultFont::Other,
             default_cjk_font: "LXGW WenKai GB Screen".into(),
-            serif_font: "Bitter".into(),
-            sans_serif_font: "Roboto".into(),
-            cjk_default_font: None,
+            serif_font: "Georgia".into(),
+            sans_serif_font: "Arial".into(),
+            other_font: "Ysabeau Office".into(),
+            cjk_default_font: Some(ReaderFontChoice {
+                category: ReaderDefaultFont::Other,
+                family: "Ysabeau Office".into(),
+            }),
             latin_cjk_font: None,
             monospace_font: "Consolas".into(),
             font_size: 20.0,
@@ -478,31 +500,89 @@ struct ReaderFontClassification {
     monospace: bool,
 }
 
-fn classify_reader_font(panose: Option<&[u8]>, fixed_pitch: bool) -> ReaderFontClassification {
-    let Some(panose) = panose.filter(|panose| panose.len() >= 4) else {
+fn classify_reader_font(
+    panose: Option<&[u8]>,
+    family_class: Option<i16>,
+    fixed_pitch: bool,
+) -> ReaderFontClassification {
+    let panose = panose.filter(|panose| panose.len() >= 4);
+    let monospace = fixed_pitch || panose.is_some_and(|panose| panose[0] == 2 && panose[3] == 9);
+    if monospace {
         return ReaderFontClassification {
-            monospace: fixed_pitch,
-            ..ReaderFontClassification::default()
-        };
-    };
-    let monospace = fixed_pitch || panose[0] == 2 && panose[3] == 9;
-    if monospace || panose[0] != 2 {
-        return ReaderFontClassification {
-            monospace,
+            monospace: true,
             ..ReaderFontClassification::default()
         };
     }
+    if let Some(panose) = panose.filter(|panose| panose[0] == 2) {
+        let classification = ReaderFontClassification {
+            serif: matches!(panose[1], 2..=10),
+            sans_serif: matches!(panose[1], 11..=15),
+            monospace: false,
+        };
+        if classification.serif || classification.sans_serif {
+            return classification;
+        }
+    }
+    let family_class = family_class.map(|value| value.to_be_bytes()[0]);
     ReaderFontClassification {
-        serif: matches!(panose[1], 2..=10),
-        sans_serif: matches!(panose[1], 11..=15),
+        serif: family_class.is_some_and(|class| matches!(class, 1..=5 | 7)),
+        sans_serif: family_class == Some(8),
         monospace: false,
     }
+}
+
+fn infer_reader_font_classification(family: &str) -> ReaderFontClassification {
+    let normalized = family.to_ascii_lowercase();
+    let words = normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let has_word = |candidate| words.contains(&candidate);
+    let serif = has_word("serif")
+        || has_word("roman")
+        || has_word("antiqua")
+        || has_word("mincho")
+        || ["baskerville", "bodoni", "bookman", "sitka"]
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix));
+    let sans_serif = !serif
+        && (has_word("sans")
+            || has_word("gothic")
+            || has_word("grotesk")
+            || has_word("ui")
+            || ["arial", "helvetica"]
+                .iter()
+                .any(|prefix| normalized.starts_with(prefix)));
+    ReaderFontClassification {
+        serif,
+        sans_serif,
+        monospace: false,
+    }
+}
+
+fn is_symbolic_reader_font(family: &str, panose: Option<&[u8]>, family_class: Option<i16>) -> bool {
+    let family_class = family_class.map(|value| value.to_be_bytes()[0]);
+    let normalized = family.to_ascii_lowercase();
+    panose.is_some_and(|panose| panose.first() == Some(&5))
+        || family_class == Some(12)
+        || normalized.contains("math")
+        || normalized.contains("symbol")
+        || normalized.contains("webdings")
+        || normalized.contains("wingdings")
 }
 
 fn supports_common_chinese(charmap: &parley::fontique::Charmap<'_>) -> bool {
     const COMMON_CHINESE_PROBE: &str =
         "中文字体阅读书籍测试国家学习时间这样问题繁體國學時門風龍臺灣";
     COMMON_CHINESE_PROBE
+        .chars()
+        .all(|character| charmap.map(character).is_some())
+}
+
+fn supports_common_latin(charmap: &parley::fontique::Charmap<'_>) -> bool {
+    const COMMON_LATIN_PROBE: &str =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    COMMON_LATIN_PROBE
         .chars()
         .all(|character| charmap.map(character).is_some())
 }
@@ -717,6 +797,7 @@ pub struct ReaderFontFamilies {
     pub all: Vec<String>,
     pub serif: Vec<String>,
     pub sans_serif: Vec<String>,
+    pub other: Vec<String>,
     pub monospace: Vec<String>,
     pub chinese: Vec<String>,
 }
@@ -725,11 +806,13 @@ impl ReaderFontFamilies {
     pub fn include_configured(&mut self, typography: &ReaderTypography) {
         include_available_family(&self.all, &mut self.serif, &typography.serif_font);
         include_available_family(&self.all, &mut self.sans_serif, &typography.sans_serif_font);
+        include_available_family(&self.all, &mut self.other, &typography.other_font);
         include_available_family(&self.all, &mut self.monospace, &typography.monospace_font);
         if let Some(choice) = &typography.cjk_default_font {
             let category = match choice.category {
                 ReaderDefaultFont::Serif => &mut self.serif,
                 ReaderDefaultFont::SansSerif => &mut self.sans_serif,
+                ReaderDefaultFont::Other => &mut self.other,
             };
             include_available_family(&self.all, category, &choice.family);
         }
@@ -743,7 +826,7 @@ impl ReaderFontFamilies {
     pub fn repair_typography(&self, typography: &mut ReaderTypography) -> bool {
         typography.normalize();
         let defaults = ReaderTypography::default();
-        let repaired = repair_available_family(
+        let mut repaired = repair_available_family(
             &self.chinese,
             &mut typography.default_cjk_font,
             &defaults.default_cjk_font,
@@ -755,15 +838,21 @@ impl ReaderFontFamilies {
             &self.sans_serif,
             &mut typography.sans_serif_font,
             &defaults.sans_serif_font,
-        ) | repair_available_family(
-            &self.monospace,
-            &mut typography.monospace_font,
-            &defaults.monospace_font,
-        );
+        ) | repair_optional_family(&self.other, &mut typography.other_font)
+            | repair_available_family(
+                &self.monospace,
+                &mut typography.monospace_font,
+                &defaults.monospace_font,
+            );
+        if typography.default_font == ReaderDefaultFont::Other && typography.other_font.is_empty() {
+            typography.default_font = ReaderDefaultFont::Serif;
+            repaired = true;
+        }
         let cjk_default_repaired = typography.cjk_default_font.as_mut().is_some_and(|choice| {
             let available = match choice.category {
                 ReaderDefaultFont::Serif => &self.serif,
                 ReaderDefaultFont::SansSerif => &self.sans_serif,
+                ReaderDefaultFont::Other => &self.other,
             };
             repair_optional_family(available, &mut choice.family)
         });
@@ -785,8 +874,9 @@ fn repair_optional_family(available: &[String], current: &mut String) -> bool {
         .iter()
         .find(|family| family.eq_ignore_ascii_case(current))
     else {
+        let repaired = !current.is_empty();
         current.clear();
-        return true;
+        return repaired;
     };
     if matching == current {
         false
@@ -896,10 +986,13 @@ impl LayoutEngine {
             let Some(data) = font_info.load(None) else {
                 continue;
             };
-            let supports_chinese = font_info
-                .charmap_index()
-                .charmap(data.as_ref())
-                .is_some_and(|charmap| supports_common_chinese(&charmap));
+            let charmap = font_info.charmap_index().charmap(data.as_ref());
+            let supports_chinese = charmap
+                .as_ref()
+                .is_some_and(|charmap| supports_common_chinese(charmap));
+            let supports_latin = charmap
+                .as_ref()
+                .is_some_and(|charmap| supports_common_latin(charmap));
             let Ok(font) = FontRef::from_index(data.as_ref(), font_info.index()) else {
                 continue;
             };
@@ -919,14 +1012,24 @@ impl LayoutEngine {
                 .post()
                 .ok()
                 .is_some_and(|post| post.is_fixed_pitch() != 0);
-            let panose = font.os2().ok().map(|os2| os2.panose_10());
-            let classification = classify_reader_font(panose, fixed_pitch);
+            let os2 = font.os2().ok();
+            let panose = os2.as_ref().map(|os2| os2.panose_10());
+            let family_class = os2.as_ref().map(|os2| os2.s_family_class());
+            let mut classification = classify_reader_font(panose, family_class, fixed_pitch);
+            if !classification.serif && !classification.sans_serif && !classification.monospace {
+                classification = infer_reader_font_classification(family_name);
+            }
             if classification.monospace {
                 families.monospace.push(family_name.clone());
             } else if classification.serif {
                 families.serif.push(family_name.clone());
             } else if classification.sans_serif {
                 families.sans_serif.push(family_name.clone());
+            } else if supports_latin
+                && !supports_chinese
+                && !is_symbolic_reader_font(family_name, panose, family_class)
+            {
+                families.other.push(family_name.clone());
             }
         }
         families
@@ -5048,19 +5151,26 @@ mod tests {
     }
 
     #[test]
-    fn reader_typography_matches_readest_defaults_and_builds_cjk_stacks() {
+    fn reader_typography_uses_bundled_language_defaults_and_builds_cjk_stacks() {
         let typography = ReaderTypography::default();
-        assert_eq!(typography.default_font, ReaderDefaultFont::Serif);
+        assert_eq!(typography.default_font, ReaderDefaultFont::Other);
         assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
-        assert_eq!(typography.serif_font, "Bitter");
-        assert_eq!(typography.sans_serif_font, "Roboto");
-        assert!(typography.cjk_default_font.is_none());
+        assert_eq!(typography.serif_font, "Georgia");
+        assert_eq!(typography.sans_serif_font, "Arial");
+        assert_eq!(typography.other_font, "Ysabeau Office");
+        assert_eq!(
+            typography.cjk_default_font,
+            Some(ReaderFontChoice {
+                category: ReaderDefaultFont::Other,
+                family: "Ysabeau Office".into(),
+            })
+        );
         assert!(typography.latin_cjk_font.is_none());
         assert_eq!(typography.monospace_font, "Consolas");
         assert!((typography.font_size - 20.0).abs() < f32::EPSILON);
         assert!((typography.minimum_font_size - 12.0).abs() < f32::EPSILON);
         assert_eq!(typography.font_weight, 400);
-        assert!(typography.serif_stack().contains("\"Bitter\""));
+        assert!(typography.serif_stack().contains("\"Georgia\""));
         assert!(typography.serif_stack().contains("\"SimSun\""));
         assert!(typography.serif_stack().ends_with("serif"));
         assert!(
@@ -5107,6 +5217,19 @@ mod tests {
     }
 
     #[test]
+    fn other_font_category_uses_the_selected_family_with_a_safe_fallback() {
+        let typography = ReaderTypography {
+            default_font: ReaderDefaultFont::Other,
+            other_font: "Ysabeau Office".into(),
+            ..ReaderTypography::default()
+        };
+
+        let stack = typography.default_stack_for(WritingSystem::Latin);
+        assert!(stack.starts_with("\"Ysabeau Office\""));
+        assert!(stack.ends_with("sans-serif"));
+    }
+
+    #[test]
     fn reader_typography_normalizes_persisted_values() {
         let mut typography = ReaderTypography {
             default_cjk_font: "  ".into(),
@@ -5126,7 +5249,7 @@ mod tests {
         typography.normalize();
         assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
         assert_eq!(typography.serif_font, "Georgia");
-        assert_eq!(typography.sans_serif_font, "Roboto");
+        assert_eq!(typography.sans_serif_font, "Arial");
         assert!(typography.cjk_default_font.is_none());
         assert!(typography.latin_cjk_font.is_none());
         assert_eq!(typography.monospace_font, "Consolas");
@@ -5144,20 +5267,22 @@ mod tests {
         let families = ReaderFontFamilies {
             all: vec![
                 "LXGW WenKai GB Screen".into(),
-                "Bitter".into(),
-                "Roboto".into(),
+                "Georgia".into(),
+                "Arial".into(),
                 "Consolas".into(),
             ],
             chinese: vec!["LXGW WenKai GB Screen".into()],
-            serif: vec!["Bitter".into()],
-            sans_serif: vec!["Roboto".into()],
+            serif: vec!["Georgia".into()],
+            sans_serif: vec!["Arial".into()],
             monospace: vec!["Consolas".into()],
             ..ReaderFontFamilies::default()
         };
         let mut typography = ReaderTypography {
+            default_font: ReaderDefaultFont::Other,
             default_cjk_font: "宋体".into(),
             serif_font: "Unavailable Serif".into(),
             sans_serif_font: "Unavailable Sans".into(),
+            other_font: "Unavailable Other".into(),
             cjk_default_font: Some(ReaderFontChoice {
                 category: ReaderDefaultFont::Serif,
                 family: "Unavailable CJK Western".into(),
@@ -5169,8 +5294,10 @@ mod tests {
 
         assert!(families.repair_typography(&mut typography));
         assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
-        assert_eq!(typography.serif_font, "Bitter");
-        assert_eq!(typography.sans_serif_font, "Roboto");
+        assert_eq!(typography.serif_font, "Georgia");
+        assert_eq!(typography.sans_serif_font, "Arial");
+        assert_eq!(typography.default_font, ReaderDefaultFont::Serif);
+        assert!(typography.other_font.is_empty());
         assert!(typography.cjk_default_font.is_none());
         assert!(typography.latin_cjk_font.is_none());
         assert_eq!(typography.monospace_font, "Consolas");
@@ -5179,22 +5306,37 @@ mod tests {
 
     #[test]
     fn reader_font_classification_uses_panose_and_fixed_pitch_metadata() {
-        let serif = classify_reader_font(Some(&[2, 2, 5, 3, 0, 0, 0, 0, 0, 0]), false);
+        let serif = classify_reader_font(Some(&[2, 2, 5, 3, 0, 0, 0, 0, 0, 0]), None, false);
         assert!(serif.serif);
         assert!(!serif.sans_serif);
         assert!(!serif.monospace);
 
-        let sans = classify_reader_font(Some(&[2, 11, 5, 3, 0, 0, 0, 0, 0, 0]), false);
+        let sans = classify_reader_font(Some(&[2, 11, 5, 3, 0, 0, 0, 0, 0, 0]), None, false);
         assert!(!sans.serif);
         assert!(sans.sans_serif);
         assert!(!sans.monospace);
 
-        let monospace = classify_reader_font(Some(&[2, 11, 5, 9, 0, 0, 0, 0, 0, 0]), false);
+        let monospace = classify_reader_font(Some(&[2, 11, 5, 9, 0, 0, 0, 0, 0, 0]), None, false);
         assert!(!monospace.serif);
         assert!(!monospace.sans_serif);
         assert!(monospace.monospace);
 
-        assert!(classify_reader_font(None, true).monospace);
+        assert!(classify_reader_font(None, None, true).monospace);
+
+        let family_class_serif = classify_reader_font(Some(&[0; 10]), Some(1 << 8), false);
+        assert!(family_class_serif.serif);
+        let family_class_sans = classify_reader_font(Some(&[0; 10]), Some(8 << 8), false);
+        assert!(family_class_sans.sans_serif);
+        let unclassified = classify_reader_font(Some(&[0; 10]), Some(10 << 8), false);
+        assert!(!unclassified.serif && !unclassified.sans_serif && !unclassified.monospace);
+
+        assert!(infer_reader_font_classification("Sitka Text").serif);
+        assert!(infer_reader_font_classification("Segoe UI Variable Text").sans_serif);
+        assert!(infer_reader_font_classification("Comic Sans MS").sans_serif);
+        let ysabeau = infer_reader_font_classification("Ysabeau Office");
+        assert!(!ysabeau.serif && !ysabeau.sans_serif && !ysabeau.monospace);
+        assert!(is_symbolic_reader_font("Symbol", Some(&[5; 10]), None));
+        assert!(is_symbolic_reader_font("DejaVu Math TeX Gyre", None, None));
     }
 
     #[test]
