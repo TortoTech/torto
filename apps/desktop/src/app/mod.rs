@@ -46,10 +46,15 @@ impl DesktopApp {
         self.pending_reader_notice = None;
         self.pending_reader_error = None;
         self.shelf.open_book(path);
-        if let Some(next_reader) = self.shelf.take_opened_reader() {
+        if let Some(mut next_reader) = self.shelf.take_opened_reader() {
             if let Some(current_reader) = self.reader.as_ref() {
                 current_reader.prepare_for_shutdown();
             }
+            // The reader may have been constructed asynchronously from settings
+            // that were superseded while the book was opening. Apply the
+            // authoritative in-memory snapshot before its first frame so an old
+            // compiled section cannot survive until the next settings change.
+            next_reader.apply_global_settings(self.settings.applied());
             self.reader = Some(next_reader);
         }
     }
@@ -295,7 +300,9 @@ impl DesktopApp {
 
     fn promote_opened_reader(&mut self) {
         if self.reader.is_none() {
+            let applied = self.settings.applied().clone();
             self.reader = self.shelf.take_opened_reader().map(|mut reader| {
+                reader.apply_global_settings(&applied);
                 if let Some(error) = self.pending_reader_error.take() {
                     self.pending_reader_notice = None;
                     reader.report_settings_error(error);

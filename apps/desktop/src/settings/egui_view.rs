@@ -1007,9 +1007,9 @@ fn reader_typeface_settings(
                     ui,
                     language.text("字重", "Font weight"),
                     &mut typography.font_weight,
-                    300,
-                    800,
-                    100,
+                    200,
+                    900,
+                    25,
                 );
             });
     });

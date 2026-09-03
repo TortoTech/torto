@@ -3,13 +3,13 @@
 These font binaries are bundled so the native reader has deterministic reading defaults without
 depending on fonts installed on the host system.
 
-- Ysabeau Office variable Roman and Italic: Google Fonts `ofl/ysabeauoffice`
+- Literata variable Roman and Italic (`opsz`, `wght`): Google Fonts `ofl/literata`
 - LXGW WenKai GB Screen v1.522: <https://github.com/lxgw/LxgwWenKai-Screen/releases/tag/v1.522>
 
 All files are distributed under the SIL Open Font License 1.1. See `OFL-1.1.txt`.
 Copyright notices and reserved names remain with their upstream projects:
 
-- Copyright 2023 The Ysabeau Project Authors (<https://github.com/CatharsisFonts/Ysabeau>).
+- Copyright 2017 The Literata Project Authors (<https://github.com/googlefonts/literata>).
 - Copyright 2021-2026 LXGW, with the Reserved Font Names declared by the upstream OFL, and
   Copyright 2020 The Klee Project Authors.
 

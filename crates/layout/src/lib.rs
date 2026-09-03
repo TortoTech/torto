@@ -8,10 +8,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use image::ImageError;
+use parley::setting::Tag;
 use parley::{
-    Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight, IndentOptions,
-    InlineBox as ParleyInlineBox, InlineBoxKind, Layout, LayoutContext, LineHeight,
-    PositionedLayoutItem, StyleProperty,
+    Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontVariation, FontVariations,
+    FontWeight, IndentOptions, InlineBox as ParleyInlineBox, InlineBoxKind, Layout, LayoutContext,
+    LineHeight, PositionedLayoutItem, StyleProperty,
 };
 use read_fonts::{FontRef, TableProvider as _};
 use rebook_publication::{
@@ -27,6 +28,12 @@ use unicode_script::{Script, UnicodeScript as _};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 const QUOTE_VERTICAL_PADDING: f32 = 12.0;
+const LITERATA_FAMILY: &str = "Literata";
+const LEGACY_YSABEAU_FAMILY: &str = "Ysabeau Office";
+const OPTICAL_SIZE_TAG: Tag = Tag::new(b"opsz");
+const MIN_OPTICAL_SIZE: f32 = 7.0;
+const MAX_OPTICAL_SIZE: f32 = 72.0;
+const CSS_PX_TO_POINTS: f32 = 0.75;
 
 /// Shared light-theme accent used by semantic quote decorations and block activation fills.
 pub const LIGHT_QUOTE_ACCENT_COLOR: Rgba = Rgba {
@@ -251,6 +258,29 @@ impl ReaderTypography {
     /// Repairs persisted or externally supplied settings before layout uses them.
     pub fn normalize(&mut self) {
         let defaults = Self::default();
+        let configured_other = self.other_font.trim();
+        let used_deprecated_primary = self.default_font == ReaderDefaultFont::Other
+            && (configured_other.eq_ignore_ascii_case(LEGACY_YSABEAU_FAMILY)
+                || configured_other.eq_ignore_ascii_case(LITERATA_FAMILY));
+        if used_deprecated_primary {
+            self.default_font = ReaderDefaultFont::Serif;
+            self.serif_font = LITERATA_FAMILY.into();
+            self.other_font.clear();
+        }
+        if let Some(choice) = &mut self.cjk_default_font
+            && choice
+                .family
+                .trim()
+                .eq_ignore_ascii_case(LEGACY_YSABEAU_FAMILY)
+        {
+            choice.category = ReaderDefaultFont::Serif;
+            choice.family = LITERATA_FAMILY.into();
+        } else if let Some(choice) = &mut self.cjk_default_font
+            && choice.family.trim().eq_ignore_ascii_case(LITERATA_FAMILY)
+        {
+            choice.category = ReaderDefaultFont::Serif;
+            choice.family = LITERATA_FAMILY.into();
+        }
         normalize_family(&mut self.default_cjk_font, &defaults.default_cjk_font);
         if self.default_cjk_font.eq_ignore_ascii_case("LXGW WenKai") {
             self.default_cjk_font = "LXGW WenKai GB Screen".into();
@@ -273,7 +303,7 @@ impl ReaderTypography {
         normalize_family(&mut self.monospace_font, &defaults.monospace_font);
         self.minimum_font_size = finite_clamp(self.minimum_font_size, 1.0, 120.0, 12.0);
         self.font_size = finite_clamp(self.font_size, self.minimum_font_size, 120.0, 20.0);
-        self.font_weight = self.font_weight.clamp(100, 900).div_ceil(100) * 100;
+        self.font_weight = self.font_weight.clamp(200, 900);
     }
 
     #[must_use]
@@ -396,14 +426,14 @@ impl ReaderTypography {
 impl Default for ReaderTypography {
     fn default() -> Self {
         Self {
-            default_font: ReaderDefaultFont::Other,
+            default_font: ReaderDefaultFont::Serif,
             default_cjk_font: "LXGW WenKai GB Screen".into(),
-            serif_font: "Georgia".into(),
+            serif_font: LITERATA_FAMILY.into(),
             sans_serif_font: "Arial".into(),
-            other_font: "Ysabeau Office".into(),
+            other_font: String::new(),
             cjk_default_font: Some(ReaderFontChoice {
-                category: ReaderDefaultFont::Other,
-                family: "Ysabeau Office".into(),
+                category: ReaderDefaultFont::Serif,
+                family: LITERATA_FAMILY.into(),
             }),
             latin_cjk_font: None,
             monospace_font: "Consolas".into(),
@@ -476,6 +506,17 @@ fn finite_clamp(value: f32, minimum: f32, maximum: f32, fallback: f32) -> f32 {
     }
 }
 
+fn optical_size_for_font(font_size: f32) -> f32 {
+    (font_size * CSS_PX_TO_POINTS).clamp(MIN_OPTICAL_SIZE, MAX_OPTICAL_SIZE)
+}
+
+fn optical_size_variations(font_size: f32) -> [FontVariation; 1] {
+    [FontVariation::new(
+        OPTICAL_SIZE_TAG,
+        optical_size_for_font(font_size),
+    )]
+}
+
 fn font_stack<'a>(families: impl IntoIterator<Item = &'a str>, generic: &str) -> String {
     let mut seen = HashSet::new();
     let mut stack = families
@@ -542,7 +583,7 @@ fn infer_reader_font_classification(family: &str) -> ReaderFontClassification {
         || has_word("roman")
         || has_word("antiqua")
         || has_word("mincho")
-        || ["baskerville", "bodoni", "bookman", "sitka"]
+        || ["baskerville", "bodoni", "bookman", "literata", "sitka"]
             .iter()
             .any(|prefix| normalized.starts_with(prefix));
     let sans_serif = !serif
@@ -1956,6 +1997,10 @@ impl LayoutEngine {
                 .ranged_builder(&mut self.font_context, text, 1.0, false);
         builder.push_default(StyleProperty::FontFamily(FontFamily::from(font_stack)));
         builder.push_default(StyleProperty::FontSize(typography.font_size));
+        let default_variations = optical_size_variations(typography.font_size);
+        builder.push_default(StyleProperty::FontVariations(FontVariations::from(
+            &default_variations,
+        )));
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(f32::from(
             typography.font_weight,
         ))));
@@ -1969,6 +2014,11 @@ impl LayoutEngine {
             let size = (typography.font_size * span.style.size_scale.clamp(0.5, 3.0))
                 .max(typography.minimum_font_size);
             builder.push(StyleProperty::FontSize(size), span.range.clone());
+            let variations = optical_size_variations(size);
+            builder.push(
+                StyleProperty::FontVariations(FontVariations::from(&variations)),
+                span.range.clone(),
+            );
             builder.push(
                 StyleProperty::Brush(TextBrush::new(
                     span.style.color,
@@ -2047,6 +2097,10 @@ impl LayoutEngine {
                 .ranged_builder(&mut self.font_context, marker, 1.0, false);
         builder.push_default(StyleProperty::FontFamily(FontFamily::from(font_stack)));
         builder.push_default(StyleProperty::FontSize(typography.font_size));
+        let variations = optical_size_variations(typography.font_size);
+        builder.push_default(StyleProperty::FontVariations(FontVariations::from(
+            &variations,
+        )));
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(f32::from(
             typography.font_weight,
         ))));
@@ -4039,7 +4093,6 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-
         assert!(
             runs.iter()
                 .any(|run| { run.text.contains("重点") && run.style.bold && !run.style.italic })
@@ -5153,16 +5206,16 @@ mod tests {
     #[test]
     fn reader_typography_uses_bundled_language_defaults_and_builds_cjk_stacks() {
         let typography = ReaderTypography::default();
-        assert_eq!(typography.default_font, ReaderDefaultFont::Other);
+        assert_eq!(typography.default_font, ReaderDefaultFont::Serif);
         assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
-        assert_eq!(typography.serif_font, "Georgia");
+        assert_eq!(typography.serif_font, "Literata");
         assert_eq!(typography.sans_serif_font, "Arial");
-        assert_eq!(typography.other_font, "Ysabeau Office");
+        assert!(typography.other_font.is_empty());
         assert_eq!(
             typography.cjk_default_font,
             Some(ReaderFontChoice {
-                category: ReaderDefaultFont::Other,
-                family: "Ysabeau Office".into(),
+                category: ReaderDefaultFont::Serif,
+                family: "Literata".into(),
             })
         );
         assert!(typography.latin_cjk_font.is_none());
@@ -5170,7 +5223,7 @@ mod tests {
         assert!((typography.font_size - 20.0).abs() < f32::EPSILON);
         assert!((typography.minimum_font_size - 12.0).abs() < f32::EPSILON);
         assert_eq!(typography.font_weight, 400);
-        assert!(typography.serif_stack().contains("\"Georgia\""));
+        assert!(typography.serif_stack().starts_with("\"Literata\""));
         assert!(typography.serif_stack().contains("\"SimSun\""));
         assert!(typography.serif_stack().ends_with("serif"));
         assert!(
@@ -5220,13 +5273,177 @@ mod tests {
     fn other_font_category_uses_the_selected_family_with_a_safe_fallback() {
         let typography = ReaderTypography {
             default_font: ReaderDefaultFont::Other,
-            other_font: "Ysabeau Office".into(),
+            other_font: "Decorative Reader".into(),
             ..ReaderTypography::default()
         };
 
         let stack = typography.default_stack_for(WritingSystem::Latin);
-        assert!(stack.starts_with("\"Ysabeau Office\""));
+        assert!(stack.starts_with("\"Decorative Reader\""));
         assert!(stack.ends_with("sans-serif"));
+    }
+
+    #[test]
+    fn legacy_ysabeau_defaults_migrate_to_literata() {
+        let mut typography = ReaderTypography {
+            default_font: ReaderDefaultFont::Other,
+            serif_font: "Georgia".into(),
+            other_font: " Ysabeau Office ".into(),
+            cjk_default_font: Some(ReaderFontChoice {
+                category: ReaderDefaultFont::Other,
+                family: "Ysabeau Office".into(),
+            }),
+            ..ReaderTypography::default()
+        };
+
+        typography.normalize();
+
+        assert_eq!(typography.default_font, ReaderDefaultFont::Serif);
+        assert_eq!(typography.serif_font, "Literata");
+        assert!(typography.other_font.is_empty());
+        assert_eq!(
+            typography.cjk_default_font,
+            Some(ReaderFontChoice {
+                category: ReaderDefaultFont::Serif,
+                family: "Literata".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn transitional_literata_other_category_is_canonicalized_as_serif() {
+        let mut typography = ReaderTypography {
+            default_font: ReaderDefaultFont::Other,
+            serif_font: "Georgia".into(),
+            other_font: "Literata".into(),
+            cjk_default_font: Some(ReaderFontChoice {
+                category: ReaderDefaultFont::Other,
+                family: "Literata".into(),
+            }),
+            ..ReaderTypography::default()
+        };
+
+        typography.normalize();
+
+        assert_eq!(typography.default_font, ReaderDefaultFont::Serif);
+        assert_eq!(typography.serif_font, "Literata");
+        assert!(typography.other_font.is_empty());
+        assert_eq!(
+            typography.cjk_default_font,
+            Some(ReaderFontChoice {
+                category: ReaderDefaultFont::Serif,
+                family: "Literata".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn optical_size_tracks_each_span_size_in_typographic_points() {
+        assert!((optical_size_for_font(4.0) - 7.0).abs() < f32::EPSILON);
+        assert!((optical_size_for_font(20.0) - 15.0).abs() < f32::EPSILON);
+        assert!((optical_size_for_font(32.0) - 24.0).abs() < f32::EPSILON);
+        assert!((optical_size_for_font(120.0) - 72.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cjk_prose_digits_use_the_configured_western_font() {
+        const LITERATA: &[u8] = include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf");
+        const CJK: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKaiGBScreen.ttf");
+        let literata = ReaderFontBlob::new(Arc::new(LITERATA));
+        let cjk = ReaderFontBlob::new(Arc::new(CJK));
+        let mut engine = LayoutEngine::with_fonts([literata, cjk]);
+        let text = "卷二，93页14行—94页1—4行";
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let style = ReaderStyle {
+            typography: ReaderTypography {
+                default_font: ReaderDefaultFont::Other,
+                other_font: "Literata".into(),
+                cjk_default_font: Some(ReaderFontChoice {
+                    category: ReaderDefaultFont::Other,
+                    family: "Literata".into(),
+                }),
+                ..ReaderTypography::default()
+            },
+            writing_system: WritingSystem::Cjk,
+            ..ReaderStyle::default()
+        };
+        let prepared = engine.shape_text_with_min_width(&block, &style, 800.0, 40.0);
+        let runs = prepared
+            .layout
+            .lines()
+            .flat_map(|line| line.items())
+            .filter_map(|item| match item {
+                PositionedLayoutItem::GlyphRun(glyphs) => Some((
+                    text[glyphs.run().text_range()].to_owned(),
+                    glyphs.run().font().data.as_ref() == LITERATA,
+                )),
+                PositionedLayoutItem::InlineBox(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            runs.iter()
+                .filter(|(run, _)| run.chars().any(|character| character.is_ascii_digit()))
+                .all(|(_, uses_literata)| *uses_literata),
+            "CJK prose digits did not use Literata: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn literata_defaults_to_lining_figures() {
+        use parley::FontFeatures;
+
+        const LITERATA: &[u8] = include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf");
+        const LITERATA_ITALIC: &[u8] =
+            include_bytes!("../../../assets/fonts/Literata-Italic-opsz-wght.ttf");
+        let literata = ReaderFontBlob::new(Arc::new(LITERATA));
+        let literata_italic = ReaderFontBlob::new(Arc::new(LITERATA_ITALIC));
+        let mut engine = LayoutEngine::with_fonts([literata, literata_italic]);
+        let mut glyph_ids = |features: Option<&str>, italic: bool| {
+            let mut builder = engine.layout_context.ranged_builder(
+                &mut engine.font_context,
+                "0123456789",
+                1.0,
+                false,
+            );
+            builder.push_default(StyleProperty::FontFamily(FontFamily::from("Literata")));
+            builder.push_default(StyleProperty::FontSize(20.0));
+            if italic {
+                builder.push_default(StyleProperty::FontStyle(FontStyle::Italic));
+            }
+            if let Some(features) = features {
+                builder.push_default(StyleProperty::FontFeatures(FontFeatures::from(features)));
+            }
+            let mut layout: Layout<TextBrush> = builder.build("0123456789");
+            layout.break_all_lines(None);
+            layout
+                .get(0)
+                .unwrap()
+                .items()
+                .flat_map(|item| match item {
+                    PositionedLayoutItem::GlyphRun(run) => {
+                        run.glyphs().map(|glyph| glyph.id).collect::<Vec<_>>()
+                    }
+                    PositionedLayoutItem::InlineBox(_) => Vec::new(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for italic in [false, true] {
+            let default = glyph_ids(None, italic);
+            let lining = glyph_ids(Some("\"lnum\""), italic);
+            let oldstyle = glyph_ids(Some("\"onum\""), italic);
+            assert_eq!(default, lining);
+            assert_ne!(default, oldstyle);
+        }
     }
 
     #[test]
@@ -5255,7 +5472,7 @@ mod tests {
         assert_eq!(typography.monospace_font, "Consolas");
         assert!((typography.font_size - 20.0).abs() < f32::EPSILON);
         assert!((typography.minimum_font_size - 1.0).abs() < f32::EPSILON);
-        assert_eq!(typography.font_weight, 500);
+        assert_eq!(typography.font_weight, 455);
 
         typography.default_cjk_font = "LXGW WenKai".into();
         typography.normalize();
@@ -5333,8 +5550,7 @@ mod tests {
         assert!(infer_reader_font_classification("Sitka Text").serif);
         assert!(infer_reader_font_classification("Segoe UI Variable Text").sans_serif);
         assert!(infer_reader_font_classification("Comic Sans MS").sans_serif);
-        let ysabeau = infer_reader_font_classification("Ysabeau Office");
-        assert!(!ysabeau.serif && !ysabeau.sans_serif && !ysabeau.monospace);
+        assert!(infer_reader_font_classification("Literata").serif);
         assert!(is_symbolic_reader_font("Symbol", Some(&[5; 10]), None));
         assert!(is_symbolic_reader_font("DejaVu Math TeX Gyre", None, None));
     }

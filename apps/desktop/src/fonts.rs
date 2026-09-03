@@ -2,18 +2,17 @@ use std::sync::Arc;
 
 use peniko::Blob;
 
-const YSABEAU_OFFICE_REGULAR: &[u8] =
-    include_bytes!("../../../assets/fonts/YsabeauOffice-wght.ttf");
-const YSABEAU_OFFICE_ITALIC: &[u8] =
-    include_bytes!("../../../assets/fonts/YsabeauOffice-Italic-wght.ttf");
+const LITERATA_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf");
+const LITERATA_ITALIC: &[u8] =
+    include_bytes!("../../../assets/fonts/Literata-Italic-opsz-wght.ttf");
 pub(crate) fn cjk_font_bytes() -> &'static [u8] {
     rebook_formats::cjk_fallback_font_bytes()
 }
 
 pub fn embedded_reader_fonts() -> Arc<[Blob<u8>]> {
     [
-        font_blob(YSABEAU_OFFICE_REGULAR),
-        font_blob(YSABEAU_OFFICE_ITALIC),
+        font_blob(LITERATA_REGULAR),
+        font_blob(LITERATA_ITALIC),
         font_blob(cjk_font_bytes()),
     ]
     .into()
@@ -44,19 +43,14 @@ mod tests {
         let mut families = engine.available_reader_font_families();
         families.include_configured(&rebook_layout::ReaderTypography::default());
 
-        for expected in ["Ysabeau Office", "LXGW WenKai GB Screen"] {
+        for expected in ["Literata", "LXGW WenKai GB Screen"] {
             assert!(
                 families.all.iter().any(|family| family == expected),
                 "missing embedded font family {expected:?}; registered: {:?}",
                 families.all
             );
         }
-        assert!(
-            families
-                .other
-                .iter()
-                .any(|family| family == "Ysabeau Office")
-        );
+        assert!(families.serif.iter().any(|family| family == "Literata"));
         assert!(
             families
                 .chinese

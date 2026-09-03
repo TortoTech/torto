@@ -641,11 +641,11 @@ mod tests {
     fn typography_round_trips_and_normalizes() {
         let path = test_path();
         let typography = ReaderTypography {
-            default_font: ReaderDefaultFont::Other,
+            default_font: ReaderDefaultFont::Serif,
             default_cjk_font: "  Microsoft YaHei  ".into(),
             serif_font: "Literata".into(),
             sans_serif_font: "Noto Sans".into(),
-            other_font: "Ysabeau Office".into(),
+            other_font: "Decorative Reader".into(),
             cjk_default_font: Some(ReaderFontChoice {
                 category: ReaderDefaultFont::Serif,
                 family: "  Georgia  ".into(),
@@ -685,14 +685,14 @@ mod tests {
         save_to(&path, &preferences).unwrap();
         let loaded = load_from(path.clone()).unwrap();
 
-        assert_eq!(loaded.typography.default_font, ReaderDefaultFont::Other);
+        assert_eq!(loaded.typography.default_font, ReaderDefaultFont::Serif);
         assert_eq!(
             loaded.interface_typography.font_family,
             "Microsoft YaHei UI"
         );
         assert!((loaded.interface_typography.font_size - 15.0).abs() < f32::EPSILON);
         assert_eq!(loaded.typography.default_cjk_font, "Microsoft YaHei");
-        assert_eq!(loaded.typography.other_font, "Ysabeau Office");
+        assert_eq!(loaded.typography.other_font, "Decorative Reader");
         assert_eq!(
             loaded.typography.cjk_default_font,
             Some(ReaderFontChoice {
@@ -706,7 +706,7 @@ mod tests {
         );
         assert!((loaded.typography.font_size - 18.0).abs() < f32::EPSILON);
         assert!((loaded.typography.minimum_font_size - 9.0).abs() < f32::EPSILON);
-        assert_eq!(loaded.typography.font_weight, 600);
+        assert_eq!(loaded.typography.font_weight, 550);
         assert_eq!(loaded.typesetting.mode, TypesettingMode::Unified);
         assert!((loaded.typesetting.heading_scale - 1.8).abs() < f32::EPSILON);
         assert!((loaded.typesetting.paragraph_gap_em - 0.9).abs() < f32::EPSILON);
