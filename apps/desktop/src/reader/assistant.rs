@@ -1719,17 +1719,15 @@ impl DesktopReader {
 
     fn focus_structure_keys(&self) -> Vec<crate::plugins::ParagraphStructureKey> {
         let mut keys = Vec::new();
-        for unit in self
-            .focus_action_units()
-            .iter()
-            .filter(|unit| unit.is_paragraph)
-        {
-            let key = crate::plugins::ParagraphStructureKey {
-                section_index: unit.position.section_index,
-                node: unit.range.start.node.clone(),
-            };
-            if !keys.contains(&key) {
-                keys.push(key);
+        for unit in self.focus_action_units() {
+            for range in &unit.structure_ranges {
+                let key = crate::plugins::ParagraphStructureKey {
+                    section_index: unit.position.section_index,
+                    node: range.start.node.clone(),
+                };
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
             }
         }
         keys

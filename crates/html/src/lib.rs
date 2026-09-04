@@ -567,6 +567,7 @@ impl<'a> ReadingIrParser<'a> {
         let mut stanza_break_after = Vec::new();
         let mut pending_stanza_break = None;
         let mut body_has_distinct_typography = false;
+        let mut body_has_vertical_boundary = false;
         let mut last_body_consumed = 0;
 
         for (index, node) in siblings.iter().copied().enumerate() {
@@ -594,6 +595,7 @@ impl<'a> ReadingIrParser<'a> {
                         node,
                         reference_layout.expect("quote body layout exists"),
                         reference_text_style.expect("quote body text style exists"),
+                        body_has_vertical_boundary,
                     )
                 {
                     break;
@@ -635,11 +637,15 @@ impl<'a> ReadingIrParser<'a> {
             reference_text_style.get_or_insert(text_style);
             reference_tag.get_or_insert(tag);
             body_has_distinct_typography |= self.styles.has_distinct_quote_typography(node);
+            body_has_vertical_boundary |= layout.has_vertical_boundary();
             body.push(node);
             last_body_consumed = index + 1;
         }
 
-        if body.len() >= MIN_UNATTRIBUTED_BODY_BLOCKS && body_has_distinct_typography {
+        if body.len() >= MIN_UNATTRIBUTED_BODY_BLOCKS
+            && body_has_distinct_typography
+            && body_has_vertical_boundary
+        {
             self.parse_quote_nodes_with_stanza_breaks(container, &body, None, &stanza_break_after)?;
             return Ok(Some(last_body_consumed));
         }
@@ -1791,6 +1797,33 @@ fn node_text(node: Node<'_, '_>) -> String {
         .collect()
 }
 
+fn starts_with_attribution_marker(node: Node<'_, '_>) -> bool {
+    let text = node_text(node);
+    let text = text.trim_start();
+    matches!(text.chars().next(), Some('—' | '–' | '―')) || text.starts_with("--")
+}
+
+fn first_visible_text_has_attribution_markup(node: Node<'_, '_>) -> bool {
+    let Some(first_text) = node.descendants().find(|descendant| {
+        descendant.is_text()
+            && descendant
+                .text()
+                .is_some_and(|text| !text.trim().is_empty())
+    }) else {
+        return false;
+    };
+    first_text
+        .ancestors()
+        .take_while(|ancestor| *ancestor != node)
+        .filter(Node::is_element)
+        .any(|ancestor| {
+            matches!(
+                ancestor.tag_name().name().to_ascii_lowercase().as_str(),
+                "cite" | "em" | "i"
+            )
+        })
+}
+
 fn is_note_section_label(label: &str) -> bool {
     let label = label
         .split_whitespace()
@@ -2644,6 +2677,11 @@ impl QuoteLayoutMetrics {
         (self.start - other.start).abs() <= horizontal_tolerance
             && (self.end - other.end).abs() <= horizontal_tolerance
     }
+
+    fn has_vertical_boundary(self) -> bool {
+        const MIN_VERTICAL_SPACING: f32 = 0.5;
+        self.before > MIN_VERTICAL_SPACING || self.after > MIN_VERTICAL_SPACING
+    }
 }
 
 #[derive(Default)]
@@ -2888,11 +2926,8 @@ impl StyleSheet {
     }
 
     fn grouped_quote_body_layout(&self, node: Node<'_, '_>) -> Option<QuoteLayoutMetrics> {
-        const MIN_VERTICAL_SPACING: f32 = 0.5;
         let layout = self.quote_layout_metrics(node);
-        (layout.has_symmetric_inset()
-            && (layout.before > MIN_VERTICAL_SPACING || layout.after > MIN_VERTICAL_SPACING))
-            .then_some(layout)
+        layout.has_symmetric_inset().then_some(layout)
     }
 
     fn has_sibling_quote_attribution_role(
@@ -2900,14 +2935,23 @@ impl StyleSheet {
         node: Node<'_, '_>,
         body_layout: QuoteLayoutMetrics,
         body_text_style: TextStyle,
+        body_has_vertical_boundary: bool,
     ) -> bool {
         let attribution_layout = self.quote_layout_metrics(node);
         let attribution_text_style =
             self.text_style_for_block(node, TextBlockKind::QuoteAttribution);
-        attribution_text_style.size_scale + 0.05 < body_text_style.size_scale
+        let has_role = attribution_text_style.size_scale + 0.05 < body_text_style.size_scale
             || attribution_text_style.italic != body_text_style.italic
             || attribution_layout.start + 4.0 < body_layout.start
             || attribution_layout.end + 4.0 < body_layout.end
+            || starts_with_attribution_marker(node)
+            || first_visible_text_has_attribution_markup(node);
+        let has_related_inset = attribution_layout.compatible_with(body_layout)
+            || attribution_layout.start + 4.0 < body_layout.start
+            || attribution_layout.end + 4.0 < body_layout.end;
+        has_role
+            && has_related_inset
+            && (body_has_vertical_boundary || attribution_layout.has_vertical_boundary())
     }
 
     fn has_distinct_quote_typography(&self, node: Node<'_, '_>) -> bool {
@@ -3166,7 +3210,7 @@ impl SimpleSelector {
 
 fn apply_semantic_block_style(kind: TextBlockKind, style: &mut TextStyle, inherited_size: f32) {
     match kind {
-        TextBlockKind::Heading(level) => {
+        TextBlockKind::Heading(level) | TextBlockKind::HeadingOrdinal(level) => {
             style.bold = true;
             style.size_scale = inherited_size
                 * match level {
@@ -5396,6 +5440,81 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn groups_zero_margin_epigraph_body_with_its_marked_source() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            .body-line {
+                font-family: serif;
+                font-size: 90%;
+                text-align: justify;
+                text-indent: 1.5em;
+                margin: 0 1.5em;
+            }
+            .source-line {
+                font-family: serif;
+                font-size: 95%;
+                text-align: right;
+                text-indent: 0;
+                margin: 0.5em 1.5em 2em;
+            }
+        </style></head><body>
+            <p class="body-line">We read to dream and aspire, but also to acquire.</p>
+            <p class="source-line"><i>—Carol Smith, publisher and chief revenue officer at</i> Harper’s Bazaar</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Quote(quote)] = section.blocks.as_slice() else {
+            panic!("expected the epigraph and source to form one quote");
+        };
+        assert_eq!(quote.body.len(), 1);
+        assert_eq!(quote.body[0].kind, TextBlockKind::Blockquote);
+        let attribution = quote
+            .attribution
+            .as_ref()
+            .expect("the marked source should remain attached");
+        assert_eq!(attribution.kind, TextBlockKind::QuoteAttribution);
+        assert!(attribution.content.iter().any(|inline| matches!(
+            inline,
+            Inline::Text(run) if run.text.starts_with("—Carol Smith") && run.style.italic
+        )));
+        assert!(quote.source.is_some());
+    }
+
+    #[test]
+    fn ordinary_inset_prose_and_right_aligned_text_are_not_grouped_without_source_semantics() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            .inset { text-align: justify; margin: 0 1.5em; }
+            .tail { text-align: right; margin: 0.5em 1.5em 2em; }
+        </style></head><body>
+            <p class="inset">Ordinary inset prose.</p>
+            <p class="tail">Continue reading</p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        assert_eq!(section.blocks.len(), 2);
+        assert!(section.blocks.iter().all(|block| matches!(
+            block,
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                ..
+            })
+        )));
     }
 
     #[test]

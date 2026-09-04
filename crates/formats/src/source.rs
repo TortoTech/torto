@@ -89,7 +89,7 @@ pub(crate) fn collect_toc_heading_hints(
 
 pub(crate) fn promote_toc_headings(section: &mut Section, hints: &[TocHeadingHint]) {
     for hint in hints {
-        let block_index = hint.fragment.as_deref().and_then(|fragment| {
+        let anchored_index = hint.fragment.as_deref().and_then(|fragment| {
             let node = section
                 .anchors
                 .iter()
@@ -106,33 +106,239 @@ pub(crate) fn promote_toc_headings(section: &mut Section, hints: &[TocHeadingHin
             })
         });
 
-        let block_index = block_index.or_else(|| {
-            hint.fragment.is_none().then(|| {
-                section
-                    .blocks
-                    .iter()
-                    .take(PATH_ONLY_HEADING_SEARCH_BLOCKS)
-                    .position(|block| {
-                        matches!(
-                            block,
-                            Block::Text(text)
-                                if matches!(
-                                    text.kind,
-                                    TextBlockKind::Paragraph | TextBlockKind::Heading(_)
-                                ) && normalized_text_block(text) == hint.label
-                        )
-                    })
-            })?
-        });
-
-        let Some(Block::Text(text)) = block_index.and_then(|index| section.blocks.get_mut(index))
-        else {
+        let search_range = heading_search_range(section.blocks.len(), anchored_index);
+        let matches = search_range
+            .clone()
+            .filter_map(|index| heading_candidate(&section.blocks, index, hint))
+            .collect::<Vec<_>>();
+        let [candidate] = matches.as_slice() else {
             continue;
         };
-        if text.kind == TextBlockKind::Paragraph && normalized_text_block(text) == hint.label {
-            text.kind = TextBlockKind::Heading(hint.level);
+        match *candidate {
+            HeadingCandidate::Single(index) => {
+                if let Some(Block::Text(text)) = section.blocks.get_mut(index)
+                    && text.kind == TextBlockKind::Paragraph
+                {
+                    text.kind = TextBlockKind::Heading(hint.level);
+                }
+            }
+            HeadingCandidate::Split { ordinal, title } => {
+                let Ok([Block::Text(ordinal), Block::Text(title)]) =
+                    section.blocks.get_disjoint_mut([ordinal, title])
+                else {
+                    continue;
+                };
+                ordinal.kind = TextBlockKind::HeadingOrdinal(hint.level);
+                title.kind = TextBlockKind::Heading(hint.level);
+            }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadingCandidate {
+    Single(usize),
+    Split { ordinal: usize, title: usize },
+}
+
+fn heading_search_range(
+    block_count: usize,
+    anchored_index: Option<usize>,
+) -> std::ops::Range<usize> {
+    if let Some(index) = anchored_index {
+        index.saturating_sub(1)..index.saturating_add(2).min(block_count)
+    } else {
+        0..PATH_ONLY_HEADING_SEARCH_BLOCKS.min(block_count)
+    }
+}
+
+fn heading_candidate(
+    blocks: &[Block],
+    index: usize,
+    hint: &TocHeadingHint,
+) -> Option<HeadingCandidate> {
+    let block = heading_text_block(blocks.get(index)?)?;
+    if heading_labels_match(&normalized_text_block(block), &hint.label) {
+        return Some(HeadingCandidate::Single(index));
+    }
+
+    let title_index = index.checked_add(1)?;
+    let title = heading_text_block(blocks.get(title_index)?)?;
+    let ordinal = normalized_text_block(block);
+    let title = normalized_text_block(title);
+    (is_heading_ordinal(&ordinal) && split_heading_matches(&ordinal, &title, &hint.label))
+        .then_some(HeadingCandidate::Split {
+            ordinal: index,
+            title: title_index,
+        })
+}
+
+fn heading_text_block(block: &Block) -> Option<&TextBlock> {
+    match block {
+        Block::Text(text)
+            if matches!(
+                text.kind,
+                TextBlockKind::Paragraph
+                    | TextBlockKind::Heading(_)
+                    | TextBlockKind::HeadingOrdinal(_)
+            ) =>
+        {
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+fn split_heading_matches(ordinal: &str, title: &str, hint: &str) -> bool {
+    if title.is_empty() {
+        return false;
+    }
+    let combined = format!("{ordinal} {title}");
+    if heading_labels_match(&combined, hint) {
+        return true;
+    }
+
+    let Some(ordinal_key) = heading_ordinal_key(ordinal) else {
+        return false;
+    };
+    let Some((hint_ordinal, hint_title)) = split_heading_label(hint) else {
+        return false;
+    };
+    ordinal_key == hint_ordinal && heading_labels_match(title, hint_title)
+}
+
+fn heading_labels_match(left: &str, right: &str) -> bool {
+    heading_match_key(left) == heading_match_key(right)
+}
+
+fn heading_match_key(text: &str) -> String {
+    text.chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !matches!(
+                    character,
+                    ':' | '.'
+                        | '-'
+                        | '\u{2010}'
+                        | '\u{2011}'
+                        | '\u{2012}'
+                        | '\u{2013}'
+                        | '\u{2014}'
+                )
+        })
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn split_heading_label(label: &str) -> Option<(String, &str)> {
+    let trimmed = label.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    for prefix in ["chapter", "part", "book"] {
+        if lower == prefix || !lower.starts_with(prefix) {
+            continue;
+        }
+        let rest = trimmed.get(prefix.len()..)?.trim_start();
+        let ordinal_end = rest
+            .char_indices()
+            .find_map(|(index, character)| {
+                (character.is_whitespace()
+                    || matches!(character, ':' | '.' | '-' | '\u{2013}' | '\u{2014}'))
+                .then_some(index)
+            })
+            .unwrap_or(rest.len());
+        let ordinal = rest.get(..ordinal_end)?.trim();
+        let title = rest
+            .get(ordinal_end..)?
+            .trim_start_matches(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, ':' | '.' | '-' | '\u{2013}' | '\u{2014}')
+            });
+        if !ordinal.is_empty() && !title.is_empty() {
+            return Some((heading_match_key(ordinal), title));
+        }
+    }
+
+    let ordinal_end = trimmed.char_indices().find_map(|(index, character)| {
+        (character.is_whitespace()
+            || matches!(character, ':' | '.' | '-' | '\u{2013}' | '\u{2014}'))
+        .then_some(index)
+    })?;
+    let ordinal = trimmed.get(..ordinal_end)?.trim();
+    let title = trimmed
+        .get(ordinal_end..)?
+        .trim_start_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(character, ':' | '.' | '-' | '\u{2013}' | '\u{2014}')
+        });
+    (!ordinal.is_empty() && !title.is_empty()).then(|| (heading_match_key(ordinal), title))
+}
+
+fn heading_ordinal_key(text: &str) -> Option<String> {
+    let mut normalized = text.trim().to_ascii_lowercase();
+    for prefix in ["chapter", "part", "book"] {
+        if normalized.starts_with(prefix) {
+            normalized = normalized.get(prefix.len()..)?.trim_start().to_owned();
+            break;
+        }
+    }
+    let normalized = normalized.trim_matches(|character: char| {
+        character.is_whitespace() || matches!(character, ':' | '.' | '-' | '\u{2013}' | '\u{2014}')
+    });
+    is_bare_heading_ordinal(normalized).then(|| heading_match_key(normalized))
+}
+
+fn is_heading_ordinal(text: &str) -> bool {
+    heading_ordinal_key(text).is_some()
+}
+
+fn is_bare_heading_ordinal(text: &str) -> bool {
+    !text.is_empty()
+        && (text.chars().all(|character| character.is_ascii_digit())
+            || is_roman_numeral(text)
+            || is_english_number_word(text))
+}
+
+fn is_roman_numeral(text: &str) -> bool {
+    text.len() <= 12
+        && text
+            .chars()
+            .all(|character| matches!(character, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'))
+}
+
+fn is_english_number_word(text: &str) -> bool {
+    text.split([' ', '-']).all(|word| {
+        matches!(
+            word,
+            "one"
+                | "two"
+                | "three"
+                | "four"
+                | "five"
+                | "six"
+                | "seven"
+                | "eight"
+                | "nine"
+                | "ten"
+                | "eleven"
+                | "twelve"
+                | "thirteen"
+                | "fourteen"
+                | "fifteen"
+                | "sixteen"
+                | "seventeen"
+                | "eighteen"
+                | "nineteen"
+                | "twenty"
+                | "thirty"
+                | "forty"
+                | "fifty"
+                | "sixty"
+                | "seventy"
+                | "eighty"
+                | "ninety"
+                | "hundred"
+        )
+    })
 }
 
 fn normalized_text_block(block: &TextBlock) -> String {
@@ -471,6 +677,130 @@ mod tests {
             panic!("heading should retain authored text");
         };
         assert!((run.style.size_scale - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn reflowable_direct_source_promotes_a_split_number_and_title() {
+        let source = DirectBookSource::open(
+            SourceBook {
+                id: "split-toc-heading-test".into(),
+                metadata: Metadata {
+                    title: "Direct".into(),
+                    authors: Vec::new(),
+                    languages: vec!["en".into()],
+                    layout: RenditionLayout::Reflowable,
+                },
+                sections: vec![SourceSection {
+                    title: "Chapter".into(),
+                    content: SectionContent::Html(
+                        "<p id=\"chapter-1\">1</p><p>Why Goal Setting Is Broken</p><p>Body.</p>"
+                            .into(),
+                    ),
+                    linear: true,
+                }],
+                table_of_contents: vec![SourceTocEntry {
+                    label: "Chapter 1: Why Goal Setting Is Broken".into(),
+                    href: "Text/section-1.xhtml#chapter-1".into(),
+                    children: Vec::new(),
+                }],
+                resources: Vec::new(),
+                cover_path: None,
+            },
+            BookFormat::Epub,
+        )
+        .unwrap();
+
+        let section = source.parse_section(0).unwrap();
+        assert!(matches!(
+            section.blocks.first(),
+            Some(Block::Text(text)) if text.kind == TextBlockKind::HeadingOrdinal(1)
+        ));
+        assert!(matches!(
+            section.blocks.get(1),
+            Some(Block::Text(text)) if text.kind == TextBlockKind::Heading(1)
+        ));
+    }
+
+    #[test]
+    fn reflowable_direct_source_groups_an_authored_part_heading() {
+        let source = DirectBookSource::open(
+            SourceBook {
+                id: "split-part-heading-test".into(),
+                metadata: Metadata {
+                    title: "Direct".into(),
+                    authors: Vec::new(),
+                    languages: vec!["en".into()],
+                    layout: RenditionLayout::Reflowable,
+                },
+                sections: vec![SourceSection {
+                    title: "Part".into(),
+                    content: SectionContent::Html(
+                        "<h2 id=\"part-one\">Part I</h2><h2>Introduction</h2><p>Body.</p>".into(),
+                    ),
+                    linear: true,
+                }],
+                table_of_contents: vec![SourceTocEntry {
+                    label: "Part I Introduction".into(),
+                    href: "Text/section-1.xhtml#part-one".into(),
+                    children: Vec::new(),
+                }],
+                resources: Vec::new(),
+                cover_path: None,
+            },
+            BookFormat::Epub,
+        )
+        .unwrap();
+
+        let section = source.parse_section(0).unwrap();
+        assert!(matches!(
+            section.blocks.first(),
+            Some(Block::Text(text)) if text.kind == TextBlockKind::HeadingOrdinal(1)
+        ));
+        assert!(matches!(
+            section.blocks.get(1),
+            Some(Block::Text(text)) if text.kind == TextBlockKind::Heading(1)
+        ));
+    }
+
+    #[test]
+    fn reflowable_direct_source_does_not_guess_a_split_heading_without_a_toc_match() {
+        let source = DirectBookSource::open(
+            SourceBook {
+                id: "split-toc-heading-negative-test".into(),
+                metadata: Metadata {
+                    title: "Direct".into(),
+                    authors: Vec::new(),
+                    languages: vec!["en".into()],
+                    layout: RenditionLayout::Reflowable,
+                },
+                sections: vec![SourceSection {
+                    title: "Chapter".into(),
+                    content: SectionContent::Html(
+                        "<p id=\"chapter-1\">1</p><p>A numbered body paragraph.</p>".into(),
+                    ),
+                    linear: true,
+                }],
+                table_of_contents: vec![SourceTocEntry {
+                    label: "Chapter 1: A Different Title".into(),
+                    href: "Text/section-1.xhtml#chapter-1".into(),
+                    children: Vec::new(),
+                }],
+                resources: Vec::new(),
+                cover_path: None,
+            },
+            BookFormat::Epub,
+        )
+        .unwrap();
+
+        let section = source.parse_section(0).unwrap();
+        assert!(matches!(
+            section.blocks.first(),
+            Some(Block::Text(text)) if text.kind == TextBlockKind::Paragraph
+        ));
+        assert!(matches!(
+            section.blocks.get(1),
+            Some(Block::Text(text)) if text.kind == TextBlockKind::Paragraph
+        ));
     }
 
     #[test]

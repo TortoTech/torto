@@ -3189,10 +3189,7 @@ fn reading_unit_has_activatable_content(unit: &ReadingUnit, fragments: &[Content
         .iter()
         .flat_map(|fragment| &fragment.blocks)
         .any(|block| match block {
-            Block::Text(text) => {
-                !matches!(text.kind, rebook_publication::TextBlockKind::Heading(_))
-                    && block_text_len(block) > 0
-            }
+            Block::Text(text) => !text.kind.is_heading() && block_text_len(block) > 0,
             Block::Quote(_) | Block::Image(_) | Block::Figure(_) | Block::Table(_) => true,
             Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => false,
         })

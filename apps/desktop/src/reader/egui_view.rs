@@ -197,8 +197,9 @@ const fn should_hide_reader_cursor(
     is_focus_mode: bool,
     hide_cursor_in_focus_mode: bool,
     interaction_blocked: bool,
+    floating_sidebar_visible: bool,
 ) -> bool {
-    is_focus_mode && hide_cursor_in_focus_mode && !interaction_blocked
+    is_focus_mode && hide_cursor_in_focus_mode && !interaction_blocked && !floating_sidebar_visible
 }
 
 const fn reader_menu_close_requested(overlay: ReaderOverlay, escape_pressed: bool) -> bool {
@@ -217,7 +218,99 @@ enum ClassicNavigationAction {
 enum TocKeyboardAction {
     Previous,
     Next,
+    Expand,
+    Collapse,
     Activate,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ModifierTapState {
+    #[default]
+    Idle,
+    Armed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModifierTapInput {
+    CleanPress,
+    ChordedPress,
+    Release,
+    OtherInput,
+    FocusLost,
+}
+
+fn advance_modifier_tap(state: &mut ModifierTapState, input: ModifierTapInput) -> bool {
+    match input {
+        ModifierTapInput::CleanPress => *state = ModifierTapState::Armed,
+        ModifierTapInput::ChordedPress => *state = ModifierTapState::Cancelled,
+        ModifierTapInput::OtherInput if *state == ModifierTapState::Armed => {
+            *state = ModifierTapState::Cancelled;
+        }
+        ModifierTapInput::Release => {
+            let triggered = *state == ModifierTapState::Armed;
+            *state = ModifierTapState::Idle;
+            return triggered;
+        }
+        ModifierTapInput::FocusLost => *state = ModifierTapState::Idle,
+        ModifierTapInput::OtherInput => {}
+    }
+    false
+}
+
+fn modifier_tap_triggered(
+    state: &mut ModifierTapState,
+    events: &[egui::Event],
+    modifier_key: egui::Key,
+) -> bool {
+    let mut triggered = false;
+    for event in events {
+        let input = match event {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                repeat,
+                modifiers,
+                ..
+            } if *key == modifier_key => {
+                if *repeat {
+                    continue;
+                }
+                if modifiers.ctrl || modifiers.shift || modifiers.mac_cmd || modifiers.command {
+                    ModifierTapInput::ChordedPress
+                } else {
+                    ModifierTapInput::CleanPress
+                }
+            }
+            egui::Event::Key {
+                key,
+                pressed: false,
+                ..
+            } if *key == modifier_key => ModifierTapInput::Release,
+            egui::Event::Key { pressed: true, .. }
+            | egui::Event::Text(_)
+            | egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::Paste(_)
+            | egui::Event::PointerButton { pressed: true, .. }
+            | egui::Event::MouseWheel { .. }
+            | egui::Event::Zoom(_)
+            | egui::Event::Rotate(_) => ModifierTapInput::OtherInput,
+            egui::Event::ModifiersChanged(modifiers)
+                if modifiers.ctrl || modifiers.shift || modifiers.mac_cmd || modifiers.command =>
+            {
+                ModifierTapInput::OtherInput
+            }
+            egui::Event::WindowFocused(false) => ModifierTapInput::FocusLost,
+            _ => continue,
+        };
+        triggered |= advance_modifier_tap(state, input);
+    }
+    triggered
+}
+
+fn is_bare_left_alt_shortcut(shortcut: egui::KeyboardShortcut) -> bool {
+    shortcut.logical_key == egui::Key::AltLeft && shortcut.modifiers == egui::Modifiers::NONE
 }
 
 const fn toc_keyboard_navigation_enabled(is_focus_mode: bool, sidebar_pinned: bool) -> bool {
@@ -260,6 +353,18 @@ fn next_toc_keyboard_row(
         PageDirection::Previous => base.unwrap_or(row_count).saturating_sub(1),
         PageDirection::Next => base.map_or(0, |row| row.saturating_add(1).min(row_count - 1)),
     })
+}
+
+const fn toc_expansion_target(
+    action: TocKeyboardAction,
+    has_children: bool,
+    expanded: bool,
+) -> Option<bool> {
+    match (action, has_children, expanded) {
+        (TocKeyboardAction::Expand, true, false) => Some(true),
+        (TocKeyboardAction::Collapse, true, true) => Some(false),
+        _ => None,
+    }
 }
 
 const fn classic_navigation_action(
@@ -576,7 +681,8 @@ impl DesktopReader {
                 ui.painter().rect_filled(filled, 0.0, palette().accent);
             });
 
-        if !self.ui.sidebar_pinned && sidebar_progress > 0.001 {
+        let floating_sidebar_visible = !self.ui.sidebar_pinned && sidebar_progress > 0.001;
+        if floating_sidebar_visible {
             self.floating_sidebar(&ctx, sidebar_progress);
         }
         if self.is_focus_mode() {
@@ -606,6 +712,7 @@ impl DesktopReader {
                 self.focus_cursor_hidden_override,
             ),
             interaction_blocked,
+            floating_sidebar_visible,
         ) {
             ctx.set_cursor_icon(egui::CursorIcon::None);
         }
@@ -921,6 +1028,8 @@ impl DesktopReader {
     }
 
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
+        let focus_footnote_requested =
+            self.focus_footnote_shortcut_requested(ctx, interaction_blocked);
         let escape_pressed = self.ui.overlay == ReaderOverlay::Menu
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if reader_menu_close_requested(self.ui.overlay, escape_pressed) {
@@ -953,7 +1062,7 @@ impl DesktopReader {
             ctx.memory_mut(egui::Memory::stop_text_input);
             return;
         }
-        if self.focus_footnote_shortcut(ctx, interaction_blocked) {
+        if self.focus_footnote_shortcut(ctx, focus_footnote_requested) {
             return;
         }
         if self.ui.focus_footnotes_visible {
@@ -1078,6 +1187,10 @@ impl DesktopReader {
                 Some(TocKeyboardAction::Previous)
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
                 Some(TocKeyboardAction::Next)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                Some(TocKeyboardAction::Expand)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                Some(TocKeyboardAction::Collapse)
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
                 Some(TocKeyboardAction::Activate)
             } else {
@@ -1106,6 +1219,33 @@ impl DesktopReader {
                     },
                 );
             }
+            TocKeyboardAction::Expand | TocKeyboardAction::Collapse => {
+                let focused_row = self
+                    .ui
+                    .toc_keyboard_row
+                    .filter(|&row| row < row_indices.len())
+                    .or(active_row);
+                self.ui.toc_keyboard_row = focused_row;
+                let item = focused_row
+                    .and_then(|row| row_indices.get(row))
+                    .and_then(|&index| self.reader.toc_items().get(index))
+                    .map(|item| {
+                        (
+                            item.id.clone(),
+                            item.has_children,
+                            self.ui.expanded_toc.contains(&item.id),
+                        )
+                    });
+                if let Some((id, has_children, expanded)) = item
+                    && let Some(target) = toc_expansion_target(action, has_children, expanded)
+                {
+                    if target {
+                        self.ui.expanded_toc.insert(id);
+                    } else {
+                        self.ui.expanded_toc.remove(&id);
+                    }
+                }
+            }
             TocKeyboardAction::Activate => {
                 let focused_row = self
                     .ui
@@ -1130,27 +1270,51 @@ impl DesktopReader {
         true
     }
 
-    fn focus_footnote_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
-        if !self.is_focus_mode()
-            || !ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_footnotes))
-        {
+    fn focus_footnote_shortcut_requested(
+        &mut self,
+        ctx: &egui::Context,
+        interaction_blocked: bool,
+    ) -> bool {
+        let context_active = self.is_focus_mode()
+            && !interaction_blocked
+            && !self.ui.overlay_visible()
+            && !self.ui.sidebar_open
+            && self.image_preview.is_none()
+            && self.ui.assistant_panel.is_none()
+            && self.annotation_note_draft.is_none()
+            && !ctx.text_edit_focused();
+        if !context_active {
+            self.ui.focus_footnote_modifier_tap = ModifierTapState::Idle;
+            return false;
+        }
+
+        let shortcut = self.shortcuts.focus_footnotes;
+        if !is_bare_left_alt_shortcut(shortcut) {
+            self.ui.focus_footnote_modifier_tap = ModifierTapState::Idle;
+            return ctx.input_mut(|input| input.consume_shortcut(&shortcut));
+        }
+
+        ctx.input(|input| {
+            modifier_tap_triggered(
+                &mut self.ui.focus_footnote_modifier_tap,
+                &input.raw.events,
+                shortcut.logical_key,
+            )
+        })
+    }
+
+    fn focus_footnote_shortcut(&mut self, ctx: &egui::Context, requested: bool) -> bool {
+        if !requested {
             return false;
         }
         if self.ui.focus_footnotes_visible {
             self.close_focus_footnotes();
             return true;
         }
-        let can_open = !interaction_blocked
-            && !self.ui.overlay_visible()
-            && !self.ui.sidebar_open
-            && self.image_preview.is_none()
-            && self.ui.assistant_panel.is_none()
-            && self.annotation_note_draft.is_none()
-            && !ctx.text_edit_focused()
-            && self
-                .focus_units
-                .get(self.focus_unit_index)
-                .is_some_and(|unit| !unit.footnotes.is_empty());
+        let can_open = self
+            .focus_units
+            .get(self.focus_unit_index)
+            .is_some_and(|unit| !unit.footnotes.is_empty());
         if can_open {
             self.ui.focus_footnotes_visible = true;
             self.ui.focus_footnote_scroll_delta = 0.0;
@@ -2281,14 +2445,14 @@ impl DesktopReader {
                             open_note = icon_button(ui, Icon::MessageSquarePlus)
                                 .on_hover_text(&note_hover)
                                 .clicked();
-                            structure = ui
-                                .add_enabled_ui(can_structure, |ui| {
-                                    selectable_icon_button(ui, Icon::ListTree, structure_active)
-                                })
-                                .inner
-                                .on_hover_text(&structure_hover)
-                                .clicked();
                         });
+                        structure = ui
+                            .add_enabled_ui(can_structure, |ui| {
+                                selectable_icon_button(ui, Icon::ListTree, structure_active)
+                            })
+                            .inner
+                            .on_hover_text(&structure_hover)
+                            .clicked();
                     });
                 }
             });
@@ -5364,6 +5528,95 @@ mod reference_suggestion_label_tests {
     }
 
     #[test]
+    fn horizontal_toc_navigation_only_changes_expandable_rows() {
+        assert_eq!(
+            toc_expansion_target(TocKeyboardAction::Expand, true, false),
+            Some(true)
+        );
+        assert_eq!(
+            toc_expansion_target(TocKeyboardAction::Collapse, true, true),
+            Some(false)
+        );
+        assert_eq!(
+            toc_expansion_target(TocKeyboardAction::Expand, true, true),
+            None
+        );
+        assert_eq!(
+            toc_expansion_target(TocKeyboardAction::Collapse, true, false),
+            None
+        );
+        assert_eq!(
+            toc_expansion_target(TocKeyboardAction::Expand, false, false),
+            None
+        );
+        assert_eq!(
+            toc_expansion_target(TocKeyboardAction::Collapse, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn bare_alt_triggers_only_after_an_uninterrupted_release() {
+        let mut state = ModifierTapState::Idle;
+        assert!(!advance_modifier_tap(
+            &mut state,
+            ModifierTapInput::CleanPress
+        ));
+        assert_eq!(state, ModifierTapState::Armed);
+        assert!(advance_modifier_tap(&mut state, ModifierTapInput::Release));
+        assert_eq!(state, ModifierTapState::Idle);
+
+        assert!(!advance_modifier_tap(
+            &mut state,
+            ModifierTapInput::CleanPress
+        ));
+        assert!(!advance_modifier_tap(
+            &mut state,
+            ModifierTapInput::OtherInput
+        ));
+        assert_eq!(state, ModifierTapState::Cancelled);
+        assert!(!advance_modifier_tap(&mut state, ModifierTapInput::Release));
+        assert_eq!(state, ModifierTapState::Idle);
+    }
+
+    #[test]
+    fn bare_alt_candidate_is_cancelled_by_chords_and_focus_loss() {
+        let mut state = ModifierTapState::Idle;
+        assert!(!advance_modifier_tap(
+            &mut state,
+            ModifierTapInput::ChordedPress
+        ));
+        assert!(!advance_modifier_tap(&mut state, ModifierTapInput::Release));
+
+        assert!(!advance_modifier_tap(
+            &mut state,
+            ModifierTapInput::CleanPress
+        ));
+        assert!(!advance_modifier_tap(
+            &mut state,
+            ModifierTapInput::FocusLost
+        ));
+        assert_eq!(state, ModifierTapState::Idle);
+        assert!(!advance_modifier_tap(&mut state, ModifierTapInput::Release));
+    }
+
+    #[test]
+    fn modifier_tap_mode_is_limited_to_the_bare_left_alt_binding() {
+        assert!(is_bare_left_alt_shortcut(egui::KeyboardShortcut::new(
+            egui::Modifiers::NONE,
+            egui::Key::AltLeft
+        )));
+        assert!(!is_bare_left_alt_shortcut(egui::KeyboardShortcut::new(
+            egui::Modifiers::ALT,
+            egui::Key::F
+        )));
+        assert!(!is_bare_left_alt_shortcut(egui::KeyboardShortcut::new(
+            egui::Modifiers::NONE,
+            egui::Key::AltRight
+        )));
+    }
+
+    #[test]
     fn cursor_hiding_is_scoped_to_the_unblocked_focus_reader() {
         assert!(crate::reader::resolved_focus_cursor_hidden(true, None));
         assert!(!crate::reader::resolved_focus_cursor_hidden(
@@ -5374,10 +5627,11 @@ mod reference_suggestion_label_tests {
             false,
             Some(true)
         ));
-        assert!(should_hide_reader_cursor(true, true, false));
-        assert!(!should_hide_reader_cursor(false, true, false));
-        assert!(!should_hide_reader_cursor(true, false, false));
-        assert!(!should_hide_reader_cursor(true, true, true));
+        assert!(should_hide_reader_cursor(true, true, false, false));
+        assert!(!should_hide_reader_cursor(false, true, false, false));
+        assert!(!should_hide_reader_cursor(true, false, false, false));
+        assert!(!should_hide_reader_cursor(true, true, true, false));
+        assert!(!should_hide_reader_cursor(true, true, false, true));
     }
 
     #[test]
@@ -5443,6 +5697,82 @@ mod reference_suggestion_label_tests {
             rebook_formats::BookFormat::Epub,
             PdfOcrViewMode::Original,
         ));
+    }
+
+    #[test]
+    fn modifier_tap_event_stream_distinguishes_alt_from_alt_chords() {
+        let key = |key, pressed, modifiers| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let mut state = ModifierTapState::Idle;
+        assert!(modifier_tap_triggered(
+            &mut state,
+            &[
+                key(egui::Key::AltLeft, true, egui::Modifiers::ALT),
+                key(egui::Key::AltLeft, false, egui::Modifiers::NONE),
+            ],
+            egui::Key::AltLeft,
+        ));
+
+        assert!(!modifier_tap_triggered(
+            &mut state,
+            &[
+                key(egui::Key::AltLeft, true, egui::Modifiers::ALT),
+                key(egui::Key::F, true, egui::Modifiers::ALT),
+                key(egui::Key::F, false, egui::Modifiers::ALT),
+                key(egui::Key::AltLeft, false, egui::Modifiers::NONE),
+            ],
+            egui::Key::AltLeft,
+        ));
+
+        assert!(!modifier_tap_triggered(
+            &mut state,
+            &[
+                key(egui::Key::AltLeft, true, egui::Modifiers::ALT),
+                key(egui::Key::Tab, true, egui::Modifiers::ALT),
+                egui::Event::WindowFocused(false),
+            ],
+            egui::Key::AltLeft,
+        ));
+        assert_eq!(state, ModifierTapState::Idle);
+    }
+
+    #[test]
+    fn modifier_tap_event_stream_rejects_altgr_and_other_modifiers() {
+        let key = |key, pressed, modifiers| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let ctrl_alt = egui::Modifiers::CTRL | egui::Modifiers::ALT;
+        let mut state = ModifierTapState::Idle;
+        assert!(!modifier_tap_triggered(
+            &mut state,
+            &[
+                key(egui::Key::ControlLeft, true, egui::Modifiers::CTRL),
+                key(egui::Key::AltRight, true, ctrl_alt),
+                key(egui::Key::AltRight, false, egui::Modifiers::CTRL),
+                key(egui::Key::ControlLeft, false, egui::Modifiers::NONE),
+            ],
+            egui::Key::AltLeft,
+        ));
+        assert_eq!(state, ModifierTapState::Idle);
+
+        assert!(!modifier_tap_triggered(
+            &mut state,
+            &[
+                key(egui::Key::AltLeft, true, ctrl_alt),
+                key(egui::Key::AltLeft, false, egui::Modifiers::CTRL),
+            ],
+            egui::Key::AltLeft,
+        ));
+        assert_eq!(state, ModifierTapState::Idle);
     }
 
     #[test]

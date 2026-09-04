@@ -512,6 +512,9 @@ pub enum TextBlockKind {
     Paragraph,
     /// Heading with a one-based source level.
     Heading(u8),
+    /// Ordinal or division label immediately preceding a heading, such as
+    /// `1`, `Chapter 1`, or `Part II`.
+    HeadingOrdinal(u8),
     /// Quoted prose.
     Blockquote,
     /// Source or credit attached to quoted prose.
@@ -552,6 +555,19 @@ pub enum TextBlockKind {
 }
 
 impl TextBlockKind {
+    /// Returns whether this text participates in an authored heading.
+    pub const fn is_heading(self) -> bool {
+        matches!(self, Self::Heading(_) | Self::HeadingOrdinal(_))
+    }
+
+    /// Returns the one-based source level for heading text.
+    pub const fn heading_level(self) -> Option<u8> {
+        match self {
+            Self::Heading(level) | Self::HeadingOrdinal(level) => Some(level),
+            _ => None,
+        }
+    }
+
     /// Returns whether this text is stored as the definition of a footnote.
     pub const fn is_footnote_definition(self) -> bool {
         matches!(self, Self::FootnoteDefinition)

@@ -168,7 +168,7 @@ fn search_sections(
 pub(crate) fn text_block_kind(block: &TextBlock) -> &'static str {
     match block.kind {
         TextBlockKind::Paragraph => "paragraph",
-        TextBlockKind::Heading(_) => "heading",
+        TextBlockKind::Heading(_) | TextBlockKind::HeadingOrdinal(_) => "heading",
         TextBlockKind::Blockquote => "blockquote",
         TextBlockKind::QuoteAttribution => "quote-attribution",
         TextBlockKind::Preformatted => "preformatted",

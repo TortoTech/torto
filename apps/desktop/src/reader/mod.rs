@@ -605,13 +605,13 @@ struct ScrollQuoteBridge {
 struct FocusUnit {
     range: SourceRange,
     paint_ranges: Vec<SourceRange>,
+    structure_ranges: Vec<SourceRange>,
     text: String,
     clipboard_text: String,
     position: ReaderPosition,
     rect: egui::Rect,
     is_image: bool,
     is_table: bool,
-    is_paragraph: bool,
     rectangular_activation: bool,
     structured_activation: bool,
     rectangular_activation_rect: Option<egui::Rect>,
@@ -1179,6 +1179,7 @@ fn focus_block_paint_ranges(block: &Block, range: &SourceRange) -> Vec<SourceRan
 fn merge_inferred_caption_focus_unit(image: &mut FocusUnit, caption: FocusUnit) {
     image.range.end = caption.range.end;
     image.paint_ranges.extend(caption.paint_ranges);
+    image.structure_ranges.extend(caption.structure_ranges);
     image.text = caption.text;
     image.clipboard_text = caption.clipboard_text;
     image.rect = image.rect.union(caption.rect);
@@ -1194,6 +1195,29 @@ fn merge_inferred_caption_focus_unit(image: &mut FocusUnit, caption: FocusUnit) 
         (None, caption) => caption,
     };
     image.footnotes.extend(caption.footnotes);
+}
+
+fn focus_block_structure_ranges(block: &Block) -> Vec<SourceRange> {
+    match block {
+        Block::Text(text)
+            if matches!(text.kind, TextBlockKind::Paragraph | TextBlockKind::Caption) =>
+        {
+            text.source.iter().cloned().collect()
+        }
+        Block::Figure(figure) => figure
+            .captions
+            .iter()
+            .filter_map(|caption| caption.source.clone())
+            .collect(),
+        Block::Text(_)
+        | Block::Quote(_)
+        | Block::Table(_)
+        | Block::Image(_)
+        | Block::Note(_)
+        | Block::Separator(_)
+        | Block::LineBreak
+        | Block::PageBreak => Vec::new(),
+    }
 }
 
 fn focus_unit_geometry_ranges(
@@ -1770,145 +1794,128 @@ impl DesktopReader {
             } else {
                 None
             };
-            let (
-                range,
-                paint_ranges,
-                text,
-                is_image,
-                is_table,
-                is_paragraph,
-                rectangular_activation,
-                list_depth,
-            ) = match block {
-                Block::Text(block) => {
-                    if matches!(block.kind, TextBlockKind::Heading(_)) {
-                        active_list_root = None;
-                        if units.is_empty()
-                            && let Some(range) = block.source.clone()
-                        {
-                            leading_heading_ranges.push(range);
+            let (range, paint_ranges, text, is_image, is_table, rectangular_activation, list_depth) =
+                match block {
+                    Block::Text(block) => {
+                        if block.kind.is_heading() {
+                            active_list_root = None;
+                            if units.is_empty()
+                                && let Some(range) = block.source.clone()
+                            {
+                                leading_heading_ranges.push(range);
+                            }
+                            continue;
                         }
-                        continue;
+                        let Some(range) = block.source.clone() else {
+                            // Bilingual translation companions have no canonical
+                            // source range and must not split an authored list tree.
+                            continue;
+                        };
+                        let list_depth = match block.kind {
+                            TextBlockKind::ListItem { depth, .. } => Some(depth),
+                            _ => None,
+                        };
+                        (
+                            range.clone(),
+                            vec![range],
+                            text_block_focus_text(block),
+                            false,
+                            false,
+                            block.kind == TextBlockKind::Preformatted,
+                            list_depth,
+                        )
                     }
-                    let Some(range) = block.source.clone() else {
-                        // Bilingual translation companions have no canonical
-                        // source range and must not split an authored list tree.
-                        continue;
-                    };
-                    let list_depth = match block.kind {
-                        TextBlockKind::ListItem { depth, .. } => Some(depth),
-                        _ => None,
-                    };
-                    (
-                        range.clone(),
-                        vec![range],
-                        text_block_focus_text(block),
-                        false,
-                        false,
-                        block.kind == TextBlockKind::Paragraph,
-                        block.kind == TextBlockKind::Preformatted,
-                        list_depth,
-                    )
-                }
-                Block::Quote(quote) => {
-                    let Some(range) = quote.source.clone() else {
-                        continue;
-                    };
-                    let paint_ranges = focus_block_paint_ranges(block, &range);
-                    let text = quote
-                        .body
-                        .iter()
-                        .chain(quote.attribution.iter())
-                        .map(text_block_focus_text)
-                        .filter(|text| !text.trim().is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    (range, paint_ranges, text, false, false, false, true, None)
-                }
-                Block::Table(table) => {
-                    let Some(range) = table.source.clone() else {
-                        continue;
-                    };
-                    let paint_ranges = focus_block_paint_ranges(block, &range);
-                    let text = table
-                        .rows
-                        .iter()
-                        .flat_map(|row| &row.cells)
-                        .map(|cell| text_block_focus_text(&cell.text))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    (range, paint_ranges, text, false, true, false, false, None)
-                }
-                Block::Image(image) => {
-                    // Fixed-layout PDF pages are represented as images with a text
-                    // layer; their paragraphs already supply the focus units. A
-                    // source-backed image without a text layer is an authored block
-                    // image and should occupy one step in focus navigation.
-                    if image.text_layer.is_some() {
+                    Block::Quote(quote) => {
+                        let Some(range) = quote.source.clone() else {
+                            continue;
+                        };
+                        let paint_ranges = focus_block_paint_ranges(block, &range);
+                        let text = quote
+                            .body
+                            .iter()
+                            .chain(quote.attribution.iter())
+                            .map(text_block_focus_text)
+                            .filter(|text| !text.trim().is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        (range, paint_ranges, text, false, false, true, None)
+                    }
+                    Block::Table(table) => {
+                        let Some(range) = table.source.clone() else {
+                            continue;
+                        };
+                        let paint_ranges = focus_block_paint_ranges(block, &range);
+                        let text = table
+                            .rows
+                            .iter()
+                            .flat_map(|row| &row.cells)
+                            .map(|cell| text_block_focus_text(&cell.text))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        (range, paint_ranges, text, false, true, false, None)
+                    }
+                    Block::Image(image) => {
+                        // Fixed-layout PDF pages are represented as images with a text
+                        // layer; their paragraphs already supply the focus units. A
+                        // source-backed image without a text layer is an authored block
+                        // image and should occupy one step in focus navigation.
+                        if image.text_layer.is_some() {
+                            active_list_root = None;
+                            continue;
+                        }
+                        let Some(range) = image.source.clone() else {
+                            continue;
+                        };
+                        let text = if image.alt.trim().is_empty() {
+                            self.language.text("图片", "Image").to_owned()
+                        } else {
+                            image.alt.clone()
+                        };
+                        (range.clone(), vec![range], text, true, false, false, None)
+                    }
+                    Block::Figure(figure) => {
+                        let Some(range) = figure.source.clone() else {
+                            continue;
+                        };
+                        let paint_ranges = focus_block_paint_ranges(block, &range);
+                        let caption = figure
+                            .captions
+                            .iter()
+                            .map(text_block_focus_text)
+                            .filter(|text| !text.trim().is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let text = if caption.is_empty() {
+                            figure
+                                .images
+                                .iter()
+                                .map(|image| image.alt.trim())
+                                .filter(|alt| !alt.is_empty())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        } else {
+                            caption
+                        };
+                        let text = if text.is_empty() {
+                            self.language.text("图片", "Image").to_owned()
+                        } else {
+                            text
+                        };
+                        (range, paint_ranges, text, true, false, false, None)
+                    }
+                    Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {
                         active_list_root = None;
                         continue;
                     }
-                    let Some(range) = image.source.clone() else {
-                        continue;
-                    };
-                    let text = if image.alt.trim().is_empty() {
-                        self.language.text("图片", "Image").to_owned()
-                    } else {
-                        image.alt.clone()
-                    };
-                    (
-                        range.clone(),
-                        vec![range],
-                        text,
-                        true,
-                        false,
-                        false,
-                        false,
-                        None,
-                    )
-                }
-                Block::Figure(figure) => {
-                    let Some(range) = figure.source.clone() else {
-                        continue;
-                    };
-                    let paint_ranges = focus_block_paint_ranges(block, &range);
-                    let caption = figure
-                        .captions
-                        .iter()
-                        .map(text_block_focus_text)
-                        .filter(|text| !text.trim().is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let text = if caption.is_empty() {
-                        figure
-                            .images
-                            .iter()
-                            .map(|image| image.alt.trim())
-                            .filter(|alt| !alt.is_empty())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    } else {
-                        caption
-                    };
-                    let text = if text.is_empty() {
-                        self.language.text("图片", "Image").to_owned()
-                    } else {
-                        text
-                    };
-                    (range, paint_ranges, text, true, false, false, false, None)
-                }
-                Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {
-                    active_list_root = None;
-                    continue;
-                }
-            };
-            let structured_activation = matches!(block, Block::Text(text) if text.kind == TextBlockKind::Paragraph)
-                && self
-                    .structure_source
+                };
+            let structure_ranges = focus_block_structure_ranges(block);
+            let structured_activation = structure_ranges.iter().any(|range| {
+                self.structure_source
                     .is_structured(&crate::plugins::ParagraphStructureKey {
                         section_index: layout.section_index,
                         node: range.start.node.clone(),
-                    });
+                    })
+            });
             let rectangular_activation = rectangular_activation || structured_activation;
             if text.trim().is_empty() {
                 if list_depth.is_none_or(|depth| depth == 0) {
@@ -1945,13 +1952,13 @@ impl DesktopReader {
             let unit = FocusUnit {
                 range,
                 paint_ranges,
+                structure_ranges,
                 text,
                 clipboard_text,
                 position,
                 rect,
                 is_image,
                 is_table,
-                is_paragraph,
                 rectangular_activation,
                 structured_activation,
                 rectangular_activation_rect,
@@ -2196,7 +2203,7 @@ impl DesktopReader {
     fn focus_has_structurable_units(&self) -> bool {
         self.focus_action_units()
             .iter()
-            .any(|unit| unit.is_paragraph)
+            .any(|unit| !unit.structure_ranges.is_empty())
     }
 
     fn sync_focus_selected_image(&mut self) {
@@ -2937,6 +2944,7 @@ struct ReaderUiState {
     focus_actions_visible: bool,
     focus_footnotes_visible: bool,
     focus_footnote_scroll_delta: f32,
+    focus_footnote_modifier_tap: egui_view::ModifierTapState,
 }
 
 impl ReaderUiState {
@@ -3191,6 +3199,7 @@ impl DesktopReader {
                 focus_actions_visible: false,
                 focus_footnotes_visible: false,
                 focus_footnote_scroll_delta: 0.0,
+                focus_footnote_modifier_tap: egui_view::ModifierTapState::Idle,
             },
             plugin_settings,
             language,
@@ -4081,6 +4090,7 @@ mod tests {
         let mut image = FocusUnit {
             range: image_range.clone(),
             paint_ranges: vec![image_range],
+            structure_ranges: Vec::new(),
             text: "Image".into(),
             clipboard_text: "Image".into(),
             position: ReaderPosition {
@@ -4091,7 +4101,6 @@ mod tests {
             rect: egui::Rect::from_min_max(egui::pos2(10.0, 10.0), egui::pos2(90.0, 80.0)),
             is_image: true,
             is_table: false,
-            is_paragraph: false,
             rectangular_activation: false,
             structured_activation: false,
             rectangular_activation_rect: None,
@@ -4100,13 +4109,13 @@ mod tests {
         let caption = FocusUnit {
             range: caption_range.clone(),
             paint_ranges: vec![caption_range.clone()],
+            structure_ranges: vec![caption_range.clone()],
             text: "Figure 1. A leaf.".into(),
             clipboard_text: "Figure 1. A leaf.".into(),
             position: image.position,
             rect: egui::Rect::from_min_max(egui::pos2(10.0, 84.0), egui::pos2(90.0, 104.0)),
             is_image: false,
             is_table: false,
-            is_paragraph: false,
             rectangular_activation: false,
             structured_activation: false,
             rectangular_activation_rect: None,
@@ -4118,6 +4127,7 @@ mod tests {
         merge_inferred_caption_focus_unit(&mut image, caption);
 
         assert_eq!(image.range.end, caption_range.end);
+        assert_eq!(image.structure_ranges, [caption_range.clone()]);
         assert_eq!(image.paint_ranges.len(), 2);
         assert_eq!(image.text, "Figure 1. A leaf.");
         assert_eq!(image.clipboard_text, "Figure 1. A leaf.");
@@ -4260,13 +4270,13 @@ mod tests {
         let unit = |node: &str, text: &str, y: f32| FocusUnit {
             range: range(node),
             paint_ranges: vec![range(node)],
+            structure_ranges: Vec::new(),
             text: text.into(),
             clipboard_text: text.into(),
             position,
             rect: egui::Rect::from_min_size(egui::pos2(20.0, y), egui::vec2(400.0, 40.0)),
             is_image: false,
             is_table: false,
-            is_paragraph: false,
             rectangular_activation: false,
             structured_activation: false,
             rectangular_activation_rect: None,
@@ -4332,13 +4342,13 @@ mod tests {
         let units = ["previous", "target"].map(|node| FocusUnit {
             range: range(node),
             paint_ranges: vec![range(node)],
+            structure_ranges: Vec::new(),
             text: node.into(),
             clipboard_text: node.into(),
             position: current,
             rect: egui::Rect::ZERO,
             is_image: false,
             is_table: false,
-            is_paragraph: true,
             rectangular_activation: false,
             structured_activation: false,
             rectangular_activation_rect: None,
@@ -4659,6 +4669,7 @@ mod tests {
             focus_actions_visible: false,
             focus_footnotes_visible: false,
             focus_footnote_scroll_delta: 0.0,
+            focus_footnote_modifier_tap: super::egui_view::ModifierTapState::Idle,
         };
 
         ui.reveal_toolbar(now);
@@ -4699,6 +4710,7 @@ mod tests {
             focus_actions_visible: false,
             focus_footnotes_visible: false,
             focus_footnote_scroll_delta: 0.0,
+            focus_footnote_modifier_tap: super::egui_view::ModifierTapState::Idle,
         };
 
         assert!(ui.set_toolbar_hovered(true, now));

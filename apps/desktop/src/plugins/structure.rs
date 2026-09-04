@@ -78,19 +78,13 @@ impl ParagraphStructureSource {
             .inner
             .parse_section(key.section_index)
             .map_err(|error| error.to_string())?;
-        let Some(primary) = section.blocks.iter().find_map(|block| {
-            matches!(block, Block::Text(text) if text.source.as_ref().is_some_and(|range| range.start.node == key.node))
-                .then_some(block)
-                .and_then(|block| match block {
-                    Block::Text(text) => Some(text),
-                    _ => None,
-                })
-        }) else {
+        let Some(primary) = section
+            .blocks
+            .iter()
+            .find_map(|block| structurable_text_for_node(block, &key.node))
+        else {
             return Ok(false);
         };
-        if primary.kind != TextBlockKind::Paragraph {
-            return Ok(false);
-        }
         Ok(paragraph_atoms_for_content(&primary.content, &self.language_hint).len() >= 2)
     }
 }
@@ -112,29 +106,30 @@ impl BookSource for ParagraphStructureSource {
             .map_err(|_| PublicationError::InvalidPublication("按句分段状态已损坏".to_owned()))?;
         let mut block_index = 0;
         while block_index < section.blocks.len() {
-            let active = match &section.blocks[block_index] {
-                Block::Text(text) => text.source.as_ref().and_then(|range| {
-                    let key = ParagraphStructureKey {
-                        section_index: index,
-                        node: range.start.node.clone(),
-                    };
-                    state.active.get(&key).copied()
-                }),
-                _ => None,
-            }
-            .unwrap_or(false);
-            if !active {
-                block_index += 1;
-                continue;
-            }
-            if let Block::Text(primary) = &mut section.blocks[block_index]
-                && primary.kind == TextBlockKind::Paragraph
-            {
-                apply_sentence_structure(primary, &self.language_hint);
-            }
-            if let Some(Block::Text(companion)) = section.blocks.get_mut(block_index + 1)
+            let active_text = match &mut section.blocks[block_index] {
+                Block::Text(primary) => {
+                    let active = text_structure_is_active(primary, index, &state);
+                    if active && text_kind_is_structurable(primary.kind) {
+                        apply_sentence_structure(primary, &self.language_hint);
+                    }
+                    active
+                }
+                Block::Figure(figure) => {
+                    for caption in &mut figure.captions {
+                        if text_structure_is_active(caption, index, &state)
+                            && text_kind_is_structurable(caption.kind)
+                        {
+                            apply_sentence_structure(caption, &self.language_hint);
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            };
+            if active_text
+                && let Some(Block::Text(companion)) = section.blocks.get_mut(block_index + 1)
                 && companion.source.is_none()
-                && companion.kind == TextBlockKind::Paragraph
+                && text_kind_is_structurable(companion.kind)
             {
                 apply_sentence_structure(companion, &self.language_hint);
             }
@@ -195,7 +190,46 @@ fn paragraph_atoms_for_content(content: &[Inline], language_hint: &str) -> Vec<P
     }
     let atoms = paragraph_atoms_with_protected_ranges(&text, &protected, language_hint);
     let atoms = attach_paired_punctuation_atoms(atoms, &text);
+    let atoms = merge_leading_continuation_punctuation_atoms(atoms, &text);
     attach_footnote_atoms(atoms, &text, &footnotes)
+}
+
+fn text_kind_is_structurable(kind: TextBlockKind) -> bool {
+    matches!(kind, TextBlockKind::Paragraph | TextBlockKind::Caption)
+}
+
+fn text_structure_is_active(
+    text: &TextBlock,
+    section_index: usize,
+    state: &StructureState,
+) -> bool {
+    text.source.as_ref().is_some_and(|range| {
+        state.active.get(&ParagraphStructureKey {
+            section_index,
+            node: range.start.node.clone(),
+        }) == Some(&true)
+    })
+}
+
+fn structurable_text_for_node<'a>(block: &'a Block, node: &str) -> Option<&'a TextBlock> {
+    let matches = |text: &TextBlock| {
+        text_kind_is_structurable(text.kind)
+            && text
+                .source
+                .as_ref()
+                .is_some_and(|range| range.start.node == node)
+    };
+    match block {
+        Block::Text(text) => matches(text).then_some(text),
+        Block::Figure(figure) => figure.captions.iter().find(|caption| matches(caption)),
+        Block::Quote(_)
+        | Block::Table(_)
+        | Block::Image(_)
+        | Block::Note(_)
+        | Block::Separator(_)
+        | Block::LineBreak
+        | Block::PageBreak => None,
+    }
 }
 
 fn is_focus_footnote(run: &TextRun) -> bool {
@@ -262,6 +296,32 @@ fn attach_paired_punctuation_atoms(atoms: Vec<ParagraphAtom>, text: &str) -> Vec
         }
     }
     attach_leading_parenthetical_suffixes(attached, &chars, &pairs)
+}
+
+fn merge_leading_continuation_punctuation_atoms(
+    atoms: Vec<ParagraphAtom>,
+    text: &str,
+) -> Vec<ParagraphAtom> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut merged: Vec<ParagraphAtom> = Vec::with_capacity(atoms.len());
+    for atom in atoms {
+        let first = (atom.start..atom.end)
+            .find(|index| !chars[*index].is_whitespace())
+            .and_then(|index| chars.get(index));
+        if first.is_some_and(|character| is_sentence_continuation_punctuation(*character))
+            && let Some(previous) = merged.last_mut()
+        {
+            previous.text.push_str(&atom.text);
+            previous.end = atom.end;
+        } else {
+            merged.push(atom);
+        }
+    }
+    merged
+}
+
+const fn is_sentence_continuation_punctuation(character: char) -> bool {
+    matches!(character, '，' | '、' | '；' | '：' | ',' | ';' | ':')
 }
 
 fn attach_leading_parenthetical_suffixes(
@@ -617,6 +677,46 @@ fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
 mod tests {
     use super::*;
 
+    struct StaticSource {
+        book: Book,
+        section: Section,
+    }
+
+    impl BookSource for StaticSource {
+        fn book(&self) -> &Book {
+            &self.book
+        }
+
+        fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+            (index == 0)
+                .then(|| self.section.clone())
+                .ok_or_else(|| PublicationError::ResourceNotFound(format!("section {index}")))
+        }
+
+        fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+            Err(PublicationError::ResourceNotFound(href.to_string()))
+        }
+    }
+
+    fn source_range(
+        spine: &rebook_publication::SpineItemId,
+        node: &str,
+        text: &str,
+    ) -> rebook_publication::SourceRange {
+        rebook_publication::SourceRange {
+            start: rebook_publication::SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: rebook_publication::SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: u64::try_from(text.chars().count()).unwrap(),
+            },
+        }
+    }
+
     #[test]
     fn atoms_cover_cjk_and_latin_sentences_without_rewriting() {
         let text = "首先，观察系统。其次，比较反馈；Finally, decide.";
@@ -653,6 +753,95 @@ mod tests {
     }
 
     #[test]
+    fn figure_and_standalone_captions_support_sentence_structure() {
+        let spine = rebook_publication::SpineItemId::new("chapter-1").unwrap();
+        let href = PublicationUrl::parse("chapter-1.xhtml").unwrap();
+        let figure_text = "Figure one. Second sentence.";
+        let standalone_text = "Figure two. Another sentence.";
+        let text_block = |kind, node: &str, text: &str| TextBlock {
+            kind,
+            content: vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: Default::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: Some(source_range(&spine, node, text)),
+        };
+        let section = Section {
+            id: spine.clone(),
+            href: href.clone(),
+            blocks: vec![
+                Block::Figure(rebook_publication::FigureBlock {
+                    images: Vec::new(),
+                    captions: vec![text_block(
+                        TextBlockKind::Caption,
+                        "figure-caption",
+                        figure_text,
+                    )],
+                    caption_position: rebook_publication::CaptionPosition::After,
+                    style: Default::default(),
+                    source: Some(source_range(&spine, "figure", "")),
+                }),
+                Block::Text(text_block(
+                    TextBlockKind::Caption,
+                    "standalone-caption",
+                    standalone_text,
+                )),
+            ],
+            anchors: Vec::new(),
+        };
+        let source = ParagraphStructureSource::new(Arc::new(StaticSource {
+            book: Book {
+                id: rebook_publication::PublicationId::new("caption-structure-test").unwrap(),
+                metadata: rebook_publication::Metadata {
+                    languages: vec!["en".into()],
+                    ..Default::default()
+                },
+                cover: None,
+                sections: vec![rebook_publication::SpineItem {
+                    id: spine,
+                    href,
+                    media_type: "application/xhtml+xml".into(),
+                    linear: true,
+                    properties: Vec::new(),
+                }],
+                table_of_contents: Vec::new(),
+            },
+            section,
+        }));
+        let figure_key = ParagraphStructureKey {
+            section_index: 0,
+            node: "figure-caption".into(),
+        };
+        let standalone_key = ParagraphStructureKey {
+            section_index: 0,
+            node: "standalone-caption".into(),
+        };
+
+        assert!(source.can_structure(&figure_key).unwrap());
+        assert!(source.can_structure(&standalone_key).unwrap());
+        source.set_active(figure_key, true).unwrap();
+        source.set_active(standalone_key, true).unwrap();
+        let section = source.parse_section(0).unwrap();
+
+        let Block::Figure(figure) = &section.blocks[0] else {
+            panic!("expected figure");
+        };
+        assert_eq!(
+            inline_text(&figure.captions[0].content),
+            "Figure one. \n\nSecond sentence."
+        );
+        let Block::Text(caption) = &section.blocks[1] else {
+            panic!("expected standalone caption");
+        };
+        assert_eq!(
+            inline_text(&caption.content),
+            "Figure two. \n\nAnother sentence."
+        );
+    }
+
+    #[test]
     fn sentence_leading_quoted_term_is_not_attached_to_the_previous_sentence() {
         let mut block = TextBlock {
             kind: TextBlockKind::Paragraph,
@@ -672,6 +861,53 @@ mod tests {
             inline_text(&block.content),
             "本书的核心关注点是现代纯粹数学，这一决定需要作一些说明。\n\n“现代”一词很简单，正如上文所述。\n\n然后继续。"
         );
+    }
+
+    #[test]
+    fn quoted_exclamations_with_continuation_punctuation_stay_in_the_outer_sentence() {
+        let text = concat!(
+            "大喊一声“锤子！”，可能表示敲锤子或递锤子的意思；",
+            "也有可能表示警告，“锤子要从屋顶上掉下来了，当心！”；",
+            "此外，它还可能是提醒你买锤子或者不要忘记带锤子；等等。",
+            "我们可以尽情地想象各种意义。"
+        );
+        let content = vec![Inline::Text(TextRun {
+            text: text.to_owned(),
+            style: Default::default(),
+            link: None,
+        })];
+
+        let atoms = paragraph_atoms_for_content(&content, "zh");
+
+        assert_eq!(atoms.len(), 2);
+        assert_eq!(
+            atoms[0].text,
+            concat!(
+                "大喊一声“锤子！”，可能表示敲锤子或递锤子的意思；",
+                "也有可能表示警告，“锤子要从屋顶上掉下来了，当心！”；",
+                "此外，它还可能是提醒你买锤子或者不要忘记带锤子；等等。"
+            )
+        );
+        assert_eq!(atoms[1].text, "我们可以尽情地想象各种意义。");
+        assert!(atoms.iter().skip(1).all(|atom| {
+            atom.text
+                .trim_start()
+                .chars()
+                .next()
+                .is_none_or(|character| !is_sentence_continuation_punctuation(character))
+        }));
+    }
+
+    #[test]
+    fn quoted_sentence_followed_by_ordinary_text_keeps_its_boundary() {
+        let text = "他说：“快走！”第二天他们再次见面。";
+        let atoms = paragraph_atoms_with_protected_ranges(text, &[], "zh");
+        let atoms = attach_paired_punctuation_atoms(atoms, text);
+        let atoms = merge_leading_continuation_punctuation_atoms(atoms, text);
+
+        assert_eq!(atoms.len(), 2);
+        assert_eq!(atoms[0].text, "他说：“快走！”");
+        assert_eq!(atoms[1].text, "第二天他们再次见面。");
     }
 
     #[test]

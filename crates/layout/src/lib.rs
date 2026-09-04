@@ -1224,6 +1224,26 @@ impl LayoutEngine {
                 continue;
             }
 
+            if unified_reflow
+                && let Some(Block::Text(ordinal)) = layout_blocks.get(block_index).copied()
+                && let TextBlockKind::HeadingOrdinal(level) = ordinal.kind
+                && let Some(Block::Text(title)) = layout_blocks.get(block_index + 1).copied()
+                && title.kind.heading_level() == Some(level)
+            {
+                let ordinal = resolve_text_block(ordinal, reader_style, TextContext::Flow);
+                let title = resolve_text_block(title, reader_style, TextContext::Flow);
+                let ordinal_text = self.shape_text(&ordinal, reader_style, content_width);
+                let title_text = self.shape_text(&title, reader_style, content_width);
+                paginator.keep_together_if_fits(
+                    prepared_flow_height(&ordinal_text)
+                        + ordinal.style.margin_before.max(0.0)
+                        + ordinal.style.margin_after.max(0.0)
+                        + prepared_flow_height(&title_text)
+                        + title.style.margin_before.max(0.0)
+                        + title.style.margin_after.max(0.0),
+                );
+            }
+
             let block = layout_blocks[block_index];
             match block {
                 Block::Text(block) => {
@@ -2230,6 +2250,11 @@ fn resolve_text_block<'a>(
                 1.3,
                 base_size * profile.heading_body_gap_em,
             ),
+            TextBlockKind::HeadingOrdinal(level) => (
+                unified_heading_scale(profile.heading_scale, level) * 0.72,
+                1.15,
+                base_size * 0.25,
+            ),
             TextBlockKind::Caption => (profile.caption_font_scale, 1.4, 0.0),
             TextBlockKind::Preformatted => (0.9, 1.45, base_size * profile.paragraph_gap_em),
             TextBlockKind::Blockquote => (
@@ -2347,13 +2372,12 @@ fn resolve_text_block<'a>(
                 } else {
                     scale * 0.75
                 };
-                if matches!(
-                    block.kind,
-                    TextBlockKind::Heading(_) | TextBlockKind::DefinitionTerm { .. }
-                ) {
+                if block.kind.is_heading()
+                    || matches!(block.kind, TextBlockKind::DefinitionTerm { .. })
+                {
                     run.style.bold = true;
                 }
-                if matches!(block.kind, TextBlockKind::Heading(_)) {
+                if block.kind.is_heading() {
                     // Unified/focus typesetting owns heading presentation.
                     // Preserve inline emphasis in prose, but do not carry an
                     // authored block-level italic heading into focus mode.
@@ -4532,6 +4556,39 @@ mod tests {
         assert!((run.style.size_scale - 1.432).abs() < 0.001);
         assert!(run.style.bold);
         assert!(!run.style.italic);
+    }
+
+    #[test]
+    fn unified_split_heading_uses_a_compact_ordinal_before_the_title() {
+        let text_block = |kind| TextBlock {
+            kind,
+            content: vec![Inline::Text(TextRun {
+                text: "Heading".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let ordinal = text_block(TextBlockKind::HeadingOrdinal(2));
+        let title = text_block(TextBlockKind::Heading(2));
+
+        let ordinal = resolve_text_block(&ordinal, &style, TextContext::Flow);
+        let title = resolve_text_block(&title, &style, TextContext::Flow);
+        let Inline::Text(ordinal_run) = &ordinal.content[0] else {
+            panic!("expected ordinal text run");
+        };
+        let Inline::Text(title_run) = &title.content[0] else {
+            panic!("expected title text run");
+        };
+        assert!(ordinal_run.style.size_scale < title_run.style.size_scale);
+        assert!(ordinal.style.margin_after < title.style.margin_after);
+        assert!(ordinal_run.style.bold);
+        assert!(!ordinal_run.style.italic);
     }
 
     #[test]
