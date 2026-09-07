@@ -1389,6 +1389,17 @@ impl LayoutEngine {
                 Block::Separator(separator) => {
                     if !unified_reflow || separator.in_quote {
                         match separator.kind {
+                            SeparatorKind::Symbols => {
+                                if let Some(text) = &separator.text {
+                                    let prepared = self.shape_text_from_source(
+                                        source,
+                                        text,
+                                        reader_style,
+                                        content_width,
+                                    )?;
+                                    paginator.push_text(&prepared, text)?;
+                                }
+                            }
                             SeparatorKind::Spacing => paginator.ensure_minimum_spacing(
                                 separator.style.margin_before.max(0.0)
                                     + reader_style.typography.font_size
@@ -6172,6 +6183,22 @@ mod tests {
             href: PublicationUrl::parse("chapter.xhtml").unwrap(),
             blocks: vec![
                 paragraph("Before"),
+                Block::Separator(SeparatorBlock {
+                    kind: SeparatorKind::Symbols,
+                    text: Some(TextBlock {
+                        kind: TextBlockKind::Paragraph,
+                        content: vec![Inline::Text(TextRun {
+                            text: "* * *".into(),
+                            style: TextStyle::default(),
+                            link: None,
+                        })],
+                        style: BlockStyle::default(),
+                        source: None,
+                    }),
+                    in_quote: false,
+                    image: None,
+                    style: BlockStyle::default(),
+                }),
                 Block::Separator(SeparatorBlock::spacing(
                     rebook_publication::BlockStyle::default(),
                 )),
@@ -6204,6 +6231,19 @@ mod tests {
         let book = LayoutEngine::new()
             .layout_section(&source, &section, viewport, &ReaderStyle::default())
             .unwrap();
+        assert!(
+            !unified
+                .pages
+                .iter()
+                .flat_map(|p| &p.items)
+                .any(|item| matches!(item,PageItem::Text(text) if text.text.as_ref()=="* * *"))
+        );
+        assert!(
+            book.pages
+                .iter()
+                .flat_map(|p| &p.items)
+                .any(|item| matches!(item,PageItem::Text(text) if text.text.as_ref()=="* * *"))
+        );
         assert!(
             book.pages
                 .iter()

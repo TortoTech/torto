@@ -431,6 +431,9 @@ pub struct NoteBlock {
 /// A non-prose boundary retained semantically so reading modes can choose whether to show it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeparatorBlock {
+    /// Original symbol line, retained for publication-authored typesetting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextBlock>,
     pub kind: SeparatorKind,
     /// Quote-owned separators retain their authored rendering in every typesetting mode.
     #[serde(default)]
@@ -446,6 +449,7 @@ pub struct SeparatorBlock {
 impl SeparatorBlock {
     pub fn spacing(style: BlockStyle) -> Self {
         Self {
+            text: None,
             kind: SeparatorKind::Spacing,
             in_quote: false,
             image: None,
@@ -455,6 +459,7 @@ impl SeparatorBlock {
 
     pub fn rule() -> Self {
         Self {
+            text: None,
             kind: SeparatorKind::Rule,
             in_quote: false,
             image: None,
@@ -464,6 +469,7 @@ impl SeparatorBlock {
 
     pub fn ornament(image: ImageBlock) -> Self {
         Self {
+            text: None,
             kind: SeparatorKind::Ornament,
             in_quote: false,
             image: Some(image),
@@ -473,6 +479,7 @@ impl SeparatorBlock {
 
     pub fn rule_in_quote() -> Self {
         Self {
+            text: None,
             kind: SeparatorKind::Rule,
             in_quote: true,
             image: None,
@@ -485,6 +492,8 @@ impl SeparatorBlock {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SeparatorKind {
+    /// An authored symbol-only scene or section break.
+    Symbols,
     /// An authored blank paragraph or equivalent vertical spacer.
     Spacing,
     /// A semantic or visual horizontal rule such as HTML `hr`.

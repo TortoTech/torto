@@ -678,6 +678,9 @@ impl<'a> ReadingIrParser<'a> {
             self.parse_note_definition_nodes(&[node])?;
             return Ok(());
         }
+        if matches!(name.as_str(), "p" | "div") && self.try_parse_symbol_separator(node)? {
+            return Ok(());
+        }
         match name.as_str() {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let level = name[1..].parse::<u8>().unwrap_or(1);
@@ -768,6 +771,128 @@ impl<'a> ReadingIrParser<'a> {
             _ => self.parse_children(node)?,
         }
         Ok(())
+    }
+
+    fn try_parse_symbol_separator(&mut self, node: Node<'_, '_>) -> Result<bool, HtmlError> {
+        if self.inside_quote
+            || self.inside_note_definition
+            || has_quote_semantic_word(node)
+            || node.ancestors().filter(Node::is_element).any(|ancestor| {
+                matches!(
+                    ancestor.tag_name().name(),
+                    "blockquote"
+                        | "figure"
+                        | "figcaption"
+                        | "table"
+                        | "td"
+                        | "th"
+                        | "ul"
+                        | "ol"
+                        | "li"
+                        | "dl"
+                        | "dt"
+                        | "dd"
+                        | "pre"
+                        | "code"
+                        | "nav"
+                        | "aside"
+                )
+            })
+            || node
+                .descendants()
+                .skip(1)
+                .filter(Node::is_element)
+                .any(|child| {
+                    matches!(
+                        child.tag_name().name(),
+                        "p" | "div"
+                            | "br"
+                            | "img"
+                            | "image"
+                            | "svg"
+                            | "math"
+                            | "a"
+                            | "sup"
+                            | "sub"
+                            | "code"
+                            | "table"
+                    )
+                })
+        {
+            return Ok(false);
+        }
+        let compact = node
+            .descendants()
+            .filter(Node::is_text)
+            .filter_map(|n| n.text())
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace() && !matches!(c, '\u{200b}' | '\u{2060}' | '\u{feff}'))
+            .take(33)
+            .collect::<String>();
+        let chars = compact.chars().collect::<Vec<_>>();
+        if chars.is_empty() || chars.len() > 32 {
+            return Ok(false);
+        }
+        let repeated = chars.len() >= 3
+            && matches!(chars[0], '*' | '＊' | '※' | '•' | '⁂' | '⁎' | '✻' | '✽')
+            && chars.iter().all(|c| *c == chars[0]);
+        let weak = matches!(compact.as_str(), "▲" | "◆" | "❦" | "❧")
+            || (chars.len() >= 3
+                && chars
+                    .iter()
+                    .all(|c| matches!(c, '-' | '—' | '–' | '─' | '━' | '_')))
+            || (compact.ends_with('▲')
+                && chars.len() >= 4
+                && chars[..chars.len() - 1]
+                    .iter()
+                    .all(|c| matches!(c, '-' | '—' | '─')));
+        if !repeated && !weak {
+            return Ok(false);
+        }
+        let style = self.styles.block_style(node, BlockStyle::default());
+        if weak {
+            let centered = style.align == TextAlignment::Center
+                || node.children().filter(Node::is_element).any(|child| {
+                    self.styles.block_style(child, BlockStyle::default()).align
+                        == TextAlignment::Center
+                });
+            let previous = node.prev_siblings().skip(1).find(Node::is_element);
+            let next = node.next_siblings().skip(1).find(Node::is_element);
+            let prose = |neighbor: Option<Node<'_, '_>>| {
+                neighbor.is_some_and(|n| {
+                    n.tag_name().name() == "p"
+                        && n.descendants()
+                            .filter(Node::is_text)
+                            .filter_map(|n| n.text())
+                            .map(|s| s.chars().count())
+                            .sum::<usize>()
+                            >= 40
+                })
+            };
+            let has_rule = previous.is_some_and(|n| n.tag_name().name() == "hr")
+                || next.is_some_and(|n| n.tag_name().name() == "hr");
+            if !centered
+                || !((prose(previous)
+                    && prose(next)
+                    && (style.margin_before >= 8.0 || style.margin_after >= 8.0))
+                    || has_rule)
+            {
+                return Ok(false);
+            }
+        }
+        self.push_text_block(node, TextBlockKind::Paragraph, style)?;
+        if let Some(Block::Text(text)) = self.blocks.last().cloned() {
+            *self.blocks.last_mut().expect("symbol text exists") =
+                Block::Separator(SeparatorBlock {
+                    kind: rebook_publication::SeparatorKind::Symbols,
+                    text: Some(text),
+                    in_quote: false,
+                    image: None,
+                    style,
+                });
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn try_parse_structural_quote(&mut self, container: Node<'_, '_>) -> Result<bool, HtmlError> {
@@ -5932,6 +6057,66 @@ mod tests {
             panic!("expected one quote without promoted separators");
         };
         assert_eq!(quote.body.len(), 2);
+    }
+
+    #[test]
+    fn symbol_separators_preserve_their_source_text_and_require_safe_context() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html><body>
+          <p id="stars" style="text-align:center">* <span>*</span>&#160;*</p>
+          <p><span style="display:block;text-align:center">※※※</span></p>
+          <div>• &#x200b;• •</div>
+          <p>A sufficiently long ordinary paragraph before the section break.</p>
+          <p style="text-align:center;margin:1em 0">————</p>
+          <p>A sufficiently long ordinary paragraph following the section break.</p>
+          <p style="text-align:center;margin:2em 0">▲</p>
+          <p>Another sufficiently long paragraph describing the next scene.</p>
+          <p>*</p><p>……</p><p>“……”</p><p>!!!</p><p>—</p>
+          <p style="text-align:center">.<br/>.<br/>.</p>
+          <blockquote><p>* * *</p></blockquote>
+          <ul><li><p>* * *</p></li></ul>
+          <p><a href='#note'>***</a></p>
+        </body></html>"#;
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let separators = section
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Separator(s) if s.kind == rebook_publication::SeparatorKind::Symbols => {
+                    Some(s)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(separators.len(), 5);
+        let original = separators[0].text.as_ref().unwrap();
+        assert_eq!(original.style.align, TextAlignment::Center);
+        assert!(original.source.is_some());
+        assert!(
+            section
+                .anchors
+                .iter()
+                .any(|a| a.fragment == "stars"
+                    && a.source == original.source.as_ref().unwrap().start)
+        );
+        assert!(section.blocks.iter().any(
+            |b| matches!(b,Block::Quote(q) if q.body.iter().any(|p| text_block_text(p)=="* * *"))
+        ));
+        for expected in ["*", "……", "“……”", "!!!", "—"] {
+            assert!(
+                section
+                    .blocks
+                    .iter()
+                    .any(|b| matches!(b,Block::Text(t) if text_block_text(t)==expected)),
+                "lost {expected}"
+            );
+        }
     }
 
     #[test]
