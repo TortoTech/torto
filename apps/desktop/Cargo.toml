@@ -37,6 +37,7 @@ atomicwrites.workspace = true
 base64.workspace = true
 bytemuck.workspace = true
 bytes.workspace = true
+chrono = "0.4"
 directories.workspace = true
 egui = { workspace = true, features = ["serde"] }
 egui_commonmark.workspace = true

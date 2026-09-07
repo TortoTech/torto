@@ -468,6 +468,7 @@ fn resolve_book_display_metadata(
 }
 
 pub(super) struct DesktopReader {
+    statistics: crate::statistics::Tracker,
     reader: ReaderSession,
     source: Arc<dyn BookSource>,
     rewrite_source: Arc<RewriteBookSource>,
@@ -1200,7 +1201,10 @@ fn merge_inferred_caption_focus_unit(image: &mut FocusUnit, caption: FocusUnit) 
 fn focus_block_structure_ranges(block: &Block) -> Vec<SourceRange> {
     match block {
         Block::Text(text)
-            if matches!(text.kind, TextBlockKind::Paragraph | TextBlockKind::Caption) =>
+            if matches!(
+                text.kind,
+                TextBlockKind::Paragraph | TextBlockKind::Blockquote | TextBlockKind::Caption
+            ) =>
         {
             text.source.iter().cloned().collect()
         }
@@ -1209,8 +1213,18 @@ fn focus_block_structure_ranges(block: &Block) -> Vec<SourceRange> {
             .iter()
             .filter_map(|caption| caption.source.clone())
             .collect(),
+        Block::Quote(quote) => quote
+            .body
+            .iter()
+            .filter(|body| {
+                matches!(
+                    body.kind,
+                    TextBlockKind::Paragraph | TextBlockKind::Blockquote
+                )
+            })
+            .filter_map(|body| body.source.clone())
+            .collect(),
         Block::Text(_)
-        | Block::Quote(_)
         | Block::Table(_)
         | Block::Image(_)
         | Block::Note(_)
@@ -1909,13 +1923,18 @@ impl DesktopReader {
                     }
                 };
             let structure_ranges = focus_block_structure_ranges(block);
-            let structured_activation = structure_ranges.iter().any(|range| {
-                self.structure_source
-                    .is_structured(&crate::plugins::ParagraphStructureKey {
-                        section_index: layout.section_index,
-                        node: range.start.node.clone(),
-                    })
-            });
+            // Quotes already have their own background. Sentence splitting must
+            // not replace it with the ordinary paragraph's green activation fill.
+            let preserve_quote_background = matches!(block, Block::Quote(_))
+                || matches!(block, Block::Text(text) if text.kind == TextBlockKind::Blockquote);
+            let structured_activation = !preserve_quote_background
+                && structure_ranges.iter().any(|range| {
+                    self.structure_source
+                        .is_structured(&crate::plugins::ParagraphStructureKey {
+                            section_index: layout.section_index,
+                            node: range.start.node.clone(),
+                        })
+                });
             let rectangular_activation = rectangular_activation || structured_activation;
             if text.trim().is_empty() {
                 if list_depth.is_none_or(|depth| depth == 0) {
@@ -3136,6 +3155,7 @@ impl DesktopReader {
         let search = SearchUiState::default();
         Self {
             reader,
+            statistics: crate::statistics::Tracker::new(&book_id),
             source,
             rewrite_source,
             translation_source,
@@ -4024,6 +4044,44 @@ mod tests {
         assert_eq!(
             focus_block_paint_ranges(&block, &table_range),
             vec![first_cell, second_cell]
+        );
+    }
+
+    #[test]
+    fn quote_structure_actions_target_body_sources_only() {
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let text = |kind, node: &str| TextBlock {
+            kind,
+            content: Vec::new(),
+            style: BlockStyle::default(),
+            source: Some(SourceRange {
+                start: SourceAnchor {
+                    spine: spine.clone(),
+                    node: node.into(),
+                    text_offset: 0,
+                },
+                end: SourceAnchor {
+                    spine: spine.clone(),
+                    node: node.into(),
+                    text_offset: 8,
+                },
+            }),
+        };
+        let first = text(TextBlockKind::Blockquote, "quote-first");
+        let second = text(TextBlockKind::Paragraph, "quote-second");
+        let expected = vec![
+            first.source.clone().unwrap(),
+            second.source.clone().unwrap(),
+        ];
+        let quote = Block::Quote(rebook_publication::QuoteBlock {
+            body: vec![first.clone(), second],
+            attribution: Some(text(TextBlockKind::QuoteAttribution, "credit")),
+            source: None,
+        });
+        assert_eq!(super::focus_block_structure_ranges(&quote), expected);
+        assert_eq!(
+            super::focus_block_structure_ranges(&Block::Text(first)),
+            expected[..1]
         );
     }
 

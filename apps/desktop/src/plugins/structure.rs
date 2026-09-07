@@ -124,6 +124,19 @@ impl BookSource for ParagraphStructureSource {
                     }
                     false
                 }
+                Block::Quote(quote) => {
+                    let mut active_primary = false;
+                    for body in &mut quote.body {
+                        let active = text_structure_is_active(body, index, &state);
+                        if (active || (body.source.is_none() && active_primary))
+                            && text_kind_is_structurable(body.kind)
+                        {
+                            apply_sentence_structure(body, &self.language_hint);
+                        }
+                        active_primary = active;
+                    }
+                    false
+                }
                 _ => false,
             };
             if active_text
@@ -195,7 +208,10 @@ fn paragraph_atoms_for_content(content: &[Inline], language_hint: &str) -> Vec<P
 }
 
 fn text_kind_is_structurable(kind: TextBlockKind) -> bool {
-    matches!(kind, TextBlockKind::Paragraph | TextBlockKind::Caption)
+    matches!(
+        kind,
+        TextBlockKind::Paragraph | TextBlockKind::Blockquote | TextBlockKind::Caption
+    )
 }
 
 fn text_structure_is_active(
@@ -222,8 +238,8 @@ fn structurable_text_for_node<'a>(block: &'a Block, node: &str) -> Option<&'a Te
     match block {
         Block::Text(text) => matches(text).then_some(text),
         Block::Figure(figure) => figure.captions.iter().find(|caption| matches(caption)),
-        Block::Quote(_)
-        | Block::Table(_)
+        Block::Quote(quote) => quote.body.iter().find(|body| matches(body)),
+        Block::Table(_)
         | Block::Image(_)
         | Block::Note(_)
         | Block::Separator(_)
@@ -753,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn figure_and_standalone_captions_support_sentence_structure() {
+    fn captions_and_quote_bodies_support_sentence_structure() {
         let spine = rebook_publication::SpineItemId::new("chapter-1").unwrap();
         let href = PublicationUrl::parse("chapter-1.xhtml").unwrap();
         let figure_text = "Figure one. Second sentence.";
@@ -788,6 +804,24 @@ mod tests {
                     "standalone-caption",
                     standalone_text,
                 )),
+                Block::Quote(rebook_publication::QuoteBlock {
+                    body: vec![text_block(
+                        TextBlockKind::Blockquote,
+                        "quote-body",
+                        "First sentence. Second sentence.",
+                    )],
+                    attribution: Some(text_block(
+                        TextBlockKind::QuoteAttribution,
+                        "quote-credit",
+                        "Author. Book.",
+                    )),
+                    source: Some(source_range(&spine, "quote", "")),
+                }),
+                Block::Text(text_block(
+                    TextBlockKind::Blockquote,
+                    "legacy-quote",
+                    "Legacy sentence. Another sentence.",
+                )),
             ],
             anchors: Vec::new(),
         };
@@ -821,6 +855,27 @@ mod tests {
 
         assert!(source.can_structure(&figure_key).unwrap());
         assert!(source.can_structure(&standalone_key).unwrap());
+        let quote_key = ParagraphStructureKey {
+            section_index: 0,
+            node: "quote-body".into(),
+        };
+        let legacy_key = ParagraphStructureKey {
+            section_index: 0,
+            node: "legacy-quote".into(),
+        };
+        assert!(source.can_structure(&quote_key).unwrap());
+        assert!(source.can_structure(&legacy_key).unwrap());
+        assert!(
+            !source
+                .can_structure(&ParagraphStructureKey {
+                    section_index: 0,
+                    node: "quote-credit".into()
+                })
+                .unwrap()
+        );
+        let original_quote = source.parse_section(0).unwrap().blocks[2].clone();
+        source.set_active(quote_key.clone(), true).unwrap();
+        source.set_active(legacy_key, true).unwrap();
         source.set_active(figure_key, true).unwrap();
         source.set_active(standalone_key, true).unwrap();
         let section = source.parse_section(0).unwrap();
@@ -839,6 +894,30 @@ mod tests {
             inline_text(&caption.content),
             "Figure two. \n\nAnother sentence."
         );
+        let Block::Quote(quote) = &section.blocks[2] else {
+            panic!("expected quote")
+        };
+        assert_eq!(
+            inline_text(&quote.body[0].content),
+            "First sentence. \n\nSecond sentence."
+        );
+        assert_eq!(quote.body[0].kind, TextBlockKind::Blockquote);
+        assert_eq!(quote.body[0].style.subparagraph_gap_em, Some(0.3));
+        let Block::Quote(original) = &original_quote else {
+            unreachable!()
+        };
+        assert_eq!(quote.attribution, original.attribution);
+        assert_eq!(quote.source, original.source);
+        assert_eq!(quote.body[0].source, original.body[0].source);
+        let Block::Text(legacy) = &section.blocks[3] else {
+            panic!("expected legacy quote")
+        };
+        assert_eq!(
+            inline_text(&legacy.content),
+            "Legacy sentence. \n\nAnother sentence."
+        );
+        source.set_active(quote_key, false).unwrap();
+        assert_eq!(source.parse_section(0).unwrap().blocks[2], original_quote);
     }
 
     #[test]

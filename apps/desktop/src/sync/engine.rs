@@ -71,7 +71,12 @@ where
 {
     let store = SyncStore::open_default(settings.device_id.clone())?;
     let cache_dir = download_cache_dir()?;
-    run_sync_with_store(settings, password, local_books, store, cache_dir, progress).await
+    let webdav = WebDavClient::new(&settings, password.clone())?;
+    let device = settings.device_id.clone();
+    let report =
+        run_sync_with_store(settings, password, local_books, store, cache_dir, progress).await?;
+    crate::statistics::sync(&webdav, &device).await?;
+    Ok(report)
 }
 
 async fn run_sync_with_store<F>(

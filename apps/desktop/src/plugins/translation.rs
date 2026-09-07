@@ -38,6 +38,7 @@ struct StoredBlockTranslation {
 
 #[derive(Default)]
 struct TranslationState {
+    target_writing_system: rebook_publication::WritingSystem,
     enabled: bool,
     mode: TranslationMode,
     sections: HashMap<usize, HashMap<usize, StoredBlockTranslation>>,
@@ -53,6 +54,35 @@ pub struct TranslationBookSource {
 }
 
 impl TranslationBookSource {
+    pub fn set_target_language(&self, language: &str) -> Result<(), String> {
+        let tag = match language.trim().to_lowercase().as_str() {
+            "simplified chinese"
+            | "traditional chinese"
+            | "chinese"
+            | "简体中文"
+            | "繁體中文"
+            | "繁体中文" => "zh",
+            "japanese" | "日语" | "日本語" => "ja",
+            "korean" | "韩语" | "한국어" => "ko",
+            "english" => "en",
+            "french" => "fr",
+            "german" => "de",
+            "spanish" => "es",
+            "portuguese" => "pt",
+            "italian" => "it",
+            _ => language,
+        };
+        let system = rebook_publication::Metadata {
+            languages: vec![tag.to_owned()],
+            ..Default::default()
+        }
+        .writing_system();
+        self.state
+            .write()
+            .map_err(|_| "正文翻译状态已损坏".to_owned())?
+            .target_writing_system = system;
+        Ok(())
+    }
     pub fn new(inner: Arc<dyn BookSource>, mode: TranslationMode) -> Self {
         let fixed_page_replacement_only =
             inner.book().metadata.layout == RenditionLayout::PrePaginated;
@@ -630,6 +660,17 @@ impl BookSource for TranslationBookSource {
                 }
                 other => rendered.push(other),
             }
+        }
+        for block in &mut rendered {
+            visit_note_text_blocks_mut(block, &mut 0, &mut |_, text| {
+                for inline in &mut text.content {
+                    if let Inline::Text(run) = inline
+                        && run.style.display_writing_system.is_some()
+                    {
+                        run.style.display_writing_system = Some(state.target_writing_system);
+                    }
+                }
+            });
         }
         section.blocks = rendered;
         Ok(section)
@@ -1267,6 +1308,11 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
     let mut content = Vec::new();
     for (text, style) in styled {
         append_translated_span(&mut content, &text, style, original, &math);
+    }
+    for inline in &mut content {
+        if let Inline::Text(run) = inline {
+            run.style.display_writing_system = Some(rebook_publication::WritingSystem::Unknown);
+        }
     }
     restore_inline_images(&mut content, original);
     content
@@ -2519,6 +2565,7 @@ mod tests {
     #[test]
     fn toggles_between_original_replace_and_bilingual_views() {
         let source = TranslationBookSource::new(source(), TranslationMode::Replace);
+        source.set_target_language("简体中文").unwrap();
         source
             .store_section(
                 0,
@@ -2550,6 +2597,18 @@ mod tests {
         assert_eq!(bilingual.blocks.len(), 2);
         assert_eq!(block_text(&bilingual.blocks[0]), "Hello");
         assert_eq!(block_text(&bilingual.blocks[1]), "你好");
+        let display_system = |block: &Block| match block {
+            Block::Text(text) => text.content.iter().find_map(|inline| match inline {
+                Inline::Text(run) => run.style.display_writing_system,
+                _ => None,
+            }),
+            _ => None,
+        };
+        assert_eq!(display_system(&bilingual.blocks[0]), None);
+        assert_eq!(
+            display_system(&bilingual.blocks[1]),
+            Some(rebook_publication::WritingSystem::Cjk)
+        );
         assert!(matches!(&bilingual.blocks[1], Block::Text(block) if block.source.is_none()));
     }
 

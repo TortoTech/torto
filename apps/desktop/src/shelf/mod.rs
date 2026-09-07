@@ -28,7 +28,7 @@ const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const SHELF_TOAST_TOP_OFFSET: f32 = 84.0;
 const SHELF_SCROLLBAR_GUTTER: f32 = 16.0;
 const CARD_WIDTH: f32 = 180.0;
-const CARD_HEIGHT: f32 = 280.0;
+const CARD_HEIGHT: f32 = 300.0;
 const COVER_WIDTH: f32 = 160.0;
 const COVER_HEIGHT: f32 = 228.0;
 const SHELF_TITLE_BOLD_OFFSET: f32 = 0.45;
@@ -75,6 +75,7 @@ fn sync_progress_log(progress: &SyncProgress) -> Option<String> {
 }
 
 pub(crate) struct ShelfFeature {
+    statistics: crate::statistics::Page,
     shelf: ShelfState,
     import_task: TaskSlot<()>,
     pending_reader: Option<DesktopReader>,
@@ -182,6 +183,7 @@ impl ShelfFeature {
             .as_ref()
             .map(|_| Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
         let mut feature = Self {
+            statistics: crate::statistics::Page::default(),
             shelf: ShelfState {
                 library,
                 query: String::new(),
@@ -245,6 +247,7 @@ impl ShelfFeature {
             self.cover_textures.clear();
         }
         let metadata = Some(BookDisplayMetadata::from(&book));
+        crate::statistics::register_book(&book);
         match open_reader(
             &book.path,
             Arc::clone(&self.reader_fonts),
@@ -368,6 +371,10 @@ impl ShelfFeature {
     }
 
     fn refresh_read_activity(&mut self) {
+        let open = self.statistics.open;
+        self.statistics
+            .open(self.shelf.library.books(), self.local_store.as_ref());
+        self.statistics.open = open;
         let Some(store) = &self.local_store else {
             self.read_activity.clear();
             return;
@@ -647,6 +654,11 @@ impl ShelfFeature {
     }
 
     pub(crate) fn ui(&mut self, root_ui: &mut egui::Ui, interaction_blocked: bool) {
+        if self.statistics.open {
+            self.statistics
+                .ui(root_ui, self.language, interaction_blocked);
+            return;
+        }
         let ctx = root_ui.ctx().clone();
         self.dismiss_transient_messages_if_due(&ctx);
         let focus_search = !interaction_blocked
@@ -733,6 +745,15 @@ impl ShelfFeature {
                 let search_response = shelf_search_field(ui, &mut self.shelf.query, &search_hint);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let settings = icon_button(ui, Icon::Settings);
+                    if ui
+                        .add_enabled_ui(!interaction_blocked, |ui| icon_button(ui, Icon::Chart))
+                        .inner
+                        .on_hover_text(self.language.text("阅读统计", "Reading statistics"))
+                        .clicked()
+                    {
+                        self.statistics
+                            .open(self.shelf.library.books(), self.local_store.as_ref());
+                    }
                     if !interaction_blocked {
                         if settings
                             .on_hover_text(self.language.text("设置", "Settings"))
@@ -919,8 +940,26 @@ impl ShelfFeature {
         );
 
         let clicked = !interaction_blocked && response.clicked();
+        painter.text(
+            egui::pos2(rect.left() + 12.0, rect.bottom() - 18.0),
+            egui::Align2::LEFT_CENTER,
+            self.statistics.badge(&book.id, self.language),
+            egui::FontId::proportional(11.0),
+            palette().muted,
+        );
         if !interaction_blocked {
             response.context_menu(|ui| {
+                if ui
+                    .button(self.language.text("阅读详情", "Reading details"))
+                    .clicked()
+                {
+                    self.statistics.show_book(
+                        book,
+                        self.shelf.library.books(),
+                        self.local_store.as_ref(),
+                    );
+                    ui.close();
+                }
                 if ui
                     .button(self.language.text("从书架移除", "Remove from library"))
                     .clicked()

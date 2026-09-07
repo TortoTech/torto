@@ -612,6 +612,59 @@ impl DesktopReader {
     ) -> ReaderFramePlan {
         let ctx = root_ui.ctx().clone();
         let now = Instant::now();
+        let statistics_active = self.statistics.tick(
+            ctx.input(|i| i.focused)
+                && !interaction_blocked
+                && self.ui.overlay != ReaderOverlay::Menu
+                && !(self.ui.assistant_panel.is_some() && ctx.text_edit_focused()),
+            ctx.input(|i| {
+                i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key { pressed: true, .. }
+                            | egui::Event::PointerButton { pressed: true, .. }
+                            | egui::Event::MouseWheel { .. }
+                            | egui::Event::Text(_)
+                    )
+                })
+            }),
+            self.snapshot.total_progression,
+        );
+        ctx.request_repaint_after(Duration::from_secs(1));
+        egui::Area::new("reading-statistics-status".into())
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-10.0, -4.0])
+            .show(&ctx, |ui| {
+                let label = if statistics_active {
+                    self.language.text("阅读计时中", "Reading timer active")
+                } else {
+                    self.language.text("阅读计时已暂停", "Reading timer paused")
+                };
+                ui.add_enabled_ui(!interaction_blocked, |ui| {
+                    if ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new(label).size(10.0).color(palette().muted),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text(self.language.text(
+                            "点击暂停或恢复阅读计时",
+                            "Click to pause or resume reading time",
+                        ))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.statistics.toggle_timer();
+                    }
+                    if self.snapshot.total_progression >= 0.999
+                        && ui
+                            .small_button(self.language.text("标记为已读完", "Mark as finished"))
+                            .clicked()
+                    {
+                        self.statistics.mark_finished();
+                    }
+                });
+            });
         self.advance_frame(now);
         self.apply_pending_focus_wheel_turn();
         self.copy_shortcut(&ctx, interaction_blocked);

@@ -848,6 +848,9 @@ impl Default for Rgba {
 /// Renderer-independent inline presentation and semantic subset.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
+    /// Display language override for translated text; None retains book defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_writing_system: Option<WritingSystem>,
     pub bold: bool,
     pub italic: bool,
     /// Semantic stress emphasis originating from HTML `<em>`.
@@ -885,6 +888,7 @@ pub struct TextStyle {
 impl Default for TextStyle {
     fn default() -> Self {
         Self {
+            display_writing_system: None,
             bold: false,
             italic: false,
             emphasis: false,

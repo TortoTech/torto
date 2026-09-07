@@ -17,6 +17,7 @@ mod preferences;
 mod reader;
 mod settings;
 mod shelf;
+mod statistics;
 mod sync;
 mod ui;
 #[cfg(target_os = "windows")]

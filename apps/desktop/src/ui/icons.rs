@@ -11,6 +11,7 @@ macro_rules! asset {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Icon {
+    Chart,
     AlertCircle,
     BookOpen,
     Bot,
@@ -54,7 +55,8 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 39] = [
+    const ALL: [Self; 40] = [
+        Self::Chart,
         Self::AlertCircle,
         Self::BookOpen,
         Self::Bot,
@@ -114,6 +116,7 @@ impl Icon {
             Self::Languages => asset!("languages"),
             Self::Library => asset!("library"),
             Self::ListTree => asset!("list-tree"),
+            Self::Chart => asset!("chart-column"),
             Self::Maximize2 => asset!("maximize-2"),
             Self::Menu => asset!("menu"),
             Self::MessageCircle => asset!("message-circle"),

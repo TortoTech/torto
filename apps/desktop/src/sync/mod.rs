@@ -3,7 +3,7 @@ mod engine;
 mod protocol;
 mod settings;
 mod store;
-mod webdav;
+pub(crate) mod webdav;
 
 use std::error::Error;
 use std::fs::{self, OpenOptions};

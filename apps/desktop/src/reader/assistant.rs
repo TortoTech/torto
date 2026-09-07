@@ -1539,6 +1539,13 @@ impl DesktopReader {
             self.translation.show_error(error, Instant::now());
             return;
         }
+        let target = self
+            .plugin_settings
+            .resolved_target_language(crate::preferences::AppLanguage::system_translation_target());
+        if let Err(error) = self.translation_source.set_target_language(&target) {
+            self.show_error(error);
+            return;
+        }
         self.translation.enabled = true;
         if self.set_translation_rendering(true) {
             self.refresh_translation_view();
@@ -1591,6 +1598,13 @@ impl DesktopReader {
         let mut settings = self.plugin_settings.clone();
         settings.target_language = settings
             .resolved_target_language(crate::preferences::AppLanguage::system_translation_target());
+        if let Err(error) = self
+            .translation_source
+            .set_target_language(&settings.target_language)
+        {
+            self.show_error(error);
+            return;
+        }
         self.translation.task.begin(TranslationTask {
             section_index,
             settings,

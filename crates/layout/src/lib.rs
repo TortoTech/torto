@@ -1419,7 +1419,12 @@ impl LayoutEngine {
                     }
                 }
                 Block::LineBreak => paginator.ensure_minimum_spacing(
-                    reader_style.typography.font_size * reader_style.typesetting.body_line_height,
+                    reader_style.typography.font_size
+                        * if unified_reflow {
+                            unified_body_line_height(reader_style.writing_system)
+                        } else {
+                            reader_style.typesetting.body_line_height
+                        },
                 ),
                 Block::PageBreak => paginator.force_page(),
                 Block::Note(_) => unreachable!("note blocks are flattened before layout"),
@@ -1839,7 +1844,7 @@ impl LayoutEngine {
             .map(|(offset, glyph)| (*offset, glyph.width))
             .collect::<HashMap<_, _>>();
         let mut selected_hyphens = Vec::new();
-        let optimized = should_optimize
+        let mut optimized = should_optimize
             && linebreak::parley::plan_optimized(
                 &mut layout,
                 &text,
@@ -1883,6 +1888,38 @@ impl LayoutEngine {
             .is_some();
         if !optimized {
             layout.break_all_lines(Some(available_width));
+            if block.style.align == TextAlignment::Justify
+                && let Some(plan) = linebreak::parley::plan_wrapped_justification(
+                    &mut layout,
+                    &text,
+                    available_width,
+                )
+            {
+                let mut adjusted = self.build_text_layout(
+                    &text,
+                    &spans,
+                    &inline_images,
+                    &font_stack,
+                    typography,
+                    block.style.line_height,
+                    reader_style.foreground,
+                    &plan.adjustments,
+                );
+                self.apply_text_indents(
+                    &mut adjusted,
+                    block,
+                    &text[..source_text_start],
+                    typography,
+                    &font_stack,
+                    first_line_indent,
+                );
+                if linebreak::parley::apply_breaks(&mut adjusted, &plan.lines, available_width)
+                    .is_some()
+                {
+                    layout = adjusted;
+                    optimized = true;
+                }
+            }
         }
         let alignment = if optimized {
             Alignment::Start
@@ -2223,6 +2260,14 @@ fn centered_table_offset(unified: bool, available_width: f32, column_widths: &[f
     }
 }
 
+fn unified_body_line_height(system: WritingSystem) -> f32 {
+    match system {
+        WritingSystem::Cjk => 1.7,
+        WritingSystem::Latin => 1.4,
+        WritingSystem::Other | WritingSystem::Unknown => 1.5,
+    }
+}
+
 fn resolve_text_block<'a>(
     block: &'a TextBlock,
     reader_style: &ReaderStyle,
@@ -2242,6 +2287,15 @@ fn resolve_text_block<'a>(
     let typography = &reader_style.typography;
     let profile = &reader_style.typesetting;
     let base_size = typography.font_size;
+    let display_system = block
+        .content
+        .iter()
+        .find_map(|inline| match inline {
+            Inline::Text(run) => run.style.display_writing_system,
+            _ => None,
+        })
+        .unwrap_or(reader_style.writing_system);
+    let body_line_height = unified_body_line_height(display_system);
     let (scale, line_height, margin_after) = match context {
         TextContext::Table => (profile.table_font_scale, profile.table_line_height, 0.0),
         TextContext::Flow => match block.kind {
@@ -2257,23 +2311,19 @@ fn resolve_text_block<'a>(
             ),
             TextBlockKind::Caption => (profile.caption_font_scale, 1.4, 0.0),
             TextBlockKind::Preformatted => (0.9, 1.45, base_size * profile.paragraph_gap_em),
-            TextBlockKind::Blockquote => (
-                0.95,
-                profile.body_line_height,
-                base_size * profile.paragraph_gap_em,
-            ),
+            TextBlockKind::Blockquote => {
+                (0.95, body_line_height, base_size * profile.paragraph_gap_em)
+            }
             TextBlockKind::QuoteAttribution => (0.88, 1.4, 0.0),
             TextBlockKind::Paragraph
             | TextBlockKind::FootnoteDefinition
             | TextBlockKind::ListItem { .. }
-            | TextBlockKind::DefinitionDescription { .. } => (
-                1.0,
-                profile.body_line_height,
-                base_size * profile.paragraph_gap_em,
-            ),
+            | TextBlockKind::DefinitionDescription { .. } => {
+                (1.0, body_line_height, base_size * profile.paragraph_gap_em)
+            }
             TextBlockKind::DefinitionTerm { .. } => (
                 1.0,
-                profile.body_line_height,
+                body_line_height,
                 base_size * profile.paragraph_gap_em.min(0.25),
             ),
         },
@@ -2389,6 +2439,16 @@ fn resolve_text_block<'a>(
                 ) {
                     run.style.bold = false;
                     run.style.italic = false;
+                }
+                if block.kind == TextBlockKind::Caption {
+                    // Unified captions use one neutral presentation regardless of
+                    // publisher CSS or semantic tags that would recreate bold or
+                    // italic styling in the later script-aware pass.
+                    run.style.bold = false;
+                    run.style.italic = false;
+                    run.style.emphasis = false;
+                    run.style.alternate_voice = false;
+                    run.style.citation = false;
                 }
             }
             Inline::Math(run) => run.size_scale = scale,
@@ -4472,6 +4532,49 @@ mod tests {
     }
 
     #[test]
+    fn sentence_justification_preserves_subparagraph_indents_and_gaps() {
+        let sentence = "威斯康星大学麦迪逊分校的比较心理学家哈里·哈洛（Harry Harlow）进行了一项臭名昭著的实验。";
+        let run = Inline::Text(TextRun {
+            text: sentence.into(),
+            style: TextStyle::default(),
+            link: None,
+        });
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![run.clone(), Inline::Break, Inline::Break, run],
+            style: rebook_publication::BlockStyle {
+                indent: 32.0,
+                subparagraph_gap_em: Some(0.3),
+                ..rebook_publication::BlockStyle::default()
+            },
+            source: None,
+        };
+        let style = ReaderStyle::default();
+        let mut engine = LayoutEngine::new();
+        let natural = engine.shape_text(&block, &style, 400.0);
+        block.style.align = TextAlignment::Justify;
+        let justified = engine.shape_text(&block, &style, 400.0);
+        assert_eq!(natural.layout.len(), justified.layout.len());
+        assert_eq!(natural.text, justified.text);
+        for (before, after) in natural.layout.lines().zip(justified.layout.lines()) {
+            assert_eq!(before.text_range(), after.text_range());
+            assert_eq!(before.break_reason(), after.break_reason());
+            assert!((before.metrics().offset - after.metrics().offset).abs() < 0.01);
+            assert!((before.metrics().line_height - after.metrics().line_height).abs() < 0.01);
+            if matches!(
+                after.break_reason(),
+                parley::layout::BreakReason::None | parley::layout::BreakReason::Explicit
+            ) {
+                assert!((before.metrics().advance - after.metrics().advance).abs() < 0.01);
+            } else {
+                assert!(
+                    (linebreak::parley::positioned_line_content_end(after) - 400.0).abs() < 0.1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn semantic_subparagraph_break_uses_the_compact_configured_gap() {
         let block = TextBlock {
             kind: TextBlockKind::Paragraph,
@@ -4559,6 +4662,58 @@ mod tests {
     }
 
     #[test]
+    fn translated_prose_uses_display_language_line_height() {
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "译文 translated text".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let mut style = ReaderStyle {
+            writing_system: WritingSystem::Latin,
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        assert!(
+            (resolve_text_block(&block, &style, TextContext::Flow)
+                .style
+                .line_height
+                - 1.4)
+                .abs()
+                < 0.001
+        );
+        if let Inline::Text(run) = &mut block.content[0] {
+            run.style.display_writing_system = Some(WritingSystem::Cjk);
+        }
+        assert!(
+            (resolve_text_block(&block, &style, TextContext::Flow)
+                .style
+                .line_height
+                - 1.7)
+                .abs()
+                < 0.001
+        );
+        block.kind = TextBlockKind::Caption;
+        assert!(
+            (resolve_text_block(&block, &style, TextContext::Flow)
+                .style
+                .line_height
+                - 1.4)
+                .abs()
+                < 0.001
+        );
+        style.typesetting.mode = TypesettingMode::Book;
+        assert_eq!(
+            resolve_text_block(&block, &style, TextContext::Flow).as_ref(),
+            &block
+        );
+    }
+
+    #[test]
     fn unified_split_heading_uses_a_compact_ordinal_before_the_title() {
         let text_block = |kind| TextBlock {
             kind,
@@ -4589,6 +4744,48 @@ mod tests {
         assert!(ordinal.style.margin_after < title.style.margin_after);
         assert!(ordinal_run.style.bold);
         assert!(!ordinal_run.style.italic);
+    }
+
+    #[test]
+    fn unified_captions_clear_all_authored_bold_and_italic_sources() {
+        let block = TextBlock {
+            kind: TextBlockKind::Caption,
+            content: vec![Inline::Text(TextRun {
+                text: "Figure 1. Authored emphasis and citation.".into(),
+                style: TextStyle {
+                    bold: true,
+                    italic: true,
+                    emphasis: true,
+                    alternate_voice: true,
+                    citation: true,
+                    ..TextStyle::default()
+                },
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        let classic = ReaderStyle::default();
+        let unified = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+
+        let classic = resolve_text_block(&block, &classic, TextContext::Flow);
+        let unified = resolve_text_block(&block, &unified, TextContext::Flow);
+        let Inline::Text(classic_run) = &classic.content[0] else {
+            panic!("expected classic caption text");
+        };
+        let Inline::Text(unified_run) = &unified.content[0] else {
+            panic!("expected unified caption text");
+        };
+        assert!(classic_run.style.bold);
+        assert!(classic_run.style.italic);
+        assert!(!unified_run.style.bold);
+        assert!(!unified_run.style.italic);
+        assert!(!unified_run.style.emphasis);
+        assert!(!unified_run.style.alternate_voice);
+        assert!(!unified_run.style.citation);
     }
 
     #[test]

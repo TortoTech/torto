@@ -14,6 +14,106 @@ use super::knuth_plass::{self, ClusterItem, LineBreak, ParagraphOptions};
 const MIXED_SCRIPT_SPACING_EM: f32 = 0.25;
 const MIXED_SCRIPT_SHRINK_EM: f32 = 0.125;
 
+/// Justify already wrapped LTR prose, including explicit subparagraph breaks.
+/// Keep the selected breaks and share excess space with CJK boundaries after
+/// ordinary spaces have reached 150% of their natural width.
+pub(crate) fn plan_wrapped_justification(
+    layout: &mut Layout<TextBrush>,
+    text: &str,
+    column_width: f32,
+) -> Option<ParagraphPlan> {
+    if layout.is_rtl() || !layout.inline_boxes().is_empty() {
+        return None;
+    }
+    layout.break_all_lines(Some(column_width));
+    layout.align(
+        parley::Alignment::Start,
+        parley::AlignmentOptions::default(),
+    );
+    let mut lines = Vec::new();
+    let mut adjustments = Vec::new();
+    let mut breakpoint = 0;
+    for line in layout.lines() {
+        let mut clusters = Vec::new();
+        for run in line.runs() {
+            if run.is_rtl() {
+                return None;
+            }
+            for cluster in run.clusters() {
+                clusters.push((
+                    cluster.text_range(),
+                    cluster.advance(),
+                    cluster.first_style().brush,
+                ));
+            }
+        }
+        let cluster_count = u32::try_from(clusters.len()).ok()?;
+        if cluster_count == 0 {
+            return None;
+        }
+        breakpoint += cluster_count;
+        let metrics = line.metrics();
+        let natural_width = metrics.advance - metrics.trailing_whitespace;
+        lines.push(LineBreak {
+            cluster_count,
+            breakpoint,
+            natural_width,
+            adjustment_ratio: 0.0,
+            badness: 0.0,
+            hyphenated: false,
+        });
+        if matches!(
+            line.break_reason(),
+            parley::layout::BreakReason::None | parley::layout::BreakReason::Explicit
+        ) {
+            continue;
+        }
+        let extra = (column_width - metrics.offset - natural_width).max(0.0);
+        let end = clusters
+            .iter()
+            .rposition(|(range, _, _)| !text[range.clone()].chars().all(char::is_whitespace))
+            .map_or(0, |index| index + 1);
+        let mut slots = Vec::new();
+        for (index, (range, advance, brush)) in clusters[..end].iter().enumerate() {
+            let source = &text[range.clone()];
+            let space = matches!(source, " " | "\u{00a0}" | "\u{3000}");
+            let cjk = index + 1 < end
+                && source.chars().last().is_some_and(is_cjk_justification_char)
+                && text[clusters[index + 1].0.clone()]
+                    .chars()
+                    .next()
+                    .is_some_and(is_cjk_justification_char)
+                && !brush.footnote_reference
+                && !clusters[index + 1].2.footnote_reference;
+            if space || cjk {
+                slots.push((range.clone(), if space { advance * 0.5 } else { 0.0 }));
+            }
+        }
+        let capacity: f32 = slots.iter().map(|(_, capacity)| capacity).sum();
+        let ratio = if capacity > 0.0 {
+            (extra / capacity).min(1.0)
+        } else {
+            0.0
+        };
+        let remainder = if slots.is_empty() {
+            0.0
+        } else {
+            (extra - capacity).max(0.0) / slots.iter().map(|_| 1.0_f32).sum::<f32>()
+        };
+        for (range, capacity) in slots {
+            let amount = capacity * ratio + remainder;
+            if amount > f32::EPSILON {
+                adjustments.push(SpacingAdjustment { range, amount });
+            }
+        }
+    }
+    Some(ParagraphPlan {
+        hyphen_offsets: vec![None; lines.len()],
+        lines,
+        adjustments,
+    })
+}
+
 /// A spacing delta applied to every shaped cluster in this byte range.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpacingAdjustment {
@@ -552,6 +652,97 @@ mod tests {
         let mut builder = layout_context.ranged_builder(&mut font_context, text, 1.0, false);
         builder.push_default(StyleProperty::FontSize(font_size));
         builder.build(text)
+    }
+
+    #[test]
+    fn sentence_breaks_share_justification_with_cjk_and_preserve_last_lines() {
+        let text = "托马塞洛的推理有相当多的实证支持。\n\n事实上，我们从对非人灵长类动物的研究中得知，这样的实验对于了解语言的起源几乎没有帮助。20世纪70年代，威斯康星大学麦迪逊分校的比较心理学家哈里·哈洛（Harry Harlow）进行了一项臭名昭著的实验。\n\n实验表明，如果恒河猴在隔离环境中长大，它们的行为最终也会受到严重干扰。";
+        let name_space = text.find("Harry Harlow").unwrap() + "Harry".len();
+        let mut checked_name = false;
+        for width in [360.0, 520.0, 800.0] {
+            let mut natural = layout_for(text, 18.0);
+            let plan = plan_wrapped_justification(&mut natural, text, width).unwrap();
+            let original_lines: Vec<_> = natural
+                .lines()
+                .map(|line| {
+                    (
+                        line.text_range(),
+                        line.break_reason(),
+                        line.metrics().advance,
+                    )
+                })
+                .collect();
+            for line in natural.lines() {
+                if matches!(
+                    line.break_reason(),
+                    parley::layout::BreakReason::None | parley::layout::BreakReason::Explicit
+                ) {
+                    assert!(
+                        !plan
+                            .adjustments
+                            .iter()
+                            .any(|adjustment| line.text_range().contains(&adjustment.range.start))
+                    );
+                }
+                if let Some(space) = plan
+                    .adjustments
+                    .iter()
+                    .find(|adjustment| adjustment.range.start == name_space)
+                {
+                    if line.text_range().contains(&name_space) {
+                        let cjk = plan
+                            .adjustments
+                            .iter()
+                            .find(|adjustment| {
+                                line.text_range().contains(&adjustment.range.start)
+                                    && text[adjustment.range.clone()]
+                                        .chars()
+                                        .all(is_cjk_justification_char)
+                            })
+                            .unwrap();
+                        let natural_space = line
+                            .runs()
+                            .find_map(|run| {
+                                run.clusters()
+                                    .find(|cluster| cluster.text_range().start == name_space)
+                                    .map(|cluster| cluster.advance())
+                            })
+                            .unwrap();
+                        assert!((space.amount - cjk.amount - natural_space * 0.5).abs() < 0.01);
+                        checked_name = true;
+                    }
+                }
+            }
+            let mut fonts = FontContext::new();
+            let mut context = LayoutContext::<TextBrush>::new();
+            let mut builder = context.ranged_builder(&mut fonts, text, 1.0, false);
+            builder.push_default(StyleProperty::FontSize(18.0));
+            for adjustment in &plan.adjustments {
+                builder.push(
+                    StyleProperty::LetterSpacing(adjustment.amount),
+                    adjustment.range.clone(),
+                );
+            }
+            let mut adjusted = builder.build(text);
+            apply_breaks(&mut adjusted, &plan.lines, width).unwrap();
+            adjusted.align(
+                parley::Alignment::Start,
+                parley::AlignmentOptions::default(),
+            );
+            for (line, (range, reason, advance)) in adjusted.lines().zip(original_lines) {
+                assert_eq!(line.text_range(), range);
+                assert_eq!(line.break_reason(), reason);
+                if matches!(
+                    reason,
+                    parley::layout::BreakReason::None | parley::layout::BreakReason::Explicit
+                ) {
+                    assert!((line.metrics().advance - advance).abs() < 0.01);
+                } else {
+                    assert!((positioned_line_content_end(line) - width).abs() < 0.1);
+                }
+            }
+        }
+        assert!(checked_name);
     }
 
     #[test]
