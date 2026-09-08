@@ -484,6 +484,7 @@ impl DesktopReader {
         let now = Instant::now();
         self.statistics.tick(
             ctx.input(|i| i.focused)
+                && self.completion.is_none()
                 && !interaction_blocked
                 && self.ui.overlay != ReaderOverlay::Menu
                 && !(self.ui.assistant_panel.is_some() && ctx.text_edit_focused()),
@@ -501,29 +502,21 @@ impl DesktopReader {
             self.snapshot.total_progression,
         );
         ctx.request_repaint_after(Duration::from_secs(1));
-        egui::Area::new("reading-statistics-status".into())
-            .anchor(egui::Align2::RIGHT_BOTTOM, [-10.0, -4.0])
-            .show(&ctx, |ui| {
-                ui.add_enabled_ui(!interaction_blocked, |ui| {
-                    if self.snapshot.total_progression >= 0.999
-                        && ui
-                            .small_button(self.language.text("标记为已读完", "Mark as finished"))
-                            .clicked()
-                    {
-                        self.statistics.mark_finished();
-                    }
-                });
-            });
         self.advance_frame(now);
-        self.apply_pending_focus_wheel_turn();
-        self.copy_shortcut(&ctx, interaction_blocked);
-        self.keyboard_shortcuts(&ctx, interaction_blocked);
+        if self.completion.is_none() {
+            self.apply_pending_focus_wheel_turn();
+            self.copy_shortcut(&ctx, interaction_blocked);
+            self.keyboard_shortcuts(&ctx, interaction_blocked);
+        }
         self.request_frame_repaint(&ctx);
         if let Some(deadline) = self.next_transient_message_deadline() {
             ctx.request_repaint_after(deadline.saturating_duration_since(now));
         }
 
         let (sidebar_progress, assistant_progress) = self.show_side_panels(root_ui);
+        if self.completion.is_some() {
+            return self.completion_page_ui(root_ui, interaction_blocked);
+        }
 
         let background = self.reader.style().background;
         let background_ui = color32(background);

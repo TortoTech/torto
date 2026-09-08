@@ -412,6 +412,11 @@ impl DesktopReader {
             Ok(NavigationAttempt::Pending) => {}
             Ok(NavigationAttempt::Ready(result)) => {
                 let moved = result.outcome == NavigationOutcome::Moved;
+                if !moved && direction == PageDirection::Next {
+                    self.pending_page_turn = None;
+                    self.open_completion_page();
+                    return;
+                }
                 let section_changed = result.snapshot.location.section_index != previous_section;
                 let segment_changed = result.snapshot.location.segment_index != previous_segment;
                 self.apply_snapshot(

@@ -13,6 +13,7 @@ pub(super) const fn snapshot_reanchors_focus(effects: SnapshotEffects) -> bool {
 
 impl DesktopReader {
     pub(in crate::reader) fn go_to_toc(&mut self, id: &str, target: &PublicationUrl) {
+        self.completion = None;
         self.ui.focus_footnotes_visible = false;
         self.ui.focus_footnote_scroll_delta = 0.0;
         if self.is_focus_mode() {
@@ -138,6 +139,9 @@ impl DesktopReader {
             }
             Ok(NavigationAttempt::Ready(_)) => {
                 self.pending_reading_unit_turn = None;
+                if direction == PageDirection::Next {
+                    self.open_completion_page();
+                }
             }
             Err(error) => {
                 self.pending_reading_unit_turn = None;

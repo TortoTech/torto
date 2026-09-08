@@ -62,6 +62,7 @@ mod assistant;
 mod chat_autocomplete;
 mod chat_footnotes;
 mod chat_markdown;
+mod completion;
 mod egui_view;
 mod footnote_layout;
 mod interaction;
@@ -470,6 +471,7 @@ fn resolve_book_display_metadata(
 }
 
 pub(super) struct DesktopReader {
+    completion: Option<completion::CompletionPage>,
     footnote_layout: footnote_layout::FootnoteRenderer,
     statistics: crate::statistics::Tracker,
     reader: ReaderSession,
@@ -3365,6 +3367,7 @@ impl DesktopReader {
         let search = SearchUiState::default();
         Self {
             reader,
+            completion: None,
             statistics: crate::statistics::Tracker::new(&book_id),
             footnote_layout: Default::default(),
             source,

@@ -217,6 +217,22 @@ pub(crate) struct Tracker {
     offset: i32,
 }
 impl Tracker {
+    pub(crate) fn completion_summary(&mut self) -> SyncResult<(u64, Option<String>)> {
+        self.save();
+        flush();
+        if service().failed.load(Ordering::Relaxed) {
+            return Err("Reading statistics could not be saved".into());
+        }
+        let books = aggregate(&events(&database()?)?);
+        Ok(books.get(&self.book).map_or((0, None), |book| {
+            (
+                union_duration(&book.intervals),
+                (book.status == Status::Finished)
+                    .then(|| book.finished.clone())
+                    .flatten(),
+            )
+        }))
+    }
     pub(crate) fn mark_finished(&mut self) {
         self.save();
         record(
