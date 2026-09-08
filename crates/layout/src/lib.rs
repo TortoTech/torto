@@ -2152,7 +2152,7 @@ impl LayoutEngine {
             layout.set_text_indent(
                 first_line_indent,
                 IndentOptions {
-                    each_line: block.style.subparagraph_gap_em.is_some(),
+                    each_line: block.style.sentence_indents,
                     ..IndentOptions::default()
                 },
             );
@@ -3150,27 +3150,7 @@ fn prepare_inline_content(
                 ));
             }
             Inline::Break => {
-                let compact_gap = text
-                    .ends_with('\n')
-                    .then_some(block.style.subparagraph_gap_em)
-                    .flatten();
-                if let Some(gap_em) = compact_gap {
-                    let start = text.len();
-                    text.push('\u{2060}');
-                    spans.push(StyledRange {
-                        range: start..text.len(),
-                        style: TextStyle {
-                            size_scale: (block.style.line_height + gap_em.clamp(0.0, 2.0))
-                                / block.style.line_height.max(0.1),
-                            color: fallback_color,
-                            ..TextStyle::default()
-                        },
-                        footnote_reference_group: 0,
-                        hyphenation_suppressed: true,
-                    });
-                } else {
-                    text.push('\n');
-                }
+                text.push('\n');
             }
         }
     }
@@ -4558,10 +4538,10 @@ mod tests {
         });
         let mut block = TextBlock {
             kind: TextBlockKind::Paragraph,
-            content: vec![run.clone(), Inline::Break, Inline::Break, run],
+            content: vec![run.clone(), Inline::Break, run],
             style: rebook_publication::BlockStyle {
                 indent: 32.0,
-                subparagraph_gap_em: Some(0.3),
+                sentence_indents: true,
                 ..rebook_publication::BlockStyle::default()
             },
             source: None,
@@ -4592,7 +4572,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_subparagraph_break_uses_the_compact_configured_gap() {
+    fn semantic_subparagraph_break_uses_normal_line_height() {
         let block = TextBlock {
             kind: TextBlockKind::Paragraph,
             content: vec![
@@ -4601,7 +4581,6 @@ mod tests {
                     style: TextStyle::default(),
                     link: None,
                 }),
-                Inline::Break,
                 Inline::Break,
                 Inline::Text(TextRun {
                     text: "Second sentence.".into(),
@@ -4612,7 +4591,7 @@ mod tests {
             style: rebook_publication::BlockStyle {
                 indent: 24.0,
                 line_height: 1.5,
-                subparagraph_gap_em: Some(0.3),
+                sentence_indents: true,
                 ..rebook_publication::BlockStyle::default()
             },
             source: None,
@@ -4621,6 +4600,7 @@ mod tests {
         let prepared = LayoutEngine::new().shape_text(&block, &style, 400.0);
 
         assert_eq!(prepared.layout.len(), 2);
+        assert!(!prepared.text.contains('\u{2060}'));
         assert!((prepared.layout.get(0).unwrap().metrics().offset - 24.0).abs() < 0.01);
         assert!((prepared.layout.get(1).unwrap().metrics().offset - 24.0).abs() < 0.01);
         let body_line_height = prepared.layout.get(0).unwrap().metrics().line_height;
@@ -4630,8 +4610,8 @@ mod tests {
             "expected the preceding line to keep the 1.5em body line height, got {body_line_height}"
         );
         assert!(
-            (next_line_height - style.typography.font_size * 1.8).abs() < 0.5,
-            "expected 1.5em line height plus a 0.3em subparagraph gap, got {next_line_height}"
+            (next_line_height - body_line_height).abs() < 0.01,
+            "sentence break must preserve normal line height, got {next_line_height}"
         );
     }
 

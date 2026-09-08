@@ -56,6 +56,7 @@ pub struct PageQuoteBridge {
 
 /// Retained drawing commands for one page. No parsing, shaping, or pagination
 /// occurs while this list is replayed.
+#[derive(Clone)]
 pub struct PageDisplayList {
     width: u32,
     height: u32,
@@ -69,18 +70,31 @@ pub struct PageDisplayList {
     table_regions: Vec<TableRegion>,
     quote_regions: Vec<QuoteRegion>,
     footnote_regions: Vec<FootnoteRegion>,
+    text_groups: Vec<SourceTextGroup>,
 }
 
+#[derive(Clone)]
+struct SourceTextGroup {
+    source: SourceRange,
+    commands: Range<usize>,
+    regions: Range<usize>,
+    inline_regions: Range<usize>,
+    footnotes: Range<usize>,
+}
+
+#[derive(Clone)]
 struct InlineContentRegion {
     bounds: Rect,
     source: SourceRange,
 }
 
+#[derive(Clone)]
 struct TableRegion {
     bounds: Rect,
     sources: Vec<SourceRange>,
 }
 
+#[derive(Clone)]
 struct QuoteRegion {
     bounds: Rect,
     sources: Vec<SourceRange>,
@@ -91,6 +105,7 @@ struct QuoteRegion {
     accent: Color,
 }
 
+#[derive(Clone)]
 struct FootnoteRegion {
     bounds: Rect,
     source: SourceRange,
@@ -158,6 +173,49 @@ fn source_range_highlight_path(rects: impl IntoIterator<Item = Rect>) -> BezPath
 }
 
 impl PageDisplayList {
+    /// Apply a local reflow correction to a paragraph, including its hit-test
+    /// geometry. Other source blocks and the page's scroll geometry stay fixed.
+    pub fn translate_source_text(&self, range: &SourceRange, dy: f32) -> Self {
+        let mut page = self.clone();
+        let delta = Vec2::new(0.0, f64::from(dy));
+        let transform = Affine::translate(delta);
+        for group in &self.text_groups {
+            if group.source.start.spine != range.start.spine
+                || group.source.start.node != range.start.node
+            {
+                continue;
+            }
+            for command in &mut page.commands[group.commands.clone()] {
+                match command {
+                    DisplayCommand::Glyphs(c) => c.transform = transform * c.transform,
+                    DisplayCommand::Image(c) => {
+                        c.transform = transform * c.transform;
+                        c.bounds = c.bounds + delta;
+                    }
+                    DisplayCommand::FillRect(c) => c.rect = c.rect + delta,
+                    DisplayCommand::FillRoundedRect(c) => {
+                        c.rect = RoundedRect::from_rect(c.rect.rect() + delta, c.rect.radii())
+                    }
+                    DisplayCommand::Rule(c) => {
+                        c.start.1 += f64::from(dy);
+                        c.end.1 += f64::from(dy);
+                    }
+                }
+            }
+            for region in &mut page.text_regions[group.regions.clone()] {
+                if let TextRegion::Shaped(r) = region {
+                    r.origin_y += dy;
+                }
+            }
+            for region in &mut page.inline_content_regions[group.inline_regions.clone()] {
+                region.bounds = region.bounds + delta;
+            }
+            for region in &mut page.footnote_regions[group.footnotes.clone()] {
+                region.bounds = region.bounds + delta;
+            }
+        }
+        page
+    }
     /// Logical width of the compiled page.
     pub fn width(&self) -> u32 {
         self.width
@@ -542,6 +600,24 @@ impl PageDisplayList {
             .reduce(|bounds, next| bounds.union(next))
     }
 
+    /// Baseline of the first visible text line intersecting a source range.
+    /// Unlike selection-box edges this tracks actual text when mixed-font line
+    /// metrics change during reflow.
+    pub fn source_text_baseline(&self, range: &SourceRange) -> Option<f32> {
+        self.text_regions.iter().find_map(|region| {
+            let TextRegion::Shaped(region) = region else {
+                return None;
+            };
+            let bytes = region.byte_range_for_source(range)?;
+            region.lines.clone().find_map(|index| {
+                let line = region.layout.get(index)?;
+                let line_range = line.text_range();
+                (bytes.start < line_range.end && bytes.end > line_range.start)
+                    .then_some(region.origin_y + line.metrics().baseline)
+            })
+        })
+    }
+
     pub fn contains_source_anchor(&self, anchor: &SourceAnchor) -> bool {
         self.text_regions
             .iter()
@@ -744,6 +820,7 @@ fn vertical_rect_distance(rect: Rect, y: f32) -> f32 {
     }
 }
 
+#[derive(Clone)]
 enum TextRegion {
     Shaped(ShapedTextRegion),
     Fixed(FixedTextRegion),
@@ -846,6 +923,7 @@ impl TextRegion {
     }
 }
 
+#[derive(Clone)]
 struct ShapedTextRegion {
     layout: Arc<Layout<TextBrush>>,
     text: Arc<str>,
@@ -1232,6 +1310,7 @@ fn scale_source_offset_to_text(
     usize::try_from(scaled).ok()
 }
 
+#[derive(Clone)]
 struct FixedTextRegion {
     text: Arc<str>,
     spans: Arc<[FixedTextSpan]>,
@@ -1455,6 +1534,7 @@ fn source_range_contains(range: &SourceRange, anchor: &SourceAnchor) -> bool {
                 && anchor.text_offset == range.start.text_offset))
 }
 
+#[derive(Clone)]
 enum DisplayCommand {
     Glyphs(GlyphCommand),
     Image(ImageCommand),
@@ -1514,6 +1594,7 @@ impl DisplayCommand {
     }
 }
 
+#[derive(Clone)]
 struct GlyphCommand {
     font: FontData,
     font_size: f32,
@@ -1525,6 +1606,7 @@ struct GlyphCommand {
     glyphs: Arc<[Glyph]>,
 }
 
+#[derive(Clone)]
 struct ImageCommand {
     image: ImageBrush,
     transform: Affine,
@@ -1536,16 +1618,19 @@ struct ImageCommand {
     source: Option<SourceRange>,
 }
 
+#[derive(Clone)]
 struct FillRectCommand {
     rect: Rect,
     color: Color,
 }
 
+#[derive(Clone)]
 struct FillRoundedRectCommand {
     rect: RoundedRect,
     color: Color,
 }
 
+#[derive(Clone)]
 struct RuleCommand {
     start: (f64, f64),
     end: (f64, f64),
@@ -1571,9 +1656,16 @@ impl DisplayListCompiler {
         let mut table_regions = Vec::new();
         let mut quote_regions = Vec::new();
         let mut footnote_regions = Vec::new();
+        let mut text_groups: Vec<SourceTextGroup> = Vec::new();
         for item in &page.items {
             match item {
                 PageItem::Text(text) => {
+                    let starts = (
+                        commands.len(),
+                        text_regions.len(),
+                        inline_content_regions.len(),
+                        footnote_regions.len(),
+                    );
                     if let Some(region) = text_region(text) {
                         text_regions.push(region);
                     }
@@ -1583,6 +1675,20 @@ impl DisplayListCompiler {
                         &mut footnote_regions,
                         text,
                     );
+                    // Synthetic discretionary hyphens follow their parent text.
+                    let source = text
+                        .source
+                        .clone()
+                        .or_else(|| text_groups.last().map(|g| g.source.clone()));
+                    if let Some(source) = source {
+                        text_groups.push(SourceTextGroup {
+                            source,
+                            commands: starts.0..commands.len(),
+                            regions: starts.1..text_regions.len(),
+                            inline_regions: starts.2..inline_content_regions.len(),
+                            footnotes: starts.3..footnote_regions.len(),
+                        });
+                    }
                 }
                 PageItem::Quote(quote) => {
                     let bounds = quote_bounds(quote);
@@ -1700,6 +1806,7 @@ impl DisplayListCompiler {
         }
 
         PageDisplayList {
+            text_groups,
             width: page.viewport.width,
             height: page.viewport.height,
             content_top,
@@ -2356,6 +2463,31 @@ mod tests {
             Some(source.clone())
         );
         assert_eq!(list.footnote_source_at(0.0, 0.0), None);
+        let shifted = list.translate_source_text(&source, 1.85);
+        assert!(
+            (shifted.source_text_baseline(&source).unwrap()
+                - list.source_text_baseline(&source).unwrap()
+                - 1.85)
+                .abs()
+                < 0.001
+        );
+        let shifted_icon = shifted.footnote_regions[0].bounds;
+        assert!((shifted_icon.y0 - icon_bounds.y0 - 1.85).abs() < 0.001);
+        assert_eq!(
+            shifted.footnote_source_at(
+                shifted_icon.center().x as f32,
+                shifted_icon.center().y as f32
+            ),
+            Some(source.clone())
+        );
+        for (old, new) in list
+            .source_rects(std::slice::from_ref(&source))
+            .iter()
+            .zip(shifted.source_rects(std::slice::from_ref(&source)))
+        {
+            assert!((new.y0 - old.y0 - 1.85).abs() < 0.001);
+            assert_eq!(old.x0, new.x0);
+        }
         let painted_glyphs = list
             .commands
             .iter()

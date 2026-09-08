@@ -60,8 +60,10 @@ static NEXT_CHAT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 mod assistant;
 mod chat_autocomplete;
+mod chat_footnotes;
 mod chat_markdown;
 mod egui_view;
+mod footnote_layout;
 mod interaction;
 mod navigation;
 pub(super) mod render;
@@ -468,6 +470,7 @@ fn resolve_book_display_metadata(
 }
 
 pub(super) struct DesktopReader {
+    footnote_layout: footnote_layout::FootnoteRenderer,
     statistics: crate::statistics::Tracker,
     reader: ReaderSession,
     source: Arc<dyn BookSource>,
@@ -531,6 +534,7 @@ pub(super) struct DesktopReader {
     focus_overflow_origin: Option<(SourceRange, egui::Rect, egui::Vec2, f32)>,
     focus_selection_anchor: Option<usize>,
     focus_target_offset: Option<f32>,
+    focus_reflow_anchor: Option<FocusReflowAnchor>,
     focus_anchor: Option<SourceAnchor>,
     focus_toc_override: Option<String>,
     pending_page_turn: Option<PageDirection>,
@@ -586,6 +590,7 @@ struct SelectedImage {
     scroll_mode: bool,
 }
 
+#[derive(Clone)]
 struct ScrollSectionLayout {
     section_index: usize,
     reading_unit_index: usize,
@@ -1678,6 +1683,15 @@ impl ScrollSectionLayout {
         })
     }
 
+    fn source_baseline(&self, range: &SourceRange) -> Option<f32> {
+        self.pages.iter().enumerate().find_map(|(index, entry)| {
+            entry
+                .page
+                .source_text_baseline(range)
+                .map(|y| self.content_y(index, y))
+        })
+    }
+
     fn first_visible_page(&self, offset_y: f32) -> Option<ReaderPosition> {
         self.pages
             .iter()
@@ -1707,7 +1721,136 @@ struct ScrollViewportState {
     size: egui::Vec2,
 }
 
+struct FocusReflowAnchor {
+    section_index: usize,
+    reading_unit_index: usize,
+    range: SourceRange,
+    screen_y: f32,
+    uses_baseline: bool,
+    visible_start_offset: Option<f32>,
+    viewport_height: f32,
+}
+
+fn reflow_anchor_offset(
+    content_y: f32,
+    screen_y: f32,
+    viewport_height: f32,
+    content_height: f32,
+) -> f32 {
+    (content_y + viewport_height * 0.5 - screen_y).clamp(
+        0.0,
+        (focus_scroll_content_height(content_height, viewport_height) - viewport_height).max(0.0),
+    )
+}
+
 impl DesktopReader {
+    fn capture_focus_reflow_anchor(&self) -> Option<FocusReflowAnchor> {
+        if !self.is_focus_mode() {
+            return None;
+        }
+        let viewport = self.scroll_viewport?;
+        let layout = self.scroll_section.as_ref()?;
+        let unit = self.focus_units.get(self.focus_unit_index)?;
+        let padding = self.scroll_content_padding(viewport.size.y);
+        let visible_top = viewport.offset_y - padding;
+        let mut range = unit.paint_ranges.first()?.clone();
+        let top = layout.source_top(&range)?;
+        if top < visible_top {
+            // Resolve a real text cluster at the visible top, not a percentage of
+            // the paragraph: sentence splitting changes its height non-uniformly.
+            let (page_index, page_y) =
+                layout.page_at_content_y(visible_top.max(unit.rect.top()))?;
+            let page = &layout.pages[page_index].page;
+            let hit = page.hit_test_text(unit.rect.left(), page_y, false)?;
+            let fragment =
+                page.selection_fragment(hit.region_index, hit.cluster_start..hit.cluster_end)?;
+            if !unit
+                .paint_ranges
+                .iter()
+                .any(|r| source_range_contains_anchor(r, &fragment.range.start))
+            {
+                return None;
+            }
+            range = fragment.range;
+        }
+        let baseline = layout.source_baseline(&range);
+        let anchor_y = baseline.or_else(|| layout.source_top(&range))?;
+        Some(FocusReflowAnchor {
+            section_index: layout.section_index,
+            reading_unit_index: layout.reading_unit_index,
+            range,
+            screen_y: anchor_y + padding - viewport.offset_y,
+            uses_baseline: baseline.is_some(),
+            visible_start_offset: (top >= visible_top && top < visible_top + viewport.size.y)
+                .then_some(viewport.offset_y),
+            viewport_height: viewport.size.y,
+        })
+    }
+
+    fn locally_correct_focus_reflow(
+        &mut self,
+        layout: Arc<ScrollSectionLayout>,
+        viewport_height: f32,
+    ) -> Arc<ScrollSectionLayout> {
+        let Some(anchor) = self.focus_reflow_anchor.as_ref() else {
+            return layout;
+        };
+        if !anchor.uses_baseline
+            || anchor.section_index != layout.section_index
+            || anchor.reading_unit_index != layout.reading_unit_index
+            || (anchor.viewport_height - viewport_height).abs() > MOTION_EPSILON
+        {
+            return layout;
+        }
+        let Some(offset) = anchor.visible_start_offset else {
+            return layout;
+        };
+        let Some(baseline) = layout.source_baseline(&anchor.range) else {
+            return layout;
+        };
+        let dy = anchor.screen_y + offset - viewport_height * 0.5 - baseline;
+        if dy.abs() < 0.001 {
+            return layout;
+        }
+        let mut corrected = (*layout).clone();
+        for entry in &mut corrected.pages {
+            if entry.page.source_text_baseline(&anchor.range).is_some() {
+                entry.page = Arc::new(entry.page.translate_source_text(&anchor.range, dy));
+            }
+        }
+        let corrected = Arc::new(corrected);
+        self.scroll_section = Some(corrected.clone());
+        self.page_scenes.clear();
+        self.page_scene_lru.clear();
+        self.bump_scene_revision();
+        corrected
+    }
+
+    fn restore_focus_reflow_anchor(
+        &mut self,
+        layout: &ScrollSectionLayout,
+        viewport_height: f32,
+    ) -> Option<f32> {
+        let anchor = self.focus_reflow_anchor.take()?;
+        if !self.is_focus_mode()
+            || anchor.section_index != layout.section_index
+            || anchor.reading_unit_index != layout.reading_unit_index
+        {
+            return None;
+        }
+        let top = if anchor.uses_baseline {
+            layout.source_baseline(&anchor.range)?
+        } else {
+            layout.source_top(&anchor.range)?
+        };
+        Some(reflow_anchor_offset(
+            top,
+            anchor.screen_y,
+            viewport_height,
+            layout.content_height,
+        ))
+    }
+
     fn focus_mode_allowed(&self) -> bool {
         self.format != BookFormat::Pdf
             || self
@@ -3223,6 +3366,7 @@ impl DesktopReader {
         Self {
             reader,
             statistics: crate::statistics::Tracker::new(&book_id),
+            footnote_layout: Default::default(),
             source,
             rewrite_source,
             translation_source,
@@ -3313,6 +3457,7 @@ impl DesktopReader {
             focus_overflow_origin: None,
             focus_selection_anchor: None,
             focus_target_offset: None,
+            focus_reflow_anchor: None,
             focus_anchor: restored_focus_anchor,
             focus_toc_override: None,
             pending_page_turn: None,
@@ -3390,6 +3535,143 @@ fn logical_dimension(value: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a local book via TORTO_REFLOW_BOOK"]
+    fn inspect_language_game_first_line_reflow() {
+        use super::*;
+        let book = rebook_formats::open_file(std::env::var("TORTO_REFLOW_BOOK").unwrap()).unwrap();
+        let original = book.source();
+        let structured = crate::plugins::ParagraphStructureSource::new(original.clone());
+        let mut found = None;
+        for index in 0..original.book().sections.len() {
+            let section = original.parse_section(index).unwrap();
+            if let Some(block) = section
+                .blocks
+                .iter()
+                .find(|b| block_focus_text(b).starts_with("对达尔文的进化论来说"))
+            {
+                found = Some((index, block.clone()));
+                break;
+            }
+        }
+        let (index, before) = found.expect("target paragraph");
+        let range = block_source_range(&before).unwrap().clone();
+        eprintln!("target section={index} node={}", range.start.node);
+        structured
+            .set_active(
+                crate::plugins::ParagraphStructureKey {
+                    section_index: index,
+                    node: range.start.node.clone(),
+                },
+                true,
+            )
+            .unwrap();
+        let section = structured.parse_section(index).unwrap();
+        let original_section = original.parse_section(index).unwrap();
+        let mut style = rebook_layout::ReaderStyle::default();
+        style.typography = crate::preferences::load_reader_preferences()
+            .unwrap()
+            .typography;
+        style.typesetting = rebook_layout::ReaderTypesetting::unified();
+        style.writing_system = original.book().metadata.writing_system();
+        style.focus_footnote_icons = true;
+        style.horizontal_margin = 0.0;
+        style.spread = rebook_layout::SpreadMode::Scroll;
+        let mut engine = rebook_layout::LayoutEngine::with_fonts(
+            crate::fonts::embedded_reader_fonts().iter().cloned(),
+        );
+        for width in [650, 800, 1000] {
+            let mut before_baseline = None;
+            for (name, blocks) in [
+                ("before", &original_section.blocks),
+                ("after", &section.blocks),
+            ] {
+                let layout = engine
+                    .layout_blocks(
+                        original.as_ref(),
+                        blocks,
+                        rebook_layout::LayoutViewport::new(width, 10000).unwrap(),
+                        &style,
+                    )
+                    .unwrap();
+                for page in &layout.pages {
+                    for item in &page.items {
+                        if let rebook_layout::PageItem::Text(p) = item {
+                            if !p
+                                .source
+                                .as_ref()
+                                .is_some_and(|r| r.start.node == range.start.node)
+                            {
+                                continue;
+                            }
+                            let line = p.layout.get(p.lines.start).unwrap();
+                            let list =
+                                rebook_renderer::DisplayListCompiler::default().compile(page);
+                            let baseline = list.source_text_baseline(&range).unwrap();
+                            assert!(
+                                (baseline - (p.origin_y + line.metrics().baseline)).abs() < 0.001
+                            );
+                            if name == "before" {
+                                before_baseline = Some(baseline);
+                            } else {
+                                let previous = before_baseline.unwrap();
+                                let corrected =
+                                    list.translate_source_text(&range, previous - baseline);
+                                assert!(
+                                    (corrected.source_text_baseline(&range).unwrap() - previous)
+                                        .abs()
+                                        < 0.001
+                                );
+                                for other in &page.items {
+                                    if let rebook_layout::PageItem::Text(other) = other
+                                        && let Some(other_range) = &other.source
+                                        && other_range.start.node != range.start.node
+                                    {
+                                        assert_eq!(
+                                            list.source_rects(std::slice::from_ref(other_range)),
+                                            corrected
+                                                .source_rects(std::slice::from_ref(other_range))
+                                        );
+                                    }
+                                }
+                                let old_offset = previous + 400.0 - 120.0;
+                                let screen_y = previous + 400.0 - old_offset;
+                                let local_offset = reflow_anchor_offset(
+                                    corrected.source_text_baseline(&range).unwrap(),
+                                    screen_y,
+                                    800.0,
+                                    10000.0,
+                                );
+                                assert!(
+                                    (local_offset - old_offset).abs() < 0.001,
+                                    "local correction must not scroll preceding paragraphs"
+                                );
+                                let new_offset =
+                                    reflow_anchor_offset(baseline, screen_y, 800.0, 10000.0);
+                                let drift = baseline + 400.0 - new_offset - screen_y;
+                                assert!(drift.abs() < 0.001);
+                                let restored_offset =
+                                    reflow_anchor_offset(previous, screen_y, 800.0, 10000.0);
+                                assert!((restored_offset - old_offset).abs() < 0.001);
+                                eprintln!(
+                                    "{width} baseline delta={} corrected screen drift={drift}",
+                                    baseline - previous
+                                );
+                            }
+                            eprintln!(
+                                "{width} {name} origin=({}, {}) metrics={:?} source_top={:?}",
+                                p.origin_x,
+                                p.origin_y,
+                                line.metrics(),
+                                list.source_content_bounds(std::slice::from_ref(&range))
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     use super::navigation::snapshot_reanchors_focus;
     use super::{
         BookDisplayMetadata, Duration, FOCUS_SCROLL_MAX_DURATION, FOCUS_SCROLL_MIN_DURATION,
@@ -3561,6 +3843,68 @@ mod tests {
             );
         }
         assert_eq!(source.parse_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn chat_footnotes_capture_only_selected_references_and_cached_translation() {
+        let mut current = footnote_section("current", "current.xhtml", "Selected paragraph 2 2");
+        let Block::Text(paragraph) = &mut current.blocks[0] else {
+            unreachable!()
+        };
+        paragraph.kind = TextBlockKind::Paragraph;
+        let range = paragraph.source.clone().unwrap();
+        for _ in 0..2 {
+            paragraph.content.push(Inline::Text(TextRun {
+                text: "2".into(),
+                style: TextStyle {
+                    link_role: LinkRole::FootnoteReference,
+                    ..TextStyle::default()
+                },
+                link: Some(PublicationUrl::parse("linked.xhtml#note").unwrap()),
+            }));
+        }
+        let linked = footnote_section("linked", "linked.xhtml", "2 Original note");
+        let source = CountingFootnoteSource {
+            book: Book {
+                id: PublicationId::new("chat-footnotes").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: [&current, &linked]
+                    .into_iter()
+                    .map(|section| SpineItem {
+                        id: section.id.clone(),
+                        href: section.href.clone(),
+                        media_type: "application/xhtml+xml".into(),
+                        linear: true,
+                        properties: Vec::new(),
+                    })
+                    .collect(),
+                table_of_contents: Vec::new(),
+            },
+            sections: vec![current.clone(), linked],
+            parse_count: AtomicUsize::new(0),
+        };
+        let displayed = CountingFootnoteSource {
+            book: source.book.clone(),
+            sections: vec![
+                current,
+                footnote_section("linked", "linked.xhtml", "2 译文脚注"),
+            ],
+            parse_count: AtomicUsize::new(0),
+        };
+        let snapshot =
+            super::chat_footnotes::capture(&source, Some(&displayed), &[range.clone(), range])
+                .unwrap()
+                .unwrap();
+        assert_eq!(snapshot.matches("Original note").count(), 1);
+        assert_eq!(snapshot.matches("译文脚注").count(), 1);
+        assert_eq!(snapshot.matches("original_marker").count(), 3); // explanation + two references
+        assert!(
+            super::chat_footnotes::capture(&source, None, &[])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(source.parse_count.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -4731,6 +5075,29 @@ mod tests {
 
         assert!(target > content_height);
         assert!(target <= maximum_offset);
+    }
+
+    #[test]
+    fn sentence_reflow_keeps_anchor_screen_position_when_content_grows_or_shrinks() {
+        use super::reflow_anchor_offset;
+        let viewport_height = 800.0;
+        // A visible paragraph opening stays at 120px even after crossing the
+        // oversized-unit threshold; a clipped current line also stays in place.
+        for screen_y in [120.0, -8.0] {
+            for (content_y, content_height) in [(500.0, 1800.0), (920.0, 2600.0), (410.0, 1500.0)] {
+                let offset =
+                    reflow_anchor_offset(content_y, screen_y, viewport_height, content_height);
+                assert!((content_y + viewport_height * 0.5 - offset - screen_y).abs() < 0.01);
+            }
+        }
+    }
+
+    #[test]
+    fn sentence_reflow_anchor_only_clamps_to_document_scroll_bounds() {
+        use super::reflow_anchor_offset;
+        assert_eq!(reflow_anchor_offset(0.0, 900.0, 800.0, 1000.0), 0.0);
+        let max = focus_scroll_content_height(1000.0, 800.0) - 800.0;
+        assert_eq!(reflow_anchor_offset(5000.0, 0.0, 800.0, 1000.0), max);
     }
 
     #[test]

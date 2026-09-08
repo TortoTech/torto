@@ -1287,7 +1287,23 @@ impl DesktopReader {
             .as_ref()
             .map(|s| s.images.clone())
             .unwrap_or_default();
-        let display_content = if images.is_empty() {
+        let footnotes = if self.is_focus_mode() && kind == ChatRequestKind::Normal {
+            selection.as_ref().and_then(|selection| {
+                match super::chat_footnotes::capture(
+                    self.rewrite_source.as_ref(),
+                    self.translation
+                        .render_enabled
+                        .then_some(self.source.as_ref()),
+                    &selection.ranges,
+                ) {
+                    Ok(notes) => notes,
+                    Err(_) => Some("关联脚注资料读取失败，请勿猜测缺失的脚注内容。".to_owned()),
+                }
+            })
+        } else {
+            None
+        };
+        let display_content = if images.is_empty() && footnotes.is_none() {
             display_content
         } else {
             display_content.or_else(|| Some(question.clone()))
@@ -1300,6 +1316,11 @@ impl DesktopReader {
                     .map(|s| s.text.chars().take(20_000).collect::<String>())
                     .unwrap_or_default()
             )
+        } else {
+            question
+        };
+        let question = if let Some(footnotes) = footnotes {
+            format!("{question}\n\n{footnotes}")
         } else {
             question
         };
@@ -1833,6 +1854,7 @@ impl DesktopReader {
         let Some(activate) = focus_structure_activation(&candidates) else {
             return;
         };
+        let reflow_anchor = self.capture_focus_reflow_anchor();
         for (key, active) in candidates {
             if active == activate {
                 continue;
@@ -1843,6 +1865,7 @@ impl DesktopReader {
             }
         }
         self.refresh_translation_view();
+        self.focus_reflow_anchor = reflow_anchor;
     }
 
     pub(super) fn focus_structure_is_active(&self) -> bool {

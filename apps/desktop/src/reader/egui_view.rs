@@ -1,12 +1,9 @@
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, Pos2, Rect, RichText, TextureId, Vec2};
-use rebook_layout::linebreak::{MeasuredCluster, SpacingAdjustment, plan_measured_text};
 use rebook_layout::{SpreadMode, reading_content_left, reading_content_width};
 use rebook_reader::{PageDirection, ReaderImage, SelectionGranularity};
-use unicode_segmentation::UnicodeSegmentation;
 
 use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, chat_reference_token, move_suggestion_index,
@@ -23,9 +20,9 @@ use crate::plugins::{
 use crate::preferences::{AppLanguage, AppTheme};
 use crate::settings::ReaderSettingsChange;
 use crate::ui::{
-    Icon, ToastKind, decode_color_image, dialog_action_button, footnote_link_color, icon,
-    icon_button, navigation_button, navigation_text_button, paint_icon, palette,
-    selectable_icon_button, show_toast, small_icon_button,
+    Icon, ToastKind, decode_color_image, dialog_action_button, icon, icon_button,
+    navigation_button, navigation_text_button, paint_icon, palette, selectable_icon_button,
+    show_toast, small_icon_button,
 };
 
 pub(super) const SIDEBAR_WIDTH: f32 = 256.0;
@@ -47,7 +44,7 @@ const ASSISTANT_SELECTION_SCROLL_EDGE: f32 = 36.0;
 const ASSISTANT_SELECTION_SCROLL_MIN_SPEED: f32 = 90.0;
 const ASSISTANT_SELECTION_SCROLL_MAX_SPEED: f32 = 640.0;
 const ASSISTANT_KEYBOARD_SCROLL_STEP: f32 = 64.0;
-const TOOLBAR_HEIGHT: f32 = 48.0;
+const TOOLBAR_HEIGHT: f32 = 44.0;
 const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
 const TOOLBAR_TITLE_SIZE: f32 = 15.0;
 const TOC_ROW_HEIGHT: f32 = 36.0;
@@ -60,138 +57,6 @@ const IMAGE_PREVIEW_MAX_ZOOM: f32 = 8.0;
 const IMAGE_PREVIEW_WHEEL_SPEED: f32 = 0.0025;
 const IMAGE_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
 const IMAGE_LONG_PRESS_MAX_TRAVEL: f32 = 8.0;
-
-struct FootnoteTextLayout {
-    lines: Vec<FootnoteTextLine>,
-    height: f32,
-}
-
-struct FootnoteTextLine {
-    runs: Vec<FootnoteTextRun>,
-    height: f32,
-}
-
-struct FootnoteTextRun {
-    x: f32,
-    galley: Arc<egui::Galley>,
-}
-
-fn footnote_cluster_spacing(
-    adjustments: &[SpacingAdjustment],
-    range: &std::ops::Range<usize>,
-) -> f32 {
-    adjustments
-        .iter()
-        .find(|adjustment| {
-            adjustment.range.start <= range.start && adjustment.range.end >= range.end
-        })
-        .map_or(0.0, |adjustment| adjustment.amount)
-}
-
-fn optimized_footnote_text_layout(
-    ctx: &egui::Context,
-    text: &str,
-    font: &egui::FontId,
-    color: Color32,
-    width: f32,
-) -> FootnoteTextLayout {
-    ctx.fonts_mut(|fonts| {
-        let graphemes = text
-            .grapheme_indices(true)
-            .map(|(start, grapheme)| {
-                let range = start..start + grapheme.len();
-                let advance = fonts
-                    .layout_no_wrap(grapheme.to_owned(), font.clone(), color)
-                    .size()
-                    .x;
-                MeasuredCluster {
-                    range,
-                    advance,
-                    em: font.size,
-                    ordinary_baseline: true,
-                    footnote_reference: false,
-                }
-            })
-            .collect::<Vec<_>>();
-        let Some(plan) = plan_measured_text(text, &graphemes, width, 0.0, font.size) else {
-            let galley = fonts.layout(text.to_owned(), font.clone(), color, width);
-            return FootnoteTextLayout {
-                height: galley.size().y,
-                lines: vec![FootnoteTextLine {
-                    height: galley.size().y,
-                    runs: vec![FootnoteTextRun { x: 0.0, galley }],
-                }],
-            };
-        };
-
-        let mut lines = Vec::with_capacity(plan.lines.len());
-        let mut cluster_start = 0;
-        for (line_index, line) in plan.lines.iter().enumerate() {
-            let cluster_end = cluster_start
-                + usize::try_from(line.cluster_count).unwrap_or(graphemes.len() - cluster_start);
-            let cluster_end = cluster_end.min(graphemes.len());
-            let mut visible_end = cluster_end;
-            if line_index + 1 < plan.lines.len() {
-                while visible_end > cluster_start
-                    && text[graphemes[visible_end - 1].range.clone()]
-                        .chars()
-                        .all(|character| character.is_whitespace() && character != '\u{00a0}')
-                {
-                    visible_end -= 1;
-                }
-            }
-            let mut x = 0.0;
-            let mut height = 0.0_f32;
-            let mut runs = Vec::with_capacity(visible_end.saturating_sub(cluster_start));
-            for cluster in &graphemes[cluster_start..visible_end] {
-                let galley = fonts.layout_no_wrap(
-                    text[cluster.range.clone()].to_owned(),
-                    font.clone(),
-                    color,
-                );
-                height = height.max(galley.size().y);
-                runs.push(FootnoteTextRun { x, galley });
-                x += cluster.advance + footnote_cluster_spacing(&plan.adjustments, &cluster.range);
-            }
-            if !runs.is_empty() {
-                lines.push(FootnoteTextLine {
-                    runs,
-                    height: height.max(font.size),
-                });
-            }
-            cluster_start = cluster_end;
-        }
-        if lines.is_empty() {
-            let galley = fonts.layout(text.to_owned(), font.clone(), color, width);
-            return FootnoteTextLayout {
-                height: galley.size().y,
-                lines: vec![FootnoteTextLine {
-                    height: galley.size().y,
-                    runs: vec![FootnoteTextRun { x: 0.0, galley }],
-                }],
-            };
-        }
-        FootnoteTextLayout {
-            height: lines.iter().map(|line| line.height).sum(),
-            lines,
-        }
-    })
-}
-
-fn paint_footnote_text_line(ui: &mut egui::Ui, line: &FootnoteTextLine, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width().max(1.0), line.height),
-        egui::Sense::hover(),
-    );
-    let painter = ui.painter_at(rect);
-    for run in &line.runs {
-        painter.galley(
-            Pos2::new(rect.left() + run.x, rect.top()),
-            Arc::clone(&run.galley),
-            color,
-        );
-    }
-}
 
 const fn should_hide_reader_cursor(
     is_focus_mode: bool,
@@ -789,6 +654,7 @@ impl DesktopReader {
                 return rect;
             }
         };
+        let layout = self.locally_correct_focus_reflow(layout, size.y);
         let rebuild_focus_units = self.is_focus_mode() && self.focus_units.is_empty();
         if rebuild_focus_units {
             self.rebuild_focus_units(&layout);
@@ -822,7 +688,9 @@ impl DesktopReader {
             scroll_area = scroll_area.scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR);
         }
         if rebuild_focus_units || (self.is_focus_mode() && self.scroll_viewport.is_none()) {
-            self.focus_target_offset = self.focus_unit_target_offset(size.y);
+            self.focus_target_offset = self
+                .restore_focus_reflow_anchor(&layout, size.y)
+                .or_else(|| self.focus_unit_target_offset(size.y));
             self.ui.focus_scroll_motion = None;
         }
         if let Some(motion) = self.ui.focus_scroll_motion {
@@ -1849,6 +1717,7 @@ impl DesktopReader {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui, background: Color32) {
+        let vertical_padding = ((TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) / 2.0) as i8;
         let toolbar_width = ui.available_width();
         let hover_rect = Rect::from_min_size(
             ui.next_widget_position(),
@@ -1860,10 +1729,10 @@ impl DesktopReader {
         let chapter_title = self.current_chapter_title().to_owned();
         egui::Frame::new()
             .fill(background)
-            .inner_margin(egui::Margin::symmetric(0, SIDEBAR_PADDING))
+            .inner_margin(egui::Margin::symmetric(0, vertical_padding))
             .show(ui, |ui| {
                 ui.set_min_width(toolbar_width);
-                ui.set_min_height(TOOLBAR_HEIGHT - f32::from(SIDEBAR_PADDING) * 2.0);
+                ui.set_min_height(TOOLBAR_CONTROL_SIZE);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let left_control_count = if self.ui.sidebar_open { 2.0 } else { 3.0 }
@@ -2223,27 +2092,33 @@ impl DesktopReader {
         };
         let maximum_body_height = (viewport.height() * 0.52).clamp(160.0, 380.0);
         let frame_horizontal_margin = 24.0;
-        let leading_icon_width = 19.0;
         let scrollbar_reserve = 8.0;
         let style = ctx.style_of(crate::ui::theme());
-        let text_width = (width
-            - frame_horizontal_margin
-            - leading_icon_width
-            - style.spacing.item_spacing.x
-            - scrollbar_reserve)
-            .max(1.0);
+        let text_width = (width - frame_horizontal_margin - scrollbar_reserve).max(1.0);
         let body_font = egui::TextStyle::Body.resolve(style.as_ref());
         let text_color = palette().text;
         let footnote_text_layouts = footnotes
             .iter()
             .map(|footnote| {
-                optimized_footnote_text_layout(
-                    ctx,
-                    &footnote.text,
-                    &body_font,
-                    text_color,
-                    text_width,
-                )
+                self.footnote_layout
+                    .layout(
+                        self.source.as_ref(),
+                        &footnote.text,
+                        &self.reader.style(),
+                        body_font.size,
+                        text_color,
+                        text_width,
+                    )
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "footnote layout failed");
+                        super::footnote_layout::FootnoteLayout::fallback(
+                            ctx,
+                            &footnote.text,
+                            &body_font,
+                            text_color,
+                            text_width,
+                        )
+                    })
             })
             .collect::<Vec<_>>();
         let measured_text_height = footnote_text_layouts
@@ -2282,7 +2157,6 @@ impl DesktopReader {
                     });
                     let routed_scroll = wheel_scroll - keyboard_scroll;
                     ui.horizontal_top(|ui| {
-                        ui.add(icon(Icon::Info).size(19.0).color(footnote_link_color()));
                         let content_width = ui.available_width().max(1.0);
                         ui.vertical(|ui| {
                             ui.set_width(content_width);
@@ -2304,9 +2178,7 @@ impl DesktopReader {
                                         }
                                         ui.vertical(|ui| {
                                             ui.spacing_mut().item_spacing.y = 0.0;
-                                            for line in &layout.lines {
-                                                paint_footnote_text_line(ui, line, text_color);
-                                            }
+                                            layout.paint(ui);
                                         });
                                     }
                                 });

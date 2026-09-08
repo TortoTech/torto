@@ -1273,6 +1273,7 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         ui,
                         "chat-reasoning-effort",
                         &mut settings.chat_reasoning_effort,
+                        language,
                     );
                 });
                 ui.end_row();
@@ -1474,6 +1475,7 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         ui,
                         "translation-reasoning-effort",
                         &mut settings.translation_reasoning_effort,
+                        language,
                     );
                 });
                 ui.end_row();
@@ -1527,17 +1529,30 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     });
 }
 
+fn reasoning_effort_label(language: AppLanguage, effort: ReasoningEffort) -> &'static str {
+    let chinese = match effort {
+        ReasoningEffort::Default => "默认",
+        ReasoningEffort::None => "不思考",
+        ReasoningEffort::Minimal => "极低",
+        ReasoningEffort::Low => "低",
+        ReasoningEffort::Medium => "中",
+        ReasoningEffort::High => "高",
+    };
+    language.text(chinese, effort.label())
+}
+
 fn reasoning_effort_selector(
     ui: &mut egui::Ui,
     id_salt: &'static str,
     selected: &mut ReasoningEffort,
+    language: AppLanguage,
 ) {
     egui::ComboBox::from_id_salt(id_salt)
         .width(SETTINGS_MODEL_SELECT_WIDTH)
-        .selected_text(selected.label())
+        .selected_text(reasoning_effort_label(language, *selected))
         .show_ui(ui, |ui| {
             for effort in ReasoningEffort::ALL {
-                ui.selectable_value(selected, effort, effort.label());
+                ui.selectable_value(selected, effort, reasoning_effort_label(language, effort));
             }
         });
 }

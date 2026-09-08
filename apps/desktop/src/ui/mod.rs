@@ -549,7 +549,7 @@ pub(crate) fn selectable_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -
 }
 
 fn painted_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {
-    painted_icon_button_sized(ui, glyph, selected, 32.0, 17.0)
+    painted_icon_button_sized(ui, glyph, selected, 32.0, 18.0)
 }
 
 fn painted_icon_button_sized(

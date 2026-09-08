@@ -247,9 +247,9 @@ mod list_structure_tests {
                 .iter()
                 .filter(|inline| matches!(inline, Inline::Break))
                 .count(),
-            2
+            1
         );
-        assert_eq!(block.style.subparagraph_gap_em, Some(0.3));
+        assert!(block.style.sentence_indents);
     }
 }
 
@@ -672,12 +672,11 @@ fn apply_sentence_structure(block: &mut TextBlock, language_hint: &str) {
     for (index, atom) in atoms.iter().enumerate() {
         if index > 0 {
             content.push(Inline::Break);
-            content.push(Inline::Break);
         }
         content.extend(slice_inlines(&original, atom.start, atom.end));
     }
     block.content = content;
-    block.style.subparagraph_gap_em = Some(0.3);
+    block.style.sentence_indents = true;
 }
 
 fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
@@ -800,11 +799,8 @@ mod tests {
             source: None,
         };
         apply_sentence_structure(&mut block, "zh");
-        assert_eq!(
-            inline_text(&block.content),
-            "第一句。\n\n第二句！\n\n第三句？"
-        );
-        assert_eq!(block.style.subparagraph_gap_em, Some(0.3));
+        assert_eq!(inline_text(&block.content), "第一句。\n第二句！\n第三句？");
+        assert!(block.style.sentence_indents);
     }
 
     #[test]
@@ -924,24 +920,24 @@ mod tests {
         };
         assert_eq!(
             inline_text(&figure.captions[0].content),
-            "Figure one. \n\nSecond sentence."
+            "Figure one. \nSecond sentence."
         );
         let Block::Text(caption) = &section.blocks[1] else {
             panic!("expected standalone caption");
         };
         assert_eq!(
             inline_text(&caption.content),
-            "Figure two. \n\nAnother sentence."
+            "Figure two. \nAnother sentence."
         );
         let Block::Quote(quote) = &section.blocks[2] else {
             panic!("expected quote")
         };
         assert_eq!(
             inline_text(&quote.body[0].content),
-            "First sentence. \n\nSecond sentence."
+            "First sentence. \nSecond sentence."
         );
         assert_eq!(quote.body[0].kind, TextBlockKind::Blockquote);
-        assert_eq!(quote.body[0].style.subparagraph_gap_em, Some(0.3));
+        assert!(quote.body[0].style.sentence_indents);
         let Block::Quote(original) = &original_quote else {
             unreachable!()
         };
@@ -953,7 +949,7 @@ mod tests {
         };
         assert_eq!(
             inline_text(&legacy.content),
-            "Legacy sentence. \n\nAnother sentence."
+            "Legacy sentence. \nAnother sentence."
         );
         source.set_active(quote_key, false).unwrap();
         assert_eq!(source.parse_section(0).unwrap().blocks[2], original_quote);
@@ -977,7 +973,7 @@ mod tests {
 
         assert_eq!(
             inline_text(&block.content),
-            "本书的核心关注点是现代纯粹数学，这一决定需要作一些说明。\n\n“现代”一词很简单，正如上文所述。\n\n然后继续。"
+            "本书的核心关注点是现代纯粹数学，这一决定需要作一些说明。\n“现代”一词很简单，正如上文所述。\n然后继续。"
         );
     }
 
@@ -1079,7 +1075,7 @@ mod tests {
 
         apply_sentence_structure(&mut block, "zh");
 
-        assert_eq!(inline_text(&block.content), "第一句。\n\n第二句。54");
+        assert_eq!(inline_text(&block.content), "第一句。\n第二句。54");
     }
 
     #[test]
@@ -1125,7 +1121,7 @@ mod tests {
         assert_eq!(inline_text(&block.content).matches("【8】").count(), 1);
         assert_eq!(
             inline_text(&block.content),
-            "分手时，她说：“朝朝暮暮，阳台之下。”【8】\n\n这里天地交媾的古老宇宙形象已经变成一个美丽的故事。\n\n不过应当注意。"
+            "分手时，她说：“朝朝暮暮，阳台之下。”【8】\n这里天地交媾的古老宇宙形象已经变成一个美丽的故事。\n不过应当注意。"
         );
     }
 
@@ -1163,7 +1159,7 @@ mod tests {
 
         assert_eq!(
             inline_text(&block.content),
-            "他说：“唯女子与小人为难养也。近之则不孙，远之则怨。”（《论语》卷十七）【5】\n\n话讲得机智却相当刻薄。\n\n无论如何，妇女的地位非常低下。"
+            "他说：“唯女子与小人为难养也。近之则不孙，远之则怨。”（《论语》卷十七）【5】\n话讲得机智却相当刻薄。\n无论如何，妇女的地位非常低下。"
         );
     }
 
@@ -1196,7 +1192,7 @@ mod tests {
 
         assert_eq!(
             inline_text(&block.content),
-            "Literature creates, as Ryan puts it, “possible worlds.” ^{11} \n\nKittler’s proposition follows. \n\nAnother sentence follows."
+            "Literature creates, as Ryan puts it, “possible worlds.” ^{11} \nKittler’s proposition follows. \nAnother sentence follows."
         );
         let formula = block
             .content
@@ -1245,7 +1241,7 @@ mod tests {
 
         assert_eq!(
             inline_text(&block.content),
-            "正文。脚注第一句。脚注第二句。\n\n下文。"
+            "正文。脚注第一句。脚注第二句。\n下文。"
         );
     }
 }

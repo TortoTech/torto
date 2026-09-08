@@ -2,6 +2,8 @@
 
 ## GitHub Release Notes
 
+- The GitHub Release title must exactly match its tag, including the lowercase `v` prefix (for example, `v0.5.0`). Do not add the product name, dates, subtitles, or descriptive suffixes. This is the release title, not a heading in the release notes body.
+- When publishing with the GitHub CLI, explicitly use the tag as the title (for example, `gh release create v0.5.0 --title "v0.5.0" --notes-file <path>`), and verify the published title matches the tag.
 - Write release notes in English first, followed by the Simplified Chinese translation inside an HTML `<details>` block.
 - The summary tag must be exactly `<summary>中文更新说明</summary>`. Do not rename it or add attributes; the desktop updater uses this exact marker to select notes for the current interface language.
 - Write for ordinary users. Lead with what changed in their experience and why it is useful, rather than how it was implemented.

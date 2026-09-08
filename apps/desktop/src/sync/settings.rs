@@ -34,8 +34,8 @@ pub(crate) enum CloudProviderKind {
 
 impl CloudProviderKind {
     pub(crate) const ALL: [Self; 7] = [
-        Self::Jianguoyun,
         Self::CstCloud,
+        Self::Jianguoyun,
         Self::InfiniCloud,
         Self::Koofr,
         Self::HiDrive,
@@ -128,8 +128,8 @@ impl SyncSettings {
     pub(crate) fn new_device() -> Self {
         Self {
             enabled: false,
-            provider: CloudProviderKind::Jianguoyun,
-            base_url: CloudProviderKind::Jianguoyun
+            provider: CloudProviderKind::CstCloud,
+            base_url: CloudProviderKind::CstCloud
                 .base_url()
                 .unwrap_or_default()
                 .into(),
@@ -187,7 +187,7 @@ impl SyncSettings {
             && self.provider == CloudProviderKind::Custom
             && self.base_url.trim().is_empty()
         {
-            self.select_provider(CloudProviderKind::Jianguoyun);
+            self.select_provider(CloudProviderKind::CstCloud);
         }
     }
 
@@ -294,11 +294,12 @@ mod tests {
     }
 
     #[test]
-    fn new_devices_default_to_jianguoyun() {
+    fn new_devices_default_to_cstcloud() {
         let settings = SyncSettings::new_device();
 
-        assert_eq!(settings.provider, CloudProviderKind::Jianguoyun);
-        assert_eq!(settings.base_url, "https://dav.jianguoyun.com/dav");
+        assert_eq!(settings.provider, CloudProviderKind::CstCloud);
+        assert_eq!(settings.base_url, "https://data.cstcloud.cn/dav");
+        assert_eq!(CloudProviderKind::ALL[0], settings.provider);
     }
 
     #[test]
@@ -354,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_empty_endpoint_migrates_to_jianguoyun() {
+    fn legacy_empty_endpoint_migrates_to_cstcloud() {
         let json = r#"{
             "version": 1,
             "settings": {
@@ -370,7 +371,7 @@ mod tests {
 
         settings.migrate_from_version(stored.version);
 
-        assert_eq!(settings.provider, CloudProviderKind::Jianguoyun);
-        assert_eq!(settings.base_url, "https://dav.jianguoyun.com/dav");
+        assert_eq!(settings.provider, CloudProviderKind::CstCloud);
+        assert_eq!(settings.base_url, "https://data.cstcloud.cn/dav");
     }
 }

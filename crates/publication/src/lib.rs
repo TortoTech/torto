@@ -1029,10 +1029,9 @@ pub struct BlockStyle {
     pub margin_start_fraction: f32,
     pub indent: f32,
     pub line_height: f32,
-    /// Compact vertical gap, in ems, used between semantic subparagraphs that
-    /// remain part of one selectable/source-addressable text block.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subparagraph_gap_em: Option<f32>,
+    /// Apply the paragraph indent after each semantic sentence break.
+    #[serde(default)]
+    pub sentence_indents: bool,
 }
 
 impl Default for BlockStyle {
@@ -1047,7 +1046,7 @@ impl Default for BlockStyle {
             margin_start_fraction: 0.0,
             indent: 0.0,
             line_height: 1.5,
-            subparagraph_gap_em: None,
+            sentence_indents: false,
         }
     }
 }

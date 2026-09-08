@@ -818,14 +818,6 @@ impl Page {
                     .size(17.0)
                     .strong(),
             );
-            ui.label(
-                egui::RichText::new(language.text(
-                    "展示所选期间末尾30天，悬停查看每日时长",
-                    "Last 30 days of the selected period. Hover for daily time.",
-                ))
-                .small()
-                .color(palette().muted),
-            );
             draw_trend(ui, &days, start, end);
         });
         card().show(ui, |ui| {
@@ -874,7 +866,7 @@ impl Page {
             ui.set_min_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    egui::RichText::new(language.text("书籍阅读记录", "Books"))
+                    egui::RichText::new(language.text("阅读记录", "Reading records"))
                         .size(17.0)
                         .strong(),
                 );
@@ -1429,6 +1421,15 @@ fn book_row(
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+fn trend_date_label(day: NaiveDate, current_year: i32) -> String {
+    day.format(if day.year() == current_year {
+        "%m/%d"
+    } else {
+        "%Y/%m/%d"
+    })
+    .to_string()
+}
+
 fn draw_trend(
     ui: &mut egui::Ui,
     days: &BTreeMap<String, u64>,
@@ -1442,7 +1443,7 @@ fn draw_trend(
             start.is_none_or(|start| day >= start).then(|| {
                 let text = day.to_string();
                 let ms = *days.get(&text).unwrap_or(&0);
-                (text, ms)
+                (day, ms)
             })
         })
         .collect::<Vec<_>>();
@@ -1455,6 +1456,7 @@ fn draw_trend(
         egui::Sense::hover(),
     );
     let width = rect.width() / values.len() as f32;
+    let current_year = Local::now().year();
     for (index, (day, ms)) in values.iter().enumerate() {
         let x = rect.left() + index as f32 * width;
         let bar = egui::Rect::from_min_max(
@@ -1474,19 +1476,42 @@ fn draw_trend(
             ui.id().with(day),
             egui::Sense::hover(),
         )
-        .on_hover_text(format!("{day}: {}", duration(*ms)));
+        .on_hover_text(format!(
+            "{}: {}",
+            trend_date_label(*day, current_year),
+            duration(*ms)
+        ));
     }
-    ui.horizontal(|ui| {
-        ui.small(&values[0].0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.small(&values[values.len() - 1].0);
-        });
-    });
+    ui.allocate_ui_with_layout(
+        egui::vec2(rect.width(), ui.spacing().interact_size.y),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.small(trend_date_label(values[0].0, current_year));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.small(trend_date_label(values[values.len() - 1].0, current_year));
+            });
+        },
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trend_dates_omit_only_the_current_year() {
+        assert_eq!(
+            trend_date_label(NaiveDate::from_ymd_opt(2026, 9, 7).unwrap(), 2026),
+            "09/07"
+        );
+        assert_eq!(
+            trend_date_label(NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(), 2026),
+            "2025/12/31"
+        );
+        assert_eq!(
+            trend_date_label(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap(), 2026),
+            "2027/01/01"
+        );
+    }
     #[test]
     fn overview_fits_narrow_and_wide_windows() {
         for width in [400.0, 1000.0] {
