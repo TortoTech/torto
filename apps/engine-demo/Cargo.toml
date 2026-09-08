@@ -1,0 +1,29 @@
+[package]
+name = "rebook-engine-demo"
+description = "Reader engine laboratory and benchmark demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyrender.workspace = true
+bytemuck.workspace = true
+image.workspace = true
+kurbo.workspace = true
+peniko.workspace = true
+pollster.workspace = true
+rebook-engine = { path = "../../crates/engine" }
+rebook-layout = { path = "../../crates/layout" }
+rebook-publication = { path = "../../crates/publication" }
+rebook-reader = { path = "../../crates/reader" }
+rebook-renderer = { path = "../../crates/renderer" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+vello.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[lints]
+workspace = true

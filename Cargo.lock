@@ -4052,6 +4052,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "rebook-engine"
+version = "0.5.0"
+dependencies = [
+ "rebook-formats",
+ "rebook-layout",
+ "rebook-publication",
+ "rebook-reader",
+ "rebook-renderer",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "rebook-engine-demo"
+version = "0.5.0"
+dependencies = [
+ "anyrender",
+ "bytemuck",
+ "image",
+ "kurbo",
+ "peniko",
+ "pollster",
+ "rebook-engine",
+ "rebook-layout",
+ "rebook-publication",
+ "rebook-reader",
+ "rebook-renderer",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "vello",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "rebook-formats"
 version = "0.5.0"
 dependencies = [

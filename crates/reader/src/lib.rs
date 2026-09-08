@@ -105,11 +105,21 @@ pub struct ReaderLocation {
 }
 
 /// Resolved random-access destination in the current pagination generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReaderPosition {
     pub section_index: usize,
     pub segment_index: usize,
     pub page_index: usize,
+}
+
+impl From<ReaderLocation> for ReaderPosition {
+    fn from(loc: ReaderLocation) -> Self {
+        Self {
+            section_index: loc.section_index,
+            segment_index: loc.segment_index,
+            page_index: loc.page_index,
+        }
+    }
 }
 
 /// A pointer-resolved text position tied to the current pagination generation.
@@ -170,6 +180,7 @@ pub struct ReaderVisibleTextFragment {
 /// One visual reader surface assembled from adjacent logical pages. In double
 /// mode the secondary page may come from the next layout segment or authored
 /// spine section.
+#[derive(Clone)]
 pub struct ReaderSpread {
     pub primary: Arc<PageDisplayList>,
     pub secondary: Option<Arc<PageDisplayList>>,
@@ -238,6 +249,51 @@ pub struct NavigationResult {
 pub enum NavigationAttempt {
     Ready(NavigationResult),
     Pending,
+}
+
+/// Opaque identity of a prepared or pending navigation transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NavigationToken {
+    id: u64,
+    generation: u64,
+}
+
+/// State of a non-committing navigation preparation.
+pub enum NavigationPreparation {
+    Ready(PreparedNavigation),
+    Pending(NavigationToken),
+    Boundary,
+}
+
+/// A prepared navigation transaction holding source and destination spreads.
+pub struct PreparedNavigation {
+    token: NavigationToken,
+    direction: PageDirection,
+    source: ReaderPosition,
+    destination: ReaderPosition,
+    destination_spread: ReaderSpread,
+}
+
+impl PreparedNavigation {
+    pub const fn token(&self) -> NavigationToken {
+        self.token
+    }
+
+    pub const fn direction(&self) -> PageDirection {
+        self.direction
+    }
+
+    pub const fn source(&self) -> ReaderPosition {
+        self.source
+    }
+
+    pub const fn destination(&self) -> ReaderPosition {
+        self.destination
+    }
+
+    pub const fn destination_spread(&self) -> &ReaderSpread {
+        &self.destination_spread
+    }
 }
 
 enum PositionAttempt {
@@ -604,6 +660,8 @@ pub struct ReaderSession {
     current_page: usize,
     current_reading_unit: usize,
     fixed_reading_units: Option<Vec<FixedReadingUnit>>,
+    active_navigation: Option<(NavigationToken, PageDirection)>,
+    next_navigation_token_id: u64,
 }
 
 impl ReaderSession {
@@ -708,6 +766,8 @@ impl ReaderSession {
             current_page: 0,
             current_reading_unit: 0,
             fixed_reading_units,
+            active_navigation: None,
+            next_navigation_token_id: 1,
         })
     }
 
@@ -938,11 +998,20 @@ impl ReaderSession {
     pub fn current_spread(&mut self) -> Result<ReaderSpread, ReaderError> {
         self.poll_prefetch()?;
         let position = self.current_position();
+        self.spread_at(position)
+    }
+
+    /// Assembles a `ReaderSpread` for an arbitrary position using cached segments.
+    pub fn spread_at(&mut self, position: ReaderPosition) -> Result<ReaderSpread, ReaderError> {
+        let key = SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        };
         let (primary, visible_pages, secondary_offset_x) = self
             .cache
-            .get(&self.current_key())
+            .get(&key)
             .and_then(|segment| {
-                segment.pages.get(self.current_page).map(|page| {
+                segment.pages.get(position.page_index).map(|page| {
                     (
                         Arc::clone(page),
                         segment.visible_pages,
@@ -953,7 +1022,7 @@ impl ReaderSession {
             .ok_or(ReaderError::PageOutOfBounds(position))?;
         let secondary = if visible_pages > 1 {
             self.next_position(position)?
-                .map(|position| self.page_at(position))
+                .map(|pos| self.page_at(pos))
                 .transpose()?
         } else {
             None
@@ -1905,6 +1974,118 @@ impl ReaderSession {
         }
     }
 
+    /// Prepares a non-committing navigation transaction. Never changes reading position
+    /// or locator. Returns `Ready` if the destination spread is cached and ready,
+    /// `Pending` if layout is in progress, or `Boundary` if at the beginning/end of the book.
+    pub fn prepare_navigation(
+        &mut self,
+        direction: PageDirection,
+    ) -> Result<NavigationPreparation, ReaderError> {
+        self.poll_prefetch()?;
+        let attempt = self.resolve_destination_position(direction)?;
+        let generation = self.prefetch_worker.generation();
+        let token = NavigationToken {
+            id: self.next_navigation_token_id,
+            generation,
+        };
+        self.next_navigation_token_id = self.next_navigation_token_id.wrapping_add(1);
+
+        match attempt {
+            PositionAttempt::Ready(None) => {
+                self.active_navigation = None;
+                Ok(NavigationPreparation::Boundary)
+            }
+            PositionAttempt::Pending => {
+                self.active_navigation = Some((token, direction));
+                Ok(NavigationPreparation::Pending(token))
+            }
+            PositionAttempt::Ready(Some(destination)) => {
+                let destination_spread = self.spread_at(destination)?;
+                self.active_navigation = Some((token, direction));
+                Ok(NavigationPreparation::Ready(PreparedNavigation {
+                    token,
+                    direction,
+                    source: self.current_position(),
+                    destination,
+                    destination_spread,
+                }))
+            }
+        }
+    }
+
+    /// Polls a pending navigation transaction token. If ready, returns `Ready` with
+    /// the prepared navigation. If invalid or stale, returns `Err(ReaderError::StaleNavigationToken)`.
+    pub fn poll_navigation(
+        &mut self,
+        token: NavigationToken,
+    ) -> Result<NavigationPreparation, ReaderError> {
+        self.poll_prefetch()?;
+        let generation = self.prefetch_worker.generation();
+        if token.generation != generation {
+            return Err(ReaderError::StaleNavigationToken);
+        }
+        let Some((active_token, direction)) = self.active_navigation else {
+            return Err(ReaderError::StaleNavigationToken);
+        };
+        if active_token != token {
+            return Err(ReaderError::StaleNavigationToken);
+        }
+
+        let attempt = self.resolve_destination_position(direction)?;
+        match attempt {
+            PositionAttempt::Ready(None) => {
+                self.active_navigation = None;
+                Ok(NavigationPreparation::Boundary)
+            }
+            PositionAttempt::Pending => Ok(NavigationPreparation::Pending(token)),
+            PositionAttempt::Ready(Some(destination)) => {
+                let destination_spread = self.spread_at(destination)?;
+                Ok(NavigationPreparation::Ready(PreparedNavigation {
+                    token,
+                    direction,
+                    source: self.current_position(),
+                    destination,
+                    destination_spread,
+                }))
+            }
+        }
+    }
+
+    /// Commits a prepared navigation transaction, moving the reader position exactly once.
+    /// Rejects stale or invalid tokens with `Err(ReaderError::StaleNavigationToken)`.
+    pub fn commit_navigation(
+        &mut self,
+        prepared: PreparedNavigation,
+    ) -> Result<NavigationResult, ReaderError> {
+        let generation = self.prefetch_worker.generation();
+        if prepared.token.generation != generation {
+            return Err(ReaderError::StaleNavigationToken);
+        }
+        let Some((active_token, _)) = self.active_navigation else {
+            return Err(ReaderError::StaleNavigationToken);
+        };
+        if active_token != prepared.token {
+            return Err(ReaderError::StaleNavigationToken);
+        }
+
+        self.active_navigation = None;
+        self.install_position(prepared.destination);
+        self.sync_reading_unit_to_position();
+        Ok(self.moved())
+    }
+
+    /// Cancels a pending or prepared navigation transaction. Returns `true` if cancelled,
+    /// or `false` if the token did not match active navigation.
+    pub fn cancel_navigation(&mut self, token: NavigationToken) -> bool {
+        if let Some((active_token, _)) = self.active_navigation
+            && active_token == token
+        {
+            self.active_navigation = None;
+            return true;
+        }
+        false
+    }
+
     /// Queues a small layout-segment window around the current position for background
     /// pagination and display-list compilation. Crossing forward over an
     /// authored section boundary queues the start of the following sections.
@@ -2147,6 +2328,7 @@ impl ReaderSession {
         self.section_indices_by_path = section_indices_by_path;
         self.hidden_sections = hidden_sections;
         self.fixed_reading_units = fixed_reading_units;
+        self.active_navigation = None;
         self.prefetch_inflight.clear();
         self.prefetch_failures.clear();
         self.cache.clear();
@@ -2311,41 +2493,61 @@ impl ReaderSession {
     }
 
     fn try_next_page(&mut self) -> Result<NavigationAttempt, ReaderError> {
-        let mut destination = self.current_position();
-        for _ in 0..self.current_visible_pages() {
-            match self.try_next_position(destination)? {
-                PositionAttempt::Ready(Some(next)) => destination = next,
-                PositionAttempt::Ready(None) => {
-                    return Ok(NavigationAttempt::Ready(self.boundary()));
-                }
-                PositionAttempt::Pending => return Ok(NavigationAttempt::Pending),
+        match self.resolve_destination_position(PageDirection::Next)? {
+            PositionAttempt::Ready(None) => Ok(NavigationAttempt::Ready(self.boundary())),
+            PositionAttempt::Pending => Ok(NavigationAttempt::Pending),
+            PositionAttempt::Ready(Some(destination)) => {
+                self.install_position(destination);
+                Ok(NavigationAttempt::Ready(self.moved()))
             }
         }
-        if !self.try_spread_ready_at(destination)? {
-            return Ok(NavigationAttempt::Pending);
-        }
-        self.install_position(destination);
-        Ok(NavigationAttempt::Ready(self.moved()))
     }
 
     fn try_previous_page(&mut self) -> Result<NavigationAttempt, ReaderError> {
-        let original = self.current_position();
-        let mut destination = original;
-        for _ in 0..self.current_visible_pages() {
-            match self.try_previous_position(destination)? {
-                PositionAttempt::Ready(Some(previous)) => destination = previous,
-                PositionAttempt::Ready(None) => break,
-                PositionAttempt::Pending => return Ok(NavigationAttempt::Pending),
+        match self.resolve_destination_position(PageDirection::Previous)? {
+            PositionAttempt::Ready(None) => Ok(NavigationAttempt::Ready(self.boundary())),
+            PositionAttempt::Pending => Ok(NavigationAttempt::Pending),
+            PositionAttempt::Ready(Some(destination)) => {
+                self.install_position(destination);
+                Ok(NavigationAttempt::Ready(self.moved()))
             }
         }
-        if destination == original {
-            return Ok(NavigationAttempt::Ready(self.boundary()));
+    }
+
+    fn resolve_destination_position(
+        &mut self,
+        direction: PageDirection,
+    ) -> Result<PositionAttempt, ReaderError> {
+        let original = self.current_position();
+        let mut destination = original;
+        let visible_pages = self.current_visible_pages();
+        match direction {
+            PageDirection::Next => {
+                for _ in 0..visible_pages {
+                    match self.try_next_position(destination)? {
+                        PositionAttempt::Ready(Some(next)) => destination = next,
+                        PositionAttempt::Ready(None) => return Ok(PositionAttempt::Ready(None)),
+                        PositionAttempt::Pending => return Ok(PositionAttempt::Pending),
+                    }
+                }
+            }
+            PageDirection::Previous => {
+                for _ in 0..visible_pages {
+                    match self.try_previous_position(destination)? {
+                        PositionAttempt::Ready(Some(previous)) => destination = previous,
+                        PositionAttempt::Ready(None) => break,
+                        PositionAttempt::Pending => return Ok(PositionAttempt::Pending),
+                    }
+                }
+                if destination == original {
+                    return Ok(PositionAttempt::Ready(None));
+                }
+            }
         }
         if !self.try_spread_ready_at(destination)? {
-            return Ok(NavigationAttempt::Pending);
+            return Ok(PositionAttempt::Pending);
         }
-        self.install_position(destination);
-        Ok(NavigationAttempt::Ready(self.moved()))
+        Ok(PositionAttempt::Ready(Some(destination)))
     }
 
     fn try_spread_ready_at(&mut self, position: ReaderPosition) -> Result<bool, ReaderError> {
@@ -2563,7 +2765,7 @@ impl ReaderSession {
             .ok_or(ReaderError::PageOutOfBounds(position))
     }
 
-    fn current_position(&self) -> ReaderPosition {
+    pub fn current_position(&self) -> ReaderPosition {
         ReaderPosition {
             section_index: self.current_section,
             segment_index: self.current_segment,
@@ -2835,6 +3037,7 @@ impl ReaderSession {
     }
 
     fn invalidate_layout(&mut self, fraction: f32) -> Result<(), ReaderError> {
+        self.active_navigation = None;
         self.prefetch_worker.invalidate();
         self.prefetch_inflight.clear();
         self.prefetch_failures.clear();
@@ -4289,6 +4492,8 @@ pub enum ReaderError {
     PrefetchWorkerStopped,
     #[error("parsed section repository lock is poisoned")]
     SectionRepositoryPoisoned,
+    #[error("navigation token is stale or invalid")]
+    StaleNavigationToken,
 }
 
 #[cfg(test)]
@@ -6755,5 +6960,135 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(reader);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn prepared_navigation_leaves_state_unchanged_and_commits_cleanly() {
+        let source = CountingSource::new(&["第一章内容".into(), "第二章内容".into()]);
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        reader.wait_for_prefetch().unwrap();
+
+        let initial_position = reader.current_position();
+        let initial_locator = reader.current_locator();
+        let initial_snapshot = reader.snapshot();
+
+        // 1. Boundary at beginning
+        match reader.prepare_navigation(PageDirection::Previous).unwrap() {
+            NavigationPreparation::Boundary => {}
+            _ => panic!("expected boundary at start"),
+        }
+        assert_eq!(reader.current_position(), initial_position);
+
+        // 2. Prepare next: initially destination section is not cached yet, so preparation is Pending
+        let prep = reader.prepare_navigation(PageDirection::Next).unwrap();
+        let token = match prep {
+            NavigationPreparation::Pending(tok) => tok,
+            NavigationPreparation::Ready(_) => panic!("expected pending before prefetch"),
+            NavigationPreparation::Boundary => panic!("expected pending, not boundary"),
+        };
+        assert_eq!(reader.current_position(), initial_position);
+        assert_eq!(reader.current_locator(), initial_locator);
+        assert_eq!(reader.snapshot(), initial_snapshot);
+
+        // Wait for prefetch worker to compile the destination
+        reader.wait_for_prefetch().unwrap();
+
+        // Polling the token now yields Ready
+        let NavigationPreparation::Ready(prepared) = reader.poll_navigation(token).unwrap() else {
+            panic!("expected ready after wait_for_prefetch");
+        };
+        assert_eq!(prepared.source(), initial_position);
+        assert_ne!(prepared.destination(), initial_position);
+        assert_eq!(reader.current_position(), initial_position);
+        assert_eq!(reader.current_locator(), initial_locator);
+        assert_eq!(reader.snapshot(), initial_snapshot);
+
+        // 3. Cancel prepared navigation
+        let token = prepared.token();
+        assert!(reader.cancel_navigation(token));
+        assert_eq!(reader.current_position(), initial_position);
+        assert_eq!(reader.current_locator(), initial_locator);
+
+        // 4. Reprepare (now cached, returns Ready immediately) and commit
+        let NavigationPreparation::Ready(prepared) =
+            reader.prepare_navigation(PageDirection::Next).unwrap()
+        else {
+            panic!("expected ready prepared navigation");
+        };
+        let expected_destination = prepared.destination();
+        let result = reader.commit_navigation(prepared).unwrap();
+        assert_eq!(result.outcome, NavigationOutcome::Moved);
+        assert_eq!(reader.current_position(), expected_destination);
+
+        // 5. Double commit with same token fails
+        reader.wait_for_prefetch().unwrap();
+        let NavigationPreparation::Ready(stale_prepared) =
+            reader.prepare_navigation(PageDirection::Previous).unwrap()
+        else {
+            panic!("expected ready prepared navigation");
+        };
+        let token = stale_prepared.token();
+        reader.cancel_navigation(token);
+        assert!(matches!(
+            reader.commit_navigation(stale_prepared),
+            Err(ReaderError::StaleNavigationToken)
+        ));
+    }
+
+    #[test]
+    fn navigation_tokens_are_invalidated_by_resize_and_style() {
+        let source = CountingSource::new(&["第一章内容".into(), "第二章内容".into()]);
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        reader.wait_for_prefetch().unwrap();
+
+        // First prepare triggers prefetch
+        let NavigationPreparation::Pending(token) =
+            reader.prepare_navigation(PageDirection::Next).unwrap()
+        else {
+            panic!("expected pending");
+        };
+        reader.wait_for_prefetch().unwrap();
+
+        let NavigationPreparation::Ready(prepared) = reader.poll_navigation(token).unwrap() else {
+            panic!("expected ready prepared navigation");
+        };
+        let token = prepared.token();
+
+        // Resize invalidates token
+        reader.resize(viewport(800, 600)).unwrap();
+        assert!(!reader.cancel_navigation(token));
+        assert!(matches!(
+            reader.poll_navigation(token),
+            Err(ReaderError::StaleNavigationToken)
+        ));
+        assert!(matches!(
+            reader.commit_navigation(prepared),
+            Err(ReaderError::StaleNavigationToken)
+        ));
+
+        // Wait for prefetch after resize
+        reader.wait_for_prefetch().unwrap();
+        let NavigationPreparation::Pending(token2) =
+            reader.prepare_navigation(PageDirection::Next).unwrap()
+        else {
+            panic!("expected pending");
+        };
+        reader.wait_for_prefetch().unwrap();
+        let NavigationPreparation::Ready(prepared2) = reader.poll_navigation(token2).unwrap()
+        else {
+            panic!("expected ready prepared navigation");
+        };
+        let token2 = prepared2.token();
+
+        let mut style = reader.style().clone();
+        style.column_gap += 10.0;
+        reader.set_style(style).unwrap();
+        assert!(matches!(
+            reader.commit_navigation(prepared2),
+            Err(ReaderError::StaleNavigationToken)
+        ));
+        assert!(!reader.cancel_navigation(token2));
     }
 }

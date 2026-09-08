@@ -1,0 +1,18 @@
+[package]
+name = "rebook-engine"
+description = "Platform-neutral reader engine facade"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rebook-formats = { path = "../formats" }
+rebook-layout = { path = "../layout" }
+rebook-publication = { path = "../publication" }
+rebook-reader = { path = "../reader" }
+rebook-renderer = { path = "../renderer" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
