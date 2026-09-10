@@ -26,6 +26,7 @@ pub(crate) fn plan_wrapped_justification(
         return None;
     }
     layout.break_all_lines(Some(column_width));
+    repair_trailing_footnote_line(layout, text, column_width);
     layout.align(
         parley::Alignment::Start,
         parley::AlignmentOptions::default(),
@@ -345,6 +346,7 @@ fn plan_measured_content(
         });
     }
     clusters.extend(text_clusters);
+    keep_footnotes_with_anchor(&mut clusters);
     clusters.last_mut()?.break_after = true;
 
     let items = shaped_cluster_items(&clusters)?;
@@ -434,6 +436,111 @@ struct ShapedCluster {
     footnote_reference: bool,
     inline_box: bool,
     hyphen_width_after: f32,
+}
+
+fn keep_footnotes_with_anchor(clusters: &mut [ShapedCluster]) {
+    for index in 1..clusters.len() {
+        if !clusters[index].footnote_reference {
+            continue;
+        }
+        let mut previous = index - 1;
+        loop {
+            // The displayed digit is an icon slot, not an independent number.
+            // Keep whitespace and adjacent markers attached to their text anchor.
+            clusters[previous].break_after = false;
+            clusters[previous].hyphen_width_after = 0.0;
+            if previous == 0 || !clusters[previous].is_breakable_space {
+                break;
+            }
+            previous -= 1;
+        }
+    }
+}
+
+/// Native wrapping is also used when optimization is unavailable. Repair the
+/// trailing icon-only line without changing text, source offsets, or hard breaks.
+pub(crate) fn repair_trailing_footnote_line(
+    layout: &mut Layout<TextBrush>,
+    text: &str,
+    width: f32,
+) {
+    if layout.is_rtl()
+        || !layout.inline_boxes().is_empty()
+        || text.contains(['\n', '\r', '\t'])
+        || layout.len() < 2
+    {
+        return;
+    }
+    if !layout.get(layout.len() - 1).is_some_and(|line| {
+        line.runs().any(|run| {
+            run.clusters()
+                .any(|cluster| cluster.first_style().brush.footnote_reference)
+        })
+    }) {
+        return;
+    }
+    let lines = layout.lines().collect::<Vec<_>>();
+    let clusters = lines
+        .iter()
+        .map(|line| {
+            line.runs()
+                .flat_map(|run| {
+                    run.clusters()
+                        .map(|cluster| {
+                            (
+                                cluster.text_range(),
+                                cluster.advance(),
+                                cluster.first_style().brush.footnote_reference,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let last = clusters.len() - 1;
+    let tail = &clusters[last];
+    if !tail.iter().any(|(_, _, footnote)| *footnote)
+        || tail.iter().any(|(range, _, footnote)| {
+            !*footnote && !text[range.clone()].chars().all(char::is_whitespace)
+        })
+    {
+        return;
+    }
+    let previous = &clusters[last - 1];
+    let legal = LineSegmenter::new_auto(LineBreakOptions::default())
+        .segment_str(text)
+        .collect::<Vec<_>>();
+    let tail_width: f32 = tail.iter().map(|(_, advance, _)| advance).sum();
+    let available = width - lines[last].metrics().offset;
+    let Some(split) = (1..previous.len()).rev().find(|&index| {
+        let (range, _, footnote) = &previous[index];
+        !footnote
+            && !text[range.clone()].chars().all(char::is_whitespace)
+            && legal.binary_search(&range.start).is_ok()
+            && previous[index..]
+                .iter()
+                .map(|(_, advance, _)| advance)
+                .sum::<f32>()
+                + tail_width
+                <= available
+    }) else {
+        return;
+    };
+    let mut counts = clusters.iter().map(Vec::len).collect::<Vec<_>>();
+    counts[last] += counts[last - 1] - split;
+    counts[last - 1] = split;
+    let mut breaker = layout.break_lines();
+    for count in counts {
+        let Ok(count) = u32::try_from(count) else {
+            return;
+        };
+        if breaker.break_next_with_length(count).is_none() {
+            return;
+        }
+        breaker.set_prior_line_width(width);
+    }
+    breaker.finish();
 }
 
 fn shaped_cluster_items(clusters: &[ShapedCluster]) -> Option<Vec<ClusterItem>> {
@@ -670,6 +777,48 @@ fn is_rtl_codepoint(character: char) -> bool {
 mod tests {
     use super::*;
     use parley::{FontContext, InlineBox, InlineBoxKind, LayoutContext, StyleProperty};
+
+    #[test]
+    fn footnote_breaks_stay_with_text_across_punctuation_spaces_and_adjacent_markers() {
+        for body in [
+            "你听到的是他准备讲述的故事。",
+            "你听到的是他准备讲述的故事。” ",
+            "This is the end of the story. ",
+        ] {
+            for marker in ["0", "0\u{2060}\u{2060}", "00"] {
+                let text = format!("{body}{marker}");
+                let measured = text
+                    .char_indices()
+                    .map(|(start, character)| MeasuredCluster {
+                        range: start..start + character.len_utf8(),
+                        advance: if character == '\u{2060}' {
+                            0.0
+                        } else if character.is_ascii() {
+                            9.0
+                        } else {
+                            18.0
+                        },
+                        em: 18.0,
+                        ordinary_baseline: start < body.len(),
+                        footnote_reference: start >= body.len(),
+                    })
+                    .collect::<Vec<_>>();
+                for width in (90..200).step_by(11) {
+                    let plan =
+                        plan_measured_text(&text, &measured, width as f32, 0.0, 18.0).unwrap();
+                    for line in plan.lines.iter().take(plan.lines.len() - 1) {
+                        let next = &measured[line.breakpoint as usize];
+                        assert!(!next.footnote_reference, "orphan at {width}: {text}");
+                        let remainder = text[next.range.start..].trim_start();
+                        assert!(
+                            !remainder.starts_with(['0', '。', '”']),
+                            "detached trailing group: {remainder}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn layout_for(text: &str, font_size: f32) -> Layout<TextBrush> {
         let mut font_context = FontContext::new();

@@ -1905,6 +1905,7 @@ impl LayoutEngine {
             .is_some();
         if !optimized {
             layout.break_all_lines(Some(available_width));
+            linebreak::parley::repair_trailing_footnote_line(&mut layout, &text, available_width);
             if block.style.align == TextAlignment::Justify
                 && let Some(plan) = linebreak::parley::plan_wrapped_justification(
                     &mut layout,
@@ -4402,6 +4403,65 @@ mod tests {
                 .all(|span| span.footnote_reference_group == 0)
         );
         assert_eq!(classic_text, "123[4][5]inline note");
+    }
+
+    #[test]
+    fn focus_footnote_icon_never_becomes_an_orphan_last_line() {
+        const CJK: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKaiGBScreen.ttf");
+        let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(Arc::new(CJK))]);
+        let body = "你继续读下去，因为他已答应你一个“奇妙”的故事。你在开头的几行里就觉得你是在一位实事求是的人的面前。你知道他是当真的，他会是一个言而有信的人。某件“奇妙”的事情将会来自这个人准备述说的故事。";
+        for strategy in [LineBreakStrategy::Optimized, LineBreakStrategy::Greedy] {
+            for marker in ["1", "[12]", "【3】"] {
+                let block = TextBlock {
+                    kind: TextBlockKind::Paragraph,
+                    content: vec![
+                        Inline::Text(TextRun {
+                            text: body.into(),
+                            style: TextStyle::default(),
+                            link: None,
+                        }),
+                        Inline::Text(TextRun {
+                            text: marker.into(),
+                            style: TextStyle {
+                                link_role: LinkRole::FootnoteReference,
+                                baseline: TextBaseline::Superscript,
+                                ..TextStyle::default()
+                            },
+                            link: Some(PublicationUrl::parse("notes.xhtml#note").unwrap()),
+                        }),
+                    ],
+                    style: BlockStyle::default(),
+                    source: None,
+                };
+                let style = ReaderStyle {
+                    focus_footnote_icons: true,
+                    writing_system: WritingSystem::Cjk,
+                    typesetting: ReaderTypesetting {
+                        line_break_strategy: strategy,
+                        ..ReaderTypesetting::unified()
+                    },
+                    ..ReaderStyle::default()
+                };
+                for width in (160..640).step_by(9) {
+                    let prepared =
+                        engine.shape_text_with_min_width(&block, &style, width as f32, 1.0);
+                    assert_eq!(
+                        prepared.text.chars().count(),
+                        body.chars().count() + marker.chars().count()
+                    );
+                    let last = prepared.layout.lines().last().unwrap();
+                    assert!(
+                        last.runs().any(|run| run.clusters().any(|cluster| {
+                            !cluster.first_style().brush.footnote_reference
+                                && prepared.text[cluster.text_range()]
+                                    .chars()
+                                    .any(|c| !c.is_whitespace() && !matches!(c, '。' | '”'))
+                        })),
+                        "orphan footnote: strategy={strategy:?}, width={width}, marker={marker}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
