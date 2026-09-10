@@ -48,6 +48,7 @@ egui_extras.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true
 fontdb.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 image.workspace = true
 jsonrepair-rs.workspace = true
 keyring.workspace = true
@@ -66,7 +67,7 @@ rebook-math = { path = "../../crates/math" }
 rebook-publication = { path = "../../crates/publication" }
 rebook-reader = { path = "../../crates/reader" }
 rebook-renderer = { path = "../../crates/renderer" }
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 resvg.workspace = true
 rfd.workspace = true
 rusqlite.workspace = true

@@ -64,7 +64,9 @@ impl DesktopApp {
         ui: &mut egui::Ui,
         page_texture: Option<ReaderPageTexture>,
     ) -> Option<ReaderFramePlan> {
+        let ui_started = std::time::Instant::now();
         self.reconcile_state(ui.ctx());
+        self.shelf.poll_sync(ui.ctx());
         let open_settings_shortcut = self.settings.applied().shortcuts.open_settings;
         if !self.settings.is_open()
             && ui
@@ -115,6 +117,18 @@ impl DesktopApp {
                 .overlay(ui.ctx(), self.settings.applied().language);
         }
         self.apply_settings_if_changed(ui.ctx());
+        if ui_started.elapsed() >= std::time::Duration::from_millis(100) {
+            crate::diagnostics::log(
+                "ui.slow_frame",
+                &[
+                    crate::diagnostics::Field::U64(
+                        "elapsed_ms",
+                        ui_started.elapsed().as_millis() as u64,
+                    ),
+                    crate::diagnostics::Field::Bool("reader_open", self.reader.is_some()),
+                ],
+            );
+        }
         plan
     }
 
@@ -291,6 +305,9 @@ impl DesktopApp {
             .as_ref()
             .is_some_and(|reader| reader.exit_requested)
         {
+            if let Some(reader) = &self.reader {
+                reader.prepare_for_shutdown();
+            }
             self.reader = None;
             self.shelf.resume();
         }

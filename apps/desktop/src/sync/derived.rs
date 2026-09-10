@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static DERIVED_REVISION: AtomicU64 = AtomicU64::new(0);
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -9,9 +12,12 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::plugins::{PdfOcrSyncData, export_pdf_ocr_sync_data, import_pdf_ocr_sync_data};
+use crate::plugins::{
+    PdfOcrSyncData, export_pdf_ocr_sync_data, import_pdf_ocr_sync_data, pdf_ocr_sync_fingerprint,
+};
 
 use super::SyncResult;
+use super::engine::{SyncProgress, SyncStage};
 use super::webdav::WebDavClient;
 
 const DERIVED_SYNC_VERSION: u8 = 1;
@@ -55,19 +61,23 @@ struct BookDerivedMetadata {
 enum DerivedOperation {
     UploadMetadata {
         book_id: String,
+        dirty_revision: Option<Vec<u8>>,
         bytes: Vec<u8>,
     },
     DownloadMetadata {
         book_id: String,
+        dirty_revision: Option<Vec<u8>>,
         bytes: Vec<u8>,
     },
     UploadOcr {
         book_id: String,
+        dirty_revision: Option<Vec<u8>>,
         bytes: Vec<u8>,
         manifest: OcrManifest,
     },
     DownloadOcr {
         book_id: String,
+        dirty_revision: Option<Vec<u8>>,
         manifest: OcrManifest,
     },
 }
@@ -75,10 +85,12 @@ enum DerivedOperation {
 impl DerivedOperation {
     fn length(&self) -> u64 {
         match self {
-            Self::UploadMetadata { bytes, .. }
-            | Self::DownloadMetadata { bytes, .. }
-            | Self::UploadOcr { bytes, .. } => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            Self::UploadMetadata { bytes, .. } | Self::UploadOcr { bytes, .. } => {
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+            }
             Self::DownloadOcr { manifest, .. } => manifest.content_length,
+            // Metadata is fetched while planning; applying it is not another download.
+            Self::DownloadMetadata { .. } => 0,
         }
     }
 }
@@ -92,20 +104,30 @@ pub(crate) fn mark_derived_dirty(book_id: &str, kind: DerivedDataKind) -> io::Re
         )
     })?;
     fs::create_dir_all(parent)?;
-    fs::write(path, [])
+    crate::persistence::write_bytes_atomic(&path, uuid::Uuid::new_v4().to_string().as_bytes())?;
+    DERIVED_REVISION.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
-pub(crate) async fn sync_derived_data<F>(
+pub(crate) fn derived_change_token() -> io::Result<Option<String>> {
+    let revision = DERIVED_REVISION.load(Ordering::Relaxed);
+    Ok((revision > 0).then(|| revision.to_string()))
+}
+
+pub(crate) async fn prepare_derived_data<F>(
     webdav: &WebDavClient,
     book_ids: impl IntoIterator<Item = String>,
-    cache_dir: &Path,
+    archive_dir: &Path,
     mut progress: F,
-) -> SyncResult<()>
+) -> SyncResult<PreparedDerivedData>
 where
-    F: FnMut(u64, u64),
+    F: FnMut(SyncStage, u64, u64),
 {
     let mut operations = Vec::new();
-    for book_id in book_ids {
+    let book_ids = book_ids.into_iter().collect::<Vec<_>>();
+    let book_total = book_ids.len() as u64;
+    progress(SyncStage::CheckingDerivedData, 0, book_total);
+    for (index, book_id) in book_ids.into_iter().enumerate() {
         let remote_files = webdav
             .list_json_files(&format!("derived/{book_id}/"))
             .await?
@@ -121,29 +143,98 @@ where
         collect_ocr_operation(
             webdav,
             &book_id,
+            archive_dir,
             remote_files.contains("ocr.json"),
             &mut operations,
         )
         .await?;
+        progress(
+            SyncStage::CheckingDerivedData,
+            (index + 1) as u64,
+            book_total,
+        );
     }
 
-    let total = operations.iter().map(DerivedOperation::length).sum();
-    let mut completed = 0_u64;
-    progress(completed, total);
-    fs::create_dir_all(cache_dir)?;
-    for operation in operations {
-        completed = execute_operation(
-            webdav,
-            operation,
-            cache_dir,
-            completed,
-            total,
-            &mut progress,
-        )
-        .await?;
-        progress(completed, total);
+    let (uploads, mut downloads): (Vec<_>, Vec<_>) =
+        operations.into_iter().partition(|operation| {
+            matches!(
+                operation,
+                DerivedOperation::UploadMetadata { .. } | DerivedOperation::UploadOcr { .. }
+            )
+        });
+    downloads
+        .sort_by_key(|operation| matches!(operation, DerivedOperation::DownloadMetadata { .. }));
+    Ok(PreparedDerivedData { uploads, downloads })
+}
+
+pub(crate) struct PreparedDerivedData {
+    uploads: Vec<DerivedOperation>,
+    downloads: Vec<DerivedOperation>,
+}
+
+impl PreparedDerivedData {
+    pub(crate) fn upload_bytes(&self) -> u64 {
+        self.uploads.iter().map(DerivedOperation::length).sum()
     }
-    Ok(())
+
+    pub(crate) fn download_bytes(&self) -> u64 {
+        self.downloads.iter().map(DerivedOperation::length).sum()
+    }
+
+    pub(crate) fn operation_count(&self) -> usize {
+        self.uploads.len() + self.downloads.len()
+    }
+
+    pub(crate) async fn execute(
+        &mut self,
+        webdav: &WebDavClient,
+        cache_dir: &Path,
+        stage: SyncStage,
+        mut completed: u64,
+        total: u64,
+        progress: &mut impl FnMut(SyncProgress),
+    ) -> SyncResult<()> {
+        let operations = match stage {
+            SyncStage::Uploading => std::mem::take(&mut self.uploads),
+            SyncStage::Downloading => std::mem::take(&mut self.downloads),
+            _ => unreachable!("derived transfers require an upload or download direction"),
+        };
+        fs::create_dir_all(cache_dir)?;
+        for operation in operations {
+            let operation_stage = if matches!(operation, DerivedOperation::DownloadMetadata { .. })
+            {
+                SyncStage::CheckingDerivedData
+            } else {
+                stage
+            };
+            progress(SyncProgress::Stage {
+                stage: operation_stage,
+                completed,
+                total,
+            });
+            completed = execute_operation(
+                webdav,
+                operation,
+                cache_dir,
+                completed,
+                total,
+                &mut |completed, total| {
+                    progress(SyncProgress::Stage {
+                        stage: operation_stage,
+                        completed,
+                        total,
+                    })
+                },
+            )
+            .await?;
+            progress(SyncProgress::Stage {
+                stage: operation_stage,
+                completed,
+                total,
+            });
+        }
+        Ok(())
+    }
 }
 
 async fn execute_operation<F>(
@@ -158,29 +249,44 @@ where
     F: FnMut(u64, u64),
 {
     match operation {
-        DerivedOperation::UploadMetadata { book_id, bytes } => {
+        DerivedOperation::UploadMetadata {
+            book_id,
+            bytes,
+            dirty_revision,
+        } => {
             let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             webdav
                 .ensure_collection(&format!("derived/{book_id}/"))
                 .await?;
             webdav
-                .put_mutable_bytes(
+                .put_mutable_bytes_with_progress(
                     &format!("derived/{book_id}/metadata.json"),
                     bytes,
                     "application/json",
+                    |sent| {
+                        progress(
+                            completed.saturating_add(sent.min(length.saturating_sub(1))),
+                            total,
+                        )
+                    },
                 )
                 .await?;
-            clear_dirty_marker(&book_id, DerivedDataKind::Metadata)?;
+            acknowledge_derived(webdav, &book_id, DerivedDataKind::Metadata, &dirty_revision)?;
             Ok(completed.saturating_add(length))
         }
-        DerivedOperation::DownloadMetadata { book_id, bytes } => {
-            let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        DerivedOperation::DownloadMetadata {
+            book_id,
+            bytes,
+            dirty_revision,
+        } => {
+            require_unchanged(&book_id, DerivedDataKind::Metadata, &dirty_revision)?;
             apply_metadata_document(&book_id, &bytes)?;
-            clear_dirty_marker(&book_id, DerivedDataKind::Metadata)?;
-            Ok(completed.saturating_add(length))
+            acknowledge_derived(webdav, &book_id, DerivedDataKind::Metadata, &dirty_revision)?;
+            Ok(completed)
         }
         DerivedOperation::UploadOcr {
             book_id,
+            dirty_revision,
             bytes,
             manifest,
         } => {
@@ -189,21 +295,38 @@ where
                 .ensure_collection(&format!("derived/{book_id}/"))
                 .await?;
             webdav
-                .put_mutable_bytes(
+                .put_mutable_bytes_with_progress(
                     &format!("derived/{book_id}/ocr.zip"),
                     bytes,
                     "application/zip",
+                    |sent| {
+                        progress(
+                            completed.saturating_add(sent.min(length.saturating_sub(1))),
+                            total,
+                        )
+                    },
                 )
                 .await?;
             webdav
                 .put_mutable_json(&format!("derived/{book_id}/ocr.json"), &manifest)
                 .await?;
-            clear_dirty_marker(&book_id, DerivedDataKind::Ocr)?;
+            acknowledge_derived(webdav, &book_id, DerivedDataKind::Ocr, &dirty_revision)?;
             Ok(completed.saturating_add(length))
         }
-        DerivedOperation::DownloadOcr { book_id, manifest } => {
+        DerivedOperation::DownloadOcr {
+            book_id,
+            manifest,
+            dirty_revision,
+        } => {
             download_ocr(
-                webdav, &book_id, &manifest, cache_dir, completed, total, progress,
+                webdav,
+                &book_id,
+                &manifest,
+                cache_dir,
+                completed,
+                total,
+                progress,
+                &dirty_revision,
             )
             .await
         }
@@ -218,6 +341,7 @@ async fn download_ocr<F>(
     completed: u64,
     total: u64,
     progress: &mut F,
+    dirty_revision: &Option<Vec<u8>>,
 ) -> SyncResult<u64>
 where
     F: FnMut(u64, u64),
@@ -228,7 +352,13 @@ where
             &format!("derived/{book_id}/ocr.zip"),
             &cache_path,
             manifest.content_length,
-            |downloaded| progress(completed.saturating_add(downloaded), total),
+            |downloaded| {
+                progress(
+                    completed
+                        .saturating_add(downloaded.min(manifest.content_length.saturating_sub(1))),
+                    total,
+                )
+            },
         )
         .await?;
     if !found {
@@ -245,9 +375,10 @@ where
         )
         .into());
     }
+    require_unchanged(book_id, DerivedDataKind::Ocr, dirty_revision)?;
     import_pdf_ocr_sync_data(book_id, unpack_ocr_archive(bytes)?)?;
     fs::remove_file(cache_path).ok();
-    clear_dirty_marker(book_id, DerivedDataKind::Ocr)?;
+    acknowledge_derived(webdav, book_id, DerivedDataKind::Ocr, dirty_revision)?;
     Ok(completed.saturating_add(manifest.content_length))
 }
 
@@ -257,6 +388,7 @@ async fn collect_metadata_operation(
     remote_present: bool,
     operations: &mut Vec<DerivedOperation>,
 ) -> SyncResult<()> {
+    let dirty_revision = read_dirty_revision(book_id, DerivedDataKind::Metadata)?;
     let mut local = local_metadata_document(book_id)?;
     let path = format!("derived/{book_id}/metadata.json");
     let remote = if remote_present {
@@ -270,27 +402,32 @@ async fn collect_metadata_operation(
         .transpose()?;
     match (local.as_mut(), remote_document.as_ref()) {
         (Some(local), Some(remote)) if local == remote => {
-            clear_dirty_marker(book_id, DerivedDataKind::Metadata)?;
+            acknowledge_derived(webdav, book_id, DerivedDataKind::Metadata, &dirty_revision)?;
         }
         (Some(local), None) => {
             operations.push(DerivedOperation::UploadMetadata {
                 book_id: book_id.to_owned(),
+                dirty_revision,
                 bytes: serde_json::to_vec_pretty(local)?,
             });
         }
-        (Some(local), Some(remote)) if is_dirty(book_id, DerivedDataKind::Metadata)? => {
+        (Some(local), Some(remote)) if is_dirty(webdav, book_id, DerivedDataKind::Metadata)? => {
             local.toc = local.toc.take().or_else(|| remote.toc.clone());
             local.metadata = local.metadata.take().or_else(|| remote.metadata.clone());
             operations.push(DerivedOperation::UploadMetadata {
                 book_id: book_id.to_owned(),
+                dirty_revision,
                 bytes: serde_json::to_vec_pretty(local)?,
             });
         }
         (_, Some(_)) => operations.push(DerivedOperation::DownloadMetadata {
             book_id: book_id.to_owned(),
+            dirty_revision,
             bytes: remote.expect("remote metadata bytes exist with a parsed document"),
         }),
-        (None, None) => clear_dirty_marker(book_id, DerivedDataKind::Metadata)?,
+        (None, None) => {
+            acknowledge_derived(webdav, book_id, DerivedDataKind::Metadata, &dirty_revision)?
+        }
     }
     Ok(())
 }
@@ -357,12 +494,12 @@ fn apply_metadata_document(book_id: &str, bytes: &[u8]) -> io::Result<()> {
 async fn collect_ocr_operation(
     webdav: &WebDavClient,
     book_id: &str,
+    archive_dir: &Path,
     remote_present: bool,
     operations: &mut Vec<DerivedOperation>,
 ) -> SyncResult<()> {
-    let local = export_pdf_ocr_sync_data(book_id)?
-        .map(pack_ocr_archive)
-        .transpose()?;
+    let dirty_revision = read_dirty_revision(book_id, DerivedDataKind::Ocr)?;
+    let local = cached_ocr_archive(webdav, book_id, archive_dir)?;
     let manifest_path = format!("derived/{book_id}/ocr.json");
     let remote = if remote_present {
         webdav
@@ -377,32 +514,96 @@ async fn collect_ocr_operation(
         validate_ocr_manifest(book_id, manifest)?;
     }
     match (local, remote) {
-        (Some(bytes), Some(manifest)) if sha256(&bytes) == manifest.content_sha256 => {
-            clear_dirty_marker(book_id, DerivedDataKind::Ocr)?;
+        (Some(local), Some(manifest))
+            if local.manifest.content_sha256 == manifest.content_sha256 =>
+        {
+            acknowledge_derived(webdav, book_id, DerivedDataKind::Ocr, &dirty_revision)?;
         }
-        (Some(bytes), None) => {
-            let manifest = ocr_manifest(book_id, &bytes);
+        (Some(local), None) => {
+            let bytes = fs::read(&local.path)?;
+            let manifest = local.manifest;
             operations.push(DerivedOperation::UploadOcr {
                 book_id: book_id.to_owned(),
+                dirty_revision,
                 bytes,
                 manifest,
             });
         }
-        (Some(bytes), Some(_)) if is_dirty(book_id, DerivedDataKind::Ocr)? => {
-            let manifest = ocr_manifest(book_id, &bytes);
+        (Some(local), Some(_)) if is_dirty(webdav, book_id, DerivedDataKind::Ocr)? => {
+            let bytes = fs::read(&local.path)?;
+            let manifest = local.manifest;
             operations.push(DerivedOperation::UploadOcr {
                 book_id: book_id.to_owned(),
+                dirty_revision,
                 bytes,
                 manifest,
             });
         }
         (_, Some(manifest)) => operations.push(DerivedOperation::DownloadOcr {
             book_id: book_id.to_owned(),
+            dirty_revision,
             manifest,
         }),
-        (None, None) => clear_dirty_marker(book_id, DerivedDataKind::Ocr)?,
+        (None, None) => {
+            acknowledge_derived(webdav, book_id, DerivedDataKind::Ocr, &dirty_revision)?
+        }
     }
     Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedOcrArchive {
+    fingerprint: String,
+    manifest: OcrManifest,
+    path: PathBuf,
+}
+
+fn cached_ocr_archive(
+    webdav: &WebDavClient,
+    book_id: &str,
+    directory: &Path,
+) -> SyncResult<Option<CachedOcrArchive>> {
+    let Some(fingerprint) = pdf_ocr_sync_fingerprint(book_id)? else {
+        return Ok(None);
+    };
+    let key = format!("ocr-archive:{book_id}");
+    let previous = webdav
+        .cache_get(&key)?
+        .and_then(|bytes| serde_json::from_slice::<CachedOcrArchive>(&bytes).ok());
+    if let Some(cached) = previous.as_ref()
+        && cached.fingerprint == fingerprint
+        && fs::metadata(&cached.path)
+            .is_ok_and(|metadata| metadata.len() == cached.manifest.content_length)
+    {
+        return Ok(previous);
+    }
+    let Some(data) = export_pdf_ocr_sync_data(book_id)? else {
+        return Ok(None);
+    };
+    let bytes = pack_ocr_archive(data)?;
+    if pdf_ocr_sync_fingerprint(book_id)?.as_deref() != Some(fingerprint.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "OCR changed while preparing sync; retry required",
+        )
+        .into());
+    }
+    fs::create_dir_all(directory)?;
+    let path = directory.join(format!("{book_id}-{fingerprint}-upload.zip"));
+    crate::persistence::write_bytes_atomic(&path, &bytes)?;
+    let cached = CachedOcrArchive {
+        fingerprint,
+        manifest: ocr_manifest(book_id, &bytes),
+        path,
+    };
+    webdav.cache_set(&key, &serde_json::to_vec(&cached)?)?;
+    if let Some(previous) = previous
+        && previous.path != cached.path
+        && previous.path.parent() == Some(directory)
+    {
+        fs::remove_file(previous.path).ok();
+    }
+    Ok(Some(cached))
 }
 
 fn pack_ocr_archive(data: PdfOcrSyncData) -> io::Result<Vec<u8>> {
@@ -522,21 +723,145 @@ fn dirty_marker_path(book_id: &str, kind: DerivedDataKind) -> io::Result<PathBuf
         .join(format!("{safe_id}.{}", kind.marker_name())))
 }
 
-fn is_dirty(book_id: &str, kind: DerivedDataKind) -> io::Result<bool> {
-    Ok(dirty_marker_path(book_id, kind)?.exists())
-}
-
-fn clear_dirty_marker(book_id: &str, kind: DerivedDataKind) -> io::Result<()> {
-    match fs::remove_file(dirty_marker_path(book_id, kind)?) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+fn read_dirty_revision(book_id: &str, kind: DerivedDataKind) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(dirty_marker_path(book_id, kind)?) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn is_dirty(webdav: &WebDavClient, book_id: &str, kind: DerivedDataKind) -> SyncResult<bool> {
+    let Some(revision) = read_dirty_revision(book_id, kind)? else {
+        return Ok(false);
+    };
+    Ok(webdav
+        .cache_get(&format!("derived-ack:{book_id}:{}", kind.marker_name()))?
+        .as_ref()
+        != Some(&revision))
+}
+
+fn acknowledge_derived(
+    webdav: &WebDavClient,
+    book_id: &str,
+    kind: DerivedDataKind,
+    revision: &Option<Vec<u8>>,
+) -> SyncResult<()> {
+    if let Some(revision) = revision {
+        webdav.cache_set(
+            &format!("derived-ack:{book_id}:{}", kind.marker_name()),
+            revision,
+        )?;
+    }
+    Ok(())
+}
+
+fn require_unchanged(
+    book_id: &str,
+    kind: DerivedDataKind,
+    expected: &Option<Vec<u8>>,
+) -> SyncResult<()> {
+    if &read_dirty_revision(book_id, kind)? != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "Local derived data changed during download; retry required",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocr_sync_cache_reuses_archive_until_local_files_change() {
+        let id = sha256(uuid::Uuid::new_v4().as_bytes());
+        let root = std::env::temp_dir().join(format!("ocr-cache-test-{id}"));
+        let store = crate::sync::SyncStore::open_at(root.join("cache.sqlite"), "device").unwrap();
+        let mut settings = crate::sync::SyncSettings::new_device();
+        settings.provider = crate::sync::CloudProviderKind::Custom;
+        settings.base_url = "http://127.0.0.1:1".into();
+        settings.username = "reader".into();
+        let client = WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(store, "account".into());
+        let document = |markdown: &str| PdfOcrSyncData {
+            document: serde_json::to_vec(&serde_json::json!({
+                "version": 1, "book_id": id, "provider": "paddle-ocr", "model": "fixture",
+                "view_mode": "original", "pages": [{ "markdown": markdown }], "resources": []
+            }))
+            .unwrap(),
+            resources: Vec::new(),
+        };
+        import_pdf_ocr_sync_data(&id, document("first page")).unwrap();
+        let first = cached_ocr_archive(&client, &id, &root).unwrap().unwrap();
+        let modified = fs::metadata(&first.path).unwrap().modified().unwrap();
+        let second = cached_ocr_archive(&client, &id, &root).unwrap().unwrap();
+        assert_eq!(first.path, second.path);
+        assert_eq!(
+            fs::metadata(&second.path).unwrap().modified().unwrap(),
+            modified
+        );
+        import_pdf_ocr_sync_data(&id, document("a changed and longer page")).unwrap();
+        let changed = cached_ocr_archive(&client, &id, &root).unwrap().unwrap();
+        assert_ne!(
+            first.manifest.content_sha256,
+            changed.manifest.content_sha256
+        );
+        assert_ne!(first.path, changed.path);
+        fs::remove_file(&changed.path).unwrap();
+        let repaired = cached_ocr_archive(&client, &id, &root).unwrap().unwrap();
+        assert_eq!(
+            repaired.manifest.content_sha256,
+            changed.manifest.content_sha256
+        );
+        drop(client);
+        let directory = ProjectDirs::from("com", "Rebook", "Rebook")
+            .unwrap()
+            .data_local_dir()
+            .join("pdf-ocr")
+            .join(&id);
+        fs::remove_file(directory.join("document.json")).unwrap();
+        fs::remove_dir(directory.join("resources")).unwrap();
+        fs::remove_dir(directory).unwrap();
+        for entry in fs::read_dir(&root).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn derived_sync_ack_keeps_newer_edits_and_other_accounts_pending() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let database = std::env::temp_dir().join(format!("derived-revision-{id}.sqlite"));
+        let store = crate::sync::SyncStore::open_at(database.clone(), "device").unwrap();
+        let mut settings = crate::sync::SyncSettings::new_device();
+        settings.provider = crate::sync::CloudProviderKind::Custom;
+        settings.base_url = "http://127.0.0.1:1".into();
+        settings.username = "reader".into();
+        let first = WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(store.clone(), "first".into());
+        let second = WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(store, "second".into());
+        mark_derived_dirty(&id, DerivedDataKind::Ocr).unwrap();
+        let old = read_dirty_revision(&id, DerivedDataKind::Ocr).unwrap();
+        mark_derived_dirty(&id, DerivedDataKind::Ocr).unwrap();
+        acknowledge_derived(&first, &id, DerivedDataKind::Ocr, &old).unwrap();
+        assert!(is_dirty(&first, &id, DerivedDataKind::Ocr).unwrap());
+        assert!(require_unchanged(&id, DerivedDataKind::Ocr, &old).is_err());
+        let current = read_dirty_revision(&id, DerivedDataKind::Ocr).unwrap();
+        acknowledge_derived(&first, &id, DerivedDataKind::Ocr, &current).unwrap();
+        assert!(!is_dirty(&first, &id, DerivedDataKind::Ocr).unwrap());
+        assert!(is_dirty(&second, &id, DerivedDataKind::Ocr).unwrap());
+        fs::remove_file(dirty_marker_path(&id, DerivedDataKind::Ocr).unwrap()).unwrap();
+        drop(first);
+        drop(second);
+        let _ = fs::remove_file(database);
+    }
 
     fn fixture() -> PdfOcrSyncData {
         PdfOcrSyncData {

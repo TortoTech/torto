@@ -480,6 +480,26 @@ pub(crate) struct Page {
     custom: bool,
 }
 impl Page {
+    pub(crate) fn shelf_snapshot(
+        library: &[LibraryBook],
+        store: Option<&crate::sync::SyncStore>,
+    ) -> Result<Self, String> {
+        let mut snapshot = Self::default();
+        snapshot.open(library, store);
+        if let Some(error) = snapshot.error.take() {
+            return Err(error);
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) fn apply_shelf_snapshot(&mut self, snapshot: Self) {
+        self.progress = snapshot.progress;
+        self.annotations = snapshot.annotations;
+        self.history = snapshot.history;
+        self.books = snapshot.books;
+        self.error = snapshot.error;
+    }
+
     pub(crate) fn badge(&self, id: &str, language: AppLanguage) -> String {
         self.books.get(id).map_or_else(
             || Status::NotStarted.label(language).into(),
@@ -1252,46 +1272,97 @@ impl Page {
     }
 }
 
+pub(crate) fn sync_due(
+    webdav: &crate::sync::webdav::WebDavClient,
+    force: bool,
+) -> SyncResult<bool> {
+    let last = webdav
+        .cache_get("statistics:last-success")?
+        .and_then(|value| String::from_utf8(value).ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    Ok(force || Utc::now().timestamp_millis().saturating_sub(last) >= 10 * 60 * 1000)
+}
+
 pub(crate) async fn sync(
     webdav: &crate::sync::webdav::WebDavClient,
     device: &str,
 ) -> SyncResult<()> {
     flush();
-    webdav.ensure_collection("statistics/").await?;
-    for file in webdav.list_json_files("statistics/").await? {
+    sync_with_database(webdav, device, &mut database()?).await
+}
+
+async fn sync_with_database(
+    webdav: &crate::sync::webdav::WebDavClient,
+    device: &str,
+    db: &mut Connection,
+) -> SyncResult<()> {
+    use sha2::{Digest, Sha256};
+    let files = webdav.list_json_files("statistics/").await?;
+    for file in &files {
         if file.contains('/') || file.contains('\\') {
             continue;
         }
-        if let Some(remote) = webdav.get_optional(&format!("statistics/{file}")).await? {
+        let path = format!("statistics/{file}");
+        if let Some(remote) = webdav.get_optional(&path).await? {
             if remote.bytes.len() > 32 * 1024 * 1024 {
                 return Err("Statistics shard too large".into());
+            }
+            let digest = format!("{:x}", Sha256::digest(&remote.bytes));
+            let applied = format!("statistics:applied:{file}");
+            if webdav.cache_get(&applied)?.as_deref() == Some(digest.as_bytes()) {
+                continue;
             }
             let shard: Shard = serde_json::from_slice(&remote.bytes)?;
             if shard.version != 1 || shard.events.len() > 100_000 {
                 return Err("Unsupported statistics shard".into());
             }
-            insert(&mut database()?, &shard.events)?;
+            insert(db, &shard.events)?;
+            webdav.cache_set(&applied, digest.as_bytes())?;
         }
     }
-    let local = events(&database()?)?;
-    let mut months = BTreeMap::<String, Vec<Event>>::new();
-    for event in local.into_iter().filter(|e| e.device == device) {
-        let month = Utc
-            .timestamp_millis_opt(event.at as i64)
-            .single()
-            .ok_or("Invalid event timestamp")?
-            .format("%Y-%m")
-            .to_string();
-        months.entry(month).or_default().push(event);
-    }
-    for (month, events) in months {
+    let months = {
+        let mut query = db.prepare(
+            "SELECT strftime('%Y-%m', at / 1000, 'unixepoch'), COUNT(*)
+            FROM events WHERE device = ?1 GROUP BY 1 ORDER BY 1",
+        )?;
+        query
+            .query_map([device], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (month, revision) in months {
+        let file = format!("{device}-{month}.json");
+        let key = format!("statistics:uploaded:{file}");
+        let revision = revision.to_string();
+        if files.contains(&file) && webdav.cache_get(&key)?.as_deref() == Some(revision.as_bytes())
+        {
+            continue;
+        }
+        if !files.contains(&file) {
+            webdav.invalidate_object(&format!("statistics/{file}"))?;
+        }
+        let events = {
+            let mut query = db.prepare(
+                "SELECT json FROM events WHERE device = ?1
+                AND strftime('%Y-%m', at / 1000, 'unixepoch') = ?2 ORDER BY at,id",
+            )?;
+            query
+                .query_map(params![device, month], |row| row.get::<_, String>(0))?
+                .map(|row| -> SyncResult<Event> { Ok(serde_json::from_str(&row?)?) })
+                .collect::<SyncResult<Vec<_>>>()?
+        };
         webdav
-            .put_mutable_json(
-                &format!("statistics/{device}-{month}.json"),
-                &Shard { version: 1, events },
-            )
+            .put_mutable_json(&format!("statistics/{file}"), &Shard { version: 1, events })
             .await?;
+        // Confirm only the snapshot count; events inserted during the PUT remain pending.
+        webdav.cache_set(&key, revision.as_bytes())?;
     }
+    webdav.cache_set(
+        "statistics:last-success",
+        Utc::now().timestamp_millis().to_string().as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -1513,6 +1584,131 @@ fn draw_trend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_snapshot_preserves_open_statistics_controls() {
+        let mut page = Page {
+            open: true,
+            selected: Some("book".into()),
+            query: "filter".into(),
+            clear_confirm: true,
+            ..Default::default()
+        };
+        page.covers.insert("book".into(), vec![1, 2, 3]);
+        let mut snapshot = Page::default();
+        snapshot.books.insert(
+            "book".into(),
+            BookStats {
+                title: "Updated title".into(),
+                ..Default::default()
+            },
+        );
+        page.apply_shelf_snapshot(snapshot);
+        assert!(page.open);
+        assert!(page.clear_confirm);
+        assert_eq!(page.selected.as_deref(), Some("book"));
+        assert_eq!(page.query, "filter");
+        assert_eq!(page.covers["book"], [1, 2, 3]);
+        assert_eq!(page.books["book"].title, "Updated title");
+    }
+
+    #[test]
+    fn statistics_sync_uploads_only_changed_months_and_repairs_deleted_shards() {
+        let server = crate::sync::FakeWebDav::start();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut settings = crate::sync::SyncSettings::new_device();
+        settings.provider = crate::sync::CloudProviderKind::Custom;
+        settings.base_url = server.base_url();
+        settings.username = "reader".into();
+        let path =
+            std::env::temp_dir().join(format!("stats-sync-cache-{}.sqlite", uuid::Uuid::new_v4()));
+        let store =
+            crate::sync::SyncStore::open_at(path.clone(), settings.device_id.clone()).unwrap();
+        let client = crate::sync::webdav::WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(store, crate::sync::account_key(&settings));
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE events(id TEXT PRIMARY KEY,device TEXT,at INTEGER,json TEXT)",
+        )
+        .unwrap();
+        let event = |id: &str, month| Event {
+            id: id.into(),
+            device: settings.device_id.clone(),
+            book: "book".into(),
+            at: Utc
+                .with_ymd_and_hms(2026, month, 5, 0, 0, 0)
+                .unwrap()
+                .timestamp_millis() as u64,
+            kind: EventKind::Clear,
+        };
+        insert(&mut db, &[event("one", 1), event("two", 2)]).unwrap();
+        assert!(sync_due(&client, false).unwrap());
+        runtime
+            .block_on(sync_with_database(&client, &settings.device_id, &mut db))
+            .unwrap();
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _, _)| method == "PUT")
+                .count(),
+            2
+        );
+        assert!(!sync_due(&client, false).unwrap());
+        assert!(sync_due(&client, true).unwrap());
+        server.requests.lock().unwrap().clear();
+        runtime
+            .block_on(sync_with_database(&client, &settings.device_id, &mut db))
+            .unwrap();
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(method, _, _)| method != "PUT")
+        );
+        insert(&mut db, &[event("three", 2)]).unwrap();
+        server.requests.lock().unwrap().clear();
+        runtime
+            .block_on(sync_with_database(&client, &settings.device_id, &mut db))
+            .unwrap();
+        let puts = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _, _)| method == "PUT")
+            .map(|(_, path, _)| path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(puts.len(), 1);
+        assert!(puts[0].ends_with("-2026-02.json"));
+        server
+            .objects
+            .lock()
+            .unwrap()
+            .retain(|path, _| !path.ends_with("-2026-01.json"));
+        server.requests.lock().unwrap().clear();
+        runtime
+            .block_on(sync_with_database(&client, &settings.device_id, &mut db))
+            .unwrap();
+        let puts = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _, _)| method == "PUT")
+            .map(|(_, path, _)| path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(puts.len(), 1);
+        assert!(puts[0].ends_with("-2026-01.json"));
+        drop(client);
+        let _ = std::fs::remove_file(path);
+        server.stop();
+    }
     #[test]
     fn trend_dates_omit_only_the_current_year() {
         assert_eq!(

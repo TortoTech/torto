@@ -1503,6 +1503,35 @@ pub(crate) fn export_pdf_ocr_sync_data(book_id: &str) -> io::Result<Option<PdfOc
     }))
 }
 
+pub(crate) fn pdf_ocr_sync_fingerprint(book_id: &str) -> io::Result<Option<String>> {
+    let Some(document) = load_document(book_id)? else {
+        return Ok(None);
+    };
+    let directory = book_directory(book_id)?;
+    let mut digest = Sha256::new();
+    // Compare filesystem revisions first; unchanged resources need not be read or packed again.
+    let mut paths = vec![directory.join(DOCUMENT_FILE)];
+    for resource in document.resources {
+        validate_sync_resource_name(&resource.file_name)?;
+        paths.push(directory.join("resources").join(resource.file_name));
+    }
+    paths.sort();
+    for path in paths {
+        let metadata = fs::metadata(&path)?;
+        digest.update(path.to_string_lossy().as_bytes());
+        digest.update(metadata.len().to_le_bytes());
+        digest.update(
+            metadata
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos()
+                .to_le_bytes(),
+        );
+    }
+    Ok(Some(format!("{:x}", digest.finalize())))
+}
+
 pub(crate) fn import_pdf_ocr_sync_data(book_id: &str, data: PdfOcrSyncData) -> io::Result<()> {
     let mut document: StoredPdfOcrDocument = serde_json::from_slice(&data.document)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;

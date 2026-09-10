@@ -11,7 +11,8 @@ use crate::highlights::{HighlightRepository, HighlightResult, StoredHighlight};
 
 use super::SyncResult;
 use super::protocol::{
-    AnnotationState, ClockOrder, DeviceBookEntry, HybridTimestamp, ProgressState, compare_clocks,
+    AnnotationState, ClockOrder, DeviceBookEntry, DeviceBookState, HybridTimestamp,
+    PROTOCOL_VERSION, ProgressState, compare_clocks,
 };
 
 const DATABASE_FILE: &str = "sync-v1.sqlite3";
@@ -79,6 +80,7 @@ impl SyncStore {
             conflict_of: None,
         };
         write_annotation(&transaction, &annotation)?;
+        mark_reading_changed(&transaction, &self.device_id, &annotation.book_id)?;
         transaction.commit()?;
         Ok(annotation)
     }
@@ -94,6 +96,7 @@ impl SyncStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub(crate) fn annotations_for_device_book(
         &self,
         book_id: &str,
@@ -124,6 +127,7 @@ impl SyncStore {
         annotation.deleted_at = Some(updated_at);
         annotation.origin_device.clone_from(&self.device_id);
         write_annotation(&transaction, &annotation)?;
+        mark_reading_changed(&transaction, &self.device_id, &annotation.book_id)?;
         transaction.commit()?;
         Ok(true)
     }
@@ -141,6 +145,9 @@ impl SyncStore {
         if annotation.deleted_at.is_some() {
             return Ok(false);
         }
+        if annotation.note == note {
+            return Ok(false);
+        }
         let updated_at = tick(&transaction, &self.device_id, None)?;
         let counter = annotation.clock.entry(self.device_id.clone()).or_default();
         *counter = counter.saturating_add(1);
@@ -148,6 +155,7 @@ impl SyncStore {
         annotation.updated_at = updated_at;
         annotation.origin_device.clone_from(&self.device_id);
         write_annotation(&transaction, &annotation)?;
+        mark_reading_changed(&transaction, &self.device_id, &annotation.book_id)?;
         transaction.commit()?;
         Ok(true)
     }
@@ -202,17 +210,25 @@ impl SyncStore {
         locator.validate()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
+        let locator_json = serde_json::to_string(locator)?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT locator_json FROM progress WHERE book_id = ?1",
+                [book_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() == Some(locator_json.as_str()) {
+            return Ok(());
+        }
         let updated_at = tick(&transaction, &self.device_id, None)?;
         transaction.execute(
             "INSERT INTO progress(book_id, locator_json, updated_hlc) VALUES (?1, ?2, ?3) \
              ON CONFLICT(book_id) DO UPDATE SET locator_json = excluded.locator_json, \
              updated_hlc = excluded.updated_hlc",
-            params![
-                book_id,
-                serde_json::to_string(locator)?,
-                serde_json::to_string(&updated_at)?
-            ],
+            params![book_id, locator_json, serde_json::to_string(&updated_at)?],
         )?;
+        mark_reading_changed(&transaction, &self.device_id, book_id)?;
         transaction.commit()?;
         Ok(())
     }
@@ -252,15 +268,6 @@ impl SyncStore {
             activity_times.insert(book_id, updated_at.wall_time_ms);
         }
         Ok(activity_times)
-    }
-
-    pub(crate) fn progress_state(&self, book_id: &str) -> SyncResult<Option<ProgressState>> {
-        Ok(self.load_progress(book_id)?.and_then(|progress| {
-            (progress.updated_at.device_id == self.device_id).then_some(ProgressState {
-                locator: progress.locator,
-                updated_at: progress.updated_at,
-            })
-        }))
     }
 
     pub(crate) fn merge_progress(&self, progress: &ProgressState) -> SyncResult<bool> {
@@ -333,7 +340,7 @@ impl SyncStore {
         local_book_ids: &[String],
     ) -> SyncResult<Vec<DeviceBookEntry>> {
         for book_id in local_book_ids {
-            self.set_book_present(book_id, true)?;
+            self.register_book_if_missing(book_id)?;
         }
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -351,6 +358,11 @@ impl SyncStore {
                 changed_at: serde_json::from_str(&changed_at)?,
             })
         })
+        .filter(|entry: &SyncResult<DeviceBookEntry>| {
+            entry.as_ref().map_or(true, |entry| {
+                !entry.present || local_book_ids.contains(&entry.book_id)
+            })
+        })
         .collect()
     }
 
@@ -366,6 +378,22 @@ impl SyncStore {
             == Some(false))
     }
 
+    pub(crate) fn register_book_if_missing(&self, book_id: &str) -> SyncResult<()> {
+        let connection = self.connection()?;
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM book_membership WHERE book_id = ?1)",
+            [book_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            let timestamp = self.tick()?;
+            // A removal committed after the existence check must win over this old snapshot.
+            connection.execute("INSERT OR IGNORE INTO book_membership(book_id,present,changed_hlc) VALUES (?1,1,?2)",
+                params![book_id, serde_json::to_string(&timestamp)?])?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn tick(&self) -> SyncResult<HybridTimestamp> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -374,8 +402,120 @@ impl SyncStore {
         Ok(timestamp)
     }
 
+    pub(crate) fn pending_reading(&self, account: &str) -> SyncResult<Vec<(String, u64, u64)>> {
+        let connection = self.connection()?;
+        let mut query = connection.prepare(
+            "SELECT c.book_id, c.revision, c.changed_ms FROM reading_changes c
+             LEFT JOIN reading_ack a ON a.account = ?1 AND a.book_id = c.book_id
+             WHERE c.device_id = ?2 AND c.revision > COALESCE(a.revision, 0)
+             ORDER BY c.changed_ms, c.book_id",
+        )?;
+        Ok(query
+            .query_map(params![account, self.device_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn acknowledge_reading(
+        &self,
+        account: &str,
+        book_id: &str,
+        revision: u64,
+    ) -> SyncResult<()> {
+        self.connection()?.execute(
+            "INSERT INTO reading_ack(account, book_id, revision) VALUES (?1, ?2, ?3)
+             ON CONFLICT(account, book_id) DO UPDATE SET revision = MAX(revision, excluded.revision)",
+            params![account, book_id, i64::try_from(revision)?])?;
+        Ok(())
+    }
+
+    pub(crate) fn reading_snapshot(&self, book_id: &str) -> SyncResult<(u64, DeviceBookState)> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let revision = transaction
+            .query_row(
+                "SELECT revision FROM reading_changes WHERE device_id = ?1 AND book_id = ?2",
+                params![self.device_id, book_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            .max(0) as u64;
+        let progress = transaction
+            .query_row(
+                "SELECT locator_json, updated_hlc FROM progress WHERE book_id = ?1",
+                [book_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(locator, timestamp)| -> SyncResult<ProgressState> {
+                Ok(ProgressState {
+                    locator: serde_json::from_str(&locator)?,
+                    updated_at: serde_json::from_str(&timestamp)?,
+                })
+            })
+            .transpose()?
+            .filter(|value| value.updated_at.device_id == self.device_id);
+        let annotations = {
+            let mut query = transaction.prepare(
+                "SELECT id, book_id, ranges_json, quote, note, created_at, updated_hlc, clock_json,
+                 deleted_hlc, origin_device, conflict_of FROM annotations
+                 WHERE book_id = ?1 AND origin_device = ?2 ORDER BY id",
+            )?;
+            query
+                .query_map(params![book_id, self.device_id], read_annotation_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let state = DeviceBookState {
+            version: PROTOCOL_VERSION,
+            device_id: self.device_id.clone(),
+            book_id: book_id.to_owned(),
+            updated_at: tick(&transaction, &self.device_id, None)?,
+            progress,
+            annotations,
+        };
+        transaction.commit()?;
+        Ok((revision, state))
+    }
+
+    pub(crate) fn cache_get(&self, account: &str, key: &str) -> SyncResult<Option<Vec<u8>>> {
+        Ok(self
+            .connection()?
+            .query_row(
+                "SELECT value FROM transfer_cache WHERE account = ?1 AND key = ?2",
+                params![account, key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn cache_set(&self, account: &str, key: &str, value: &[u8]) -> SyncResult<()> {
+        self.connection()?.execute(
+            "INSERT INTO transfer_cache(account,key,value) VALUES (?1,?2,?3)
+            ON CONFLICT(account,key) DO UPDATE SET value = excluded.value",
+            params![account, key, value],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn cache_remove(&self, account: &str, key: &str) -> SyncResult<()> {
+        self.connection()?.execute(
+            "DELETE FROM transfer_cache WHERE account = ?1 AND key = ?2",
+            params![account, key],
+        )?;
+        Ok(())
+    }
+
     fn initialize(&self) -> SyncResult<()> {
         let connection = self.connection()?;
+        let had_change_table: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reading_changes')",
+            [], |row| row.get(0))?;
         let schema_version =
             connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?;
         if schema_version != DATABASE_SCHEMA_VERSION {
@@ -417,8 +557,33 @@ impl SyncStore {
                 book_id TEXT PRIMARY KEY,
                 present INTEGER NOT NULL,
                 changed_hlc TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS reading_changes(
+                device_id TEXT NOT NULL, book_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                changed_ms INTEGER NOT NULL, PRIMARY KEY(device_id, book_id));
+             CREATE TABLE IF NOT EXISTS reading_ack(
+                account TEXT NOT NULL, book_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                PRIMARY KEY(account, book_id));
+             CREATE TABLE IF NOT EXISTS transfer_cache(
+                account TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL,
+                PRIMARY KEY(account, key));",
         )?;
+        // Additive migration: retain existing progress and annotations, and publish them once per account.
+        let seed_key = format!("reading-change-seed:{}", self.device_id);
+        let seeded: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_meta WHERE key = ?1)",
+            [&seed_key],
+            |row| row.get(0),
+        )?;
+        if !had_change_table || !seeded {
+            connection.execute("INSERT OR IGNORE INTO reading_changes(device_id,book_id,revision,changed_ms)
+            SELECT ?1, book_id, 1, 0 FROM progress WHERE json_extract(updated_hlc, '$.device_id') = ?1
+            UNION SELECT ?1, book_id, 1, 0 FROM annotations WHERE origin_device = ?1", [&self.device_id])?;
+            connection.execute(
+                "INSERT OR REPLACE INTO sync_meta(key,value) VALUES (?1,'1')",
+                [&seed_key],
+            )?;
+        }
         connection.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
         Ok(())
     }
@@ -428,6 +593,17 @@ impl SyncStore {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(connection)
     }
+}
+
+fn mark_reading_changed(
+    transaction: &Transaction<'_>,
+    device: &str,
+    book_id: &str,
+) -> SyncResult<()> {
+    transaction.execute("INSERT INTO reading_changes(device_id,book_id,revision,changed_ms) VALUES (?1,?2,1,?3)
+        ON CONFLICT(device_id,book_id) DO UPDATE SET revision = revision + 1, changed_ms = excluded.changed_ms",
+        params![device, book_id, i64::try_from(unix_timestamp_millis())?])?;
+    Ok(())
 }
 
 impl HighlightRepository for SyncStore {
@@ -604,6 +780,128 @@ fn unix_timestamp_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_library_snapshot_preserves_removals_and_defers_new_unuploaded_books() {
+        let store = test_store("membership-snapshot");
+        store.set_book_present("old", true).unwrap();
+        let captured = vec!["old".to_owned()];
+        store.set_book_present("old", false).unwrap();
+        store.set_book_present("new", true).unwrap();
+        let entries = store.membership_entries(&captured).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].book_id, "old");
+        assert!(!entries[0].present);
+        assert!(store.is_locally_removed("old").unwrap());
+        let next = store.membership_entries(&["new".into()]).unwrap();
+        assert!(
+            next.iter()
+                .any(|entry| entry.book_id == "new" && entry.present)
+        );
+        cleanup(&store);
+    }
+
+    #[test]
+    fn sync_acknowledges_only_uploaded_revision_and_survives_reopen() {
+        let store = test_store("incremental-revisions");
+        store.save_progress("book", &locator("book", 0.2)).unwrap();
+        let (uploaded_revision, snapshot) = store.reading_snapshot("book").unwrap();
+        assert_eq!(
+            snapshot.progress.unwrap().locator.total_progression,
+            Some(0.2)
+        );
+        store.save_progress("book", &locator("book", 0.3)).unwrap();
+        store
+            .acknowledge_reading("account-a", "book", uploaded_revision)
+            .unwrap();
+        let reopened = SyncStore::open_at(store.path.clone(), store.device_id.clone()).unwrap();
+        let pending = reopened.pending_reading("account-a").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].1 > uploaded_revision);
+        reopened
+            .acknowledge_reading("account-a", "book", pending[0].1)
+            .unwrap();
+        reopened
+            .save_progress("book", &locator("book", 0.3))
+            .unwrap();
+        assert!(reopened.pending_reading("account-a").unwrap().is_empty());
+        assert_eq!(reopened.pending_reading("account-b").unwrap().len(), 1);
+        // A late completion can never replace a newer acknowledgement.
+        reopened
+            .acknowledge_reading("account-a", "book", uploaded_revision)
+            .unwrap();
+        assert!(reopened.pending_reading("account-a").unwrap().is_empty());
+        cleanup(&store);
+    }
+
+    #[test]
+    fn sync_cache_is_isolated_by_account_and_additive_migration_preserves_progress() {
+        let store = test_store("incremental-migration");
+        store.save_progress("book", &locator("book", 0.7)).unwrap();
+        let original = store.load_progress("book").unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE reading_changes; DROP TABLE reading_ack; DROP TABLE transfer_cache;",
+            )
+            .unwrap();
+        let reopened = SyncStore::open_at(store.path.clone(), store.device_id.clone()).unwrap();
+        assert_eq!(reopened.load_progress("book").unwrap(), original);
+        assert_eq!(reopened.pending_reading("account-a").unwrap().len(), 1);
+        reopened
+            .cache_set("account-a", "object:file", b"first")
+            .unwrap();
+        reopened
+            .cache_set("account-b", "object:file", b"second")
+            .unwrap();
+        assert_eq!(
+            reopened
+                .cache_get("account-a", "object:file")
+                .unwrap()
+                .as_deref(),
+            Some(b"first".as_slice())
+        );
+        assert_eq!(
+            reopened
+                .cache_get("account-b", "object:file")
+                .unwrap()
+                .as_deref(),
+            Some(b"second".as_slice())
+        );
+        cleanup(&store);
+    }
+
+    #[test]
+    fn sync_tracks_annotation_edits_and_deletions_in_the_same_snapshot() {
+        let store = test_store("incremental-notes");
+        store
+            .create_annotation(
+                "note".into(),
+                "book".into(),
+                vec![source_range()],
+                "quote".into(),
+                None,
+                1,
+            )
+            .unwrap();
+        let (first, _) = store.reading_snapshot("book").unwrap();
+        store.acknowledge_reading("account", "book", first).unwrap();
+        store
+            .update_annotation_note("note", Some("edited".into()))
+            .unwrap();
+        let (edited, snapshot) = store.reading_snapshot("book").unwrap();
+        assert!(edited > first);
+        assert_eq!(snapshot.annotations[0].note.as_deref(), Some("edited"));
+        store.delete_annotation("note").unwrap();
+        store
+            .acknowledge_reading("account", "book", edited)
+            .unwrap();
+        let (_, snapshot) = store.reading_snapshot("book").unwrap();
+        assert!(snapshot.annotations[0].deleted_at.is_some());
+        assert_eq!(store.pending_reading("account").unwrap().len(), 1);
+        cleanup(&store);
+    }
     use rebook_publication::{PublicationId, PublicationUrl, SourceAnchor, SpineItemId};
 
     #[test]

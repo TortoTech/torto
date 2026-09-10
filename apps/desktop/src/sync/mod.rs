@@ -3,6 +3,8 @@ mod engine;
 mod protocol;
 mod settings;
 mod store;
+#[cfg(test)]
+pub(crate) use engine::tests::FakeWebDav;
 pub(crate) mod webdav;
 
 use std::error::Error;
@@ -13,11 +15,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
 
-pub(crate) use engine::{LocalSyncBook, SyncProgress, SyncReport, SyncStage, run_sync};
+pub(crate) use engine::{LocalSyncBook, SyncMode, SyncProgress, SyncReport, SyncStage, run_sync};
 pub(crate) use settings::{CloudProviderKind, SyncSettings};
 pub(crate) use store::SyncStore;
 
 pub(crate) type SyncResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+pub(crate) fn account_key(settings: &SyncSettings) -> String {
+    use sha2::{Digest, Sha256};
+    let endpoint = reqwest::Url::parse(&settings.base_url)
+        .map_or_else(|_| settings.base_url.clone(), |url| url.to_string());
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{:?}\n{}\n{}\n{}",
+                settings.provider,
+                endpoint.trim_end_matches('/'),
+                settings.username,
+                settings.device_id
+            )
+            .as_bytes()
+        )
+    )
+}
 
 pub(crate) fn format_error_chain(error: &(dyn Error + 'static)) -> String {
     let mut messages = Vec::new();
@@ -49,4 +70,4 @@ pub(crate) fn append_sync_log(level: &str, message: &str) -> io::Result<PathBuf>
     writeln!(file, "[{timestamp}] {level} {message}")?;
     Ok(path)
 }
-pub(crate) use derived::{DerivedDataKind, mark_derived_dirty};
+pub(crate) use derived::{DerivedDataKind, derived_change_token, mark_derived_dirty};

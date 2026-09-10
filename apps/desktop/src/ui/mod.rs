@@ -32,7 +32,6 @@ static INTERFACE_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(DEFAULT_INTERFACE_FO
 pub(crate) enum ToastKind {
     Success,
     Error,
-    Loading,
 }
 
 /// Theme-dependent color set. Chrome reads colors through `palette()` so a
@@ -450,22 +449,16 @@ pub(crate) fn show_toast(
     let palette = palette();
     let (icon_kind, fill, border, foreground) = match kind {
         ToastKind::Success => (
-            Some(Icon::CheckCircle),
+            Icon::CheckCircle,
             palette.accent_soft,
             palette.accent_border,
             palette.accent,
         ),
         ToastKind::Error => (
-            Some(Icon::AlertCircle),
+            Icon::AlertCircle,
             palette.error_fill,
             palette.error_stroke,
             palette.error_text,
-        ),
-        ToastKind::Loading => (
-            None,
-            palette.accent_soft,
-            palette.accent_border,
-            palette.accent,
         ),
     };
     let font_size = scaled_font_size(13.0);
@@ -506,11 +499,7 @@ pub(crate) fn show_toast(
                     ui.set_width((width - TOAST_HORIZONTAL_PADDING).max(1.0));
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = TOAST_ITEM_SPACING;
-                        if let Some(icon_kind) = icon_kind {
-                            ui.add(icon(icon_kind).size(TOAST_ICON_SIZE).color(foreground));
-                        } else {
-                            ui.add(egui::Spinner::new().size(TOAST_ICON_SIZE).color(foreground));
-                        }
+                        ui.add(icon(icon_kind).size(TOAST_ICON_SIZE).color(foreground));
                         ui.vertical(|ui| {
                             ui.set_width(label_width);
                             ui.add(

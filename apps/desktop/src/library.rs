@@ -51,6 +51,12 @@ pub struct LocalLibrary {
     books: Vec<LibraryBook>,
 }
 
+pub(crate) struct LibraryMetadataUpdate {
+    pub id: String,
+    pub title: String,
+    pub authors: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredLibrary {
     version: u32,
@@ -246,30 +252,48 @@ impl LocalLibrary {
         title: &str,
         authors: &[String],
     ) -> LibraryResult<bool> {
-        let Some(index) = self.books.iter().position(|book| book.id == id) else {
+        self.update_metadata_batch(&[LibraryMetadataUpdate {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            authors: authors.to_vec(),
+        }])
+    }
+
+    pub(crate) fn update_metadata_batch(
+        &mut self,
+        updates: &[LibraryMetadataUpdate],
+    ) -> LibraryResult<bool> {
+        let mut changed_books: Option<Vec<LibraryBook>> = None;
+        for update in updates {
+            let current = changed_books.as_ref().unwrap_or(&self.books);
+            let Some(index) = current.iter().position(|book| book.id == update.id) else {
+                continue;
+            };
+            let title = update.title.trim();
+            let mut authors = update
+                .authors
+                .iter()
+                .map(|author| author.trim().to_owned())
+                .filter(|author| !author.is_empty())
+                .collect::<Vec<_>>();
+            authors.dedup();
+            let title_changed = !title.is_empty() && current[index].title != title;
+            let authors_changed = !authors.is_empty() && current[index].authors != authors;
+            if !title_changed && !authors_changed {
+                continue;
+            }
+            // Compare before cloning covers; one changed batch needs only one clone and one commit.
+            let books = changed_books.get_or_insert_with(|| self.books.clone());
+            if title_changed {
+                title.clone_into(&mut books[index].title);
+            }
+            if authors_changed {
+                books[index].authors = authors;
+            }
+        }
+        let Some(books) = changed_books else {
             return Ok(false);
         };
-        let mut books = self.books.clone();
-        let book = &mut books[index];
-        let title = title.trim();
-        let mut normalized_authors = authors
-            .iter()
-            .map(|author| author.trim().to_owned())
-            .filter(|author| !author.is_empty())
-            .collect::<Vec<_>>();
-        normalized_authors.dedup();
-        let mut changed = false;
-        if !title.is_empty() && book.title != title {
-            title.clone_into(&mut book.title);
-            changed = true;
-        }
-        if !normalized_authors.is_empty() && book.authors != normalized_authors {
-            book.authors = normalized_authors;
-            changed = true;
-        }
-        if !changed {
-            return Ok(false);
-        }
         self.persist_books(&books)?;
         self.books = books;
         Ok(true)
@@ -387,6 +411,54 @@ mod tests {
 
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
+
+    #[test]
+    fn metadata_batch_skips_unchanged_writes_and_commits_atomically() {
+        let root = test_directory("metadata-batch");
+        let mut library = LocalLibrary::load_from(root.clone()).unwrap();
+        for id in ["first", "second"] {
+            library.books.push(LibraryBook {
+                id: id.into(),
+                title: id.into(),
+                authors: Vec::new(),
+                file_name: format!("{id}.pdf"),
+                path: root.join(BOOKS_DIRECTORY).join(format!("{id}.pdf")),
+                cover_bytes: None,
+                added_at: 1,
+            });
+        }
+        fs::create_dir(root.join(MANIFEST_FILE)).unwrap();
+        assert!(
+            !library
+                .update_metadata_batch(&[LibraryMetadataUpdate {
+                    id: "first".into(),
+                    title: "first".into(),
+                    authors: Vec::new(),
+                }])
+                .unwrap()
+        );
+        let updates = ["first", "second"].map(|id| LibraryMetadataUpdate {
+            id: id.into(),
+            title: format!("Updated {id}"),
+            authors: vec![" Author ".into()],
+        });
+        assert!(library.update_metadata_batch(&updates).is_err());
+        assert_eq!(library.books[0].title, "first");
+        assert_eq!(library.books[1].title, "second");
+        fs::remove_dir(root.join(MANIFEST_FILE)).unwrap();
+        assert!(library.update_metadata_batch(&updates).unwrap());
+        let restored = LocalLibrary::load_from(root.clone()).unwrap();
+        assert!(
+            restored
+                .books
+                .iter()
+                .all(|book| book.title.starts_with("Updated ") && book.authors == ["Author"])
+        );
+        fs::remove_file(root.join(MANIFEST_FILE)).unwrap();
+        fs::remove_dir(root.join(BOOKS_DIRECTORY)).unwrap();
+        fs::remove_dir(root.join(COVERS_DIRECTORY)).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 
     const FIXTURE_ENTRIES: [&str; 5] = [
         "META-INF/container.xml",

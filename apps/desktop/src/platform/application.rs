@@ -412,6 +412,12 @@ impl ApplicationHandler<UserEvent> for Application {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        let sync_callback = match &event {
+            UserEvent::ShelfSync(_) => Some("sync.complete"),
+            UserEvent::ShelfSyncProgress(_) => Some("sync.progress"),
+            _ => None,
+        };
+        let callback_started = Instant::now();
         match event {
             UserEvent::RepaintAfter(delay) => self.schedule_repaint(event_loop, delay),
             #[cfg(target_os = "macos")]
@@ -433,6 +439,20 @@ impl ApplicationHandler<UserEvent> for Application {
             }
             UserEvent::ReaderPdfToc(message) => self.app.complete_reader_pdf_toc(message),
             UserEvent::ReaderPdfOcr(message) => self.app.complete_reader_pdf_ocr(message),
+        }
+        if let Some(callback) = sync_callback
+            && callback_started.elapsed() >= Duration::from_millis(100)
+        {
+            crate::diagnostics::log(
+                "window.slow_sync_callback",
+                &[
+                    crate::diagnostics::Field::Text("callback", callback),
+                    crate::diagnostics::Field::U64(
+                        "elapsed_ms",
+                        callback_started.elapsed().as_millis() as u64,
+                    ),
+                ],
+            );
         }
         if let Some(window) = &self.window {
             window.window.request_redraw();

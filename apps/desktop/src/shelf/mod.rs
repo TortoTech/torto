@@ -1,3 +1,13 @@
+mod background;
+mod sync_button;
+mod sync_schedule;
+
+use background::BackgroundJob;
+
+use sync_schedule::SyncSchedule;
+
+use sync_button::SyncButtonState;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,13 +18,13 @@ use egui::{Color32, RichText, TextureHandle, Vec2};
 use peniko::Blob;
 
 use crate::async_task::{TaskResult, TaskSlot};
-use crate::library::{LibraryBook, LocalLibrary};
+use crate::library::{LibraryBook, LibraryMetadataUpdate, LocalLibrary};
 use crate::preferences::{self, AppLanguage};
 use crate::reader::{BookDisplayMetadata, DesktopReader, open_reader};
 use crate::settings::AppliedSettings;
 use crate::sync::{
-    LocalSyncBook, SyncProgress, SyncReport, SyncSettings, SyncStage, SyncStore, append_sync_log,
-    format_error_chain, run_sync,
+    LocalSyncBook, SyncMode, SyncProgress, SyncReport, SyncSettings, SyncStage, SyncStore,
+    append_sync_log, format_error_chain, run_sync,
 };
 use crate::ui::{
     Icon, ToastKind, decode_color_image, dialog_action_button, dialog_danger_button, icon,
@@ -23,8 +33,7 @@ use crate::ui::{
 
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 // Keep shelf notifications below the 28 px top inset and 44 px header so they
-// never cover the import or settings actions. Success, error, and sync progress
-// all flow through the same shelf notification slot.
+// never cover the import or settings actions.
 const SHELF_TOAST_TOP_OFFSET: f32 = 84.0;
 const SHELF_SCROLLBAR_GUTTER: f32 = 16.0;
 const CARD_WIDTH: f32 = 180.0;
@@ -32,31 +41,6 @@ const CARD_HEIGHT: f32 = 300.0;
 const COVER_WIDTH: f32 = 160.0;
 const COVER_HEIGHT: f32 = 228.0;
 const SHELF_TITLE_BOLD_OFFSET: f32 = 0.45;
-
-fn sync_progress_text(
-    language: AppLanguage,
-    stage: SyncStage,
-    completed: u64,
-    total: u64,
-) -> String {
-    let label = match stage {
-        SyncStage::Checking => language.text("检查同步状态", "Checking sync status"),
-        SyncStage::Uploading => language.text("上传中", "Uploading"),
-        SyncStage::Downloading => language.text("下载中", "Downloading"),
-        SyncStage::ReadingData => language.text("同步阅读数据", "Syncing reading data"),
-        SyncStage::DerivedData => language.text("同步 OCR 数据", "Syncing OCR data"),
-    };
-    let percent = if total == 0 {
-        100
-    } else {
-        u64::try_from(
-            (u128::from(completed).saturating_mul(100) + u128::from(total / 2)) / u128::from(total),
-        )
-        .unwrap_or(100)
-        .min(100)
-    };
-    format!("{label} {percent}%")
-}
 
 fn sync_progress_log(progress: &SyncProgress) -> Option<String> {
     match progress {
@@ -89,6 +73,9 @@ pub(crate) struct ShelfFeature {
     settings_requested: bool,
     cover_textures: HashMap<String, TextureHandle>,
     read_activity: HashMap<String, u64>,
+    refresh_generation: u64,
+    refresh_requested: bool,
+    refresh_job: BackgroundJob<(u64, Result<ShelfSnapshot, String>)>,
 }
 
 struct ShelfState {
@@ -107,9 +94,55 @@ struct SyncUiState {
     settings: SyncSettings,
     password: String,
     task: TaskSlot<SyncTask>,
-    status: String,
-    imported_books: usize,
+    button: SyncButtonState,
+    schedule: SyncSchedule,
     import_error: Option<String>,
+    probe_requested: Option<(SyncStore, String)>,
+    probe_job: BackgroundJob<(String, Result<Option<u64>, String>)>,
+}
+
+struct ShelfSnapshot {
+    statistics: crate::statistics::Page,
+    activity: HashMap<String, u64>,
+    metadata: Vec<LibraryMetadataUpdate>,
+}
+
+fn load_shelf_snapshot(
+    mut books: Vec<LibraryBook>,
+    store: Option<SyncStore>,
+) -> Result<ShelfSnapshot, String> {
+    let mut metadata = Vec::new();
+    for book in &mut books {
+        if let Some(update) =
+            crate::generated_metadata::load(&book.id).map_err(|error| error.to_string())?
+        {
+            let changed = (!update.title.trim().is_empty() && book.title != update.title)
+                || (!update.authors.is_empty() && book.authors != update.authors);
+            if changed {
+                if !update.title.trim().is_empty() {
+                    book.title.clone_from(&update.title);
+                }
+                if !update.authors.is_empty() {
+                    book.authors.clone_from(&update.authors);
+                }
+                metadata.push(LibraryMetadataUpdate {
+                    id: book.id.clone(),
+                    title: update.title,
+                    authors: update.authors,
+                });
+            }
+        }
+    }
+    let statistics = crate::statistics::Page::shelf_snapshot(&books, store.as_ref())?;
+    let activity = store
+        .as_ref()
+        .map_or(Ok(HashMap::new()), SyncStore::progress_activity_times)
+        .map_err(|error| error.to_string())?;
+    Ok(ShelfSnapshot {
+        statistics,
+        activity,
+        metadata,
+    })
 }
 
 #[derive(Clone)]
@@ -117,6 +150,7 @@ pub(crate) struct SyncTask {
     pub(crate) settings: SyncSettings,
     pub(crate) password: String,
     pub(crate) books: Vec<LocalSyncBook>,
+    pub(crate) mode: SyncMode,
 }
 
 pub(crate) type SyncTaskMessage = TaskResult<SyncReport>;
@@ -139,7 +173,14 @@ impl ShelfFeature {
         title: &str,
         authors: &[String],
     ) -> crate::library::LibraryResult<bool> {
-        self.shelf.library.update_metadata(book_id, title, authors)
+        let changed = self
+            .shelf
+            .library
+            .update_metadata(book_id, title, authors)?;
+        if changed {
+            self.refresh_read_activity();
+        }
+        Ok(changed)
     }
 
     pub(crate) fn new(library: LocalLibrary, reader_fonts: Arc<[Blob<u8>]>) -> Self {
@@ -204,9 +245,11 @@ impl ShelfFeature {
                 settings,
                 password,
                 task: TaskSlot::default(),
-                status: String::new(),
-                imported_books: 0,
+                button: SyncButtonState::default(),
+                schedule: SyncSchedule::default(),
                 import_error: None,
+                probe_requested: None,
+                probe_job: BackgroundJob::default(),
             },
             language,
             search_shortcut: egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F),
@@ -216,10 +259,16 @@ impl ShelfFeature {
             settings_requested: false,
             cover_textures: HashMap::new(),
             read_activity: HashMap::new(),
+            refresh_generation: 0,
+            refresh_requested: false,
+            refresh_job: BackgroundJob::default(),
         };
         feature.refresh_read_activity();
+        feature.register_local_membership();
         if can_start_sync {
-            feature.start_sync();
+            feature.start_sync(SyncMode::Full {
+                force_statistics: false,
+            });
         }
         feature
     }
@@ -247,6 +296,8 @@ impl ShelfFeature {
             }
         };
         if imported {
+            self.register_local_membership();
+            self.request_file_sync();
             self.cover_textures.clear();
         }
         let metadata = Some(BookDisplayMetadata::from(&book));
@@ -276,6 +327,10 @@ impl ShelfFeature {
         self.shelf.error = None;
         match self.shelf.library.import_files(paths) {
             Ok(summary) => {
+                if summary.imported > 0 {
+                    self.register_local_membership();
+                    self.request_file_sync();
+                }
                 self.cover_textures.clear();
                 let message = match (
                     self.language.resolved(),
@@ -314,6 +369,7 @@ impl ShelfFeature {
     fn remove_book(&mut self, id: &str) {
         match self.shelf.library.remove(id) {
             Ok(true) => {
+                self.request_file_sync();
                 if let Some(store) = &self.local_store
                     && let Err(error) = store.set_book_present(id, false)
                 {
@@ -355,13 +411,22 @@ impl ShelfFeature {
     }
 
     pub(crate) fn apply_global_settings(&mut self, settings: &AppliedSettings) {
+        let changed = crate::sync::account_key(&self.sync.settings)
+            != crate::sync::account_key(&settings.sync_settings)
+            || self.sync.password != settings.sync_password
+            || self.sync.settings.enabled != settings.sync_settings.enabled;
         self.language = settings.language;
         self.search_shortcut = settings.shortcuts.search;
         self.import_books_shortcut = settings.shortcuts.import_books;
         self.return_to_shelf_shortcut = settings.shortcuts.return_to_shelf;
         self.sync.settings.clone_from(&settings.sync_settings);
         self.sync.password.clone_from(&settings.sync_password);
-        self.start_sync();
+        if changed {
+            self.local_store = SyncStore::open_default(self.sync.settings.device_id.clone()).ok();
+            self.start_sync(SyncMode::Full {
+                force_statistics: false,
+            });
+        }
     }
 
     pub(crate) fn resume(&mut self) {
@@ -371,40 +436,122 @@ impl ShelfFeature {
         self.refresh_read_activity();
         self.shelf.selected_book_id = None;
         self.shelf.focus_selected_book = true;
-        self.start_sync();
+        self.start_sync(SyncMode::Reading);
     }
 
     fn refresh_read_activity(&mut self) {
-        let open = self.statistics.open;
-        self.statistics
-            .open(self.shelf.library.books(), self.local_store.as_ref());
-        self.statistics.open = open;
-        let Some(store) = &self.local_store else {
-            self.read_activity.clear();
-            return;
-        };
-        match store.progress_activity_times() {
-            Ok(activity_times) => self.read_activity = activity_times,
-            Err(error) => {
-                tracing::warn!(%error, "failed to load shelf reading activity");
-                self.read_activity.clear();
+        self.refresh_generation = self.refresh_generation.wrapping_add(1);
+        self.refresh_requested = true;
+    }
+
+    fn poll_background(&mut self) {
+        if let Some((generation, result)) = self.refresh_job.poll()
+            && generation == self.refresh_generation
+        {
+            match result {
+                Ok(snapshot) => {
+                    self.statistics.apply_shelf_snapshot(snapshot.statistics);
+                    self.read_activity = snapshot.activity;
+                    if let Err(error) = self.shelf.library.update_metadata_batch(&snapshot.metadata)
+                    {
+                        self.sync_failed(error.to_string());
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "failed to refresh shelf data"),
             }
         }
     }
 
-    fn start_sync(&mut self) {
-        if self.sync.task.is_pending() || !self.sync.settings.enabled {
+    pub(crate) fn request_file_sync(&mut self) {
+        self.refresh_read_activity();
+        self.sync.schedule.request(SyncMode::Full {
+            force_statistics: false,
+        });
+    }
+
+    fn register_local_membership(&self) {
+        if let Some(store) = &self.local_store {
+            for book in self.shelf.library.books() {
+                if let Err(error) = store.set_book_present(&book.id, true) {
+                    tracing::warn!(%error, "failed to register local book membership");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn poll_sync(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        self.sync.button.expire(now);
+        self.poll_background();
+        if self.refresh_job.is_running() || self.refresh_requested {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        let probe = self.sync.probe_job.poll();
+        if !self.sync.settings.enabled {
             return;
         }
+        ctx.request_repaint_after(Duration::from_secs(1));
+        if let Some((account, result)) = probe
+            && account == crate::sync::account_key(&self.sync.settings)
+            && !self.sync.task.is_pending()
+        {
+            match result {
+                Ok(latest) => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    if let Some(mode) = self.sync.schedule.next(now, now_ms, latest) {
+                        self.start_sync(mode);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "failed to inspect pending sync changes"),
+            }
+        }
+        if now < self.sync.schedule.next_poll {
+            return;
+        }
+        self.sync.schedule.next_poll = now + Duration::from_secs(1);
+        if let Ok(token) = crate::sync::derived_change_token() {
+            if token.is_some() && token != self.sync.schedule.derived_token {
+                self.request_file_sync();
+            }
+            self.sync.schedule.derived_token = token;
+        }
+        if self.sync.task.is_pending() || self.sync.probe_job.is_running() {
+            return;
+        }
+        if let Some(store) = &self.local_store {
+            self.sync.probe_requested =
+                Some((store.clone(), crate::sync::account_key(&self.sync.settings)));
+        }
+    }
+
+    fn start_sync(&mut self, mode: SyncMode) {
+        if self.sync.task.is_pending() {
+            self.sync.schedule.request(mode);
+            return;
+        }
+        if !self.sync.settings.enabled {
+            return;
+        }
+        self.sync.schedule.started(mode);
+        self.sync.button = SyncButtonState::Running {
+            stage: SyncStage::Preparing,
+            completed: 0,
+            total: 0,
+        };
         if let Err(error) = self.sync.settings.validate() {
-            self.show_error(format!(
+            self.sync.schedule.completed(mode, false, Instant::now());
+            self.sync_failed(format!(
                 "{}: {error}",
                 self.language.text("无法开始同步", "Unable to start sync")
             ));
             return;
         }
         if self.sync.password.is_empty() {
-            self.show_error(
+            self.sync.schedule.completed(mode, false, Instant::now());
+            self.sync_failed(
                 self.language
                     .text(
                         "无法开始同步：请先填写 WebDAV 密码",
@@ -414,32 +561,30 @@ impl ShelfFeature {
             );
             return;
         }
-        self.sync.status = self
-            .language
-            .text("正在同步书籍与阅读数据…", "Syncing books and reading data…")
-            .into();
-        self.sync.imported_books = 0;
         self.sync.import_error = None;
-        self.shelf.notice = Some(self.sync.status.clone());
-        self.shelf.notice_dismiss_at = None;
+        self.sync.schedule.derived_token = crate::sync::derived_change_token().ok().flatten();
         self.sync.task.begin(SyncTask {
+            mode,
             settings: self.sync.settings.clone(),
             password: self.sync.password.clone(),
-            books: self
-                .shelf
-                .library
-                .books()
-                .iter()
-                .map(|book| LocalSyncBook {
-                    id: book.id.clone(),
-                    title: book.title.clone(),
-                    authors: book.authors.clone(),
-                    file_name: book.file_name.clone(),
-                    path: book.path.clone(),
-                    cover_bytes: book.cover_bytes.clone(),
-                    added_at: book.added_at,
-                })
-                .collect(),
+            books: if mode == SyncMode::Reading {
+                Vec::new()
+            } else {
+                self.shelf
+                    .library
+                    .books()
+                    .iter()
+                    .map(|book| LocalSyncBook {
+                        id: book.id.clone(),
+                        title: book.title.clone(),
+                        authors: book.authors.clone(),
+                        file_name: book.file_name.clone(),
+                        path: book.path.clone(),
+                        cover_bytes: book.cover_bytes.clone(),
+                        added_at: book.added_at,
+                    })
+                    .collect()
+            },
         });
     }
 
@@ -448,6 +593,62 @@ impl ShelfFeature {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<crate::platform::UserEvent>,
     ) {
+        if self.refresh_requested && !self.refresh_job.is_running() {
+            self.refresh_requested = false;
+            let generation = self.refresh_generation;
+            let books = self
+                .shelf
+                .library
+                .books()
+                .iter()
+                .map(|book| LibraryBook {
+                    id: book.id.clone(),
+                    title: book.title.clone(),
+                    authors: book.authors.clone(),
+                    file_name: book.file_name.clone(),
+                    path: book.path.clone(),
+                    cover_bytes: None,
+                    added_at: book.added_at,
+                })
+                .collect();
+            let store = self.local_store.clone();
+            let wake = proxy.clone();
+            self.refresh_job.start(
+                runtime,
+                move || {
+                    let started = Instant::now();
+                    let result = load_shelf_snapshot(books, store);
+                    tracing::debug!(
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "background shelf refresh completed"
+                    );
+                    (generation, result)
+                },
+                move || {
+                    let _ =
+                        wake.send_event(crate::platform::UserEvent::RepaintAfter(Duration::ZERO));
+                },
+            );
+        }
+        if !self.sync.probe_job.is_running()
+            && let Some((store, account)) = self.sync.probe_requested.take()
+        {
+            let wake = proxy.clone();
+            self.sync.probe_job.start(
+                runtime,
+                move || {
+                    let latest = store
+                        .pending_reading(&account)
+                        .map(|pending| pending.into_iter().map(|(_, _, changed)| changed).max())
+                        .map_err(|error| error.to_string());
+                    (account, latest)
+                },
+                move || {
+                    let _ =
+                        wake.send_event(crate::platform::UserEvent::RepaintAfter(Duration::ZERO));
+                },
+            );
+        }
         if let Some(request) = self.import_task.take_pending() {
             let proxy = proxy.clone();
             runtime.spawn(async move {
@@ -491,6 +692,7 @@ impl ShelfFeature {
                     payload.settings,
                     payload.password,
                     payload.books,
+                    payload.mode,
                     move |progress| {
                         if let Some(message) = sync_progress_log(&progress)
                             && let Err(error) = append_sync_log("INFO", &message)
@@ -552,43 +754,38 @@ impl ShelfFeature {
         }
     }
 
-    pub(crate) fn complete_sync(&mut self, message: SyncTaskMessage) {
-        if self.sync.task.complete(message.id).is_none() {
-            return;
+    fn sync_failed(&mut self, error: String) {
+        self.sync.button = SyncButtonState::Failed;
+        if let Err(log_error) = append_sync_log("ERROR", &error) {
+            tracing::warn!(%log_error, "failed to append WebDAV sync log");
         }
-        self.refresh_read_activity();
+    }
+
+    pub(crate) fn complete_sync(&mut self, message: SyncTaskMessage) {
+        let Some(task) = self.sync.task.complete(message.id) else {
+            return;
+        };
+        let success = message.result.is_ok() && self.sync.import_error.is_none();
+        self.sync
+            .schedule
+            .completed(task.mode, success, Instant::now());
+        if matches!(task.mode, SyncMode::Full { .. })
+            || message
+                .result
+                .as_ref()
+                .is_ok_and(|report| report.updated_progress > 0 || report.merged_annotations > 0)
+        {
+            self.refresh_read_activity();
+        }
         match message.result {
-            Ok(report) => {
+            Ok(_) => {
                 if let Some(error) = self.sync.import_error.take() {
-                    self.show_error(error);
+                    self.sync_failed(error);
                     return;
                 }
-                if let Err(error) = self.apply_synced_generated_metadata() {
-                    self.show_error(format!(
-                        "{}: {error}",
-                        self.language.text(
-                            "应用同步的书籍元数据失败",
-                            "Failed to apply synced book metadata"
-                        )
-                    ));
-                    return;
-                }
-                let imported = self.sync.imported_books;
-                self.sync.status = format!(
-                    "{} · ↑{} ↓{} · {}",
-                    self.language.text("同步完成", "Sync complete"),
-                    report.uploaded_books,
-                    imported,
-                    report.updated_progress,
-                );
-                self.show_notice(self.sync.status.clone());
+                self.sync.button = SyncButtonState::completed(Instant::now());
             }
-            Err(error) => {
-                self.show_error(format!(
-                    "{}: {error}",
-                    self.language.text("WebDAV 同步失败", "WebDAV sync failed")
-                ));
-            }
+            Err(error) => self.sync_failed(error),
         }
     }
 
@@ -602,7 +799,11 @@ impl ShelfFeature {
                 completed,
                 total,
             } => {
-                self.sync.status = sync_progress_text(self.language, stage, completed, total);
+                self.sync.button = SyncButtonState::Running {
+                    stage,
+                    completed,
+                    total,
+                };
             }
             SyncProgress::Downloaded {
                 book,
@@ -611,12 +812,10 @@ impl ShelfFeature {
                 total,
             } => {
                 match self.shelf.library.import_remote(*book) {
-                    Ok(true) => {
-                        self.sync.imported_books += 1;
-                        self.cover_textures.clear();
-                        fs::remove_file(&cache_path).ok();
-                    }
-                    Ok(false) => {
+                    Ok(imported) => {
+                        if imported {
+                            self.cover_textures.clear();
+                        }
                         fs::remove_file(&cache_path).ok();
                     }
                     Err(error) => {
@@ -627,34 +826,13 @@ impl ShelfFeature {
                         ));
                     }
                 }
-                self.sync.status =
-                    sync_progress_text(self.language, SyncStage::Downloading, completed, total);
+                self.sync.button = SyncButtonState::Running {
+                    stage: SyncStage::Downloading,
+                    completed,
+                    total,
+                };
             }
         }
-        if self.sync.import_error.is_none() {
-            self.shelf.error = None;
-            self.shelf.error_dismiss_at = None;
-            self.shelf.notice = Some(self.sync.status.clone());
-            self.shelf.notice_dismiss_at = None;
-        }
-    }
-
-    fn apply_synced_generated_metadata(&mut self) -> crate::library::LibraryResult<()> {
-        let book_ids = self
-            .shelf
-            .library
-            .books()
-            .iter()
-            .map(|book| book.id.clone())
-            .collect::<Vec<_>>();
-        for book_id in book_ids {
-            if let Some(metadata) = crate::generated_metadata::load(&book_id)? {
-                self.shelf
-                    .library
-                    .update_metadata(&book_id, &metadata.title, &metadata.authors)?;
-            }
-        }
-        Ok(())
     }
 
     pub(crate) fn ui(&mut self, root_ui: &mut egui::Ui, interaction_blocked: bool) {
@@ -753,6 +931,17 @@ impl ShelfFeature {
                 let search_response = shelf_search_field(ui, &mut self.shelf.query, &search_hint);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let settings = icon_button(ui, Icon::Settings);
+                    if self.sync.settings.enabled
+                        && self
+                            .sync
+                            .button
+                            .show(ui, interaction_blocked, self.language)
+                            .clicked()
+                    {
+                        self.start_sync(SyncMode::Full {
+                            force_statistics: true,
+                        });
+                    }
                     if ui
                         .add_enabled_ui(!interaction_blocked, |ui| icon_button(ui, Icon::Chart))
                         .inner
@@ -1013,11 +1202,7 @@ impl ShelfFeature {
                 ctx,
                 "shelf-notice",
                 notice,
-                if self.sync.task.is_pending() {
-                    ToastKind::Loading
-                } else {
-                    ToastKind::Success
-                },
+                ToastKind::Success,
                 Vec2::new(-24.0, SHELF_TOAST_TOP_OFFSET),
                 false,
             );
@@ -1357,7 +1542,33 @@ fn sort_shelf_books(books: &mut [LibraryBook], read_activity: &HashMap<String, u
 
 #[cfg(test)]
 mod tests {
+    use super::sync_button::sync_progress_text;
     use super::*;
+
+    #[test]
+    fn sync_percentage_only_reaches_100_when_complete() {
+        assert_eq!(
+            sync_progress_text(AppLanguage::English, SyncStage::Uploading, 999, 1000),
+            "Syncing · Uploading 99%"
+        );
+        assert_eq!(
+            sync_progress_text(AppLanguage::English, SyncStage::Uploading, 1000, 1000),
+            "Syncing · Uploading 100%"
+        );
+        assert_eq!(
+            sync_progress_text(
+                AppLanguage::English,
+                SyncStage::Uploading,
+                u64::MAX - 1,
+                u64::MAX
+            ),
+            "Syncing · Uploading 99%"
+        );
+        assert_eq!(
+            sync_progress_text(AppLanguage::English, SyncStage::Preparing, 0, 0),
+            "Syncing…"
+        );
+    }
 
     fn book(id: &str, added_at: u64) -> LibraryBook {
         LibraryBook {

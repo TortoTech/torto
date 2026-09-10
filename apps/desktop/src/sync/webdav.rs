@@ -1,23 +1,28 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use reqwest::header::{
-    CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderName, HeaderValue, IF_MATCH, IF_NONE_MATCH, RANGE,
+    CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderName, HeaderValue, IF_MATCH,
+    IF_NONE_MATCH, LOCATION, RANGE,
 };
 use reqwest::{Client, Method, StatusCode, Url};
 
 use super::SyncResult;
 use super::settings::SyncSettings;
+use super::store::SyncStore;
 
 const DEPTH: HeaderName = HeaderName::from_static("depth");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(30);
 const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_mins(2);
-const DOWNLOAD_PROGRESS_INTERVAL: u64 = 256 * 1024;
+const PROGRESS_REFRESH: Duration = Duration::from_millis(100);
+const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteObject {
@@ -33,6 +38,7 @@ pub(crate) struct WebDavClient {
     username: String,
     password: String,
     cstcloud_compatibility: bool,
+    cache: Option<(SyncStore, String)>,
 }
 
 impl WebDavClient {
@@ -87,7 +93,74 @@ impl WebDavClient {
             username: settings.username.clone(),
             password,
             cstcloud_compatibility: compatibility_user_agent.is_some(),
+            cache: None,
         })
+    }
+
+    pub(crate) fn with_store(mut self, store: SyncStore, account: String) -> Self {
+        self.cache = Some((store, account));
+        self
+    }
+
+    pub(crate) fn cache_get(&self, key: &str) -> SyncResult<Option<Vec<u8>>> {
+        self.cache
+            .as_ref()
+            .map_or(Ok(None), |(store, account)| store.cache_get(account, key))
+    }
+
+    pub(crate) fn cache_set(&self, key: &str, value: &[u8]) -> SyncResult<()> {
+        self.cache.as_ref().map_or(Ok(()), |(store, account)| {
+            store.cache_set(account, key, value)
+        })
+    }
+
+    pub(crate) fn invalidate_object(&self, path: &str) -> SyncResult<()> {
+        self.cache.as_ref().map_or(Ok(()), |(store, account)| {
+            store.cache_remove(account, &format!("object:{path}"))
+        })
+    }
+
+    fn cached_object(&self, path: &str) -> SyncResult<Option<RemoteObject>> {
+        let Some(bytes) = self.cache_get(&format!("object:{path}"))? else {
+            return Ok(None);
+        };
+        let Some(split) = bytes.iter().position(|byte| *byte == b'\n') else {
+            return Ok(None);
+        };
+        let etag = std::str::from_utf8(&bytes[..split])?.to_owned();
+        Ok(Some(RemoteObject {
+            bytes: bytes[split + 1..].to_vec(),
+            etag: (!etag.is_empty()).then_some(etag),
+        }))
+    }
+
+    fn remember_object(&self, path: &str, object: &RemoteObject) -> SyncResult<()> {
+        if self.cache.is_none() {
+            return Ok(());
+        }
+        let mut bytes = object
+            .etag
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&object.bytes);
+        self.cache_set(&format!("object:{path}"), &bytes)
+    }
+
+    async fn repair_parent(&self, path: &str) -> SyncResult<()> {
+        self.create_collection_absolute(self.root.join("../")?)
+            .await?;
+        self.create_collection_absolute(self.root.clone()).await?;
+        let mut current = self.root.clone();
+        if let Some((parent, _)) = path.rsplit_once('/') {
+            for segment in parent.split('/').filter(|segment| !segment.is_empty()) {
+                current = current.join(&format!("{segment}/"))?;
+                self.create_collection_absolute(current.clone()).await?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn ensure_base_layout(&self) -> SyncResult<()> {
@@ -120,8 +193,19 @@ impl WebDavClient {
     }
 
     pub(crate) async fn get_optional(&self, path: &str) -> SyncResult<Option<RemoteObject>> {
-        let response = self.request(Method::GET, self.url(path)?).send().await?;
+        let cached = self.cached_object(path)?;
+        let mut request = self.request(Method::GET, self.url(path)?);
+        if let Some(etag) = cached.as_ref().and_then(|object| object.etag.as_ref()) {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+        let response = request.send().await?;
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return cached.map(Some).ok_or_else(|| {
+                io::Error::other("WebDAV returned 304 without cached content").into()
+            });
+        }
         if response.status() == StatusCode::NOT_FOUND {
+            self.invalidate_object(path)?;
             return Ok(None);
         }
         let response = response.error_for_status()?;
@@ -130,10 +214,12 @@ impl WebDavClient {
             .get(ETAG)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        Ok(Some(RemoteObject {
+        let object = RemoteObject {
             bytes: response.bytes().await?.to_vec(),
             etag,
-        }))
+        };
+        self.remember_object(path, &object)?;
+        Ok(Some(object))
     }
 
     pub(crate) async fn download_to_file<F>(
@@ -214,7 +300,7 @@ impl WebDavClient {
             .append(append)
             .truncate(!append)
             .open(destination)?;
-        let mut last_reported = downloaded;
+        let mut last_update = Instant::now();
         while let Some(chunk) = response.chunk().await? {
             let chunk_length = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
             let next = downloaded.saturating_add(chunk_length);
@@ -227,11 +313,9 @@ impl WebDavClient {
             }
             file.write_all(&chunk)?;
             downloaded = next;
-            if downloaded.saturating_sub(last_reported) >= DOWNLOAD_PROGRESS_INTERVAL
-                || downloaded == expected_length
-            {
+            if last_update.elapsed() >= PROGRESS_REFRESH || downloaded == expected_length {
                 progress(downloaded);
-                last_reported = downloaded;
+                last_update = Instant::now();
             }
         }
         file.flush()?;
@@ -253,45 +337,146 @@ impl WebDavClient {
         bytes: Vec<u8>,
         content_type: &'static str,
     ) -> SyncResult<bool> {
-        if self.cstcloud_compatibility {
-            if self.get_optional(path).await?.is_some() {
-                return Ok(false);
-            }
-            self.request(Method::PUT, self.url(path)?)
-                .header(CONTENT_TYPE, content_type)
-                .body(bytes)
-                .send()
-                .await?
-                .error_for_status()?;
-            return Ok(true);
-        }
-        let response = self
-            .request(Method::PUT, self.url(path)?)
-            .header(IF_NONE_MATCH, "*")
-            .header(CONTENT_TYPE, content_type)
-            .body(bytes)
-            .send()
-            .await?;
-        if response.status() == StatusCode::PRECONDITION_FAILED {
-            return Ok(false);
-        }
-        response.error_for_status()?;
-        Ok(true)
+        self.put_immutable_with_progress(path, bytes, content_type, |_| {})
+            .await
     }
 
-    pub(crate) async fn put_mutable_bytes(
+    pub(crate) async fn put_immutable_with_progress(
         &self,
         path: &str,
         bytes: Vec<u8>,
         content_type: &'static str,
+        progress: impl FnMut(u64),
+    ) -> SyncResult<bool> {
+        if self.cstcloud_compatibility && self.get_optional(path).await?.is_some() {
+            return Ok(false);
+        }
+        self.put_with_progress(path, bytes, content_type, true, progress)
+            .await
+    }
+
+    pub(crate) async fn put_mutable_bytes_with_progress(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+        content_type: &'static str,
+        progress: impl FnMut(u64),
     ) -> SyncResult<()> {
-        self.request(Method::PUT, self.url(path)?)
-            .header(CONTENT_TYPE, content_type)
-            .body(bytes)
-            .send()
-            .await?
-            .error_for_status()?;
+        self.put_with_progress(path, bytes, content_type, false, progress)
+            .await?;
         Ok(())
+    }
+
+    async fn put_with_progress(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+        content_type: &'static str,
+        immutable: bool,
+        mut progress: impl FnMut(u64),
+    ) -> SyncResult<bool> {
+        let bytes = bytes::Bytes::from(bytes);
+        let length = bytes.len() as u64;
+        let mut url = self.url(path)?;
+        let mut last_reported = 0;
+        progress(0);
+        // Streaming bodies cannot be replayed by reqwest's redirect policy.
+        // Replay our shared buffer explicitly, retaining same-origin authentication.
+        for _ in 0..10 {
+            let consumed = Arc::new(AtomicU64::new(0));
+            let counter = Arc::clone(&consumed);
+            let body = futures_util::stream::unfold(bytes.clone(), move |mut remaining| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    if remaining.is_empty() {
+                        return None;
+                    }
+                    let chunk = remaining.split_to(remaining.len().min(UPLOAD_CHUNK_SIZE));
+                    counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    Some((Ok::<_, io::Error>(chunk), remaining))
+                }
+            });
+            let mut request = self
+                .request(Method::PUT, url.clone())
+                .header(CONTENT_TYPE, content_type)
+                .header(CONTENT_LENGTH, length)
+                .body(reqwest::Body::wrap_stream(body));
+            if immutable && !self.cstcloud_compatibility {
+                request = request.header(IF_NONE_MATCH, "*");
+            }
+            let mut pending = Box::pin(request.send());
+            let response = loop {
+                match futures_util::future::select(
+                    pending,
+                    Box::pin(tokio::time::sleep(PROGRESS_REFRESH)),
+                )
+                .await
+                {
+                    futures_util::future::Either::Left((result, _)) => break result?,
+                    futures_util::future::Either::Right((_, request)) => {
+                        pending = request;
+                        // Body consumption includes transport buffering. Reserve completion
+                        // until the server acknowledges the request successfully.
+                        let current = consumed
+                            .load(Ordering::Relaxed)
+                            .min(length.saturating_sub(1));
+                        if current > last_reported {
+                            progress(current);
+                            last_reported = current;
+                        }
+                    }
+                }
+            };
+            if matches!(
+                response.status(),
+                StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+            ) {
+                let location = response
+                    .headers()
+                    .get(LOCATION)
+                    .ok_or_else(|| io::Error::other("WebDAV upload redirect has no location"))?
+                    .to_str()?;
+                let next = response.url().join(location)?;
+                if next.origin() != self.root.origin() {
+                    return Err(
+                        io::Error::other("WebDAV upload redirected to a different origin").into(),
+                    );
+                }
+                url = next;
+                continue;
+            }
+            if immutable && response.status() == StatusCode::PRECONDITION_FAILED {
+                return Ok(false);
+            }
+            if matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::CONFLICT
+            ) {
+                self.repair_parent(path).await?;
+                continue;
+            }
+            if !response.status().is_success() {
+                response.error_for_status()?;
+                return Err(io::Error::other("Unexpected WebDAV upload response").into());
+            }
+            progress(length);
+            if content_type == "application/json" {
+                let etag = response
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                self.remember_object(
+                    path,
+                    &RemoteObject {
+                        bytes: bytes.to_vec(),
+                        etag,
+                    },
+                )?;
+            }
+            return Ok(true);
+        }
+        Err(io::Error::other("Too many WebDAV upload redirects").into())
     }
 
     pub(crate) async fn put_mutable_json<T: serde::Serialize + ?Sized>(
@@ -300,36 +485,61 @@ impl WebDavClient {
         value: &T,
     ) -> SyncResult<()> {
         let bytes = serde_json::to_vec_pretty(value)?;
-        for _ in 0..2 {
-            let existing = self.get_optional(path).await?;
-            if self.cstcloud_compatibility {
-                self.request(Method::PUT, self.url(path)?)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(bytes.clone())
-                    .send()
-                    .await?
-                    .error_for_status()?;
+        let mut existing = match self.cached_object(path)? {
+            Some(object) => Some(object),
+            None => self.get_optional(path).await?,
+        };
+        for _ in 0..3 {
+            if existing
+                .as_ref()
+                .is_some_and(|object| object.bytes == bytes)
+            {
                 return Ok(());
             }
             let mut request = self
                 .request(Method::PUT, self.url(path)?)
                 .header(CONTENT_TYPE, "application/json")
                 .body(bytes.clone());
-            request = if let Some(etag) = existing.and_then(|object| object.etag) {
-                request.header(IF_MATCH, etag)
-            } else {
-                request.header(IF_NONE_MATCH, "*")
-            };
+            if !self.cstcloud_compatibility {
+                request = if let Some(etag) = existing
+                    .as_ref()
+                    .and_then(|object| object.etag.as_ref())
+                    .filter(|etag| !etag.is_empty())
+                {
+                    request.header(IF_MATCH, etag)
+                } else if existing.is_none() {
+                    request.header(IF_NONE_MATCH, "*")
+                } else {
+                    request
+                };
+            }
             let response = request.send().await?;
-            if response.status() == StatusCode::PRECONDITION_FAILED {
+            if matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::CONFLICT
+            ) {
+                self.repair_parent(path).await?;
+                self.invalidate_object(path)?;
+                existing = None;
                 continue;
             }
-            response.error_for_status()?;
+            if response.status() == StatusCode::PRECONDITION_FAILED {
+                self.invalidate_object(path)?;
+                existing = self.get_optional(path).await?;
+                continue;
+            }
+            let response = response.error_for_status()?;
+            let etag = response
+                .headers()
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            self.remember_object(path, &RemoteObject { bytes, etag })?;
             return Ok(());
         }
         Err(io::Error::new(
             io::ErrorKind::WouldBlock,
-            format!("WebDAV 文件在写入时被其他客户端修改：{path}"),
+            format!("WebDAV file changed during upload: {path}"),
         )
         .into())
     }
@@ -394,6 +604,33 @@ impl WebDavClient {
     }
 
     async fn ensure_collection_absolute(&self, url: Url) -> SyncResult<()> {
+        let key = format!("directory:{url}");
+        if self.cache_get(&key)?.is_some() {
+            return Ok(());
+        }
+        if let Err(error) = self.create_collection_absolute(url.clone()).await {
+            let missing_parent = error
+                .downcast_ref::<reqwest::Error>()
+                .and_then(reqwest::Error::status)
+                .is_some_and(|status| {
+                    matches!(status, StatusCode::NOT_FOUND | StatusCode::CONFLICT)
+                });
+            if !missing_parent {
+                return Err(error);
+            }
+            if let Some(relative) = url.path().strip_prefix(self.root.path()) {
+                self.repair_parent(&format!("{relative}__directory__"))
+                    .await?;
+            } else {
+                self.create_collection_absolute(self.root.join("../")?)
+                    .await?;
+            }
+            self.create_collection_absolute(url).await?;
+        }
+        self.cache_set(&key, b"1")
+    }
+
+    async fn create_collection_absolute(&self, url: Url) -> SyncResult<()> {
         let response = self
             .request(Method::from_bytes(b"MKCOL")?, url)
             .send()
@@ -448,6 +685,122 @@ mod tests {
 
     use super::*;
     use crate::sync::CloudProviderKind;
+
+    fn upload_case(status: u16, redirect: bool, immutable: bool) -> (Vec<u64>, SyncResult<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let payload = vec![42; 2 * 1024 * 1024];
+        let expected = payload.clone();
+        let server = thread::spawn(move || {
+            for attempt in 0..=usize::from(redirect) {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 16 * 1024];
+                let header_end = loop {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                assert!(headers.starts_with("put "));
+                assert!(headers.contains(&format!("content-length: {}", expected.len())));
+                assert!(headers.contains("authorization: basic "));
+                assert_eq!(headers.contains("if-none-match: *"), immutable);
+                assert!(!headers.contains("transfer-encoding: chunked"));
+                while request.len() - header_end < expected.len() {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert_eq!(&request[header_end..], expected);
+                // Allow progress polling while the server has not acknowledged the PUT.
+                thread::sleep(Duration::from_millis(150));
+                let response = if redirect && attempt == 0 {
+                    "307 Temporary Redirect\r\nLocation: /redirected-upload".to_owned()
+                } else {
+                    format!("{status} Test")
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 {response}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+        let mut settings = SyncSettings::new_device();
+        settings.provider = CloudProviderKind::Custom;
+        settings.base_url = format!("http://{address}");
+        settings.username = "reader".into();
+        let client = WebDavClient::new(&settings, "secret".into()).unwrap();
+        let mut updates = Vec::new();
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            if immutable {
+                client
+                    .put_immutable_with_progress(
+                        "book.epub",
+                        payload,
+                        "application/octet-stream",
+                        |sent| updates.push(sent),
+                    )
+                    .await
+            } else {
+                client
+                    .put_mutable_bytes_with_progress(
+                        "ocr.zip",
+                        payload,
+                        "application/zip",
+                        |sent| updates.push(sent),
+                    )
+                    .await
+                    .map(|()| true)
+            }
+        });
+        server.join().unwrap();
+        assert_eq!(updates.first(), Some(&0));
+        assert!(
+            updates
+                .iter()
+                .any(|&sent| sent > 0 && sent < 2 * 1024 * 1024)
+        );
+        assert!(updates.windows(2).all(|pair| pair[0] <= pair[1]));
+        (updates, result)
+    }
+
+    #[test]
+    fn streamed_book_and_ocr_uploads_report_progress_before_completion() {
+        for immutable in [true, false] {
+            let (updates, result) = upload_case(201, false, immutable);
+            assert!(result.unwrap());
+            assert_eq!(updates.last(), Some(&(2 * 1024 * 1024)));
+        }
+    }
+
+    #[test]
+    fn failed_or_already_existing_upload_does_not_report_full_transfer() {
+        for status in [500, 412] {
+            let (updates, result) = upload_case(status, false, true);
+            if status == 500 {
+                assert!(result.is_err());
+            } else {
+                assert!(!result.unwrap());
+            }
+            assert!(updates.iter().all(|&sent| sent < 2 * 1024 * 1024));
+        }
+    }
+
+    #[test]
+    fn streamed_upload_replays_body_on_same_origin_redirect() {
+        let (updates, result) = upload_case(201, true, true);
+        assert!(result.unwrap());
+        assert_eq!(updates.last(), Some(&(2 * 1024 * 1024)));
+    }
 
     fn captured_request_headers(provider: CloudProviderKind, download: bool) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -574,7 +927,12 @@ mod tests {
         let client = WebDavClient::new(&settings, "secret".into()).unwrap();
         let created = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(client.put_immutable("probe.json", b"payload".to_vec(), "application/json"))
+            .block_on(client.put_immutable_with_progress(
+                "probe.json",
+                b"payload".to_vec(),
+                "application/json",
+                |_| {},
+            ))
             .unwrap();
         assert!(created);
 
