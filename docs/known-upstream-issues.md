@@ -1,9 +1,47 @@
 # 核心依赖已知问题
 
-- 最近更新：2026-08-31
+- 最近更新：2026-09-10
 - 记录范围：已经在 Torto 中复现、确认与上游依赖、Windows 图形栈或渲染帧时序有关，并需要本地兼容代码或长期回归检查的问题
 
 依赖升级时应逐项检查本文。只有在上游修复已经进入当前版本，并且移除本地兼容代码后相关回归测试仍能通过，才删除对应兼容代码和本文条目。
+
+## 2026-09-10 上游版本核查
+
+本次对照 `Cargo.lock`、crates.io 的最新稳定版、GitHub issue/PR 状态、发布说明和相关源码核查；没有升级依赖，也没有移除本地兼容代码。以下结论是上游核查结果，不代表已经在 Torto 中验证新版行为。
+
+### 可用版本
+
+| 依赖 | 项目当前版本 | 最新稳定版 | 与本文问题有关的结论 |
+| --- | --- | --- | --- |
+| egui / epaint | 0.36.1 | [0.36.2](https://github.com/emilk/egui/releases/tag/0.36.2)，2026-09-08 | 新修复 `TextEdit` 忽略最小高度、细长倾斜矩形绘制；适合优先做补丁升级验证，但不等于已有兼容代码均可删除。 |
+| egui_commonmark | 0.25.0 | [0.25.0](https://crates.io/crates/egui_commonmark/0.25.0) | 没有更新的稳定版，多行跨组件选区问题仍开放。 |
+| Vello | 0.10.0 | [0.10.0](https://github.com/linebender/vello/releases/tag/v0.10.0) | 没有更新的稳定版，图片重放问题仍开放，unpacked bitmap mask 仍未支持。 |
+| Parley | 0.11.1 | [0.11.1](https://github.com/linebender/parley/releases/tag/v0.11.1) | 没有更新的稳定版，两端对齐选区问题仍开放。 |
+| Skrifa | 0.44.0；锁文件另含 0.42.1 | [0.47.0](https://crates.io/crates/skrifa/0.47.0)，2026-09-08 | 单独升级不能修复 Vello 的宋体绘制路径；Vello 0.10.0 仍依赖 Skrifa 0.44。 |
+| wgpu | 29.0.4 | [30.0.1](https://github.com/gfx-rs/wgpu/releases/tag/v30.0.1)，2026-08-22 | 30.0.1 的 acquire fence 修复针对非 Windows，不能据此认定本文 Windows 黑帧问题解决。 |
+| winit | 0.30.13 | [0.30.13](https://github.com/rust-windowing/winit/releases/tag/v0.30.13) | 另有 [0.31.0-beta.3](https://github.com/rust-windowing/winit/releases/tag/v0.31.0-beta.3)（2026-09-04），仍为预发行版。 |
+
+### 已确认的新修复与仍需保留的兼容逻辑
+
+| 本地问题 | 最新核查结果 |
+| --- | --- |
+| 显式高度的 TextEdit | 新版已合入 [#8420](https://github.com/emilk/egui/pull/8420)，修复忽略 `min_size.y`。旧的感知区域修复 [#7436](https://github.com/emilk/egui/pull/7436) 和 hint 对齐修复 [#8332](https://github.com/emilk/egui/pull/8332) 早于本次检查，当前 0.36.1 已包含。0.36.2 的默认对齐仍为 `LEFT_TOP`，因此显式 `.vertical_align(Center)` 仍是必要的设计设置。 |
+| 紧凑圆角控件羽化角线 | [#8482](https://github.com/emilk/egui/pull/8482) 修复的是细长矩形快速路径忽略旋转角度，不是本文圆角边界场景的一一对应修复。[#2735](https://github.com/emilk/egui/issues/2735)、[#7424](https://github.com/emilk/egui/issues/7424) 仍开放；可升级后验证，但暂保留局部几何处理。 |
+| Vello 图片再次出现时不显示 | [#1809](https://github.com/linebender/vello/issues/1809) 仍开放；0.10.0 释放图片 GPU 资源的修复不能替代图片重放修复。保留图集刷新。 |
+| 宋体等嵌入点阵字体空白 | [Fontations #1639](https://github.com/googlefonts/fontations/issues/1639) 仍开放；[#1839](https://github.com/googlefonts/fontations/pull/1839) 已于 2026-04-20 合并，不是本次新增修复。[Vello 0.10.0](https://github.com/linebender/vello/blob/v0.10.0/vello/src/scene.rs) 及本次查看的 [主干对应路径](https://github.com/linebender/vello/blob/main/research/vello_research/src/scene.rs) 仍直接跳过 unpacked mask。保留字体过滤。 |
+| Windows 全屏/IME 黑帧、放大窗口黑边 | [winit #3730](https://github.com/rust-windowing/winit/issues/3730)、[wgpu #5374](https://github.com/gfx-rs/wgpu/issues/5374) 仍开放，且仍无已确认覆盖 Torto 全屏/IME 场景的发布修复。winit beta.3 的键盘布局切换冻结、DPI HDC 泄漏修复是不同问题。保留模拟全屏、surface 恢复和原生背景处理。 |
+| Parley 两端对齐选区过短 | [#396](https://github.com/linebender/parley/issues/396) 仍开放。保留选区宽度修正。 |
+| Markdown 多组件选区覆盖行首 | [egui_commonmark #80](https://github.com/lampsitter/egui_commonmark/issues/80) 仍开放，暂无新版可解决该问题。保留不可选择的布局换行与本地表格布局。 |
+| 离屏端点导致选区清空 | 核查 [egui 0.36.2 的 Label](https://github.com/emilk/egui/blob/0.36.2/crates/egui/src/widgets/label.rs) 和 [选区状态](https://github.com/emilk/egui/blob/0.36.2/crates/egui/src/text_selection/label_text_selection.rs)：可见区域检查和未遇到两端点时清空选区的逻辑仍存在。保留本地 Label 补丁。 |
+| 虚拟列表底部抖动 | [#1787](https://github.com/emilk/egui/issues/1787)、[#3268](https://github.com/emilk/egui/issues/3268) 仍开放；[0.36.2 的 show_rows](https://github.com/emilk/egui/blob/0.36.2/crates/egui/src/containers/scroll_area.rs) 仍在末行越界时向前补首行。保留本地虚拟化。 |
+| 控件 ID/矩形变化误报 | [#8343](https://github.com/emilk/egui/issues/8343)、[#8092](https://github.com/emilk/egui/issues/8092) 仍开放，0.36.2 发布说明没有对应修复。保留当前调试设置。 |
+| 专注模式滚轮跨小节闪首图 | 本地输入时序问题，仍按下文已完成的本地修复维护，不属于等待依赖升级解决的项目。 |
+
+### 升级优先级
+
+1. 优先评估 egui/epaint 0.36.2：合并官方补丁到本地 `third_party/egui`、`third_party/egui-wgpu`，核对配套 egui crates 和锁文件，再运行输入框、选区、目录滚动、圆角与 DPI 回归。不能直接丢弃本地 fork。
+2. 暂不为了这些问题单独升级 wgpu 30：除未确认解决目标问题外，[Vello 0.10.0 的清单](https://github.com/linebender/vello/blob/v0.10.0/Cargo.toml) 仍使用 wgpu 29；[wgpu 30](https://github.com/gfx-rs/wgpu/releases/tag/v30.0.0) 还改变了 surface 配置和 present API，需作为图形栈整体迁移评估。
+3. Skrifa 0.47 和 winit 0.31 beta 继续跟踪；本次没有找到足以直接撤销字体过滤、Windows 窗口兼容或其他主要 workaround 的证据。
 
 ## Vello：重复渲染同一 `ImageData` 时图片只在首次出现
 
