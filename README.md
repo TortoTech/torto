@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://github.com/TortoTech/torto/releases/latest"><img src="https://img.shields.io/github/v/release/TortoTech/torto?display_name=tag&sort=semver" alt="Latest release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/TortoTech/torto" alt="MIT License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/TortoTech/torto" alt="AGPL v3 License"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-5b6ee1" alt="Windows and macOS">
   <img src="https://img.shields.io/badge/UI-egui-7c3aed" alt="Built with egui">
 </p>
@@ -125,4 +125,4 @@ Please report reproducible problems in [Issues](https://github.com/TortoTech/tor
 
 ## License
 
-Torto is available under the [MIT License](LICENSE).
+Torto is available under the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`).

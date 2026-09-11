@@ -745,6 +745,11 @@ mod tests {
         assert!(wix.contains("MigrateFeatures='yes'"));
         assert!(license.contains("Copyright (c) 2026 TortoTech"));
         assert!(installer_license.contains("Copyright (c) 2026 TortoTech"));
+        for text in [license, installer_license] {
+            assert!(text.contains("SPDX-License-Identifier: AGPL-3.0-only"));
+            assert!(text.contains("GNU AFFERO GENERAL PUBLIC LICENSE"));
+            assert!(text.contains("13. Remote Network Interaction"));
+        }
     }
 
     #[test]

@@ -1790,6 +1790,28 @@ impl LayoutEngine {
     ) -> PreparedText {
         let (start_offset, available_width, first_line_indent) =
             resolve_text_measure(block, content_width, minimum_width);
+        let sentence_reference = if block.style.sentence_indents
+            && block.style.preserve_sentence_prefix
+            && matches!(
+                block.style.align,
+                TextAlignment::Start | TextAlignment::Justify
+            ) {
+            let mut original = block.clone();
+            original
+                .content
+                .retain(|inline| !matches!(inline, Inline::Break));
+            original.style.sentence_indents = false;
+            original.style.preserve_sentence_prefix = false;
+            Some(self.shape_text_with_min_width_and_rasters(
+                &original,
+                reader_style,
+                content_width,
+                minimum_width,
+                inline_rasters,
+            ))
+        } else {
+            None
+        };
         let typography = &reader_style.typography;
         let (text, spans, inline_images, source_text_start) = prepare_inline_content(
             block,
@@ -1800,6 +1822,15 @@ impl LayoutEngine {
             reader_style.focus_footnote_icons,
             inline_rasters,
         );
+        let sentence_reference = sentence_reference.filter(|reference| {
+            let end = text.find('\n').unwrap_or(text.len());
+            !reference.hyphens.iter().any(|hyphen| {
+                reference
+                    .layout
+                    .get(hyphen.line_index)
+                    .is_some_and(|line| line.text_range().start < end)
+            })
+        });
         let font_stack = if block.kind == TextBlockKind::Preformatted {
             typography.monospace_stack()
         } else {
@@ -1906,11 +1937,15 @@ impl LayoutEngine {
         if !optimized {
             layout.break_all_lines(Some(available_width));
             linebreak::parley::repair_trailing_footnote_line(&mut layout, &text, available_width);
-            if block.style.align == TextAlignment::Justify
-                && let Some(plan) = linebreak::parley::plan_wrapped_justification(
+            if (block.style.align == TextAlignment::Justify || sentence_reference.is_some())
+                && let Some(plan) = linebreak::parley::plan_wrapped_with_sentence_prefix(
                     &mut layout,
                     &text,
                     available_width,
+                    sentence_reference
+                        .as_ref()
+                        .map(|reference| (reference.layout.as_ref(), reference.text.as_ref())),
+                    block.style.align == TextAlignment::Justify,
                 )
             {
                 let mut adjusted = self.build_text_layout(
@@ -4628,6 +4663,99 @@ mod tests {
                     (linebreak::parley::positioned_line_content_end(after) - 400.0).abs() < 0.1
                 );
             }
+        }
+    }
+
+    #[test]
+    fn sentence_split_preserves_leading_sentence_glyph_positions() {
+        const CJK: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKaiGBScreen.ttf");
+        const LATIN: &[u8] = include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf");
+        let mut engine = LayoutEngine::with_fonts([
+            ReaderFontBlob::new(Arc::new(CJK)),
+            ReaderFontBlob::new(Arc::new(LATIN)),
+        ]);
+        let first = "为了“精确”不惜牺牲其他美德，这种译者，在潜意识里认为外文优于中文，因为外文比中文“精确”。";
+        let rest = "这种译者面对“优越”而“精确”的外文，诚惶诚恐，亦步亦趋，深恐译漏了一个冠词、代名词、复数、被动的语气，或是调换了名词和动词的位置。用英文说，就成了 A soldier be loyal to his country。";
+        let run = |text: String| {
+            Inline::Text(TextRun {
+                text,
+                style: TextStyle::default(),
+                link: None,
+            })
+        };
+        let before = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![run(format!("{first}{rest}"))],
+            style: BlockStyle {
+                align: TextAlignment::Justify,
+                indent: 40.0,
+                line_height: 1.7,
+                ..Default::default()
+            },
+            source: None,
+        };
+        let mut after = before.clone();
+        after.content = vec![run(first.into()), Inline::Break, run(rest.into())];
+        after.style.sentence_indents = true;
+        after.style.preserve_sentence_prefix = true;
+        let style = ReaderStyle {
+            writing_system: WritingSystem::Cjk,
+            typography: ReaderTypography {
+                font_size: 20.0,
+                ..Default::default()
+            },
+            typesetting: ReaderTypesetting::unified(),
+            ..Default::default()
+        };
+        let positions = |prepared: &PreparedText| {
+            let mut result = Vec::new();
+            for line in prepared.layout.lines() {
+                let mut x = line.metrics().offset;
+                for run in line.runs() {
+                    for cluster in run.clusters() {
+                        if cluster.text_range().end <= first.len() {
+                            result.push((cluster.text_range(), x, line.metrics().baseline));
+                        }
+                        x += cluster.advance();
+                    }
+                }
+            }
+            result
+        };
+        for width in [320.0, 480.0, 650.0, 800.0] {
+            let original = engine.shape_text_with_min_width(&before, &style, width, 1.0);
+            let split = engine.shape_text_with_min_width(&after, &style, width, 1.0);
+            let old = positions(&original);
+            let new = positions(&split);
+            assert_eq!(old.len(), new.len());
+            let y_delta = new[0].2 - old[0].2;
+            for (old, new) in old.iter().zip(&new) {
+                assert_eq!(old.0, new.0);
+                assert!(
+                    (old.1 - new.1).abs() < 0.02,
+                    "horizontal drift at width {width}: {old:?} -> {new:?}"
+                );
+                assert!(
+                    (old.2 - new.2 + y_delta).abs() < 0.02,
+                    "baseline drift at width {width}: {old:?} -> {new:?}"
+                );
+            }
+            let continuation = split
+                .layout
+                .lines()
+                .find(|line| line.text_range().start == first.len() + 1)
+                .unwrap();
+            assert!((continuation.metrics().offset - 40.0).abs() < 0.02);
+        }
+        after.style.align = TextAlignment::Center;
+        let mut centered = after.clone();
+        centered.style.preserve_sentence_prefix = false;
+        let actual = engine.shape_text_with_min_width(&after, &style, 650.0, 1.0);
+        let expected = engine.shape_text_with_min_width(&centered, &style, 650.0, 1.0);
+        assert_eq!(actual.layout.len(), expected.layout.len());
+        for (actual, expected) in actual.layout.lines().zip(expected.layout.lines()) {
+            assert_eq!(actual.text_range(), expected.text_range());
+            assert!((actual.metrics().offset - expected.metrics().offset).abs() < 0.01);
         }
     }
 

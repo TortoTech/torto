@@ -17,22 +17,38 @@ const MIXED_SCRIPT_SHRINK_EM: f32 = 0.125;
 /// Justify already wrapped LTR prose, including explicit subparagraph breaks.
 /// Keep the selected breaks and share excess space with CJK boundaries after
 /// ordinary spaces have reached 150% of their natural width.
+#[cfg(test)]
 pub(crate) fn plan_wrapped_justification(
     layout: &mut Layout<TextBrush>,
     text: &str,
     column_width: f32,
+) -> Option<ParagraphPlan> {
+    plan_wrapped_with_sentence_prefix(layout, text, column_width, None, true)
+}
+
+pub(crate) fn plan_wrapped_with_sentence_prefix(
+    layout: &mut Layout<TextBrush>,
+    text: &str,
+    column_width: f32,
+    reference: Option<(&Layout<TextBrush>, &str)>,
+    justify_suffix: bool,
 ) -> Option<ParagraphPlan> {
     if layout.is_rtl() || !layout.inline_boxes().is_empty() {
         return None;
     }
     layout.break_all_lines(Some(column_width));
     repair_trailing_footnote_line(layout, text, column_width);
+    let preserved = reference.and_then(|(original, original_text)| {
+        preserve_sentence_prefix(layout, text, original, original_text, column_width)
+    });
     layout.align(
         parley::Alignment::Start,
         parley::AlignmentOptions::default(),
     );
     let mut lines = Vec::new();
-    let mut adjustments = Vec::new();
+    let mut adjustments = preserved
+        .as_ref()
+        .map_or_else(Vec::new, |(_, spacing)| spacing.clone());
     let mut breakpoint = 0;
     for line in layout.lines() {
         let mut clusters = Vec::new();
@@ -63,10 +79,15 @@ pub(crate) fn plan_wrapped_justification(
             badness: 0.0,
             hyphenated: false,
         });
-        if matches!(
-            line.break_reason(),
-            parley::layout::BreakReason::None | parley::layout::BreakReason::Explicit
-        ) {
+        if !justify_suffix
+            || preserved
+                .as_ref()
+                .is_some_and(|(end, _)| line.text_range().start <= *end)
+            || matches!(
+                line.break_reason(),
+                parley::layout::BreakReason::None | parley::layout::BreakReason::Explicit
+            )
+        {
             continue;
         }
         let extra = (column_width - metrics.offset - natural_width).max(0.0);
@@ -113,6 +134,88 @@ pub(crate) fn plan_wrapped_justification(
         lines,
         adjustments,
     })
+}
+
+fn preserve_sentence_prefix(
+    layout: &mut Layout<TextBrush>,
+    text: &str,
+    original: &Layout<TextBrush>,
+    original_text: &str,
+    width: f32,
+) -> Option<(usize, Vec<SpacingAdjustment>)> {
+    let end = text.find('\n')?;
+    if end == 0
+        || original.is_rtl()
+        || !original.inline_boxes().is_empty()
+        || original_text.get(..end)? != &text[..end]
+    {
+        return None;
+    }
+    let mut original_clusters = Vec::new();
+    let mut line_counts = Vec::new();
+    for line in original.lines() {
+        let mut count = 0_u32;
+        for run in line.runs() {
+            if run.is_rtl() {
+                return None;
+            }
+            for cluster in run.clusters() {
+                let range = cluster.text_range();
+                if range.start >= end {
+                    continue;
+                }
+                if range.end > end {
+                    return None;
+                }
+                original_clusters.push((range, cluster.advance()));
+                count += 1;
+            }
+        }
+        if count > 0 {
+            line_counts.push(count);
+        }
+        if line.text_range().end >= end {
+            break;
+        }
+    }
+    let mut natural = Vec::new();
+    let mut found_break = false;
+    for line in layout.lines() {
+        for run in line.runs() {
+            if run.is_rtl() {
+                return None;
+            }
+            for cluster in run.clusters() {
+                let range = cluster.text_range();
+                if range.start < end {
+                    natural.push((range, cluster.advance()));
+                } else if range == (end..end + 1) {
+                    found_break = true;
+                }
+            }
+        }
+    }
+    if !found_break || original_clusters.len() != natural.len() {
+        return None;
+    }
+    let mut spacing = Vec::new();
+    for ((range, desired), (actual_range, advance)) in original_clusters.into_iter().zip(natural) {
+        if range != actual_range {
+            return None;
+        }
+        let amount = desired - advance;
+        if amount.abs() > 0.0001 {
+            spacing.push(SpacingAdjustment { range, amount });
+        }
+    }
+    *line_counts.last_mut()? += 1; // Consume the inserted newline, retaining its sentence indent.
+    let mut breaker = layout.break_lines();
+    for count in line_counts {
+        breaker.break_next_with_length(count)?;
+        breaker.set_prior_line_width(width);
+    }
+    breaker.break_remaining(width);
+    Some((end, spacing))
 }
 
 /// A spacing delta applied to every shaped cluster in this byte range.

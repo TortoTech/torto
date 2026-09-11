@@ -647,7 +647,60 @@ fn paragraph_atoms_with_protected_ranges(
             });
         }
     }
-    atoms
+    let quote_boundaries = nested_quote_sentence_boundaries(&segmentation_chars);
+    if quote_boundaries.is_empty() {
+        return atoms;
+    }
+    let boundaries = atoms
+        .iter()
+        .take(atoms.len().saturating_sub(1))
+        .map(|atom| atom.end)
+        .chain(quote_boundaries);
+    atoms_from_boundaries(boundaries, &chars, atoms.len())
+}
+
+fn nested_quote_sentence_boundaries(chars: &[char]) -> Vec<usize> {
+    let pairs = paired_punctuation_ranges(chars);
+    let mut boundaries = Vec::new();
+    for range in &pairs {
+        if !matches!(chars.get(range.start), Some('“' | '‘' | '「' | '『'))
+            || pairs
+                .iter()
+                .any(|parent| parent.start < range.start && range.end <= parent.end)
+        {
+            continue;
+        }
+        let mut index = range.end;
+        let mut closers = 0;
+        while index > range.start {
+            match chars[index - 1] {
+                '”' | '’' | '」' | '』' => {
+                    closers += 1;
+                    index -= 1;
+                }
+                character if character.is_whitespace() => index -= 1,
+                _ => break,
+            }
+        }
+        // SentenceX can hide the final terminator in nested quotes (e.g. 。’”).
+        // Add only the boundary after the complete quotation, never inside it.
+        if closers >= 2
+            && index > range.start
+            && matches!(chars[index - 1], '。' | '！' | '？' | '!' | '?')
+        {
+            let mut end = range.end;
+            while chars
+                .get(end)
+                .is_some_and(|character| character.is_whitespace())
+            {
+                end += 1;
+            }
+            if end < chars.len() {
+                boundaries.push(end);
+            }
+        }
+    }
+    boundaries
 }
 
 fn inline_text(content: &[Inline]) -> String {
@@ -668,6 +721,9 @@ fn apply_sentence_structure(block: &mut TextBlock, language_hint: &str) {
         return;
     }
     let original = std::mem::take(&mut block.content);
+    block.style.preserve_sentence_prefix = original.iter().all(
+        |inline| matches!(inline, Inline::Text(run) if !run.text.contains(['\n', '\r', '\t'])),
+    );
     let mut content = Vec::new();
     for (index, atom) in atoms.iter().enumerate() {
         if index > 0 {
@@ -730,6 +786,84 @@ fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_quote_closers_leave_following_sentence_separate() {
+        let text = concat!(
+            "193 页，在“代名词”项下，作者讨论中译的另一个危机：“They are good questions, ",
+            "because they call for thought-provoking answers 是平淡无奇的一句英文，但也很容易译得不像中文。",
+            "（they 这个字是翻译海中的‘鲨鱼’，译者碰到了它就危险了……）",
+            "就像‘它们是好的问题，因为它们需要对方做出激发思想的回答’，真再忠于原文也没有了。",
+            "也不错，就是读者不知道那两个‘它们’是谁。如果是朗诵出来的，心中更想不起那批‘人’是谁。",
+            "‘好的问题’‘做出……的回答’不像中国话。如果有这样一个意思要表达，而表达的人又没有看到英文，",
+            "中国人会这样说：‘这些问题问得好，要回答就要好好动一下脑筋（思想一番）。’”",
+            "这样的翻译才是活的译句，不是死的译字，才是变通，不是向英文投降。"
+        );
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: Default::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        };
+        let atoms = paragraph_atoms_for_content(&block.content, "zh");
+        assert_eq!(
+            atoms.len(),
+            2,
+            "long quotation collapsed to {} atoms: {:?}",
+            atoms.len(),
+            atoms.iter().map(|atom| &atom.text).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            atoms[1].text,
+            "这样的翻译才是活的译句，不是死的译字，才是变通，不是向英文投降。"
+        );
+        assert!(atoms[0].text.ends_with("。’”"));
+        assert_eq!(
+            atoms
+                .iter()
+                .map(|atom| atom.text.as_str())
+                .collect::<String>(),
+            text
+        );
+        assert!(atoms.iter().any(|atom| {
+            atom.text
+                .contains("‘它们是好的问题，因为它们需要对方做出激发思想的回答’")
+        }));
+        assert!(atoms.iter().any(|atom| {
+            atom.text
+                .contains("（they 这个字是翻译海中的‘鲨鱼’，译者碰到了它就危险了……）")
+        }));
+        apply_sentence_structure(&mut block, "zh");
+        assert_eq!(inline_text(&block.content).matches('\n').count(), 1);
+        assert_eq!(inline_text(&block.content).replace('\n', ""), text);
+    }
+
+    #[test]
+    fn nested_quote_boundary_keeps_continuations_and_citations_attached() {
+        let text = "他说：“她喊‘快走！’”，随后大家离开。第二天又回来了。";
+        let content = vec![Inline::Text(TextRun {
+            text: text.into(),
+            style: Default::default(),
+            link: None,
+        })];
+        let atoms = paragraph_atoms_for_content(&content, "zh");
+        assert_eq!(atoms.len(), 2);
+        assert_eq!(atoms[0].text, "他说：“她喊‘快走！’”，随后大家离开。");
+        let text = "他说：“她念‘第一句。第二句。’”（出处）后面的解释另起一句。";
+        let content = vec![Inline::Text(TextRun {
+            text: text.into(),
+            style: Default::default(),
+            link: None,
+        })];
+        let atoms = paragraph_atoms_for_content(&content, "zh");
+        assert_eq!(atoms.len(), 2);
+        assert_eq!(atoms[0].text, "他说：“她念‘第一句。第二句。’”（出处）");
+        assert_eq!(atoms[1].text, "后面的解释另起一句。");
+    }
 
     struct StaticSource {
         book: Book,

@@ -1032,6 +1032,10 @@ pub struct BlockStyle {
     /// Apply the paragraph indent after each semantic sentence break.
     #[serde(default)]
     pub sentence_indents: bool,
+    /// Sentence breaks were inserted into continuous prose. Keep the leading
+    /// sentence's existing wrapping and spacing when displaying the split view.
+    #[serde(default)]
+    pub preserve_sentence_prefix: bool,
 }
 
 impl Default for BlockStyle {
@@ -1047,6 +1051,7 @@ impl Default for BlockStyle {
             indent: 0.0,
             line_height: 1.5,
             sentence_indents: false,
+            preserve_sentence_prefix: false,
         }
     }
 }

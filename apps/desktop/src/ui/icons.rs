@@ -18,6 +18,7 @@ pub(crate) enum Icon {
     BrainCircuit,
     CheckCircle,
     ChevronDown,
+    ChevronLeft,
     ChevronRight,
     Cloud,
     Copy,
@@ -55,7 +56,7 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 40] = [
+    const ALL: [Self; 41] = [
         Self::Chart,
         Self::AlertCircle,
         Self::BookOpen,
@@ -63,6 +64,7 @@ impl Icon {
         Self::BrainCircuit,
         Self::CheckCircle,
         Self::ChevronDown,
+        Self::ChevronLeft,
         Self::ChevronRight,
         Self::Cloud,
         Self::Copy,
@@ -106,6 +108,7 @@ impl Icon {
             Self::BrainCircuit => asset!("brain-circuit"),
             Self::CheckCircle => asset!("check-circle"),
             Self::ChevronDown => asset!("chevron-down"),
+            Self::ChevronLeft => asset!("chevron-left"),
             Self::ChevronRight => asset!("chevron-right"),
             Self::Cloud => asset!("cloud"),
             Self::Copy => asset!("copy"),

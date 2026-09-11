@@ -3545,13 +3545,15 @@ mod tests {
         let book = rebook_formats::open_file(std::env::var("TORTO_REFLOW_BOOK").unwrap()).unwrap();
         let original = book.source();
         let structured = crate::plugins::ParagraphStructureSource::new(original.clone());
+        let prefix =
+            std::env::var("TORTO_REFLOW_PREFIX").unwrap_or_else(|_| "对达尔文的进化论来说".into());
         let mut found = None;
         for index in 0..original.book().sections.len() {
             let section = original.parse_section(index).unwrap();
             if let Some(block) = section
                 .blocks
                 .iter()
-                .find(|b| block_focus_text(b).starts_with("对达尔文的进化论来说"))
+                .find(|b| block_focus_text(b).starts_with(&prefix))
             {
                 found = Some((index, block.clone()));
                 break;
@@ -3608,6 +3610,35 @@ mod tests {
                                 continue;
                             }
                             let line = p.layout.get(p.lines.start).unwrap();
+                            eprintln!(
+                                "{width} {name} sentence breaks={}",
+                                p.text.matches('\n').count()
+                            );
+                            if let Some((_, tail)) = p.text.rsplit_once('\n') {
+                                eprintln!("last sentence: {tail:?}");
+                            }
+                            for (index, row) in p.layout.lines().take(3).enumerate() {
+                                eprintln!(
+                                    "row {width} {name} {index}: {:?} x={} baseline={} height={}",
+                                    &p.text[row.text_range()],
+                                    row.metrics().offset,
+                                    row.metrics().baseline,
+                                    row.metrics().line_height
+                                );
+                                let metrics = row
+                                    .runs()
+                                    .flat_map(|run| {
+                                        run.clusters()
+                                            .take(12)
+                                            .map(|c| {
+                                                (p.text[c.text_range()].to_owned(), c.advance())
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .take(12)
+                                    .collect::<Vec<_>>();
+                                eprintln!("clusters {index}: {metrics:?}");
+                            }
                             let list =
                                 rebook_renderer::DisplayListCompiler::default().compile(page);
                             let baseline = list.source_text_baseline(&range).unwrap();

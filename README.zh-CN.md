@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://github.com/TortoTech/torto/releases/latest"><img src="https://img.shields.io/github/v/release/TortoTech/torto?display_name=tag&sort=semver" alt="最新版本"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/TortoTech/torto" alt="MIT 许可证"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/TortoTech/torto" alt="AGPL v3 许可证"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-5b6ee1" alt="支持 Windows 与 macOS">
   <img src="https://img.shields.io/badge/UI-egui-7c3aed" alt="使用 egui 构建">
   <a href="https://linux.do"><img src="https://img.shields.io/badge/LINUX-DO-FFB003.svg" alt="LINUX DO"></a>
@@ -170,4 +170,4 @@ cargo run -p rebook-desktop --example generate_macos_icons
 
 ## 开源许可
 
-本项目基于 [MIT License](LICENSE) 开源。
+本项目基于 [GNU Affero General Public License v3.0](LICENSE)（`AGPL-3.0-only`）开源。

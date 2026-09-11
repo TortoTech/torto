@@ -16,6 +16,8 @@ use crate::library::LibraryBook;
 use crate::preferences::AppLanguage;
 use crate::sync::SyncResult;
 
+mod period;
+
 fn now_ms() -> u64 {
     Utc::now().timestamp_millis().max(0) as u64
 }
@@ -331,6 +333,16 @@ struct BookStats {
     intervals: Vec<(u64, u64, i32)>,
     days: BTreeMap<String, u64>,
 }
+
+impl BookStats {
+    fn display_progress(&self) -> f64 {
+        if self.status == Status::Finished {
+            1.0
+        } else {
+            self.progress.clamp(0.0, 1.0)
+        }
+    }
+}
 fn union_duration(intervals: &[(u64, u64, i32)]) -> u64 {
     let mut sorted = intervals.to_vec();
     sorted.sort_unstable();
@@ -471,13 +483,9 @@ pub(crate) struct Page {
     selected: Option<String>,
     books: BTreeMap<String, BookStats>,
     error: Option<String>,
-    days: i64,
-    query: String,
-    status_filter: Option<Status>,
+    period: period::Period,
+    period_offset: i32,
     finish_date: String,
-    custom_start: String,
-    custom_end: String,
-    custom: bool,
 }
 impl Page {
     pub(crate) fn shelf_snapshot(
@@ -508,7 +516,7 @@ impl Page {
                     format!(
                         "{} · {:.1}%",
                         book.status.label(language),
-                        book.progress * 100.0
+                        book.display_progress() * 100.0
                     )
                 } else {
                     book.status.label(language).into()
@@ -643,343 +651,266 @@ impl Page {
                 egui::Frame::new()
                     .fill(palette().background)
                     .inner_margin(egui::Margin {
-                        left: 36,
-                        right: 16,
+                        left: 24,
+                        right: 24,
                         top: 28,
                         bottom: 28,
                     }),
             )
             .show(root, |ui| {
-                ui.add_enabled_ui(!blocked, |ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 44.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            if self.selected.is_some()
-                                && dialog_action_button(
-                                    ui,
-                                    language.text("返回概览", "Back to overview"),
-                                    false,
-                                )
-                                .clicked()
-                            {
-                                self.selected = None;
-                                self.clear_confirm = false;
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    language.text("阅读统计", "Reading statistics"),
-                                )
-                                .size(22.0)
-                                .strong(),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if icon_button(ui, Icon::Library)
-                                        .on_hover_text(language.text("返回书架", "Back to library"))
-                                        .clicked()
-                                    {
-                                        self.selected = None;
-                                        self.clear_confirm = false;
-                                        self.open = false;
-                                    }
-                                },
-                            );
-                        },
-                    );
-                    ui.add_space(20.0);
-                    if let Some(error) = &self.error {
-                        ui.colored_label(palette().error_text, error);
-                    }
-                    if service().failed.load(Ordering::Relaxed) {
-                        ui.colored_label(
-                            palette().error_text,
-                            language.text(
-                                "部分统计保存失败，请检查磁盘。",
-                                "Some statistics could not be saved. Check disk space.",
-                            ),
+                let rect = ui.available_rect_before_wrap();
+                let width = rect.width().min(800.0);
+                let centered = egui::Rect::from_min_size(
+                    egui::pos2(rect.center().x - width / 2.0, rect.top()),
+                    egui::vec2(width, rect.height()),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(centered), |ui| {
+                    ui.add_enabled_ui(!blocked, |ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 44.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                if self.selected.is_some()
+                                    && dialog_action_button(
+                                        ui,
+                                        language.text("返回概览", "Back to overview"),
+                                        false,
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected = None;
+                                    self.clear_confirm = false;
+                                }
+                                ui.label(
+                                    egui::RichText::new(
+                                        language.text("阅读统计", "Reading statistics"),
+                                    )
+                                    .size(22.0)
+                                    .strong(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if icon_button(ui, Icon::Library)
+                                            .on_hover_text(
+                                                language.text("返回书架", "Back to library"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.selected = None;
+                                            self.clear_confirm = false;
+                                            self.open = false;
+                                        }
+                                    },
+                                );
+                            },
                         );
-                    }
-                    egui::ScrollArea::vertical()
-                        .id_salt(("statistics-page", self.selected.clone()))
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_max_width(1120.0);
-                            ui.spacing_mut().item_spacing.y = 12.0;
-                            if let Some(id) = self.selected.clone() {
-                                self.detail(ui, language, &id);
-                            } else {
-                                self.overview(ui, language);
-                            }
-                        });
+                        ui.add_space(20.0);
+                        if let Some(error) = &self.error {
+                            ui.colored_label(palette().error_text, error);
+                        }
+                        if service().failed.load(Ordering::Relaxed) {
+                            ui.colored_label(
+                                palette().error_text,
+                                language.text(
+                                    "部分统计保存失败，请检查磁盘。",
+                                    "Some statistics could not be saved. Check disk space.",
+                                ),
+                            );
+                        }
+                        egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .id_salt(("statistics-page", self.selected.clone()))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_max_width(800.0);
+                                ui.spacing_mut().item_spacing.y = 12.0;
+                                if let Some(id) = self.selected.clone() {
+                                    self.detail(ui, language, &id);
+                                } else {
+                                    self.overview(ui, language);
+                                }
+                            });
+                    });
                 });
             });
     }
 
     fn overview(&mut self, ui: &mut egui::Ui, language: AppLanguage) {
-        use crate::ui::palette;
+        use period::Period;
+
+        let today = Local::now().date_naive();
         ui.horizontal_wrapped(|ui| {
-            for (days, zh, en) in [
-                (7, "最近7天", "Last 7 days"),
-                (30, "最近30天", "Last 30 days"),
-                (365, "今年", "This year"),
-                (0, "全部", "All time"),
+            for (period, zh, en) in [
+                (Period::Week, "周", "Week"),
+                (Period::Month, "月", "Month"),
+                (Period::Year, "年", "Year"),
+                (Period::All, "总", "All"),
             ] {
-                if choice(ui, language.text(zh, en), !self.custom && self.days == days).clicked() {
-                    self.days = days;
-                    self.custom = false;
-                }
-            }
-            if choice(ui, language.text("自定义", "Custom"), self.custom).clicked() {
-                self.custom = true;
-                if self.custom_start.is_empty() {
-                    self.custom_start =
-                        (Local::now().date_naive() - chrono::Duration::days(29)).to_string();
-                    self.custom_end = Local::now().date_naive().to_string();
+                if choice(ui, language.text(zh, en), self.period == period).clicked() {
+                    self.period = period;
+                    self.period_offset = 0;
                 }
             }
         });
-        if self.custom {
-            ui.scope(|ui| {
-                // Reserve the input's full height before laying out the first
-                // label; later widgets cannot reposition an already painted label.
-                let font = egui::TextStyle::Body.resolve(ui.style());
-                let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font)) + 4.0;
-                ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(row_height);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(language.text("从", "From"));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.custom_start)
-                            .desired_width(110.0)
-                            .hint_text("YYYY-MM-DD"),
-                    );
-                    ui.label(language.text("至", "To"));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.custom_end)
-                            .desired_width(110.0)
-                            .hint_text("YYYY-MM-DD"),
-                    );
-                });
+        if self.period != Period::All {
+            ui.horizontal_wrapped(|ui| {
+                let (previous, next, current) = match self.period {
+                    Period::Week => (
+                        ("上一周", "Previous week"),
+                        ("下一周", "Next week"),
+                        ("本周", "This week"),
+                    ),
+                    Period::Month => (
+                        ("上一月", "Previous month"),
+                        ("下一月", "Next month"),
+                        ("本月", "This month"),
+                    ),
+                    _ => (
+                        ("上一年", "Previous year"),
+                        ("下一年", "Next year"),
+                        ("今年", "This year"),
+                    ),
+                };
+                if crate::ui::icon_button(ui, crate::ui::Icon::ChevronLeft)
+                    .on_hover_text(language.text(previous.0, previous.1))
+                    .clicked()
+                {
+                    self.period_offset -= 1;
+                }
+                let range = self.period.range(today, self.period_offset);
+                let start = range.start.unwrap();
+                match self.period {
+                    Period::Week => week_range_label(ui, start, range.end, today.year(), language),
+                    Period::Month => {
+                        period_range_label(ui, &[start.format("%Y/%m").to_string()]);
+                    }
+                    _ => {
+                        period_range_label(ui, &[start.format("%Y").to_string()]);
+                    }
+                }
+                if ui
+                    .add_enabled_ui(self.period_offset < 0, |ui| {
+                        crate::ui::icon_button(ui, crate::ui::Icon::ChevronRight)
+                    })
+                    .inner
+                    .on_hover_text(language.text(next.0, next.1))
+                    .clicked()
+                {
+                    self.period_offset += 1;
+                }
+                if self.period_offset < 0
+                    && choice(ui, language.text(current.0, current.1), false).clicked()
+                {
+                    self.period_offset = 0;
+                }
             });
         }
-        let today = Local::now().date_naive();
-        let start = if self.custom {
-            NaiveDate::parse_from_str(&self.custom_start, "%Y-%m-%d").ok()
-        } else if self.days == 365 {
-            NaiveDate::from_ymd_opt(today.year(), 1, 1)
-        } else if self.days > 0 {
-            today.checked_sub_signed(chrono::Duration::days(self.days - 1))
-        } else {
-            None
-        };
-        let end = if self.custom {
-            NaiveDate::parse_from_str(&self.custom_end, "%Y-%m-%d")
-                .ok()
-                .unwrap_or(today)
-        } else {
-            today
-        };
-        if self.custom
-            && (start.is_none()
-                || NaiveDate::parse_from_str(&self.custom_end, "%Y-%m-%d").is_err()
-                || start.is_some_and(|s| s > end))
-        {
-            ui.colored_label(
-                palette().error_text,
-                language.text("请输入有效日期范围", "Enter a valid date range"),
-            );
-            return;
-        }
-        let in_range = |day: &str| {
-            NaiveDate::parse_from_str(day, "%Y-%m-%d")
-                .is_ok_and(|d| start.is_none_or(|s| d >= s) && d <= end)
-        };
+        let range = self.period.range(today, self.period_offset);
         let intervals = self
             .books
             .values()
             .flat_map(|b| b.intervals.iter().copied())
             .collect::<Vec<_>>();
         let days = daily(&intervals);
-        let total = days
-            .iter()
-            .filter(|(d, _)| in_range(d))
-            .map(|(_, v)| *v)
-            .sum();
         let valid = self
             .books
             .values()
             .flat_map(|b| b.valid_intervals.iter().copied())
             .collect::<Vec<_>>();
-        let reading_days = daily(&valid).keys().filter(|d| in_range(d)).count();
+        let reading_days = daily(&valid)
+            .keys()
+            .filter(|day| range.contains(day))
+            .count();
         let finished = self
             .books
             .values()
-            .filter(|b| b.status == Status::Finished && b.finished.as_deref().is_some_and(in_range))
+            .filter(|b| {
+                b.status == Status::Finished
+                    && b.finished.as_deref().is_some_and(|day| range.contains(day))
+            })
             .count();
+        let books = longest_reading(&self.books, range);
         let metrics = [
             (
-                language.text("今日阅读", "Today"),
-                duration(*days.get(&today.to_string()).unwrap_or(&0)),
+                language.text("阅读时长", "Reading time"),
+                duration(range.total(&days)),
+                "",
             ),
             (
-                language.text("期间阅读时长", "Reading time"),
-                duration(total),
-            ),
-            (
-                language.text("期间读完", "Books finished"),
+                language.text("读完", "Finished"),
                 finished.to_string(),
+                language.text("本", "books"),
             ),
             (
-                language.text("期间阅读天数", "Reading days"),
+                language.text("阅读", "Reading days"),
                 reading_days.to_string(),
+                language.text("天", "days"),
+            ),
+            (
+                language.text("读过", "Books read"),
+                books.len().to_string(),
+                language.text("本", "books"),
             ),
         ];
         let columns = if ui.available_width() < 650.0 { 2 } else { 4 };
         for row in metrics.chunks(columns) {
             ui.columns(columns, |uis| {
-                for (column, (label, value)) in uis.iter_mut().zip(row) {
+                for (column, (label, value, unit)) in uis.iter_mut().zip(row) {
                     card().show(column, |ui| {
                         ui.set_min_width(ui.available_width());
-                        ui.label(egui::RichText::new(*label).color(palette().muted));
-                        ui.label(egui::RichText::new(value).size(28.0).color(palette().text));
+                        ui.label(statistics_title(*label));
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 34.0),
+                            egui::Layout::left_to_right(egui::Align::BOTTOM),
+                            |ui| {
+                                let job = if unit.is_empty() {
+                                    reading_time_text(range.total(&days), language, 28.0)
+                                } else {
+                                    statistic_text(&[(value.clone(), *unit)], 28.0)
+                                };
+                                let galley = fitted_statistic_text(ui, job, ui.available_width());
+                                ui.add(egui::Label::new(galley));
+                            },
+                        );
                     });
                 }
             });
         }
         card().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(
-                egui::RichText::new(language.text("阅读趋势", "Reading trend"))
-                    .size(17.0)
-                    .strong(),
+            ui.label(statistics_title(
+                language.text("阅读时长分布", "Reading time distribution"),
+            ));
+            draw_reading_distribution(
+                ui,
+                self.period,
+                &self.period.distribution(range, &days),
+                language,
             );
-            draw_trend(ui, &days, start, end);
         });
         card().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(
-                egui::RichText::new(language.text("最近读完", "Recently finished"))
-                    .size(17.0)
-                    .strong(),
-            );
-            let mut recent = self
-                .books
-                .iter()
-                .filter(|(_, b)| {
-                    b.status == Status::Finished && b.finished.as_deref().is_some_and(in_range)
-                })
-                .collect::<Vec<_>>();
-            recent.sort_by_key(|(_, b)| std::cmp::Reverse(b.finished.clone()));
-            if recent.is_empty() {
+            ui.label(statistics_title(
+                language.text("阅读最久", "Most time spent reading"),
+            ));
+            if books.is_empty() {
                 empty_hint(
                     ui,
                     language.text(
-                        "这个期间还没有读完记录",
-                        "No books finished in this period.",
+                        "这段时间还没有阅读记录",
+                        "No reading recorded in this period.",
                     ),
                 );
             }
-            for (id, book) in recent.into_iter().take(5) {
+            for (id, book, time) in books {
                 if book_row(
                     ui,
                     id,
                     book,
-                    book.finished.as_deref().unwrap_or(""),
-                    language,
-                    self.covers.get(id).map(Vec::as_slice),
-                    &mut self.textures,
-                )
-                .clicked()
-                {
-                    self.selected = Some(id.clone());
-                    self.finish_date = book.finished.clone().unwrap_or_default();
-                    self.clear_confirm = false;
-                }
-            }
-        });
-        card().show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new(language.text("阅读记录", "Reading records"))
-                        .size(17.0)
-                        .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} {}",
-                        self.books
-                            .values()
-                            .filter(|b| b.status == Status::Reading)
-                            .count(),
-                        language.text("本在读", "currently reading")
-                    ))
-                    .small()
-                    .color(palette().muted),
-                );
-            });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.query)
-                    .desired_width(ui.available_width().min(320.0))
-                    .hint_text(language.text("搜索书名或作者", "Search title or author")),
-            );
-            ui.horizontal_wrapped(|ui| {
-                for status in [
-                    None,
-                    Some(Status::NotStarted),
-                    Some(Status::Reading),
-                    Some(Status::Finished),
-                ] {
-                    if choice(
-                        ui,
-                        status.map_or(language.text("全部", "All"), |s| s.label(language)),
-                        self.status_filter == status,
-                    )
-                    .clicked()
-                    {
-                        self.status_filter = status;
-                    }
-                }
-            });
-            let query = self.query.trim().to_lowercase();
-            let mut books = self
-                .books
-                .iter()
-                .filter(|(_, b)| {
-                    self.status_filter.is_none_or(|s| s == b.status)
-                        && (b.title.to_lowercase().contains(&query)
-                            || b.authors.to_lowercase().contains(&query))
-                })
-                .collect::<Vec<_>>();
-            books.sort_by_key(|(_, b)| {
-                std::cmp::Reverse(
-                    b.days
-                        .iter()
-                        .filter(|(d, _)| in_range(d))
-                        .map(|(_, v)| *v)
-                        .sum::<u64>(),
-                )
-            });
-            if books.is_empty() {
-                empty_hint(ui, language.text("没有匹配的书籍", "No matching books."));
-            }
-            for (id, book) in books {
-                let time = book
-                    .days
-                    .iter()
-                    .filter(|(d, _)| in_range(d))
-                    .map(|(_, v)| *v)
-                    .sum();
-                if book_row(
-                    ui,
-                    id,
-                    book,
-                    &if time == 0 {
-                        String::new()
-                    } else {
-                        duration(time)
-                    },
+                    time,
                     language,
                     self.covers.get(id).map(Vec::as_slice),
                     &mut self.textures,
@@ -1040,9 +971,9 @@ impl Page {
                         egui::RichText::new(book.status.label(language)).color(palette().accent),
                     );
                     ui.add(
-                        egui::ProgressBar::new(book.progress as f32)
+                        egui::ProgressBar::new(book.display_progress() as f32)
                             .desired_width(ui.available_width().min(340.0))
-                            .text(format!("{:.1}%", book.progress * 100.0)),
+                            .text(format!("{:.1}%", book.display_progress() * 100.0)),
                     );
                     ui.small(
                         egui::RichText::new(language.text(
@@ -1403,24 +1334,201 @@ fn empty_hint(ui: &mut egui::Ui, label: &str) {
     ui.label(egui::RichText::new(label).color(crate::ui::palette().muted));
     ui.add_space(12.0);
 }
+fn statistics_title(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text)
+        .size(crate::ui::scaled_font_size(14.0))
+        .color(crate::ui::palette().muted)
+}
+
+fn week_range_label(
+    ui: &mut egui::Ui,
+    start: NaiveDate,
+    end: NaiveDate,
+    current_year: i32,
+    language: AppLanguage,
+) {
+    let parts = [
+        trend_date_label(start, current_year),
+        language.text("至", "-").to_owned(),
+        end.format(if start.year() == end.year() {
+            "%m/%d"
+        } else {
+            "%Y/%m/%d"
+        })
+        .to_string(),
+    ];
+    period_range_label(ui, &parts);
+}
+
+fn period_range_text_y(
+    center: f32,
+    galley: &egui::Galley,
+    digits: &egui::Galley,
+    separator: bool,
+) -> f32 {
+    if separator {
+        center - digits.size().y / 2.0 + digits.mesh_bounds.center().y
+            - galley.mesh_bounds.center().y
+    } else {
+        center - galley.size().y / 2.0
+    }
+}
+
+fn period_range_label(ui: &mut egui::Ui, parts: &[String]) -> egui::Response {
+    let color = crate::ui::palette().muted;
+    let galleys = parts
+        .iter()
+        .map(|part| {
+            egui::WidgetText::from(statistics_title(part.clone())).into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::FontSelection::Default,
+            )
+        })
+        .collect::<Vec<_>>();
+    let width = galleys.iter().map(|galley| galley.size().x).sum::<f32>()
+        + parts.len().saturating_sub(1) as f32 * 6.0;
+    let height = galleys
+        .iter()
+        .map(|galley| galley.size().y)
+        .fold(32.0_f32, f32::max);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let digits = egui::WidgetText::from(statistics_title("0123456789")).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::FontSelection::Default,
+    );
+    let mut x = rect.left();
+    for (part, galley) in parts.iter().zip(galleys) {
+        let y = period_range_text_y(
+            rect.center().y,
+            &galley,
+            &digits,
+            part == "-" || part == "至",
+        );
+        let advance = galley.size().x + 6.0;
+        ui.painter().galley(egui::pos2(x, y), galley, color);
+        x += advance;
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), parts.join(" "))
+    });
+    response
+}
+
+fn statistic_text(parts: &[(String, &str)], size: f32) -> egui::text::LayoutJob {
+    let colors = crate::ui::palette();
+    let mut job = egui::text::LayoutJob::default();
+    for (index, (number, unit)) in parts.iter().enumerate() {
+        job.append(
+            number,
+            if index == 0 { 0.0 } else { 3.0 },
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(size),
+                color: colors.text,
+                valign: egui::Align::BOTTOM,
+                ..Default::default()
+            },
+        );
+        job.append(
+            unit,
+            3.0,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(size * 0.46),
+                color: colors.text,
+                valign: egui::Align::BOTTOM,
+                ..Default::default()
+            },
+        );
+    }
+    job.wrap.max_rows = 1;
+    job
+}
+
+fn reading_time_text(ms: u64, language: AppLanguage, size: f32) -> egui::text::LayoutJob {
+    statistic_text(
+        &[
+            ((ms / 3_600_000).to_string(), language.text("小时", "hour")),
+            (
+                ((ms / 60_000) % 60).to_string(),
+                language.text("分钟", "min"),
+            ),
+        ],
+        size,
+    )
+}
+
+fn fitted_statistic_text(
+    ui: &egui::Ui,
+    mut job: egui::text::LayoutJob,
+    width: f32,
+) -> Arc<egui::Galley> {
+    let mut galley = ui.painter().layout_job(job.clone());
+    if galley.size().x > width {
+        let scale = width.max(1.0) / galley.size().x;
+        for section in &mut job.sections {
+            section.format.font_id.size *= scale;
+            section.leading_space *= scale;
+        }
+        galley = ui.painter().layout_job(job.clone());
+    }
+    // Bottom alignment aligns line boxes, not font baselines. Give every
+    // section the same descent so mixed font sizes share one baseline.
+    let mut ascents = vec![0.0_f32; job.sections.len()];
+    let mut descent = 0.0_f32;
+    for (glyph, (byte_index, _)) in galley
+        .rows
+        .iter()
+        .flat_map(|row| row.glyphs.iter())
+        .zip(job.text.char_indices())
+    {
+        let ascent = glyph.font_face_ascent + 0.5 * (glyph.font_height - glyph.font_face_height);
+        if let Some(index) = job.sections.iter().position(|section| {
+            section.byte_range.start.0 <= byte_index && byte_index < section.byte_range.end.0
+        }) {
+            ascents[index] = ascent;
+        }
+        descent = descent.max(glyph.font_height - ascent);
+    }
+    for (section, ascent) in job.sections.iter_mut().zip(ascents) {
+        section.format.line_height = Some(ascent + descent);
+    }
+    ui.painter().layout_job(job)
+}
+
+fn reading_row_text_positions(
+    center_y: f32,
+    time: &egui::Galley,
+    title: &egui::Galley,
+) -> (f32, f32) {
+    let gap = 8.0;
+    let top = center_y - (time.mesh_bounds.height() + gap + title.mesh_bounds.height()) / 2.0;
+    (
+        top - time.mesh_bounds.top(),
+        top + time.mesh_bounds.height() + gap - title.mesh_bounds.top(),
+    )
+}
+
 fn book_row(
     ui: &mut egui::Ui,
     id: &str,
     book: &BookStats,
-    value: &str,
+    time: u64,
     language: AppLanguage,
     cover: Option<&[u8]>,
     textures: &mut HashMap<String, egui::TextureHandle>,
 ) -> egui::Response {
     let colors = crate::ui::palette();
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 68.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 88.0), egui::Sense::click());
     if response.hovered() || response.has_focus() {
         ui.painter()
             .rect_filled(rect, 6.0, colors.hovered_weak_fill);
     }
     let cover_rect =
-        egui::Rect::from_min_size(rect.min + egui::vec2(10.0, 8.0), egui::vec2(36.0, 52.0));
+        egui::Rect::from_min_size(rect.min + egui::vec2(10.0, 8.0), egui::vec2(48.0, 72.0));
     if ui.is_rect_visible(rect) {
         if !textures.contains_key(id)
             && let Some(bytes) = cover
@@ -1457,42 +1565,42 @@ fn book_row(
             );
         }
     }
-    let narrow = rect.width() < 480.0;
-    let reserve = if narrow { 100.0 } else { 240.0 };
+    let content_left = rect.left() + 74.0;
+    let content_width = (rect.right() - 28.0 - content_left).max(1.0);
+    let time = reading_time_text(time, language, 20.0);
+    let time = fitted_statistic_text(ui, time, content_width);
     let title = if book.title.is_empty() {
         id
     } else {
         &book.title
     };
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        title.into(),
-        egui::FontId::proportional(14.0),
-        colors.text,
-    );
-    job.wrap.max_width = (rect.width() - reserve - 70.0).max(40.0);
+    let mut job = egui::WidgetText::from(statistics_title(title))
+        .into_layout_job(ui.style(), egui::FontSelection::Default, ui.text_valign())
+        .as_ref()
+        .clone();
+    job.wrap.max_width = content_width;
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     let title = ui.painter().layout_job(job);
+    let (top, title_top) = reading_row_text_positions(cover_rect.center().y, &time, &title);
     ui.painter()
-        .galley(rect.min + egui::vec2(58.0, 10.0), title, colors.text);
-    let subtitle = format!(
-        "{} · {:.1}%",
-        book.status.label(language),
-        book.progress * 100.0
-    );
-    ui.painter().text(
-        rect.min + egui::vec2(58.0, 42.0),
-        egui::Align2::LEFT_CENTER,
-        subtitle,
-        egui::FontId::proportional(12.0),
-        colors.muted,
-    );
-    ui.painter().text(
-        egui::pos2(rect.right() - 24.0, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
-        value,
-        egui::FontId::proportional(14.0),
-        colors.text,
+        .galley(egui::pos2(content_left, top), time, colors.text);
+    ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_size(
+                egui::pos2(content_left, title_top),
+                egui::vec2(content_width, title.size().y),
+            ))
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    )
+    .add(
+        egui::Label::new(statistics_title(if book.title.is_empty() {
+            id
+        } else {
+            &book.title
+        }))
+        .truncate()
+        .halign(egui::Align::Min),
     );
     crate::ui::paint_icon(
         ui,
@@ -1506,6 +1614,219 @@ fn book_row(
     response
         .on_hover_text(format!("{}\n{}", book.title, book.authors))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn longest_reading(
+    books: &BTreeMap<String, BookStats>,
+    range: period::DateRange,
+) -> Vec<(&String, &BookStats, u64)> {
+    let mut ranked = books
+        .iter()
+        .filter_map(|(id, book)| {
+            let time = range.total(&book.days);
+            (time > 0).then_some((id, book, time))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(_, _, time)| std::cmp::Reverse(*time));
+    ranked
+}
+
+fn distribution_axis_label(
+    period: period::Period,
+    date: NaiveDate,
+    language: AppLanguage,
+) -> String {
+    use period::Period;
+    match period {
+        Period::Week => {
+            let labels = [
+                ("一", "Mon"),
+                ("二", "Tue"),
+                ("三", "Wed"),
+                ("四", "Thu"),
+                ("五", "Fri"),
+                ("六", "Sat"),
+                ("日", "Sun"),
+            ];
+            let (zh, en) = labels[date.weekday().num_days_from_monday() as usize];
+            language.text(zh, en).into()
+        }
+        Period::Month if date.day() == 1 || date.day().is_multiple_of(5) => date.day().to_string(),
+        Period::Month => String::new(),
+        Period::Year => date.month().to_string(),
+        Period::All => date.year().to_string(),
+    }
+}
+
+const DISTRIBUTION_INTERVALS: u32 = 3;
+
+fn distribution_tick_step(max_ms: u64) -> f64 {
+    let target_minutes = max_ms as f64 / 60_000.0 * 1.08 / f64::from(DISTRIBUTION_INTERVALS);
+    for minutes in [
+        1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 180.0, 300.0, 600.0, 1200.0,
+    ] {
+        if minutes >= target_minutes {
+            return minutes * 60_000.0;
+        }
+    }
+    let hours = target_minutes / 60.0;
+    let magnitude = 10.0_f64.powf(hours.log10().floor());
+    let factor = [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .find(|factor| factor * magnitude >= hours)
+        .unwrap();
+    factor * magnitude * 3_600_000.0
+}
+
+fn distribution_tick_label(ms: f64, step_ms: f64) -> String {
+    if ms == 0.0 {
+        return "0".into();
+    }
+    let (value, unit) = if step_ms >= 3_600_000.0 {
+        (ms / 3_600_000.0, "h")
+    } else {
+        (ms / 60_000.0, "min")
+    };
+    let value = format!("{value:.2}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned();
+    format!("{value}{unit}")
+}
+
+fn draw_reading_distribution(
+    ui: &mut egui::Ui,
+    period: period::Period,
+    values: &[(NaiveDate, u64)],
+    language: AppLanguage,
+) {
+    let colors = crate::ui::palette();
+    let max = values.iter().map(|(_, ms)| *ms).max().unwrap_or(0);
+    let step = distribution_tick_step(max);
+    let ceiling = step * f64::from(DISTRIBUTION_INTERVALS);
+    let tick_labels = (0..=DISTRIBUTION_INTERVALS)
+        .map(|tick| distribution_tick_label(step * f64::from(tick), step))
+        .collect::<Vec<_>>();
+    let font = egui::FontId::proportional(11.0);
+    let axis_width = tick_labels
+        .iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(label.clone(), font.clone(), colors.muted)
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max)
+        + 14.0;
+    let (chart, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 240.0),
+        egui::Sense::hover(),
+    );
+    let plot = egui::Rect::from_min_max(
+        chart.min,
+        egui::pos2(
+            (chart.right() - axis_width).max(chart.left() + 1.0),
+            chart.bottom(),
+        ),
+    );
+    let bottom = chart.bottom() - 26.0;
+    let plot_height = 190.0;
+    for tick in 0..=DISTRIBUTION_INTERVALS {
+        if max == 0 && tick > 0 {
+            continue;
+        }
+        let y = bottom - plot_height * tick as f32 / DISTRIBUTION_INTERVALS as f32;
+        ui.painter().extend(egui::Shape::dashed_line(
+            &[egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+            egui::Stroke::new(
+                1.0,
+                colors
+                    .muted
+                    .gamma_multiply(if tick == 0 { 0.25 } else { 0.12 }),
+            ),
+            4.0,
+            4.0,
+        ));
+        ui.painter().text(
+            egui::pos2(plot.right() + 10.0, y),
+            egui::Align2::LEFT_CENTER,
+            &tick_labels[tick as usize],
+            font.clone(),
+            colors.muted,
+        );
+    }
+    if max == 0 {
+        ui.painter().text(
+            egui::pos2(plot.center().x, bottom - plot_height / 2.0),
+            egui::Align2::CENTER_CENTER,
+            language.text("暂无阅读记录", "No reading records."),
+            egui::FontId::proportional(14.0),
+            colors.muted,
+        );
+    }
+    ui.scope_builder(egui::UiBuilder::new().max_rect(plot), |ui| {
+        egui::ScrollArea::horizontal()
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .id_salt(("reading-time-distribution", period as u8))
+            .show(ui, |ui| {
+                let minimum_slot = match period {
+                    period::Period::Month => 8.0,
+                    period::Period::All => 66.0,
+                    _ => 28.0,
+                };
+                let width = plot.width().max(values.len() as f32 * minimum_slot);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(width, 240.0), egui::Sense::hover());
+                let slot = width / values.len().max(1) as f32;
+                for (index, (month, ms)) in values.iter().enumerate() {
+                    let x = rect.left() + (index as f32 + 0.5) * slot;
+                    let height = plot_height * (*ms as f64 / ceiling) as f32;
+                    let bar = egui::Rect::from_min_max(
+                        egui::pos2(x - (slot * 0.3).min(24.0), bottom - height.max(1.0)),
+                        egui::pos2(x + (slot * 0.3).min(24.0), bottom),
+                    );
+                    if *ms > 0 {
+                        ui.painter().rect_filled(bar, 3.0, colors.accent);
+                    }
+                    ui.painter().text(
+                        egui::pos2(x, bottom + 16.0),
+                        egui::Align2::CENTER_CENTER,
+                        distribution_axis_label(period, *month, language),
+                        egui::FontId::proportional(11.0),
+                        colors.muted,
+                    );
+                    let response = ui.interact(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x - slot / 2.0, rect.top()),
+                            egui::pos2(x + slot / 2.0, rect.bottom()),
+                        ),
+                        ui.id().with(month),
+                        egui::Sense::hover(),
+                    );
+                    let mut tooltip = egui::Tooltip::for_enabled(&response);
+                    tooltip.popup = tooltip
+                        .popup
+                        .anchor(bar)
+                        .align(egui::emath::RectAlign::TOP)
+                        .align_alternatives(&[egui::emath::RectAlign::TOP])
+                        .gap(6.0);
+                    tooltip.show(|ui| {
+                        ui.label(
+                            month
+                                .format(match period {
+                                    period::Period::Week | period::Period::Month => "%Y/%m/%d",
+                                    period::Period::All => "%Y",
+                                    _ => "%Y/%m",
+                                })
+                                .to_string(),
+                        );
+                        let job = reading_time_text(*ms, language, 22.0);
+                        let galley = fitted_statistic_text(ui, job, 260.0);
+                        ui.add(egui::Label::new(galley));
+                    });
+                }
+            });
+    });
 }
 
 fn trend_date_label(day: NaiveDate, current_year: i32) -> String {
@@ -1586,11 +1907,259 @@ mod tests {
     use super::*;
 
     #[test]
+    fn date_digits_keep_the_same_baseline_with_or_without_month() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                let layout = |text: &str| {
+                    egui::WidgetText::from(statistics_title(text)).into_galley(
+                        ui,
+                        Some(egui::TextWrapMode::Extend),
+                        f32::INFINITY,
+                        egui::FontSelection::Default,
+                    )
+                };
+                let digits = layout("0123456789");
+                let year = layout("2026");
+                let expected =
+                    period_range_text_y(16.0, &year, &digits, false) + year.rows[0].glyphs[0].pos.y;
+                for text in ["2026/09", "09/07", "2025/12/29"] {
+                    let date = layout(text);
+                    let baseline = period_range_text_y(16.0, &date, &digits, false)
+                        + date.rows[0].glyphs[0].pos.y;
+                    assert!((baseline - expected).abs() < 0.01);
+                }
+                let separator = layout("-");
+                let center = period_range_text_y(16.0, &separator, &digits, true)
+                    + separator.mesh_bounds.center().y;
+                assert!(
+                    (center - (16.0 - digits.size().y / 2.0 + digits.mesh_bounds.center().y)).abs()
+                        < 0.01
+                );
+            });
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn period_range_rows_keep_the_same_height() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                let mut heights = Vec::new();
+                for parts in [
+                    vec!["09/07", "-", "09/13"],
+                    vec!["2026/09"],
+                    vec!["2026"],
+                    vec!["All time"],
+                ] {
+                    let parts = parts.into_iter().map(str::to_owned).collect::<Vec<_>>();
+                    ui.horizontal(|ui| {
+                        ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
+                        heights.push(period_range_label(ui, &parts).rect.height());
+                    });
+                }
+                assert!(
+                    heights
+                        .iter()
+                        .all(|height| (*height - heights[0]).abs() < 0.01)
+                );
+            });
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn reading_row_centers_visible_text_and_keeps_an_eight_point_gap() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                for width in [120.0, 300.0] {
+                    let time = fitted_statistic_text(
+                        ui,
+                        reading_time_text(123_456_789, AppLanguage::English, 20.0),
+                        width,
+                    );
+                    let title = ui.painter().layout_no_wrap(
+                        "Typography and reading".into(),
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        crate::ui::palette().muted,
+                    );
+                    let (time_y, title_y) = reading_row_text_positions(44.0, &time, &title);
+                    let top = time_y + time.mesh_bounds.top();
+                    let bottom = title_y + title.mesh_bounds.bottom();
+                    assert!(((top + bottom) / 2.0 - 44.0).abs() < 0.01);
+                    assert!(
+                        (title_y + title.mesh_bounds.top()
+                            - time_y
+                            - time.mesh_bounds.bottom()
+                            - 8.0)
+                            .abs()
+                            < 0.01
+                    );
+                }
+            });
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn distribution_scale_leaves_headroom_from_short_sessions_to_years() {
+        for max in [
+            0,
+            1_000,
+            60_000,
+            900_000,
+            3_600_000,
+            90_000_000,
+            90_000_000_000,
+        ] {
+            let step = distribution_tick_step(max);
+            assert!(step > 0.0);
+            assert!(step * f64::from(DISTRIBUTION_INTERVALS) >= max as f64 * 1.08);
+            let labels = (0..=DISTRIBUTION_INTERVALS)
+                .map(|tick| distribution_tick_label(step * f64::from(tick), step))
+                .collect::<Vec<_>>();
+            assert_eq!(labels.len(), 4);
+            assert!(labels.iter().all(|label| !label.contains('.')));
+            assert!(labels.windows(2).all(|pair| pair[0] != pair[1]));
+        }
+        assert_eq!(distribution_tick_label(0.0, 60_000.0), "0");
+        assert_eq!(distribution_tick_label(900_000.0, 300_000.0), "15min");
+        assert_eq!(distribution_tick_label(5_400_000.0, 1_800_000.0), "90min");
+    }
+
+    #[test]
+    fn statistic_numbers_and_units_share_a_baseline_after_fitting() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                for width in [120.0, 300.0] {
+                    let mut job = reading_time_text(123_456_789, AppLanguage::English, 28.0);
+                    let unit_format = job.sections.last().unwrap().format.clone();
+                    job.append("37.2%", 18.0, unit_format);
+                    let galley = fitted_statistic_text(ui, job, width);
+                    assert!(galley.size().x <= width + 1.0);
+                    let glyphs = &galley.rows[0].glyphs;
+                    let baseline = glyphs[0].pos.y;
+                    assert!(
+                        glyphs
+                            .iter()
+                            .all(|glyph| (glyph.pos.y - baseline).abs() <= 1.0)
+                    );
+                }
+            });
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn distribution_labels_follow_selected_granularity() {
+        use period::Period;
+        let language = AppLanguage::SimplifiedChinese;
+        let today = NaiveDate::from_ymd_opt(2026, 2, 11).unwrap();
+        let labels = |period: Period| {
+            period
+                .distribution(period.range(today, 0), &BTreeMap::new())
+                .iter()
+                .map(|(date, _)| distribution_axis_label(period, *date, language))
+                .filter(|label| !label.is_empty())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(Page::default().period, Period::Week);
+        assert_eq!(
+            labels(Period::Week),
+            ["一", "二", "三", "四", "五", "六", "日"]
+        );
+        assert_eq!(labels(Period::Month), ["1", "5", "10", "15", "20", "25"]);
+        assert_eq!(
+            labels(Period::Year),
+            (1..=12).map(|month| month.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            distribution_axis_label(
+                Period::Month,
+                NaiveDate::from_ymd_opt(2026, 1, 30).unwrap(),
+                language
+            ),
+            "30"
+        );
+        assert_eq!(
+            distribution_axis_label(
+                Period::Month,
+                NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+                language
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn longest_reading_uses_selected_period_and_excludes_books_without_time() {
+        let mut books = BTreeMap::new();
+        for (id, days) in [
+            ("old", vec![("2025-12-31", 900_000)]),
+            (
+                "first",
+                vec![("2026-09-01", 120_000), ("2026-09-30", 180_000)],
+            ),
+            (
+                "second",
+                vec![("2026-09-11", 240_000), ("2026-10-01", 900_000)],
+            ),
+            ("empty", vec![]),
+            ("zero", vec![("2026-09-11", 0)]),
+        ] {
+            books.insert(
+                id.into(),
+                BookStats {
+                    days: days.into_iter().map(|(d, ms)| (d.into(), ms)).collect(),
+                    ..Default::default()
+                },
+            );
+        }
+        let today = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        let ranked = longest_reading(&books, period::Period::Month.range(today, 0));
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|(id, _, ms)| (id.as_str(), *ms))
+                .collect::<Vec<_>>(),
+            [("first", 300_000), ("second", 240_000)]
+        );
+        let ranked = longest_reading(&books, period::Period::All.range(today, 0));
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["old", "second", "first"]
+        );
+    }
+
+    #[test]
+    fn finished_books_show_full_progress_without_overwriting_resume_position() {
+        let mut book = BookStats {
+            status: Status::Finished,
+            progress: 0.37,
+            ..Default::default()
+        };
+        assert_eq!(book.display_progress(), 1.0);
+        assert_eq!(book.progress, 0.37);
+        book.status = Status::Reading;
+        assert_eq!(book.display_progress(), 0.37);
+        book.status = Status::Finished;
+        book.progress = 0.0;
+        assert_eq!(book.display_progress(), 1.0);
+    }
+
+    #[test]
     fn background_snapshot_preserves_open_statistics_controls() {
         let mut page = Page {
             open: true,
             selected: Some("book".into()),
-            query: "filter".into(),
+            period: period::Period::Month,
+            period_offset: -2,
             clear_confirm: true,
             ..Default::default()
         };
@@ -1607,7 +2176,8 @@ mod tests {
         assert!(page.open);
         assert!(page.clear_confirm);
         assert_eq!(page.selected.as_deref(), Some("book"));
-        assert_eq!(page.query, "filter");
+        assert_eq!(page.period, period::Period::Month);
+        assert_eq!(page.period_offset, -2);
         assert_eq!(page.covers["book"], [1, 2, 3]);
         assert_eq!(page.books["book"].title, "Updated title");
     }
@@ -1726,15 +2296,31 @@ mod tests {
     }
     #[test]
     fn overview_fits_narrow_and_wide_windows() {
-        for width in [400.0, 1000.0] {
+        for (width, period) in [400.0, 700.0, 1000.0].into_iter().flat_map(|width| {
+            [
+                period::Period::Week,
+                period::Period::Month,
+                period::Period::Year,
+                period::Period::All,
+            ]
+            .map(move |period| (width, period))
+        }) {
             let ctx = egui::Context::default();
-            let mut page = Page::default();
+            let mut page = Page {
+                period,
+                ..Default::default()
+            };
+            let end = now_ms();
+            let intervals = vec![(end - 3_600_000 * 12_345, end, 0)];
             page.books.insert(
                 "book".into(),
                 BookStats {
                     title:
                         "A very long title about reading and typography repeated for narrow windows"
                             .into(),
+                    days: daily(&intervals),
+                    valid_intervals: intervals.clone(),
+                    intervals,
                     ..Default::default()
                 },
             );
