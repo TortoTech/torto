@@ -3165,6 +3165,7 @@ struct ReaderUiState {
     assistant_motion: Motion,
     menu_motion: Motion,
     focus_scroll_motion: Option<Motion>,
+    focus_navigation_repeat: egui_view::FocusNavigationRepeat,
     last_motion_tick: Option<Instant>,
     wheel_accumulator: f32,
     last_wheel_turn: Option<Instant>,
@@ -3423,6 +3424,7 @@ impl DesktopReader {
                 assistant_motion: Motion::settled(0.0),
                 menu_motion: Motion::settled(0.0),
                 focus_scroll_motion: None,
+                focus_navigation_repeat: Default::default(),
                 last_motion_tick: None,
                 wheel_accumulator: 0.0,
                 last_wheel_turn: None,
@@ -3538,6 +3540,102 @@ fn logical_dimension(value: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires TORTO_FOOTNOTE_BOOK and TORTO_FOOTNOTE_AUDIT with expected chapter anchors"]
+    fn audit_local_book_focus_footnotes() {
+        use super::*;
+        let book =
+            rebook_formats::open_file(std::env::var("TORTO_FOOTNOTE_BOOK").unwrap()).unwrap();
+        let source = book.source();
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(std::env::var("TORTO_FOOTNOTE_AUDIT").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut failures = Vec::new();
+        let mut checked_notes = 0;
+        let mut checked_references = 0;
+        let mut linked = HashMap::new();
+        for (index, descriptor) in source.book().sections.iter().enumerate() {
+            let section = source.parse_section(index).unwrap();
+            let expected_section = expected
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["path"].as_str() == Some(descriptor.href.path()));
+            if let Some(expected_section) = expected_section {
+                let fragments = expected_section["fragments"].as_array().unwrap();
+                for fragment in fragments {
+                    checked_notes += 1;
+                    let fragment = fragment.as_str().unwrap();
+                    let hidden = section
+                        .anchors
+                        .iter()
+                        .find(|anchor| anchor.fragment == fragment)
+                        .and_then(|anchor| {
+                            section.blocks.iter().find_map(|block| {
+                                note_definition_containing_anchor(block, &anchor.source)
+                            })
+                        })
+                        .is_some_and(block_is_footnote_definition);
+                    if !hidden {
+                        failures.push(format!(
+                            "{}#{fragment}: definition remains visible",
+                            descriptor.href.path()
+                        ));
+                    }
+                }
+                if !fragments.is_empty() {
+                    eprintln!(
+                        "{}: {} note definitions checked",
+                        descriptor.href.path(),
+                        fragments.len()
+                    );
+                }
+            }
+            for reference in section
+                .blocks
+                .iter()
+                .filter(|block| !block_is_footnote_definition(block))
+                .flat_map(block_focus_footnotes)
+            {
+                if let FocusFootnoteSource::Reference { marker, target } = reference {
+                    checked_references += 1;
+                    if focus_footnote_text(
+                        source.as_ref(),
+                        &target,
+                        &marker,
+                        index,
+                        &section,
+                        &mut linked,
+                    )
+                    .is_none()
+                    {
+                        failures.push(format!(
+                            "{}: unresolved footnote {marker} -> {target:?}",
+                            descriptor.href.path()
+                        ));
+                    }
+                }
+            }
+        }
+        let expected_total: u64 = expected
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["count"].as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            checked_notes, expected_total,
+            "all expected note paragraphs must be covered"
+        );
+        eprintln!(
+            "Audited {} sections, {checked_notes} definitions, {checked_references} references; {} failures",
+            source.book().sections.len(),
+            failures.len()
+        );
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     #[test]
     #[ignore = "requires a local book via TORTO_REFLOW_BOOK"]
     fn inspect_language_game_first_line_reflow() {
@@ -5232,6 +5330,7 @@ mod tests {
             assistant_motion: Motion::settled(0.0),
             menu_motion: Motion::settled(0.0),
             focus_scroll_motion: None,
+            focus_navigation_repeat: Default::default(),
             last_motion_tick: None,
             wheel_accumulator: 0.0,
             last_wheel_turn: None,
@@ -5273,6 +5372,7 @@ mod tests {
             assistant_motion: Motion::settled(0.0),
             menu_motion: Motion::settled(0.0),
             focus_scroll_motion: None,
+            focus_navigation_repeat: Default::default(),
             last_motion_tick: None,
             wheel_accumulator: 0.0,
             last_wheel_turn: None,

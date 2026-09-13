@@ -78,14 +78,23 @@ impl ParagraphStructureSource {
             .inner
             .parse_section(key.section_index)
             .map_err(|error| error.to_string())?;
-        let Some(primary) = section
-            .blocks
-            .iter()
-            .find_map(|block| structurable_text_for_node(block, &key.node))
-        else {
+        let Some((primary, split_semicolons)) = section.blocks.iter().find_map(|block| {
+            structurable_text_for_node(block, &key.node).map(|text| {
+                (
+                    text,
+                    !matches!(block, Block::Quote(_)) && text.kind != TextBlockKind::Blockquote,
+                )
+            })
+        }) else {
             return Ok(false);
         };
-        Ok(paragraph_atoms_for_content(&primary.content, &self.language_hint).len() >= 2)
+        Ok(paragraph_atoms_for_content_mode(
+            &primary.content,
+            &self.language_hint,
+            split_semicolons,
+        )
+        .len()
+            >= 2)
     }
 }
 
@@ -106,6 +115,14 @@ impl BookSource for ParagraphStructureSource {
             .map_err(|_| PublicationError::InvalidPublication("按句分段状态已损坏".to_owned()))?;
         let mut block_index = 0;
         while block_index < section.blocks.len() {
+            let split_semicolons = !matches!(
+                &section.blocks[block_index],
+                Block::Quote(_)
+                    | Block::Text(TextBlock {
+                        kind: TextBlockKind::Blockquote,
+                        ..
+                    })
+            );
             let active_text = match &mut section.blocks[block_index] {
                 Block::Text(primary) => {
                     let active = text_structure_is_active(primary, index, &state);
@@ -131,7 +148,7 @@ impl BookSource for ParagraphStructureSource {
                         if (active || (body.source.is_none() && active_primary))
                             && text_kind_is_structurable(body.kind)
                         {
-                            apply_sentence_structure(body, &self.language_hint);
+                            apply_sentence_structure_mode(body, &self.language_hint, false);
                         }
                         active_primary = active;
                     }
@@ -144,7 +161,7 @@ impl BookSource for ParagraphStructureSource {
                 && companion.source.is_none()
                 && text_kind_is_structurable(companion.kind)
             {
-                apply_sentence_structure(companion, &self.language_hint);
+                apply_sentence_structure_mode(companion, &self.language_hint, split_semicolons);
             }
             block_index += 1;
         }
@@ -170,7 +187,16 @@ impl BookSource for ParagraphStructureSource {
     }
 }
 
+#[cfg(test)]
 fn paragraph_atoms_for_content(content: &[Inline], language_hint: &str) -> Vec<ParagraphAtom> {
+    paragraph_atoms_for_content_mode(content, language_hint, true)
+}
+
+fn paragraph_atoms_for_content_mode(
+    content: &[Inline],
+    language_hint: &str,
+    split_semicolons: bool,
+) -> Vec<ParagraphAtom> {
     let text = inline_text(content);
     let mut cursor = 0;
     let mut protected = Vec::new();
@@ -202,6 +228,17 @@ fn paragraph_atoms_for_content(content: &[Inline], language_hint: &str) -> Vec<P
         cursor += len;
     }
     let atoms = paragraph_atoms_with_protected_ranges(&text, &protected, language_hint);
+    let atoms = if split_semicolons && text.contains([';', '；']) {
+        let chars = text.chars().collect::<Vec<_>>();
+        let boundaries = atoms
+            .iter()
+            .take(atoms.len().saturating_sub(1))
+            .map(|atom| atom.end)
+            .chain(semicolon_boundaries(&chars, &protected));
+        atoms_from_boundaries(boundaries, &chars, atoms.len())
+    } else {
+        atoms
+    };
     let atoms = attach_paired_punctuation_atoms(atoms, &text);
     let atoms = merge_leading_continuation_punctuation_atoms(atoms, &text);
     attach_footnote_atoms(atoms, &text, &footnotes)
@@ -429,6 +466,61 @@ fn move_atom_prefix_to_previous(
     atoms[index - 1].end = prefix_end;
     atoms[index].text = remainder;
     atoms[index].start = prefix_end;
+}
+
+fn semicolon_boundaries(chars: &[char], protected: &[std::ops::Range<usize>]) -> Vec<usize> {
+    let mut closers = Vec::new();
+    let mut boundaries = Vec::new();
+    for (index, character) in chars.iter().copied().enumerate() {
+        if protected.iter().any(|range| range.contains(&index)) {
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            let escaped = chars[..index]
+                .iter()
+                .rev()
+                .take_while(|character| **character == '\\')
+                .count()
+                % 2
+                == 1;
+            let previous_is_word = index
+                .checked_sub(1)
+                .is_some_and(|previous| chars[previous].is_ascii_alphanumeric());
+            let next_is_word = chars
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_alphanumeric());
+            if escaped || (character == '\'' && previous_is_word && next_is_word) {
+                continue;
+            }
+            if closers.last() == Some(&character) {
+                closers.pop();
+            } else if character == '"' || !previous_is_word {
+                closers.push(character);
+            }
+            continue;
+        }
+        if let Some(closer) = paired_closer(character) {
+            closers.push(closer);
+            continue;
+        }
+        if paired_opener(character).is_some() {
+            if let Some(position) = closers.iter().rposition(|closer| *closer == character) {
+                closers.truncate(position);
+            }
+            continue;
+        }
+        if matches!(character, '；' | ';') && closers.is_empty() {
+            let mut end = index + 1;
+            while chars.get(end).is_some_and(|character| {
+                character.is_whitespace()
+                    || matches!(character, '；' | ';' | '。' | '.' | '！' | '!' | '？' | '?')
+            }) {
+                end += 1;
+            }
+            boundaries.push(end);
+        }
+    }
+    boundaries
 }
 
 fn paired_punctuation_ranges(chars: &[char]) -> Vec<std::ops::Range<usize>> {
@@ -716,7 +808,19 @@ fn inline_text(content: &[Inline]) -> String {
 }
 
 fn apply_sentence_structure(block: &mut TextBlock, language_hint: &str) {
-    let atoms = paragraph_atoms_for_content(&block.content, language_hint);
+    apply_sentence_structure_mode(
+        block,
+        language_hint,
+        block.kind != TextBlockKind::Blockquote,
+    );
+}
+
+fn apply_sentence_structure_mode(
+    block: &mut TextBlock,
+    language_hint: &str,
+    split_semicolons: bool,
+) {
+    let atoms = paragraph_atoms_for_content_mode(&block.content, language_hint, split_semicolons);
     if atoms.len() < 2 {
         return;
     }
@@ -786,6 +890,106 @@ fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semicolons_split_prose_but_preserve_quotations_and_brackets() {
+        for (text, expected) in [
+            (
+                "先理解原文；再组织译文。",
+                vec!["先理解原文；", "再组织译文。"],
+            ),
+            (
+                "Read first; write later.",
+                vec!["Read first;", "write later."],
+            ),
+            ("他说：“先理解；再表达。”", vec!["他说：“先理解；再表达。”"]),
+            ("“先理解”；“再表达”。", vec!["“先理解”；", "“再表达”。"]),
+            (
+                "他说：“外层‘先甲；再乙’；继续。”；结束。",
+                vec!["他说：“外层‘先甲；再乙’；继续。”；", "结束。"],
+            ),
+            (
+                "He says \"read; write\"; continue.",
+                vec!["He says \"read; write\";", "continue."],
+            ),
+            (
+                "He says 'read; write'; continue.",
+                vec!["He says 'read; write';", "continue."],
+            ),
+            (
+                "He said \"Read first. Think; then write.\"; Continue.",
+                vec!["He said \"Read first. Think; then write.\";", "Continue."],
+            ),
+            (
+                "He says \"it's good; 'read; write'\"; continue.",
+                vec!["He says \"it's good; 'read; write'\";", "continue."],
+            ),
+            (
+                "Don't rush; think first.",
+                vec!["Don't rush;", "think first."],
+            ),
+            (
+                "James' notes; read them.",
+                vec!["James' notes;", "read them."],
+            ),
+            (
+                "参见文献（甲，2020；乙，2021）；继续。",
+                vec!["参见文献（甲，2020；乙，2021）；", "继续。"],
+            ),
+            (
+                "《甲；乙》；《丙；丁》。",
+                vec!["《甲；乙》；", "《丙；丁》。"],
+            ),
+            (
+                "先做；“未闭合；继续；尾部",
+                vec!["先做；", "“未闭合；继续；尾部"],
+            ),
+            ("他说\"未闭合; 继续;尾部", vec!["他说\"未闭合; 继续;尾部"]),
+            ("A;;B;", vec!["A;;", "B;"]),
+        ] {
+            let content = vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: Default::default(),
+                link: None,
+            })];
+            let atoms = paragraph_atoms_for_content(&content, "zh");
+            assert_eq!(
+                atoms
+                    .iter()
+                    .map(|atom| atom.text.trim())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{text}"
+            );
+            assert_eq!(
+                atoms
+                    .iter()
+                    .map(|atom| atom.text.as_str())
+                    .collect::<String>(),
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn quotation_blocks_keep_semicolons_without_disabling_sentence_splitting() {
+        let mut block = TextBlock {
+            kind: TextBlockKind::Blockquote,
+            content: vec![Inline::Text(TextRun {
+                text: "甲；乙。丙；丁。".into(),
+                style: Default::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        };
+        apply_sentence_structure(&mut block, "zh");
+        assert_eq!(inline_text(&block.content), "甲；乙。\n丙；丁。");
+        assert_eq!(
+            paragraph_atoms_for_content_mode(&block.content, "zh", false).len(),
+            2
+        );
+    }
 
     #[test]
     fn nested_quote_closers_leave_following_sentence_separate() {
@@ -918,6 +1122,32 @@ mod tests {
         );
         assert_eq!(atoms.len(), 2);
         assert_eq!(atoms[1].text, "其次，比较反馈；Finally, decide.");
+    }
+
+    #[test]
+    fn sentence_structure_keeps_spaced_dictionary_initials_together() {
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "这是前一句。C. ".into(),
+                    style: Default::default(),
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: "O. D.对justify的解释是：".into(),
+                    style: Default::default(),
+                    link: None,
+                }),
+            ],
+            style: Default::default(),
+            source: None,
+        };
+        apply_sentence_structure(&mut block, "zh");
+        assert_eq!(
+            inline_text(&block.content),
+            "这是前一句。\nC. O. D.对justify的解释是："
+        );
     }
 
     #[test]
@@ -1112,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn quoted_exclamations_with_continuation_punctuation_stay_in_the_outer_sentence() {
+    fn quoted_exclamations_keep_comma_continuations_but_allow_outer_semicolons() {
         let text = concat!(
             "大喊一声“锤子！”，可能表示敲锤子或递锤子的意思；",
             "也有可能表示警告，“锤子要从屋顶上掉下来了，当心！”；",
@@ -1127,16 +1357,19 @@ mod tests {
 
         let atoms = paragraph_atoms_for_content(&content, "zh");
 
-        assert_eq!(atoms.len(), 2);
         assert_eq!(
-            atoms[0].text,
-            concat!(
+            atoms
+                .iter()
+                .map(|atom| atom.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
                 "大喊一声“锤子！”，可能表示敲锤子或递锤子的意思；",
                 "也有可能表示警告，“锤子要从屋顶上掉下来了，当心！”；",
-                "此外，它还可能是提醒你买锤子或者不要忘记带锤子；等等。"
-            )
+                "此外，它还可能是提醒你买锤子或者不要忘记带锤子；",
+                "等等。",
+                "我们可以尽情地想象各种意义。",
+            ]
         );
-        assert_eq!(atoms[1].text, "我们可以尽情地想象各种意义。");
         assert!(atoms.iter().skip(1).all(|atom| {
             atom.text
                 .trim_start()
@@ -1156,6 +1389,62 @@ mod tests {
         assert_eq!(atoms.len(), 2);
         assert_eq!(atoms[0].text, "他说：“快走！”");
         assert_eq!(atoms[1].text, "第二天他们再次见面。");
+    }
+
+    #[test]
+    fn semicolon_splitting_preserves_formulas_and_attached_footnotes() {
+        let target = PublicationUrl::parse("chapter.xhtml#note-1").unwrap();
+        let formula = rebook_publication::MathRun {
+            latex: "f(x;y)".into(),
+            display: false,
+            size_scale: 1.0,
+        };
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "先列公式".into(),
+                    style: Default::default(),
+                    link: None,
+                }),
+                Inline::Math(formula.clone()),
+                Inline::Text(TextRun {
+                    text: "；".into(),
+                    style: Default::default(),
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: "[1]".into(),
+                    style: rebook_publication::TextStyle {
+                        link_role: LinkRole::FootnoteReference,
+                        ..Default::default()
+                    },
+                    link: Some(target.clone()),
+                }),
+                Inline::Text(TextRun {
+                    text: "再解释；最后。".into(),
+                    style: Default::default(),
+                    link: None,
+                }),
+            ],
+            style: Default::default(),
+            source: None,
+        };
+        apply_sentence_structure(&mut block, "zh");
+        assert_eq!(
+            inline_text(&block.content),
+            "先列公式f(x;y)；[1]\n再解释；\n最后。"
+        );
+        assert_eq!(
+            block
+                .content
+                .iter()
+                .filter(|inline| matches!(inline, Inline::Math(run) if run == &formula))
+                .count(),
+            1
+        );
+        assert_eq!(block.content.iter().filter(|inline| matches!(inline, Inline::Text(run) if run.link.as_ref() == Some(&target))).count(), 1);
+        assert!(block.style.sentence_indents);
     }
 
     #[test]

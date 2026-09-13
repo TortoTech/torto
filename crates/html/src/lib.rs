@@ -49,6 +49,19 @@ fn classify_footnote_links(
         .iter()
         .map(|node| attribute_local(*node, "href").and_then(|href| base.resolve(href).ok()))
         .collect::<Vec<_>>();
+    // Some EPUBs put an empty ID anchor immediately before the actual link,
+    // on both the reference and definition sides. Index these associations
+    // without extending a target's scope to unrelated following prose.
+    let mut links_by_fragment = HashMap::<&str, Vec<Node<'_, '_>>>::new();
+    for node in anchors
+        .iter()
+        .copied()
+        .filter(|node| attribute_local(*node, "href").is_some())
+    {
+        if let Some(fragment) = footnote_reference_fragment(node) {
+            links_by_fragment.entry(fragment).or_default().push(node);
+        }
+    }
 
     for (index, node) in anchors.iter().copied().enumerate() {
         let Some(source_fragment) = footnote_reference_fragment(node) else {
@@ -66,21 +79,31 @@ fn classify_footnote_links(
         let Some(&target_node) = by_fragment.get(target_fragment) else {
             continue;
         };
-        let Some(counterpart) = target_node.descendants().find(|candidate| {
-            if !candidate.is_element()
-                || !candidate.tag_name().name().eq_ignore_ascii_case("a")
-                || candidate.range().start == node.range().start
-                || !matching_footnote_markers(node, *candidate)
-            {
-                return false;
-            }
-            attribute_local(*candidate, "href")
-                .and_then(|href| base.resolve(href).ok())
-                .is_some_and(|candidate_target| {
-                    candidate_target.path() == base.path()
-                        && candidate_target.fragment() == Some(source_fragment)
-                })
-        }) else {
+        let Some(counterpart) = target_node
+            .descendants()
+            .chain(
+                links_by_fragment
+                    .get(target_fragment)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )
+            .find(|candidate| {
+                if !candidate.is_element()
+                    || !candidate.tag_name().name().eq_ignore_ascii_case("a")
+                    || candidate.range().start == node.range().start
+                    || !matching_footnote_markers(node, *candidate)
+                {
+                    return false;
+                }
+                attribute_local(*candidate, "href")
+                    .and_then(|href| base.resolve(href).ok())
+                    .is_some_and(|candidate_target| {
+                        candidate_target.path() == base.path()
+                            && candidate_target.fragment() == Some(source_fragment)
+                    })
+            })
+        else {
             continue;
         };
 
@@ -4288,6 +4311,62 @@ mod tests {
             block,
             Block::Note(note) if note.kind == NoteBlockKind::Definition
         )));
+    }
+
+    #[test]
+    fn classifies_footnotes_with_separate_empty_anchors_on_both_sides() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r##"<html><body>
+            <p>First reference<a id="w1"/><a href="chapter.xhtml#m1"><sup>[1]</sup></a>.</p>
+            <p>Second reference<a id="w2"/> <a href="#m2"><sup>[2]</sup></a>.</p>
+            <p>Third reference<a id="w3"/><a href="#m3"><sup>[3]</sup></a>.</p>
+            <hr/>
+            <p class="note"><a id="m1"/><a href="chapter.xhtml#w1">[1]</a> First note.</p>
+            <p class="note"><a id="m2"/> <a href="#w2">[2]</a> Second <i>note</i>.</p>
+            <p class="note"><a id="m3"/><a href="#w3">[3]</a> Third note.</p>
+            <p class="note">[4] Ordinary unlinked text.</p>
+            <p><a id="unrelated"/> Intervening prose <a href="#w1">[1]</a>.</p>
+        </body></html>"##;
+        let section = parse_section(xml, &descriptor, |_| None).unwrap();
+        assert_eq!(
+            section
+                .blocks
+                .iter()
+                .filter(|block| block.is_footnote_definition())
+                .count(),
+            3
+        );
+        let blocks = all_text_blocks(&section);
+        let runs = blocks
+            .iter()
+            .flat_map(|block| &block.content)
+            .filter_map(|inline| {
+                if let Inline::Text(run) = inline {
+                    Some(run)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            runs.iter()
+                .filter(|run| run.style.link_role == LinkRole::FootnoteReference)
+                .count(),
+            3
+        );
+        assert_eq!(
+            runs.iter()
+                .filter(|run| run.style.link_role == LinkRole::FootnoteBacklink)
+                .count(),
+            3
+        );
+        assert!(section.blocks.iter().any(|block| matches!(block, Block::Text(text) if text.content.iter().any(|inline| matches!(inline, Inline::Text(run) if run.text.contains("Ordinary unlinked"))) && !block.is_footnote_definition())));
     }
 
     #[test]

@@ -556,6 +556,8 @@ enum ShortcutAction {
     FocusFootnotes,
     FocusExtendSelectionPrevious,
     FocusExtendSelectionNext,
+    FocusFirstParagraph,
+    FocusLastParagraph,
 }
 
 impl ShortcutAction {
@@ -583,6 +585,8 @@ impl ShortcutAction {
             Self::FocusFootnotes => shortcuts.focus_footnotes,
             Self::FocusExtendSelectionPrevious => shortcuts.focus_extend_selection_previous,
             Self::FocusExtendSelectionNext => shortcuts.focus_extend_selection_next,
+            Self::FocusFirstParagraph => shortcuts.focus_first_paragraph,
+            Self::FocusLastParagraph => shortcuts.focus_last_paragraph,
         }
     }
 
@@ -612,6 +616,8 @@ impl ShortcutAction {
                 shortcuts.focus_extend_selection_previous = binding;
             }
             Self::FocusExtendSelectionNext => shortcuts.focus_extend_selection_next = binding,
+            Self::FocusFirstParagraph => shortcuts.focus_first_paragraph = binding,
+            Self::FocusLastParagraph => shortcuts.focus_last_paragraph = binding,
         }
     }
 }

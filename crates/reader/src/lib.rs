@@ -53,20 +53,79 @@ pub fn sentence_byte_ranges(text: &str) -> Vec<Range<usize>> {
 /// character, including boundary whitespace and punctuation.
 pub fn sentence_byte_ranges_with_language(text: &str, language_hint: &str) -> Vec<Range<usize>> {
     let language = sentence_language_for_text(text, language_hint);
-    sentencex::get_sentence_boundaries(&language, text)
-        .into_iter()
-        .map(|boundary| boundary.start_byte..boundary.end_byte)
-        .collect()
+    let initialisms = initialism_byte_ranges(text);
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for boundary in sentencex::get_sentence_boundaries(&language, text) {
+        if let Some(previous) = ranges.last_mut()
+            && initialisms
+                .iter()
+                .any(|span| span.start < previous.end && previous.end < span.end)
+        {
+            previous.end = boundary.end_byte;
+        } else {
+            ranges.push(boundary.start_byte..boundary.end_byte);
+        }
+    }
+    ranges
+}
+
+/// Protect only the interior of dotted initials. The last dot remains eligible
+/// as a sentence boundary, and separate paragraphs must never be joined.
+fn initialism_byte_ranges(text: &str) -> Vec<Range<usize>> {
+    let chars = text.char_indices().collect::<Vec<_>>();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index + 1 < chars.len() {
+        if !chars[index].1.is_ascii_uppercase()
+            || chars[index + 1].1 != '.'
+            || index.checked_sub(1).is_some_and(|previous| {
+                chars[previous].1.is_ascii_alphanumeric() || chars[previous].1 == '_'
+            })
+        {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut cursor = index;
+        let mut end = index;
+        let mut initials = 0;
+        while cursor + 1 < chars.len()
+            && chars[cursor].1.is_ascii_uppercase()
+            && chars[cursor + 1].1 == '.'
+        {
+            initials += 1;
+            cursor += 2;
+            end = cursor;
+            while cursor < chars.len()
+                && chars[cursor].1.is_whitespace()
+                && !matches!(chars[cursor].1, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+            {
+                cursor += 1;
+            }
+        }
+        if initials >= 2 {
+            ranges.push(chars[start].0..chars.get(end).map_or(text.len(), |(byte, _)| *byte));
+        }
+        index = end;
+    }
+    ranges
 }
 
 /// Returns sentence ranges as Unicode scalar indices. This is used by derived
 /// Inline views whose diagnostic text keeps the same character count as the
 /// original source but may intentionally mask formulas or footnotes.
 pub fn sentence_char_ranges(text: &str, language_hint: &str) -> Vec<Range<usize>> {
-    let language = sentence_language_for_text(text, language_hint);
-    sentencex::get_sentence_boundaries(&language, text)
+    let mut byte_cursor = 0;
+    let mut char_cursor = 0;
+    sentence_byte_ranges_with_language(text, language_hint)
         .into_iter()
-        .map(|boundary| boundary.start_index..boundary.end_index)
+        .map(|range| {
+            let start = char_cursor + text[byte_cursor..range.start].chars().count();
+            let end = start + text[range.clone()].chars().count();
+            byte_cursor = range.end;
+            char_cursor = end;
+            start..end
+        })
         .collect()
 }
 
@@ -4890,6 +4949,67 @@ mod tests {
             ),
             Some(0..text.len())
         );
+    }
+
+    #[test]
+    fn initialism_protection_does_not_cover_sentences_or_paragraph_breaks() {
+        for text in [
+            "Alpha. Beta.",
+            "A.\nB.",
+            "A.\r\nB.",
+            "A.\u{2028}B.",
+            "3.14",
+            "wordA. B.",
+        ] {
+            assert!(initialism_byte_ranges(text).is_empty(), "{text}");
+        }
+        let text = "Read C. O. D. Then continue.";
+        let spans = initialism_byte_ranges(text);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&text[spans[0].clone()], "C. O. D.");
+        let sentences = sentence_byte_ranges_with_language(text, "en");
+        assert_eq!(
+            sentences
+                .iter()
+                .map(|range| &text[range.clone()])
+                .collect::<Vec<_>>(),
+            ["Read C. O. D. ", "Then continue."]
+        );
+    }
+
+    #[test]
+    fn sentence_ranges_keep_spaced_initialisms_intact() {
+        let text = "前一句。C. O. D.对justify的解释是：";
+        let byte_ranges = sentence_byte_ranges_with_language(text, "zh");
+        let sentences = byte_ranges
+            .iter()
+            .map(|range| &text[range.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(sentences, ["前一句。", "C. O. D.对justify的解释是："]);
+        for abbreviation in ["C.O.D.", "C. O. D.", "C.\u{a0}O.\u{a0}D.", "J. R. R."] {
+            let text = format!("🙂前句。{abbreviation}的释义如下。后句。");
+            let ranges = sentence_byte_ranges_with_language(&text, "zh");
+            assert_eq!(ranges.len(), 3, "{text}");
+            let chars = text.chars().collect::<Vec<_>>();
+            let character_ranges = sentence_char_ranges(&text, "zh");
+            assert_eq!(
+                ranges
+                    .iter()
+                    .map(|range| text[range.clone()].to_owned())
+                    .collect::<Vec<_>>(),
+                character_ranges
+                    .iter()
+                    .map(|range| chars[range.clone()].iter().collect::<String>())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                ranges
+                    .iter()
+                    .map(|range| &text[range.clone()])
+                    .collect::<String>(),
+                text
+            );
+        }
     }
 
     #[test]

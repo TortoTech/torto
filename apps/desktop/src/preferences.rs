@@ -184,6 +184,10 @@ pub(crate) struct ShortcutPreferences {
     pub(crate) focus_extend_selection_previous: egui::KeyboardShortcut,
     #[serde(default = "default_focus_extend_selection_next_shortcut")]
     pub(crate) focus_extend_selection_next: egui::KeyboardShortcut,
+    #[serde(default = "default_focus_first_paragraph_shortcut")]
+    pub(crate) focus_first_paragraph: egui::KeyboardShortcut,
+    #[serde(default = "default_focus_last_paragraph_shortcut")]
+    pub(crate) focus_last_paragraph: egui::KeyboardShortcut,
 }
 
 impl ShortcutPreferences {
@@ -201,7 +205,7 @@ impl ShortcutPreferences {
             .any(|binding| shortcut_chord_key_count(binding.modifiers) > MAX_SHORTCUT_KEYS)
     }
 
-    fn bindings(&self) -> [egui::KeyboardShortcut; 22] {
+    fn bindings(&self) -> [egui::KeyboardShortcut; 24] {
         [
             self.fullscreen,
             self.toggle_left_sidebar,
@@ -225,6 +229,8 @@ impl ShortcutPreferences {
             self.focus_footnotes,
             self.focus_extend_selection_previous,
             self.focus_extend_selection_next,
+            self.focus_first_paragraph,
+            self.focus_last_paragraph,
         ]
     }
 }
@@ -270,6 +276,8 @@ impl Default for ShortcutPreferences {
             focus_footnotes: default_focus_footnotes_shortcut(),
             focus_extend_selection_previous: default_focus_extend_selection_previous_shortcut(),
             focus_extend_selection_next: default_focus_extend_selection_next_shortcut(),
+            focus_first_paragraph: default_focus_first_paragraph_shortcut(),
+            focus_last_paragraph: default_focus_last_paragraph_shortcut(),
         }
     }
 }
@@ -360,6 +368,14 @@ const fn default_focus_extend_selection_previous_shortcut() -> egui::KeyboardSho
 
 const fn default_focus_extend_selection_next_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
+}
+
+const fn default_focus_first_paragraph_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Home)
+}
+
+const fn default_focus_last_paragraph_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::End)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -634,6 +650,31 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_edge_shortcuts_migrate_and_participate_in_conflict_checks() {
+        let mut shortcuts: ShortcutPreferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            shortcuts.focus_first_paragraph,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Home)
+        );
+        assert_eq!(
+            shortcuts.focus_last_paragraph,
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::End)
+        );
+        assert!(!shortcuts.has_conflicts());
+        shortcuts.focus_last_paragraph = shortcuts.focus_first_paragraph;
+        assert!(shortcuts.has_conflicts());
+        shortcuts.focus_last_paragraph =
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F8);
+        let restored: ShortcutPreferences =
+            serde_json::from_str(&serde_json::to_string(&shortcuts).unwrap()).unwrap();
+        assert_eq!(
+            restored.focus_last_paragraph,
+            shortcuts.focus_last_paragraph
+        );
+        assert!(!restored.has_conflicts());
+    }
     use rebook_layout::{ReaderDefaultFont, ReaderFontChoice};
     use std::time::{SystemTime, UNIX_EPOCH};
 

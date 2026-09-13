@@ -387,6 +387,14 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
                 ShortcutAction::FocusExtendSelectionNext,
                 language.text("向下扩展选区", "Extend selection downward"),
             ),
+            (
+                ShortcutAction::FocusFirstParagraph,
+                language.text("聚焦第一段", "Focus first paragraph"),
+            ),
+            (
+                ShortcutAction::FocusLastParagraph,
+                language.text("聚焦最后一段", "Focus last paragraph"),
+            ),
         ],
     );
 }
@@ -2105,7 +2113,7 @@ fn paint_centered_button_content(
     let text_visual_left = content_left + icon_advance;
     let origin = egui::pos2(
         text_visual_left - galley.mesh_bounds.min.x,
-        rect.center().y - galley.mesh_bounds.center().y,
+        crate::ui::visually_centered_text_y(rect.center().y, &galley),
     );
     ui.painter()
         .galley_with_override_text_color(origin, galley, color);

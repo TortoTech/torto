@@ -616,6 +616,11 @@ fn contained_feather_geometry(
     (aligned_rect.shrink(inset), (radius - inset).max(0.0))
 }
 
+/// Align visible glyph bounds with the center of an adjacent icon.
+pub(crate) fn visually_centered_text_y(center: f32, galley: &egui::Galley) -> f32 {
+    center - galley.mesh_bounds.center().y
+}
+
 /// Full-width navigation/menu row with left-aligned icon and label.
 pub(crate) fn navigation_button(ui: &mut Ui, glyph: Icon, label: &str, selected: bool) -> Response {
     let desired_size = Vec2::new(ui.available_width(), 36.0);
@@ -647,13 +652,14 @@ pub(crate) fn navigation_button(ui: &mut Ui, glyph: Icon, label: &str, selected:
             glyph,
             foreground,
         );
-        ui.painter().text(
-            egui::pos2(rect.left() + 38.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
+        let galley = ui.painter().layout_no_wrap(
+            label.into(),
             TextStyle::Body.resolve(ui.style()),
             foreground,
         );
+        let text_y = visually_centered_text_y(rect.center().y, &galley);
+        ui.painter()
+            .galley(egui::pos2(rect.left() + 38.0, text_y), galley, foreground);
     }
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), label));
     response
@@ -734,6 +740,35 @@ pub(crate) fn decode_color_image(bytes: &[u8]) -> Result<ColorImage, image::Imag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_text_is_visually_centered_with_its_icon() {
+        let ctx = egui::Context::default();
+        let mut expected = Vec::new();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                for (label, size) in [("System", 12.0), ("Typography", 14.0), ("PDF OCR", 20.0)] {
+                    ui.style_mut()
+                        .text_styles
+                        .insert(TextStyle::Body, egui::FontId::proportional(size));
+                    let response = navigation_button(ui, Icon::Settings, label, false);
+                    expected.push((label, response.rect.center().y));
+                }
+            });
+        });
+        for (label, center) in expected {
+            let text = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == label => Some(text),
+                    _ => None,
+                })
+                .expect("navigation label is painted");
+            assert!((text.pos.y + text.galley.mesh_bounds.center().y - center).abs() < 0.01);
+        }
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn app_themes_select_the_matching_egui_theme() {

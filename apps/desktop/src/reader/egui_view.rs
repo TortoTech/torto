@@ -203,6 +203,61 @@ fn shortcut_has_fresh_press(input: &egui::InputState, shortcut: &egui::KeyboardS
     })
 }
 
+fn focus_edge_index(unit_count: usize, last: bool) -> Option<usize> {
+    unit_count
+        .checked_sub(1)
+        .map(|last_index| if last { last_index } else { 0 })
+}
+
+#[derive(Default)]
+pub(super) struct FocusNavigationRepeat {
+    held: Option<(PageDirection, Instant)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FocusChatShortcutAction {
+    Open,
+    Close,
+    IgnoreRepeat,
+}
+
+fn focus_chat_shortcut_action(
+    input: &mut egui::InputState,
+    shortcut: &egui::KeyboardShortcut,
+    open: bool,
+) -> Option<FocusChatShortcutAction> {
+    let fresh = shortcut_has_fresh_press(input, shortcut);
+    input.consume_shortcut(shortcut).then_some(if !fresh {
+        FocusChatShortcutAction::IgnoreRepeat
+    } else if open {
+        FocusChatShortcutAction::Close
+    } else {
+        FocusChatShortcutAction::Open
+    })
+}
+
+impl FocusNavigationRepeat {
+    fn poll(&mut self, direction: Option<PageDirection>, fresh: bool, now: Instant) -> bool {
+        let Some(direction) = direction else {
+            self.held = None;
+            return false;
+        };
+        if fresh {
+            self.held = Some((direction, now + Duration::from_millis(350)));
+            return true;
+        }
+        if let Some((held, next)) = self.held.as_mut()
+            && *held == direction
+            && now >= *next
+        {
+            // Never catch up with a burst after a slow frame.
+            *next = now + Duration::from_millis(200);
+            return true;
+        }
+        false
+    }
+}
+
 fn next_toc_keyboard_row(
     current: Option<usize>,
     active: Option<usize>,
@@ -927,6 +982,11 @@ impl DesktopReader {
     }
 
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
+        if !self.focus_body_accepts_shortcuts(interaction_blocked)
+            || !ctx.input(|input| input.focused)
+        {
+            self.ui.focus_navigation_repeat.held = None;
+        }
         // The image preview is above the chat, TOC and reader menus. Handle its
         // dismissal before any underlying panel can consume Escape.
         if self.image_preview.is_some() {
@@ -934,6 +994,9 @@ impl DesktopReader {
                 self.image_preview = None;
                 ctx.request_repaint();
             }
+            return;
+        }
+        if self.focus_chat_shortcut(ctx, interaction_blocked) {
             return;
         }
         let focus_footnote_requested =
@@ -1035,6 +1098,9 @@ impl DesktopReader {
         if self.focus_action_shortcut(ctx, interaction_blocked) {
             return;
         }
+        if self.focus_edge_shortcut(ctx, interaction_blocked) {
+            return;
+        }
         // Focus-mode reading shortcuts are handled before the generic keyboard-focus
         // guard so a stale TextEdit focus cannot intermittently swallow them.
         if self.focus_body_accepts_shortcuts(interaction_blocked)
@@ -1042,14 +1108,6 @@ impl DesktopReader {
         {
             self.ui.focus_actions_visible = true;
             ctx.memory_mut(egui::Memory::stop_text_input);
-            return;
-        }
-        if self.focus_body_accepts_shortcuts(interaction_blocked)
-            && ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_chat))
-        {
-            self.ui.focus_actions_visible = false;
-            self.attach_current_focus_reference();
-            self.open_assistant_panel(AssistantPanel::Chat);
             return;
         }
         let open_search = !interaction_blocked
@@ -1306,6 +1364,73 @@ impl DesktopReader {
         true
     }
 
+    fn focus_edge_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
+        if !self.focus_body_accepts_shortcuts(interaction_blocked) {
+            return false;
+        }
+        let edge = ctx.input_mut(|input| {
+            if input.consume_shortcut(&self.shortcuts.focus_first_paragraph) {
+                Some(false)
+            } else if input.consume_shortcut(&self.shortcuts.focus_last_paragraph) {
+                Some(true)
+            } else {
+                None
+            }
+        });
+        let Some(last) = edge else {
+            return false;
+        };
+        self.ui.focus_navigation_repeat.held = None;
+        if let Some(index) = focus_edge_index(self.focus_units.len(), last) {
+            // Focus units already represent semantic blocks, including quotes,
+            // tables and figures; do not derive targets from visual text lines.
+            self.select_focus_unit(index);
+            self.focus_overflow_origin = None;
+            if let Some(target) = self
+                .scroll_viewport
+                .and_then(|viewport| self.focus_unit_target_offset(viewport.size.y))
+            {
+                self.animate_focus_scroll_to(target);
+            }
+            ctx.memory_mut(egui::Memory::stop_text_input);
+            ctx.request_repaint();
+        }
+        true
+    }
+
+    fn focus_chat_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
+        if !self.is_focus_mode()
+            || interaction_blocked
+            || self.ui.overlay_visible()
+            || self.ui.sidebar_open
+            || self.image_preview.is_some()
+            || self.annotation_note_draft.is_some()
+            || self.ui.focus_footnotes_visible
+        {
+            return false;
+        }
+        let open = self.ui.assistant_panel == Some(AssistantPanel::Chat)
+            && self.ui.assistant_motion.target > 0.5;
+        let Some(action) = ctx
+            .input_mut(|input| focus_chat_shortcut_action(input, &self.shortcuts.focus_chat, open))
+        else {
+            return false;
+        };
+        if action != FocusChatShortcutAction::IgnoreRepeat {
+            self.ui.focus_navigation_repeat.held = None;
+            self.ui.focus_actions_visible = false;
+            if action == FocusChatShortcutAction::Close {
+                self.close_assistant_panel();
+                ctx.memory_mut(egui::Memory::stop_text_input);
+            } else {
+                self.attach_current_focus_reference();
+                self.open_assistant_panel(AssistantPanel::Chat);
+            }
+            ctx.request_repaint();
+        }
+        true
+    }
+
     fn reading_navigation_shortcuts(&mut self, ctx: &egui::Context) {
         if self.is_focus_mode() {
             let (
@@ -1317,6 +1442,8 @@ impl DesktopReader {
                 next_unit_fresh,
                 previous_section,
                 next_section,
+                previous_held,
+                next_held,
             ) = ctx.input_mut(|input| {
                 let previous_unit_fresh =
                     shortcut_has_fresh_press(input, &self.shortcuts.previous_page_or_paragraph);
@@ -1331,28 +1458,53 @@ impl DesktopReader {
                     next_unit_fresh,
                     input.consume_shortcut(&self.shortcuts.previous_section),
                     input.consume_shortcut(&self.shortcuts.next_section),
+                    input.key_down(self.shortcuts.previous_page_or_paragraph.logical_key)
+                        && input
+                            .modifiers
+                            .matches_logically(self.shortcuts.previous_page_or_paragraph.modifiers),
+                    input.key_down(self.shortcuts.next_page_or_paragraph.logical_key)
+                        && input
+                            .modifiers
+                            .matches_logically(self.shortcuts.next_page_or_paragraph.modifiers),
                 )
             });
+            let fresh = previous_unit && previous_unit_fresh || next_unit && next_unit_fresh;
+            let direction = if previous_unit && previous_unit_fresh {
+                Some(PageDirection::Previous)
+            } else if next_unit && next_unit_fresh {
+                Some(PageDirection::Next)
+            } else {
+                self.ui
+                    .focus_navigation_repeat
+                    .held
+                    .map(|(direction, _)| direction)
+                    .filter(|direction| match direction {
+                        PageDirection::Previous => previous_held,
+                        PageDirection::Next => next_held,
+                    })
+            };
+            let now = Instant::now();
             if extend_previous {
+                self.ui.focus_navigation_repeat.held = None;
                 self.extend_focus_selection(PageDirection::Previous);
             } else if extend_next {
+                self.ui.focus_navigation_repeat.held = None;
                 self.extend_focus_selection(PageDirection::Next);
-            } else if previous_unit {
-                self.cancel_text_selection();
-                if !self.scroll_within_tall_focus_unit(PageDirection::Previous)
-                    && previous_unit_fresh
-                {
-                    self.move_focus_unit(PageDirection::Previous);
-                }
-            } else if next_unit {
-                self.cancel_text_selection();
-                if !self.scroll_within_tall_focus_unit(PageDirection::Next) && next_unit_fresh {
-                    self.move_focus_unit(PageDirection::Next);
-                }
             } else if previous_section {
+                self.ui.focus_navigation_repeat.held = None;
                 self.go_to_adjacent_section(PageDirection::Previous);
             } else if next_section {
+                self.ui.focus_navigation_repeat.held = None;
                 self.go_to_adjacent_section(PageDirection::Next);
+            } else if self.ui.focus_navigation_repeat.poll(direction, fresh, now) {
+                let direction = direction.unwrap();
+                self.cancel_text_selection();
+                if !self.scroll_within_tall_focus_unit(direction) {
+                    self.move_focus_unit(direction);
+                }
+            }
+            if let Some((_, next)) = self.ui.focus_navigation_repeat.held {
+                ctx.request_repaint_after(next.saturating_duration_since(now));
             }
             return;
         }
@@ -4998,16 +5150,9 @@ fn chat_message_card(
         .fill(if is_user {
             palette().accent_soft
         } else {
-            palette().surface
+            Color32::TRANSPARENT
         })
-        .stroke(egui::Stroke::new(
-            1.0,
-            if is_user {
-                palette().accent_border
-            } else {
-                palette().border
-            },
-        ))
+        .stroke(egui::Stroke::NONE)
         .corner_radius(8)
         .inner_margin(egui::Margin::symmetric(10, 9))
         .show(ui, |ui| {
@@ -5351,6 +5496,96 @@ fn page_wheel_input_allowed(pointer_over_page: bool, blocked: bool) -> bool {
 #[cfg(test)]
 mod reference_suggestion_label_tests {
     use super::*;
+
+    #[test]
+    fn focus_edges_use_semantic_unit_indices_and_handle_empty_content() {
+        assert_eq!(focus_edge_index(0, false), None);
+        assert_eq!(focus_edge_index(0, true), None);
+        assert_eq!(focus_edge_index(1, false), Some(0));
+        assert_eq!(focus_edge_index(1, true), Some(0));
+        assert_eq!(focus_edge_index(5, false), Some(0));
+        assert_eq!(focus_edge_index(5, true), Some(4));
+    }
+
+    #[test]
+    fn held_focus_navigation_is_delayed_capped_and_never_catches_up() {
+        let start = Instant::now();
+        let mut repeat = FocusNavigationRepeat::default();
+        let next = Some(PageDirection::Next);
+        assert!(!repeat.poll(next, false, start));
+        assert!(repeat.poll(next, true, start));
+        for ms in [1, 100, 200, 349] {
+            assert!(!repeat.poll(next, false, start + Duration::from_millis(ms)));
+        }
+        assert!(repeat.poll(next, false, start + Duration::from_millis(350)));
+        assert!(!repeat.poll(next, false, start + Duration::from_millis(549)));
+        assert!(repeat.poll(next, false, start + Duration::from_millis(550)));
+        assert!(repeat.poll(next, false, start + Duration::from_secs(5)));
+        assert!(!repeat.poll(next, false, start + Duration::from_secs(5)));
+        assert!(!repeat.poll(None, false, start + Duration::from_secs(6)));
+        assert!(!repeat.poll(next, false, start + Duration::from_secs(7)));
+        assert!(repeat.poll(
+            Some(PageDirection::Previous),
+            true,
+            start + Duration::from_secs(7)
+        ));
+        assert!(repeat.poll(next, true, start + Duration::from_millis(7050)));
+    }
+
+    #[test]
+    fn chat_shortcut_toggles_while_editing_and_ignores_key_repeat() {
+        let ctx = egui::Context::default();
+        let shortcut = crate::preferences::ShortcutPreferences::default().focus_chat;
+        let mut open = false;
+        let mut draft = "Unsent draft".to_owned();
+        for (pressed, expected) in [
+            (true, Some(FocusChatShortcutAction::Open)),
+            (true, Some(FocusChatShortcutAction::IgnoreRepeat)),
+            (false, None),
+            (true, Some(FocusChatShortcutAction::Close)),
+        ] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: shortcut.logical_key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers: shortcut.modifiers,
+                    }],
+                    ..Default::default()
+                },
+                |root| {
+                    let action =
+                        ctx.input_mut(|input| focus_chat_shortcut_action(input, &shortcut, open));
+                    assert_eq!(action, expected);
+                    if action == Some(FocusChatShortcutAction::Close) {
+                        assert!(ctx.text_edit_focused());
+                    }
+                    match action {
+                        Some(FocusChatShortcutAction::Open) => open = true,
+                        Some(FocusChatShortcutAction::Close) => {
+                            open = false;
+                            ctx.memory_mut(egui::Memory::stop_text_input);
+                        }
+                        _ => {}
+                    }
+                    egui::CentralPanel::default().show(root, |ui| {
+                        if open {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft)
+                                    .id(egui::Id::new("chat-shortcut-test")),
+                            )
+                            .request_focus();
+                        }
+                    });
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert!(!open);
+        assert_eq!(draft, "Unsent draft");
+    }
 
     fn reference(kind: ChatReferenceKind, label: &str, description: &str) -> ChatReference {
         ChatReference {
