@@ -167,6 +167,12 @@ struct ShelfRemoveConfirmation {
 }
 
 impl ShelfFeature {
+    pub(crate) fn startup_error(&self) -> Option<&str> {
+        self.shelf
+            .error
+            .as_deref()
+            .or(self.sync.import_error.as_deref())
+    }
     pub(crate) fn update_book_metadata(
         &mut self,
         book_id: &str,

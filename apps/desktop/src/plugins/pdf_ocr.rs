@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use bytes::Bytes;
-use directories::ProjectDirs;
+
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 use quick_xml::escape::unescape;
 use rebook_publication::{
@@ -1634,7 +1634,7 @@ fn load_pdf_ocr_view_mode(book_id: &str, fallback: PdfOcrViewMode) -> io::Result
 }
 
 fn book_directory(book_id: &str) -> io::Result<PathBuf> {
-    let project = ProjectDirs::from("com", "Rebook", "Rebook").ok_or_else(|| {
+    let project = crate::smoke::project_dirs().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "application data directory is unavailable",
@@ -3047,7 +3047,7 @@ mod tests {
     #[test]
     #[ignore = "diagnoses the latest local PDF OCR/generated TOC cache"]
     fn diagnose_latest_cached_generated_toc_correction() {
-        let project = ProjectDirs::from("com", "Rebook", "Rebook").unwrap();
+        let project = crate::smoke::project_dirs().unwrap();
         let root = project.data_local_dir().join(PDF_OCR_DIRECTORY);
         let latest = std::env::var("TORTO_DIAG_BOOK_ID").ok().unwrap_or_else(|| {
             fs::read_dir(root)
@@ -3776,7 +3776,7 @@ mod tests {
     #[test]
     #[ignore = "diagnoses images in the latest local PDF OCR cache"]
     fn diagnose_latest_cached_ocr_images() {
-        let project = ProjectDirs::from("com", "Rebook", "Rebook").unwrap();
+        let project = crate::smoke::project_dirs().unwrap();
         let root = project.data_local_dir().join(PDF_OCR_DIRECTORY);
         let latest = fs::read_dir(root)
             .unwrap()
@@ -3853,7 +3853,7 @@ mod tests {
     #[test]
     #[ignore = "diagnoses tables in the latest local PDF OCR cache"]
     fn diagnose_latest_cached_ocr_tables() {
-        let project = ProjectDirs::from("com", "Rebook", "Rebook").unwrap();
+        let project = crate::smoke::project_dirs().unwrap();
         let root = project.data_local_dir().join(PDF_OCR_DIRECTORY);
         let latest = fs::read_dir(root)
             .unwrap()
@@ -3916,7 +3916,7 @@ mod tests {
         reason = "full-cache diagnostic keeps formula context beside each validation step"
     )]
     fn diagnose_latest_cached_ocr_formulas() {
-        let project = ProjectDirs::from("com", "Rebook", "Rebook").unwrap();
+        let project = crate::smoke::project_dirs().unwrap();
         let root = project.data_local_dir().join(PDF_OCR_DIRECTORY);
         let latest = fs::read_dir(root)
             .unwrap()
@@ -4024,7 +4024,7 @@ mod tests {
     #[test]
     #[ignore = "diagnoses generated TOC positions in the latest local PDF OCR cache"]
     fn diagnose_latest_cached_ocr_toc_positions() {
-        let project = ProjectDirs::from("com", "Rebook", "Rebook").unwrap();
+        let project = crate::smoke::project_dirs().unwrap();
         let root = project.data_local_dir().join(PDF_OCR_DIRECTORY);
         let latest = fs::read_dir(root)
             .unwrap()

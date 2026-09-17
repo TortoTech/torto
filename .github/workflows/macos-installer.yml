@@ -6,6 +6,7 @@ on:
       - main
     tags:
       - "*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -34,7 +35,7 @@ jobs:
     env:
       CARGO_BUNDLE_VERSION: "0.11.0"
       CARGO_INCREMENTAL: "0"
-      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "true"
 
@@ -106,12 +107,7 @@ jobs:
         if: steps.cargo-bundle-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-bundle --version "$CARGO_BUNDLE_VERSION" --locked
 
-      - name: Warm release build cache
-        if: github.ref == 'refs/heads/main'
-        run: cargo build --locked --release --package rebook-desktop --target "${{ matrix.target }}"
-
-      - name: Build and verify DMG
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Build and verify application bundle
         env:
           TARGET: ${{ matrix.target }}
           ARCH: ${{ matrix.arch }}
@@ -137,6 +133,24 @@ jobs:
           plutil -lint "$app_bundle/Contents/Info.plist"
           codesign --force --deep --sign - "$app_bundle"
           codesign --verify --deep --strict --verbose=2 "$app_bundle"
+          minimum_os=$(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' "$app_bundle/Contents/Info.plist")
+          test "$minimum_os" = "15.0"
+          otool -L "$executable"
+
+      - name: Check application startup
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        timeout-minutes: 8
+        run: node scripts/smoke/macos.mjs "target/${{ matrix.target }}/release/bundle/osx/Torto.app" "$RUNNER_TEMP/torto-smoke"
+
+      - name: Build and verify DMG
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_bundle="target/$TARGET/release/bundle/osx/Torto.app"
 
           staging_dir="dist/dmg-root"
           dmg_name="Torto-$TORTO_VERSION-macos-$ARCH.dmg"
@@ -171,6 +185,30 @@ jobs:
             "$dmg_path"
           hdiutil verify "$dmg_path"
           (cd dist && shasum -a 256 "$dmg_name" > "$dmg_name.sha256")
+
+      - name: Check startup from final DMG
+        if: startsWith(github.ref, 'refs/tags/')
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          mount_dir="$RUNNER_TEMP/torto-dmg"
+          install_dir="$RUNNER_TEMP/torto-install"
+          mkdir -p "$mount_dir" "$install_dir"
+          hdiutil attach "dist/Torto-$TORTO_VERSION-macos-${{ matrix.arch }}.dmg" -nobrowse -readonly -mountpoint "$mount_dir"
+          trap 'hdiutil detach "$mount_dir" || true' EXIT
+          ditto "$mount_dir/Torto.app" "$install_dir/Torto.app"
+          codesign --verify --deep --strict --verbose=2 "$install_dir/Torto.app"
+          node scripts/smoke/macos.mjs "$install_dir/Torto.app" "$RUNNER_TEMP/torto-smoke"
+
+      - name: Upload startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-startup-${{ matrix.arch }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/torto-smoke
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload workflow artifact
         if: startsWith(github.ref, 'refs/tags/')

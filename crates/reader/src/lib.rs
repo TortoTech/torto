@@ -1038,6 +1038,48 @@ impl ReaderSession {
         self.section_pages(self.current_section)
     }
 
+    /// A chapter's own prelude may continue in unlisted spine files before its
+    /// first child. Only an unambiguous parent-only TOC file owns such a range;
+    /// any following TOC target (including a fragment target) ends it.
+    fn chapter_prelude_sections(&self, section_index: usize) -> Range<usize> {
+        let own = section_index..section_index + 1;
+        if self.fixed_reading_units.is_some() || self.hidden_sections.contains(&section_index) {
+            return own;
+        }
+        let entries = &self.toc_index.items_by_section[section_index];
+        let owner = if entries.is_empty() {
+            let Some(owner) = self.toc_index.preceding_section_by_section[section_index] else {
+                return own;
+            };
+            owner
+        } else {
+            section_index
+        };
+        let owner_entries = &self.toc_index.items_by_section[owner];
+        if owner_entries.len() != 1 || !self.toc_items[owner_entries[0]].has_children {
+            return own;
+        }
+        let sections = &self.source.book().sections;
+        if !sections[owner].linear || self.hidden_sections.contains(&owner) {
+            return own;
+        }
+        let mut end = owner + 1;
+        while end < sections.len()
+            && sections[end].linear
+            && !self.hidden_sections.contains(&end)
+            && self.toc_index.items_by_section[end].is_empty()
+        {
+            end += 1;
+        }
+        if section_index < end { owner..end } else { own }
+    }
+
+    /// Physical sections contributing to the current reflowable TOC unit.
+    /// Source anchors remain in their original spine, even when the view joins files.
+    pub fn current_reading_unit_sections(&self) -> Range<usize> {
+        self.chapter_prelude_sections(self.current_section)
+    }
+
     /// Returns the pages intersecting the active semantic table-of-contents unit.
     /// The first and last page carry semantic crop bounds so continuous views do
     /// not expose neighboring units that share those physical pages.
@@ -1087,21 +1129,38 @@ impl ReaderSession {
             }
             return Ok(pages);
         }
-        let section = self.repository.load(self.current_section)?;
+        let group = self.current_reading_unit_sections();
+        if group.len() > 1 {
+            let mut pages = Vec::new();
+            for section_index in group {
+                pages.extend(self.reading_unit_pages_for_section(section_index, 0)?);
+            }
+            return Ok(pages);
+        }
+        self.reading_unit_pages_for_section(self.current_section, self.current_reading_unit)
+    }
+
+    fn reading_unit_pages_for_section(
+        &mut self,
+        section_index: usize,
+        unit_index: usize,
+    ) -> Result<Vec<ReaderSectionPage>, ReaderError> {
+        let section = self.repository.load(section_index)?;
         let Some(unit) = section
             .reading_units
-            .get(self.current_reading_unit)
+            .get(unit_index)
             .or_else(|| section.reading_units.first())
         else {
-            return self.section_pages(self.current_section);
+            return self.section_pages(section_index);
         };
-        let ranges = section.fragments[unit.fragment_range.clone()]
+        let mut ranges = Vec::new();
+        for block in section.fragments[unit.fragment_range.clone()]
             .iter()
             .flat_map(|fragment| &fragment.blocks)
-            .filter_map(block_source)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut pages = self.section_pages(self.current_section)?;
+        {
+            append_block_geometry_sources(block, &mut ranges);
+        }
+        let mut pages = self.section_pages(section_index)?;
         let visible = pages
             .iter()
             .enumerate()
@@ -1137,6 +1196,22 @@ impl ReaderSession {
         {
             let mut ranges = Vec::new();
             for section_index in unit.section_range {
+                let section = self.repository.load(section_index)?;
+                ranges.extend(
+                    section
+                        .fragments
+                        .iter()
+                        .flat_map(|fragment| &fragment.blocks)
+                        .filter_map(block_source)
+                        .cloned(),
+                );
+            }
+            return Ok(ranges);
+        }
+        let group = self.current_reading_unit_sections();
+        if group.len() > 1 {
+            let mut ranges = Vec::new();
+            for section_index in group {
                 let section = self.repository.load(section_index)?;
                 ranges.extend(
                     section
@@ -1215,6 +1290,7 @@ impl ReaderSession {
             self.current_reading_unit = unit_index;
             return Ok(result);
         }
+        let group = self.current_reading_unit_sections();
         let count = self
             .repository
             .load(self.current_section)?
@@ -1228,7 +1304,7 @@ impl ReaderSession {
                 Some((self.current_section, self.current_reading_unit + 1))
             }
             PageDirection::Previous => {
-                if let Some(section) = self.previous_visible_section(self.current_section) {
+                if let Some(section) = self.previous_visible_section(group.start) {
                     let count = self.repository.load(section)?.reading_units.len().max(1);
                     Some((section, count - 1))
                 } else {
@@ -1236,7 +1312,7 @@ impl ReaderSession {
                 }
             }
             PageDirection::Next => self
-                .next_visible_section(self.current_section)
+                .next_visible_section(group.end - 1)
                 .map(|section| (section, 0)),
         };
         let Some((section_index, unit_index)) = target else {
@@ -1276,6 +1352,7 @@ impl ReaderSession {
             return Ok(NavigationAttempt::Ready(result));
         }
 
+        let group = self.current_reading_unit_sections();
         let count = self
             .repository
             .load(self.current_section)?
@@ -1289,7 +1366,7 @@ impl ReaderSession {
                 Some((self.current_section, self.current_reading_unit + 1))
             }
             PageDirection::Previous => {
-                if let Some(section) = self.previous_visible_section(self.current_section) {
+                if let Some(section) = self.previous_visible_section(group.start) {
                     if self.repository.get(section).is_none()
                         && !self.try_ensure_navigation_segment(SegmentKey {
                             section_index: section,
@@ -1305,12 +1382,13 @@ impl ReaderSession {
                 }
             }
             PageDirection::Next => self
-                .next_visible_section(self.current_section)
+                .next_visible_section(group.end - 1)
                 .map(|section| (section, 0)),
         };
         let Some((section_index, unit_index)) = target else {
             return Ok(NavigationAttempt::Ready(self.boundary()));
         };
+        let section_index = self.chapter_prelude_sections(section_index).start;
         let key = if unit_index == 0 {
             SegmentKey {
                 section_index,
@@ -1411,7 +1489,9 @@ impl ReaderSession {
         &mut self,
         position: ReaderPosition,
     ) -> Result<ReaderSnapshot, ReaderError> {
-        let section_is_visible = position.section_index == self.current_section
+        let section_is_visible = self
+            .current_reading_unit_sections()
+            .contains(&position.section_index)
             || self
                 .fixed_reading_units
                 .as_ref()
@@ -1444,7 +1524,9 @@ impl ReaderSession {
         position: ReaderPosition,
     ) -> Result<bool, ReaderError> {
         self.poll_prefetch()?;
-        let section_is_visible = position.section_index == self.current_section
+        let section_is_visible = self
+            .current_reading_unit_sections()
+            .contains(&position.section_index)
             || self
                 .fixed_reading_units
                 .as_ref()
@@ -2746,6 +2828,7 @@ impl ReaderSession {
         section_index: usize,
         unit_index: usize,
     ) -> Result<NavigationResult, ReaderError> {
+        let section_index = self.chapter_prelude_sections(section_index).start;
         let section = self.repository.load(section_index)?;
         let unit = section
             .reading_units
@@ -3642,6 +3725,49 @@ fn append_visible_text_fragments(
             range: fragment.range,
             text: fragment.quote,
         });
+    }
+}
+
+// Composite ranges can span several nodes; retained text geometry resolves
+// individual node ranges. Include children when calculating subsection clips,
+// otherwise a leading/trailing quote, table or figure can disappear.
+fn append_block_geometry_sources(block: &Block, ranges: &mut Vec<SourceRange>) {
+    ranges.extend(block_source(block).cloned());
+    match block {
+        Block::Quote(quote) => ranges.extend(
+            quote
+                .body
+                .iter()
+                .chain(quote.attribution.iter())
+                .filter_map(|text| text.source.clone()),
+        ),
+        Block::Table(table) => ranges.extend(
+            table
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .filter_map(|cell| cell.text.source.clone()),
+        ),
+        Block::Figure(figure) => {
+            ranges.extend(
+                figure
+                    .images
+                    .iter()
+                    .filter_map(|image| image.source.clone()),
+            );
+            ranges.extend(
+                figure
+                    .captions
+                    .iter()
+                    .filter_map(|caption| caption.source.clone()),
+            );
+        }
+        Block::Note(note) => {
+            for child in &note.blocks {
+                append_block_geometry_sources(child, ranges);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -6512,6 +6638,222 @@ mod tests {
         assert_eq!(second_leaf_ranges.len(), 1);
         assert_eq!(second_leaf_ranges[0].start.node, "leaf-b");
         assert_eq!(reader.location().segment_index, 2);
+    }
+
+    #[test]
+    fn reading_unit_clipping_keeps_leading_and_trailing_quote_children() {
+        let mut source = CountingSource::new(&["placeholder".into()]);
+        let data = Arc::get_mut(&mut source).unwrap();
+        let spine = data.sections[0].id.clone();
+        let text = |node: &str, kind| TextBlock {
+            kind,
+            content: vec![Inline::Text(TextRun {
+                text: node.into(),
+                style: Default::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: Some(SourceRange {
+                start: SourceAnchor {
+                    spine: spine.clone(),
+                    node: node.into(),
+                    text_offset: 0,
+                },
+                end: SourceAnchor {
+                    spine: spine.clone(),
+                    node: node.into(),
+                    text_offset: node.len() as u64,
+                },
+            }),
+        };
+        let quote = |body: &str, author: &str| {
+            let body = text(body, TextBlockKind::Blockquote);
+            let author = text(author, TextBlockKind::QuoteAttribution);
+            Block::Quote(rebook_publication::QuoteBlock {
+                source: Some(SourceRange {
+                    start: body.source.as_ref().unwrap().start.clone(),
+                    end: author.source.as_ref().unwrap().end.clone(),
+                }),
+                body: vec![body],
+                attribution: Some(author),
+            })
+        };
+        data.sections[0].blocks = vec![
+            quote("Opening quotation", "Opening author"),
+            Block::Text(text("Middle prose", TextBlockKind::Paragraph)),
+            quote("Closing quotation", "Closing author"),
+        ];
+        let mut expected = Vec::new();
+        for block in &data.sections[0].blocks {
+            append_block_geometry_sources(block, &mut expected);
+        }
+        let mut reader = ReaderSession::open(
+            source,
+            viewport(800, 1200),
+            ReaderStyle {
+                spread: rebook_layout::SpreadMode::Scroll,
+                typesetting: rebook_layout::ReaderTypesetting::unified(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pages = reader.current_reading_unit_pages().unwrap();
+        assert_eq!(pages.len(), 1);
+        let page = &pages[0];
+        let bounds = page.page.source_content_bounds(&expected).unwrap();
+        assert!(f64::from(page.visible_top.unwrap()) <= bounds.y0 + 0.01);
+        assert!(f64::from(page.visible_bottom.unwrap()) >= bounds.y1 - 0.01);
+        assert_eq!(page.page.source_quote_bounds(&expected).len(), 2);
+    }
+
+    #[test]
+    fn chapter_prelude_spans_unlisted_files_without_absorbing_child_preludes() {
+        let mut source =
+            CountingSource::new(&["Title".into(), "Overview".into(), "Child preface".into()]);
+        let data = Arc::get_mut(&mut source).unwrap();
+        let text_block = |section: usize, node: &str, kind, text: &str| {
+            Block::Text(TextBlock {
+                kind,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: Default::default(),
+                    link: None,
+                })],
+                style: Default::default(),
+                source: Some(SourceRange {
+                    start: SourceAnchor {
+                        spine: SpineItemId::new(format!("section-{section}")).unwrap(),
+                        node: node.into(),
+                        text_offset: 0,
+                    },
+                    end: SourceAnchor {
+                        spine: SpineItemId::new(format!("section-{section}")).unwrap(),
+                        node: node.into(),
+                        text_offset: text.chars().count() as u64,
+                    },
+                }),
+            })
+        };
+        data.sections[0].blocks =
+            vec![text_block(0, "title", TextBlockKind::Heading(1), "Chapter")];
+        data.sections[1].blocks = vec![
+            text_block(1, "intro-1", TextBlockKind::Paragraph, "First overview."),
+            text_block(1, "intro-2", TextBlockKind::Paragraph, "Second overview."),
+        ];
+        data.sections[2].blocks = vec![
+            text_block(
+                2,
+                "preface",
+                TextBlockKind::Paragraph,
+                "Child preface remains here.",
+            ),
+            text_block(2, "heading-a", TextBlockKind::Heading(2), "Child A"),
+            text_block(2, "body-a", TextBlockKind::Paragraph, "Child A body."),
+            text_block(2, "heading-b", TextBlockKind::Heading(2), "Child B"),
+            text_block(2, "body-b", TextBlockKind::Paragraph, "Child B body."),
+        ];
+        let child_anchor = block_source(&data.sections[2].blocks[3])
+            .unwrap()
+            .start
+            .clone();
+        data.sections[2].anchors.push(SectionAnchor {
+            fragment: "b".into(),
+            source: child_anchor,
+        });
+        data.book.table_of_contents = vec![TocEntry {
+            label: "Chapter".into(),
+            href: Some(data.book.sections[0].href.clone()),
+            children: vec![
+                TocEntry {
+                    label: "Child A".into(),
+                    href: Some(data.book.sections[2].href.clone()),
+                    children: Vec::new(),
+                },
+                TocEntry {
+                    label: "Child B".into(),
+                    href: Some(PublicationUrl::parse("section-2.xhtml#b").unwrap()),
+                    children: Vec::new(),
+                },
+            ],
+        }];
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(800, 600), ReaderStyle::default())
+                .unwrap();
+        assert_eq!(reader.current_reading_unit_sections(), 0..2);
+        let ranges = reader.current_reading_unit_source_ranges().unwrap();
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| range.start.node.as_str())
+                .collect::<Vec<_>>(),
+            ["title", "intro-1", "intro-2"]
+        );
+        let pages = reader.current_reading_unit_pages().unwrap();
+        assert!(pages.iter().any(|page| page.position.section_index == 0));
+        assert!(pages.iter().any(|page| page.position.section_index == 1));
+        assert!(pages.iter().all(|page| page.position.section_index < 2));
+        let overview_position = pages
+            .iter()
+            .find(|page| page.position.section_index == 1)
+            .unwrap()
+            .position;
+        reader.set_visible_position(overview_position).unwrap();
+        assert_eq!(reader.current_reading_unit_sections(), 0..2);
+        assert!(
+            reader
+                .set_visible_position(ReaderPosition {
+                    section_index: 2,
+                    segment_index: 0,
+                    page_index: 0
+                })
+                .is_err()
+        );
+        reader.go_to_source(&ranges[2].start).unwrap();
+        assert_eq!(reader.current_reading_unit_sections(), 0..2);
+        let locator = reader.current_locator();
+        let mut restored = ReaderSession::open_with_fonts_at_locator(
+            source.clone(),
+            viewport(800, 600),
+            ReaderStyle::default(),
+            Arc::default(),
+            &locator,
+        )
+        .unwrap();
+        assert_eq!(
+            restored.current_reading_unit_source_ranges().unwrap(),
+            ranges
+        );
+        restored
+            .go_to_adjacent_reading_unit(PageDirection::Next)
+            .unwrap();
+        assert_eq!(restored.current_reading_unit_sections(), 2..3);
+        let child = restored.current_reading_unit_source_ranges().unwrap();
+        assert_eq!(
+            child
+                .iter()
+                .map(|range| range.start.node.as_str())
+                .collect::<Vec<_>>(),
+            ["preface", "heading-a", "body-a"]
+        );
+        restored
+            .go_to_adjacent_reading_unit(PageDirection::Previous)
+            .unwrap();
+        assert_eq!(
+            restored.current_reading_unit_source_ranges().unwrap(),
+            ranges
+        );
+        for direction in [PageDirection::Next, PageDirection::Previous] {
+            loop {
+                match restored.try_go_to_adjacent_reading_unit(direction).unwrap() {
+                    NavigationAttempt::Ready(_) => break,
+                    NavigationAttempt::Pending => restored.wait_for_prefetch().unwrap(),
+                }
+            }
+        }
+        assert_eq!(
+            restored.current_reading_unit_source_ranges().unwrap(),
+            ranges
+        );
     }
 
     #[test]

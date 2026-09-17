@@ -580,6 +580,9 @@ impl<'a> ReadingIrParser<'a> {
         container: Node<'_, '_>,
         siblings: &[Node<'_, '_>],
     ) -> Result<Option<usize>, HtmlError> {
+        if let Some(consumed) = self.try_parse_indented_attributed_quote(container, siblings)? {
+            return Ok(Some(consumed));
+        }
         const MIN_ATTRIBUTED_BODY_BLOCKS: usize = 1;
         const MIN_UNATTRIBUTED_BODY_BLOCKS: usize = 2;
 
@@ -673,6 +676,63 @@ impl<'a> ReadingIrParser<'a> {
             return Ok(Some(last_body_consumed));
         }
 
+        Ok(None)
+    }
+
+    fn try_parse_indented_attributed_quote(
+        &mut self,
+        container: Node<'_, '_>,
+        siblings: &[Node<'_, '_>],
+    ) -> Result<Option<usize>, HtmlError> {
+        let mut body = Vec::new();
+        let mut body_inset = None::<f32>;
+        for (index, node) in siblings.iter().copied().enumerate() {
+            if node.is_text() {
+                if node.text().is_some_and(|text| text.trim().is_empty()) {
+                    continue;
+                }
+                break;
+            }
+            if !node.is_element() {
+                continue;
+            }
+            if !(node.tag_name().name().eq_ignore_ascii_case("p")
+                || node.tag_name().name().eq_ignore_ascii_case("div"))
+                || !node_has_visible_text(node)
+                || node.descendants().skip(1).any(|child| {
+                    if !child.is_element() {
+                        return false;
+                    }
+                    let name = child.tag_name().name().to_ascii_lowercase();
+                    if name == "img" {
+                        self.styles.image_establishes_block_layout(child)
+                    } else {
+                        is_block_boundary(&name)
+                            || matches!(name.as_str(), "svg" | "table" | "video" | "object")
+                    }
+                })
+            {
+                break;
+            }
+            let inset = self.styles.quote_layout_metrics(node).start;
+            if self.styles.block_style(node, BlockStyle::default()).align == TextAlignment::End {
+                if body_inset.is_some_and(|start| inset <= start + 0.5) {
+                    self.parse_quote_nodes(container, &body, Some(node))?;
+                    return Ok(Some(index + 1));
+                }
+                break;
+            }
+            // Whole-paragraph margin/padding only: ordinary first-line indents
+            // are not evidence of a quotation. Typography and decoration are irrelevant.
+            if inset < 4.0
+                || body_inset
+                    .is_some_and(|start| (inset - start).abs() > 4.0_f32.max(start.abs() * 0.25))
+            {
+                break;
+            }
+            body_inset.get_or_insert(inset);
+            body.push(node);
+        }
         Ok(None)
     }
 
@@ -5523,6 +5583,84 @@ mod tests {
     }
 
     #[test]
+    fn left_inset_and_right_aligned_attribution_need_no_font_or_decoration() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        for credit in ["An Author", "2026/09/14", "128.00"] {
+            let xml = format!(
+                "<html><body><p style='padding-left:0.5em'>Quoted <img src='symbol.png' style='height:1em;display:inline'/> text.</p><p style='padding-left:0.5em'>Second paragraph.</p><p style='text-align:right'>{credit}</p><p>Ordinary prose.</p></body></html>"
+            );
+            let section = parse_section(&xml, &descriptor, |_| None).unwrap();
+            let Block::Quote(quote) = &section.blocks[0] else {
+                panic!("expected attributed quote for {credit}");
+            };
+            assert_eq!(quote.body.len(), 2);
+            assert_eq!(
+                quote
+                    .body
+                    .iter()
+                    .flat_map(|block| &block.content)
+                    .filter(|inline| matches!(inline, Inline::Image(_)))
+                    .count(),
+                1
+            );
+            assert!(quote.source.is_some());
+            assert!(
+                quote
+                    .attribution
+                    .as_ref()
+                    .unwrap()
+                    .content
+                    .iter()
+                    .any(|inline| matches!(inline, Inline::Text(run) if run.text == credit))
+            );
+            assert!(
+                matches!(&section.blocks[1], Block::Text(text) if text.kind == TextBlockKind::Paragraph)
+            );
+        }
+    }
+
+    #[test]
+    fn left_inset_quote_rule_stops_at_structural_boundaries() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        for body in [
+            "<p style='text-indent:2em'>Only first-line indentation.</p><p style='text-align:right'>Author</p>",
+            "<p style='padding-left:1em'>Text.</p><img src='figure.png'/><p style='text-align:right'>Author</p>",
+            "<p style='padding-left:1em'>Text.</p><p><img src='figure.png'/></p><p style='text-align:right'>Author</p>",
+            "<p style='padding-left:1em'>Text<img src='figure.png' style='display:block'/></p><p style='text-align:right'>Author</p>",
+            "<p style='padding-left:1em'>Text.</p><h2>Next section</h2><p style='text-align:right'>Author</p>",
+            "<p style='padding-left:1em'>Text.</p><p>Ordinary prose.</p><p style='text-align:right'>Author</p>",
+            "<p style='padding-left:1em'>Text.</p><p style='text-align:right;padding-left:3em'>More indented.</p>",
+            "<div><p style='padding-left:1em'>Text.</p></div><div><p style='text-align:right'>Author</p></div>",
+        ] {
+            let section = parse_section(
+                &format!("<html><body>{body}</body></html>"),
+                &descriptor,
+                |_| None,
+            )
+            .unwrap();
+            assert!(
+                !section
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block, Block::Quote(_))),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
     fn recognizes_structural_quote_without_using_class_or_id_names() {
         let descriptor = SpineItem {
             id: SpineItemId::new("chapter").unwrap(),
@@ -5694,7 +5832,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_inset_prose_and_right_aligned_text_are_not_grouped_without_source_semantics() {
+    fn layout_only_quote_rule_accepts_an_unmarked_right_aligned_tail() {
         let descriptor = SpineItem {
             id: SpineItemId::new("chapter").unwrap(),
             href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
@@ -5711,14 +5849,11 @@ mod tests {
         </body></html>"#;
 
         let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
-        assert_eq!(section.blocks.len(), 2);
-        assert!(section.blocks.iter().all(|block| matches!(
-            block,
-            Block::Text(TextBlock {
-                kind: TextBlockKind::Paragraph,
-                ..
-            })
-        )));
+        let [Block::Quote(quote)] = section.blocks.as_slice() else {
+            panic!("expected layout-only grouping");
+        };
+        assert_eq!(quote.body.len(), 1);
+        assert!(quote.attribution.is_some());
     }
 
     #[test]

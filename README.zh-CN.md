@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://github.com/TortoTech/torto/releases/latest"><img src="https://img.shields.io/github/v/release/TortoTech/torto?display_name=tag&sort=semver" alt="最新版本"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/TortoTech/torto" alt="AGPL v3 许可证"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue" alt="AGPL-3.0-only 许可证"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-5b6ee1" alt="支持 Windows 与 macOS">
   <img src="https://img.shields.io/badge/UI-egui-7c3aed" alt="使用 egui 构建">
   <a href="https://linux.do"><img src="https://img.shields.io/badge/LINUX-DO-FFB003.svg" alt="LINUX DO"></a>
@@ -93,8 +93,8 @@ Torto（中文名“小龟阅读”）是一款围绕**专注模式**设计的�
 | **平台** | **安装包** | **系统要求** |
 | --- | --- | --- |
 | Windows | `Torto-*-x86_64.msi` | 64 位 Windows 10 或 Windows 11 |
-| macOS，Apple 芯片 | `Torto-*-macos-arm64.dmg` | macOS 12 或更高版本 |
-| macOS，Intel | `Torto-*-macos-x86_64.dmg` | macOS 12 或更高版本 |
+| macOS，Apple 芯片 | `Torto-*-macos-arm64.dmg` | macOS 15 或更高版本 |
+| macOS，Intel | `Torto-*-macos-x86_64.dmg` | macOS 15 或更高版本 |
 
 首次打开后：
 

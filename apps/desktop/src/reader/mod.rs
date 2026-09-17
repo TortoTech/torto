@@ -1746,6 +1746,9 @@ fn reflow_anchor_offset(
 }
 
 impl DesktopReader {
+    pub(crate) fn startup_error(&self) -> Option<&str> {
+        self.error.as_deref().or(self.reopen_error.as_deref())
+    }
     fn capture_focus_reflow_anchor(&self) -> Option<FocusReflowAnchor> {
         if !self.is_focus_mode() {
             return None;
@@ -1880,7 +1883,7 @@ impl DesktopReader {
     fn current_scroll_layout(
         &mut self,
     ) -> Result<Arc<ScrollSectionLayout>, rebook_reader::ReaderError> {
-        let section_index = self.snapshot.location.section_index;
+        let section_index = self.reader.current_reading_unit_sections().start;
         let reading_unit = self.reader.reading_unit_location();
         let preserve_physical_pages =
             self.format == BookFormat::Pdf && self.pdf_ocr.mode == PdfOcrViewMode::Original;
@@ -1946,11 +1949,34 @@ impl DesktopReader {
             self.selection = None;
             self.selection_toolbar_visible = false;
         }
-        let Ok(section) = self.source.parse_section(layout.section_index) else {
+        let parsed = self
+            .reader
+            .current_reading_unit_sections()
+            .map(|index| {
+                self.source
+                    .parse_section(index)
+                    .map(|section| (index, section))
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(sections) = parsed else {
             self.focus_units.clear();
             self.focus_unit_index = 0;
             return;
         };
+        let Some((_, first)) = sections.first() else {
+            return;
+        };
+        let mut section = first.clone();
+        section.blocks = sections
+            .iter()
+            .flat_map(|(_, section)| section.blocks.iter().cloned())
+            .collect();
+        let block_sections = sections
+            .iter()
+            .flat_map(|(index, section)| {
+                std::iter::repeat_n((*index, section), section.blocks.len())
+            })
+            .collect::<Vec<_>>();
         let mut linked_footnote_sections = HashMap::new();
         let reading_ranges = self
             .reader
@@ -1963,6 +1989,7 @@ impl DesktopReader {
         let mut units: Vec<FocusUnit> = Vec::new();
         let mut active_list_root: Option<(usize, u8)> = None;
         for (block_index, block) in section.blocks.iter().enumerate() {
+            let (source_section_index, source_section) = block_sections[block_index];
             if block_source_range(block).is_some_and(|range| !reading_ranges.contains(range)) {
                 active_list_root = None;
                 continue;
@@ -1977,6 +2004,7 @@ impl DesktopReader {
             ) {
                 block_index
                     .checked_sub(1)
+                    .filter(|index| block_sections[*index].0 == source_section_index)
                     .and_then(|index| section.blocks.get(index))
                     .and_then(|block| match block {
                         Block::Image(image) if image.text_layer.is_none() => image.source.clone(),
@@ -2108,7 +2136,7 @@ impl DesktopReader {
                 && structure_ranges.iter().any(|range| {
                     self.structure_source
                         .is_structured(&crate::plugins::ParagraphStructureKey {
-                            section_index: layout.section_index,
+                            section_index: source_section_index,
                             node: range.start.node.clone(),
                         })
                 });
@@ -2121,8 +2149,8 @@ impl DesktopReader {
             }
             let footnotes = self.resolve_focus_footnotes(
                 block,
-                layout.section_index,
-                &section,
+                source_section_index,
+                source_section,
                 &mut linked_footnote_sections,
             );
             let clipboard_text = match block {
@@ -2134,9 +2162,15 @@ impl DesktopReader {
                 &leading_heading_ranges,
                 &paint_ranges,
             );
-            let Some((mut rect, position)) = focus_unit_geometry(layout, &geometry_ranges) else {
+            let Some((mut rect, mut position)) = focus_unit_geometry(layout, &geometry_ranges)
+            else {
                 continue;
             };
+            if position.section_index != source_section_index {
+                if let Some((_, body_position)) = focus_unit_geometry(layout, &paint_ranges) {
+                    position = body_position;
+                }
+            }
             let rectangular_activation_rect = rectangular_activation
                 .then(|| focus_block_activation_geometry(layout, &paint_ranges))
                 .flatten()

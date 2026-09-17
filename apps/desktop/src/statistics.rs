@@ -70,8 +70,7 @@ enum EventKind {
 }
 
 fn database() -> SyncResult<Connection> {
-    let dirs = directories::ProjectDirs::from("com", "Rebook", "Rebook")
-        .ok_or("Cannot find statistics directory")?;
+    let dirs = crate::smoke::project_dirs().ok_or("Cannot find statistics directory")?;
     std::fs::create_dir_all(dirs.data_local_dir())?;
     let db = Connection::open(dirs.data_local_dir().join("reading-statistics-v1.sqlite3"))?;
     db.busy_timeout(Duration::from_secs(5))?;

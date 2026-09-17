@@ -317,6 +317,7 @@ impl ApplicationHandler<UserEvent> for Application {
                 return;
             }
         };
+        crate::smoke::stage("window-created");
         #[cfg(target_os = "windows")]
         let native_background = {
             let hwnd = match window.window_handle().map(|handle| handle.as_raw()) {
@@ -399,6 +400,11 @@ impl ApplicationHandler<UserEvent> for Application {
     }
 
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if crate::smoke::enabled() && matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            if let Some(window) = &self.window {
+                window.window.request_redraw();
+            }
+        }
         if matches!(cause, StartCause::ResumeTimeReached { .. })
             && self
                 .repaint_at
@@ -598,6 +604,24 @@ impl ApplicationHandler<UserEvent> for Application {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if crate::smoke::enabled() {
+            match crate::smoke::should_exit() {
+                Ok(true) => {
+                    event_loop.exit();
+                    return;
+                }
+                Err(error) => {
+                    self.fatal_error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+                Ok(false) => {}
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(100),
+            ));
+            return;
+        }
         if let Some(deadline) = self.repaint_at {
             if Instant::now() >= deadline {
                 self.repaint_at = None;

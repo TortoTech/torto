@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static DERIVED_REVISION: AtomicU64 = AtomicU64::new(0);
 
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
@@ -702,7 +701,7 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 fn dirty_marker_path(book_id: &str, kind: DerivedDataKind) -> io::Result<PathBuf> {
-    let project = ProjectDirs::from("com", "Rebook", "Rebook").ok_or_else(|| {
+    let project = crate::smoke::project_dirs().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "application data directory is unavailable",
@@ -818,7 +817,7 @@ mod tests {
             changed.manifest.content_sha256
         );
         drop(client);
-        let directory = ProjectDirs::from("com", "Rebook", "Rebook")
+        let directory = crate::smoke::project_dirs()
             .unwrap()
             .data_local_dir()
             .join("pdf-ocr")

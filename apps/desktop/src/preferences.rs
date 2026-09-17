@@ -3,7 +3,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use directories::ProjectDirs;
 use rebook_layout::{
     LineBreakStrategy, ReaderTypesetting, ReaderTypography, SpreadMode, TypesettingMode,
 };
@@ -569,7 +568,7 @@ pub(crate) fn load_app_language() -> PreferencesResult<AppLanguage> {
 }
 
 fn settings_path() -> io::Result<PathBuf> {
-    let project = ProjectDirs::from("com", "Rebook", "Rebook")
+    let project = crate::smoke::project_dirs()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定阅读设置目录"))?;
     Ok(project.config_dir().join(SETTINGS_FILE))
 }

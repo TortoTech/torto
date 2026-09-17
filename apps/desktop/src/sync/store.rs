@@ -3,7 +3,6 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use directories::ProjectDirs;
 use rebook_publication::{LocatorV1, SourceRange};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -32,7 +31,7 @@ pub(crate) struct StoredProgress {
 
 impl SyncStore {
     pub(crate) fn open_default(device_id: impl Into<String>) -> SyncResult<Self> {
-        let project = ProjectDirs::from("com", "Rebook", "Rebook")
+        let project = crate::smoke::project_dirs()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定同步数据库目录"))?;
         Self::open_at(project.data_local_dir().join(DATABASE_FILE), device_id)
     }

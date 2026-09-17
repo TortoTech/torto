@@ -13,8 +13,6 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use directories::ProjectDirs;
-
 pub(crate) use engine::{LocalSyncBook, SyncMode, SyncProgress, SyncReport, SyncStage, run_sync};
 pub(crate) use settings::{CloudProviderKind, SyncSettings};
 pub(crate) use store::SyncStore;
@@ -54,7 +52,7 @@ pub(crate) fn format_error_chain(error: &(dyn Error + 'static)) -> String {
 }
 
 pub(crate) fn append_sync_log(level: &str, message: &str) -> io::Result<PathBuf> {
-    let project = ProjectDirs::from("com", "Rebook", "Rebook")
+    let project = crate::smoke::project_dirs()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定同步日志目录"))?;
     let log_dir = project.data_local_dir().join("logs");
     fs::create_dir_all(&log_dir)?;

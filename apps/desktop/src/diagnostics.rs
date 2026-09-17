@@ -16,8 +16,6 @@ mod imp {
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use directories::ProjectDirs;
-
     use super::Field;
 
     const MAX_LOG_BYTES: u64 = 1_048_576;
@@ -27,7 +25,7 @@ mod imp {
         let Ok(_guard) = LOG_LOCK.lock() else {
             return;
         };
-        let Some(project) = ProjectDirs::from("com", "Rebook", "Rebook") else {
+        let Some(project) = crate::smoke::project_dirs() else {
             return;
         };
         let log_dir = project.data_local_dir().join("logs");

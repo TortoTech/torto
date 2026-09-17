@@ -3,7 +3,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use directories::ProjectDirs;
 use sha2::{Digest, Sha256};
 
 use crate::library::RemoteLibraryBook;
@@ -762,7 +761,7 @@ async fn download_book(
 }
 
 fn download_cache_dir() -> SyncResult<PathBuf> {
-    let project = ProjectDirs::from("com", "Rebook", "Rebook").ok_or_else(|| {
+    let project = crate::smoke::project_dirs().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "Unable to determine the WebDAV download cache directory",
@@ -1090,7 +1089,7 @@ pub(super) mod tests {
             },
         )
         .unwrap();
-        let ocr_directory = ProjectDirs::from("com", "Rebook", "Rebook")
+        let ocr_directory = crate::smoke::project_dirs()
             .unwrap()
             .data_local_dir()
             .join("pdf-ocr")

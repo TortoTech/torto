@@ -3,7 +3,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use directories::ProjectDirs;
 use rebook_formats::open_bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -78,7 +77,7 @@ struct StoredBook {
 
 impl LocalLibrary {
     pub fn load_default() -> LibraryResult<Self> {
-        let project = ProjectDirs::from("com", "Rebook", "Rebook")
+        let project = crate::smoke::project_dirs()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定本地书架数据目录"))?;
         Self::load_from(project.data_local_dir().join("library"))
     }

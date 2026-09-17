@@ -3,7 +3,6 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use directories::ProjectDirs;
 use rebook_publication::{
     Book, BookSource, PublicationError, PublicationUrl, RasterResource, Resource, Section,
     TableOfContentsOrigin, TocEntry,
@@ -149,7 +148,7 @@ pub(crate) fn load_source(source: Arc<dyn BookSource>) -> io::Result<Arc<dyn Boo
 }
 
 fn generated_toc_path(book_id: &str) -> io::Result<PathBuf> {
-    let project = ProjectDirs::from("com", "Rebook", "Rebook").ok_or_else(|| {
+    let project = crate::smoke::project_dirs().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "application data directory is unavailable",

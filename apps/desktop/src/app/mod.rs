@@ -27,6 +27,12 @@ pub(crate) struct DesktopApp {
 }
 
 impl DesktopApp {
+    pub(crate) fn startup_error(&self) -> Option<&str> {
+        self.pending_reader_error
+            .as_deref()
+            .or_else(|| self.shelf.startup_error())
+            .or_else(|| self.reader.as_ref().and_then(DesktopReader::startup_error))
+    }
     pub(crate) fn new(library: LocalLibrary, reader_fonts: Arc<[Blob<u8>]>) -> Self {
         let settings = SettingsFeature::new(&reader_fonts);
         Self {

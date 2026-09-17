@@ -18,7 +18,6 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use directories::ProjectDirs;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
@@ -742,7 +741,7 @@ fn normalize_selection(providers: &[AiProvider], provider_id: &mut String, model
 }
 
 fn settings_path() -> io::Result<PathBuf> {
-    let project = ProjectDirs::from("com", "Rebook", "Rebook")
+    let project = crate::smoke::project_dirs()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定插件配置目录"))?;
     Ok(project.config_dir().join(SETTINGS_FILE))
 }

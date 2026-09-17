@@ -1284,21 +1284,34 @@ impl LayoutEngine {
                             // without an attribution visibly bottom-heavy.
                             resolved.to_mut().style.margin_after = 0.0;
                         }
-                        let mut prepared = self.shape_text(&resolved, reader_style, quote_width);
+                        let mut prepared = self.shape_text_from_source(
+                            source,
+                            &resolved,
+                            reader_style,
+                            quote_width,
+                        )?;
                         if unified_reflow {
                             prepared.start_offset += quote_horizontal_padding;
                         }
                         prepared_body.push((prepared, resolved));
                     }
-                    let prepared_attribution = quote.attribution.as_ref().map(|attribution| {
+                    let prepared_attribution = if let Some(attribution) = quote.attribution.as_ref()
+                    {
                         let resolved =
                             resolve_text_block(attribution, reader_style, TextContext::Flow);
-                        let mut prepared = self.shape_text(&resolved, reader_style, quote_width);
+                        let mut prepared = self.shape_text_from_source(
+                            source,
+                            &resolved,
+                            reader_style,
+                            quote_width,
+                        )?;
                         if unified_reflow {
                             prepared.start_offset += quote_horizontal_padding;
                         }
-                        (prepared, resolved)
-                    });
+                        Some((prepared, resolved))
+                    } else {
+                        None
+                    };
                     if unified_reflow {
                         let content_height = prepared_body
                             .iter()
@@ -7931,6 +7944,89 @@ mod tests {
         };
 
         assert!((image.y - ReaderStyle::default().top_margin).abs() < 0.001);
+    }
+
+    #[test]
+    fn quote_body_and_attribution_load_inline_symbol_images() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("quote-images").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let text = |kind| TextBlock {
+            kind,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "Before ".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                }),
+                Inline::Image(Box::new(rebook_publication::InlineImageRun {
+                    image: ImageBlock {
+                        href: PublicationUrl::parse("symbol.png").unwrap(),
+                        alt: String::new(),
+                        style: ImageStyle::default(),
+                        source: None,
+                        text_layer: None,
+                    },
+                    size_scale: 1.0,
+                    intrinsic_sizing: false,
+                    vertical_align: InlineImageAlignment::Middle,
+                    presentation: true,
+                })),
+                Inline::Text(TextRun {
+                    text: " after".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                }),
+            ],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![Block::Quote(QuoteBlock {
+                body: vec![text(TextBlockKind::Blockquote)],
+                attribution: Some(text(TextBlockKind::QuoteAttribution)),
+                source: None,
+            })],
+            anchors: Vec::new(),
+        };
+        for typesetting in [ReaderTypesetting::default(), ReaderTypesetting::unified()] {
+            let layout = LayoutEngine::new()
+                .layout_section(
+                    &source,
+                    &section,
+                    LayoutViewport::new(600, 600).unwrap(),
+                    &ReaderStyle {
+                        typesetting,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let texts = layout
+                .pages
+                .iter()
+                .flat_map(|page| &page.items)
+                .filter_map(|item| {
+                    if let PageItem::Text(text) = item {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(texts.len(), 2);
+            for text in texts {
+                assert_eq!(text.inline_images.len(), 1);
+                assert!(text.text.contains("Before") && text.text.contains("after"));
+            }
+        }
     }
 
     #[test]

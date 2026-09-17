@@ -58,6 +58,12 @@ impl GpuState {
             .await
             .map_err(|error| error.to_string())?;
         let capabilities = surface.get_capabilities(&adapter);
+        if crate::smoke::enabled() {
+            crate::smoke::stage(&format!("gpu: {:?}", adapter.get_info()));
+            device.on_uncaptured_error(Arc::new(|error| {
+                crate::smoke::gpu_error(format!("{error}"))
+            }));
+        }
         let format = capabilities
             .formats
             .iter()
@@ -306,6 +312,21 @@ impl GpuState {
             .submit(callback_commands.into_iter().chain([encoder.finish()]));
         window.pre_present_notify();
         frame.present();
+        if crate::smoke::enabled() {
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(10)),
+                })
+                .map_err(|error| error.to_string())?;
+            let reader_ready = plan.is_some()
+                && !page_target_recreated
+                && self
+                    .page_target
+                    .as_ref()
+                    .is_some_and(|target| target.rendered_scene.is_some());
+            crate::smoke::presented(reader_ready, app.startup_error())?;
+        }
         for id in self.retired_page_textures.drain(..) {
             self.egui_renderer.free_texture(&id);
         }

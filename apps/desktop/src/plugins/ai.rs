@@ -749,6 +749,7 @@ fn translation_system_prompt(target_language: &str, fixed_page_hint: &str) -> St
 
 # 翻译任务
 - 把输入 JSON 对象中的每个值翻译为{target_language}。
+- 不要直译，按{target_language}语言习惯翻译。
 - 忠实保留原文语气、事实、专名所指与段落结构。
 
 # 中文表达（目标语言为中文时）

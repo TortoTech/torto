@@ -5498,6 +5498,185 @@ mod reference_suggestion_label_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires the local Reading in the Brain EPUB via TORTO_PRELUDE_BOOK"]
+    fn local_chapter_prelude_keeps_two_focus_blocks_and_scoped_edge_shortcuts() {
+        use crate::reader::*;
+        struct EmptyHighlights;
+        impl crate::highlights::HighlightRepository for EmptyHighlights {
+            fn highlights_for_book(
+                &self,
+                _: &str,
+            ) -> crate::highlights::HighlightResult<Vec<StoredHighlight>> {
+                Ok(Vec::new())
+            }
+            fn insert_highlight(
+                &self,
+                _: &StoredHighlight,
+            ) -> crate::highlights::HighlightResult<()> {
+                panic!("read-only audit")
+            }
+            fn update_highlight(
+                &self,
+                _: &StoredHighlight,
+            ) -> crate::highlights::HighlightResult<bool> {
+                panic!("read-only audit")
+            }
+            fn remove_highlight(&self, _: &str) -> crate::highlights::HighlightResult<bool> {
+                panic!("read-only audit")
+            }
+        }
+        let path = std::path::PathBuf::from(std::env::var("TORTO_PRELUDE_BOOK").unwrap());
+        let book = rebook_formats::open_file(&path).unwrap();
+        let rewrite_source = std::sync::Arc::new(RewriteBookSource::new(book.source()));
+        let settings = PluginSettings::default();
+        let translation_source = std::sync::Arc::new(TranslationBookSource::new(
+            rewrite_source.clone(),
+            settings.translation_mode,
+        ));
+        let structure_source =
+            std::sync::Arc::new(ParagraphStructureSource::new(translation_source.clone()));
+        let source: std::sync::Arc<dyn BookSource> = structure_source.clone();
+        let chapter = source
+            .book()
+            .table_of_contents
+            .iter()
+            .find(|entry| entry.label == "5 如何学习阅读")
+            .unwrap();
+        let target = chapter.href.clone().unwrap();
+        let child_target = chapter.children[0].href.clone().unwrap();
+        let mut session = ReaderSession::open(
+            source.clone(),
+            rebook_layout::LayoutViewport::new(800, 700).unwrap(),
+            ReaderStyle {
+                spread: SpreadMode::Scroll,
+                typesetting: ReaderTypesetting::unified(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        session.go_to_href(&target).unwrap();
+        let mut reader = DesktopReader::new(
+            session,
+            DesktopReaderResources {
+                source,
+                rewrite_source,
+                translation_source,
+                structure_source,
+                pdf_ocr_controller: None,
+                pdf_ocr_available: false,
+                pdf_ocr_mode: PdfOcrViewMode::Original,
+                cover: None,
+                format: BookFormat::Epub,
+                book_id: "prelude-audit".into(),
+                display_metadata: BookDisplayMetadata {
+                    id: "prelude-audit".into(),
+                    title: "Audit".into(),
+                    authors: Vec::new(),
+                },
+                pdf_metadata_missing: PdfMetadataMissing {
+                    title: false,
+                    authors: false,
+                },
+                highlight_store: HighlightStore::from_repository(EmptyHighlights),
+                highlights: Vec::new(),
+                progress_store: None,
+                restored_source_range: None,
+                plugin_settings: settings,
+                language: AppLanguage::SimplifiedChinese,
+                reading_mode: ReadingMode::Focus,
+                hide_cursor_in_focus_mode: false,
+                selection_granularity: SelectionGranularity::Paragraph,
+                shortcuts: ShortcutPreferences::default(),
+                sync_settings: SyncSettings::new_device(),
+                sync_password: String::new(),
+                source_path: path,
+            },
+        );
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        assert_eq!(reader.focus_units.len(), 2);
+        assert!(reader.focus_units[0].text.starts_with("阅读学习涉及两个"));
+        assert!(reader.focus_units[1].text.starts_with("尽管这些还只是"));
+        assert!(reader.focus_units.iter().all(|unit| {
+            reader.source.book().sections[unit.position.section_index].id == unit.range.start.spine
+        }));
+        let ctx = egui::Context::default();
+        for (key, expected) in [(egui::Key::End, 1), (egui::Key::Home, 0)] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::CTRL,
+                    }],
+                    ..Default::default()
+                },
+                |_| {
+                    assert!(reader.focus_edge_shortcut(&ctx, false));
+                },
+            );
+            output.textures_delta.clear();
+            assert_eq!(reader.focus_unit_index, expected);
+        }
+        let source_position = reader.focus_units[1].position;
+        let snapshot = reader.reader.set_visible_position(source_position).unwrap();
+        reader.install_snapshot(snapshot);
+        assert!(std::sync::Arc::ptr_eq(
+            &layout,
+            &reader.current_scroll_layout().unwrap()
+        ));
+        reader
+            .reader
+            .go_to_adjacent_reading_unit(PageDirection::Next)
+            .unwrap();
+        assert_eq!(
+            reader.reader.book().sections[reader.reader.location().section_index]
+                .href
+                .path(),
+            child_target.path()
+        );
+        let child = reader.reader.current_reading_unit_source_ranges().unwrap();
+        assert!(
+            child
+                .iter()
+                .all(|range| range.start.spine != reader.focus_units[0].range.start.spine)
+        );
+        let child_layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&child_layout);
+        let quote = reader.focus_units.first().unwrap();
+        assert!(quote.text.starts_with("我希望，每个阅读者"));
+        assert!(quote.text.contains("弗拉基米尔"));
+        let activation = quote
+            .rectangular_activation_rect
+            .expect("quotation activation");
+        let mut visible_text_lines = 0;
+        for (index, page) in child_layout.pages.iter().enumerate() {
+            for rect in page.page.source_rects(&quote.paint_ranges) {
+                let top = child_layout.content_y(index, rect.y0 as f32);
+                let bottom = child_layout.content_y(index, rect.y1 as f32);
+                assert!(top >= activation.top() - 1.0 && bottom <= activation.bottom() + 1.0);
+                assert!(rect.y0 >= f64::from(child_layout.page_origins[index]) - 1.0);
+                assert!(
+                    rect.y1
+                        <= f64::from(
+                            child_layout.page_origins[index] + child_layout.page_heights[index]
+                        ) + 1.0
+                );
+                visible_text_lines += 1;
+            }
+        }
+        assert!(
+            visible_text_lines >= 3,
+            "quotation body and attribution must survive subsection clipping"
+        );
+        eprintln!(
+            "Verified: chapter title + 2 overview blocks; Ctrl+Home/End => 0/1; child subsection unchanged; physical-file transition reuses the same layout."
+        );
+    }
+
+    #[test]
     fn focus_edges_use_semantic_unit_indices_and_handle_empty_content() {
         assert_eq!(focus_edge_index(0, false), None);
         assert_eq!(focus_edge_index(0, true), None);

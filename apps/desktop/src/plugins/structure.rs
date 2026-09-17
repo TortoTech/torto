@@ -422,14 +422,11 @@ fn attach_leading_parenthetical_suffixes(
     pairs: &[std::ops::Range<usize>],
 ) -> Vec<ParagraphAtom> {
     for index in 1..atoms.len() {
-        let previous_ends_with_quote = (atoms[index - 1].start..atoms[index - 1].end)
+        let previous_last = (atoms[index - 1].start..atoms[index - 1].end)
             .rev()
-            .find(|position| !chars[*position].is_whitespace())
-            .and_then(|position| chars.get(position))
-            .is_some_and(|character| matches!(character, '”' | '’' | '」' | '』'));
-        if !previous_ends_with_quote {
-            continue;
-        }
+            .find(|position| !chars[*position].is_whitespace());
+        let previous_ends_with_quote = previous_last
+            .is_some_and(|position| matches!(chars[position], '”' | '’' | '」' | '』'));
         let current_start = atoms[index].start;
         let prefix_start = (current_start..atoms[index].end)
             .find(|position| !chars[*position].is_whitespace())
@@ -444,6 +441,22 @@ fn attach_leading_parenthetical_suffixes(
         else {
             continue;
         };
+        // A complete parenthetical sentence immediately following a sentence
+        // is a trailing aside, not the beginning of the next sentence. Keep
+        // noun prefixes such as “（新方法）可以...” with their own predicate.
+        let sentence_aside = previous_last.is_some_and(|position| {
+            matches!(chars[position], '。' | '！' | '？' | '.' | '!' | '?')
+                && !chars[position + 1..prefix_start].contains(&'\n')
+        }) && chars[prefix_start + 1..prefix_end - 1]
+            .iter()
+            .rev()
+            .find(|character| {
+                !character.is_whitespace() && !matches!(character, '”' | '’' | '」' | '』')
+            })
+            .is_some_and(|character| matches!(character, '。' | '！' | '？' | '.' | '!' | '?'));
+        if !previous_ends_with_quote && !sentence_aside {
+            continue;
+        }
         move_atom_prefix_to_previous(&mut atoms, index, prefix_end, chars);
     }
     atoms
@@ -469,6 +482,14 @@ fn move_atom_prefix_to_previous(
 }
 
 fn semicolon_boundaries(chars: &[char], protected: &[std::ops::Range<usize>]) -> Vec<usize> {
+    unquoted_punctuation_boundaries(chars, protected, &['；', ';'])
+}
+
+fn unquoted_punctuation_boundaries(
+    chars: &[char],
+    protected: &[std::ops::Range<usize>],
+    terminators: &[char],
+) -> Vec<usize> {
     let mut closers = Vec::new();
     let mut boundaries = Vec::new();
     for (index, character) in chars.iter().copied().enumerate() {
@@ -509,7 +530,7 @@ fn semicolon_boundaries(chars: &[char], protected: &[std::ops::Range<usize>]) ->
             }
             continue;
         }
-        if matches!(character, '；' | ';') && closers.is_empty() {
+        if terminators.contains(&character) && closers.is_empty() {
             let mut end = index + 1;
             while chars.get(end).is_some_and(|character| {
                 character.is_whitespace()
@@ -739,7 +760,8 @@ fn paragraph_atoms_with_protected_ranges(
             });
         }
     }
-    let quote_boundaries = nested_quote_sentence_boundaries(&segmentation_chars);
+    let mut quote_boundaries = nested_quote_sentence_boundaries(&segmentation_chars);
+    quote_boundaries.extend(cjk_boundaries_before_lowercase_words(&segmentation_chars));
     if quote_boundaries.is_empty() {
         return atoms;
     }
@@ -749,6 +771,16 @@ fn paragraph_atoms_with_protected_ranges(
         .map(|atom| atom.end)
         .chain(quote_boundaries);
     atoms_from_boundaries(boundaries, &chars, atoms.len())
+}
+
+fn cjk_boundaries_before_lowercase_words(chars: &[char]) -> Vec<usize> {
+    // SentenceX can suppress a CJK terminator glued to a lowercase English
+    // example. Share quotation/bracket protection with semicolon splitting;
+    // leave ASCII periods (abbreviations/decimals) to the segmenter.
+    unquoted_punctuation_boundaries(chars, &[], &['。', '！', '？'])
+        .into_iter()
+        .filter(|end| chars.get(*end).is_some_and(char::is_ascii_lowercase))
+        .collect()
 }
 
 fn nested_quote_sentence_boundaries(chars: &[char]) -> Vec<usize> {
@@ -989,6 +1021,107 @@ mod tests {
             paragraph_atoms_for_content_mode(&block.content, "zh", false).len(),
             2
         );
+    }
+
+    #[test]
+    fn chinese_sentence_before_lowercase_english_starts_a_new_paragraph() {
+        let first = "很多人把复数的名词也译成了“一个”或“一种”。";
+        let second = "new methods译成了“一种新方法”，more difficult ways译成了“一个更艰难的途径”，不但不好，而且错了。";
+        for separator in ["", " "] {
+            let content = vec![Inline::Text(TextRun {
+                text: format!("{first}{separator}{second}"),
+                style: Default::default(),
+                link: None,
+            })];
+            let atoms = paragraph_atoms_for_content(&content, "zh");
+            assert_eq!(
+                atoms
+                    .iter()
+                    .map(|atom| atom.text.trim())
+                    .collect::<Vec<_>>(),
+                vec![first, second]
+            );
+            assert_eq!(
+                atoms
+                    .iter()
+                    .map(|atom| atom.text.as_str())
+                    .collect::<String>(),
+                format!("{first}{separator}{second}")
+            );
+        }
+        for text in [
+            "作者说：“很多人译成一种。new methods 也是这样译的。”",
+            "作者说：\"很多人译成一种。new methods也是这样译的。\"",
+            "这是一段说明（很多人译成一种。new methods 也是这样译的）。",
+        ] {
+            let quoted = vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: Default::default(),
+                link: None,
+            })];
+            let atoms = paragraph_atoms_for_content(&quoted, "zh");
+            assert_eq!(
+                atoms.len(),
+                1,
+                "must preserve quotation/parenthesis: {text}"
+            );
+            assert_eq!(atoms[0].text, text);
+        }
+    }
+
+    #[test]
+    fn complete_parenthetical_aside_stays_with_preceding_sentence() {
+        let first = "“承认问题的重要性和迫切性”也不像话。";
+        let second = "这句原文to acknowledge the importance and the urgency of the problem，译成“承认问题严重，也很迫切”就可以了。（比较起来，“连贯性”“长期性”等略微好些。）";
+        let third = "这种用法是由英文的-ty（-ity、-ety）、-ness这些字尾构成的名词译来的。";
+        let original = format!("{first}{second}{third}");
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: original.clone(),
+                style: Default::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        };
+        let atoms = paragraph_atoms_for_content(&block.content, "zh");
+        assert_eq!(
+            atoms
+                .iter()
+                .map(|atom| atom.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![first, second, third]
+        );
+        apply_sentence_structure(&mut block, "zh");
+        assert_eq!(
+            inline_text(&block.content),
+            format!("{first}\n{second}\n{third}")
+        );
+        for (text, expected) in [
+            (
+                "前句结束。（新方法）可以提高效率。",
+                vec!["前句结束。", "（新方法）可以提高效率。"],
+            ),
+            (
+                "前句结束。（补充说明。）后句开始。",
+                vec!["前句结束。（补充说明。）", "后句开始。"],
+            ),
+        ] {
+            let content = vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: Default::default(),
+                link: None,
+            })];
+            let atoms = paragraph_atoms_for_content(&content, "zh");
+            assert_eq!(
+                atoms
+                    .iter()
+                    .map(|atom| atom.text.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
     }
 
     #[test]

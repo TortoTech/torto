@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use directories::ProjectDirs;
 use egui::RichText;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use reqwest::header::{ACCEPT, USER_AGENT};
@@ -525,7 +524,7 @@ async fn download_update(release: UpdateRelease) -> Result<DownloadedUpdate, Str
     }
     let bytes = response.bytes().await.map_err(|error| error.to_string())?;
     verify_installer_bytes(&release.asset, &bytes)?;
-    let project = ProjectDirs::from("com", "Rebook", "Rebook")
+    let project = crate::smoke::project_dirs()
         .ok_or_else(|| "Unable to resolve the local update directory".to_string())?;
     let path = project
         .cache_dir()

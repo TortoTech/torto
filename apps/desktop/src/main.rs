@@ -17,6 +17,7 @@ mod preferences;
 mod reader;
 mod settings;
 mod shelf;
+mod smoke;
 mod statistics;
 mod sync;
 mod ui;
@@ -33,7 +34,10 @@ use app::DesktopApp;
 use library::LocalLibrary;
 
 fn main() -> ExitCode {
-    match run() {
+    let result = run();
+    let error = result.as_ref().err().map(ToString::to_string);
+    let smoke_result = smoke::finish(error.as_deref());
+    match result.and_then(|()| smoke_result.map_err(Into::into)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("torto failed: {error}");
@@ -43,8 +47,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    diagnostics::install_panic_hook();
     let launch = parse_arguments()?;
+    diagnostics::install_panic_hook();
     let reader_fonts = fonts::embedded_reader_fonts();
 
     let library =
@@ -70,6 +74,15 @@ fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
     let Some(first) = arguments.next() else {
         return Ok(LaunchMode::Shelf);
     };
+    if first == "--smoke-test" {
+        let output = arguments.next().ok_or("missing smoke output directory")?;
+        let book = arguments.next().map(PathBuf::from);
+        if arguments.next().is_some() {
+            return Err(usage(&executable).into());
+        }
+        smoke::start(PathBuf::from(output), book.is_some())?;
+        return Ok(book.map_or(LaunchMode::Shelf, LaunchMode::Open));
+    }
     let launch = LaunchMode::Open(PathBuf::from(first));
     if arguments.next().is_some() {
         return Err(usage(&executable).into());

@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://github.com/TortoTech/torto/releases/latest"><img src="https://img.shields.io/github/v/release/TortoTech/torto?display_name=tag&sort=semver" alt="Latest release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/TortoTech/torto" alt="AGPL v3 License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue" alt="AGPL-3.0-only License"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-5b6ee1" alt="Windows and macOS">
   <img src="https://img.shields.io/badge/UI-egui-7c3aed" alt="Built with egui">
 </p>
@@ -92,8 +92,8 @@ Download the latest build from [GitHub Releases](https://github.com/TortoTech/to
 | **Platform** | **Package** | **Requirements** |
 | --- | --- | --- |
 | Windows | `Torto-*-x86_64.msi` | 64-bit Windows 10 or 11 |
-| macOS, Apple silicon | `Torto-*-macos-arm64.dmg` | macOS 12 or later |
-| macOS, Intel | `Torto-*-macos-x86_64.dmg` | macOS 12 or later |
+| macOS, Apple silicon | `Torto-*-macos-arm64.dmg` | macOS 15 or later |
+| macOS, Intel | `Torto-*-macos-x86_64.dmg` | macOS 15 or later |
 
 After installation, import one or more books from the bookshelf and open a book in Focus Mode. Use `↑` / `↓`, the mouse wheel, or the reader scrollbar to move between reading units; press `Space` for passage actions and `Tab` for passage-scoped chat. Use `Ctrl + F` to search the current book and the reader menu to change layout, typography, theme, translation, AI, OCR, shortcuts, and sync settings.
 
