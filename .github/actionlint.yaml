@@ -1,0 +1,8 @@
+# Additional accepted label: GitHub-hosted macOS 27 public preview.
+# actionlint 1.7.12 does not yet include this official hosted label. Its
+# configuration calls the extension list "self-hosted-runner", but the workflow
+# itself still selects GitHub's hosted xcode-27 image, not a self-hosted machine.
+# https://github.blog/changelog/2026-09-10-xcode-27-runner-image-now-runs-on-macos-27/
+self-hosted-runner:
+  labels:
+    - xcode-27

@@ -1,0 +1,134 @@
+name: Test macOS 27 startup
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-27-startup-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build release-compatible ARM64 app on macOS 15
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      TARGET: aarch64-apple-darwin
+      CARGO_BUNDLE_VERSION: "0.11.0"
+      CARGO_INCREMENTAL: "0"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-macos-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-macos-
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.16.0"
+
+      - name: Add Rust target
+        run: rustup target add "$TARGET"
+
+      - name: Restore cargo-bundle
+        id: cargo-bundle-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-bundle
+          key: cargo-bundle-macos-arm64-${{ env.CARGO_BUNDLE_VERSION }}
+
+      - name: Install cargo-bundle
+        if: steps.cargo-bundle-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-bundle --version "$CARGO_BUNDLE_VERSION" --locked
+
+      - name: Build and verify app
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --package rebook-desktop --target "$TARGET"
+          CARGO_BUNDLE_SKIP_BUILD=1 cargo bundle --release --package rebook-desktop --format osx --target "$TARGET"
+          app="target/$TARGET/release/bundle/osx/Torto.app"
+          test -x "$app/Contents/MacOS/torto"
+          file "$app/Contents/MacOS/torto" | grep -F arm64
+          plutil -lint "$app/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' "$app/Contents/Info.plist")" = "15.0"
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          mkdir -p dist
+          # Preserve executable modes and bundle symlinks between runners.
+          tar -czf dist/Torto-arm64.tar.gz -C "$(dirname "$app")" Torto.app
+          (cd dist && shasum -a 256 Torto-arm64.tar.gz > Torto-arm64.tar.gz.sha256)
+
+      - name: Upload app for compatibility test
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-27-test-app
+          path: dist/Torto-arm64.tar.gz*
+          if-no-files-found: error
+          retention-days: 3
+
+  startup:
+    name: Test five startup scenarios on macOS 27
+    needs: build
+    # GitHub's macOS 27 preview image is ARM64-only. Do not substitute macOS 26.
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Verify actual macOS version and architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/torto-smoke"
+          sw_vers | tee "$RUNNER_TEMP/torto-smoke/runner-system.txt"
+          uname -m | tee -a "$RUNNER_TEMP/torto-smoke/runner-system.txt"
+          version="$(sw_vers -productVersion)"
+          [[ "$version" == 27.* ]] || { echo "Expected macOS 27, got $version" >&2; exit 1; }
+          [[ "$(uname -m)" == arm64 ]]
+
+      - name: Download macOS 15-built app
+        uses: actions/download-artifact@v8
+        with:
+          name: macos-27-test-app
+          path: dist
+
+      - name: Verify and unpack unchanged app
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && shasum -a 256 -c Torto-arm64.tar.gz.sha256)
+          mkdir -p "$RUNNER_TEMP/torto-install"
+          tar -xzf dist/Torto-arm64.tar.gz -C "$RUNNER_TEMP/torto-install"
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/torto-install/Torto.app"
+
+      - name: Check application startup
+        timeout-minutes: 10
+        run: node scripts/smoke/macos.mjs "$RUNNER_TEMP/torto-install/Torto.app" "$RUNNER_TEMP/torto-smoke"
+
+      - name: Upload startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-27-startup-arm64-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/torto-smoke
+          if-no-files-found: warn
+          retention-days: 14

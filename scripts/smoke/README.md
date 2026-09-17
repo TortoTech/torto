@@ -28,4 +28,12 @@ of the final DMG, without modifying or rebuilding the release afterward.
 The runner must provide a working window server and GPU. Lack of either is a
 failure, not a silent skip or software-rendering substitution. These checks do
 not replace Developer ID signing/notarization or testing downloaded apps under
-Gatekeeper on independent Macs. They test macOS 15, not older systems.
+Gatekeeper on independent Macs. The installer workflow tests macOS 15, not older
+systems.
+
+The separate `Test macOS 27 startup` workflow runs on main pushes or manual
+dispatch. It builds the ARM64 Release app on macOS 15, transfers the signed app
+without rebuilding/re-signing, and runs the same five checks on `xcode-27`.
+It checks the actual OS version first because this preview runner label used to
+run macOS 26. GitHub currently offers this image only for ARM64. This compatibility
+workflow does not publish releases or change the macOS 15 minimum requirement.
