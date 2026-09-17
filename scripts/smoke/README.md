@@ -4,7 +4,9 @@
 
 Runs the bundled executable against a fresh shelf, an original generated EPUB
 (Chinese/English text and PNG) and PDF (text and vector graphics), then launches
-the bundle through Launch Services (`open -n -W -a`). Each scenario uses a new
+the bundle through Launch Services (`open -n -W -a`). A fifth scenario sends an
+EPUB through `open -a APP BOOK` to verify Finder file-open event handling without
+passing a book on the application's command line. Each scenario uses a new
 profile; it must not reuse an earlier output directory. Node and macOS system
 tools are the only script dependencies.
 

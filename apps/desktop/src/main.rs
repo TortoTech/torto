@@ -74,13 +74,14 @@ fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
     let Some(first) = arguments.next() else {
         return Ok(LaunchMode::Shelf);
     };
-    if first == "--smoke-test" {
+    if first == "--smoke-test" || first == "--smoke-test-open-event" {
+        let expects_open_event = first == "--smoke-test-open-event";
         let output = arguments.next().ok_or("missing smoke output directory")?;
         let book = arguments.next().map(PathBuf::from);
         if arguments.next().is_some() {
             return Err(usage(&executable).into());
         }
-        smoke::start(PathBuf::from(output), book.is_some())?;
+        smoke::start(PathBuf::from(output), expects_open_event || book.is_some())?;
         return Ok(book.map_or(LaunchMode::Shelf, LaunchMode::Open));
     }
     let launch = LaunchMode::Open(PathBuf::from(first));

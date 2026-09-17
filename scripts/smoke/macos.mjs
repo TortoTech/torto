@@ -10,13 +10,14 @@ const fixtures = path.join(output, 'fixtures');
 createFixtures(fixtures);
 fs.writeFileSync(path.join(output, 'environment.txt'), `${os.type()} ${os.release()} ${os.arch()}\n${spawnSync('sw_vers', {encoding:'utf8'}).stdout}`);
 const summary = [];
-for (const [name, book, finder] of [['shelf', null, false], ['epub', 'startup.epub', false], ['pdf', 'startup.pdf', false], ['launch-services', null, true]]) {
+for (const [name, book, finder] of [['shelf', null, false], ['epub', 'startup.epub', false], ['pdf', 'startup.pdf', false], ['launch-services', null, true], ['finder-epub', 'startup.epub', true]]) {
   const dir = path.join(output, name);
   fs.mkdirSync(dir); // A reused result/profile must never produce a false pass.
-  const args = ['--smoke-test', dir, ...(book ? [path.join(fixtures, book)] : [])];
+  const openEvent = name === 'finder-epub';
+  const args = [openEvent ? '--smoke-test-open-event' : '--smoke-test', dir, ...(book && !openEvent ? [path.join(fixtures, book)] : [])];
   const stdout = fs.openSync(path.join(dir, 'stdout.log'), 'w'), stderr = fs.openSync(path.join(dir, 'stderr.log'), 'w');
   const started = Date.now();
-  let timedOut = false, screenshot = false;
+  let timedOut = false, screenshot = false, eventSent = false;
   let appPid;
   const child = spawn(finder ? '/usr/bin/open' : path.join(app, 'Contents/MacOS/torto'), finder ? ['-n', '-W', '-a', app, '--args', ...args] : args, {stdio:['ignore', stdout, stderr]});
   const timer = setTimeout(() => {
@@ -38,7 +39,13 @@ for (const [name, book, finder] of [['shelf', null, false], ['epub', 'startup.ep
   const capture = setInterval(() => {
     if (screenshot) return;
     try {
-      if (fs.readFileSync(path.join(dir, 'stage.txt'), 'utf8') === 'content-presented') {
+      const stage = fs.readFileSync(path.join(dir, 'stage.txt'), 'utf8');
+      if (openEvent && !eventSent && stage.startsWith('gpu:')) {
+        eventSent = true;
+        const opened = spawnSync('/usr/bin/open', ['-a', app, path.join(fixtures, book)], {encoding:'utf8', timeout:10000});
+        if (opened.status !== 0) launchError = opened.stderr || 'Finder open event failed';
+      }
+      if (stage === 'content-presented') {
         screenshot = true;
         spawnSync('/usr/sbin/screencapture', ['-x', path.join(dir, 'screen.png')], {timeout:5000});
       }

@@ -139,7 +139,7 @@ jobs:
 
       - name: Check application startup
         if: "!startsWith(github.ref, 'refs/tags/')"
-        timeout-minutes: 8
+        timeout-minutes: 10
         run: node scripts/smoke/macos.mjs "target/${{ matrix.target }}/release/bundle/osx/Torto.app" "$RUNNER_TEMP/torto-smoke"
 
       - name: Build and verify DMG
@@ -188,7 +188,7 @@ jobs:
 
       - name: Check startup from final DMG
         if: startsWith(github.ref, 'refs/tags/')
-        timeout-minutes: 8
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
