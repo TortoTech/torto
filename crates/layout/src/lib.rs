@@ -1496,13 +1496,14 @@ impl LayoutEngine {
             .iter()
             .map(|caption| {
                 self.shape_figure_caption(
+                    source,
                     caption,
                     reader_style,
                     (content_width - media_start_offset).max(1.0),
                     unified_reflow,
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, LayoutError>>()?;
         let outer_gap = if unified_reflow {
             reader_style.typography.font_size * reader_style.typesetting.media_gap_em
         } else {
@@ -1618,18 +1619,21 @@ impl LayoutEngine {
 
     fn shape_figure_caption<'a>(
         &mut self,
+        source: &dyn BookSource,
         caption: &'a TextBlock,
         reader_style: &ReaderStyle,
         content_width: f32,
         unified_reflow: bool,
-    ) -> (PreparedText, Cow<'a, TextBlock>) {
+    ) -> Result<(PreparedText, Cow<'a, TextBlock>), LayoutError> {
         let mut resolved = resolve_text_block(caption, reader_style, TextContext::Flow);
-        let mut prepared = self.shape_text(&resolved, reader_style, content_width);
+        let mut prepared =
+            self.shape_text_from_source(source, &resolved, reader_style, content_width)?;
         if unified_reflow && prepared.layout.len() > 1 {
             resolved.to_mut().style.align = TextAlignment::Start;
-            prepared = self.shape_text(&resolved, reader_style, content_width);
+            prepared =
+                self.shape_text_from_source(source, &resolved, reader_style, content_width)?;
         }
-        (prepared, resolved)
+        Ok((prepared, resolved))
     }
 
     #[allow(
@@ -7359,6 +7363,15 @@ mod tests {
 
     #[test]
     fn unified_figure_captions_center_one_line_and_left_align_multiple_lines() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("caption-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
         let caption = |text: &str| TextBlock {
             kind: TextBlockKind::Caption,
             content: vec![Inline::Text(TextRun {
@@ -7376,7 +7389,9 @@ mod tests {
         let mut engine = LayoutEngine::new();
 
         let short = caption("Figure 1. A leaf.");
-        let (short, _) = engine.shape_figure_caption(&short, &style, 320.0, true);
+        let (short, _) = engine
+            .shape_figure_caption(&source, &short, &style, 320.0, true)
+            .unwrap();
         assert_eq!(short.layout.len(), 1);
         assert!(
             short
@@ -7389,7 +7404,9 @@ mod tests {
         let long = caption(
             "Figure 2. A deliberately long caption that wraps across several lines at this width.",
         );
-        let (long, _) = engine.shape_figure_caption(&long, &style, 180.0, true);
+        let (long, _) = engine
+            .shape_figure_caption(&source, &long, &style, 180.0, true)
+            .unwrap();
         assert!(long.layout.len() > 1);
         assert!(
             (0..long.layout.len()).all(|index| long.layout.get(index).is_some_and(|line| line
@@ -7413,6 +7430,31 @@ mod tests {
                 .all(|line| linebreak::parley::positioned_line_content_end(line) >= 179.0),
             "optimized caption lines should visually fill the shared measure"
         );
+        let mut with_symbol = caption(
+            "Figure 3. A long description with an inline symbol and trailing text that wraps.",
+        );
+        with_symbol.content.push(Inline::Image(Box::new(
+            rebook_publication::InlineImageRun {
+                image: ImageBlock {
+                    href: PublicationUrl::parse("symbol.png").unwrap(),
+                    alt: String::new(),
+                    style: ImageStyle::default(),
+                    source: None,
+                    text_layer: None,
+                },
+                size_scale: 1.0,
+                intrinsic_sizing: false,
+                vertical_align: InlineImageAlignment::Middle,
+                presentation: true,
+            },
+        )));
+        let (prepared, resolved) = engine
+            .shape_figure_caption(&source, &with_symbol, &style, 180.0, true)
+            .unwrap();
+        assert!(prepared.layout.len() > 1);
+        assert_eq!(prepared.inline_images.len(), 1);
+        assert_eq!(resolved.style.align, TextAlignment::Start);
+        assert_eq!(resolved.style.indent, 0.0);
     }
 
     #[test]

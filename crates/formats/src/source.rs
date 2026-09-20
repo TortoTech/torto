@@ -475,6 +475,8 @@ impl BookSource for DirectBookSource {
                 let document = format!(
                     "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title></title></head><body>{body}</body></html>"
                 );
+                let document = crate::markup::html(&document, Default::default())
+                    .map_err(PublicationError::InvalidPublication)?;
                 let mut section = parse_section(&document, descriptor, |_| None)
                     .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
                 if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {

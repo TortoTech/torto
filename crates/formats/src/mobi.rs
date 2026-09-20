@@ -202,8 +202,8 @@ impl HtmlParser {
                                         quick_xml::XmlVersion::Implicit1_0,
                                         reader.decoder(),
                                     )
-                                    .unwrap_or_default()
-                                    .into_owned(),
+                                    .map(|value| decode_entities(&value))
+                                    .unwrap_or_default(),
                             )
                         })
                         .collect();
@@ -229,6 +229,21 @@ impl HtmlParser {
                             item.text.push_str(&value);
                             self.items.push(item);
                         }
+                    }
+                }
+                Event::GeneralRef(reference) if in_body => {
+                    let value = reference
+                        .resolve_char_ref()?
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| {
+                            format!("&{};", String::from_utf8_lossy(reference.as_ref()))
+                        });
+                    if let Some(item) = stack.last_mut() {
+                        item.text.push_str(&value);
+                    } else {
+                        let mut item = ContentItem::new(ContentType::Text);
+                        item.text = value;
+                        self.items.push(item);
                     }
                 }
                 Event::CData(text) if in_body => {
@@ -302,7 +317,11 @@ fn normalize_chapter(
         Some(format!("href=\"#filepos{value}\""))
     });
     let source = strip_document_wrappers(&source);
-    let source = normalize_void_elements(&source);
+    let document = format!(
+        "<html xmlns:mbp=\"http://mobipocket.com/ns/mbp\"><head></head><body>{source}</body></html>"
+    );
+    let source = crate::markup::html(&document, Default::default())
+        .map_err(|error| conversion_error(format, error))?;
     let source = protect_entities(&source);
     let mut parser = HtmlParser::new();
     parser
@@ -380,64 +399,6 @@ fn rewrite_numeric_attributes(
         output.push_str(&source[copied..start]);
         output.push_str(&replacement);
         copied = end;
-        search = end;
-    }
-    if copied == 0 {
-        source.to_owned()
-    } else {
-        output.push_str(&source[copied..]);
-        output
-    }
-}
-
-fn normalize_void_elements(source: &str) -> String {
-    let lower = source.to_ascii_lowercase();
-    let mut output = String::with_capacity(source.len());
-    let mut copied = 0usize;
-    let mut search = 0usize;
-    while let Some(relative_start) = lower[search..].find('<') {
-        let start = search + relative_start;
-        let Some(relative_end) = lower[start..].find('>') else {
-            break;
-        };
-        let end = start + relative_end + 1;
-        let inner = lower[start + 1..end - 1].trim();
-        let closing = inner.starts_with('/');
-        let name = inner
-            .trim_start_matches('/')
-            .split_ascii_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches('/');
-        let is_void = matches!(
-            name,
-            "area"
-                | "base"
-                | "br"
-                | "col"
-                | "embed"
-                | "hr"
-                | "img"
-                | "input"
-                | "link"
-                | "meta"
-                | "param"
-                | "source"
-                | "track"
-                | "wbr"
-        );
-        if is_void {
-            output.push_str(&source[copied..start]);
-            if !closing {
-                let tag = source[start..end - 1].trim_end_matches(char::is_whitespace);
-                output.push_str(tag);
-                if !tag.ends_with('/') {
-                    output.push('/');
-                }
-                output.push('>');
-            }
-            copied = end;
-        }
         search = end;
     }
     if copied == 0 {
@@ -534,7 +495,7 @@ fn render_item(item: &ContentItem) -> String {
         ContentType::HorizontalRule => "<hr/>".to_owned(),
         ContentType::Text => content,
         ContentType::Other(tag) => match tag.to_ascii_lowercase().as_str() {
-            "br" | "mbp:pagebreak" => "<br/>".to_owned(),
+            "br" | "mbp:pagebreak" => format!("<br/>{content}"),
             "div" | "section" | "article" => wrap("div", item, &content),
             "ul" => wrap("ul", item, &content),
             "ol" => wrap("ol", item, &content),
@@ -630,6 +591,21 @@ mod tests {
         assert!(body.contains("<a id=\"chapter-start\"></a>"), "{body}");
         assert!(body.contains("Hello &amp; world"), "{body}");
         assert!(body.contains("src=\"../Images/image-1.jpg\""));
+    }
+
+    #[test]
+    fn malformed_mobi_preserves_entities_images_and_page_break_content() {
+        let images = HashMap::from([(1, "Images/image-1.jpg".to_owned())]);
+        let body = normalize_chapter(
+            r#"<p>A & raw &#9731; &copy;<p>B<img recindex="1" alt="a > b"><mbp:pagebreak/><p>C"#,
+            &images,
+            BookFormat::Azw3,
+        )
+        .unwrap();
+        assert!(body.contains("A &amp; raw ☃ ©"), "{body}");
+        assert!(body.contains("a &gt; b"), "{body}");
+        assert!(body.contains("Images/image-1.jpg"), "{body}");
+        assert!(body.contains('C'), "{body}");
     }
 
     #[test]

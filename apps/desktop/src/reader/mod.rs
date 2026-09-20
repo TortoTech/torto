@@ -44,6 +44,9 @@ const FOCUS_TRAILING_SCROLL_SPACE: f32 = FOCUS_UNIT_MIN_HEIGHT / 2.0;
 const TOOLBAR_HIDE_DELAY: Duration = Duration::from_millis(500);
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const MOTION_EPSILON: f32 = 0.001;
+// ScrollArea rounds the content origin to physical pixels. Do not turn that
+// sub-point difference into another navigation action after an animation ends.
+const FOCUS_SCROLL_BOUNDARY_EPSILON: f32 = 1.0;
 const SEARCH_MARK_COLOR: Color = Color::from_rgba8(250, 204, 21, 89);
 const ASSISTANT_MARK_COLOR: Color = Color::from_rgba8(245, 158, 11, 56);
 const FOCUS_TABLE_BOTTOM_MARGIN: f32 = 24.0;
@@ -621,6 +624,8 @@ struct FocusUnit {
     position: ReaderPosition,
     rect: egui::Rect,
     is_image: bool,
+    image_rect: Option<egui::Rect>,
+    caption_rect: Option<egui::Rect>,
     is_table: bool,
     rectangular_activation: bool,
     structured_activation: bool,
@@ -1187,6 +1192,11 @@ fn focus_block_paint_ranges(block: &Block, range: &SourceRange) -> Vec<SourceRan
 }
 
 fn merge_inferred_caption_focus_unit(image: &mut FocusUnit, caption: FocusUnit) {
+    image.caption_rect = Some(
+        image
+            .caption_rect
+            .map_or(caption.rect, |rect| rect.union(caption.rect)),
+    );
     image.range.end = caption.range.end;
     image.paint_ranges.extend(caption.paint_ranges);
     image.structure_ranges.extend(caption.structure_ranges);
@@ -1289,6 +1299,25 @@ fn focus_unit_geometry(
         }
     }
     bounds.zip(position)
+}
+
+fn single_focus_image_rect(
+    layout: &ScrollSectionLayout,
+    ranges: &[SourceRange],
+) -> Option<egui::Rect> {
+    let mut images = layout.pages.iter().enumerate().flat_map(|(index, page)| {
+        page.page
+            .image_source_rects(ranges)
+            .into_iter()
+            .map(move |rect| {
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.x0 as f32, layout.content_y(index, rect.y0 as f32)),
+                    egui::pos2(rect.x1 as f32, layout.content_y(index, rect.y1 as f32)),
+                )
+            })
+    });
+    let first = images.next()?;
+    images.next().is_none().then_some(first)
 }
 
 const fn ordered_focus_selection_bounds(anchor: usize, focus: usize) -> (usize, usize) {
@@ -1471,6 +1500,103 @@ fn focus_unit_target_offset_for_rect(rect: egui::Rect, viewport_height: f32) -> 
     }
 }
 
+// A single image followed by a caption is entered at the image's real center,
+// even when the complete semantic unit exceeds the viewport. Leading captions
+// and multi-image figures retain their reading-order-based behavior.
+fn image_caption_scroll_bounds(unit: &FocusUnit, viewport_height: f32) -> Option<(f32, f32)> {
+    let image = unit.image_rect?;
+    if unit.rect.height() <= viewport_height + MOTION_EPSILON
+        || (image.height() > viewport_height + MOTION_EPSILON
+            && unit.fitting_caption(viewport_height).is_none())
+        || image.top() > unit.rect.top() + MOTION_EPSILON
+        || image.bottom() >= unit.rect.bottom() - MOTION_EPSILON
+    {
+        return None;
+    }
+    let start = if image.height() <= viewport_height + MOTION_EPSILON {
+        image.center().y.max(0.0)
+    } else {
+        focus_unit_target_offset_for_rect(unit.rect, viewport_height)
+    };
+    let (_, window_bottom) = focus_reading_window(viewport_height);
+    let end = unit.fitting_caption(viewport_height).map_or_else(
+        || (unit.rect.bottom() + viewport_height * 0.5 - window_bottom).max(start),
+        |caption| caption.center().y.max(start),
+    );
+    Some((start, end))
+}
+
+impl FocusUnit {
+    fn fitting_caption(&self, height: f32) -> Option<egui::Rect> {
+        let caption = self.caption_rect?;
+        let image = self.image_rect?;
+        (caption.height() <= height + FOCUS_SCROLL_BOUNDARY_EPSILON
+            && caption.top() >= image.bottom() - FOCUS_SCROLL_BOUNDARY_EPSILON)
+            .then_some(caption)
+    }
+
+    fn navigation_target(
+        &self,
+        current: f32,
+        height: f32,
+        top: f32,
+        bottom: f32,
+        direction: PageDirection,
+    ) -> Option<f32> {
+        let (window_top, window_bottom) = focus_reading_window(height);
+        let step = (window_bottom - window_top).max(1.0);
+        if image_caption_scroll_bounds(self, height).is_some()
+            && self.fitting_caption(height).is_some()
+        {
+            let image = self.image_rect?;
+            if image.height() <= height + MOTION_EPSILON {
+                // Both fit separately: exactly two stops, with reversible navigation.
+                return focus_scroll_target(
+                    current,
+                    top,
+                    bottom,
+                    (bottom - top).max(1.0),
+                    direction,
+                );
+            }
+            // A tall image must still be read to its bottom before centering the caption.
+            let image_end = (image.bottom() + height * 0.5 - window_bottom).clamp(top, bottom);
+            match direction {
+                PageDirection::Next if current >= image_end - FOCUS_SCROLL_BOUNDARY_EPSILON => {
+                    return (current < bottom - FOCUS_SCROLL_BOUNDARY_EPSILON).then_some(bottom);
+                }
+                PageDirection::Previous if current > image_end + FOCUS_SCROLL_BOUNDARY_EPSILON => {
+                    return Some(image_end);
+                }
+                _ => return focus_scroll_target(current, top, image_end, step, direction),
+            }
+        }
+        focus_scroll_target(current, top, bottom, step, direction)
+    }
+    fn image_progress_offset(&self, height: f32, progress: f32) -> f32 {
+        image_caption_scroll_bounds(self, height).map_or_else(
+            || self.target_offset(height),
+            |(start, end)| start + (end - start) * progress.clamp(0.0, 1.0),
+        )
+    }
+    fn target_offset(&self, viewport_height: f32) -> f32 {
+        image_caption_scroll_bounds(self, viewport_height).map_or_else(
+            || focus_unit_target_offset_for_rect(self.rect, viewport_height),
+            |(start, _)| start,
+        )
+    }
+
+    fn offset_after_resize(&self, previous_height: f32, height: f32, current: f32) -> f32 {
+        if let Some((start, end)) = image_caption_scroll_bounds(self, height) {
+            if (current - self.target_offset(previous_height)).abs() <= MOTION_EPSILON {
+                return start;
+            }
+            return (current + (height - previous_height) * 0.5).clamp(start, end);
+        }
+        focus_offset_after_viewport_resize(self.rect, previous_height, height, current)
+    }
+}
+
 fn focus_navigation_scroll_bounds(
     rect: egui::Rect,
     viewport_height: f32,
@@ -1484,8 +1610,8 @@ fn focus_navigation_scroll_bounds(
     let screen_top = rect.top() + padding - offset;
     let screen_bottom = rect.bottom() + padding - offset;
     if retained_origin.is_none()
-        && screen_top >= -MOTION_EPSILON
-        && screen_bottom <= viewport_height + MOTION_EPSILON
+        && screen_top >= -FOCUS_SCROLL_BOUNDARY_EPSILON
+        && screen_bottom <= viewport_height + FOCUS_SCROLL_BOUNDARY_EPSILON
     {
         return None;
     }
@@ -1514,7 +1640,9 @@ fn focus_offset_after_viewport_resize(
 }
 
 fn focus_viewport_height_changed(previous: egui::Vec2, current: egui::Vec2) -> bool {
-    (previous.y - current.y).abs() > MOTION_EPSILON
+    // Layout rounding must not cancel a scroll animation as if the user had
+    // resized the window. Real one-pixel viewport changes still count.
+    (previous.y - current.y).abs() > 0.5
 }
 
 fn focus_scroll_content_height(content_height: f32, viewport_height: f32) -> f32 {
@@ -1557,11 +1685,21 @@ fn focus_scroll_target(
             .clamp(0.0, step_count)
     };
     match direction {
-        PageDirection::Previous if current > top + MOTION_EPSILON => {
-            Some((top + (current_anchor - 1.0).max(0.0) * balanced_step).max(top))
+        PageDirection::Previous if current > top + FOCUS_SCROLL_BOUNDARY_EPSILON => {
+            let index = (current_anchor - 1.0).max(0.0);
+            Some(if index == 0.0 {
+                top
+            } else {
+                (top + index * balanced_step).max(top)
+            })
         }
-        PageDirection::Next if current < bottom - MOTION_EPSILON => {
-            Some((top + (current_anchor + 1.0).min(step_count) * balanced_step).min(bottom))
+        PageDirection::Next if current < bottom - FOCUS_SCROLL_BOUNDARY_EPSILON => {
+            let index = (current_anchor + 1.0).min(step_count);
+            Some(if index == step_count {
+                bottom
+            } else {
+                (top + index * balanced_step).min(bottom)
+            })
         }
         PageDirection::Previous | PageDirection::Next => None,
     }
@@ -1731,6 +1869,7 @@ struct FocusReflowAnchor {
     uses_baseline: bool,
     visible_start_offset: Option<f32>,
     viewport_height: f32,
+    image_progress: Option<f32>,
 }
 
 fn reflow_anchor_offset(
@@ -1759,6 +1898,20 @@ impl DesktopReader {
         let padding = self.scroll_content_padding(viewport.size.y);
         let visible_top = viewport.offset_y - padding;
         let mut range = unit.paint_ranges.first()?.clone();
+        if let Some((start, end)) = image_caption_scroll_bounds(unit, viewport.size.y) {
+            return Some(FocusReflowAnchor {
+                section_index: layout.section_index,
+                reading_unit_index: layout.reading_unit_index,
+                range,
+                screen_y: 0.0,
+                uses_baseline: false,
+                visible_start_offset: None,
+                viewport_height: viewport.size.y,
+                image_progress: Some(
+                    ((viewport.offset_y - start) / (end - start).max(1.0)).clamp(0.0, 1.0),
+                ),
+            });
+        }
         let top = layout.source_top(&range)?;
         if top < visible_top {
             // Resolve a real text cluster at the visible top, not a percentage of
@@ -1789,6 +1942,7 @@ impl DesktopReader {
             visible_start_offset: (top >= visible_top && top < visible_top + viewport.size.y)
                 .then_some(viewport.offset_y),
             viewport_height: viewport.size.y,
+            image_progress: None,
         })
     }
 
@@ -1841,6 +1995,17 @@ impl DesktopReader {
             || anchor.section_index != layout.section_index
             || anchor.reading_unit_index != layout.reading_unit_index
         {
+            return None;
+        }
+        if let Some(progress) = anchor.image_progress {
+            let unit = self.focus_units.get(self.focus_unit_index)?;
+            if unit
+                .paint_ranges
+                .iter()
+                .any(|range| range.start == anchor.range.start)
+            {
+                return Some(unit.image_progress_offset(viewport_height, progress));
+            }
             return None;
         }
         let top = if anchor.uses_baseline {
@@ -2189,6 +2354,21 @@ impl DesktopReader {
             }
             let target_reached = first_unit_after_anchor.is_none()
                 && focus_block_index.is_some_and(|target| block_index >= target);
+            let single_image = matches!(block, Block::Image(image) if image.text_layer.is_none())
+                || matches!(block, Block::Figure(figure) if figure.images.len() == 1);
+            let image_rect = single_image
+                .then(|| single_focus_image_rect(layout, &paint_ranges))
+                .flatten();
+            let caption_rect = if let Block::Figure(figure) = block {
+                let ranges = figure
+                    .captions
+                    .iter()
+                    .filter_map(|caption| caption.source.clone())
+                    .collect::<Vec<_>>();
+                focus_unit_geometry(layout, &ranges).map(|(rect, _)| rect)
+            } else {
+                None
+            };
             let unit = FocusUnit {
                 range,
                 paint_ranges,
@@ -2198,6 +2378,8 @@ impl DesktopReader {
                 position,
                 rect,
                 is_image,
+                image_rect,
+                caption_rect,
                 is_table,
                 rectangular_activation,
                 structured_activation,
@@ -2259,10 +2441,7 @@ impl DesktopReader {
 
     fn focus_unit_target_offset(&self, viewport_height: f32) -> Option<f32> {
         let unit = self.focus_units.get(self.focus_unit_index)?;
-        Some(focus_unit_target_offset_for_rect(
-            unit.rect,
-            viewport_height,
-        ))
+        Some(unit.target_offset(viewport_height))
     }
 
     fn animate_focus_scroll_to(&mut self, target: f32) {
@@ -2291,6 +2470,14 @@ impl DesktopReader {
             return false;
         };
         let padding = self.scroll_content_padding(viewport.size.y);
+        // advance_motion clears the finished motion before ScrollArea applies
+        // its final offset. Prefer that pending endpoint over last frame's view.
+        let logical_offset = self
+            .ui
+            .focus_scroll_motion
+            .map(|motion| motion.target)
+            .or(self.focus_target_offset)
+            .unwrap_or(viewport.offset_y);
         let retained_origin =
             self.focus_overflow_origin
                 .as_ref()
@@ -2298,13 +2485,16 @@ impl DesktopReader {
                     (range == &unit.range && *rect == unit.rect && *size == viewport.size)
                         .then_some(*origin)
                 });
-        let Some((top, bottom)) = focus_navigation_scroll_bounds(
-            unit.rect,
-            viewport.size.y,
-            padding,
-            viewport.offset_y,
-            retained_origin,
-        ) else {
+        let image_bounds = image_caption_scroll_bounds(unit, viewport.size.y);
+        let Some((top, bottom)) = image_bounds.or_else(|| {
+            focus_navigation_scroll_bounds(
+                unit.rect,
+                viewport.size.y,
+                padding,
+                logical_offset,
+                retained_origin,
+            )
+        }) else {
             self.focus_overflow_origin = None;
             return false;
         };
@@ -2312,29 +2502,38 @@ impl DesktopReader {
             unit.range.clone(),
             unit.rect,
             viewport.size,
-            retained_origin.unwrap_or(viewport.offset_y),
+            retained_origin.unwrap_or(logical_offset),
         ));
         if self.ui.focus_scroll_motion.is_some_and(|motion| {
             motion.is_animating()
-                && match direction {
-                    PageDirection::Previous => motion.target <= top + MOTION_EPSILON,
-                    PageDirection::Next => motion.target >= bottom - MOTION_EPSILON,
-                }
+                && ((image_bounds.is_some() && (motion.target - top).abs() <= MOTION_EPSILON)
+                    || match direction {
+                        PageDirection::Previous => motion.target <= top + MOTION_EPSILON,
+                        PageDirection::Next => motion.target >= bottom - MOTION_EPSILON,
+                    })
         }) {
             // Repeated key events must not cross a block boundary before the
             // viewport has actually reached the animated edge.
             return true;
         }
-        let current = self
-            .ui
-            .focus_scroll_motion
-            .map_or(viewport.offset_y, |motion| motion.target)
-            .clamp(top, bottom);
-        let (window_top, window_bottom) = focus_reading_window(viewport.size.y);
-        let step = (window_bottom - window_top).max(1.0);
-        let Some(target) = focus_scroll_target(current, top, bottom, step, direction) else {
+        let current = logical_offset.clamp(top, bottom);
+        let Some(target) = unit.navigation_target(current, viewport.size.y, top, bottom, direction)
+        else {
             return false;
         };
+        crate::diagnostics::log(
+            "focus.scroll.step",
+            &[
+                crate::diagnostics::Field::Usize("unit", self.focus_unit_index),
+                crate::diagnostics::Field::F32("current", current),
+                crate::diagnostics::Field::F32("view", viewport.offset_y),
+                crate::diagnostics::Field::F32("top", top),
+                crate::diagnostics::Field::F32("bottom", bottom),
+                crate::diagnostics::Field::F32("target", target),
+                crate::diagnostics::Field::F32("height", viewport.size.y),
+                crate::diagnostics::Field::Bool("image_anchor", image_bounds.is_some()),
+            ],
+        );
         self.animate_focus_scroll_to(target);
         true
     }
@@ -2530,12 +2729,8 @@ impl DesktopReader {
                 .ui
                 .focus_scroll_motion
                 .map_or(previous.offset_y, |motion| motion.value);
-            self.focus_target_offset = Some(focus_offset_after_viewport_resize(
-                unit.rect,
-                previous.size.y,
-                viewport.size.y,
-                current_offset,
-            ));
+            self.focus_target_offset =
+                Some(unit.offset_after_resize(previous.size.y, viewport.size.y, current_offset));
             self.ui.focus_scroll_motion = None;
             ctx.request_repaint();
         }
@@ -4736,6 +4931,8 @@ mod tests {
             },
             rect: egui::Rect::from_min_max(egui::pos2(10.0, 10.0), egui::pos2(90.0, 80.0)),
             is_image: true,
+            image_rect: None,
+            caption_rect: None,
             is_table: false,
             rectangular_activation: false,
             structured_activation: false,
@@ -4751,6 +4948,8 @@ mod tests {
             position: image.position,
             rect: egui::Rect::from_min_max(egui::pos2(10.0, 84.0), egui::pos2(90.0, 104.0)),
             is_image: false,
+            image_rect: None,
+            caption_rect: None,
             is_table: false,
             rectangular_activation: false,
             structured_activation: false,
@@ -4760,6 +4959,8 @@ mod tests {
             }],
         };
 
+        let image_only_rect = image.rect;
+        image.image_rect = Some(image_only_rect);
         merge_inferred_caption_focus_unit(&mut image, caption);
 
         assert_eq!(image.range.end, caption_range.end);
@@ -4768,8 +4969,167 @@ mod tests {
         assert_eq!(image.text, "Figure 1. A leaf.");
         assert_eq!(image.clipboard_text, "Figure 1. A leaf.");
         assert_eq!(image.rect.max.y, 104.0);
+        assert_eq!(image.image_rect, Some(image_only_rect));
+        assert_eq!(image.caption_rect.unwrap().min.y, 84.0);
         assert!(image.is_image);
         assert_eq!(image.footnotes[0].text, "Caption note");
+    }
+
+    fn image_caption_fixture(image: egui::Rect, full: egui::Rect) -> FocusUnit {
+        let anchor = SourceAnchor {
+            spine: SpineItemId::new("image-chapter").unwrap(),
+            node: "image".into(),
+            text_offset: 0,
+        };
+        FocusUnit {
+            range: SourceRange {
+                start: anchor.clone(),
+                end: anchor,
+            },
+            paint_ranges: Vec::new(),
+            structure_ranges: Vec::new(),
+            text: "Caption".into(),
+            clipboard_text: "Caption".into(),
+            position: ReaderPosition {
+                section_index: 0,
+                segment_index: 0,
+                page_index: 0,
+            },
+            rect: full,
+            is_image: true,
+            image_rect: Some(image),
+            caption_rect: None,
+            is_table: false,
+            rectangular_activation: false,
+            structured_activation: false,
+            rectangular_activation_rect: None,
+            footnotes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fitting_image_with_long_caption_starts_centered_then_scrolls_to_caption_end() {
+        let rect =
+            |top, bottom| egui::Rect::from_min_max(egui::pos2(0.0, top), egui::pos2(400.0, bottom));
+        let unit = image_caption_fixture(rect(1000.0, 1600.0), rect(1000.0, 2000.0));
+        let (start, end) = super::image_caption_scroll_bounds(&unit, 800.0).unwrap();
+        assert_eq!(start, 1300.0);
+        assert_eq!(unit.target_offset(800.0), start);
+        assert_eq!(unit.image_rect.unwrap().center().y + 400.0 - start, 400.0);
+        assert_eq!(end, 1880.0);
+        let mut offset = start;
+        let mut stops = vec![offset];
+        while let Some(next) =
+            super::focus_scroll_target(offset, start, end, 240.0, PageDirection::Next)
+        {
+            assert!(next > offset && next - offset <= 240.01);
+            offset = next;
+            stops.push(offset);
+            assert!(stops.len() < 10);
+        }
+        assert!((offset - end).abs() < 0.01);
+        for expected in stops.iter().rev().skip(1) {
+            offset = super::focus_scroll_target(offset, start, end, 240.0, PageDirection::Previous)
+                .unwrap();
+            assert!((offset - expected).abs() < 0.01);
+        }
+        assert!(
+            super::focus_scroll_target(offset, start, end, 240.0, PageDirection::Previous)
+                .is_none()
+        );
+        // No virtual minimum-height box for a small image followed by long text.
+        let small = image_caption_fixture(rect(1000.0, 1100.0), rect(1000.0, 2000.0));
+        assert_eq!(small.target_offset(800.0), 1050.0);
+    }
+
+    #[test]
+    fn single_screen_caption_is_a_centered_navigation_stop() {
+        let rect =
+            |top, bottom| egui::Rect::from_min_max(egui::pos2(0.0, top), egui::pos2(400.0, bottom));
+        let mut unit = image_caption_fixture(rect(1000.0, 1600.0), rect(1000.0, 2000.0));
+        unit.caption_rect = Some(rect(1620.0, 2000.0));
+        let (start, end) = super::image_caption_scroll_bounds(&unit, 800.0).unwrap();
+        assert_eq!((start, end), (1300.0, 1810.0));
+        assert_eq!(
+            unit.navigation_target(start, 800.0, start, end, PageDirection::Next),
+            Some(end)
+        );
+        assert_eq!(
+            unit.navigation_target(end, 800.0, start, end, PageDirection::Previous),
+            Some(start)
+        );
+        assert!(
+            unit.navigation_target(end, 800.0, start, end, PageDirection::Next)
+                .is_none()
+        );
+        assert!(
+            unit.navigation_target(start, 800.0, start, end, PageDirection::Previous)
+                .is_none()
+        );
+        assert_eq!(unit.caption_rect.unwrap().center().y + 400.0 - end, 400.0);
+
+        unit.image_rect = Some(rect(1000.0, 2200.0));
+        unit.caption_rect = Some(rect(2220.0, 2820.0));
+        unit.rect = rect(1000.0, 2820.0);
+        let (start, end) = super::image_caption_scroll_bounds(&unit, 800.0).unwrap();
+        assert_eq!((start, end), (1120.0, 2520.0));
+        let mut current = start;
+        let mut stops = vec![current];
+        while let Some(next) =
+            unit.navigation_target(current, 800.0, start, end, PageDirection::Next)
+        {
+            assert!(next > current);
+            stops.push(next);
+            current = next;
+            assert!(stops.len() < 20);
+        }
+        assert_eq!(stops, vec![1120.0, 1360.0, 1600.0, 1840.0, 2080.0, 2520.0]);
+        for expected in stops.iter().rev().skip(1) {
+            current = unit
+                .navigation_target(current, 800.0, start, end, PageDirection::Previous)
+                .unwrap();
+            assert_eq!(current, *expected);
+        }
+        // A caption longer than a screen must keep intermediate reading stops.
+        unit.image_rect = Some(rect(1000.0, 1600.0));
+        unit.caption_rect = Some(rect(1620.0, 2600.0));
+        unit.rect = rect(1000.0, 2600.0);
+        let (start, end) = super::image_caption_scroll_bounds(&unit, 800.0).unwrap();
+        assert!(
+            unit.navigation_target(start, 800.0, start, end, PageDirection::Next)
+                .unwrap()
+                < end
+        );
+    }
+
+    #[test]
+    fn image_caption_entry_respects_reading_order_and_viewport_changes() {
+        let rect =
+            |top, bottom| egui::Rect::from_min_max(egui::pos2(0.0, top), egui::pos2(400.0, bottom));
+        for unit in [
+            image_caption_fixture(rect(1000.0, 1600.0), rect(1000.0, 1750.0)), // all fits
+            image_caption_fixture(rect(1000.0, 1900.0), rect(1000.0, 2200.0)), // tall image
+            image_caption_fixture(rect(1400.0, 2000.0), rect(1000.0, 2000.0)), // caption before
+        ] {
+            assert!(super::image_caption_scroll_bounds(&unit, 800.0).is_none());
+            assert_eq!(
+                unit.target_offset(800.0),
+                focus_unit_target_offset_for_rect(unit.rect, 800.0)
+            );
+        }
+        let mut unit = image_caption_fixture(rect(1000.0, 1600.0), rect(1000.0, 2000.0));
+        assert_eq!(unit.offset_after_resize(800.0, 700.0, 1300.0), 1300.0);
+        assert_eq!(unit.offset_after_resize(800.0, 700.0, 1600.0), 1550.0);
+        assert_eq!(
+            unit.offset_after_resize(700.0, 1200.0, 1550.0),
+            unit.target_offset(1200.0)
+        );
+        assert_eq!(unit.image_progress_offset(800.0, 0.0), 1300.0);
+        assert_eq!(unit.image_progress_offset(800.0, 0.5), 1590.0);
+        unit.rect.max.y = 2400.0; // narrower layout makes the caption longer
+        assert_eq!(unit.image_progress_offset(800.0, 0.5), 1790.0);
+        unit.image_rect = None; // multi-image groups deliberately have no single-image anchor
+        assert!(super::image_caption_scroll_bounds(&unit, 800.0).is_none());
     }
 
     #[test]
@@ -4912,6 +5272,8 @@ mod tests {
             position,
             rect: egui::Rect::from_min_size(egui::pos2(20.0, y), egui::vec2(400.0, 40.0)),
             is_image: false,
+            image_rect: None,
+            caption_rect: None,
             is_table: false,
             rectangular_activation: false,
             structured_activation: false,
@@ -4984,6 +5346,8 @@ mod tests {
             position: current,
             rect: egui::Rect::ZERO,
             is_image: false,
+            image_rect: None,
+            caption_rect: None,
             is_table: false,
             rectangular_activation: false,
             structured_activation: false,
@@ -5116,6 +5480,38 @@ mod tests {
     }
 
     #[test]
+    fn pixel_rounded_scroll_endpoints_do_not_create_tiny_extra_steps() {
+        for (top, bottom) in [(1000.375_f32, 1455.751), (20000.3, 20712.41)] {
+            for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+                assert!(
+                    focus_scroll_target(
+                        (bottom * scale).round() / scale,
+                        top,
+                        bottom,
+                        240.0,
+                        PageDirection::Next
+                    )
+                    .is_none()
+                );
+                assert!(
+                    focus_scroll_target(
+                        (top * scale).round() / scale,
+                        top,
+                        bottom,
+                        240.0,
+                        PageDirection::Previous
+                    )
+                    .is_none()
+                );
+                let target =
+                    focus_scroll_target(bottom - 100.0, top, bottom, 240.0, PageDirection::Next)
+                        .unwrap();
+                assert_eq!(target, bottom);
+            }
+        }
+    }
+
+    #[test]
     fn tall_focus_unit_scrolls_by_one_reading_window_and_clamps_at_its_edges() {
         let top = 620.0;
         let bottom = 2_780.0;
@@ -5213,6 +5609,30 @@ mod tests {
             (focus_offset_after_viewport_resize(unit, 500.0, 800.0, 650.0) - 800.0).abs()
                 < f32::EPSILON
         );
+    }
+
+    #[test]
+    fn document_coordinate_rounding_is_not_a_viewport_resize() {
+        let mut previous = egui::vec2(800.0, 1319.0);
+        let mut maximum_delta = 0.0_f32;
+        for step in 0..2000 {
+            // min.y is below 2^14 and max.y is above it, so their f32
+            // resolutions differ. Alternating ties expose the height jitter.
+            let offset = 15719.001 + step as f32 / 512.0;
+            let viewport =
+                egui::Rect::from_min_size(egui::pos2(0.0, offset), egui::vec2(800.0, 1319.0));
+            maximum_delta = maximum_delta.max((previous.y - viewport.height()).abs());
+            assert!(!focus_viewport_height_changed(previous, viewport.size()));
+            previous = viewport.size();
+        }
+        assert!(
+            maximum_delta > super::MOTION_EPSILON,
+            "reproduce the old false resize"
+        );
+        assert!(focus_viewport_height_changed(
+            previous,
+            egui::vec2(800.0, 1320.0)
+        ));
     }
 
     #[test]

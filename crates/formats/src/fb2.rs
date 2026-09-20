@@ -25,6 +25,7 @@ struct ImageReference {
 pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, FormatError> {
     let xml_bytes = extract_xml(bytes)?;
     let xml = decode_xml(&xml_bytes, BookFormat::Fb2)?;
+    let xml = crate::markup::fb2(&xml).map_err(|error| conversion_error(BookFormat::Fb2, error))?;
     let document =
         Document::parse(&xml).map_err(|error| conversion_error(BookFormat::Fb2, error))?;
     let root = document.root_element();

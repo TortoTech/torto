@@ -233,7 +233,7 @@ impl EpubPublication {
             )));
         }
 
-        let xml = self.archive.read_xml(&descriptor.href)?;
+        let xml = self.archive.read_content_xml(&descriptor.href)?;
         let mut section = parse_section_with_hints_and_image_classifier(
             &xml,
             descriptor,
@@ -551,6 +551,18 @@ impl EpubArchive {
     }
 
     fn read_xml(&self, href: &PublicationUrl) -> Result<String, EpubError> {
+        self.read_xml_document(href, false)
+    }
+
+    fn read_content_xml(&self, href: &PublicationUrl) -> Result<String, EpubError> {
+        self.read_xml_document(href, true)
+    }
+
+    fn read_xml_document(
+        &self,
+        href: &PublicationUrl,
+        recover_content: bool,
+    ) -> Result<String, EpubError> {
         let entry = self
             .entries
             .get(href.path())
@@ -564,6 +576,21 @@ impl EpubArchive {
         )?;
         let bytes = self.read(href)?;
         let text = decode_xml(&bytes, href)?;
+        if recover_content {
+            return crate::markup::html(
+                &text,
+                crate::markup::Limits {
+                    bytes: usize::try_from(self.limits.xml_bytes).unwrap_or(usize::MAX),
+                    depth: self.limits.xml_depth,
+                    ..Default::default()
+                },
+            )
+            .map(Cow::into_owned)
+            .map_err(|message| EpubError::InvalidXml {
+                resource: href.to_string(),
+                message,
+            });
+        }
         sanitize_and_validate_xml(&text, href, self.limits.xml_depth)
     }
 
@@ -1643,6 +1670,56 @@ mod tests {
             .resource(publication.book().cover.as_ref().expect("EPUB 3 cover"))
             .expect("cover resource");
         assert_eq!(cover.bytes.as_ref(), b"fake-png");
+    }
+
+    #[test]
+    fn missing_content_div_ends_preserve_text_anchors_and_original_resource() {
+        let html = r##"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Copyright</title></head><body><div class="outer" id="copyright"><div class="inner"><h1>版权信息</h1><p>书名：测试 &amp; 示例</p><p><em>作者</em><a href="#copyright">返回</a></p><!-- </div> --></body></html>"##;
+        let mut entries = minimal_entries();
+        for (name, bytes, _) in &mut entries {
+            if *name == "OPS/Text/chapter.xhtml" {
+                *bytes = html.as_bytes();
+            }
+        }
+        let publication = EpubPublication::open_bytes(zip_entries(&entries)).unwrap();
+        let href = PublicationUrl::parse("OPS/Text/chapter.xhtml").unwrap();
+        assert!(matches!(
+            publication.archive.read_xml(&href),
+            Err(EpubError::InvalidXml { .. })
+        ));
+        let section = publication.parse_section(0).expect("recovered content");
+        assert!(
+            section
+                .anchors
+                .iter()
+                .any(|anchor| anchor.fragment == "copyright")
+        );
+        let text = section
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                if let Block::Text(text) = block {
+                    Some(text)
+                } else {
+                    None
+                }
+            })
+            .flat_map(|block| &block.content)
+            .filter_map(|inline| {
+                if let Inline::Text(run) = inline {
+                    Some(run.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<String>();
+        assert!(text.contains("版权信息"));
+        assert!(text.contains("书名：测试 & 示例"));
+        assert!(text.contains("作者返回"));
+        let original = publication.resource(&href).unwrap();
+        assert_eq!(original.bytes.as_ref(), html.as_bytes());
+        let repaired = publication.archive.read_content_xml(&href).unwrap();
+        assert_eq!(repaired, html.replace("</body>", "</div></div></body>"));
     }
 
     #[test]

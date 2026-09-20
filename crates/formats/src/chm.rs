@@ -345,7 +345,8 @@ impl BookSource for ChmPublication {
             .ok_or_else(|| PublicationError::ResourceNotFound(format!("section {index}")))?;
         let bytes = resource_bytes(&self.resources, &descriptor.href)
             .ok_or_else(|| PublicationError::ResourceNotFound(descriptor.href.to_string()))?;
-        let xhtml = html_to_xhtml(&decode_text(bytes));
+        let xhtml =
+            html_to_xhtml(&decode_text(bytes)).map_err(PublicationError::InvalidPublication)?;
         let mut section = parse_section(&xhtml, descriptor, |href| {
             resource_bytes(&self.resources, href).map(decode_text)
         })
@@ -611,13 +612,12 @@ fn non_empty_text(value: impl AsRef<str>) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn html_to_xhtml(source: &str) -> String {
-    let mut document = Html::parse_document(source);
+fn html_to_xhtml(source: &str) -> Result<String, String> {
+    let source = crate::markup::html(source, Default::default())?;
+    let mut document = Html::parse_document(&source);
     normalize_legacy_chm_layout(&mut document);
-    // html5ever serializes non-breaking spaces with the HTML-only `&nbsp;`
-    // entity. Reading IR is parsed as XML, where numeric character references
-    // are portable without loading an external DTD.
-    normalize_void_elements(&document.html().replace("&nbsp;", "&#160;"))
+    // Share XML-safe serialization while retaining CHM-specific layout cleanup.
+    crate::markup::serialize_html(&document, Default::default())
 }
 
 fn normalize_legacy_chm_layout(document: &mut Html) {
@@ -678,57 +678,6 @@ fn normalize_legacy_chm_layout(document: &mut Html) {
         if let Some(mut node) = document.tree.get_mut(id) {
             node.detach();
         }
-    }
-}
-
-fn normalize_void_elements(source: &str) -> String {
-    let lower = source.to_ascii_lowercase();
-    let mut output = String::with_capacity(source.len() + 32);
-    let mut copied = 0_usize;
-    let mut search = 0_usize;
-    while let Some(relative_start) = lower[search..].find('<') {
-        let start = search + relative_start;
-        let Some(relative_end) = lower[start..].find('>') else {
-            break;
-        };
-        let end = start + relative_end + 1;
-        let inner = lower[start + 1..end - 1].trim();
-        let name = inner
-            .trim_start_matches('/')
-            .split_ascii_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches('/');
-        if matches!(
-            name,
-            "area"
-                | "base"
-                | "br"
-                | "col"
-                | "embed"
-                | "hr"
-                | "img"
-                | "input"
-                | "link"
-                | "meta"
-                | "param"
-                | "source"
-                | "track"
-                | "wbr"
-        ) && !inner.starts_with('/')
-            && !inner.ends_with('/')
-        {
-            output.push_str(&source[copied..end - 1]);
-            output.push_str("/>");
-            copied = end;
-        }
-        search = end;
-    }
-    if copied == 0 {
-        source.to_owned()
-    } else {
-        output.push_str(&source[copied..]);
-        output
     }
 }
 
@@ -894,7 +843,7 @@ mod tests {
     fn repairs_legacy_html_into_reading_ir_compatible_xhtml() {
         let xhtml = html_to_xhtml(
             r#"<HTML><HEAD><META charset=windows-1252><title>Legacy</title></HEAD><BODY><p>One&nbsp;two<br><img src="images/a.jpg"></BODY></HTML>"#,
-        );
+        ).unwrap();
         let document = roxmltree::Document::parse(&xhtml).expect("well-formed XHTML");
 
         assert_eq!(

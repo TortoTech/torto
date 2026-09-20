@@ -9,6 +9,7 @@ mod chm;
 mod epub;
 mod fb2;
 mod kf8;
+mod markup;
 mod mobi;
 mod pdf;
 mod source;

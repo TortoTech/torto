@@ -347,9 +347,12 @@ impl<'a> ReadingIrParser<'a> {
         while index < children.len() {
             let node = children[index];
             if node.is_element() {
-                if let Some(caption_index) =
-                    inferred_figure_caption_sibling(&children, index, &self.footnote_links)
-                {
+                if let Some(caption_index) = inferred_figure_caption_sibling(
+                    &children,
+                    index,
+                    &self.footnote_links,
+                    &self.styles,
+                ) {
                     self.parse_inferred_figure_pair(node, children[caption_index])?;
                     index = caption_index + 1;
                     continue;
@@ -498,12 +501,20 @@ impl<'a> ReadingIrParser<'a> {
             .styles
             .text_style_for_block(container, TextBlockKind::Paragraph);
         let mut collector = InlineCollector::new(false);
+        let inline_caption = container
+            .tag_name()
+            .name()
+            .eq_ignore_ascii_case("figcaption")
+            && node_has_visible_text(container);
 
         let children = container.children().collect::<Vec<_>>();
         let mut index = 0;
         while index < children.len() {
             let child = children[index];
             if child.is_element()
+                && !(inline_caption
+                    && child.tag_name().name().eq_ignore_ascii_case("img")
+                    && !self.styles.image_establishes_block_layout(child))
                 && (is_block_boundary(child.tag_name().name().to_ascii_lowercase().as_str())
                     || child.tag_name().name().eq_ignore_ascii_case("br"))
             {
@@ -512,9 +523,12 @@ impl<'a> ReadingIrParser<'a> {
                     style,
                     std::mem::replace(&mut collector, InlineCollector::new(false)),
                 );
-                if let Some(caption_index) =
-                    inferred_figure_caption_sibling(&children, index, &self.footnote_links)
-                {
+                if let Some(caption_index) = inferred_figure_caption_sibling(
+                    &children,
+                    index,
+                    &self.footnote_links,
+                    &self.styles,
+                ) {
                     self.parse_inferred_figure_pair(child, children[caption_index])?;
                     index = caption_index + 1;
                     continue;
@@ -533,7 +547,7 @@ impl<'a> ReadingIrParser<'a> {
                 index += 1;
                 continue;
             }
-            if child.is_element() && has_descendant_image(child) {
+            if child.is_element() && has_descendant_image(child) && !inline_caption {
                 self.push_collected_text_block(
                     TextBlockKind::Paragraph,
                     style,
@@ -552,7 +566,8 @@ impl<'a> ReadingIrParser<'a> {
                 child,
                 text_style,
                 None,
-                &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links),
+                &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
+                    .with_inline_images(inline_caption),
                 &mut collector,
             );
             index += 1;
@@ -1481,10 +1496,14 @@ impl<'a> ReadingIrParser<'a> {
         let unsupported_caption = caption_nodes.iter().any(|caption| {
             caption.descendants().skip(1).any(|node| {
                 node.is_element()
-                    && matches!(
-                        node.tag_name().name().to_ascii_lowercase().as_str(),
-                        "figure" | "img" | "image" | "table"
-                    )
+                    && match node.tag_name().name().to_ascii_lowercase().as_str() {
+                        "img" => {
+                            !node_has_visible_text(*caption)
+                                || self.styles.image_establishes_block_layout(node)
+                        }
+                        "figure" | "image" | "table" => true,
+                        _ => false,
+                    }
             })
         });
         if image_nodes.is_empty() || unsupported_caption {
@@ -1824,6 +1843,7 @@ fn inferred_figure_caption_sibling(
     siblings: &[Node<'_, '_>],
     image_index: usize,
     footnote_links: &HashMap<usize, LinkRole>,
+    styles: &StyleSheet,
 ) -> Option<usize> {
     let image = *siblings.get(image_index)?;
     if !is_captionable_image_container(image, footnote_links) {
@@ -1839,7 +1859,7 @@ fn inferred_figure_caption_sibling(
         if !sibling.is_element() {
             continue;
         }
-        return is_inferred_figure_caption(sibling).then_some(index);
+        return is_inferred_figure_caption(sibling, styles).then_some(index);
     }
     None
 }
@@ -1881,7 +1901,7 @@ fn is_captionable_image_container(
         })
 }
 
-fn is_inferred_figure_caption(node: Node<'_, '_>) -> bool {
+fn is_inferred_figure_caption(node: Node<'_, '_>, styles: &StyleSheet) -> bool {
     if !node.is_element()
         || !matches!(
             node.tag_name().name().to_ascii_lowercase().as_str(),
@@ -1889,10 +1909,11 @@ fn is_inferred_figure_caption(node: Node<'_, '_>) -> bool {
         )
         || node.descendants().skip(1).any(|descendant| {
             descendant.is_element()
-                && matches!(
-                    descendant.tag_name().name().to_ascii_lowercase().as_str(),
-                    "div" | "figure" | "figcaption" | "img" | "image" | "table"
-                )
+                && match descendant.tag_name().name().to_ascii_lowercase().as_str() {
+                    "img" => styles.image_establishes_block_layout(descendant),
+                    "div" | "figure" | "figcaption" | "image" | "table" => true,
+                    _ => false,
+                }
         })
     {
         return false;
@@ -4890,6 +4911,69 @@ mod tests {
             "A leaf without a numbered label."
         );
         assert_eq!(text_block_text(label_caption), "▲图6-5 实战中的图表");
+    }
+
+    #[test]
+    fn captions_keep_inline_symbols_but_do_not_absorb_block_images() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html><head><style>.symbol{display:inline;width:1em}.standalone{display:block}</style></head><body>
+        <div><img src="main.jpg"/><p id="caption" style="text-align:center">图十三　洗脚大会。<img class="symbol" src="symbol.png"/>出处说明。</p></div>
+        <img src="next.jpg"/><p>图十四　说明。<img class="standalone" src="other.jpg"/>另一幅图。</p>
+        <figure><img src="explicit.jpg"/><figcaption>Explicit caption <img class="symbol" src="symbol.png"/> end.</figcaption></figure>
+        </body></html>"#;
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let caption = section
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Text(text) if text.kind == TextBlockKind::Caption => Some(text),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(text_block_text(caption), "图十三　洗脚大会。出处说明。");
+        assert_eq!(
+            caption
+                .content
+                .iter()
+                .filter(|inline| matches!(inline, Inline::Image(_)))
+                .count(),
+            1
+        );
+        assert!(
+            section
+                .anchors
+                .iter()
+                .any(|anchor| anchor.fragment == "caption")
+        );
+        assert!(section.blocks.iter().any(
+            |block| matches!(block, Block::Image(image) if image.href.path().ends_with("other.jpg"))
+        ));
+        let figure = section
+            .blocks
+            .iter()
+            .find_map(|block| {
+                if let Block::Figure(figure) = block {
+                    Some(figure)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(figure.images.len(), 1);
+        assert_eq!(
+            figure.captions[0]
+                .content
+                .iter()
+                .filter(|inline| matches!(inline, Inline::Image(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]

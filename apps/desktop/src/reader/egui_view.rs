@@ -773,12 +773,17 @@ impl DesktopReader {
         let mut page_rect = Rect::NOTHING;
         let keyboard_scroll_delta = std::mem::take(&mut self.pending_keyboard_scroll_delta);
         let scroll_output = scroll_area.show_viewport(ui, |ui, viewport| {
-            ui.set_width(viewport.width());
-            let content_padding = self.scroll_content_padding(viewport.height());
+            // `viewport` is in document coordinates: max.y - min.y loses
+            // precision at large scroll offsets. The screen-space clip stays
+            // stable and must also supply the size used by navigation/reflow.
+            let visible_rect = ui.clip_rect();
+            let viewport_size = Vec2::new(viewport.width(), visible_rect.height());
+            ui.set_width(viewport_size.x);
+            let content_padding = self.scroll_content_padding(viewport_size.y);
             let scroll_content_height = if self.is_focus_mode() {
-                focus_scroll_content_height(layout.content_height, viewport.height())
+                focus_scroll_content_height(layout.content_height, viewport_size.y)
             } else {
-                (layout.content_height + content_padding * 2.0).max(viewport.height())
+                (layout.content_height + content_padding * 2.0).max(viewport_size.y)
             };
             ui.set_height(scroll_content_height);
             if keyboard_scroll_delta.abs() > f32::EPSILON {
@@ -789,7 +794,6 @@ impl DesktopReader {
             // leaks the rounding residue into the page texture position and produces a
             // one-pixel wobble near the end of programmatic scrolling. Its clip rect is
             // already the stable viewport in screen coordinates.
-            let visible_rect = ui.clip_rect();
             page_rect = visible_rect;
             let painter = ui.painter().with_clip_rect(visible_rect);
             painter.rect_filled(visible_rect, 0.0, background);
@@ -810,7 +814,7 @@ impl DesktopReader {
                 ui.ctx(),
                 super::ScrollViewportState {
                     offset_y: viewport.min.y,
-                    size: viewport.size(),
+                    size: viewport_size,
                 },
             );
             if self.image_preview.is_none() && !interaction_blocked {
@@ -853,7 +857,7 @@ impl DesktopReader {
             && let Some(target_offset) = self
                 .focus_units
                 .get(index)
-                .map(|unit| focus_unit_target_offset_for_rect(unit.rect, viewport_height))
+                .map(|unit| unit.target_offset(viewport_height))
         {
             // The native scroll bar supplies a continuous offset. Quantize its
             // state to the nearest focus unit so dragging the handle previews
@@ -5674,6 +5678,235 @@ mod reference_suggestion_label_tests {
         eprintln!(
             "Verified: chapter title + 2 overview blocks; Ctrl+Home/End => 0/1; child subsection unchanged; physical-file transition reuses the same layout."
         );
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_PICTURE_BOOK"]
+    fn local_picture_scroll_distances() {
+        use crate::reader::*;
+        struct EmptyHighlights;
+        impl crate::highlights::HighlightRepository for EmptyHighlights {
+            fn highlights_for_book(
+                &self,
+                _: &str,
+            ) -> crate::highlights::HighlightResult<Vec<StoredHighlight>> {
+                Ok(Vec::new())
+            }
+            fn insert_highlight(
+                &self,
+                _: &StoredHighlight,
+            ) -> crate::highlights::HighlightResult<()> {
+                panic!("read-only audit")
+            }
+            fn update_highlight(
+                &self,
+                _: &StoredHighlight,
+            ) -> crate::highlights::HighlightResult<bool> {
+                panic!("read-only audit")
+            }
+            fn remove_highlight(&self, _: &str) -> crate::highlights::HighlightResult<bool> {
+                panic!("read-only audit")
+            }
+        }
+        for (width, height) in [(800, 600), (1000, 800), (1400, 1000), (2560, 1319)] {
+            let path = std::path::PathBuf::from(std::env::var("TORTO_PICTURE_BOOK").unwrap());
+            let book = rebook_formats::open_file(&path).unwrap();
+            let rewrite_source = std::sync::Arc::new(RewriteBookSource::new(book.source()));
+            let settings = PluginSettings::default();
+            let translation_source = std::sync::Arc::new(TranslationBookSource::new(
+                rewrite_source.clone(),
+                settings.translation_mode,
+            ));
+            let structure_source =
+                std::sync::Arc::new(ParagraphStructureSource::new(translation_source.clone()));
+            let source: std::sync::Arc<dyn BookSource> = structure_source.clone();
+            let chapter = source
+                .book()
+                .table_of_contents
+                .iter()
+                .find(|entry| entry.label == "图版")
+                .unwrap();
+            let target = chapter.href.clone().unwrap();
+
+            let mut session = ReaderSession::open(
+                source.clone(),
+                rebook_layout::LayoutViewport::new(width, height).unwrap(),
+                ReaderStyle {
+                    spread: SpreadMode::Scroll,
+                    typesetting: ReaderTypesetting::unified(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            session.go_to_href(&target).unwrap();
+            let mut reader = DesktopReader::new(
+                session,
+                DesktopReaderResources {
+                    source,
+                    rewrite_source,
+                    translation_source,
+                    structure_source,
+                    pdf_ocr_controller: None,
+                    pdf_ocr_available: false,
+                    pdf_ocr_mode: PdfOcrViewMode::Original,
+                    cover: None,
+                    format: BookFormat::Epub,
+                    book_id: "prelude-audit".into(),
+                    display_metadata: BookDisplayMetadata {
+                        id: "prelude-audit".into(),
+                        title: "Audit".into(),
+                        authors: Vec::new(),
+                    },
+                    pdf_metadata_missing: PdfMetadataMissing {
+                        title: false,
+                        authors: false,
+                    },
+                    highlight_store: HighlightStore::from_repository(EmptyHighlights),
+                    highlights: Vec::new(),
+                    progress_store: None,
+                    restored_source_range: None,
+                    plugin_settings: settings,
+                    language: AppLanguage::SimplifiedChinese,
+                    reading_mode: ReadingMode::Focus,
+                    hide_cursor_in_focus_mode: false,
+                    selection_granularity: SelectionGranularity::Paragraph,
+                    shortcuts: ShortcutPreferences::default(),
+                    sync_settings: SyncSettings::new_device(),
+                    sync_password: String::new(),
+                    source_path: path,
+                },
+            );
+            let layout = reader.current_scroll_layout().unwrap();
+            reader.rebuild_focus_units(&layout);
+            let mut checked = 0;
+            for index in 0..reader.focus_units.len() {
+                let unit = &reader.focus_units[index];
+                if !unit.is_image || unit.rect.height() <= height as f32 {
+                    continue;
+                }
+                let label = unit.text.chars().take(24).collect::<String>();
+                let start = unit.target_offset(height as f32);
+                let (_, end) = image_caption_scroll_bounds(unit, height as f32)
+                    .or_else(|| {
+                        focus_navigation_scroll_bounds(
+                            unit.rect,
+                            height as f32,
+                            height as f32 * 0.5,
+                            start,
+                            None,
+                        )
+                    })
+                    .unwrap();
+                if let Some(caption) = unit.fitting_caption(height as f32)
+                    && unit
+                        .image_rect
+                        .is_some_and(|image| image.height() <= height as f32)
+                    && image_caption_scroll_bounds(unit, height as f32).is_some()
+                {
+                    assert!((end - caption.center().y).abs() < 0.01);
+                    assert_eq!(
+                        unit.navigation_target(
+                            start,
+                            height as f32,
+                            start,
+                            end,
+                            PageDirection::Next
+                        ),
+                        Some(end)
+                    );
+                }
+                reader.focus_unit_index = index;
+                for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+                    reader.ui.focus_scroll_motion = None;
+                    reader.focus_overflow_origin = None;
+                    reader.focus_target_offset = None;
+                    let mut offset = (start * scale).round() / scale;
+                    let mut distances = Vec::new();
+                    for direction in [PageDirection::Next, PageDirection::Previous] {
+                        for step_index in 0..1000 {
+                            reader.scroll_viewport = Some(ScrollViewportState {
+                                offset_y: offset,
+                                size: egui::vec2(width as f32, height as f32),
+                            });
+                            if !reader.scroll_within_tall_focus_unit(direction) {
+                                break;
+                            }
+                            let motion = reader.ui.focus_scroll_motion.as_mut().unwrap();
+                            let next = motion.target;
+                            let distance = (next - offset).abs();
+                            assert!(
+                                distance > 1.0,
+                                "tiny corrective step: {width}x{height} {label} scale={scale} delta={distance}"
+                            );
+                            assert!(step_index < 999, "scroll must reach its boundary");
+                            distances.push(distance);
+                            motion.advance(Duration::from_secs(1));
+                            offset = (next * scale).round() / scale;
+                            reader.ui.focus_scroll_motion = None;
+                        }
+                    }
+                    // The last animation can finish before the viewport receives
+                    // its final offset; that pending endpoint must win.
+                    reader.focus_target_offset = Some(end);
+                    reader.scroll_viewport.as_mut().unwrap().offset_y = end - 8.0;
+                    assert!(!reader.scroll_within_tall_focus_unit(PageDirection::Next));
+                    eprintln!(
+                        "{width}x{height} unit={index} scale={scale} {label} distances={distances:?}"
+                    );
+                }
+                if label.starts_with("图十四") {
+                    reader.ui.focus_scroll_motion = None;
+                    reader.focus_target_offset = None;
+                    reader.focus_overflow_origin = None;
+                    reader.scroll_viewport = Some(ScrollViewportState {
+                        offset_y: start,
+                        size: egui::vec2(width as f32, height as f32),
+                    });
+                    let ctx = egui::Context::default();
+                    for _ in 0..100 {
+                        if !reader.scroll_within_tall_focus_unit(PageDirection::Next) {
+                            break;
+                        }
+                        let expected = reader.ui.focus_scroll_motion.unwrap().target;
+                        let now = Instant::now();
+                        reader.ui.last_motion_tick = Some(now);
+                        let mut current = reader.scroll_viewport.unwrap().offset_y;
+                        for frame in 1..=60 {
+                            reader.advance_motion(now + Duration::from_millis(frame * 16));
+                            current = reader
+                                .ui
+                                .focus_scroll_motion
+                                .map(|motion| motion.value)
+                                .or_else(|| reader.focus_target_offset.take())
+                                .unwrap_or(current);
+                            // Reproduce ScrollArea's large-coordinate size calculation.
+                            let document_viewport = Rect::from_min_size(
+                                Pos2::new(0.0, current),
+                                egui::vec2(width as f32, height as f32),
+                            );
+                            reader.update_scroll_viewport(
+                                &ctx,
+                                ScrollViewportState {
+                                    offset_y: current,
+                                    size: document_viewport.size(),
+                                },
+                            );
+                            if reader.ui.focus_scroll_motion.is_none() {
+                                assert!(
+                                    (current - expected).abs() < 1.0,
+                                    "Figure 14 animation interrupted at {current}, expected {expected}"
+                                );
+                                break;
+                            }
+                        }
+                        assert!((current - expected).abs() < 1.0);
+                    }
+                    assert!((reader.scroll_viewport.unwrap().offset_y - end).abs() < 1.0);
+                }
+                checked += 1;
+            }
+            assert!(checked > 0);
+        }
     }
 
     #[test]
