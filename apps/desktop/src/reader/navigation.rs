@@ -301,7 +301,7 @@ impl DesktopReader {
         }
     }
 
-    fn progress_source_range(&self) -> Option<SourceRange> {
+    pub(super) fn progress_source_range(&self) -> Option<SourceRange> {
         if self.is_focus_mode() {
             return self
                 .focus_units

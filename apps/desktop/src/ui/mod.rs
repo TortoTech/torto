@@ -14,7 +14,7 @@ use egui::{
 pub(crate) use icons::{Icon, IconWidget, paint_icon};
 
 use crate::preferences::{
-    AppTheme, DEFAULT_INTERFACE_FONT_SIZE, InterfaceTypography, SYSTEM_INTERFACE_FONT,
+    AppLanguage, AppTheme, DEFAULT_INTERFACE_FONT_SIZE, InterfaceTypography, SYSTEM_INTERFACE_FONT,
 };
 
 const EGUI_BASE_FONT_SIZE: f32 = 13.0;
@@ -193,6 +193,7 @@ pub(crate) fn footnote_link_color() -> Color32 {
 pub(crate) fn configure(
     ctx: &egui::Context,
     interface_typography: &InterfaceTypography,
+    language: AppLanguage,
     runtime: &tokio::runtime::Handle,
 ) {
     egui_extras::install_image_loaders(ctx);
@@ -206,7 +207,7 @@ pub(crate) fn configure(
         options.sync_window_theme = true;
     });
     configure_tessellation(ctx);
-    apply_interface_typography(ctx, interface_typography);
+    apply_interface_typography(ctx, interface_typography, language);
 
     apply_visuals(ctx, &Palette::light());
     ctx.all_styles_mut(|style| {
@@ -251,6 +252,7 @@ fn configure_tessellation(ctx: &egui::Context) {
 pub(crate) fn apply_interface_typography(
     ctx: &egui::Context,
     interface_typography: &InterfaceTypography,
+    language: AppLanguage,
 ) {
     let mut interface_typography = interface_typography.clone();
     interface_typography.normalize();
@@ -265,13 +267,17 @@ pub(crate) fn apply_interface_typography(
     let mut database = fontdb::Database::new();
     database.load_system_fonts();
     let requested_families = if interface_typography.font_family == SYSTEM_INTERFACE_FONT {
-        system_ui_font_candidates()
+        system_ui_font_candidates(language)
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
     } else {
         std::iter::once(interface_typography.font_family.clone())
-            .chain(system_ui_font_candidates().iter().map(ToString::to_string))
+            .chain(
+                system_ui_font_candidates(language)
+                    .iter()
+                    .map(ToString::to_string),
+            )
             .collect()
     };
     let mut interface_fonts = Vec::new();
@@ -376,18 +382,32 @@ fn load_system_font(
 }
 
 #[cfg(target_os = "windows")]
-const fn system_ui_font_candidates() -> &'static [&'static str] {
-    &["Segoe UI", "Microsoft YaHei UI"]
+fn system_ui_font_candidates(language: AppLanguage) -> &'static [&'static str] {
+    // CJK UI fonts also contain Latin glyphs. Using the same face for mixed
+    // labels avoids egui vertically centering two different fallback metrics.
+    if language.resolved() == AppLanguage::SimplifiedChinese {
+        &["Microsoft YaHei UI", "Segoe UI"]
+    } else {
+        &["Segoe UI", "Microsoft YaHei UI"]
+    }
 }
 
 #[cfg(target_os = "macos")]
-const fn system_ui_font_candidates() -> &'static [&'static str] {
-    &[".AppleSystemUIFont", "PingFang SC", "Helvetica Neue"]
+fn system_ui_font_candidates(language: AppLanguage) -> &'static [&'static str] {
+    if language.resolved() == AppLanguage::SimplifiedChinese {
+        &["PingFang SC", ".AppleSystemUIFont", "Helvetica Neue"]
+    } else {
+        &[".AppleSystemUIFont", "PingFang SC", "Helvetica Neue"]
+    }
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-const fn system_ui_font_candidates() -> &'static [&'static str] {
-    &["Noto Sans", "Noto Sans CJK SC", "DejaVu Sans"]
+fn system_ui_font_candidates(language: AppLanguage) -> &'static [&'static str] {
+    if language.resolved() == AppLanguage::SimplifiedChinese {
+        &["Noto Sans CJK SC", "Noto Sans", "DejaVu Sans"]
+    } else {
+        &["Noto Sans", "Noto Sans CJK SC", "DejaVu Sans"]
+    }
 }
 
 // Rebuild egui visuals from a palette. Startup applies the light palette;
@@ -837,6 +857,41 @@ mod tests {
             interface_extra_text_line_spacing(24.0)
                 > interface_extra_text_line_spacing(EGUI_BASE_FONT_SIZE)
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn chinese_system_ui_keeps_latin_and_cjk_on_the_same_font_baseline() {
+        for language in [AppLanguage::English, AppLanguage::SimplifiedChinese] {
+            let ctx = egui::Context::default();
+            apply_interface_typography(&ctx, &InterfaceTypography::default(), language);
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                for size in [12.0, 14.0, 18.0] {
+                    let galley = ui.painter().layout_no_wrap(
+                        "AI排版".into(),
+                        egui::FontId::proportional(size),
+                        Color32::BLACK,
+                    );
+                    let glyphs = &galley.rows[0].glyphs;
+                    println!(
+                        "{language:?} {size}: Latin baseline={}, CJK baseline={}",
+                        glyphs[0].pos.y, glyphs[2].pos.y
+                    );
+                    if language == AppLanguage::SimplifiedChinese {
+                        for glyph in glyphs {
+                            assert!((glyph.pos.y - glyphs[0].pos.y).abs() < 0.01);
+                            assert!(
+                                (glyph.font_face_height - glyphs[0].font_face_height).abs() < 0.01
+                            );
+                            assert!(
+                                (glyph.font_face_ascent - glyphs[0].font_face_ascent).abs() < 0.01
+                            );
+                        }
+                    }
+                }
+            });
+            output.textures_delta.clear();
+        }
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::plugins::semantic_layout::SemanticLayoutSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,6 +72,7 @@ mod footnote_layout;
 mod interaction;
 mod navigation;
 pub(super) mod render;
+mod semantic_layout;
 mod settings_controller;
 mod ui_controller;
 
@@ -210,7 +212,14 @@ pub(super) fn open_reader(
     } else {
         TranslationBookSource::new(rewrite_source.clone(), plugin_settings.translation_mode)
     });
-    let structure_source = Arc::new(ParagraphStructureSource::new(translation_source.clone()));
+    let semantic_source = Arc::new(SemanticLayoutSource::new(
+        translation_source.clone(),
+        rewrite_source.clone(),
+    ));
+    if !fixed_page {
+        semantic_source.configure(&book_id, &plugin_settings);
+    }
+    let structure_source = Arc::new(ParagraphStructureSource::new(semantic_source.clone()));
     let source: Arc<dyn BookSource> = structure_source.clone();
     let mut highlight_store = HighlightStore::from_repository(local_store.clone());
     let mut highlights = highlight_store.for_book(&book_id);
@@ -310,6 +319,7 @@ pub(super) fn open_reader(
             rewrite_source,
             translation_source,
             structure_source,
+            semantic_source,
             pdf_ocr_controller,
             pdf_ocr_available,
             pdf_ocr_mode,
@@ -475,6 +485,7 @@ fn resolve_book_display_metadata(
 
 pub(super) struct DesktopReader {
     completion: Option<completion::CompletionPage>,
+    semantic_layout: semantic_layout::SemanticLayoutState,
     footnote_layout: footnote_layout::FootnoteRenderer,
     statistics: crate::statistics::Tracker,
     reader: ReaderSession,
@@ -482,6 +493,7 @@ pub(super) struct DesktopReader {
     rewrite_source: Arc<RewriteBookSource>,
     translation_source: Arc<TranslationBookSource>,
     structure_source: Arc<ParagraphStructureSource>,
+    semantic_source: Arc<SemanticLayoutSource>,
     pdf_ocr_controller: Option<Arc<PdfOcrSourceController>>,
     snapshot: ReaderSnapshot,
     cover: Option<Vec<u8>>,
@@ -1872,6 +1884,12 @@ struct FocusReflowAnchor {
     image_progress: Option<f32>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusReflowKind {
+    ParagraphStructure,
+    DocumentLayout,
+}
+
 fn reflow_anchor_offset(
     content_y: f32,
     screen_y: f32,
@@ -1888,7 +1906,7 @@ impl DesktopReader {
     pub(crate) fn startup_error(&self) -> Option<&str> {
         self.error.as_deref().or(self.reopen_error.as_deref())
     }
-    fn capture_focus_reflow_anchor(&self) -> Option<FocusReflowAnchor> {
+    fn capture_focus_reflow_anchor(&self, kind: FocusReflowKind) -> Option<FocusReflowAnchor> {
         if !self.is_focus_mode() {
             return None;
         }
@@ -1939,7 +1957,11 @@ impl DesktopReader {
             range,
             screen_y: anchor_y + padding - viewport.offset_y,
             uses_baseline: baseline.is_some(),
-            visible_start_offset: (top >= visible_top && top < visible_top + viewport.size.y)
+            // Whole-document changes must preserve the viewport, not translate
+            // one paragraph independently of neighboring text and images.
+            visible_start_offset: (kind == FocusReflowKind::ParagraphStructure
+                && top >= visible_top
+                && top < visible_top + viewport.size.y)
                 .then_some(viewport.offset_y),
             viewport_height: viewport.size.y,
             image_progress: None,
@@ -2897,6 +2919,7 @@ struct DesktopReaderResources {
     rewrite_source: Arc<RewriteBookSource>,
     translation_source: Arc<TranslationBookSource>,
     structure_source: Arc<ParagraphStructureSource>,
+    semantic_source: Arc<SemanticLayoutSource>,
     pdf_ocr_controller: Option<Arc<PdfOcrSourceController>>,
     pdf_ocr_available: bool,
     pdf_ocr_mode: PdfOcrViewMode,
@@ -3506,6 +3529,7 @@ impl DesktopReader {
             rewrite_source,
             translation_source,
             structure_source,
+            semantic_source,
             pdf_ocr_controller,
             pdf_ocr_available,
             pdf_ocr_mode,
@@ -3598,12 +3622,14 @@ impl DesktopReader {
         Self {
             reader,
             completion: None,
+            semantic_layout: Default::default(),
             statistics: crate::statistics::Tracker::new(&book_id),
             footnote_layout: Default::default(),
             source,
             rewrite_source,
             translation_source,
             structure_source,
+            semantic_source,
             pdf_ocr_controller,
             snapshot,
             cover,

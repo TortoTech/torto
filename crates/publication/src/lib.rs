@@ -1015,6 +1015,10 @@ pub struct BlockStyle {
     /// unified typesetting to distinguish authored intent from fallback style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authored_alignment: Option<TextAlignment>,
+    /// Alignment recommended by a semantic overlay for unified typesetting.
+    /// Kept separate from authored styles so book-mode rendering retains them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_alignment: Option<TextAlignment>,
     pub margin_before: f32,
     pub margin_after: f32,
     /// A structural line break follows this block. Layout engines should retain
@@ -1043,6 +1047,7 @@ impl Default for BlockStyle {
         Self {
             align: TextAlignment::Start,
             authored_alignment: None,
+            semantic_alignment: None,
             margin_before: 0.0,
             margin_after: 16.0,
             hard_break_after: false,

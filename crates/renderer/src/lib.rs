@@ -933,9 +933,37 @@ struct ShapedTextRegion {
     origin_y: f32,
     available_width: f32,
     source: SourceRange,
+    discretionary_hyphens: Vec<DiscretionaryHyphen>,
+}
+
+#[derive(Clone)]
+struct DiscretionaryHyphen {
+    line_index: usize,
+    start: f32,
+    end: f32,
 }
 
 impl ShapedTextRegion {
+    fn attach_discretionary_hyphen(&mut self, text: &TextPlacement) {
+        let Some(glyph_line) = text.layout.get(0) else {
+            return;
+        };
+        let baseline = text.origin_y + glyph_line.metrics().baseline;
+        let start = text.origin_x - self.origin_x;
+        if let Some(line_index) = self.lines.clone().find(|index| {
+            self.layout.get(*index).is_some_and(|line| {
+                (self.origin_y + line.metrics().baseline - baseline).abs() < 0.05
+                    && (positioned_line_content_end(line) - start).abs() < 0.05
+            })
+        }) {
+            self.discretionary_hyphens.push(DiscretionaryHyphen {
+                line_index,
+                start,
+                end: start + text.available_width,
+            });
+        }
+    }
+
     fn visible_byte_range(&self) -> Option<Range<usize>> {
         let mut visible = self.lines.clone().filter_map(|line_index| {
             let line = self.layout.get(line_index)?;
@@ -992,6 +1020,29 @@ impl ShapedTextRegion {
         } else {
             y.clamp(top + 0.01, bottom - 0.01) - self.origin_y
         };
+        // A discretionary hyphen has no source character. A pointer on it still
+        // belongs to the preceding cluster, rather than falling outside the text.
+        for hyphen in &self.discretionary_hyphens {
+            let line = self.layout.get(hyphen.line_index)?;
+            if (hyphen.start..=hyphen.end).contains(&local_x)
+                && (line.metrics().block_min_coord..=line.metrics().block_max_coord)
+                    .contains(&local_y)
+            {
+                let range = line
+                    .runs()
+                    .filter_map(|run| {
+                        run.visual_clusters()
+                            .last()
+                            .map(|cluster| cluster.text_range())
+                    })
+                    .last()?;
+                return Some(TextRegionHit {
+                    byte_index: range.end,
+                    cluster_start: range.start,
+                    cluster_end: range.end,
+                });
+            }
+        }
         let (byte_index, cluster_start, cluster_end) = if exact {
             let (cluster, side) = Cluster::from_point_exact(&self.layout, local_x, local_y)?;
             let range = cluster.text_range();
@@ -1041,7 +1092,12 @@ impl ShapedTextRegion {
         if byte_range.end <= byte_range.start {
             return Vec::new();
         }
-        let shared_wrapped_end = shared_wrapped_content_end(&self.layout);
+        let shared_wrapped_end = self
+            .discretionary_hyphens
+            .iter()
+            .fold(shared_wrapped_content_end(&self.layout), |end, hyphen| {
+                end.max(hyphen.end)
+            });
         let selection = Selection::new(
             Cursor::from_byte_index(&self.layout, byte_range.start, Affinity::Downstream),
             Cursor::from_byte_index(&self.layout, byte_range.end, Affinity::Upstream),
@@ -1138,6 +1194,21 @@ impl ShapedTextRegion {
                     }
                 }
 
+                // Cover the display-only glyph only when the selection reaches
+                // its source line's end. This applies to partial-word selections
+                // too, without adding synthetic characters to copied text.
+                if let Some(line) = self.layout.get(line_index)
+                    && selected_text.start < line.text_range().end
+                    && selected_text.end >= line.text_range().end
+                {
+                    for hyphen in self
+                        .discretionary_hyphens
+                        .iter()
+                        .filter(|h| h.line_index == line_index)
+                    {
+                        x1 = x1.max(f64::from(hyphen.end));
+                    }
+                }
                 Rect::new(
                     x0 + f64::from(self.origin_x),
                     rect.y0 + f64::from(self.origin_y),
@@ -1657,7 +1728,11 @@ impl DisplayListCompiler {
         let mut quote_regions = Vec::new();
         let mut footnote_regions = Vec::new();
         let mut text_groups: Vec<SourceTextGroup> = Vec::new();
+        let mut parent_text_region = None;
         for item in &page.items {
+            if !matches!(item, PageItem::Text(_)) {
+                parent_text_region = None;
+            }
             match item {
                 PageItem::Text(text) => {
                     let starts = (
@@ -1667,7 +1742,16 @@ impl DisplayListCompiler {
                         footnote_regions.len(),
                     );
                     if let Some(region) = text_region(text) {
+                        parent_text_region = Some(text_regions.len());
                         text_regions.push(region);
+                    } else if text.text.as_ref() == "\u{2010}" {
+                        if let Some(index) = parent_text_region
+                            && let Some(TextRegion::Shaped(parent)) = text_regions.get_mut(index)
+                        {
+                            parent.attach_discretionary_hyphen(text);
+                        }
+                    } else {
+                        parent_text_region = None;
                     }
                     compile_text_commands(
                         &mut commands,
@@ -2005,6 +2089,7 @@ fn text_region(text: &TextPlacement) -> Option<TextRegion> {
         origin_y: text.origin_y,
         available_width: text.available_width,
         source: text.source.clone()?,
+        discretionary_hyphens: Vec::new(),
     }))
 }
 
@@ -3002,6 +3087,178 @@ mod tests {
             "the first line must share the hanging inset without including the marker"
         );
         assert!((continuation_rect.x1 - f64::from(expected_right + 24.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn list_hyphens_are_inside_activation_geometry_without_becoming_source_text() {
+        use rebook_layout::{LayoutEngine, ReaderStyle, ReaderTypesetting, SpreadMode};
+        use rebook_publication::{
+            Block, BlockStyle, Book, BookSource, Inline, Metadata, PublicationError, PublicationId,
+            PublicationUrl, Resource, TextBlock, TextBlockKind, TextLanguage, TextRun, TextStyle,
+            WritingSystem,
+        };
+        struct Source(Book);
+        impl BookSource for Source {
+            fn book(&self) -> &Book {
+                &self.0
+            }
+            fn parse_section(
+                &self,
+                _: usize,
+            ) -> Result<rebook_publication::Section, PublicationError> {
+                unreachable!()
+            }
+            fn resource(&self, _: &PublicationUrl) -> Result<Resource, PublicationError> {
+                unreachable!()
+            }
+        }
+        let source = Source(Book {
+            id: PublicationId::new("list-hyphen-geometry").unwrap(),
+            metadata: Metadata {
+                languages: vec!["en-US".into()],
+                ..Metadata::default()
+            },
+            cover: None,
+            sections: vec![],
+            table_of_contents: vec![],
+        });
+        let body = "Do this exercise four times, once per day for four consecutive days. Keep in mind: Write for fifteen to twenty minutes about a challenging event that affected your life. Extraordinary typographical considerations improve international readability and representation.";
+        let start = SourceAnchor {
+            spine: rebook_publication::SpineItemId::new("chapter").unwrap(),
+            node: "list-item".into(),
+            text_offset: 0,
+        };
+        let range = SourceRange {
+            end: SourceAnchor {
+                text_offset: body.chars().count() as u64,
+                ..start.clone()
+            },
+            start,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            writing_system: WritingSystem::Latin,
+            spread: SpreadMode::Single,
+            horizontal_margin: 12.0,
+            top_margin: 12.0,
+            bottom_margin: 12.0,
+            ..ReaderStyle::default()
+        };
+        let mut engine = LayoutEngine::new();
+        let mut hyphen_count = 0;
+        let mut continuation_hyphen = false;
+        let mut exceeded_old_geometry = false;
+        for depth in [0, 1] {
+            let block = Block::Text(TextBlock {
+                kind: TextBlockKind::ListItem {
+                    ordered: false,
+                    ordinal: 1,
+                    marker_visible: true,
+                    depth,
+                },
+                content: vec![Inline::Text(TextRun {
+                    text: body.into(),
+                    style: TextStyle {
+                        language: TextLanguage::EnglishUs,
+                        ..TextStyle::default()
+                    },
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: Some(range.clone()),
+            });
+            for width in [160, 220, 300] {
+                let layout = engine
+                    .layout_blocks(
+                        &source,
+                        std::slice::from_ref(&block),
+                        LayoutViewport::new(width, 180).unwrap(),
+                        &style,
+                    )
+                    .unwrap();
+                let mut copied = String::new();
+                for page in &layout.pages {
+                    let list = DisplayListCompiler.compile(page);
+                    let rects = list.source_rects(std::slice::from_ref(&range));
+                    let emitted = page.items.iter().filter(|item| matches!(item, PageItem::Text(t) if t.source.is_none() && t.text.as_ref()=="\u{2010}")).count();
+                    let attached: usize = list
+                        .text_regions
+                        .iter()
+                        .map(|r| match r {
+                            TextRegion::Shaped(r) => r.discretionary_hyphens.len(),
+                            _ => 0,
+                        })
+                        .sum();
+                    assert_eq!(
+                        attached, emitted,
+                        "every display-only hyphen needs parent geometry"
+                    );
+                    for (region_index, region) in list.text_regions.iter().enumerate() {
+                        let TextRegion::Shaped(region) = region else {
+                            continue;
+                        };
+                        let visible = region.visible_byte_range().unwrap();
+                        copied.push_str(&region.selection_fragment(visible).unwrap().quote);
+                        for hyphen in &region.discretionary_hyphens {
+                            hyphen_count += 1;
+                            continuation_hyphen |= hyphen.line_index > 0;
+                            exceeded_old_geometry |=
+                                hyphen.end > shared_wrapped_content_end(&region.layout) + 0.01;
+                            let line = region.layout.get(hyphen.line_index).unwrap();
+                            let x = f64::from(region.origin_x + hyphen.end);
+                            let y = region.origin_y + line.metrics().baseline;
+                            assert!(
+                                rects.iter().any(|rect| rect.y0 <= f64::from(y)
+                                    && rect.y1 >= f64::from(y)
+                                    && rect.x1 >= x - 0.01),
+                                "active geometry excludes the rendered hyphen"
+                            );
+                            let last = line
+                                .runs()
+                                .filter_map(|run| {
+                                    run.visual_clusters()
+                                        .last()
+                                        .map(|cluster| cluster.text_range())
+                                })
+                                .last()
+                                .unwrap();
+                            let partial =
+                                list.selection_fragment(region_index, last.clone()).unwrap();
+                            assert!(partial.rects.iter().any(|rect| rect.x1 >= x - 0.01));
+                            assert!(!partial.quote.contains('\u{2010}'));
+                            let hit = list
+                                .hit_test_text(
+                                    region.origin_x + f32::midpoint(hyphen.start, hyphen.end),
+                                    y,
+                                    true,
+                                )
+                                .unwrap();
+                            assert_eq!(hit.region_index, region_index);
+                            assert_eq!(hit.cluster_end, last.end);
+                            let earlier = region.selection_rects(
+                                line.text_range().start.max(region.source_text_start)..last.start,
+                            );
+                            assert!(
+                                earlier.iter().all(|rect| rect.x1 < x),
+                                "a selection before the final cluster must not include the hyphen"
+                            );
+                        }
+                    }
+                }
+                assert_eq!(
+                    copied, body,
+                    "copying must omit both synthetic markers and hyphens"
+                );
+            }
+        }
+        assert!(
+            hyphen_count > 0 && continuation_hyphen,
+            "fixture must exercise hyphens on hanging continuation lines"
+        );
+        assert!(
+            exceeded_old_geometry,
+            "fixture must reproduce the missing right-edge geometry"
+        );
     }
 
     #[test]

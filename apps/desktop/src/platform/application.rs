@@ -236,7 +236,12 @@ impl Application {
         runtime: tokio::runtime::Runtime,
     ) -> Self {
         let egui_ctx = egui::Context::default();
-        crate::ui::configure(&egui_ctx, app.interface_typography(), runtime.handle());
+        crate::ui::configure(
+            &egui_ctx,
+            app.interface_typography(),
+            app.interface_language(),
+            runtime.handle(),
+        );
         crate::ui::set_theme(&egui_ctx, app.theme());
         crate::ui::apply_visuals(&egui_ctx, &crate::ui::palette());
         let repaint_proxy = proxy.clone();

@@ -798,6 +798,7 @@ mod tests {
         crate::ui::apply_interface_typography(
             &ctx,
             &crate::preferences::InterfaceTypography::default(),
+            crate::preferences::AppLanguage::English,
         );
         let mut cache = CommonMarkCache::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {

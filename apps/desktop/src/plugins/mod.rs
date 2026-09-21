@@ -10,6 +10,7 @@ mod pdf_toc;
 mod pdf_vision;
 mod rewrite;
 mod search;
+pub(crate) mod semantic_layout;
 mod structure;
 mod translation;
 
@@ -252,6 +253,8 @@ impl AiProvider {
     reason = "plugin settings persist independent user-facing feature toggles"
 )]
 pub struct PluginSettings {
+    #[serde(default)]
+    pub semantic_layout: semantic_layout::SemanticLayoutSettings,
     pub providers: Vec<AiProvider>,
     pub chat_provider: String,
     pub chat_model: String,
@@ -292,6 +295,7 @@ impl Default for PluginSettings {
     fn default() -> Self {
         Self {
             providers: vec![AiProvider::default()],
+            semantic_layout: semantic_layout::SemanticLayoutSettings::default(),
             chat_provider: DEFAULT_PROVIDER_ID.into(),
             chat_model: DEFAULT_MODEL.into(),
             chat_reasoning_effort: ReasoningEffort::Default,
@@ -492,6 +496,14 @@ impl PluginSettings {
 
     pub fn translation_endpoint(&self) -> Result<(&AiProvider, &str), String> {
         self.endpoint(&self.translation_provider, &self.translation_model, "翻译")
+    }
+
+    pub(crate) fn semantic_layout_endpoint(&self) -> Result<(&AiProvider, &str), String> {
+        self.endpoint(
+            &self.semantic_layout.provider,
+            &self.semantic_layout.model,
+            "排版 → 布局",
+        )
     }
 
     pub(crate) fn resolved_target_language(&self, system_language: &str) -> String {

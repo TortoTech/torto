@@ -342,7 +342,11 @@ impl DesktopApp {
         let revision_changed = revision != self.applied_settings_revision;
         let applied = self.settings.applied().clone();
         if revision_changed {
-            crate::ui::apply_interface_typography(ctx, &applied.interface_typography);
+            crate::ui::apply_interface_typography(
+                ctx,
+                &applied.interface_typography,
+                applied.language,
+            );
             crate::ui::set_theme(ctx, applied.theme);
         }
         let resolved_theme_changed = crate::ui::sync_system_theme(ctx, applied.theme);
@@ -364,5 +368,9 @@ impl DesktopApp {
 
     pub(crate) fn interface_typography(&self) -> &InterfaceTypography {
         &self.settings.applied().interface_typography
+    }
+
+    pub(crate) fn interface_language(&self) -> crate::preferences::AppLanguage {
+        self.settings.applied().language
     }
 }

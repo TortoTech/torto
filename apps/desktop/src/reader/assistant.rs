@@ -82,6 +82,7 @@ impl DesktopReader {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     ) {
+        self.tick_semantic_layout(runtime, proxy);
         if let Some(request) = self.search.task.take_pending() {
             let proxy = proxy.clone();
             runtime.spawn(async move {
@@ -1854,7 +1855,8 @@ impl DesktopReader {
         let Some(activate) = focus_structure_activation(&candidates) else {
             return;
         };
-        let reflow_anchor = self.capture_focus_reflow_anchor();
+        let reflow_anchor =
+            self.capture_focus_reflow_anchor(super::FocusReflowKind::ParagraphStructure);
         for (key, active) in candidates {
             if active == activate {
                 continue;

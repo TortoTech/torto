@@ -799,39 +799,22 @@ fn system_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
 }
 
 fn typography_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
-    let language = state.draft_language;
-    reader_font_settings(
+    reader_layout_settings(
         ui,
-        language,
+        state.draft_language,
         &mut state.draft_reading_mode,
         &mut state.draft_spread,
         &mut state.draft_hide_cursor_in_focus_mode,
-        &mut state.draft_typography,
         &mut state.draft_typesetting,
-        &state.available_reader_font_families,
-    );
-}
-
-fn reader_font_settings(
-    ui: &mut egui::Ui,
-    language: AppLanguage,
-    reading_mode: &mut ReadingMode,
-    spread: &mut SpreadMode,
-    hide_cursor_in_focus_mode: &mut bool,
-    typography: &mut rebook_layout::ReaderTypography,
-    typesetting: &mut rebook_layout::ReaderTypesetting,
-    font_families: &rebook_layout::ReaderFontFamilies,
-) {
-    reader_layout_settings(
-        ui,
-        language,
-        reading_mode,
-        spread,
-        hide_cursor_in_focus_mode,
-        typesetting,
+        &mut state.draft_plugin_settings,
     );
     ui.add_space(12.0);
-    reader_typeface_settings(ui, language, typography, font_families);
+    reader_typeface_settings(
+        ui,
+        state.draft_language,
+        &mut state.draft_typography,
+        &state.available_reader_font_families,
+    );
 }
 
 fn reader_layout_settings(
@@ -841,7 +824,9 @@ fn reader_layout_settings(
     spread: &mut SpreadMode,
     hide_cursor_in_focus_mode: &mut bool,
     typesetting: &mut rebook_layout::ReaderTypesetting,
+    plugin_settings: &mut PluginSettings,
 ) {
+    let model_options = configured_model_options(plugin_settings);
     settings_card(ui, |ui| {
         settings_module_label(ui, language.text("布局", "Layout"));
         ui.add_space(4.0);
@@ -913,8 +898,46 @@ fn reader_layout_settings(
                     });
                     ui.end_row();
                 }
+
+                semantic_layout_rows(ui, language, plugin_settings, &model_options);
             });
+        if plugin_settings.semantic_layout.enabled {
+            if let Err(error) = plugin_settings.semantic_layout_endpoint() {
+                ui.colored_label(palette().muted, error);
+            }
+        }
     });
+}
+
+fn semantic_layout_rows(
+    ui: &mut egui::Ui,
+    language: AppLanguage,
+    plugin_settings: &mut PluginSettings,
+    model_options: &[ConfiguredModel],
+) {
+    let settings = &mut plugin_settings.semantic_layout;
+    settings_row_label(ui, language.text("AI排版", "AI layout"));
+    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+        toggle_switch(ui, &mut settings.enabled);
+        ui.add(icon(Icon::CircleHelp).size(16.0).color(palette().muted))
+            .on_hover_text(language.text(
+                "补充未识别的引用、图注",
+                "Recognize missing quotes and captions",
+            ));
+    });
+    ui.end_row();
+    if settings.enabled {
+        settings_row_label(ui, language.text("排版模型", "Layout model"));
+        configured_model_selector(
+            ui,
+            "semantic-layout-model",
+            model_options,
+            &mut settings.provider,
+            &mut settings.model,
+            language,
+        );
+        ui.end_row();
+    }
 }
 
 fn reader_typeface_settings(

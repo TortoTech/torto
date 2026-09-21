@@ -13,6 +13,9 @@ use rebook_publication::{
 use roxmltree::{Document, Node};
 use thiserror::Error;
 
+mod font_size;
+use font_size::FontSize;
+
 #[derive(Debug, Error)]
 pub enum HtmlError {
     #[error("invalid HTML in {resource}: {message}")]
@@ -2917,6 +2920,7 @@ impl QuoteLayoutMetrics {
 struct StyleSheet {
     rules: Vec<StyleRule>,
     next_order: usize,
+    root_font_size: Option<f32>,
 }
 
 struct StyleRule {
@@ -2968,6 +2972,12 @@ impl StyleSheet {
                 _ => {}
             }
         }
+        // The root's own rem units refer to the initial font size, not itself.
+        sheet.root_font_size = sheet
+            .cascaded_properties(document.root_element())
+            .get("font-size")
+            .and_then(|value| FontSize::parse(value))
+            .and_then(|size| size.resolve(1.0, 1.0));
         sheet
     }
 
@@ -3348,7 +3358,12 @@ impl StyleSheet {
 
     fn apply_text_node(&self, node: Node<'_, '_>, style: &mut TextStyle, inherited_size: f32) {
         let properties = self.cascaded_properties(node);
-        apply_text_properties(style, &properties, inherited_size);
+        let root_size = if node.parent().is_some_and(|parent| parent.is_root()) {
+            1.0
+        } else {
+            self.root_font_size.unwrap_or(1.0)
+        };
+        apply_text_properties(style, &properties, inherited_size, root_size);
         if let Some(language) = attribute_local(node, "lang") {
             style.language = TextLanguage::from_bcp47(language);
         }
@@ -3528,12 +3543,14 @@ fn apply_text_properties(
     style: &mut TextStyle,
     properties: &HashMap<String, String>,
     inherited_size: f32,
+    root_size: f32,
 ) {
     if let Some(value) = properties
         .get("font-size")
-        .and_then(|value| css_scale(value))
+        .and_then(|value| FontSize::parse(value))
+        .and_then(|size| size.resolve(inherited_size, root_size))
     {
-        style.size_scale = inherited_size * value;
+        style.size_scale = value;
     }
     if let Some(value) = properties.get("font-weight") {
         style.bold = value == "bold"
@@ -3575,6 +3592,10 @@ fn insert_declarations(
     declarations: impl IntoIterator<Item = (String, String)>,
 ) {
     for (name, value) in declarations {
+        // Invalid declarations must not erase an earlier usable font size.
+        if name == "font-size" && FontSize::parse(&value).is_none() {
+            continue;
+        }
         if name == "margin" {
             if let Some((top, right, bottom, left)) = box_sides(&value) {
                 properties.insert("margin-top".into(), top.to_owned());
@@ -3716,24 +3737,6 @@ fn css_horizontal_length(value: &str) -> Option<(f32, f32)> {
     css_length(value)
         .filter(|value| value.is_finite())
         .map(|value| (value, 0.0))
-}
-
-fn css_scale(value: &str) -> Option<f32> {
-    const BASE_FONT_SIZE: f32 = 16.0;
-    let value = value.trim();
-    if let Some(percent) = value.strip_suffix('%') {
-        return percent.parse::<f32>().ok().map(|number| number / 100.0);
-    }
-    if let Some(em) = value
-        .strip_suffix("rem")
-        .or_else(|| value.strip_suffix("em"))
-    {
-        return em.parse::<f32>().ok();
-    }
-    if let Some(px) = value.strip_suffix("px") {
-        return px.parse::<f32>().ok().map(|number| number / BASE_FONT_SIZE);
-    }
-    None
 }
 
 fn css_line_height(value: &str) -> Option<f32> {

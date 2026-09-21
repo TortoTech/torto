@@ -5537,8 +5537,13 @@ mod reference_suggestion_label_tests {
             rewrite_source.clone(),
             settings.translation_mode,
         ));
+        let semantic_source =
+            std::sync::Arc::new(crate::plugins::semantic_layout::SemanticLayoutSource::new(
+                translation_source.clone(),
+                rewrite_source.clone(),
+            ));
         let structure_source =
-            std::sync::Arc::new(ParagraphStructureSource::new(translation_source.clone()));
+            std::sync::Arc::new(ParagraphStructureSource::new(semantic_source.clone()));
         let source: std::sync::Arc<dyn BookSource> = structure_source.clone();
         let chapter = source
             .book()
@@ -5566,6 +5571,7 @@ mod reference_suggestion_label_tests {
                 rewrite_source,
                 translation_source,
                 structure_source,
+                semantic_source,
                 pdf_ocr_controller: None,
                 pdf_ocr_available: false,
                 pdf_ocr_mode: PdfOcrViewMode::Original,
@@ -5717,8 +5723,13 @@ mod reference_suggestion_label_tests {
                 rewrite_source.clone(),
                 settings.translation_mode,
             ));
+            let semantic_source =
+                std::sync::Arc::new(crate::plugins::semantic_layout::SemanticLayoutSource::new(
+                    translation_source.clone(),
+                    rewrite_source.clone(),
+                ));
             let structure_source =
-                std::sync::Arc::new(ParagraphStructureSource::new(translation_source.clone()));
+                std::sync::Arc::new(ParagraphStructureSource::new(semantic_source.clone()));
             let source: std::sync::Arc<dyn BookSource> = structure_source.clone();
             let chapter = source
                 .book()
@@ -5746,6 +5757,7 @@ mod reference_suggestion_label_tests {
                     rewrite_source,
                     translation_source,
                     structure_source,
+                    semantic_source,
                     pdf_ocr_controller: None,
                     pdf_ocr_available: false,
                     pdf_ocr_mode: PdfOcrViewMode::Original,

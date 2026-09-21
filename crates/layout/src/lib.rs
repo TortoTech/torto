@@ -1492,18 +1492,13 @@ impl LayoutEngine {
             style.margin_after = 0.0;
             images.push((load_raster_image(source, image)?, style, image));
         }
-        let captions = figure_captions
-            .iter()
-            .map(|caption| {
-                self.shape_figure_caption(
-                    source,
-                    caption,
-                    reader_style,
-                    (content_width - media_start_offset).max(1.0),
-                    unified_reflow,
-                )
-            })
-            .collect::<Result<Vec<_>, LayoutError>>()?;
+        let captions = self.shape_figure_captions(
+            source,
+            figure_captions,
+            reader_style,
+            (content_width - media_start_offset).max(1.0),
+            unified_reflow,
+        )?;
         let outer_gap = if unified_reflow {
             reader_style.typography.font_size * reader_style.typesetting.media_gap_em
         } else {
@@ -1634,6 +1629,47 @@ impl LayoutEngine {
                 self.shape_text_from_source(source, &resolved, reader_style, content_width)?;
         }
         Ok((prepared, resolved))
+    }
+
+    fn shape_figure_captions<'a>(
+        &mut self,
+        source: &dyn BookSource,
+        captions: &'a [TextBlock],
+        reader_style: &ReaderStyle,
+        content_width: f32,
+        unified_reflow: bool,
+    ) -> Result<Vec<(PreparedText, Cow<'a, TextBlock>)>, LayoutError> {
+        let mut shaped = captions
+            .iter()
+            .map(|caption| {
+                self.shape_figure_caption(
+                    source,
+                    caption,
+                    reader_style,
+                    content_width,
+                    unified_reflow,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // The semantic caption can consist of several authored paragraphs (or
+        // bilingual companions). Apply the single-line/multi-line rule to the
+        // entire caption, not independently to each fragment.
+        if unified_reflow
+            && shaped
+                .iter()
+                .map(|(text, _)| text.layout.len())
+                .sum::<usize>()
+                > 1
+        {
+            for (prepared, resolved) in &mut shaped {
+                if resolved.style.align != TextAlignment::Start {
+                    resolved.to_mut().style.align = TextAlignment::Start;
+                    *prepared =
+                        self.shape_text_from_source(source, resolved, reader_style, content_width)?;
+                }
+            }
+        }
+        Ok(shaped)
     }
 
     #[allow(
@@ -2410,7 +2446,15 @@ fn resolve_text_block<'a>(
             block.kind,
             TextBlockKind::Paragraph | TextBlockKind::Blockquote
         );
-        resolved.style.align = if prose
+        resolved.style.align = if block.kind == TextBlockKind::Blockquote
+            && let Some(alignment) = block.style.semantic_alignment
+        {
+            if alignment == TextAlignment::Start {
+                TextAlignment::Justify
+            } else {
+                alignment
+            }
+        } else if prose
             && let Some(authored_alignment) = block.style.authored_alignment
             && authored_alignment != TextAlignment::Start
         {
@@ -2527,6 +2571,18 @@ fn resolve_text_block<'a>(
         }
     }
     resolve_semantic_inline_presentation(&mut resolved.content, reader_style.writing_system);
+    if matches!(
+        block.kind,
+        TextBlockKind::Blockquote | TextBlockKind::QuoteAttribution
+    ) {
+        // Quote presentation stays upright even when semantic emphasis would
+        // otherwise restore italics after authored styles have been cleared.
+        for inline in &mut resolved.content {
+            if let Inline::Text(run) = inline {
+                run.style.italic = false;
+            }
+        }
+    }
     Cow::Owned(resolved)
 }
 
@@ -5384,6 +5440,55 @@ mod tests {
     }
 
     #[test]
+    fn unified_font_sizes_replace_authored_scales_while_book_mode_preserves_them() {
+        for kind in [
+            TextBlockKind::Paragraph,
+            TextBlockKind::Blockquote,
+            TextBlockKind::QuoteAttribution,
+        ] {
+            let block = TextBlock {
+                kind,
+                content: [0.6, 0.75, 8.0 / 9.0, 1.0, 1.2, 1.5, 2.0, 3.0]
+                    .into_iter()
+                    .map(|size_scale| {
+                        Inline::Text(TextRun {
+                            text: "Mixed authored sizes".into(),
+                            style: TextStyle {
+                                size_scale,
+                                ..TextStyle::default()
+                            },
+                            link: None,
+                        })
+                    })
+                    .collect(),
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            };
+            let book = ReaderStyle::default();
+            assert_eq!(
+                resolve_text_block(&block, &book, TextContext::Flow).content,
+                block.content
+            );
+            let unified = ReaderStyle {
+                typesetting: ReaderTypesetting::unified(),
+                ..book
+            };
+            let resolved = resolve_text_block(&block, &unified, TextContext::Flow);
+            let expected = match kind {
+                TextBlockKind::Blockquote => 0.95,
+                TextBlockKind::QuoteAttribution => 0.88,
+                _ => 1.0,
+            };
+            for inline in &resolved.content {
+                let Inline::Text(run) = inline else {
+                    panic!("expected text")
+                };
+                assert!((run.style.size_scale - expected).abs() < 0.0001);
+            }
+        }
+    }
+
+    #[test]
     fn unified_quotes_clear_authored_bold_and_italic_styles() {
         let style = ReaderStyle {
             typesetting: ReaderTypesetting::unified(),
@@ -5393,25 +5498,37 @@ mod tests {
         for kind in [TextBlockKind::Blockquote, TextBlockKind::QuoteAttribution] {
             let block = TextBlock {
                 kind,
-                content: vec![Inline::Text(TextRun {
-                    text: "Authored emphasis".into(),
-                    style: TextStyle {
-                        bold: true,
-                        italic: true,
-                        ..TextStyle::default()
-                    },
-                    link: None,
-                })],
+                content: (0..4)
+                    .map(|source| {
+                        Inline::Text(TextRun {
+                            text: "Authored emphasis".into(),
+                            style: TextStyle {
+                                bold: true,
+                                italic: true,
+                                emphasis: source == 1,
+                                alternate_voice: source == 2,
+                                citation: source == 3,
+                                ..TextStyle::default()
+                            },
+                            link: None,
+                        })
+                    })
+                    .collect(),
                 style: rebook_publication::BlockStyle::default(),
                 source: None,
             };
 
             let resolved = resolve_text_block(&block, &style, TextContext::Flow);
-            let Inline::Text(run) = &resolved.content[0] else {
-                panic!("expected text run");
-            };
-            assert!(!run.style.bold);
-            assert!(!run.style.italic);
+            for inline in &resolved.content {
+                let Inline::Text(run) = inline else {
+                    panic!("expected text run");
+                };
+                assert!(!run.style.bold);
+                assert!(!run.style.italic);
+            }
+            let book_style = ReaderStyle::default();
+            let original = resolve_text_block(&block, &book_style, TextContext::Flow);
+            assert_eq!(original.content, block.content);
         }
     }
 
@@ -7458,6 +7575,69 @@ mod tests {
     }
 
     #[test]
+    fn semantic_quote_alignment_is_only_applied_in_unified_typesetting() {
+        let mut block = TextBlock {
+            kind: TextBlockKind::Blockquote,
+            content: vec![Inline::Text(TextRun {
+                text: "A quoted passage.".into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: BlockStyle {
+                align: TextAlignment::Center,
+                authored_alignment: Some(TextAlignment::Center),
+                ..BlockStyle::default()
+            },
+            source: None,
+        };
+        let mut style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        for alignment in [
+            TextAlignment::Start,
+            TextAlignment::Center,
+            TextAlignment::End,
+            TextAlignment::Justify,
+        ] {
+            block.style.semantic_alignment = Some(alignment);
+            assert_eq!(
+                resolve_text_block(&block, &style, TextContext::Flow)
+                    .style
+                    .align,
+                if alignment == TextAlignment::Start {
+                    TextAlignment::Justify
+                } else {
+                    alignment
+                }
+            );
+        }
+        block.style.semantic_alignment = None;
+        assert_eq!(
+            resolve_text_block(&block, &style, TextContext::Flow)
+                .style
+                .align,
+            TextAlignment::Center
+        );
+        block.style.semantic_alignment = Some(TextAlignment::Start);
+        style.typesetting.mode = TypesettingMode::Book;
+        assert_eq!(
+            resolve_text_block(&block, &style, TextContext::Flow)
+                .style
+                .align,
+            TextAlignment::Center
+        );
+        style.typesetting.mode = TypesettingMode::Unified;
+        block.kind = TextBlockKind::Paragraph;
+        assert_eq!(
+            resolve_text_block(&block, &style, TextContext::Flow)
+                .style
+                .align,
+            TextAlignment::Center
+        );
+    }
+
+    #[test]
     fn authored_image_margin_larger_than_the_default_gap_is_preserved() {
         let viewport = LayoutViewport::new(400, 500).unwrap();
         let mut paginator = Paginator::new(
@@ -7496,6 +7676,72 @@ mod tests {
         };
 
         assert!((image.y - (separator.y + 1.0) - 25.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn caption_fragments_share_alignment_without_changing_authored_book_styles() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("caption-fragments").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: vec![],
+                table_of_contents: vec![],
+            },
+        };
+        let captions = [
+            "A short first line",
+            "and a short second line",
+            "Figure 1. A longer description that wraps across multiple lines in the caption area.",
+        ]
+        .map(|text| TextBlock {
+            kind: TextBlockKind::Caption,
+            content: vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: BlockStyle {
+                align: TextAlignment::Center,
+                ..BlockStyle::default()
+            },
+            source: None,
+        });
+        let mut engine = LayoutEngine::new();
+        let mut style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        for group in [&captions[..2], &captions[..]] {
+            let shaped = engine
+                .shape_figure_captions(&source, group, &style, 240.0, true)
+                .unwrap();
+            assert!(shaped.iter().all(|(text, resolved)| {
+                resolved.style.align == TextAlignment::Start
+                    && text
+                        .layout
+                        .lines()
+                        .all(|line| line.metrics().offset.abs() < 0.01)
+            }));
+        }
+        let single = engine
+            .shape_figure_captions(&source, &captions[..1], &style, 400.0, true)
+            .unwrap();
+        assert!(single[0].0.layout.lines().next().unwrap().metrics().offset > 0.0);
+        style.typesetting.mode = TypesettingMode::Book;
+        let authored = engine
+            .shape_figure_captions(&source, &captions, &style, 240.0, false)
+            .unwrap();
+        assert!(
+            authored
+                .iter()
+                .all(|(_, resolved)| resolved.style.align == TextAlignment::Center)
+        );
+        assert!(
+            captions
+                .iter()
+                .all(|caption| caption.style.align == TextAlignment::Center)
+        );
     }
 
     #[test]
