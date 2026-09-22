@@ -1229,6 +1229,10 @@ pub(super) fn validate_translation_math_placeholders(
 
 fn push_translation_style_markup(output: &mut String, run: &TextRun) {
     let mut closing = Vec::new();
+    if let Some(scale) = run.style.keyword_size_scale {
+        output.push_str(&format!("<torto-size scale=\"{scale}\">"));
+        closing.push("</torto-size>");
+    }
     if run.style.inline_role == InlineRole::Footnote {
         output.push_str("<inlinefootnote>");
         closing.push("</inlinefootnote>");
@@ -1461,6 +1465,18 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
             Inline::Text(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
         })
         .unwrap_or(fallback);
+    // Only a uniform paragraph-wide keyword can safely survive old unmarked
+    // translations. Mixed spans are restored from explicit translation tags.
+    if original
+        .iter()
+        .filter_map(|inline| match inline {
+            Inline::Text(run) => Some(run.style.keyword_size_scale),
+            _ => None,
+        })
+        .any(|size| size != style.keyword_size_scale)
+    {
+        style.keyword_size_scale = None;
+    }
     style.bold = false;
     style.italic = false;
     style.emphasis = false;
@@ -1568,6 +1584,7 @@ fn is_cjk(character: char) -> bool {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TranslationStyleTag {
+    KeywordSize,
     Bold,
     Emphasis,
     AlternateVoice,
@@ -1598,6 +1615,18 @@ fn parse_inline_style_markup(
         if opening {
             stack.push((tag, style));
             style = apply_translation_style_tag(style, tag);
+            if tag == TranslationStyleTag::KeywordSize {
+                let scale = token
+                    .strip_prefix("<torto-size scale=\"")?
+                    .strip_suffix("\">")?
+                    .parse::<f32>()
+                    .ok()?;
+                if !scale.is_finite() || scale <= 0.0 {
+                    return None;
+                }
+                style.keyword_size_scale = Some(scale);
+                style.size_scale = scale;
+            }
         } else {
             let (open_tag, previous) = stack.pop()?;
             if open_tag != tag {
@@ -1613,10 +1642,9 @@ fn parse_inline_style_markup(
     (found && stack.is_empty()).then_some(styled)
 }
 
-fn next_translation_style_tag(
-    text: &str,
-) -> Option<(usize, TranslationStyleTag, bool, &'static str)> {
-    [
+fn next_translation_style_tag(text: &str) -> Option<(usize, TranslationStyleTag, bool, &str)> {
+    let fixed = [
+        ("</torto-size>", TranslationStyleTag::KeywordSize, false),
         ("<strong>", TranslationStyleTag::Bold, true),
         ("</strong>", TranslationStyleTag::Bold, false),
         ("<b>", TranslationStyleTag::Bold, true),
@@ -1660,11 +1688,25 @@ fn next_translation_style_tag(
     ]
     .into_iter()
     .filter_map(|(token, tag, opening)| text.find(token).map(|index| (index, tag, opening, token)))
-    .min_by_key(|(index, _, opening, _)| (*index, !*opening))
+    .min_by_key(|(index, _, opening, _)| (*index, !*opening));
+    let sized = text.find("<torto-size scale=\"").and_then(|start| {
+        let end = text[start..].find('>')? + start + 1;
+        Some((
+            start,
+            TranslationStyleTag::KeywordSize,
+            true,
+            &text[start..end],
+        ))
+    });
+    fixed
+        .into_iter()
+        .chain(sized)
+        .min_by_key(|(index, _, opening, _)| (*index, !*opening))
 }
 
 fn apply_translation_style_tag(mut style: TextStyle, tag: TranslationStyleTag) -> TextStyle {
     match tag {
+        TranslationStyleTag::KeywordSize => {}
         TranslationStyleTag::Bold => style.bold = true,
         TranslationStyleTag::Emphasis => {
             style.italic = true;
@@ -2419,6 +2461,52 @@ mod tests {
             inline,
             Inline::Text(run) if run.text == "阅读" && !run.style.citation && !run.style.italic
         )));
+    }
+
+    #[test]
+    fn keyword_sizes_round_trip_translation_without_leaking_to_neighbors() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            source: None,
+            style: Default::default(),
+            content: [Some(0.75), None, Some(1.5)]
+                .into_iter()
+                .map(|size| {
+                    Inline::Text(TextRun {
+                        text: "text".into(),
+                        link: None,
+                        style: TextStyle {
+                            keyword_size_scale: size,
+                            size_scale: size.unwrap_or(1.0),
+                            ..Default::default()
+                        },
+                    })
+                })
+                .collect(),
+        };
+        assert_eq!(
+            translation_text(&block),
+            "<torto-size scale=\"0.75\">text</torto-size>text<torto-size scale=\"1.5\">text</torto-size>"
+        );
+        let translated = replacement_content(
+            "<torto-size scale=\"0.75\">小字</torto-size>正文<torto-size scale=\"1.5\"><em>大字</em></torto-size>",
+            TextStyle::default(),
+            Some(&block.content),
+        );
+        for (inline, size) in translated.iter().zip([Some(0.75), None, Some(1.5)]) {
+            let Inline::Text(run) = inline else {
+                panic!("text");
+            };
+            assert_eq!(run.style.keyword_size_scale, size);
+        }
+        assert_eq!(translated.len(), 3);
+        let legacy = replacement_content("旧译文", TextStyle::default(), Some(&block.content));
+        assert!(matches!(&legacy[0], Inline::Text(run) if run.style.keyword_size_scale.is_none()));
+        let uniform =
+            replacement_content("整段译文", TextStyle::default(), Some(&block.content[..1]));
+        assert!(
+            matches!(&uniform[0], Inline::Text(run) if run.style.keyword_size_scale == Some(0.75))
+        );
     }
 
     #[test]

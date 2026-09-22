@@ -258,12 +258,21 @@ fn captions_require_adjacent_images_and_respect_disabled_types() {
 
 #[test]
 fn quote_composition_preserves_sources_and_bilingual_attribution() {
-    let original = section(vec![
+    let mut original = section(vec![
         text("a", "Quotation"),
         text("b", "Second paragraph"),
         text("c", "Author"),
         text("p", "Narrative"),
     ]);
+    for block in &mut original.blocks {
+        if let Block::Text(text) = block {
+            for inline in &mut text.content {
+                if let Inline::Text(run) = inline {
+                    run.style.keyword_size_scale = Some(0.75);
+                }
+            }
+        }
+    }
     let group = Proposal::Quote {
         alignment: None,
         body: vec![0, 1],
@@ -277,7 +286,10 @@ fn quote_composition_preserves_sources_and_bilingual_attribution() {
             translated.source = None;
             translated.content = vec![Inline::Text(TextRun {
                 text: "翻译".into(),
-                style: Default::default(),
+                style: rebook_publication::TextStyle {
+                    keyword_size_scale: Some(0.75),
+                    ..Default::default()
+                },
                 link: None,
             })];
             blocks.push(Block::Text(translated));
@@ -290,6 +302,16 @@ fn quote_composition_preserves_sources_and_bilingual_attribution() {
     assert_eq!(quote.body.len(), 4);
     assert_eq!(quote.body[0].source.as_ref(), source(&original.blocks[0]));
     let credit = quote.attribution.as_ref().unwrap();
+    assert!(
+        quote
+            .body
+            .iter()
+            .chain(std::iter::once(credit))
+            .all(|text| text.content.iter().all(|inline| match inline {
+                Inline::Text(run) => run.style.keyword_size_scale == Some(0.75),
+                _ => true,
+            }))
+    );
     assert_eq!(credit.source.as_ref(), source(&original.blocks[2]));
     assert!(text_block_text(credit).contains("翻译"));
     assert_eq!(blocks.len(), 3); // untouched narrative and companion

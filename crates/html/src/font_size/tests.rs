@@ -102,6 +102,57 @@ fn css_inheritance_overrides_semantic_heading_and_small_defaults() {
     );
 }
 
+#[test]
+fn keyword_sizes_survive_inheritance_and_absolute_keywords_do_not_compound() {
+    for (keyword, expected) in [
+        ("xx-small", 0.6),
+        ("x-small", 0.75),
+        ("small", 8.0 / 9.0),
+        ("medium", 1.0),
+        ("large", 1.2),
+        ("x-large", 1.5),
+        ("xx-large", 2.0),
+        ("xxx-large", 3.0),
+    ] {
+        let runs = paragraph_runs(&format!(
+            r#"<html><body><p style="font-size:{keyword}">outer<br/><span>inherited</span><br/><span style="font-size:{keyword}">nested</span></p></body></html>"#
+        ));
+        for run in runs {
+            assert!((run.style.keyword_size_scale.unwrap() - expected).abs() < 0.0001);
+        }
+    }
+    let runs = paragraph_runs(
+        r#"<html><body><p style="font-size:x-large"><span style="font-size:smaller">small<br/><span style="font-size:larger">large</span></span><br/><span style="font-size:inherit">inherit</span><br/><span style="font-size:unset">unset</span><br/><span style="font-size:12px">pixels</span><br/><span style="font-size:0.5em">em</span><br/><span style="font-size:initial">reset</span><br/><span style="font-size:garbage">invalid</span></p></body></html>"#,
+    );
+    let expected = [
+        Some(1.25),
+        Some(1.5),
+        Some(1.5),
+        Some(1.5),
+        None,
+        None,
+        None,
+        Some(1.5),
+    ];
+    assert_eq!(runs.len(), expected.len());
+    for (run, expected) in runs.iter().zip(expected) {
+        assert_eq!(run.style.keyword_size_scale, expected, "{}", run.text);
+    }
+}
+
+#[test]
+fn body_keywords_do_not_replace_implicit_heading_sizes() {
+    let runs = paragraph_runs(
+        r#"<html><body style="font-size:large"><h1>heading</h1><h2 style="font-size:small">small heading</h2><h3 style="font-size:inherit">inherited heading</h3><p>body</p></body></html>"#,
+    );
+    assert_eq!(
+        runs.iter()
+            .map(|run| run.style.keyword_size_scale)
+            .collect::<Vec<_>>(),
+        vec![None, Some(8.0 / 9.0), Some(1.2), Some(1.2)]
+    );
+}
+
 /// Extracted EPUB resources, with XHTML sanitized like the EPUB import path
 /// (external DOCTYPE removed, named HTML entities expanded). Each book directory
 /// lists resource-relative XHTML paths in chapters.txt. No book content is stored

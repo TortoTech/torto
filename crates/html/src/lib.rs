@@ -3235,6 +3235,23 @@ impl StyleSheet {
             let inherited_size = style.size_scale;
             if ancestor == node {
                 apply_semantic_block_style(kind, &mut style, inherited_size);
+                if kind.is_heading() || kind == TextBlockKind::Preformatted {
+                    // Semantic block defaults establish their own size. A body
+                    // keyword must not flatten every heading; explicit CSS on
+                    // the heading can still override or inherit the body size.
+                    let inherits_size = self
+                        .cascaded_properties(ancestor)
+                        .get("font-size")
+                        .is_some_and(|value| {
+                            matches!(
+                                value.trim().to_ascii_lowercase().as_str(),
+                                "inherit" | "unset"
+                            )
+                        });
+                    if !inherits_size {
+                        style.keyword_size_scale = None;
+                    }
+                }
             }
             self.apply_text_node(ancestor, &mut style, inherited_size);
         }
@@ -3545,12 +3562,21 @@ fn apply_text_properties(
     inherited_size: f32,
     root_size: f32,
 ) {
-    if let Some(value) = properties
-        .get("font-size")
-        .and_then(|value| FontSize::parse(value))
-        .and_then(|size| size.resolve(inherited_size, root_size))
+    if let Some(declaration) = properties.get("font-size")
+        && let Some(value) =
+            FontSize::parse(declaration).and_then(|size| size.resolve(inherited_size, root_size))
     {
         style.size_scale = value;
+        match declaration.trim().to_ascii_lowercase().as_str() {
+            "xx-small" | "x-small" | "small" | "medium" | "large" | "x-large" | "xx-large"
+            | "xxx-large" | "smaller" | "larger" => {
+                style.keyword_size_scale = Some(value);
+            }
+            "inherit" | "unset" => {}
+            // Explicit lengths/reset override an inherited keyword, but are not
+            // themselves opted into unified typesetting.
+            _ => style.keyword_size_scale = None,
+        }
     }
     if let Some(value) = properties.get("font-weight") {
         style.bold = value == "bold"

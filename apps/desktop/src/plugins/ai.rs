@@ -758,7 +758,7 @@ fn translation_system_prompt(target_language: &str, fixed_page_hint: &str) -> St
 
 # 正文结构
 - 每个 JSON 值都是独立正文块。原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时保持相同类型。
-- <strong>、<em>、<i>、<cite>、<torto-italic>、<u>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记。必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。
+- <strong>、<em>、<i>、<cite>、<torto-italic>、<torto-size scale="数值">、<u>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记。必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。
 - <torto-math-0/>、<torto-math-1/> 等自闭合标签是不可修改的公式占位符。可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。
 {fixed_page_section}
 # 输出格式

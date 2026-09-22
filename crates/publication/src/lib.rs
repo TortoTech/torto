@@ -876,6 +876,10 @@ pub struct TextStyle {
     pub underline: bool,
     /// Scale relative to the reader's base font size.
     pub size_scale: f32,
+    /// Computed CSS keyword size, retained when unified layout replaces other
+    /// authored sizes. Independent of semantic heading and baseline defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyword_size_scale: Option<f32>,
     pub color: Rgba,
     /// Vertical placement relative to the surrounding text baseline.
     #[serde(default)]
@@ -905,6 +909,7 @@ impl Default for TextStyle {
             citation: false,
             underline: false,
             size_scale: 1.0,
+            keyword_size_scale: None,
             color: Rgba::BLACK,
             baseline: TextBaseline::Normal,
             link_role: LinkRole::Normal,

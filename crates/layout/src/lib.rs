@@ -2531,10 +2531,15 @@ fn resolve_text_block<'a>(
                 // Unified typesetting starts from a neutral decoration layer.
                 // Semantic/application decorations can opt back in explicitly.
                 run.style.underline = false;
+                let text_scale = run
+                    .style
+                    .keyword_size_scale
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .unwrap_or(scale);
                 run.style.size_scale = match run.style.baseline {
-                    TextBaseline::Normal => scale,
-                    TextBaseline::Superscript => scale * 0.70,
-                    TextBaseline::Subscript => scale * 0.75,
+                    TextBaseline::Normal => text_scale,
+                    TextBaseline::Superscript => text_scale * 0.70,
+                    TextBaseline::Subscript => text_scale * 0.75,
                 };
                 if block.kind.is_heading()
                     || matches!(block.kind, TextBlockKind::DefinitionTerm { .. })
@@ -5486,6 +5491,80 @@ mod tests {
                 };
                 assert!((run.style.size_scale - expected).abs() < 0.0001);
             }
+        }
+    }
+
+    #[test]
+    fn unified_keyword_sizes_override_role_sizes_without_compounding() {
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        for kind in [
+            TextBlockKind::Paragraph,
+            TextBlockKind::Heading(2),
+            TextBlockKind::Caption,
+            TextBlockKind::Blockquote,
+            TextBlockKind::QuoteAttribution,
+        ] {
+            for size in [0.6, 0.75, 8.0 / 9.0, 1.0, 1.2, 1.5, 2.0, 3.0, 1.25] {
+                let block = TextBlock {
+                    kind,
+                    source: None,
+                    style: Default::default(),
+                    content: vec![Inline::Text(TextRun {
+                        text: "Sized text 大小字".into(),
+                        link: None,
+                        style: TextStyle {
+                            size_scale: size,
+                            keyword_size_scale: Some(size),
+                            ..Default::default()
+                        },
+                    })],
+                };
+                for context in [TextContext::Flow, TextContext::Table] {
+                    let resolved = resolve_text_block(&block, &style, context);
+                    let Inline::Text(run) = &resolved.content[0] else {
+                        panic!("text");
+                    };
+                    assert_eq!(run.style.size_scale, size);
+                }
+                assert_eq!(
+                    resolve_text_block(&block, &ReaderStyle::default(), TextContext::Flow).content,
+                    block.content
+                );
+            }
+        }
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            source: None,
+            style: Default::default(),
+            content: [
+                TextBaseline::Normal,
+                TextBaseline::Superscript,
+                TextBaseline::Subscript,
+            ]
+            .into_iter()
+            .map(|baseline| {
+                Inline::Text(TextRun {
+                    text: "text".into(),
+                    link: None,
+                    style: TextStyle {
+                        baseline,
+                        size_scale: 0.4,
+                        keyword_size_scale: Some(0.75),
+                        ..Default::default()
+                    },
+                })
+            })
+            .collect(),
+        };
+        let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+        for (inline, expected) in resolved.content.iter().zip([0.75, 0.75 * 0.7, 0.75 * 0.75]) {
+            let Inline::Text(run) = inline else {
+                panic!("text");
+            };
+            assert_eq!(run.style.size_scale, expected);
         }
     }
 
