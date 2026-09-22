@@ -3144,7 +3144,12 @@ mod tests {
             bottom_margin: 12.0,
             ..ReaderStyle::default()
         };
-        let mut engine = LayoutEngine::new();
+        // The regression depends on exact line breaks. CI runners do not have
+        // the reader's default Literata installed, so register the bundled font
+        // instead of allowing platform-dependent serif fallback metrics.
+        const LATIN: &[u8] = include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf");
+        let mut engine =
+            LayoutEngine::with_fonts([rebook_layout::ReaderFontBlob::new(Arc::new(LATIN))]);
         let mut hyphen_count = 0;
         let mut continuation_hyphen = false;
         let mut exceeded_old_geometry = false;
