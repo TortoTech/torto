@@ -2575,10 +2575,11 @@ fn resolve_text_block<'a>(
         block.kind,
         TextBlockKind::Blockquote | TextBlockKind::QuoteAttribution
     ) {
-        // Quote presentation stays upright even when semantic emphasis would
-        // otherwise restore italics after authored styles have been cleared.
+        // Quote presentation stays neutral even when semantic emphasis restores
+        // italics for Latin text or bold for CJK text (including translations).
         for inline in &mut resolved.content {
             if let Inline::Text(run) = inline {
+                run.style.bold = false;
                 run.style.italic = false;
             }
         }
@@ -5501,7 +5502,7 @@ mod tests {
                 content: (0..4)
                     .map(|source| {
                         Inline::Text(TextRun {
-                            text: "Authored emphasis".into(),
+                            text: "Authored emphasis 与翻译后的强调".into(),
                             style: TextStyle {
                                 bold: true,
                                 italic: true,

@@ -761,7 +761,7 @@ impl DesktopReader {
                 self.apply_snapshot(navigation.snapshot, SnapshotEffects::navigation());
                 if self.is_focus_mode() {
                     self.focus_anchor = focus_anchor;
-                    self.focus_units.clear();
+                    self.invalidate_focus_units();
                     self.focus_target_offset = None;
                     self.ui.focus_scroll_motion = None;
                 }
@@ -1204,7 +1204,7 @@ impl DesktopReader {
                 );
                 if self.is_focus_mode() {
                     self.focus_anchor = focus_anchor;
-                    self.focus_units.clear();
+                    self.invalidate_focus_units();
                     self.focus_target_offset = None;
                     self.ui.focus_scroll_motion = None;
                 }

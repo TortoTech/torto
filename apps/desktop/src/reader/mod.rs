@@ -543,6 +543,7 @@ pub(super) struct DesktopReader {
     scroll_target_position: Option<ReaderPosition>,
     scroll_target_source: Option<SourceRange>,
     focus_units: Vec<FocusUnit>,
+    focus_units_ready: bool,
     classic_footnotes: Vec<FocusFootnote>,
     classic_footnote_anchor_y: Option<f32>,
     classic_footnote_overlay_rect: Option<egui::Rect>,
@@ -2131,6 +2132,7 @@ impl DesktopReader {
         reason = "focus-unit construction keeps semantic, paint, and geometry ranges synchronized"
     )]
     fn rebuild_focus_units(&mut self, layout: &ScrollSectionLayout) {
+        self.focus_units_ready = false;
         if self.focus_selection_anchor.take().is_some() {
             self.selection_anchor = None;
             self.selection = None;
@@ -2146,7 +2148,7 @@ impl DesktopReader {
             })
             .collect::<Result<Vec<_>, _>>();
         let Ok(sections) = parsed else {
-            self.focus_units.clear();
+            self.invalidate_focus_units();
             self.focus_unit_index = 0;
             return;
         };
@@ -2456,6 +2458,7 @@ impl DesktopReader {
             .get(self.focus_unit_index)
             .map(|unit| unit.range.start.clone());
         self.focus_units = units;
+        self.focus_units_ready = true;
         self.sync_focus_chat_session();
         self.sync_focus_selected_image();
         self.bump_scene_revision();
@@ -2560,7 +2563,17 @@ impl DesktopReader {
         true
     }
 
+    fn invalidate_focus_units(&mut self) {
+        self.focus_units.clear();
+        self.focus_units_ready = false;
+    }
+
     fn move_focus_unit(&mut self, direction: PageDirection) {
+        // Translation and AI layout refreshes clear units before the UI rebuilds
+        // them. That transient state is not an empty chapter or a chapter edge.
+        if !self.focus_units_ready {
+            return;
+        }
         self.cancel_text_selection();
         match focus_navigation_destination(self.focus_units.len(), self.focus_unit_index, direction)
         {
@@ -3710,6 +3723,7 @@ impl DesktopReader {
             scroll_target_position,
             scroll_target_source,
             focus_units: Vec::new(),
+            focus_units_ready: false,
             classic_footnotes: Vec::new(),
             classic_footnote_anchor_y: None,
             classic_footnote_overlay_rect: None,

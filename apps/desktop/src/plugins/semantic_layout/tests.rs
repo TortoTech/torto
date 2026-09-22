@@ -794,6 +794,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
                     Err(error) => panic!("{error}"),
                 }
             };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -874,6 +875,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
             &RecognitionRoles {
                 quotes: true,
                 captions: false,
+                headings: false,
             },
             0..1,
             0..1,
@@ -883,6 +885,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
     let figure = completion_options(&RecognitionRoles {
         quotes: false,
         captions: true,
+        headings: false,
     });
     assert_eq!(
         figure

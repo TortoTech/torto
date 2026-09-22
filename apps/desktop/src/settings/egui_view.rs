@@ -921,8 +921,8 @@ fn semantic_layout_rows(
         toggle_switch(ui, &mut settings.enabled);
         ui.add(icon(Icon::CircleHelp).size(16.0).color(palette().muted))
             .on_hover_text(language.text(
-                "补充未识别的引用、图注",
-                "Recognize missing quotes and captions",
+                "补充未识别的引用、图注和数字节标题",
+                "Recognize missing quotes, captions and numbered section headings",
             ));
     });
     ui.end_row();

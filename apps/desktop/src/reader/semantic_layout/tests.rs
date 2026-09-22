@@ -49,6 +49,10 @@ impl crate::highlights::HighlightRepository for EmptyHighlights {
 }
 
 fn fixture() -> (DesktopReader, Section, SourceRange) {
+    fixture_with_numbered_heading(false)
+}
+
+fn fixture_with_numbered_heading(numbered_heading: bool) -> (DesktopReader, Section, SourceRange) {
     let spine = SpineItemId::new("chapter").unwrap();
     let href = PublicationUrl::parse("chapter.xhtml").unwrap();
     let text = |node: &str, text: String| {
@@ -79,12 +83,15 @@ fn fixture() -> (DesktopReader, Section, SourceRange) {
         node: "image".into(),
         text_offset: 0,
     };
-    let section=Section {id:spine.clone(),href:href.clone(),anchors:vec![],blocks:vec![
+    let mut section=Section {id:spine.clone(),href:href.clone(),anchors:vec![],blocks:vec![
         text("earlier","Earlier paragraphs change height when recognized as a quotation. ".repeat(25)),
         text("current","Current paragraph stays next to its illustration after the preceding content is reflowed. ".repeat(6)),
         Block::Image(ImageBlock {href:PublicationUrl::parse("image.png").unwrap(),alt:String::new(),style:Default::default(),source:Some(SourceRange {start:image_anchor.clone(),end:image_anchor}),text_layer:None}),
     ]};
     let target = block_source_range(&section.blocks[1]).unwrap().clone();
+    if numbered_heading {
+        section.blocks.insert(1, text("section-number", "2".into()));
+    }
     let original = Arc::new(Fixture {
         book: Book {
             id: PublicationId::new("semantic-reflow-regression").unwrap(),
@@ -166,6 +173,70 @@ fn fixture() -> (DesktopReader, Section, SourceRange) {
         },
     );
     (reader, section, target)
+}
+
+#[test]
+fn recognized_numbered_heading_is_visible_but_not_a_focus_stop() {
+    let (mut reader, original, target) = fixture_with_numbered_heading(true);
+    let layout = reader.current_scroll_layout().unwrap();
+    reader.rebuild_focus_units(&layout);
+    assert_eq!(reader.focus_units.len(), 4);
+    let recognition = serde_json::from_value(serde_json::json!({
+        "fingerprint":crate::plugins::semantic_layout::fingerprint(&original),
+        "annotations":[{"SectionHeading":{"source":block_source_range(&original.blocks[1]).unwrap()}}],
+        "skipped_groups":0
+    })).unwrap();
+    assert!(reader.semantic_source.install(0, recognition));
+    reader.refresh_semantic_layout();
+    let layout = reader.current_scroll_layout().unwrap();
+    assert!(
+        layout
+            .source_baseline(block_source_range(&original.blocks[1]).unwrap())
+            .is_some()
+    );
+    reader.rebuild_focus_units(&layout);
+    assert_eq!(reader.focus_units.len(), 3);
+    reader.move_focus_unit(PageDirection::Next);
+    assert_eq!(reader.focus_anchor.as_ref(), Some(&target.start));
+    reader.move_focus_unit(PageDirection::Previous);
+    assert_eq!(reader.focus_unit_index, 0);
+    assert!(reader.pending_reading_unit_turn.is_none());
+}
+
+#[test]
+fn focus_navigation_waits_for_units_after_content_refresh() {
+    for semantic in [false, true] {
+        let (mut reader, _, target) = fixture();
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        reader.select_focus_unit(1);
+        assert_eq!(reader.focus_anchor.as_ref(), Some(&target.start));
+
+        if semantic {
+            reader.refresh_semantic_layout();
+        } else {
+            reader.refresh_translation_view();
+        }
+        assert!(reader.focus_units.is_empty());
+        // Rendering may populate the layout cache before the UI rebuilds units.
+        let layout = reader.current_scroll_layout().unwrap();
+        for direction in [PageDirection::Previous, PageDirection::Next] {
+            reader.move_focus_unit(direction);
+            assert!(reader.completion.is_none(), "refresh must not end the book");
+            assert!(reader.pending_reading_unit_turn.is_none());
+            assert!(reader.pending_reading_unit_entry.is_none());
+            assert_eq!(reader.focus_anchor.as_ref(), Some(&target.start));
+        }
+        reader.rebuild_focus_units(&layout);
+        reader.move_focus_unit(PageDirection::Next);
+        assert_eq!(reader.focus_unit_index, 2);
+        assert!(reader.completion.is_none());
+        reader.move_focus_unit(PageDirection::Next);
+        assert!(
+            reader.completion.is_some(),
+            "real boundaries must still work"
+        );
+    }
 }
 
 #[test]

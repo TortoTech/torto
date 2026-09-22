@@ -62,7 +62,7 @@ impl DesktopReader {
         }
         self.reading_mode = crate::preferences::ReadingMode::Classic;
         self.restore_book_chat_session();
-        self.focus_units.clear();
+        self.invalidate_focus_units();
         self.focus_target_offset = None;
         self.ui.focus_scroll_motion = None;
         self.ui.sidebar_pinned = true;
@@ -164,7 +164,7 @@ impl DesktopReader {
                     if !self.is_focus_mode() {
                         self.restore_book_chat_session();
                     }
-                    self.focus_units.clear();
+                    self.invalidate_focus_units();
                     self.focus_target_offset = None;
                     self.ui.focus_scroll_motion = None;
                     self.ui.sidebar_pinned =

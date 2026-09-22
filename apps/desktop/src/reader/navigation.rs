@@ -45,7 +45,7 @@ impl DesktopReader {
                             .leading_source_range()
                             .map(|range| range.start.clone())
                     });
-                    self.focus_units.clear();
+                    self.invalidate_focus_units();
                     self.focus_unit_index = 0;
                     self.focus_target_offset = None;
                     self.ui.focus_scroll_motion = None;
@@ -84,7 +84,7 @@ impl DesktopReader {
                         .leading_source_range()
                         .map(|range| range.start.clone())
                 });
-                self.focus_units.clear();
+                self.invalidate_focus_units();
                 self.focus_unit_index = 0;
                 self.focus_target_offset = None;
                 self.ui.focus_scroll_motion = None;
@@ -131,7 +131,7 @@ impl DesktopReader {
                 // A unit transition inside one spine section must invalidate the
                 // continuous layout just like a section transition.
                 self.scroll_section = None;
-                self.focus_units.clear();
+                self.invalidate_focus_units();
                 self.focus_unit_index = 0;
                 self.focus_target_offset = None;
                 self.ui.focus_scroll_motion = None;
@@ -237,13 +237,13 @@ impl DesktopReader {
         }
         if previous_section != target_position.section_index {
             self.scroll_section = None;
-            self.focus_units.clear();
+            self.invalidate_focus_units();
             self.focus_unit_index = 0;
             self.focus_target_offset = None;
             self.ui.focus_scroll_motion = None;
         }
         if self.is_focus_mode() && matches!(effects.scene, SceneChange::StaticContent) {
-            self.focus_units.clear();
+            self.invalidate_focus_units();
             self.focus_target_offset = None;
             self.ui.focus_scroll_motion = None;
         }

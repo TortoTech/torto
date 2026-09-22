@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use super::{PluginSettings, ReasoningEffort, ai, llm_json, text_block_text};
 
+mod headings;
 mod log;
 
 // This is the on-disk data format, not an application release or prompt revision.
@@ -42,17 +43,19 @@ impl Default for SemanticLayoutSettings {
     }
 }
 
-// Internal request roles, not user settings. Both recognizers are always enabled.
+// Internal request roles, not user settings. All recognizers are always enabled.
 #[derive(Clone)]
 struct RecognitionRoles {
     quotes: bool,
     captions: bool,
+    headings: bool,
 }
 impl Default for RecognitionRoles {
     fn default() -> Self {
         Self {
             quotes: true,
             captions: true,
+            headings: true,
         }
     }
 }
@@ -60,6 +63,9 @@ impl Default for RecognitionRoles {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Proposal {
+    SectionHeading {
+        block: usize,
+    },
     Quote {
         body: Vec<usize>,
         attribution: Option<usize>,
@@ -85,6 +91,9 @@ struct Response {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Annotation {
+    SectionHeading {
+        source: SourceRange,
+    },
     Quote {
         body: Vec<SourceRange>,
         attribution: Option<SourceRange>,
@@ -398,11 +407,18 @@ fn request_contract_fingerprint() -> &'static str {
                 PROMPT,
                 completion_options(&RecognitionRoles {
                     quotes: true,
-                    captions: false
+                    captions: false,
+                    headings: false
                 }),
                 completion_options(&RecognitionRoles {
                     quotes: false,
-                    captions: true
+                    captions: true,
+                    headings: false
+                }),
+                completion_options(&RecognitionRoles {
+                    quotes: false,
+                    captions: false,
+                    headings: true
                 }),
                 WINDOW_CHARS,
                 WINDOW_BLOCKS,
@@ -444,10 +460,28 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
         },
         "required":["kind","quote","attribution","body_index"]
     });
-    let item = match (roles.quotes, roles.captions) {
-        (true, true) => json!({"anyOf":[quote,attribution,figure]}),
-        (true, false) => json!({"anyOf":[quote,attribution]}),
-        _ => figure,
+    let heading = json!({
+        "type":"object", "additionalProperties":false,
+        "properties":{
+            "kind":{"type":"string","enum":["section_heading"]},
+            "block":{"type":"integer"}
+        },
+        "required":["kind","block"]
+    });
+    let mut items = Vec::new();
+    if roles.quotes {
+        items.extend([quote, attribution]);
+    }
+    if roles.captions {
+        items.push(figure);
+    }
+    if roles.headings {
+        items.push(heading);
+    }
+    let item = if items.len() == 1 {
+        items.remove(0)
+    } else {
+        json!({"anyOf":items})
     };
     json!({"temperature":0.0,"response_format":{
         "type":"json_schema",
@@ -510,6 +544,9 @@ fn load_recognition(section: &Section, identity: &Value) -> Option<Recognition> 
         .iter()
         .map(|a| {
             Some(match a {
+                Annotation::SectionHeading { source } => Proposal::SectionHeading {
+                    block: locate(source)?,
+                },
                 Annotation::Quote {
                     body,
                     attribution,
@@ -714,6 +751,29 @@ async fn recognize_inner(
         }
         start = end;
     }
+    let proposed = annotations
+        .iter()
+        .filter_map(|annotation| {
+            let Annotation::SectionHeading { source: range } = annotation else {
+                return None;
+            };
+            section
+                .blocks
+                .iter()
+                .position(|block| source(block) == Some(range))
+        })
+        .collect::<Vec<_>>();
+    if !proposed.is_empty() {
+        let accepted = headings::review(&client, (provider, model), section, &proposed).await?;
+        annotations.retain(|annotation| {
+            let Annotation::SectionHeading { source: range } = annotation else {
+                return true;
+            };
+            accepted
+                .iter()
+                .any(|id| source(&section.blocks[*id]) == Some(range))
+        });
+    }
     let result = Recognition {
         fingerprint,
         annotations,
@@ -743,23 +803,42 @@ async fn request_window_groups(
     // the quotation pass must reject dialogue embedded in ordinary narrative.
     let mut groups = Vec::new();
     let mut skipped_groups = 0;
-    for captions in [true, false] {
-        if (captions
-            && (!config.captions
-                || !context
+    for roles in [
+        RecognitionRoles {
+            quotes: false,
+            captions: config.captions,
+            headings: false,
+        },
+        RecognitionRoles {
+            quotes: false,
+            captions: false,
+            headings: config.headings,
+        },
+        RecognitionRoles {
+            quotes: config.quotes,
+            captions: false,
+            headings: false,
+        },
+    ] {
+        if !(roles.captions
+            && context
+                .clone()
+                .any(|index| image_needs_caption(section, index))
+            || roles.headings
+                && target
                     .clone()
-                    .any(|index| image_needs_caption(section, index))))
-            || (!captions && !config.quotes)
+                    .any(|index| headings::candidate(&section.blocks[index]).is_some())
+            || roles.quotes)
         {
             continue;
         }
-        let roles = RecognitionRoles {
-            quotes: !captions,
-            captions,
-        };
         let mut input = input.clone();
         input["quotes_enabled"] = json!(roles.quotes);
         input["captions_enabled"] = json!(roles.captions);
+        input["headings_enabled"] = json!(roles.headings);
+        if roles.headings {
+            input["numbered_candidates"] = headings::context(section, target.start);
+        }
         // Completed figure groups are protected in the quotation pass too.
         let protected: HashSet<_> = groups.iter().flat_map(proposal_ids).collect();
         if let Some(blocks) = input["blocks"].as_array_mut() {
@@ -994,6 +1073,7 @@ fn normalize_quote_attributions(
 
 fn proposal_ids(group: &Proposal) -> Vec<usize> {
     let mut ids = match group {
+        Proposal::SectionHeading { block } => vec![*block],
         Proposal::Quote {
             body, attribution, ..
         } => body
@@ -1042,6 +1122,9 @@ fn validate_window(
                 .all(|id| paragraph(&section.blocks[*id]).is_some())
         };
         let valid = match group {
+            Proposal::SectionHeading { block } => {
+                config.headings && headings::candidate(&section.blocks[*block]).is_some()
+            }
             Proposal::Quote {
                 body, attribution, ..
             } => {
@@ -1101,6 +1184,9 @@ fn annotation(group: &Proposal, section: &Section) -> Annotation {
             .clone()
     };
     match group {
+        Proposal::SectionHeading { block } => Annotation::SectionHeading {
+            source: range(block),
+        },
         Proposal::Quote {
             body,
             attribution,
@@ -1140,6 +1226,10 @@ fn annotation(group: &Proposal, section: &Section) -> Annotation {
 // Resolve against source ranges, never translated block indices. Bilingual
 // companion paragraphs have no source and stay attached to their original.
 fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
+    if let Annotation::SectionHeading { source } = annotation {
+        headings::compose(blocks, source);
+        return;
+    }
     if let Annotation::QuoteAttribution {
         quote,
         attribution,
@@ -1164,7 +1254,7 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
                 images.iter().chain(captions).collect()
             }
         }
-        Annotation::QuoteAttribution { .. } => unreachable!(),
+        Annotation::QuoteAttribution { .. } | Annotation::SectionHeading { .. } => unreachable!(),
     };
     let positions: Option<Vec<_>> = ranges
         .iter()
@@ -1243,7 +1333,7 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
             })
         }
         Annotation::Figure { before, .. } => compose_figure(selected, *before, spanning),
-        Annotation::QuoteAttribution { .. } => unreachable!(),
+        Annotation::QuoteAttribution { .. } | Annotation::SectionHeading { .. } => unreachable!(),
     };
     blocks.splice(start..end, [replacement]);
 }

@@ -1,8 +1,8 @@
 # AI layout
 
 Settings → Typography → Layout contains a global, opt-in switch and a configured
-provider/model selection. Quotes and captions are always both enabled. The help
-icon next to the switch shows “补充未识别的引用、图注” on hover.
+provider/model selection. Quotes, captions and numbered section headings are always enabled. The help
+icon next to the switch shows “补充未识别的引用、图注和数字节标题” on hover.
 Credentials remain in the existing provider configuration. A missing or deleted
 model pauses recognition; it is never silently replaced. There are no per-book
 switches or manual chapter recognition commands.
@@ -32,8 +32,8 @@ The system prompt is maintained as sectioned Markdown in
 `apps/desktop/src/plugins/semantic_layout/prompt.md`: task, input and scope,
 semantic judgment, structural requirements, output and examples. Retry feedback
 also uses Markdown headings. Book input remains a separate JSON data message. Requests use
-`response_format.type = json_schema` and `strict = true`, with a quote-only or
-caption-only schema for each pass (required fields, nullable attribution/alignment and no
+`response_format.type = json_schema` and `strict = true`, with a quote-only, caption-only or
+heading-only schema for each pass (required fields, nullable attribution/alignment and no
 additional properties). This requires a compatible endpoint; API errors are
 reported rather than silently falling back to unconstrained output. Local ID,
 source-protection and relationship checks still run after parsing.
@@ -65,6 +65,42 @@ alternate-voice or citation semantics would otherwise restore italics.
 Unified layout applies caption alignment to the whole figure caption: one line
 is centered, while multiple lines share a leading edge even when the original
 ebook split them into several paragraphs. Authored book-mode alignment is retained.
+
+## Numbered section headings
+
+An additional pass runs only for windows containing source-backed ordinary
+paragraphs consisting of a positive Arabic numeral (up to four digits), optionally
+followed by a period or closing parenthesis. This is candidate eligibility, not
+an automatic heading decision. The model distinguishes subsection boundaries from
+page numbers, footnotes, list/exercise numbers and other incidental numbering.
+An increasing sequence alone is insufficient; uncertain candidates stay unchanged.
+Roman numerals, spelled-out numbers and number-plus-title paragraphs are outside
+this initial candidate filter.
+
+The pass receives the normal body window and an ordered summary of up to 64
+nearby numeric candidates across that source section, with bounded excerpts from
+their immediate neighbors. Context-only IDs outside the target cannot be changed.
+Captions are recognized first, headings second, quotes last; accepted groups are
+protected in subsequent passes. Proposed headings receive a second, chapter-level
+audit using neighboring prose and the broader numbering pattern; only IDs
+accepted in both passes are installed. Review batches and excerpts are bounded.
+The audit cannot add new candidates, and errors preserve the original content. `section_heading` returns only an existing block
+ID. Validation enforces candidate eligibility, target ownership and non-overlap.
+
+Annotations retain the canonical source range and compose after translation,
+changing the original and its bilingual companion to `Heading(3)` without
+rewriting text. Existing small-heading layout keeps the heading with following
+body content. Focus navigation skips it in both directions while it remains
+visible. No TOC entry or reading-unit boundary is created; disabling AI layout
+restores the ordinary paragraph. Prompt/schema fingerprinting invalidates old
+cached omissions when this recognition role is introduced.
+
+The ignored `live_numbered_headings_and_book_page_numbers` test uses the configured
+model to recognize three independent synthetic numbered subsections, then checks
+the full third chapter of the local *Phantoms in the Brain* EPUB for false positives
+on residual page numbers. Set `TORTO_SEMANTIC_BOOK` and run with `--ignored`.
+Book passages remain test input, not production prompt examples. Synthetic recall
+and this one-book rejection check do not establish cross-book accuracy.
 
 ## Scheduling and persistence
 
