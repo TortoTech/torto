@@ -26,8 +26,10 @@ pub(super) fn text(id: &str, content: &str) -> Block {
     })
 }
 
-fn image(id: &str) -> Block {
+pub(super) fn image(id: &str) -> Block {
     Block::Image(ImageBlock {
+        formula_image: false,
+        formula: None,
         href: PublicationUrl::parse("image.png").unwrap(),
         alt: String::new(),
         style: rebook_publication::ImageStyle::default(),
@@ -416,6 +418,7 @@ fn translation_indices_survive_semantic_toggle_and_changed_content_is_rejected()
         .unwrap();
     let overlay = SemanticLayoutSource::new(translations.clone(), original);
     let recognition = Recognition {
+        formulas_checked: true,
         fingerprint: fingerprint(&section),
         skipped_groups: 0,
         annotations: vec![annotation(
@@ -438,6 +441,7 @@ fn translation_indices_survive_semantic_toggle_and_changed_content_is_rejected()
     assert!(!overlay.install(
         0,
         Recognition {
+            formulas_checked: true,
             fingerprint: "stale".into(),
             ..recognition
         }
@@ -475,11 +479,14 @@ fn live_semantic_layout_full_chapter() {
     let source = opened.source();
     let section = source.parse_section(index).unwrap();
     let settings = PluginSettings::load_default().unwrap();
-    let result = tokio::runtime::Runtime::new().unwrap().block_on(recognize(
-        &section,
-        source.book().id.as_str(),
-        &settings,
-    ));
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(recognize_with_source(
+            &section,
+            source.book().id.as_str(),
+            &settings,
+            source.as_ref(),
+        ));
     println!(
         "section {index}, {} blocks: {}",
         section.blocks.len(),
@@ -598,6 +605,7 @@ fn cached_negative_results_load_without_a_request_and_content_changes_miss() {
     let hash = fingerprint(&section);
     let path = recognition_path(&identity, &hash).unwrap();
     let result = Recognition {
+        formulas_checked: true,
         fingerprint: hash.clone(),
         skipped_groups: 0,
         annotations: vec![],
@@ -648,97 +656,6 @@ fn window_ownership_prevents_duplicate_groups_and_protected_boundaries_cannot_be
 }
 
 #[test]
-fn unmarked_quotes_and_inline_credits_are_not_rejected_by_typographic_rules() {
-    let section = section(vec![
-        image("ornament"),
-        text("epigraph", "Each turn brings a new beginning.\n-- A poet"),
-        text("narrative", "The author discusses the document."),
-        text("excerpt", "Please continue the experiment."),
-    ]);
-    for id in [1, 3] {
-        let proposal = Proposal::Quote {
-            alignment: None,
-            body: vec![id],
-            attribution: None,
-        };
-        validate(std::slice::from_ref(&proposal), &section).unwrap();
-        let original = paragraph(&section.blocks[id]).unwrap();
-        let mut blocks = section.blocks.clone();
-        compose(&mut blocks, &annotation(&proposal, &section));
-        let Block::Quote(quote) = &blocks[id] else {
-            panic!("expected quote");
-        };
-        assert_eq!(quote.body[0].content, original.content);
-        assert_eq!(quote.body[0].source, original.source);
-    }
-}
-
-#[test]
-fn bad_optional_credit_does_not_erase_a_valid_quotation_body() {
-    let section = section(vec![
-        text("poem", "Verse\n-- A poet"),
-        text("quote", "Another quotation"),
-        text("credit", "Another author"),
-    ]);
-    let mut groups = vec![
-        Proposal::Quote {
-            alignment: None,
-            body: vec![0],
-            attribution: Some(2),
-        },
-        Proposal::Quote {
-            alignment: None,
-            body: vec![1],
-            attribution: Some(2),
-        },
-    ];
-    assert_eq!(
-        normalize_quote_attributions(
-            &mut groups,
-            &section,
-            &RecognitionRoles::default(),
-            0..3,
-            0..3
-        ),
-        1
-    );
-    assert!(matches!(&groups[0],Proposal::Quote {body,attribution:None,..} if body==&[0]));
-    validate(&groups, &section).unwrap();
-    let mut invalid = vec![Proposal::Quote {
-        alignment: None,
-        body: vec![99],
-        attribution: Some(0),
-    }];
-    assert_eq!(
-        normalize_quote_attributions(
-            &mut invalid,
-            &section,
-            &RecognitionRoles::default(),
-            0..3,
-            0..3
-        ),
-        0
-    );
-    assert!(validate(&invalid, &section).is_err());
-    let mut inline = vec![Proposal::Quote {
-        alignment: None,
-        body: vec![0],
-        attribution: Some(0),
-    }];
-    assert_eq!(
-        normalize_quote_attributions(
-            &mut inline,
-            &section,
-            &RecognitionRoles::default(),
-            0..3,
-            0..3
-        ),
-        1
-    );
-    validate(&inline, &section).unwrap();
-}
-
-#[test]
 fn structured_prompt_examples_match_the_output_types() {
     let examples = PROMPT.split("```json").skip(1).collect::<Vec<_>>();
     assert!(!examples.is_empty());
@@ -750,8 +667,11 @@ fn structured_prompt_examples_match_the_output_types() {
                 assert!(group.get("alignment").is_some());
             }
         }
-        let response: Response = serde_json::from_value(value).unwrap();
-        assert!(!response.groups.is_empty());
+        let response: Response = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            response.groups.len(),
+            value["groups"].as_array().unwrap().len()
+        );
     }
 }
 
@@ -856,10 +776,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
                 item["required"],
                 json!(["kind", "body", "attribution", "alignment"])
             );
-            assert_eq!(
-                item["properties"]["attribution"]["type"],
-                json!(["integer", "null"])
-            );
+            assert_eq!(item["properties"]["attribution"]["type"], json!("integer"));
             assert_eq!(request["messages"][0]["content"].as_str(), Some(PROMPT));
             let input: Value =
                 serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
@@ -870,7 +787,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
                 assert!(feedback.starts_with("# Correct the response"));
                 assert!(feedback.contains("## Structural error") && feedback.contains("99"));
             }
-            let result = json!({"groups":[{"kind":"quote","body":[if attempt == 0 {99} else {0}],"attribution":null,"alignment":"center"}]});
+            let result = json!({"groups":[{"kind":"quote_inline","body":[if attempt == 0 {99} else {0}],"credit":"-- A poet","alignment":"center"}]});
             let body = json!({"choices":[{"message":{"content":result.to_string()}}]}).to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         }
@@ -942,20 +859,25 @@ fn live_hand_epigraph_with_inline_credit() {
     let settings = PluginSettings::load_default().unwrap();
     let result = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(recognize(&section, source.book().id.as_str(), &settings))
+        .block_on(recognize_with_source(
+            &section,
+            source.book().id.as_str(),
+            &settings,
+            source.as_ref(),
+        ))
         .unwrap();
     assert!(
         result
             .annotations
             .iter()
-            .any(|a| matches!(a, Annotation::Quote { body, .. } if body.contains(&range))),
+            .any(|a| matches!(a, Annotation::QuoteInline { body, .. } if body.contains(&range))),
         "Paz epigraph should be recognized without a separate attribution paragraph"
     );
     let alignment = result
         .annotations
         .iter()
         .find_map(|a| match a {
-            Annotation::Quote {
+            Annotation::QuoteInline {
                 body, alignment, ..
             } if body.contains(&range) => *alignment,
             _ => None,
@@ -967,16 +889,16 @@ fn live_hand_epigraph_with_inline_credit() {
     // Exercise the same persisted chapter path used when opening the reader.
     if result.skipped_groups == 0 {
         let cached = overlay.parse_section(index).unwrap();
-        assert!(cached.blocks.iter().any(|block| matches!(block, Block::Quote(q) if q.body.iter().any(|p| text_block_text(p).contains("Octavio Paz")))), "reader cache must expose the epigraph as a quote");
+        assert!(cached.blocks.iter().any(|block| matches!(block, Block::Quote(q) if q.attribution.as_ref().is_some_and(|p| text_block_text(p).contains("Octavio Paz")))), "reader cache must expose the epigraph as a quote");
     }
     assert!(overlay.install(index, result.clone()));
     let displayed = overlay.parse_section(index).unwrap();
-    assert!(displayed.blocks.iter().any(|block| matches!(block,Block::Quote(q) if q.body.iter().any(|p| text_block_text(p).contains("Octavio Paz") && p.style.semantic_alignment==Some(alignment.text_alignment())))));
-    assert!(displayed.blocks.iter().any(|block| matches!(block, Block::Quote(q) if q.body.iter().any(|p| text_block_text(p).contains("Octavio Paz")))));
+    assert!(displayed.blocks.iter().any(|block| matches!(block,Block::Quote(q) if q.attribution.as_ref().is_some_and(|p| text_block_text(p).contains("Octavio Paz")) && q.body.iter().all(|p| p.style.semantic_alignment==Some(alignment.text_alignment())))));
+    assert!(displayed.blocks.iter().any(|block| matches!(block, Block::Quote(q) if q.attribution.as_ref().is_some_and(|p| text_block_text(p).contains("Octavio Paz")))));
     for a in &result.annotations {
         compose(&mut section.blocks, a);
     }
-    assert!(section.blocks.iter().any(|block| matches!(block, Block::Quote(q) if q.body.iter().any(|p| text_block_text(p).contains("Octavio Paz")))));
+    assert!(section.blocks.iter().any(|block| matches!(block, Block::Quote(q) if q.attribution.as_ref().is_some_and(|p| text_block_text(p).contains("Octavio Paz")))));
     println!(
         "Full fifth chapter: Paz epigraph recognized, installed and exposed through the reader source"
     );
@@ -1006,13 +928,20 @@ fn live_ramachandran_gemini_lite() {
     let mut report = Vec::new();
     for index in [4, 5, 7, 8, 9, 11, 15] {
         let mut section = source.parse_section(index).unwrap();
-        section.blocks.truncate(24);
+        if index != 11 {
+            section.blocks.truncate(24);
+        }
         let candidates = section
             .blocks
             .iter()
             .filter(|b| paragraph(b).is_some())
             .count();
-        let result = runtime.block_on(recognize(&section, source.book().id.as_str(), &settings));
+        let result = runtime.block_on(recognize_with_source(
+            &section,
+            source.book().id.as_str(),
+            &settings,
+            source.as_ref(),
+        ));
         let input = section
             .blocks
             .iter()
@@ -1027,7 +956,18 @@ fn live_ramachandran_gemini_lite() {
                 continue;
             }
         };
-        let groups = result.annotations.len();
+        let groups = result
+            .annotations
+            .iter()
+            .filter(|a| {
+                !matches!(
+                    a,
+                    Annotation::InlineCitations { .. }
+                        | Annotation::ImageFormula { .. }
+                        | Annotation::UnreadableFormula { .. }
+                )
+            })
+            .count();
         // Manually checked against the book, including negative narrative/dialogue
         // paragraphs. Chapter 5 also contains a cartoon caption and a quoted letter.
         let quote = |body: Vec<usize>, attribution| Proposal::Quote {
@@ -1045,7 +985,6 @@ fn live_ramachandran_gemini_lite() {
                     images: vec![5],
                     captions: vec![6, 7, 8, 9],
                 },
-                quote(vec![12], None),
             ],
             9 => vec![quote(vec![3], Some(4))],
             11 => vec![quote(vec![3], Some(4)), quote(vec![5], Some(6))],
@@ -1056,6 +995,14 @@ fn live_ramachandran_gemini_lite() {
         let recognized: Vec<_> = result
             .annotations
             .iter()
+            .filter(|a| {
+                !matches!(
+                    a,
+                    Annotation::InlineCitations { .. }
+                        | Annotation::ImageFormula { .. }
+                        | Annotation::UnreadableFormula { .. }
+                )
+            })
             .cloned()
             .map(|mut a| {
                 if let Annotation::Quote { alignment, .. } = &mut a {
@@ -1067,9 +1014,8 @@ fn live_ramachandran_gemini_lite() {
         let matches_expected =
             expected.len() == groups && expected.iter().all(|a| recognized.contains(a));
         let no_false_positives = recognized.iter().all(|a| expected.contains(a));
-        // Release gate: chapter epigraphs/credits and the caption must work, and
-        // no ordinary prose may be changed. Track the unattributed letter as a
-        // recall benchmark as well, without treating model recall as perfect.
+        // Explicitly sourced epigraphs and the caption must work. The former
+        // unattributed-letter positive is now a negative example by design.
         let required_found = expected
             .iter()
             .filter(|a| {

@@ -118,6 +118,7 @@ fn completion_preserves_quote_body_styles_and_source_links() {
 
         let identity = json!(["attribution-cache-test", uuid::Uuid::new_v4().to_string()]);
         let result = Recognition {
+            formulas_checked: true,
             fingerprint: fingerprint(&original),
             annotations: vec![annotation],
             skipped_groups: 0,
@@ -192,6 +193,7 @@ fn completion_keeps_bilingual_body_and_credit_together() {
         assert!(overlay.install(
             0,
             Recognition {
+                formulas_checked: true,
                 fingerprint: fingerprint(&section),
                 annotations: vec![annotation(&proposal(inside), &section)],
                 skipped_groups: 0

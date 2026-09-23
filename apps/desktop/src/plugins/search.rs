@@ -408,6 +408,8 @@ mod tests {
                 id: spine,
                 href,
                 blocks: vec![Block::Image(ImageBlock {
+                    formula_image: false,
+                    formula: None,
                     href: PublicationUrl::parse("Pages/page-00001.png").unwrap(),
                     alt: "PDF page 1".into(),
                     style: ImageStyle::default(),

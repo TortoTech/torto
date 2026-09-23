@@ -490,6 +490,8 @@ impl BookSource for DirectBookSource {
                     id: descriptor.id.clone(),
                     href: descriptor.href.clone(),
                     blocks: vec![Block::Image(ImageBlock {
+                        formula_image: false,
+                        formula: None,
                         href,
                         alt: alt.clone(),
                         style: ImageStyle::default(),

@@ -2,6 +2,14 @@
 
 pub mod linebreak;
 
+mod formula_images;
+
+/// Whether a paragraph consists only of a recognized formula image and an
+/// optional equation number, rendered as one display formula in unified mode.
+pub fn is_display_formula(block: &rebook_publication::TextBlock) -> bool {
+    formula_images::only_formula(block).is_some()
+}
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -711,9 +719,19 @@ pub struct QuotePlacement {
     pub sources: Vec<SourceRange>,
 }
 
-/// A line slice from a shaped paragraph.
+/// Original text and ownership behind a collapsed inline reference marker.
+#[derive(Clone)]
+pub struct InlineCitationPlacement {
+    pub owner: Option<SourceRange>,
+    pub range: Range<usize>,
+    pub original: String,
+    pub number: u32,
+}
+
+/// A line slice from a shaped paragraph, retaining collapsed reference text.
 #[derive(Clone)]
 pub struct TextPlacement {
+    pub citations: Arc<[InlineCitationPlacement]>,
     pub layout: Arc<Layout<TextBrush>>,
     /// UTF-8 text shaped by Parley. Kept alongside the layout so retained
     /// renderers can map pointer hit tests back to durable source offsets.
@@ -753,6 +771,7 @@ pub struct TableCellPlacement {
 /// One raster painted at a matching Parley inline-box position.
 #[derive(Clone)]
 pub struct InlineImage {
+    pub formula_presentation: Option<FormulaPresentation>,
     pub id: u64,
     pub image: RasterImage,
     pub width: f32,
@@ -769,8 +788,15 @@ pub struct RasterImage {
     pub pixels: Arc<[u8]>,
 }
 
+#[derive(Clone)]
+pub struct FormulaPresentation {
+    pub original: RasterImage,
+    pub latex: String,
+}
+
 /// Positioned raster image.
 pub struct ImagePlacement {
+    pub formula_presentation: Option<FormulaPresentation>,
     pub image: RasterImage,
     pub x: f32,
     pub y: f32,
@@ -1207,6 +1233,7 @@ impl LayoutEngine {
                     layout_blocks.get(block_index + 1).copied(),
                 )
                 && caption.kind == TextBlockKind::Caption
+                && image.formula.is_none()
             {
                 self.push_figure(
                     &mut paginator,
@@ -1247,13 +1274,37 @@ impl LayoutEngine {
             let block = layout_blocks[block_index];
             match block {
                 Block::Text(block) => {
+                    if unified_reflow
+                        && let Some((run, number)) = formula_images::only_formula(block)
+                        && self.push_formula_image(
+                            &mut paginator,
+                            source,
+                            &run.image,
+                            block.source.clone(),
+                            number.as_deref(),
+                            reader_style,
+                            content_width,
+                        )?
+                    {
+                        block_index += 1;
+                        continue;
+                    }
                     let resolved = resolve_text_block(block, reader_style, TextContext::Flow);
-                    let prepared = self.shape_text_from_source(
+                    let mut prepared = self.shape_text_from_source(
                         source,
                         &resolved,
                         reader_style,
                         content_width,
                     )?;
+                    if block.source.is_none()
+                        && let Some(Block::Text(primary)) = block_index
+                            .checked_sub(1)
+                            .and_then(|i| layout_blocks.get(i).copied())
+                    {
+                        for citation in Arc::make_mut(&mut prepared.citations) {
+                            citation.owner.clone_from(&primary.source);
+                        }
+                    }
                     paginator.push_text(&prepared, &resolved)?;
                 }
                 Block::Quote(quote) => {
@@ -1290,6 +1341,15 @@ impl LayoutEngine {
                             reader_style,
                             quote_width,
                         )?;
+                        if body.source.is_none() {
+                            let owner = quote.body[..index]
+                                .iter()
+                                .rev()
+                                .find_map(|t| t.source.as_ref());
+                            for citation in Arc::make_mut(&mut prepared.citations) {
+                                citation.owner = owner.cloned();
+                            }
+                        }
                         if unified_reflow {
                             prepared.start_offset += quote_horizontal_padding;
                         }
@@ -1367,6 +1427,20 @@ impl LayoutEngine {
                     paginator.push_table(&prepared);
                 }
                 Block::Image(image) => {
+                    if unified_reflow
+                        && self.push_formula_image(
+                            &mut paginator,
+                            source,
+                            image,
+                            image.source.clone(),
+                            None,
+                            reader_style,
+                            content_width,
+                        )?
+                    {
+                        block_index += 1;
+                        continue;
+                    }
                     let raster = load_raster_image(source, image)?;
                     let mut image_style = image.style;
                     if unified_reflow {
@@ -1866,13 +1940,14 @@ impl LayoutEngine {
             None
         };
         let typography = &reader_style.typography;
-        let (text, spans, inline_images, source_text_start) = prepare_inline_content(
+        let (text, spans, inline_images, source_text_start, citations) = prepare_inline_content(
             block,
             reader_style.foreground,
             typography,
             available_width,
             &self.svg_options,
             reader_style.focus_footnote_icons,
+            reader_style.typesetting.mode == TypesettingMode::Unified,
             inline_rasters,
         );
         let sentence_reference = sentence_reference.filter(|reference| {
@@ -2034,6 +2109,7 @@ impl LayoutEngine {
         };
         layout.align(alignment, AlignmentOptions::default());
         PreparedText {
+            citations: citations.into(),
             layout: Arc::new(layout),
             text: text.into(),
             source_text_start,
@@ -2042,6 +2118,7 @@ impl LayoutEngine {
             inline_images: inline_images
                 .into_iter()
                 .map(|image| InlineImage {
+                    formula_presentation: image.formula_presentation,
                     id: image.id,
                     image: image.image,
                     width: image.width,
@@ -2174,8 +2251,14 @@ impl LayoutEngine {
         builder.push_default(StyleProperty::Brush(default_brush));
 
         for span in spans {
-            let size = (typography.font_size * span.style.size_scale.clamp(0.5, 3.0))
-                .max(typography.minimum_font_size);
+            let size = if span.style.inline_citation != 0 {
+                // Numbered reference icons follow the compact 8–12px footnote
+                // icon scale rather than the minimum body-text size.
+                (typography.font_size * span.style.size_scale).clamp(8.0, 12.0)
+            } else {
+                (typography.font_size * span.style.size_scale.clamp(0.5, 3.0))
+                    .max(typography.minimum_font_size)
+            };
             builder.push(StyleProperty::FontSize(size), span.range.clone());
             let variations = optical_size_variations(size);
             builder.push(
@@ -2930,6 +3013,7 @@ struct StyledRange {
 }
 
 struct PreparedText {
+    citations: Arc<[InlineCitationPlacement]>,
     layout: Arc<Layout<TextBrush>>,
     text: Arc<str>,
     source_text_start: usize,
@@ -3058,6 +3142,7 @@ fn fit_adaptive_column_widths(
 }
 
 struct PreparedInlineImage {
+    formula_presentation: Option<FormulaPresentation>,
     id: u64,
     index: usize,
     image: RasterImage,
@@ -3154,8 +3239,16 @@ fn prepare_inline_content(
     available_width: f32,
     svg_options: &resvg::usvg::Options<'_>,
     focus_footnote_icons: bool,
+    unified_math: bool,
     inline_rasters: &[Option<RasterImage>],
-) -> (String, Vec<StyledRange>, Vec<PreparedInlineImage>, usize) {
+) -> (
+    String,
+    Vec<StyledRange>,
+    Vec<PreparedInlineImage>,
+    usize,
+    Vec<InlineCitationPlacement>,
+) {
+    let mut citations = Vec::new();
     let mut text = String::new();
     let mut spans = Vec::new();
     let mut inline_images = Vec::new();
@@ -3179,6 +3272,12 @@ fn prepare_inline_content(
     for (inline_index, inline) in block.content.iter().enumerate() {
         match inline {
             Inline::Text(run) => {
+                if run.style.inline_citation != 0
+                    && inline_index > 0
+                    && matches!(&block.content[inline_index-1], Inline::Text(previous) if previous.style.inline_citation == run.style.inline_citation)
+                {
+                    continue;
+                }
                 let start = text.len();
                 let mut style = run.style;
                 if style.color == Rgba::BLACK {
@@ -3193,12 +3292,31 @@ fn prepare_inline_content(
                             && run.style.baseline == TextBaseline::Superscript));
                 let footnote_reference = focus_footnote_icons
                     && (run.style.inline_role == InlineRole::Footnote || linked_footnote_reference);
-                if footnote_reference {
+                if style.inline_citation != 0 {
+                    let original: String = block.content[inline_index..].iter().take_while(|inline| matches!(inline, Inline::Text(r) if r.style.inline_citation == style.inline_citation)).filter_map(|i| match i { Inline::Text(r) => Some(r.text.as_str()), _ => None }).collect();
+                    let label = format!("[{}]", style.inline_citation);
+                    text.push_str(&label);
+                    for _ in label.chars().count()..original.chars().count() {
+                        text.push('\u{2060}');
+                    }
+                    citations.push(InlineCitationPlacement {
+                        owner: block.source.clone(),
+                        range: start..text.len(),
+                        original,
+                        number: style.inline_citation,
+                    });
+                    style.size_scale *= 0.78;
+                    style.baseline = TextBaseline::Superscript;
+                    style.bold = false;
+                    style.italic = false;
+                } else if footnote_reference {
                     text.push_str(&footnote_icon_placeholder(&run.text));
                 } else {
                     text.push_str(&run.text);
                 }
-                let footnote_reference_group = if footnote_reference {
+                let footnote_reference_group = if style.inline_citation != 0 {
+                    0x8000_0000 | style.inline_citation
+                } else if footnote_reference {
                     let group = next_footnote_reference_group;
                     next_footnote_reference_group = next_footnote_reference_group.saturating_add(1);
                     group
@@ -3209,7 +3327,8 @@ fn prepare_inline_content(
                     range: start..text.len(),
                     style,
                     footnote_reference_group,
-                    hyphenation_suppressed: run.link.is_some()
+                    hyphenation_suppressed: style.inline_citation != 0
+                        || run.link.is_some()
                         || footnote_reference
                         || run.style.baseline != TextBaseline::Normal
                         || run.style.inline_role != InlineRole::Normal,
@@ -3224,13 +3343,17 @@ fn prepare_inline_content(
                     available_width,
                     svg_options,
                 ) {
+                    let (box_height, offset_y) =
+                        formula_images::math_vertical_metrics(run, typography, image.2)
+                            .unwrap_or((image.2, 0.0));
                     inline_images.push(PreparedInlineImage {
+                        formula_presentation: None,
                         id,
                         index: text.len(),
                         width: image.1,
                         height: image.2,
-                        box_height: image.2,
-                        offset_y: 0.0,
+                        box_height,
+                        offset_y,
                         image: image.0,
                     });
                 } else {
@@ -3255,6 +3378,24 @@ fn prepare_inline_content(
                     continue;
                 };
                 let id = u64::try_from(inline_images.len()).unwrap_or(u64::MAX);
+                if unified_math
+                    && let Some(formula) = &run.image.formula
+                    && let Ok(mut rendered) = formula_images::inline(
+                        formula,
+                        run.size_scale,
+                        typography,
+                        fallback_color,
+                        available_width,
+                        svg_options,
+                        image.clone(),
+                        id,
+                        text.len(),
+                    )
+                {
+                    rendered.index = text.len();
+                    inline_images.push(rendered);
+                    continue;
+                }
                 inline_images.push(prepare_inline_raster(
                     run,
                     image,
@@ -3269,7 +3410,7 @@ fn prepare_inline_content(
             }
         }
     }
-    (text, spans, inline_images, source_text_start)
+    (text, spans, inline_images, source_text_start, citations)
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -3321,6 +3462,7 @@ fn prepare_inline_raster(
         typography.font_size * surrounding_scale,
     );
     PreparedInlineImage {
+        formula_presentation: None,
         id,
         index,
         image,
@@ -3687,6 +3829,7 @@ impl Paginator {
             let origin_x = self.column_left() + prepared.start_offset;
             let origin_y = self.cursor_y - first_top;
             self.items.push(PageItem::Text(TextPlacement {
+                citations: Arc::clone(&prepared.citations),
                 layout: Arc::clone(&prepared.layout),
                 text: Arc::clone(&prepared.text),
                 source_text_start: prepared.source_text_start,
@@ -3712,6 +3855,7 @@ impl Paginator {
                     .get(0)
                     .ok_or(LayoutError::InvalidLayout)?;
                 self.items.push(PageItem::Text(TextPlacement {
+                    citations: Arc::from([]),
                     layout: Arc::clone(&hyphen.glyph.layout),
                     text: Arc::clone(&hyphen.glyph.text),
                     source_text_start: 0,
@@ -3834,6 +3978,7 @@ impl Paginator {
                         table.cell_padding
                     };
                     TextPlacement {
+                        citations: Arc::clone(&cell.text.citations),
                         layout: Arc::clone(&cell.text.layout),
                         text: Arc::clone(&cell.text.text),
                         source_text_start: cell.text.source_text_start,
@@ -3994,6 +4139,7 @@ impl Paginator {
                 .collect()
         });
         self.items.push(PageItem::Image(ImagePlacement {
+            formula_presentation: None,
             image,
             x,
             y: self.cursor_y,
@@ -4028,6 +4174,7 @@ impl Paginator {
         let segment = FixedPageTextReplacementSegmentPlacement {
             rect: request.rect,
             text: TextPlacement {
+                citations: Arc::clone(&prepared.citations),
                 layout: Arc::clone(&prepared.layout),
                 text: Arc::clone(&prepared.text),
                 source_text_start: prepared.source_text_start,
@@ -4068,7 +4215,12 @@ impl Paginator {
     }
 
     fn current_content_bottom(&self) -> Option<f32> {
-        self.items.last().and_then(|item| match item {
+        // Display-only hyphens are appended after their entire text placement.
+        // The last one may belong to an earlier wrapped line, so it must not
+        // replace the real paragraph bottom when collapsing semantic block gaps.
+        self.items.iter().rev().find(|item| {
+            !matches!(item, PageItem::Text(text) if text.source.is_none() && text.text.as_ref() == "\u{2010}")
+        }).and_then(|item| match item {
             PageItem::Text(text) => text
                 .lines
                 .end
@@ -4477,13 +4629,14 @@ mod tests {
         };
         let svg_options = resvg::usvg::Options::default();
 
-        let (focus_text, spans, _, _) = prepare_inline_content(
+        let (focus_text, spans, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &ReaderTypography::default(),
             320.0,
             &svg_options,
             true,
+            false,
             &[],
         );
         assert_eq!(
@@ -4502,12 +4655,13 @@ mod tests {
             )
         );
 
-        let (classic_text, disabled_spans, _, _) = prepare_inline_content(
+        let (classic_text, disabled_spans, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &ReaderTypography::default(),
             320.0,
             &svg_options,
+            false,
             false,
             &[],
         );
@@ -4585,6 +4739,8 @@ mod tests {
             content: vec![
                 Inline::Image(Box::new(rebook_publication::InlineImageRun {
                     image: ImageBlock {
+                        formula_image: false,
+                        formula: None,
                         href: PublicationUrl::parse("images/chapter-icon.jpg").unwrap(),
                         alt: String::new(),
                         style: ImageStyle::default(),
@@ -4613,12 +4769,13 @@ mod tests {
         let typography = ReaderTypography::default();
         let svg_options = resvg::usvg::Options::default();
 
-        let (text, _, images, _) = prepare_inline_content(
+        let (text, _, images, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &typography,
             320.0,
             &svg_options,
+            false,
             false,
             &[Some(raster), None],
         );
@@ -4640,6 +4797,8 @@ mod tests {
             content: vec![Inline::Image(Box::new(
                 rebook_publication::InlineImageRun {
                     image: ImageBlock {
+                        formula_image: false,
+                        formula: None,
                         href: PublicationUrl::parse("images/pi.jpg").unwrap(),
                         alt: "Image".into(),
                         style: ImageStyle::default(),
@@ -4663,12 +4822,13 @@ mod tests {
         let typography = ReaderTypography::default();
         let svg_options = resvg::usvg::Options::default();
 
-        let (_, _, images, _) = prepare_inline_content(
+        let (_, _, images, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &typography,
             320.0,
             &svg_options,
+            false,
             false,
             &[Some(raster)],
         );
@@ -6586,6 +6746,8 @@ mod tests {
             })
         };
         let ornament = ImageBlock {
+            formula_image: false,
+            formula: None,
             href: PublicationUrl::parse("rule.png").unwrap(),
             alt: String::new(),
             style: ImageStyle::default(),
@@ -7124,6 +7286,8 @@ mod tests {
                     source: None,
                 }),
                 Block::Image(ImageBlock {
+                    formula_image: false,
+                    formula: None,
                     href: PublicationUrl::parse("figure.png").unwrap(),
                     alt: "Figure".into(),
                     style: ImageStyle {
@@ -7379,6 +7543,8 @@ mod tests {
                     source: None,
                 }),
                 Block::Image(ImageBlock {
+                    formula_image: false,
+                    formula: None,
                     href: image_href,
                     alt: "Figure".into(),
                     style: ImageStyle::default(),
@@ -7427,6 +7593,8 @@ mod tests {
             href: PublicationUrl::parse("chapter.xhtml").unwrap(),
             blocks: vec![Block::Figure(rebook_publication::FigureBlock {
                 images: vec![ImageBlock {
+                    formula_image: false,
+                    formula: None,
                     href: PublicationUrl::parse("images/figure.png").unwrap(),
                     alt: "Figure".into(),
                     style: ImageStyle {
@@ -7495,6 +7663,8 @@ mod tests {
             href: PublicationUrl::parse("chapter.xhtml").unwrap(),
             blocks: vec![
                 Block::Image(ImageBlock {
+                    formula_image: false,
+                    formula: None,
                     href: PublicationUrl::parse("images/figure.png").unwrap(),
                     alt: "Figure".into(),
                     style: ImageStyle::default(),
@@ -7633,6 +7803,8 @@ mod tests {
         with_symbol.content.push(Inline::Image(Box::new(
             rebook_publication::InlineImageRun {
                 image: ImageBlock {
+                    formula_image: false,
+                    formula: None,
                     href: PublicationUrl::parse("symbol.png").unwrap(),
                     alt: String::new(),
                     style: ImageStyle::default(),
@@ -7854,6 +8026,8 @@ mod tests {
                     source: None,
                 }),
                 Block::Image(ImageBlock {
+                    formula_image: false,
+                    formula: None,
                     href: image_href,
                     alt: "Figure".into(),
                     style: ImageStyle::default(),
@@ -7908,6 +8082,8 @@ mod tests {
                     source: None,
                 }),
                 Block::Image(ImageBlock {
+                    formula_image: false,
+                    formula: None,
                     href: image_href,
                     alt: "Figure".into(),
                     style: ImageStyle::default(),
@@ -8180,6 +8356,8 @@ mod tests {
             id: SpineItemId::new("pdf-page-1").unwrap(),
             href: PublicationUrl::parse("page-1.pdf").unwrap(),
             blocks: vec![Block::Image(ImageBlock {
+                formula_image: false,
+                formula: None,
                 href,
                 alt: "PDF page 1".into(),
                 style: ImageStyle::default(),
@@ -8247,6 +8425,8 @@ mod tests {
             id: SpineItemId::new("cover").unwrap(),
             href: PublicationUrl::parse("cover.xhtml").unwrap(),
             blocks: vec![Block::Image(ImageBlock {
+                formula_image: false,
+                formula: None,
                 href: cover,
                 alt: "Cover".into(),
                 style: ImageStyle::default(),
@@ -8290,6 +8470,8 @@ mod tests {
             id: SpineItemId::new("illustration").unwrap(),
             href: PublicationUrl::parse("illustration.xhtml").unwrap(),
             blocks: vec![Block::Image(ImageBlock {
+                formula_image: false,
+                formula: None,
                 href: image_href,
                 alt: "Illustration".into(),
                 style: ImageStyle::default(),
@@ -8335,6 +8517,8 @@ mod tests {
                 }),
                 Inline::Image(Box::new(rebook_publication::InlineImageRun {
                     image: ImageBlock {
+                        formula_image: false,
+                        formula: None,
                         href: PublicationUrl::parse("symbol.png").unwrap(),
                         alt: String::new(),
                         style: ImageStyle::default(),

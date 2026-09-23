@@ -159,6 +159,26 @@ impl DesktopReader {
         }
     }
 
+    pub(in crate::reader) fn citation_at_canvas(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Option<(SourceRange, u32)> {
+        if self.is_scroll_mode() {
+            let (position, px, py) = self.scroll_page_coordinates(x, y)?;
+            self.reader
+                .inline_citation_at_page(position, px, py)
+                .ok()
+                .flatten()
+        } else {
+            self.reader
+                .inline_citation_at_current_spread(x, y)
+                .ok()
+                .flatten()
+                .map(|(_, hit)| hit)
+        }
+    }
+
     pub(in crate::reader) fn classic_footnotes_at_canvas(
         &mut self,
         x: f32,

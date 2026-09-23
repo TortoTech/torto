@@ -60,6 +60,9 @@ pub(super) fn capture(
             let mut references = Vec::new();
             for reference in refs {
                 let (key, marker, target, inline) = match reference {
+                    // Citation text is already retained in the paragraph sent
+                    // to chat; it is not a separate footnote definition.
+                    FocusFootnoteSource::Citation { .. } => continue,
                     FocusFootnoteSource::Inline(text) => {
                         (format!("inline:{text}"), String::new(), None, Some(text))
                     }

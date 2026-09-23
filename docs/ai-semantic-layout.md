@@ -1,13 +1,18 @@
 # AI layout
 
 Settings → Typography → Layout contains a global, opt-in switch and a configured
-provider/model selection. Quotes, captions and numbered section headings are always enabled. The help
-icon next to the switch shows “补充未识别的引用、图注和数字节标题” on hover.
+provider/model selection. Quotes, inline citations, formula images, captions and numbered section headings are always enabled. The help
+icon next to the switch shows “补充未识别的引用、文内文献引用、公式图片、图注和数字节标题” on hover.
 Credentials remain in the existing provider configuration. A missing or deleted
 model pauses recognition; it is never silently replaced. There are no per-book
 switches or manual chapter recognition commands.
 
 ## Pipeline
+
+See [Inline bibliographic citations](ai-inline-citations.md) for numbered inline
+markers, source-preserving folding and the shared footnote popup.
+See [Formula images](ai-formula-images.md) for visual transcription, verification,
+original-image fallback and unified formula rendering.
 
 `parser → rewrite → translation → semantic layout → sentence structure → layout`
 
@@ -17,23 +22,24 @@ blocks are represented as protected boundaries, without their text, except for
 recognized quotes missing an attribution. Those are exposed only for credit
 completion, without reclassifying or restyling their body. Headings
 provide read-only context. Model output contains IDs and roles, never replacement
-text or styles. Local validation rejects nonexistent IDs, overlaps, discontinuous
+text or styles, except for exact source-credit suffixes copied for localization.
+Local validation rejects nonexistent IDs, overlaps, discontinuous
 groups, nonadjacent captions and changes to existing semantics.
 Images adjacent to an already recognized standalone caption are protected too,
 including consecutive image runs. This prevents attaching ordinary surrounding
-prose as a second caption. Local checks validate structure rather than require
-typographic evidence: quotes may lack quotation marks, a preceding colon,
-heading adjacency or a separate attribution paragraph. An inline credit stays
-inside its original paragraph. An invalid optional attribution relationship is
-discarded without erasing an independently valid quote body. Windows with images use
-a separate caption pass, protecting accepted captions during quotation detection.
+prose as a second caption. New quotes require an explicit source in one of three
+positions: a following standalone credit (`quote`), a preceding named introduction
+ending with a colon or explicit reporting cue (`quote_before`), or the exact credit suffix of the final body
+paragraph (`quote_inline`). Unattributed prose, epigraphs and ordinary narrative
+dialogue cannot become new AI quotes. Invalid credits reject the whole new group;
+there is no body-only repair. Windows with images still use a separate caption pass.
 
 The system prompt is maintained as sectioned Markdown in
 `apps/desktop/src/plugins/semantic_layout/prompt.md`: task, input and scope,
 semantic judgment, structural requirements, output and examples. Retry feedback
 also uses Markdown headings. Book input remains a separate JSON data message. Requests use
 `response_format.type = json_schema` and `strict = true`, with a quote-only, caption-only or
-heading-only schema for each pass (required fields, nullable attribution/alignment and no
+heading-only schema for each pass (required fields, non-null new-quote attribution, nullable alignment and no
 additional properties). This requires a compatible endpoint; API errors are
 reported rather than silently falling back to unconstrained output. Local ID,
 source-protection and relationship checks still run after parsing.
@@ -42,8 +48,9 @@ source-protection and relationship checks still run after parsing.
 has no attribution. It can consume the immediately following paragraph or move
 the quote's separate final body paragraph into its attribution field. The latter
 must leave at least one body paragraph. Both cases preserve source links and
-bilingual companions. Already attributed quotes stay protected; inline credits
-sharing a paragraph with prose are left in place. The model cannot generate new
+bilingual companions. Already attributed quotes stay protected. `quote_inline`
+can also extract an explicitly written suffix from a recognized quote's final
+body paragraph without recommending alignment or changing its recognized scope. The model cannot generate new
 credit text or infer an author absent from the supplied book content.
 
 Validated IDs are resolved to source ranges. Composition happens after translation
@@ -148,14 +155,13 @@ cargo test -p rebook-desktop semantic_layout
 
 An explicitly ignored live test uses the already configured `gemini/lite` model
 and a local copy of *Phantoms in the Brain* (displayed as `V.S. Ramachandran` in
-the test library). It sends only the first 24 parsed blocks of seven selected
-chapters. Expected quote bodies, credits and a multipart cartoon caption are
+the test library). It sends the first 24 parsed blocks of six selected chapters
+and the entire eighth chapter. Expected quote bodies, credits and a multipart cartoon caption are
 checked against manually inspected passages; neighboring narrative/dialogue
 must remain ordinary paragraphs.
 The release check requires the ten chapter epigraphs (including their credits)
-and the cartoon caption, and rejects false positives. An additional unattributed
-letter is tracked as a recall benchmark: `gemini/lite` missed it in the checked
-run. The report preserves this miss rather than claiming perfect recognition.
+and the cartoon caption, and rejects false positives. An unattributed letter
+that used to be a recall target is now an explicit negative example.
 
 Set `TORTO_SEMANTIC_BOOK` to that EPUB and optionally `TORTO_SEMANTIC_REPORT` to
 a local JSON report path, then run:
@@ -174,3 +180,14 @@ accuracy estimate.
 loading and source overlay. It verifies that the Octavio Paz epigraph is a quote
 both in the result and in the reader source; a short excerpt alone is insufficient
 to reproduce the production request context.
+
+## Explicit quote source presentation
+
+Preceding introductions stay in place and their association is stored in the
+source-backed annotation. Inline suffixes are split preserving runs, links and
+character-based source ranges. A bilingual companion stays intact with its body;
+a translated-only paragraph whose suffix no longer matches stays intact rather
+than applying original offsets to translated text. Prompt/schema fingerprints
+invalidate all earlier AI results automatically, including old body-only quotes.
+The seven-chapter Ramachandran benchmark now treats the unattributed letter as
+out of scope, and still requires the sourced chapter epigraphs and caption.

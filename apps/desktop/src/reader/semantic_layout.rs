@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crate::platform::UserEvent;
 use crate::plugins::AiProvider;
 use crate::plugins::semantic_layout::{
-    Recognition, SemanticLayoutSettings, fingerprint, recognize,
+    Recognition, SemanticLayoutSettings, fingerprint, recognize_with_source as recognize,
 };
 use rebook_publication::RenditionLayout;
 
@@ -134,7 +134,7 @@ impl DesktopReader {
             self.semantic_layout.receiver = Some(rx);
             self.semantic_layout.active_section = Some(index);
             self.semantic_layout.worker = Some(runtime.spawn(async move {
-                let result = recognize(&section, &book_id, &settings).await;
+                let result = recognize(&section, &book_id, &settings, original.as_ref()).await;
                 let _ = tx.send((index, hash, result));
                 let _ = proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO));
             }));

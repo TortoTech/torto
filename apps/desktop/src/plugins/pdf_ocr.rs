@@ -3147,6 +3147,8 @@ mod tests {
                     href: descriptor.href.clone(),
                     blocks: vec![rebook_publication::Block::Image(
                         rebook_publication::ImageBlock {
+                            formula_image: false,
+                            formula: None,
                             href: PublicationUrl::parse("Pages/page-00001.png")?,
                             alt: "PDF cover".into(),
                             style: rebook_publication::ImageStyle::default(),

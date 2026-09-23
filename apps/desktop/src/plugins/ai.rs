@@ -3098,6 +3098,8 @@ mod tests {
     fn scanned_pdf_page_requests_visual_evidence_without_exposing_placeholder_alt_text() {
         let mut source = fixed_page_test_source();
         source.sections[0].blocks = vec![Block::Image(ImageBlock {
+            formula_image: false,
+            formula: None,
             href: PublicationUrl::parse("Images/page-1.jpg").unwrap(),
             alt: "PDF page 1".into(),
             style: ImageStyle::default(),
@@ -3117,6 +3119,8 @@ mod tests {
     fn direct_pdf_summary_combines_text_pages_and_original_page_images() {
         let mut source = fixed_page_test_source();
         source.sections[1].blocks = vec![Block::Image(ImageBlock {
+            formula_image: false,
+            formula: None,
             href: PublicationUrl::parse("Images/page-2.jpg").unwrap(),
             alt: "PDF page 2".into(),
             style: ImageStyle::default(),
@@ -3188,6 +3192,8 @@ mod tests {
         let source: Arc<dyn BookSource> = Arc::new({
             let mut source = fixed_page_test_source();
             source.sections[1].blocks = vec![Block::Image(ImageBlock {
+                formula_image: false,
+                formula: None,
                 href: PublicationUrl::parse("Images/page-2.jpg").unwrap(),
                 alt: "PDF page 2".into(),
                 style: ImageStyle::default(),
@@ -3227,6 +3233,8 @@ mod tests {
     fn pdf_context_keeps_visual_markers_after_the_text_budget_is_exhausted() {
         let mut source = fixed_page_test_source();
         source.sections[1].blocks = vec![Block::Image(ImageBlock {
+            formula_image: false,
+            formula: None,
             href: PublicationUrl::parse("Images/page-2.jpg").unwrap(),
             alt: "PDF page 2".into(),
             style: ImageStyle::default(),

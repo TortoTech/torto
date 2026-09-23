@@ -1734,6 +1734,8 @@ impl<'a> ReadingIrParser<'a> {
             style.margin_after = style.margin_after.max(margin_after);
         }
         Ok(Some(ImageBlock {
+            formula_image: false,
+            formula: None,
             href,
             alt: attribute_local(node, "alt").unwrap_or_default().to_owned(),
             style,
@@ -2412,6 +2414,8 @@ fn inline_image(
     }
     Some(InlineImageRun {
         image: ImageBlock {
+            formula_image: false,
+            formula: None,
             href: context.base.resolve(src).ok()?.resource_url(),
             alt: attribute_local(node, "alt").unwrap_or_default().to_owned(),
             style: context.styles.image_style(node),

@@ -86,7 +86,9 @@ fn fixture_with_numbered_heading(numbered_heading: bool) -> (DesktopReader, Sect
     let mut section=Section {id:spine.clone(),href:href.clone(),anchors:vec![],blocks:vec![
         text("earlier","Earlier paragraphs change height when recognized as a quotation. ".repeat(25)),
         text("current","Current paragraph stays next to its illustration after the preceding content is reflowed. ".repeat(6)),
-        Block::Image(ImageBlock {href:PublicationUrl::parse("image.png").unwrap(),alt:String::new(),style:Default::default(),source:Some(SourceRange {start:image_anchor.clone(),end:image_anchor}),text_layer:None}),
+        Block::Image(ImageBlock {formula_image: false,
+formula: None,
+href:PublicationUrl::parse("image.png").unwrap(),alt:String::new(),style:Default::default(),source:Some(SourceRange {start:image_anchor.clone(),end:image_anchor}),text_layer:None}),
     ]};
     let target = block_source_range(&section.blocks[1]).unwrap().clone();
     if numbered_heading {

@@ -63,9 +63,13 @@ static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CHAT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 mod assistant;
+#[cfg(test)]
+mod blank_lines_tests;
 mod chat_autocomplete;
 mod chat_footnotes;
 mod chat_markdown;
+#[cfg(test)]
+mod citation_tests;
 mod completion;
 mod egui_view;
 mod footnote_layout;
@@ -545,6 +549,7 @@ pub(super) struct DesktopReader {
     focus_units: Vec<FocusUnit>,
     focus_units_ready: bool,
     classic_footnotes: Vec<FocusFootnote>,
+    citation_popup_target: Option<(SourceRange, u32)>,
     classic_footnote_anchor_y: Option<f32>,
     classic_footnote_overlay_rect: Option<egui::Rect>,
     focus_unit_index: usize,
@@ -581,6 +586,7 @@ struct PendingTocNavigation {
 }
 
 struct ImagePreview {
+    formula: Option<String>,
     texture: egui::TextureHandle,
     image: egui::ColorImage,
     source_size: egui::Vec2,
@@ -648,10 +654,31 @@ struct FocusUnit {
 
 #[derive(Clone)]
 struct FocusFootnote {
+    citation: Option<(SourceRange, u32)>,
     text: String,
 }
 
+impl FocusFootnote {
+    fn popup_text(&self) -> &str {
+        if self.citation.is_none() {
+            return &self.text;
+        }
+        let text = self.text.trim();
+        for (open, close) in [('(', ')'), ('（', '）'), ('[', ']'), ('［', '］')] {
+            if let Some(inner) = text.strip_prefix(open).and_then(|s| s.strip_suffix(close)) {
+                return inner.trim();
+            }
+        }
+        text
+    }
+}
+
 enum FocusFootnoteSource {
+    Citation {
+        text: String,
+        source: SourceRange,
+        number: u32,
+    },
     Inline(String),
     Reference {
         marker: String,
@@ -770,6 +797,33 @@ fn text_block_focus_footnotes(block: &TextBlock) -> Vec<FocusFootnoteSource> {
         }
     }
     flush_inline_note(&mut notes, &mut inline_note);
+    if let Some(source) = &block.source {
+        let mut index = 0;
+        while index < block.content.len() {
+            let Inline::Text(run) = &block.content[index] else {
+                index += 1;
+                continue;
+            };
+            let number = run.style.inline_citation;
+            if number == 0 {
+                index += 1;
+                continue;
+            }
+            let mut text = String::new();
+            while let Some(Inline::Text(run)) = block.content.get(index) {
+                if run.style.inline_citation != number {
+                    break;
+                }
+                text.push_str(&run.text);
+                index += 1;
+            }
+            notes.push(FocusFootnoteSource::Citation {
+                text,
+                source: source.clone(),
+                number,
+            });
+        }
+    }
     notes
 }
 
@@ -1012,10 +1066,14 @@ fn text_block_focus_text(block: &TextBlock) -> String {
         .iter()
         .filter_map(|inline| match inline {
             Inline::Text(run) if run.style.inline_role == InlineRole::Footnote => None,
-            Inline::Text(run) => Some(run.text.as_str()),
-            Inline::Math(run) => Some(run.latex.as_str()),
-            Inline::Image(_) => None,
-            Inline::Break => Some("\n"),
+            Inline::Text(run) => Some(run.text.clone()),
+            Inline::Math(run) => Some(run.latex.clone()),
+            Inline::Image(run) => run
+                .image
+                .formula
+                .as_ref()
+                .map(|f| format!(r"\({}\)", f.latex)),
+            Inline::Break => Some("\n".to_owned()),
         })
         .collect()
 }
@@ -1139,7 +1197,10 @@ fn block_focus_text(block: &Block) -> String {
             .map(|cell| text_block_focus_text(&cell.text))
             .collect::<Vec<_>>()
             .join(" "),
-        Block::Image(image) => image.alt.clone(),
+        Block::Image(image) => image
+            .formula
+            .as_ref()
+            .map_or_else(|| image.alt.clone(), |f| format!(r"\({}\)", f.latex)),
         Block::Figure(figure) => figure
             .captions
             .iter()
@@ -2100,14 +2161,26 @@ impl DesktopReader {
         linked_sections: &mut HashMap<usize, Section>,
     ) -> Vec<FocusFootnote> {
         let mut seen = HashSet::new();
-        block_focus_footnotes(block)
+        let mut notes: Vec<_> = block_focus_footnotes(block)
             .into_iter()
             .filter_map(|source| match source {
+                FocusFootnoteSource::Citation {
+                    text,
+                    source,
+                    number,
+                } => Some(FocusFootnote {
+                    text,
+                    citation: Some((source, number)),
+                }),
                 FocusFootnoteSource::Inline(text) => seen
                     .insert(format!("inline:{text}"))
-                    .then_some(FocusFootnote { text }),
+                    .then_some(FocusFootnote {
+                        text,
+                        citation: None,
+                    }),
                 FocusFootnoteSource::Reference { marker, target } => {
                     seen.insert(target.to_string()).then(|| FocusFootnote {
+                        citation: None,
                         text: focus_footnote_text(
                             self.source.as_ref(),
                             &target,
@@ -2124,7 +2197,9 @@ impl DesktopReader {
                     })
                 }
             })
-            .collect()
+            .collect();
+        notes.sort_by_key(|note| note.citation.is_some());
+        notes
     }
 
     #[allow(
@@ -2223,11 +2298,14 @@ impl DesktopReader {
                             TextBlockKind::ListItem { depth, .. } => Some(depth),
                             _ => None,
                         };
+                        let is_formula = self.reader.style().typesetting.mode
+                            == rebook_layout::TypesettingMode::Unified
+                            && rebook_layout::is_display_formula(block);
                         (
                             range.clone(),
                             vec![range],
                             text_block_focus_text(block),
-                            false,
+                            is_formula,
                             false,
                             block.kind == TextBlockKind::Preformatted,
                             list_depth,
@@ -3725,6 +3803,7 @@ impl DesktopReader {
             focus_units: Vec::new(),
             focus_units_ready: false,
             classic_footnotes: Vec::new(),
+            citation_popup_target: None,
             classic_footnote_anchor_y: None,
             classic_footnote_overlay_rect: None,
             focus_unit_index: 0,
@@ -4589,6 +4668,7 @@ mod tests {
             },
             leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
+                formula_presentation: None,
                 image: RasterImage {
                     width: 2,
                     height: 2,
@@ -4635,6 +4715,7 @@ mod tests {
                 background: Rgba::BLACK,
                 leading_gap,
                 items: vec![PageItem::Image(ImagePlacement {
+                    formula_presentation: None,
                     image: RasterImage {
                         width: 2,
                         height: 2,
@@ -4918,6 +4999,8 @@ mod tests {
         let caption_range = range("caption");
         let block = Block::Figure(FigureBlock {
             images: vec![ImageBlock {
+                formula_image: false,
+                formula: None,
                 href: PublicationUrl::parse("image.png").unwrap(),
                 alt: String::new(),
                 style: ImageStyle::default(),
@@ -4995,6 +5078,7 @@ mod tests {
             structured_activation: false,
             rectangular_activation_rect: None,
             footnotes: vec![FocusFootnote {
+                citation: None,
                 text: "Caption note".into(),
             }],
         };
@@ -5330,6 +5414,7 @@ mod tests {
         let child_range = range("child");
         let mut child = unit("child", "口头文化与书面文化", 160.0);
         child.footnotes.push(FocusFootnote {
+            citation: None,
             text: "列表子项脚注".into(),
         });
         merge_focus_list_descendant(&mut root, child);

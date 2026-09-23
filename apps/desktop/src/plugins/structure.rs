@@ -205,7 +205,7 @@ fn paragraph_atoms_for_content_mode(
         let len = match inline {
             Inline::Text(run) => {
                 let len = run.text.chars().count();
-                if is_focus_footnote(run) && len > 0 {
+                if (is_focus_footnote(run) || run.style.inline_citation != 0) && len > 0 {
                     let range = cursor..cursor + len;
                     footnotes.push(range.clone());
                     protected.push(range);

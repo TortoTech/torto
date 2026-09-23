@@ -216,6 +216,7 @@ fn headings_preserve_translation_sources_toc_and_toggle() {
         .unwrap();
     let overlay = SemanticLayoutSource::new(translations.clone(), original.clone());
     let result = Recognition {
+        formulas_checked: true,
         fingerprint: fingerprint(&section),
         skipped_groups: 0,
         annotations: vec![Annotation::SectionHeading {

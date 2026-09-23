@@ -1297,6 +1297,7 @@ impl DesktopReader {
     }
 
     fn close_focus_footnotes(&mut self) {
+        self.citation_popup_target = None;
         self.ui.focus_footnotes_visible = false;
         self.ui.focus_footnote_scroll_delta = 0.0;
         self.classic_footnotes.clear();
@@ -2211,7 +2212,7 @@ impl DesktopReader {
         if !self.ui.focus_footnotes_visible {
             return;
         }
-        let footnotes = if self.is_focus_mode() {
+        let mut footnotes = if self.is_focus_mode() {
             self.focus_units
                 .get(self.focus_unit_index)
                 .map(|unit| unit.footnotes.clone())
@@ -2219,6 +2220,7 @@ impl DesktopReader {
         } else {
             self.classic_footnotes.clone()
         };
+        footnotes.sort_by_key(|note| note.citation.is_some());
         if footnotes.is_empty() {
             self.close_focus_footnotes();
             return;
@@ -2230,7 +2232,7 @@ impl DesktopReader {
             + reading_content_left(page_rect.width(), &style)
             + reading_content_width(page_rect.width(), &style);
         let preferred_x = content_right + 12.0;
-        let maximum_width = 360.0_f32.min((viewport.width() - 32.0).max(1.0));
+        let maximum_width = 480.0_f32.min((viewport.width() - 32.0).max(1.0));
         let minimum_width = 180.0_f32.min(maximum_width);
         let available_right = viewport.right() - preferred_x - 16.0;
         let width = available_right.clamp(minimum_width, maximum_width);
@@ -2246,33 +2248,84 @@ impl DesktopReader {
         let text_width = (width - frame_horizontal_margin - scrollbar_reserve).max(1.0);
         let body_font = egui::TextStyle::Body.resolve(style.as_ref());
         let text_color = palette().text;
+        let citation_gap = 4.0;
+        let citation_labels: Vec<_> = footnotes
+            .iter()
+            .map(|note| {
+                note.citation.as_ref().map(|(_, number)| {
+                    self.footnote_layout
+                        .layout(
+                            self.source.as_ref(),
+                            &format!("[{number}]"),
+                            &self.reader.style(),
+                            body_font.size,
+                            crate::ui::footnote_link_color(),
+                            body_font.size * (number.to_string().len() as f32 + 2.0),
+                        )
+                        .unwrap_or_else(|_| {
+                            super::footnote_layout::FootnoteLayout::fallback(
+                                ctx,
+                                &format!("[{number}]"),
+                                &body_font,
+                                crate::ui::footnote_link_color(),
+                                body_font.size * (number.to_string().len() as f32 + 2.0),
+                            )
+                        })
+                })
+            })
+            .collect();
         let footnote_text_layouts = footnotes
             .iter()
-            .map(|footnote| {
+            .enumerate()
+            .map(|(index, footnote)| {
                 self.footnote_layout
                     .layout(
                         self.source.as_ref(),
-                        &footnote.text,
+                        footnote.popup_text(),
                         &self.reader.style(),
                         body_font.size,
                         text_color,
-                        text_width,
+                        if footnote.citation.is_some() {
+                            (text_width
+                                - citation_labels[index]
+                                    .as_ref()
+                                    .map_or(0.0, |label| label.content_width)
+                                - citation_gap)
+                                .max(1.0)
+                        } else {
+                            text_width
+                        },
                     )
                     .unwrap_or_else(|error| {
                         tracing::warn!(%error, "footnote layout failed");
                         super::footnote_layout::FootnoteLayout::fallback(
                             ctx,
-                            &footnote.text,
+                            footnote.popup_text(),
                             &body_font,
                             text_color,
-                            text_width,
+                            if footnote.citation.is_some() {
+                                (text_width
+                                    - citation_labels[index]
+                                        .as_ref()
+                                        .map_or(0.0, |label| label.content_width)
+                                    - citation_gap)
+                                    .max(1.0)
+                            } else {
+                                text_width
+                            },
                         )
                     })
             })
             .collect::<Vec<_>>();
+        let scroll_target = self.citation_popup_target.take();
         let measured_text_height = footnote_text_layouts
             .iter()
-            .map(|layout| layout.height)
+            .enumerate()
+            .map(|(index, layout)| {
+                citation_labels[index]
+                    .as_ref()
+                    .map_or(layout.height, |label| layout.citation_row_height(label))
+            })
             .sum::<f32>();
         // Each additional item has one separator plus the vertical spacing on
         // both sides. The small safety inset covers fractional glyph metrics.
@@ -2325,10 +2378,16 @@ impl DesktopReader {
                                         if index > 0 {
                                             ui.separator();
                                         }
-                                        ui.vertical(|ui| {
-                                            ui.spacing_mut().item_spacing.y = 0.0;
-                                            layout.paint(ui);
-                                        });
+                                        let row = if let Some(label) = &citation_labels[index] {
+                                            layout.paint_with_marker(ui, label, citation_gap)
+                                        } else {
+                                            ui.vertical(|ui| layout.paint(ui)).response
+                                        };
+                                        if scroll_target.is_some()
+                                            && footnotes[index].citation == scroll_target
+                                        {
+                                            row.scroll_to_me(Some(egui::Align::Center));
+                                        }
                                     }
                                 });
                         });
@@ -3886,6 +3945,7 @@ impl DesktopReader {
             let y = position.y - response.rect.min.y;
             match self.classic_footnotes_at_canvas(x, y) {
                 Ok(Some(footnotes)) => {
+                    self.citation_popup_target = self.citation_at_canvas(x, y);
                     self.classic_footnotes = footnotes;
                     self.classic_footnote_anchor_y = Some(position.y);
                     self.ui.focus_footnotes_visible = true;
@@ -3931,6 +3991,19 @@ impl DesktopReader {
                 ImagePointerState::SuppressNextClick
             ) {
                 self.image_pointer_state = ImagePointerState::Idle;
+                return;
+            }
+            if let Some(target) = self.citation_at_canvas(x, y) {
+                if self.is_focus_mode() {
+                    self.cancel_text_selection();
+                    self.focus_clicked_unit(x, y);
+                } else if let Ok(Some(notes)) = self.classic_footnotes_at_canvas(x, y) {
+                    self.classic_footnotes = notes;
+                    self.classic_footnote_anchor_y = Some(position.y);
+                }
+                self.citation_popup_target = Some(target);
+                self.ui.focus_footnotes_visible = true;
+                response.ctx.request_repaint();
                 return;
             }
             if self.try_open_image_preview(&response.ctx, x, y) {
@@ -4064,6 +4137,9 @@ impl DesktopReader {
         let color_image =
             egui::ColorImage::from_rgba_unmultiplied([width, height], &image.pixels[..byte_len]);
         self.open_color_image_preview(ctx, color_image, "reader-image-preview");
+        if let Some(preview) = &mut self.image_preview {
+            preview.formula = image.formula;
+        }
         true
     }
 
@@ -4088,6 +4164,7 @@ impl DesktopReader {
         self.selected_image = None;
         self.image_pointer_state = ImagePointerState::Idle;
         self.image_preview = Some(super::ImagePreview {
+            formula: None,
             texture,
             image: color_image,
             source_size,
@@ -4240,8 +4317,15 @@ impl DesktopReader {
         let image_rect = Rect::from_center_size(screen.center() + preview.pan, display_size);
         let texture_id = preview.texture.id();
         let zoom_percent = preview.zoom * 100.0;
-        let interaction =
-            show_image_preview_area(ctx, screen, image_rect, texture_id, zoom_percent);
+        let interaction = show_image_preview_area(
+            ctx,
+            screen,
+            image_rect,
+            texture_id,
+            zoom_percent,
+            preview.formula.as_deref(),
+            self.language,
+        );
         close |= interaction.close;
 
         if interaction.reset {
@@ -5288,6 +5372,8 @@ fn show_image_preview_area(
     image_rect: Rect,
     texture_id: TextureId,
     zoom_percent: f32,
+    formula: Option<&str>,
+    language: AppLanguage,
 ) -> ImagePreviewInteraction {
     let mut interaction = ImagePreviewInteraction {
         close: false,
@@ -5340,6 +5426,18 @@ fn show_image_preview_area(
                 egui::FontId::monospace(crate::ui::scaled_font_size(12.0)),
                 Color32::WHITE,
             );
+            if let Some(latex) = formula {
+                let button = ui.put(
+                    Rect::from_min_size(
+                        egui::pos2(screen.left() + 16.0, screen.top() + 16.0),
+                        egui::vec2(140.0, 30.0),
+                    ),
+                    egui::Button::new(language.text("复制公式", "Copy LaTeX")),
+                );
+                if button.clicked() {
+                    ctx.copy_text(latex.to_owned());
+                }
+            }
             if backdrop.clicked()
                 && backdrop
                     .interact_pointer_pos()
@@ -6746,6 +6844,7 @@ mod reference_suggestion_label_tests {
     #[test]
     fn selected_reader_image_keeps_original_pixels_and_display_bounds() {
         let image = ReaderImage {
+            formula: None,
             position: rebook_reader::ReaderPosition {
                 section_index: 2,
                 segment_index: 3,

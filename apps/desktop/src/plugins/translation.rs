@@ -1943,6 +1943,8 @@ mod tests {
                 id: spine.clone(),
                 href,
                 blocks: vec![Block::Image(ImageBlock {
+                    formula_image: false,
+                    formula: None,
                     href: image_href,
                     alt: "PDF page".into(),
                     style: ImageStyle::default(),
@@ -2014,6 +2016,8 @@ mod tests {
     fn replacement_preserves_inline_heading_images_at_their_relative_position() {
         let image = rebook_publication::InlineImageRun {
             image: ImageBlock {
+                formula_image: false,
+                formula: None,
                 href: PublicationUrl::parse("images/chapter-icon.jpg").unwrap(),
                 alt: String::new(),
                 style: ImageStyle::default(),

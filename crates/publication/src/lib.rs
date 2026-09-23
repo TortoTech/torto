@@ -708,6 +708,12 @@ pub struct TextRun {
 /// Image block referencing a publication resource.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageBlock {
+    /// Vision confirmed a formula, even if transcription was unreadable.
+    #[serde(default)]
+    pub formula_image: bool,
+    /// Validated AI transcription; the original resource remains authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<ImageFormula>,
     /// Canonical image URL.
     pub href: PublicationUrl,
     /// Alternative text.
@@ -719,6 +725,13 @@ pub struct ImageBlock {
     /// Optional text geometry for fixed-layout pages such as PDF documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_layer: Option<FixedPageTextLayer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageFormula {
+    pub latex: String,
+    /// Number transcribed from the image, not an existing HTML equation label.
+    pub equation_number: Option<String>,
 }
 
 /// An authored image figure kept together with its caption.
@@ -857,6 +870,10 @@ impl Default for Rgba {
 /// Renderer-independent inline presentation and semantic subset.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
+    /// AI-recognized inline bibliographic citation, numbered within its source paragraph.
+    /// The text run retains the original text; only layout collapses its presentation.
+    #[serde(default)]
+    pub inline_citation: u32,
     /// Display language override for translated text; None retains book defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_writing_system: Option<WritingSystem>,
@@ -901,6 +918,7 @@ pub struct TextStyle {
 impl Default for TextStyle {
     fn default() -> Self {
         Self {
+            inline_citation: 0,
             display_writing_system: None,
             bold: false,
             italic: false,

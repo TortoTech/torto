@@ -204,6 +204,7 @@ pub struct ReaderSelection {
 /// Original image pixels resolved from a point in the visible reader spread.
 #[derive(Clone)]
 pub struct ReaderImage {
+    pub formula: Option<String>,
     pub position: ReaderPosition,
     /// Left edge in the coordinate space used for the image query.
     pub x: f32,
@@ -1581,6 +1582,20 @@ impl ReaderSession {
         Ok(self.page_at(position)?.footnote_source_at(x, y))
     }
 
+    pub fn inline_citation_at_page(
+        &mut self,
+        position: ReaderPosition,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<(SourceRange, u32)>, ReaderError> {
+        let key = SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        };
+        self.ensure_segment(key)?;
+        Ok(self.page_at(position)?.inline_citation_at(x, y))
+    }
+
     pub fn image_at_page(
         &mut self,
         position: ReaderPosition,
@@ -1727,6 +1742,21 @@ impl ReaderSession {
             .rev()
             .find_map(|(position, page, offset_x)| {
                 page.footnote_source_at(x - *offset_x, y)
+                    .map(|source| (*position, source))
+            }))
+    }
+
+    pub fn inline_citation_at_current_spread(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<(ReaderPosition, (SourceRange, u32))>, ReaderError> {
+        Ok(self
+            .current_spread_pages()?
+            .iter()
+            .rev()
+            .find_map(|(position, page, offset_x)| {
+                page.inline_citation_at(x - *offset_x, y)
                     .map(|source| (*position, source))
             }))
     }
@@ -4148,6 +4178,7 @@ fn build_reader_selection(
 )]
 fn reader_image(position: ReaderPosition, hit: PageImageHit, offset_x: f32) -> ReaderImage {
     ReaderImage {
+        formula: hit.formula,
         position,
         x: hit.bounds.x0 as f32 + offset_x,
         y: hit.bounds.y0 as f32,
@@ -4555,6 +4586,8 @@ mod tests {
                 id: descriptor.id.clone(),
                 href: descriptor.href.clone(),
                 blocks: vec![Block::Image(ImageBlock {
+                    formula_image: false,
+                    formula: None,
                     href: Self::href(index),
                     alt: format!("Page {}", index + 1),
                     style: ImageStyle::default(),
@@ -4753,6 +4786,7 @@ mod tests {
             leading_gap: 0.0,
             items: vec![rebook_layout::PageItem::Image(
                 rebook_layout::ImagePlacement {
+                    formula_presentation: None,
                     image: rebook_layout::RasterImage {
                         width: 400,
                         height: 600,

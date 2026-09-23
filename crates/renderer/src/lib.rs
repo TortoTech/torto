@@ -1,5 +1,9 @@
 //! Compiles immutable page layouts into cheap-to-replay display lists.
 
+#[cfg(test)]
+mod blank_lines_tests;
+mod citations;
+
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -40,6 +44,7 @@ pub struct PageSelectionFragment {
 /// Original raster content for the top-most image under a page coordinate.
 #[derive(Clone)]
 pub struct PageImageHit {
+    pub formula: Option<String>,
     pub bounds: Rect,
     pub width: u32,
     pub height: u32,
@@ -109,6 +114,8 @@ struct QuoteRegion {
 struct FootnoteRegion {
     bounds: Rect,
     source: SourceRange,
+    citation_number: u32,
+    citation_glyphs: Vec<GlyphCommand>,
 }
 
 const FOOTNOTE_ICON_CENTER_ABOVE_BASELINE: f32 = 0.68;
@@ -136,6 +143,14 @@ fn paint_footnote_region(
     color: Color,
     transform: Affine,
 ) {
+    if footnote.citation_number != 0 {
+        for glyphs in &footnote.citation_glyphs {
+            let mut glyphs = glyphs.clone();
+            glyphs.color = color;
+            DisplayCommand::Glyphs(glyphs).paint(scene, transform);
+        }
+        return;
+    }
     let bounds = footnote.bounds;
     let circle = Circle::new(bounds.center(), bounds.width().min(bounds.height()) * 0.5);
     scene.stroke(&Stroke::new(1.15), transform, color, None, &circle);
@@ -212,6 +227,9 @@ impl PageDisplayList {
             }
             for region in &mut page.footnote_regions[group.footnotes.clone()] {
                 region.bounds = region.bounds + delta;
+                for glyphs in &mut region.citation_glyphs {
+                    glyphs.transform = transform * glyphs.transform;
+                }
             }
         }
         page
@@ -294,6 +312,7 @@ impl PageDisplayList {
                     if command.interactive && command.bounds.contains(point) =>
                 {
                     Some(PageImageHit {
+                        formula: command.formula.clone(),
                         bounds: command.bounds,
                         width: command.width,
                         height: command.height,
@@ -925,6 +944,7 @@ impl TextRegion {
 
 #[derive(Clone)]
 struct ShapedTextRegion {
+    citations: Arc<[rebook_layout::InlineCitationPlacement]>,
     layout: Arc<Layout<TextBrush>>,
     text: Arc<str>,
     source_text_start: usize,
@@ -1063,6 +1083,21 @@ impl ShapedTextRegion {
             (byte_index, byte_index, byte_index)
         };
         let visible = self.visible_byte_range()?;
+        if let Some(c) = self
+            .citations
+            .iter()
+            .find(|c| c.range.contains(&cluster_start))
+        {
+            return Some(TextRegionHit {
+                byte_index: if byte_index <= c.range.start {
+                    c.range.start
+                } else {
+                    c.range.end
+                },
+                cluster_start: c.range.start,
+                cluster_end: c.range.end,
+            });
+        }
         Some(TextRegionHit {
             byte_index: byte_index.clamp(visible.start, visible.end),
             cluster_start: cluster_start.clamp(visible.start, visible.end),
@@ -1072,18 +1107,25 @@ impl ShapedTextRegion {
 
     fn selection_fragment(&self, byte_range: Range<usize>) -> Option<PageSelectionFragment> {
         let visible = self.visible_byte_range()?;
-        let start = floor_char_boundary(
+        let mut start = floor_char_boundary(
             &self.text,
             byte_range.start.clamp(visible.start, visible.end),
         );
-        let end = floor_char_boundary(&self.text, byte_range.end.clamp(visible.start, visible.end));
+        let mut end =
+            floor_char_boundary(&self.text, byte_range.end.clamp(visible.start, visible.end));
+        for c in self.citations.iter() {
+            if start < c.range.end && end > c.range.start {
+                start = start.min(c.range.start).max(visible.start);
+                end = end.max(c.range.end).min(visible.end);
+            }
+        }
         if end <= start {
             return None;
         }
         let range = self.source_range_for_bytes(start..end)?;
         Some(PageSelectionFragment {
             range,
-            quote: self.text.get(start..end)?.to_owned(),
+            quote: self.citation_original(start..end),
             rects: self.selection_rects(start..end),
         })
     }
@@ -1107,6 +1149,23 @@ impl ShapedTextRegion {
             .geometry(&self.layout)
             .into_iter()
             .filter(|(_, line_index)| self.lines.contains(line_index))
+            .filter(|(_, line_index)| {
+                // Parley adds a short box for a selected explicit newline. It is
+                // useful in editors, but becomes an isolated bar on an empty
+                // reader line (centered for centered paragraphs). Keep the
+                // newline in source/copy ranges; omit only its painted geometry.
+                self.layout.get(*line_index).is_some_and(|line| {
+                    self.text.get(line.text_range()).is_some_and(|text| {
+                        text.chars().any(|ch| {
+                            !ch.is_whitespace()
+                                && !ch.is_control()
+                                && !matches!(ch, '\u{00ad}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}')
+                        })
+                    }) || line.items().any(|item| {
+                        matches!(item, PositionedLayoutItem::InlineBox(inline_box) if inline_box.width > 0.0)
+                    })
+                })
+            })
             .map(|(rect, line_index)| {
                 let mut x0 = rect.x0;
                 let mut x1 = rect.x1;
@@ -1227,16 +1286,14 @@ impl ShapedTextRegion {
         }
         let source_start = self.source.start.text_offset;
         let source_length = self.source.end.text_offset.checked_sub(source_start)?;
-        let source_text = self.text.get(self.source_text_start..)?;
-        let text_length = source_text.chars().count();
+        let original = self.citation_original(self.source_text_start..self.text.len());
+        let text_length = original.chars().count();
         let start_chars = self
-            .text
-            .get(self.source_text_start..byte_range.start)?
+            .citation_original(self.source_text_start..byte_range.start)
             .chars()
             .count();
         let end_chars = self
-            .text
-            .get(self.source_text_start..byte_range.end)?
+            .citation_original(self.source_text_start..byte_range.end)
             .chars()
             .count();
         let start = source_start
@@ -1280,8 +1337,8 @@ impl ShapedTextRegion {
         if end_offset <= start_offset {
             return None;
         }
-        let source_text = self.text.get(self.source_text_start..)?;
-        let text_length = source_text.chars().count();
+        let original = self.citation_original(self.source_text_start..self.text.len());
+        let text_length = original.chars().count();
         let source_length = self
             .source
             .end
@@ -1299,8 +1356,8 @@ impl ShapedTextRegion {
             text_length,
             true,
         )?;
-        let start = self.source_text_start + byte_index_for_char_offset(source_text, start_chars);
-        let end = self.source_text_start + byte_index_for_char_offset(source_text, end_chars);
+        let start = self.citation_display_byte(start_chars, false);
+        let end = self.citation_display_byte(end_chars, true);
         let visible = self.visible_byte_range()?;
         let start = start.max(visible.start).min(visible.end);
         let end = end.max(visible.start).min(visible.end);
@@ -1679,6 +1736,7 @@ struct GlyphCommand {
 
 #[derive(Clone)]
 struct ImageCommand {
+    formula: Option<String>,
     image: ImageBrush,
     transform: Affine,
     bounds: Rect,
@@ -1836,6 +1894,7 @@ impl DisplayListCompiler {
                             f64::from(image.height) / f64::from(image.image.height.max(1)),
                         );
                     commands.push(DisplayCommand::Image(ImageCommand {
+                        formula: image.formula_presentation.as_ref().map(|f| f.latex.clone()),
                         image: ImageBrush::new(data),
                         transform,
                         bounds: Rect::new(
@@ -1844,9 +1903,18 @@ impl DisplayListCompiler {
                             f64::from(image.x + image.width),
                             f64::from(image.y + image.height),
                         ),
-                        width: image.image.width,
-                        height: image.image.height,
-                        pixels: Arc::clone(&image.image.pixels),
+                        width: image
+                            .formula_presentation
+                            .as_ref()
+                            .map_or(image.image.width, |f| f.original.width),
+                        height: image
+                            .formula_presentation
+                            .as_ref()
+                            .map_or(image.image.height, |f| f.original.height),
+                        pixels: image.formula_presentation.as_ref().map_or_else(
+                            || Arc::clone(&image.image.pixels),
+                            |f| Arc::clone(&f.original.pixels),
+                        ),
                         interactive: true,
                         source: image.source.clone(),
                     }));
@@ -2081,6 +2149,7 @@ fn fixed_page_mask_color(
 
 fn text_region(text: &TextPlacement) -> Option<TextRegion> {
     Some(TextRegion::Shaped(ShapedTextRegion {
+        citations: Arc::clone(&text.citations),
         layout: Arc::clone(&text.layout),
         text: Arc::clone(&text.text),
         source_text_start: text.source_text_start,
@@ -2142,6 +2211,7 @@ fn compile_text_commands(
 ) {
     let transform = Affine::translate((f64::from(text.origin_x), f64::from(text.origin_y)));
     let mut compiled_footnote_groups = Vec::<u32>::new();
+    let mut compiled_citation_indices: Vec<(u32, usize)> = Vec::new();
     for line in text
         .layout
         .lines()
@@ -2175,6 +2245,7 @@ fn compile_text_commands(
                     height: image.image.height,
                 };
                 commands.push(DisplayCommand::Image(ImageCommand {
+                    formula: image.formula_presentation.as_ref().map(|f| f.latex.clone()),
                     image: ImageBrush::new(data),
                     transform: image_transform,
                     bounds: Rect::new(
@@ -2183,10 +2254,19 @@ fn compile_text_commands(
                         f64::from(x + image.width),
                         f64::from(y + image.height),
                     ),
-                    width: image.image.width,
-                    height: image.image.height,
-                    pixels: Arc::clone(&image.image.pixels),
-                    interactive: false,
+                    width: image
+                        .formula_presentation
+                        .as_ref()
+                        .map_or(image.image.width, |f| f.original.width),
+                    height: image
+                        .formula_presentation
+                        .as_ref()
+                        .map_or(image.image.height, |f| f.original.height),
+                    pixels: image.formula_presentation.as_ref().map_or_else(
+                        || Arc::clone(&image.image.pixels),
+                        |f| Arc::clone(&f.original.pixels),
+                    ),
+                    interactive: image.formula_presentation.is_some(),
                     source: None,
                 }));
                 if let Some(source) = &text.source {
@@ -2209,7 +2289,60 @@ fn compile_text_commands(
                 TextBaseline::Superscript => -run.font_size() * 0.35,
                 TextBaseline::Subscript => run.font_size() * 0.2,
             };
-            if brush.footnote_reference {
+            if brush.footnote_reference_group & 0x8000_0000 != 0 {
+                let number = brush.footnote_reference_group & 0x7fff_ffff;
+                if let Some(source) = text.source.as_ref().or_else(|| {
+                    text.citations
+                        .iter()
+                        .find(|c| c.number == number)
+                        .and_then(|c| c.owner.as_ref())
+                }) {
+                    let x = text.origin_x + glyph_run.offset();
+                    let baseline = text.origin_y + glyph_run.baseline() + baseline_offset;
+                    let bounds = Rect::new(
+                        f64::from(x),
+                        f64::from(baseline - run.font_size()),
+                        f64::from(x + glyph_run.advance()),
+                        f64::from(baseline + run.font_size() * 0.2),
+                    );
+                    let command = GlyphCommand {
+                        font: run.font().clone(),
+                        font_size: run.font_size(),
+                        normalized_coords: run.normalized_coords().to_vec().into(),
+                        embolden: Vec2::ZERO,
+                        color: color(brush.color),
+                        transform,
+                        glyph_transform: None,
+                        glyphs: glyph_run
+                            .positioned_glyphs()
+                            .map(|g| Glyph {
+                                id: g.id,
+                                x: g.x,
+                                y: g.y + baseline_offset,
+                            })
+                            .collect::<Vec<_>>()
+                            .into(),
+                    };
+                    if let Some((_, index)) = compiled_citation_indices
+                        .iter()
+                        .find(|(id, _)| *id == number)
+                    {
+                        let existing = &mut footnote_regions[*index];
+                        existing.bounds = existing.bounds.union(bounds);
+                        existing.citation_glyphs.push(command);
+                    } else {
+                        compiled_citation_indices.push((number, footnote_regions.len()));
+                        footnote_regions.push(FootnoteRegion {
+                            bounds,
+                            source: source.clone(),
+                            citation_number: number,
+                            citation_glyphs: vec![command],
+                        });
+                    }
+                    continue;
+                }
+            }
+            if brush.footnote_reference && brush.footnote_reference_group & 0x8000_0000 == 0 {
                 if compiled_footnote_groups.contains(&brush.footnote_reference_group) {
                     continue;
                 }
@@ -2220,7 +2353,12 @@ fn compile_text_commands(
                         text.origin_y + glyph_run.baseline(),
                         run.font_size(),
                     );
-                    footnote_regions.push(FootnoteRegion { bounds, source });
+                    footnote_regions.push(FootnoteRegion {
+                        bounds,
+                        source,
+                        citation_number: 0,
+                        citation_glyphs: vec![],
+                    });
                     compiled_footnote_groups.push(brush.footnote_reference_group);
                 }
                 continue;
@@ -2464,6 +2602,45 @@ mod tests {
     }
 
     #[test]
+    fn rendered_formula_preview_keeps_original_pixels_and_latex() {
+        let original = rebook_layout::RasterImage {
+            width: 3,
+            height: 2,
+            pixels: vec![127; 24].into(),
+        };
+        let pixels = original.pixels.clone();
+        let page = PageLayout {
+            viewport: LayoutViewport::new(320, 240).unwrap(),
+            background: Rgba::BLACK,
+            leading_gap: 0.0,
+            items: vec![PageItem::Image(ImagePlacement {
+                formula_presentation: Some(rebook_layout::FormulaPresentation {
+                    original,
+                    latex: r"\sigma=\sqrt{k\theta^2}".into(),
+                }),
+                image: rebook_layout::RasterImage {
+                    width: 40,
+                    height: 20,
+                    pixels: vec![255; 40 * 20 * 4].into(),
+                },
+                x: 20.0,
+                y: 30.0,
+                width: 100.0,
+                height: 50.0,
+                source: None,
+                text_layer: None,
+                replacement: None,
+            })],
+        };
+        let display = DisplayListCompiler.compile(&page);
+        let hit = display.image_at(60.0, 50.0).unwrap();
+        assert_eq!((hit.width, hit.height), (3, 2));
+        assert_eq!(hit.pixels, pixels);
+        assert_eq!(hit.formula.as_deref(), Some(r"\sigma=\sqrt{k\theta^2}"));
+        assert_eq!(hit.bounds, Rect::new(20.0, 30.0, 120.0, 80.0));
+    }
+
+    #[test]
     fn empty_page_still_has_a_background() {
         let page = PageLayout {
             viewport: LayoutViewport::new(320, 240).unwrap(),
@@ -2527,6 +2704,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text,
                 source_text_start: 0,
@@ -2636,6 +2814,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text,
                 source_text_start: 0,
@@ -2730,6 +2909,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
                 source_text_start: 0,
@@ -2802,6 +2982,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text,
                 source_text_start: 0,
@@ -2811,6 +2992,7 @@ mod tests {
                 available_width: 160.0,
                 source: Some(source.clone()),
                 inline_images: Arc::from([InlineImage {
+                    formula_presentation: None,
                     id: 1,
                     image: RasterImage {
                         width: 1,
@@ -2879,6 +3061,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text,
                 source_text_start: 0,
@@ -2888,6 +3071,7 @@ mod tests {
                 available_width: 240.0,
                 source: Some(source.clone()),
                 inline_images: Arc::from([InlineImage {
+                    formula_presentation: None,
                     id: 7,
                     image: RasterImage {
                         width: 1,
@@ -2968,6 +3152,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
                 source_text_start: 0,
@@ -3052,6 +3237,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
                 source_text_start: "•\u{00a0}".len(),
@@ -3327,6 +3513,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
                 source_text_start: 0,
@@ -3399,6 +3586,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
+                formula_presentation: None,
                 image: RasterImage {
                     width: 100,
                     height: 100,
@@ -3487,6 +3675,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
+                formula_presentation: None,
                 image: RasterImage {
                     width: 100,
                     height: 100,
@@ -3507,6 +3696,7 @@ mod tests {
                             height: 30.0,
                         },
                         text: TextPlacement {
+                            citations: Arc::from([]),
                             layout: Arc::new(layout),
                             text,
                             source_text_start: 0,

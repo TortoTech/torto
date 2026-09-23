@@ -20,7 +20,7 @@ the target range, surrounding context, and enabled recognition types.
 - Existing `boundary` and `protected_boundary` blocks are read-only. Do not
   include them in groups or change their semantics.
 - `quote_missing_attribution` is an already recognized quotation. Read it only
-  to complete its attribution, using `quote_attribution`; do not reclassify its
+  to complete its attribution, using `quote_attribution` or `quote_inline`; do not reclassify its
   body, recommend a new alignment, or expand its body into neighboring prose.
 
 ## Semantic judgment
@@ -59,47 +59,45 @@ structural placement, not just a locally plausible paragraph break. Return only
 proposals with affirmative subsection evidence; reject ambiguous cases. You may
 reject every proposal. Never add an ID outside `proposed_headings` in this pass.
 
-### Quotations and epigraphs
+### Quotations: explicit source required
 
-Recognize standalone quotations, chapter epigraphs, poetry and borrowed excerpts
-from their meaning and surrounding context.
+Only create a NEW block quotation when its source is explicitly written in the
+supplied book text. This is a precision-first task: omit uncertain passages.
+Quotation marks, italics, centering, chapter-opening position or poetic language
+are NOT sufficient. Never identify an author or work from memory.
 
-Quotation marks, a preceding colon, special styling, immediate adjacency to a
-heading, and a separate attribution are **not prerequisites**. A decorative image
-before an epigraph does not disqualify it; leave that image outside the quote.
-Consecutive paragraphs or poetry lines sharing a credit can form one quotation.
+Accept exactly these source relationships:
 
-Distinguish these passages from ordinary narration containing inline quotes,
-dialogue within the book's narrative, scare quotes, and fragments that merely
-continue an inline quotation.
+- `quote`: `attribution` is the immediately FOLLOWING paragraph, a standalone
+  author/work credit belonging to this quotation. It is required and never null.
+- `quote_before`: `attribution` is the immediately PRECEDING paragraph. It must
+  name the author/work and explicitly introduce the borrowed passage with a colon
+  or a terminal cue such as "writes", "as follows" or "写道". Preserve this
+  introductory paragraph in place; do not include it in body.
+- `quote_inline`: the last body paragraph ends with an explicit author/work
+  credit. `credit` copies its EXACT suffix, including the separating dash,
+  parenthesis or line break and any trailing spaces. The reader splits that suffix
+  from the body. Do not return character offsets or rewrite the suffix.
 
-The target is a **standalone block quotation**, not every instance of quoted
-speech. Classify the passage's role in context: is it presented as an independent
-excerpt, epigraph or poem, or does it remain part of the author's narration,
-argument or explanation? Quotation marks, length, paragraph breaks and citation
-markers alone cannot decide this distinction.
+The body must be a standalone borrowed excerpt, poem or epigraph, not ordinary
+narrative or conversation. A character's name in dialogue ("Arthur said"), an
+interview answer, or the narrator's own account is NOT a bibliographic source.
+"Someone said", "research shows", a bare footnote number and a colon alone are
+not explicit sources. An adjacent ordinary sentence mentioning a person is not
+a credit. Do not take the next quotation's credit or stretch a body across
+intervening narration. A source may name an author OR a work; both are not required.
 
-If a paragraph mixes authorial prose with embedded speech or quoted text, do not
-promote the entire paragraph into a quote. IDs select whole paragraphs, not quoted
-substrings. Do not absorb surrounding prose to make a quotation group contiguous.
+Multiple body paragraphs must be consecutive, clearly belong to the same
+excerpt, and share the source. When boundaries or credit association are unclear,
+omit the ENTIRE new group. Never fall back to an unattributed new quote.
 
-Require positive contextual evidence of standalone status. This evidence may be
-semantic and does not require special formatting or a separate author credit.
-When that status is uncertain, omit the group and preserve ordinary prose.
-
-### Attribution
-
-- **Separate paragraph:** If an author/source credit immediately follows the
-  quotation and has its own ID, use that ID as `attribution`, outside `body`.
-- **Same paragraph:** If the credit shares a paragraph with the quotation,
-  including after a line break, keep the entire paragraph ID in `body` and set
-  `attribution` to `null`.
-- **No credit:** Set `attribution` to `null`. This does not disqualify the quote.
-
-Each credit belongs only to its own quotation. When two quotations occur next
-to each other, do not attach the second quotation's credit to the first one.
-If the quotation body is clear but a separate credit cannot be associated, keep
-the body and use `null` rather than omit the quotation.
+Check each explicit signature or work credit in the target window, not only the
+last one. A named work alone is sufficient attribution, including a poetry
+collection; it does not need a separate personal author name. For a shared credit,
+inspect the consecutive excerpt paragraphs preceding it and include all clearly
+related parts, not just the nearest paragraph. Stop at narration, another credit,
+or a structural boundary. A sentence continuing/closing quoted speech is NEVER
+an attribution paragraph, even if the previous paragraph mentions a speaker.
 
 ### Recommended quote-body alignment
 
@@ -125,7 +123,7 @@ of quoted conversation are prose, not poetry. Automatic line wrapping is not
 intentional poetic lineation. Choose the passage type before choosing alignment;
 chapter-opening position, italics and a following author credit do not make prose
 eligible for `center`. If uncertain whether a passage is verse, prefer `justify`.
-Keep an inline credit with its existing paragraph.
+Split only the exact credited suffix for `quote_inline`; preserve all other text.
 
 ### Complete an existing quotation's attribution
 
@@ -143,8 +141,12 @@ Return `kind: "quote_attribution"` with the quotation's top-level ID in `quote`:
   `attribution_eligible: true` may be selected this way.
 - Set exactly one of `attribution` and `body_index`. Nested body indices are not
   top-level block IDs. Never select the entire quotation as its own credit.
-- If no independently locatable credit exists, omit the completion. Leave a
-  credit sharing a single paragraph with quoted prose in that paragraph.
+- For a source at the end of the last body paragraph, use `quote_inline` with
+  `body` containing ONLY the existing quote's top-level ID, the exact `credit`
+  suffix and `alignment: null`. This only extracts the source, without changing
+  the recognized body or its alignment.
+- If no explicit credit exists, omit the completion and leave the recognized
+  quote intact. Never invent attribution or change its body boundaries.
 
 Quotations that already have an attribution are protected and require no work.
 
@@ -157,16 +159,16 @@ should remain ordinary prose.
 
 ## Structural requirements
 
-- Use existing IDs with the required block type. Never invent IDs
-  to split a paragraph.
+- Use existing IDs with the required block type. Only `quote_inline` may split
+  a paragraph, by its exact explicitly credited suffix.
 - Preserve source order. Groups must be consecutive, non-overlapping and must
   not cross structural boundaries.
 - Image and caption IDs together form one contiguous group, with no unrelated
   prose between them.
 - Never duplicate an ID in a quote's `body` and `attribution`.
 
-These requirements protect document structure. Do not turn the absence of
-typographic cues into an additional reason to reject a quotation.
+These requirements protect document structure. Explicit source evidence is
+mandatory for NEW quotes; existing heuristic quotes remain valid without it.
 
 ## Output
 
@@ -175,6 +177,15 @@ Return one JSON object conforming to the API response schema. Return an empty
 rewritten book content to the response.
 
 ## Examples
+
+### Two paragraphs sharing a source
+
+Paragraph `2` is the opening of a poem. Paragraph `3` continues the same poem.
+Paragraph `4` is “— Collected Poems”. Both parts belong to that named work.
+
+```json
+{"groups":[{"kind":"quote","body":[2,3],"attribution":4,"alignment":"start"}]}
+```
 
 ### Prose epigraph at a chapter opening
 
@@ -200,7 +211,7 @@ Image `20` is a decorative ornament. Paragraph `21` contains two lines of verse
 followed by “— A poet” after a line break.
 
 ```json
-{"groups":[{"kind":"quote","body":[21],"attribution":null,"alignment":"center"}]}
+{"groups":[{"kind":"quote_inline","body":[21],"credit":"— A poet","alignment":"center"}]}
 ```
 
 ### Caption follows an image
@@ -217,7 +228,7 @@ Paragraph `40` contains a poem and its poet's name after a line break. Paragraph
 `41` is a different quotation, followed by its separate author in paragraph `42`.
 
 ```json
-{"groups":[{"kind":"quote","body":[40],"attribution":null,"alignment":"center"},{"kind":"quote","body":[41],"attribution":42,"alignment":"justify"}]}
+{"groups":[{"kind":"quote_inline","body":[40],"credit":"— A poet","alignment":"center"},{"kind":"quote","body":[41],"attribution":42,"alignment":"justify"}]}
 ```
 
 ### Complete a recognized quote from a following credit
@@ -236,4 +247,23 @@ marked `attribution_eligible: true`.
 
 ```json
 {"groups":[{"kind":"quote_attribution","quote":60,"attribution":null,"body_index":1}]}
+```
+
+### Source introduces the next paragraph
+
+Paragraph `70` says “In The Example, Mira Vale writes:”. Paragraph `71` is the
+borrowed passage. Keep `70` in place and format only `71` as quotation body.
+
+```json
+{"groups":[{"kind":"quote_before","body":[71],"attribution":70,"alignment":"justify"}]}
+```
+
+### No source, or ordinary narrative dialogue
+
+An unattributed chapter epigraph, a patient's answer followed by “I asked him
+another question”, or prose introduced only by “Someone once said:” is outside
+the new-quote scope, even when it contains quotation marks.
+
+```json
+{"groups":[]}
 ```
