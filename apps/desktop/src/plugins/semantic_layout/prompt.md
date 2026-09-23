@@ -184,7 +184,7 @@ Paragraph `2` is the opening of a poem. Paragraph `3` continues the same poem.
 Paragraph `4` is “— Collected Poems”. Both parts belong to that named work.
 
 ```json
-{"groups":[{"kind":"quote","body":[2,3],"attribution":4,"alignment":"start"}]}
+{"groups":[{"kind":"quote","body":[2,3],"attribution":4,"alignment":"start"}],"citations":[]}
 ```
 
 ### Prose epigraph at a chapter opening
@@ -194,7 +194,7 @@ and italicized. Paragraph `8` credits its author. Despite its short length and
 position before the chapter narrative, it is continuous prose, so use `justify`.
 
 ```json
-{"groups":[{"kind":"quote","body":[7],"attribution":8,"alignment":"justify"}]}
+{"groups":[{"kind":"quote","body":[7],"attribution":8,"alignment":"justify"}],"citations":[]}
 ```
 
 ### Quotation and credit have separate IDs
@@ -202,7 +202,7 @@ position before the chapter narrative, it is continuous prose, so use `justify`.
 Paragraph `10` is a borrowed passage. Paragraph `11` is “— An author”.
 
 ```json
-{"groups":[{"kind":"quote","body":[10],"attribution":11,"alignment":"justify"}]}
+{"groups":[{"kind":"quote","body":[10],"attribution":11,"alignment":"justify"}],"citations":[]}
 ```
 
 ### Epigraph and credit share one paragraph
@@ -211,7 +211,7 @@ Image `20` is a decorative ornament. Paragraph `21` contains two lines of verse
 followed by “— A poet” after a line break.
 
 ```json
-{"groups":[{"kind":"quote_inline","body":[21],"credit":"— A poet","alignment":"center"}]}
+{"groups":[{"kind":"quote_inline","body":[21],"credit":"— A poet","alignment":"center"}],"citations":[]}
 ```
 
 ### Caption follows an image
@@ -219,7 +219,7 @@ followed by “— A poet” after a line break.
 Image `30` is followed by paragraph `31`: “Figure 2. The parts of a flower.”
 
 ```json
-{"groups":[{"kind":"figure","images":[30],"captions":[31]}]}
+{"groups":[{"kind":"figure","images":[30],"captions":[31]}],"citations":[]}
 ```
 
 ### Adjacent quotations with different credit structures
@@ -228,7 +228,7 @@ Paragraph `40` contains a poem and its poet's name after a line break. Paragraph
 `41` is a different quotation, followed by its separate author in paragraph `42`.
 
 ```json
-{"groups":[{"kind":"quote_inline","body":[40],"credit":"— A poet","alignment":"center"},{"kind":"quote","body":[41],"attribution":42,"alignment":"justify"}]}
+{"groups":[{"kind":"quote_inline","body":[40],"credit":"— A poet","alignment":"center"},{"kind":"quote","body":[41],"attribution":42,"alignment":"justify"}],"citations":[]}
 ```
 
 ### Complete a recognized quote from a following credit
@@ -236,7 +236,7 @@ Paragraph `40` contains a poem and its poet's name after a line break. Paragraph
 Block `50` is `quote_missing_attribution`. Paragraph `51` contains “— An author”.
 
 ```json
-{"groups":[{"kind":"quote_attribution","quote":50,"attribution":51,"body_index":null}]}
+{"groups":[{"kind":"quote_attribution","quote":50,"attribution":51,"body_index":null}],"citations":[]}
 ```
 
 ### Move a separate credit out of an existing quote body
@@ -246,7 +246,7 @@ quotation, and its last body paragraph `index: 1` is a separately written credit
 marked `attribution_eligible: true`.
 
 ```json
-{"groups":[{"kind":"quote_attribution","quote":60,"attribution":null,"body_index":1}]}
+{"groups":[{"kind":"quote_attribution","quote":60,"attribution":null,"body_index":1}],"citations":[]}
 ```
 
 ### Source introduces the next paragraph
@@ -255,7 +255,7 @@ Paragraph `70` says “In The Example, Mira Vale writes:”. Paragraph `71` is t
 borrowed passage. Keep `70` in place and format only `71` as quotation body.
 
 ```json
-{"groups":[{"kind":"quote_before","body":[71],"attribution":70,"alignment":"justify"}]}
+{"groups":[{"kind":"quote_before","body":[71],"attribution":70,"alignment":"justify"}],"citations":[]}
 ```
 
 ### No source, or ordinary narrative dialogue
@@ -265,5 +265,24 @@ another question”, or prose introduced only by “Someone once said:” is out
 the new-quote scope, even when it contains quotation marks.
 
 ```json
-{"groups":[]}
+{"groups":[],"citations":[]}
 ```
+
+
+## Unified response and citation targets
+
+Return one object with both `groups` and `citations` arrays. Use an empty array
+when no result is justified. `citations` contains only string IDs from
+`targets.classify_citations`, found in each block's `citation_candidates`.
+Candidate `paragraph` indexes address a block's text, quote body, or
+`citation_paragraphs`; these are local text containers, not new block IDs.
+The client owns character offsets; never return rewritten text or offsets.
+Protected blocks remain protected for group classification, but their explicitly
+listed citation candidates may be selected. Context-only citations are not targets.
+
+Judge quotations and captions together. Cartoon dialogue immediately attached to
+an image can be caption content; do not also classify it as a quotation. Do not
+reuse blocks across semantic groups. Inline citations may coexist with a quote
+body and do not claim ownership of its block. Existing headings, credited quotes,
+and captions need no reclassification. Complete missing sources only for the
+explicit existing-quote targets. All previous source and adjacency constraints apply.

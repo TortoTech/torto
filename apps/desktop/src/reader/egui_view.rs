@@ -4174,31 +4174,22 @@ impl DesktopReader {
         ctx.request_repaint();
     }
 
-    fn copy_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
+    pub(super) fn copy_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
         let text_edit_focused = ctx.text_edit_focused();
-        let copy_image = self
-            .image_preview
-            .as_ref()
-            .map(|preview| preview.image.clone())
-            .or_else(|| {
-                (!text_edit_focused)
-                    .then(|| {
-                        self.selected_image
-                            .as_ref()
-                            .map(|image| image.image.clone())
-                    })
-                    .flatten()
-            });
-        let selection_text =
-            if copy_image.is_none() && self.selection_toolbar_visible && !text_edit_focused {
-                self.selection
-                    .as_ref()
-                    .map(|selection| selection.text.clone())
-                    .filter(|text| !text.is_empty())
-            } else {
-                None
-            };
-        let focus_text = if copy_image.is_none() && selection_text.is_none() {
+        let preview = self.image_preview.is_some();
+        if !preview && (text_edit_focused || interaction_blocked) {
+            return;
+        }
+        let selected_image = self.selected_image.is_some();
+        let selection_text = if !preview && !selected_image && self.selection_toolbar_visible {
+            self.selection
+                .as_ref()
+                .map(|selection| selection.text.as_str())
+                .filter(|text| !text.is_empty())
+        } else {
+            None
+        };
+        let focus_text = if !preview && !selected_image && selection_text.is_none() {
             focus_unit_copy_text(
                 self.focus_body_accepts_shortcuts(interaction_blocked),
                 text_edit_focused,
@@ -4207,27 +4198,48 @@ impl DesktopReader {
                     .get(self.focus_unit_index)
                     .map(|unit| unit.clipboard_text.as_str()),
             )
-            .map(str::to_owned)
         } else {
             None
         };
-        if copy_image.is_none() && selection_text.is_none() && focus_text.is_none() {
+        if !preview && !selected_image && selection_text.is_none() && focus_text.is_none() {
             return;
         }
+        // Decide ownership before consuming Copy, but allocate/copy pixels only
+        // after an actual copy action. This method is also called on idle frames.
         if !ctx.input_mut(|input| consume_copy_shortcut(input, &self.shortcuts.copy)) {
             return;
         }
-
-        if let Some(image) = copy_image {
-            ctx.copy_image(image);
-            self.show_copy_notice(ctx, true);
-        } else if let Some(text) = selection_text {
-            ctx.copy_text(text);
-            self.show_copy_notice(ctx, false);
-        } else if let Some(text) = focus_text {
-            ctx.copy_text(text);
-            self.show_copy_notice(ctx, false);
-        }
+        let copied_image = if let Some(preview) = &self.image_preview {
+            if let Some(latex) = preview
+                .formula
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+            {
+                ctx.copy_text(latex.to_owned());
+                false
+            } else {
+                ctx.copy_image(preview.image.clone());
+                true
+            }
+        } else if let Some(selected) = &self.selected_image {
+            if let Some(latex) = selected
+                .formula
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+            {
+                ctx.copy_text(latex.to_owned());
+                false
+            } else {
+                ctx.copy_image(selected.color_image());
+                true
+            }
+        } else {
+            if let Some(text) = selection_text.or(focus_text) {
+                ctx.copy_text(text.to_owned());
+            }
+            false
+        };
+        self.show_copy_notice(ctx, copied_image);
     }
 
     fn show_copy_notice(&mut self, ctx: &egui::Context, image: bool) {
@@ -5282,6 +5294,20 @@ fn preview_wheel_delta(input: &egui::InputState) -> f32 {
 }
 
 impl SelectedImage {
+    pub(super) fn color_image(&self) -> egui::ColorImage {
+        egui::ColorImage::from_rgba_unmultiplied(
+            self.size,
+            &self.pixels[..self.size[0] * self.size[1] * 4],
+        )
+    }
+    pub(super) fn matches(&self, image: &ReaderImage, scroll_mode: bool) -> bool {
+        std::sync::Arc::ptr_eq(&self.pixels, &image.pixels)
+            && self.position == image.position
+            && self.scroll_mode == scroll_mode
+            && self.formula == image.formula
+            && self.bounds.min == Pos2::new(image.x, image.y)
+            && self.bounds.size() == Vec2::new(image.display_width, image.display_height)
+    }
     pub(super) fn from_reader_image(
         image: &ReaderImage,
         scroll_mode: bool,
@@ -5304,10 +5330,9 @@ impl SelectedImage {
         }
 
         Ok(Self {
-            image: egui::ColorImage::from_rgba_unmultiplied(
-                [width, height],
-                &image.pixels[..byte_len],
-            ),
+            formula: image.formula.clone(),
+            pixels: image.pixels.clone(),
+            size: [width, height],
             position: image.position,
             bounds: Rect::from_min_size(
                 Pos2::new(image.x, image.y),
@@ -6861,7 +6886,7 @@ mod reference_suggestion_label_tests {
 
         let selected = SelectedImage::from_reader_image(&image, true).expect("valid image");
 
-        assert_eq!(selected.image.size, [2, 1]);
+        assert_eq!(selected.color_image().size, [2, 1]);
         assert_eq!(selected.bounds.min, Pos2::new(24.0, 36.0));
         assert_eq!(selected.bounds.size(), Vec2::new(120.0, 80.0));
         assert!(selected.scroll_mode);

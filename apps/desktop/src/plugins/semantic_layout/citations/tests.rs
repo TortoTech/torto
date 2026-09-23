@@ -156,3 +156,188 @@ fn live_computational_models_inline_citations() {
         "Verified four citation groups; ordinary asides and original paragraph text preserved"
     );
 }
+
+fn marked_citations(block: &TextBlock) -> Vec<(u32, String)> {
+    let mut result: Vec<(u32, String)> = Vec::new();
+    for inline in &block.content {
+        if let Inline::Text(run) = inline
+            && run.style.inline_citation > 0
+        {
+            if let Some((number, text)) = result.last_mut()
+                && *number == run.style.inline_citation
+            {
+                text.push_str(&run.text);
+            } else {
+                result.push((run.style.inline_citation, run.text.clone()));
+            }
+        }
+    }
+    result
+}
+
+#[test]
+fn translated_photographed_citations_keep_all_three_markers() {
+    let Block::Text(original) = text(
+        "p",
+        "Model (Pacht & Rayner, 1993; Rayner & Duffy, 1986; Rayner & Frazier, 1989; Sereno, Pacht, & Rayner, 1992). Context (e.g., Onifer & Swinney, 1981; Swinney, 1979). Access (e.g., Glucksberg, Kreuz, & Rho, 1986; Van Petten & Kutas, 1987).",
+    ) else {
+        panic!()
+    };
+    let spans = candidates(&original);
+    let translated = "\u{6a21}\u{578b} (Pacht & Rayner, 1993; Rayner & Duffy, 1986; Rayner & Frazier, 1989;  Sereno, Pacht, & Rayner, 1992)\u{3002}\u{8bed}\u{5883}\u{ff08}\u{4f8b}\u{5982}\u{ff0c} Onifer & Swinney, 1981;  Swinney, 1979\u{ff09}\u{3002}\u{8bbf}\u{95ee} (\u{4f8b}\u{5982}, Glucksberg, Kreuz, & Rho, 1986\u{ff1b} Van Petten & Kutas, 1987)\u{3002}";
+    let Block::Text(mut target) = text("p", translated) else {
+        panic!()
+    };
+    // Translation may introduce independent bold/italic runs within a citation.
+    let Inline::Text(run) = target.content[0].clone() else {
+        panic!()
+    };
+    let split = run.text.find("Swinney").unwrap();
+    let mut head = run.clone();
+    head.text = run.text[..split].into();
+    let mut tail = run.clone();
+    tail.text = run.text[split..].into();
+    tail.style.bold = true;
+    target.content = vec![Inline::Text(head), Inline::Text(tail)];
+    apply(&mut target, &spans);
+    assert_eq!(text_block_text(&target), translated);
+    assert_eq!(
+        marked_citations(&target)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert!(target.content.iter().any(|inline| matches!(inline,Inline::Text(run) if run.style.bold && run.style.inline_citation==2)));
+    let once = target.clone();
+    apply(&mut target, &spans);
+    assert_eq!(target, once);
+    // Bilingual translation companions carry no independent source range.
+    let mut companion = text("p", translated);
+    if let Block::Text(t) = &mut companion {
+        t.source = None;
+    }
+    let mut blocks = vec![Block::Text(original.clone()), companion];
+    compose(&mut blocks, original.source.as_ref().unwrap(), &spans);
+    for block in blocks {
+        let Block::Text(t) = block else { panic!() };
+        assert_eq!(marked_citations(&t).len(), 3);
+    }
+}
+
+#[test]
+fn unmatched_or_changed_citation_does_not_disable_other_citations() {
+    let Block::Text(original) = text("p", "A (Smith, 2020), B (Jones, 2021), C (Brown, 2022).")
+    else {
+        panic!()
+    };
+    let Block::Text(mut target) = text(
+        "p",
+        "Translated (Brown, 2022), changed (Jones, 2023), missing Smith.",
+    ) else {
+        panic!()
+    };
+    let before = text_block_text(&target);
+    apply(&mut target, &candidates(&original));
+    assert_eq!(marked_citations(&target), [(1, "(Brown, 2022)".into())]);
+    assert_eq!(text_block_text(&target), before);
+}
+
+#[test]
+fn ambiguous_translations_and_protected_footnotes_stay_unmarked() {
+    let Block::Text(original) = text("p", "Evidence (e.g., Smith, 2020). Other (Jones, 2021).")
+    else {
+        panic!()
+    };
+    let Block::Text(mut target) = text(
+        "p",
+        "Translated (Smith, 2020) and (Smith, 2020), plus (Jones, 2021).",
+    ) else {
+        panic!()
+    };
+    apply(&mut target, &candidates(&original));
+    assert_eq!(marked_citations(&target), [(1, "(Jones, 2021)".into())]);
+    let Block::Text(mut protected) =
+        text("p", "Evidence (e.g., Smith, 2020). Other (Jones, 2021).")
+    else {
+        panic!()
+    };
+    let Inline::Text(run) = &mut protected.content[0] else {
+        panic!()
+    };
+    run.style.inline_role = InlineRole::Footnote;
+    apply(&mut protected, &candidates(&original));
+    assert!(marked_citations(&protected).is_empty());
+}
+
+#[test]
+fn matched_citations_are_renumbered_in_translated_order() {
+    let Block::Text(original) = text("p", "First (Smith, 2020), then (Jones, 2021).") else {
+        panic!()
+    };
+    let Block::Text(mut target) = text("p", "Translation first (Jones, 2021), then (Smith, 2020).")
+    else {
+        panic!()
+    };
+    apply(&mut target, &candidates(&original));
+    assert_eq!(
+        marked_citations(&target),
+        [(1, "(Jones, 2021)".into()), (2, "(Smith, 2020)".into())]
+    );
+}
+
+#[test]
+fn translation_pipeline_restores_tagged_citations_and_toggle_hides_only_markers() {
+    let original = section(vec![text("p", "Claim (Smith, 2020).")]);
+    let Block::Text(block) = &original.blocks[0] else {
+        panic!()
+    };
+    let recognition = Recognition {
+        formulas_checked: true,
+        fingerprint: fingerprint(&original),
+        annotations: vec![Annotation::InlineCitations {
+            source: block.source.clone().unwrap(),
+            spans: candidates(block),
+        }],
+        skipped_groups: 0,
+    };
+    let source = super::super::tests::original_source(original.clone());
+    let translation = Arc::new(crate::plugins::TranslationBookSource::new(
+        source.clone(),
+        crate::plugins::TranslationMode::Replace,
+    ));
+    let semantic = SemanticLayoutSource::new(translation.clone(), source);
+    let mut input = original.clone();
+    apply_translation_citations(&mut input, &recognition);
+    let inputs = crate::plugins::prepare_translation_inputs(&input, false);
+    assert!(inputs[0].0.text.contains("<citation id=\"1\">"));
+    translation
+        .store_batch(
+            0,
+            &[crate::plugins::BlockTranslation {
+                block_index: 0,
+                segment_index: None,
+                text: "Translated <citation id=\"1\">(Author translated, 2020)</citation>.".into(),
+            }],
+        )
+        .unwrap();
+    translation.set_enabled(true).unwrap();
+    assert!(semantic.install(0, recognition));
+    let displayed = semantic.parse_section(0).unwrap();
+    let Block::Text(block) = &displayed.blocks[0] else {
+        panic!()
+    };
+    assert_eq!(
+        marked_citations(block),
+        [(1, "(Author translated, 2020)".into())]
+    );
+    let mut settings = PluginSettings::default();
+    settings.semantic_layout.enabled = false;
+    semantic.configure("citation-test", &settings);
+    let disabled = semantic.parse_section(0).unwrap();
+    let Block::Text(disabled) = &disabled.blocks[0] else {
+        panic!()
+    };
+    assert!(marked_citations(disabled).is_empty());
+    assert_eq!(text_block_text(block), text_block_text(disabled));
+}

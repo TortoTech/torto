@@ -59,11 +59,11 @@ fn search_sections(
         let section_title = section_title(source, section_index, &section.blocks);
         for block in &section.blocks {
             if let Block::Table(table) = block {
-                for cell in table.rows.iter().flat_map(|row| &row.cells) {
-                    let Some(source_range) = &cell.text.source else {
+                for cell in table.text_blocks() {
+                    let Some(source_range) = &cell.source else {
                         continue;
                     };
-                    let text = text_block_text(&cell.text);
+                    let text = text_block_text(cell);
                     for found in matcher.find_iter(&text) {
                         let range =
                             source_range_for_match(source_range, &text, found.start(), found.end());

@@ -27,6 +27,8 @@ struct RewriteKey {
 /// A derived, in-memory publication layer. The canonical book remains
 /// untouched; reparsing a section overlays only model-approved text blocks.
 pub struct RewriteBookSource {
+    revision: std::sync::atomic::AtomicU64,
+    parsed: RwLock<HashMap<usize, Arc<Section>>>,
     inner: Arc<dyn BookSource>,
     rewrites: RwLock<HashMap<RewriteKey, String>>,
 }
@@ -34,6 +36,8 @@ pub struct RewriteBookSource {
 impl RewriteBookSource {
     pub fn new(inner: Arc<dyn BookSource>) -> Self {
         Self {
+            revision: std::sync::atomic::AtomicU64::new(0),
+            parsed: RwLock::new(HashMap::new()),
             inner,
             rewrites: RwLock::new(HashMap::new()),
         }
@@ -53,6 +57,8 @@ impl RewriteBookSource {
             let old = store.insert(key.clone(), rewrite.text.clone());
             previous.push((key, old));
         }
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(RewriteTransaction { previous })
     }
 
@@ -68,6 +74,8 @@ impl RewriteBookSource {
                 store.remove(&key);
             }
         }
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -116,7 +124,21 @@ impl RewriteBookSource {
                 previous.push((key, Some(text)));
             }
         }
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok((RewriteTransaction { previous }, cleared))
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn clear_parsed_cache(&self) {
+        if let Ok(mut parsed) = self.parsed.write() {
+            self.revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            parsed.clear();
+        }
     }
 }
 
@@ -130,7 +152,31 @@ impl BookSource for RewriteBookSource {
     }
 
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
-        let mut section = self.inner.parse_section(index)?;
+        // Cache canonical IR, never rewritten/translated text. Reflow can then
+        // reuse parsing while every read still applies the latest rewrites.
+        let revision = self.revision();
+        let cached = self
+            .parsed
+            .read()
+            .ok()
+            .and_then(|parsed| parsed.get(&index).cloned());
+        let canonical = if let Some(cached) = cached {
+            cached
+        } else {
+            let section = Arc::new(self.inner.parse_section(index)?);
+            if let Ok(mut parsed) = self.parsed.write()
+                && revision == self.revision()
+            {
+                if parsed.len() >= 16
+                    && let Some(oldest) = parsed.keys().next().copied()
+                {
+                    parsed.remove(&oldest);
+                }
+                parsed.insert(index, section.clone());
+            }
+            section
+        };
+        let mut section = (*canonical).clone();
         let rewrites = self
             .rewrites
             .read()

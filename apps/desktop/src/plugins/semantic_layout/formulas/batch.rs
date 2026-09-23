@@ -44,7 +44,16 @@ impl Input {
 
 /// Match by ID and retain independently valid results. Missing, duplicate or
 /// malformed items remain pending; a broken sibling cannot erase a good result.
+#[cfg(test)]
 fn parse(content: &str, ids: &[usize]) -> HashMap<usize, Response> {
+    parse_results(content, ids, false)
+}
+
+fn parse_results(
+    content: &str,
+    ids: &[usize],
+    retain_invalid_proposals: bool,
+) -> HashMap<usize, Response> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Item {
@@ -88,7 +97,9 @@ fn parse(content: &str, ids: &[usize]) -> HashMap<usize, Response> {
             equation_number: item.equation_number,
             transient: false,
         };
-        if response.formula().is_ok() {
+        if response.formula().is_ok()
+            || (retain_invalid_proposals && response.status == "recognized")
+        {
             result.insert(item.image_id, response);
         }
     }
@@ -158,14 +169,24 @@ async fn stage(
             Err(error) => return Err(error),
         };
         let text = ai::message_content(&message).unwrap_or_default();
-        results.extend(parse(&text, &ids));
+        results.extend(parse_results(&text, &ids, mode == "transcribe"));
     }
     Ok(results)
 }
 
 fn rendered_url(proposal: &Response) -> Result<String, String> {
-    let math =
-        rebook_math::math::render_math(proposal.latex.as_deref().unwrap(), 24.0, "#000000", true)?;
+    // A failed proposal may violate source-size/nesting restrictions. Never
+    // bypass those limits merely to create an optional review illustration.
+    validate_formula(&ImageFormula {
+        latex: proposal.latex.clone().ok_or("Missing LaTeX")?,
+        equation_number: None,
+    })?;
+    let math = rebook_math::math::render_math(
+        proposal.latex.as_deref().ok_or("Missing LaTeX")?,
+        24.0,
+        "#000000",
+        true,
+    )?;
     let svg = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" viewBox="-4 {} {} {}">{}</svg>"##,
         math.width + 8.0,
@@ -197,27 +218,45 @@ pub(super) async fn request_batch(
     let mut results = stage(client, provider, model, &inputs, "transcribe").await?;
     let mut verification = Vec::new();
     for input in &inputs {
-        if let Some(proposal) = results.get(&input.id)
-            && proposal.status == "recognized"
-        {
-            if let Ok(rendered) = rendered_url(proposal) {
-                let mut item = input.clone();
-                item.context = json!({"proposal":proposal});
-                item.rendered = Some(rendered);
-                if item.bytes() <= MAX_BYTES {
-                    verification.push(item);
-                }
-            }
-        }
-    }
-    // A successful transcription is never installed before its own verification.
-    for r in results.values_mut().filter(|r| r.status == "recognized") {
-        *r = Response {
-            status: "unreadable".into(),
-            latex: None,
-            equation_number: None,
-            transient: true,
+        let Some(proposal) = results.get(&input.id) else {
+            continue;
         };
+        if proposal.status != "recognized" {
+            continue;
+        }
+        // Formula validation includes supported syntax, bounded dimensions and
+        // a real local render. Valid self-checked results need no second call.
+        let Err(error) = proposal.formula() else {
+            continue;
+        };
+        let mut item = input.clone();
+        item.context = json!({"proposal":proposal,"local_validation_error":error,
+            "inline":batch[input.id].candidate.inline,"context":batch[input.id].candidate.context});
+        item.rendered = rendered_url(proposal).ok();
+        // A render is optional for syntax errors; keep the original available.
+        if item.bytes() > MAX_BYTES {
+            item.rendered = None;
+        }
+        log::event(
+            provider,
+            model,
+            "formula.batch.review_needed",
+            json!({"image_id":input.id,"reason":error,"has_rendering":item.rendered.is_some()}),
+        );
+        if item.bytes() <= MAX_BYTES {
+            verification.push(item);
+        }
+        // Only anomalous proposals fall back while awaiting review. A broken
+        // sibling or network error cannot discard successfully validated items.
+        results.insert(
+            input.id,
+            Response {
+                status: "unreadable".into(),
+                latex: None,
+                equation_number: None,
+                transient: true,
+            },
+        );
     }
     let mut start = 0;
     while start < verification.len() {

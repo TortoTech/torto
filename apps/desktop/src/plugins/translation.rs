@@ -30,6 +30,23 @@ pub struct BlockTranslation {
     pub text: String,
 }
 
+pub(crate) fn prepare_translation_inputs(
+    section: &Section,
+    fixed_page: bool,
+) -> Vec<(TranslationBlockInput, SourceRange)> {
+    translatable_blocks(section, fixed_page)
+        .into_iter()
+        .filter_map(|input| {
+            let range = translation_input_source_range(
+                section.blocks.get(input.block_index)?,
+                input.segment_index,
+            )?
+            .clone();
+            Some((input, range))
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct StoredBlockTranslation {
     whole: Option<String>,
@@ -54,6 +71,35 @@ pub struct TranslationBookSource {
 }
 
 impl TranslationBookSource {
+    pub(crate) fn untranslated_prepared(
+        &self,
+        index: usize,
+        prepared: &[(TranslationBlockInput, SourceRange)],
+        ranges: &[SourceRange],
+    ) -> Result<Vec<TranslationBlockInput>, String> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| "translation state lock poisoned".to_owned())?;
+        let stored = state.sections.get(&index);
+        Ok(prepared
+            .iter()
+            .filter(|(input, source)| {
+                ranges
+                    .iter()
+                    .any(|range| source_range_nodes_overlap(source, range))
+                    && !stored
+                        .and_then(|entries| entries.get(&input.block_index))
+                        .is_some_and(|value| {
+                            input.segment_index.map_or_else(
+                                || value.whole.is_some(),
+                                |segment| value.segments.contains_key(&segment),
+                            )
+                        })
+            })
+            .map(|(input, _)| input.clone())
+            .collect())
+    }
     pub fn set_target_language(&self, language: &str) -> Result<(), String> {
         let tag = match language.trim().to_lowercase().as_str() {
             "simplified chinese"
@@ -295,12 +341,10 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
             Block::Table(table) => {
                 blocks.extend(
                     table
-                        .rows
-                        .iter()
-                        .flat_map(|row| &row.cells)
+                        .text_blocks()
                         .enumerate()
                         .filter_map(|(cell_index, cell)| {
-                            translatable_text(&cell.text).map(|text| TranslationBlockInput {
+                            translatable_text(cell).map(|text| TranslationBlockInput {
                                 block_index,
                                 segment_index: Some(cell_index),
                                 text,
@@ -360,8 +404,8 @@ fn visit_note_text_blocks(
             }
         }
         Block::Table(table) => {
-            for cell in table.rows.iter().flat_map(|row| &row.cells) {
-                visit(*segment_index, &cell.text);
+            for text in table.text_blocks() {
+                visit(*segment_index, text);
                 *segment_index += 1;
             }
         }
@@ -401,8 +445,8 @@ fn visit_note_text_blocks_mut(
             }
         }
         Block::Table(table) => {
-            for cell in table.rows.iter_mut().flat_map(|row| &mut row.cells) {
-                visit(*segment_index, &mut cell.text);
+            for text in table.text_blocks_mut() {
+                visit(*segment_index, text);
                 *segment_index += 1;
             }
         }
@@ -445,8 +489,8 @@ fn note_text_source_range_at(note: &NoteBlock, target_index: usize) -> Option<&S
                 None
             }
             Block::Table(table) => {
-                for cell in table.rows.iter().flat_map(|row| &row.cells) {
-                    if let Some(range) = find_text(&cell.text) {
+                for text in table.text_blocks() {
+                    if let Some(range) = find_text(text) {
                         return Some(range);
                     }
                 }
@@ -518,11 +562,9 @@ fn translation_input_source_range(
     }
     if let (Block::Table(table), Some(segment_index)) = (block, segment_index) {
         return table
-            .rows
-            .iter()
-            .flat_map(|row| &row.cells)
+            .text_blocks()
             .nth(segment_index)
-            .and_then(|cell| cell.text.source.as_ref());
+            .and_then(|text| text.source.as_ref());
     }
     if let (Block::Figure(figure), Some(segment_index)) = (block, segment_index) {
         return figure
@@ -742,17 +784,11 @@ fn translated_table(
     translations: &HashMap<usize, String>,
     mode: TranslationMode,
 ) -> rebook_publication::TableBlock {
-    for (cell_index, cell) in table
-        .rows
-        .iter_mut()
-        .flat_map(|row| &mut row.cells)
-        .enumerate()
-    {
+    for (cell_index, cell) in table.text_blocks_mut().enumerate() {
         let Some(translated) = translations.get(&cell_index) else {
             continue;
         };
         let style = cell
-            .text
             .content
             .iter()
             .find_map(|inline| match inline {
@@ -761,13 +797,12 @@ fn translated_table(
             })
             .unwrap_or_default();
         if mode == TranslationMode::Replace {
-            let original = cell.text.content.clone();
-            cell.text.content = replacement_content(translated, style, Some(&original));
+            let original = cell.content.clone();
+            cell.content = replacement_content(translated, style, Some(&original));
         } else {
-            let original = cell.text.content.clone();
-            cell.text.content.push(Inline::Break);
-            cell.text
-                .content
+            let original = cell.content.clone();
+            cell.content.push(Inline::Break);
+            cell.content
                 .extend(replacement_content(translated, style, Some(&original)));
         }
     }
@@ -1159,7 +1194,21 @@ fn translated_fixed_page_block(text: &str, source: Option<SourceRange>) -> TextB
 fn translation_text(block: &TextBlock) -> String {
     let mut text = String::new();
     let mut math_index = 0;
+    let mut citation = 0;
     for inline in &block.content {
+        let next = match inline {
+            Inline::Text(run) => run.style.inline_citation,
+            _ => 0,
+        };
+        if next != citation {
+            if citation != 0 {
+                text.push_str("</citation>");
+            }
+            if next != 0 {
+                text.push_str(&format!("<citation id=\"{next}\">"));
+            }
+            citation = next;
+        }
         match inline {
             Inline::Text(run) => push_translation_style_markup(&mut text, run),
             Inline::Math(_) => {
@@ -1169,6 +1218,9 @@ fn translation_text(block: &TextBlock) -> String {
             Inline::Image(_) => {}
             Inline::Break => text.push('\n'),
         }
+    }
+    if citation != 0 {
+        text.push_str("</citation>");
     }
     text
 }
@@ -1482,6 +1534,7 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
     style.emphasis = false;
     style.alternate_voice = false;
     style.citation = false;
+    style.inline_citation = 0;
     style.underline = false;
     style.baseline = TextBaseline::Normal;
     style.link_role = LinkRole::Normal;
@@ -1596,6 +1649,7 @@ enum TranslationStyleTag {
     FootnoteReference,
     FootnoteBacklink,
     InlineFootnote,
+    InlineCitation,
 }
 
 fn parse_inline_style_markup(
@@ -1615,6 +1669,17 @@ fn parse_inline_style_markup(
         if opening {
             stack.push((tag, style));
             style = apply_translation_style_tag(style, tag);
+            if tag == TranslationStyleTag::InlineCitation {
+                let id = token
+                    .strip_prefix("<citation id=\"")?
+                    .strip_suffix("\">")?
+                    .parse::<u32>()
+                    .ok()?;
+                if id == 0 || style.inline_citation != 0 {
+                    return None;
+                }
+                style.inline_citation = id;
+            }
             if tag == TranslationStyleTag::KeywordSize {
                 let scale = token
                     .strip_prefix("<torto-size scale=\"")?
@@ -1644,6 +1709,7 @@ fn parse_inline_style_markup(
 
 fn next_translation_style_tag(text: &str) -> Option<(usize, TranslationStyleTag, bool, &str)> {
     let fixed = [
+        ("</citation>", TranslationStyleTag::InlineCitation, false),
         ("</torto-size>", TranslationStyleTag::KeywordSize, false),
         ("<strong>", TranslationStyleTag::Bold, true),
         ("</strong>", TranslationStyleTag::Bold, false),
@@ -1698,15 +1764,25 @@ fn next_translation_style_tag(text: &str) -> Option<(usize, TranslationStyleTag,
             &text[start..end],
         ))
     });
+    let citation = text.find("<citation id=\"").and_then(|start| {
+        let end = text[start..].find('>')? + start + 1;
+        Some((
+            start,
+            TranslationStyleTag::InlineCitation,
+            true,
+            &text[start..end],
+        ))
+    });
     fixed
         .into_iter()
+        .chain(citation)
         .chain(sized)
         .min_by_key(|(index, _, opening, _)| (*index, !*opening))
 }
 
 fn apply_translation_style_tag(mut style: TextStyle, tag: TranslationStyleTag) -> TextStyle {
     match tag {
-        TranslationStyleTag::KeywordSize => {}
+        TranslationStyleTag::KeywordSize | TranslationStyleTag::InlineCitation => {}
         TranslationStyleTag::Bold => style.bold = true,
         TranslationStyleTag::Emphasis => {
             style.italic = true;
@@ -2891,6 +2967,50 @@ mod tests {
     }
 
     #[test]
+    fn table_captions_translate_in_reading_order_and_preserve_roles() {
+        let base = source();
+        let section = rebook_html::parse_section(
+            "<html><body><div class='table'><p>Table 1. Values</p><table><tr><td>Value</td></tr></table><p>NOTE: Rounded.</p></div></body></html>",
+            &base.book().sections[0], |_| None,
+        ).unwrap();
+        let inputs = translatable_blocks(&section, false);
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| input.segment_index)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+        let Block::Table(table) = &section.blocks[0] else {
+            panic!()
+        };
+        let ranges = table
+            .text_blocks()
+            .map(|text| text.source.clone())
+            .collect::<Vec<_>>();
+        let translations = HashMap::from([
+            (0, "表 1 数据".into()),
+            (1, "数值".into()),
+            (2, "注：已取整。".into()),
+        ]);
+        for mode in [TranslationMode::Replace, TranslationMode::Bilingual] {
+            let translated = super::translated_table(table.clone(), &translations, mode);
+            assert_eq!(translated.before[0].kind, TextBlockKind::Caption);
+            assert_eq!(translated.after[0].kind, TextBlockKind::Paragraph);
+            assert_eq!(
+                translated
+                    .text_blocks()
+                    .map(|text| text.source.clone())
+                    .collect::<Vec<_>>(),
+                ranges
+            );
+            assert!(text_block_text(&translated.before[0]).contains("数据"));
+            assert!(text_block_text(&translated.rows[0].cells[0].text).contains("数值"));
+        }
+    }
+
+    #[test]
     fn translates_ocr_reflow_table_cells_and_matches_their_visible_ranges() {
         let base = source();
         let book = base.book().clone();
@@ -3089,5 +3209,135 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].text, "Narrow first line narrow second line");
         assert_eq!(groups[1].text, "full width after figure");
+    }
+}
+
+pub(super) fn citation_ids(text: &str) -> Result<Vec<u32>, String> {
+    if !text.contains("<citation") && !text.contains("</citation") {
+        return Ok(Vec::new());
+    }
+    if text.contains("<citation id=\"0\">") {
+        return Err(
+            "Citation ID 0 is invalid; IDs must be positive and already present in the source"
+                .into(),
+        );
+    }
+    let styled =
+        parse_inline_style_markup(text, TextStyle::default()).ok_or("Invalid citation markup")?;
+    if styled
+        .iter()
+        .any(|(value, _)| value.contains("<citation") || value.contains("</citation"))
+    {
+        return Err("Malformed citation markup".into());
+    }
+    let mut ids = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<citation id=\"") {
+        rest = &rest[start + "<citation id=\"".len()..];
+        let end = rest.find("\">").ok_or("Invalid citation ID")?;
+        let id = rest[..end]
+            .parse::<u32>()
+            .map_err(|_| "Invalid citation ID")?;
+        if id == 0 {
+            return Err("Citation ID must be positive".into());
+        }
+        if ids.contains(&id) {
+            return Err(format!("Duplicate citation ID: {id}"));
+        }
+        if !styled
+            .iter()
+            .any(|(value, style)| style.inline_citation == id && !value.trim().is_empty())
+        {
+            return Err(format!("Empty citation content for ID: {id}"));
+        }
+        ids.push(id);
+        rest = &rest[end + 2..];
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+pub(super) fn validate_translation_citations(source: &str, translated: &str) -> Result<(), String> {
+    let expected =
+        citation_ids(source).map_err(|reason| format!("Invalid source citation tags: {reason}"))?;
+    let actual = citation_ids(translated)
+        .map_err(|reason| format!("Invalid translated citation tags: {reason}"))?;
+    if expected != actual {
+        let missing: Vec<_> = expected.iter().filter(|id| !actual.contains(id)).collect();
+        let unexpected: Vec<_> = actual.iter().filter(|id| !expected.contains(id)).collect();
+        return Err(format!(
+            "Citation ID mismatch: missing={missing:?}, unexpected={unexpected:?}; expected={expected:?}, actual={actual:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod citation_translation_tests {
+    use super::*;
+
+    #[test]
+    fn citation_tags_group_style_runs_and_restore_with_footnotes() {
+        let run = |value: &str, id, bold| {
+            Inline::Text(TextRun {
+                text: value.into(),
+                style: TextStyle {
+                    inline_citation: id,
+                    bold,
+                    ..Default::default()
+                },
+                link: None,
+            })
+        };
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                run("Claim ", 0, false),
+                run("(e.g., ", 1, false),
+                run("Smith, 2020)", 1, true),
+                run(" follows.", 0, false),
+            ],
+            source: None,
+            style: Default::default(),
+        };
+        let input = translation_text(&block);
+        assert_eq!(input.matches("<citation id=").count(), 1);
+        let translated = "Claim <citation id=\"1\">(for example, <strong>Smith, 2020</strong>)</citation><noteref>4</noteref> follows.";
+        assert!(validate_translation_citations(&input, translated).is_ok());
+        let content = replacement_content(translated, TextStyle::default(), Some(&block.content));
+        assert!(
+            content
+                .iter()
+                .any(|i| matches!(i,Inline::Text(r) if r.style.inline_citation==1 && r.style.bold))
+        );
+        assert!(content.iter().any(|i| matches!(i,Inline::Text(r) if r.style.link_role==LinkRole::FootnoteReference && r.style.inline_citation==0)));
+        assert!(content.iter().any(|i| matches!(i,Inline::Text(r) if r.text.contains("follows") && r.style.inline_citation==0)));
+        assert!(
+            !content
+                .iter()
+                .any(|i| matches!(i,Inline::Text(r) if r.text.contains("<citation")))
+        );
+    }
+
+    #[test]
+    fn citation_validation_rejects_lost_duplicate_invented_and_malformed_ids() {
+        let input = "<citation id=\"1\">Smith 2020</citation>";
+        for invalid in [
+            "Smith 2020",
+            "<citation id=\"2\">Smith 2020</citation>",
+            "<citation id=\"1\">Smith</citation><citation id=\"1\">2020</citation>",
+            "<citation id=\"1\"></citation>",
+            "<citation id=\"1\">Smith",
+            "<citation id=\"1\"><citation id=\"2\">Smith</citation></citation>",
+            "<citation id=\"0\">Smith</citation>",
+            "<citation id=\"oops\">Smith</citation>",
+        ] {
+            assert!(
+                validate_translation_citations(input, invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(validate_translation_citations("Plain text", input).is_err());
+        assert!(validate_translation_citations("Plain text", "Translated text").is_ok());
     }
 }

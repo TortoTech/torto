@@ -10,6 +10,35 @@ static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 /// Available in release builds too. Never record request bodies or model text.
 pub(super) fn event(provider: &AiProvider, model: &str, event: &str, details: Value) {
+    write_event(
+        provider,
+        model,
+        event,
+        details,
+        "semantic-layout.log",
+        "semantic-layout.previous.log",
+    );
+}
+
+pub(crate) fn translation_event(provider: &AiProvider, model: &str, event: &str, details: Value) {
+    write_event(
+        provider,
+        model,
+        event,
+        details,
+        "translation.log",
+        "translation.previous.log",
+    );
+}
+
+fn write_event(
+    provider: &AiProvider,
+    model: &str,
+    event: &str,
+    details: Value,
+    filename: &str,
+    previous: &str,
+) {
     let Some(project) = crate::smoke::project_dirs() else {
         return;
     };
@@ -20,9 +49,9 @@ pub(super) fn event(provider: &AiProvider, model: &str, event: &str, details: Va
     if fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let path = dir.join("semantic-layout.log");
+    let path = dir.join(filename);
     if fs::metadata(&path).is_ok_and(|m| m.len() > 1_048_576) {
-        let _ = fs::copy(&path, dir.join("semantic-layout.previous.log"));
+        let _ = fs::copy(&path, dir.join(previous));
         if fs::write(&path, []).is_err() {
             return;
         }

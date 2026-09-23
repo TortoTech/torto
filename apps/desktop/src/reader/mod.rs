@@ -415,17 +415,12 @@ fn legacy_translated_paragraph_range(
                         .map(|source| (source, crate::plugins::text_block_text(block)))
                 })
         }
-        Block::Table(table) => table
-            .rows
-            .iter()
-            .flat_map(|row| &row.cells)
-            .find_map(|cell| {
-                cell.text
-                    .source
-                    .as_ref()
-                    .filter(matches_range)
-                    .map(|source| (source, crate::plugins::text_block_text(&cell.text)))
-            }),
+        Block::Table(table) => table.text_blocks().find_map(|cell| {
+            cell.source
+                .as_ref()
+                .filter(matches_range)
+                .map(|source| (source, crate::plugins::text_block_text(cell)))
+        }),
         Block::Figure(figure) => figure.captions.iter().find_map(|caption| {
             caption
                 .source
@@ -608,7 +603,9 @@ enum ImagePointerState {
 }
 
 struct SelectedImage {
-    image: egui::ColorImage,
+    formula: Option<String>,
+    pixels: Arc<[u8]>,
+    size: [usize; 2],
     position: ReaderPosition,
     bounds: egui::Rect,
     scroll_mode: bool,
@@ -846,10 +843,8 @@ fn block_is_footnote_definition(block: &Block) -> bool {
             .chain(quote.attribution.iter())
             .any(|block| text_block_has_link_role(block, LinkRole::FootnoteBacklink)),
         Block::Table(table) => table
-            .rows
-            .iter()
-            .flat_map(|row| &row.cells)
-            .any(|cell| text_block_has_link_role(&cell.text, LinkRole::FootnoteBacklink)),
+            .text_blocks()
+            .any(|text| text_block_has_link_role(text, LinkRole::FootnoteBacklink)),
         Block::Figure(figure) => figure
             .captions
             .iter()
@@ -868,10 +863,8 @@ fn block_focus_footnotes(block: &Block) -> Vec<FocusFootnoteSource> {
             .flat_map(text_block_focus_footnotes)
             .collect(),
         Block::Table(table) => table
-            .rows
-            .iter()
-            .flat_map(|row| &row.cells)
-            .flat_map(|cell| text_block_focus_footnotes(&cell.text))
+            .text_blocks()
+            .flat_map(text_block_focus_footnotes)
             .collect(),
         Block::Figure(figure) => figure
             .captions
@@ -984,8 +977,8 @@ fn collect_focus_footnote_translation_ranges(block: &Block, ranges: &mut Vec<Sou
             }
         }
         Block::Table(table) => {
-            for cell in table.rows.iter().flat_map(|row| &row.cells) {
-                push_text(&cell.text);
+            for text in table.text_blocks() {
+                push_text(text);
             }
         }
         Block::Figure(figure) => {
@@ -1176,7 +1169,14 @@ fn table_block_markdown(table: &TableBlock) -> String {
         push_row(&mut markdown, row);
     }
     markdown.pop();
-    markdown
+    table
+        .before
+        .iter()
+        .map(text_block_focus_text)
+        .chain(std::iter::once(markdown))
+        .chain(table.after.iter().map(text_block_focus_text))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn block_focus_text(block: &Block) -> String {
@@ -1191,10 +1191,8 @@ fn block_focus_text(block: &Block) -> String {
             .collect::<Vec<_>>()
             .join(" "),
         Block::Table(table) => table
-            .rows
-            .iter()
-            .flat_map(|row| &row.cells)
-            .map(|cell| text_block_focus_text(&cell.text))
+            .text_blocks()
+            .map(text_block_focus_text)
             .collect::<Vec<_>>()
             .join(" "),
         Block::Image(image) => image
@@ -1237,10 +1235,8 @@ fn focus_block_paint_ranges(block: &Block, range: &SourceRange) -> Vec<SourceRan
     }
     if let Block::Table(table) = block {
         let cell_ranges = table
-            .rows
-            .iter()
-            .flat_map(|row| &row.cells)
-            .filter_map(|cell| cell.text.source.clone())
+            .text_blocks()
+            .filter_map(|text| text.source.clone())
             .collect::<Vec<_>>();
         if !cell_ranges.is_empty() {
             return cell_ranges;
@@ -2207,6 +2203,7 @@ impl DesktopReader {
         reason = "focus-unit construction keeps semantic, paint, and geometry ranges synchronized"
     )]
     fn rebuild_focus_units(&mut self, layout: &ScrollSectionLayout) {
+        let started = Instant::now();
         self.focus_units_ready = false;
         if self.focus_selection_anchor.take().is_some() {
             self.selection_anchor = None;
@@ -2332,10 +2329,8 @@ impl DesktopReader {
                         };
                         let paint_ranges = focus_block_paint_ranges(block, &range);
                         let text = table
-                            .rows
-                            .iter()
-                            .flat_map(|row| &row.cells)
-                            .map(|cell| text_block_focus_text(&cell.text))
+                            .text_blocks()
+                            .map(text_block_focus_text)
                             .collect::<Vec<_>>()
                             .join(" ");
                         (range, paint_ranges, text, false, true, false, None)
@@ -2540,6 +2535,18 @@ impl DesktopReader {
         self.sync_focus_chat_session();
         self.sync_focus_selected_image();
         self.bump_scene_revision();
+        if started.elapsed() >= Duration::from_millis(16) {
+            crate::diagnostics::log(
+                "reader.focus.units",
+                &[
+                    crate::diagnostics::Field::U64(
+                        "elapsed_ms",
+                        started.elapsed().as_millis() as u64,
+                    ),
+                    crate::diagnostics::Field::Usize("units", self.focus_units.len()),
+                ],
+            );
+        }
     }
 
     fn focus_unit_target_offset(&self, viewport_height: f32) -> Option<f32> {
@@ -2782,36 +2789,39 @@ impl DesktopReader {
             .focus_units
             .get(self.focus_unit_index)
             .filter(|unit| unit.is_image)
-            .cloned()
+            .map(|unit| (unit.position, unit.rect))
         else {
             self.selected_image = None;
             return;
         };
-        // The retained Vello image layer can outlive the renderer's transient
-        // image upload when focus moves away and later returns to this page.
-        // The GPU renderer also refreshes the underlying image atlas, while this
-        // eviction makes the selected image underlay match the active focus page.
-        self.invalidate_page_scene(unit.position);
         let Some(layout) = self.scroll_section.as_ref() else {
             self.selected_image = None;
             return;
         };
-        let Some(page_index) = layout
-            .pages
-            .iter()
-            .position(|page| page.position == unit.position)
-        else {
+        let Some(page_index) = layout.pages.iter().position(|page| page.position == unit.0) else {
             self.selected_image = None;
             return;
         };
         let page_y =
-            unit.rect.center().y - layout.page_tops[page_index] + layout.page_origins[page_index];
-        self.selected_image = self
+            unit.1.center().y - layout.page_tops[page_index] + layout.page_origins[page_index];
+        let image = self
             .reader
-            .image_at_page(unit.position, unit.rect.center().x, page_y)
+            .image_at_page(unit.0, unit.1.center().x, page_y)
             .ok()
-            .flatten()
-            .and_then(|image| SelectedImage::from_reader_image(&image, true).ok());
+            .flatten();
+        if let Some(image) = image {
+            if self
+                .selected_image
+                .as_ref()
+                .is_some_and(|selected| selected.matches(&image, true))
+            {
+                return;
+            }
+            self.invalidate_page_scene(unit.0);
+            self.selected_image = SelectedImage::from_reader_image(&image, true).ok();
+        } else {
+            self.selected_image = None;
+        }
     }
 
     fn scroll_page_coordinates(&self, x: f32, y: f32) -> Option<(ReaderPosition, f32, f32)> {
@@ -4203,6 +4213,29 @@ mod tests {
     }
 
     #[test]
+    fn table_caption_focus_copy_and_footnote_ranges_are_complete() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let section = rebook_html::parse_section("<html><body><div class='table'><p>Table 1. Values<a href='notes.xhtml#n1' role='doc-noteref'>1</a></p><table><tr><td>42</td></tr></table><p>NOTE: Rounded.</p></div></body></html>", &descriptor, |_| None).unwrap();
+        let block = &section.blocks[0];
+        let Block::Table(table) = block else { panic!() };
+        let ranges = focus_block_paint_ranges(block, table.source.as_ref().unwrap());
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(super::block_focus_footnotes(block).len(), 1);
+        assert!(super::find_block_containing_anchor(block, &ranges[0].start).is_some());
+        let markdown = table_block_markdown(table);
+        assert_eq!(
+            markdown,
+            "Table 1. Values1\n\n| 42 |\n| --- |\n\nNOTE: Rounded."
+        );
+    }
+
+    #[test]
     fn focus_selection_keeps_a_stable_anchor_while_the_endpoint_reverses() {
         assert_eq!(ordered_focus_selection_bounds(4, 7), (4, 7));
         assert_eq!(ordered_focus_selection_bounds(4, 2), (2, 4));
@@ -4929,6 +4962,8 @@ mod tests {
             header: false,
         };
         let block = Block::Table(TableBlock {
+            before: Vec::new(),
+            after: Vec::new(),
             rows: vec![TableRow {
                 cells: vec![cell(first_cell.clone()), cell(second_cell.clone())],
             }],
@@ -5275,6 +5310,8 @@ mod tests {
             header,
         };
         let table = TableBlock {
+            before: Vec::new(),
+            after: Vec::new(),
             rows: vec![
                 TableRow {
                     cells: vec![cell("Name", true), cell("Value", true)],
@@ -5314,6 +5351,8 @@ mod tests {
             header: false,
         };
         let table = TableBlock {
+            before: Vec::new(),
+            after: Vec::new(),
             rows: vec![
                 TableRow {
                     cells: vec![cell("Merged", 2, 2), cell("R1", 1, 1)],

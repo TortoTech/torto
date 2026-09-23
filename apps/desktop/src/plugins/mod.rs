@@ -2,6 +2,8 @@
 //! stable source-backed results; none of them depend on Xilem or the renderer.
 
 mod ai;
+pub(crate) use ai::translation_batches;
+pub(crate) use translation::prepare_translation_inputs;
 pub(crate) mod chat_media;
 mod commands;
 mod llm_json;

@@ -14,6 +14,7 @@ use roxmltree::{Document, Node};
 use thiserror::Error;
 
 mod font_size;
+mod table_captions;
 use font_size::FontSize;
 
 #[derive(Debug, Error)]
@@ -350,6 +351,10 @@ impl<'a> ReadingIrParser<'a> {
         while index < children.len() {
             let node = children[index];
             if node.is_element() {
+                if let Some(consumed) = self.try_parse_table_caption_group(&children[index..])? {
+                    index += consumed;
+                    continue;
+                }
                 if let Some(caption_index) = inferred_figure_caption_sibling(
                     &children,
                     index,
@@ -526,6 +531,10 @@ impl<'a> ReadingIrParser<'a> {
                     style,
                     std::mem::replace(&mut collector, InlineCollector::new(false)),
                 );
+                if let Some(consumed) = self.try_parse_table_caption_group(&children[index..])? {
+                    index += consumed;
+                    continue;
+                }
                 if let Some(caption_index) = inferred_figure_caption_sibling(
                     &children,
                     index,
@@ -1391,6 +1400,22 @@ impl<'a> ReadingIrParser<'a> {
         let table_node = self.allocate_node();
         let table_source = self.source_range(&table_node, 0);
         self.bind_pending_anchors(&table_source.start);
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for caption in table.children().filter(|node| node.has_tag_name("caption")) {
+            let texts = self.parse_table_annotation(caption, false);
+            if caption
+                .ancestors()
+                .filter(Node::is_element)
+                .find_map(|node| self.styles.cascaded_properties(node).remove("caption-side"))
+                .as_deref()
+                .is_some_and(|side| side.eq_ignore_ascii_case("bottom"))
+            {
+                after.extend(texts);
+            } else {
+                before.extend(texts);
+            }
+        }
         let mut rows = Vec::new();
         for row in table.descendants().filter(|node| {
             node.is_element()
@@ -1467,9 +1492,14 @@ impl<'a> ReadingIrParser<'a> {
         }
         if !rows.is_empty() {
             self.blocks.push(Block::Table(TableBlock {
+                before,
+                after,
                 rows,
                 source: Some(table_source),
             }));
+        } else {
+            self.blocks
+                .extend(before.into_iter().chain(after).map(Block::Text));
         }
     }
 
@@ -1804,11 +1834,7 @@ fn mark_block_as_footnote_definition(block: &mut Block) {
             quote.body.iter_mut().for_each(mark);
             quote.attribution.iter_mut().for_each(mark);
         }
-        Block::Table(table) => table
-            .rows
-            .iter_mut()
-            .flat_map(|row| &mut row.cells)
-            .for_each(|cell| mark(&mut cell.text)),
+        Block::Table(table) => table.text_blocks_mut().for_each(mark),
         Block::Figure(figure) => figure.captions.iter_mut().for_each(mark),
         Block::Note(note) => note
             .blocks
@@ -2869,6 +2895,8 @@ fn is_block_boundary(name: &str) -> bool {
         || matches!(
             name,
             "blockquote"
+                | "html"
+                | "body"
                 | "dd"
                 | "dl"
                 | "dt"

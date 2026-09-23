@@ -349,6 +349,60 @@ impl PageDisplayList {
             .collect()
     }
 
+    /// Source content intersecting a viewport band, including image-only blocks.
+    pub fn visible_content_sources(&self, top: f32, bottom: f32) -> Vec<SourceRange> {
+        if top <= 0.0 && bottom >= self.height as f32 {
+            return self.content_sources();
+        }
+        let intersects = |rect: &Rect| rect.y1 > f64::from(top) && rect.y0 < f64::from(bottom);
+        let mut ranges = Vec::new();
+        for index in 0..self.text_region_count() {
+            if let Some(bytes) = self.text_region_visible_range(index)
+                && let Some(range) = self.text_region_source_range(index, bytes)
+                && self
+                    .source_rects(std::slice::from_ref(&range))
+                    .iter()
+                    .any(intersects)
+                && !ranges.contains(&range)
+            {
+                ranges.push(range);
+            }
+        }
+        for command in &self.commands {
+            if let DisplayCommand::Image(image) = command
+                && intersects(&image.bounds)
+                && let Some(range) = &image.source
+                && !ranges.contains(range)
+            {
+                ranges.push(range.clone());
+            }
+        }
+        ranges
+    }
+
+    /// Sources on this complete layout page, without shaping selection geometry.
+    /// Translation uses this envelope to prepare later blocks on visible pages.
+    pub fn content_sources(&self) -> Vec<SourceRange> {
+        let mut ranges = Vec::new();
+        for index in 0..self.text_region_count() {
+            if let Some(bytes) = self.text_region_visible_range(index)
+                && let Some(range) = self.text_region_source_range(index, bytes)
+                && !ranges.contains(&range)
+            {
+                ranges.push(range);
+            }
+        }
+        for command in &self.commands {
+            if let DisplayCommand::Image(image) = command
+                && let Some(range) = &image.source
+                && !ranges.contains(range)
+            {
+                ranges.push(range.clone());
+            }
+        }
+        ranges
+    }
+
     /// Visible UTF-8 byte range for a retained text placement.
     pub fn text_region_visible_range(&self, region_index: usize) -> Option<Range<usize>> {
         self.text_regions

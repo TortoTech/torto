@@ -13,6 +13,7 @@ pub(super) struct Citation {
     pub text: String,
 }
 
+#[cfg(test)]
 pub(super) fn options() -> Value {
     json!({"temperature":0.0,"response_format":{"type":"json_schema","json_schema":{
         "name":"inline_bibliographic_citations","strict":true,"schema":{
@@ -37,7 +38,7 @@ fn texts<'a>(blocks: &'a [Block], out: &mut Vec<&'a TextBlock>) {
                 out.push(t)
             }
             Block::Quote(q) => out.extend(q.body.iter()),
-            Block::Table(t) => out.extend(t.rows.iter().flat_map(|r| &r.cells).map(|c| &c.text)),
+            Block::Table(t) => out.extend(t.text_blocks()),
             _ => {}
         }
     }
@@ -47,6 +48,11 @@ pub(super) fn candidates(block: &TextBlock) -> Vec<Citation> {
     if block.source.is_none() {
         return vec![];
     }
+    candidate_spans(block)
+}
+
+// Also used for translated companion blocks, which intentionally have no source.
+fn candidate_spans(block: &TextBlock) -> Vec<Citation> {
     let text = text_block_text(block);
     let chars: Vec<_> = text.chars().collect();
     let mut forbidden = Vec::new();
@@ -112,6 +118,7 @@ pub(super) fn candidates(block: &TextBlock) -> Vec<Citation> {
     out
 }
 
+#[cfg(test)]
 pub(super) async fn recognize(
     client: &reqwest::Client,
     provider: &super::super::AiProvider,
@@ -211,30 +218,91 @@ pub(super) fn validate_annotations(section: &Section, annotations: &[Annotation]
     })
 }
 
+// Normalize presentation only: author names, years, order and punctuation
+// boundaries remain significant. Never use fuzzy author/year matching.
+fn citation_key(value: &str) -> String {
+    let value = value.trim();
+    let inner = value
+        .chars()
+        .next()
+        .and_then(|first| {
+            let last = value.chars().next_back()?;
+            matches!(
+                (first, last),
+                ('(', ')') | ('\u{ff08}', '\u{ff09}') | ('[', ']') | ('\u{ff3b}', '\u{ff3d}')
+            )
+            .then(|| &value[first.len_utf8()..value.len() - last.len_utf8()])
+        })
+        .unwrap_or(value)
+        .trim();
+    let inner = ["e.g.,", "e.g.", "\u{4f8b}\u{5982}", "\u{4f8b}"]
+        .iter()
+        .find_map(|prefix| inner.strip_prefix(prefix))
+        .unwrap_or(inner)
+        .trim_start_matches(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | '\u{ff0c}' | ':' | '\u{ff1a}')
+        });
+    inner
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| match c {
+            '\u{ff0c}' => ',',
+            '\u{ff1b}' => ';',
+            '\u{ff1a}' => ':',
+            '\u{ff06}' => '&',
+            '\u{2013}' | '\u{2011}' => '-',
+            _ => c,
+        })
+        .collect()
+}
+
 fn apply(text: &mut TextBlock, spans: &[Citation]) {
-    let value = text_block_text(text);
-    let chars: Vec<_> = value.chars().collect();
-    // Translated-only text may not preserve a citation verbatim. Never guess a
-    // replacement range or alter unrelated translated text.
-    let mut located = Vec::new();
-    for c in spans {
-        let mut c = c.clone();
-        if chars
-            .get(c.start..c.end)
-            .map(|s| s.iter().collect::<String>())
-            .as_deref()
-            != Some(&c.text)
-        {
-            let matches: Vec<_> = value.match_indices(&c.text).collect();
-            if matches.len() != 1 {
-                return;
-            }
-            c.start = value[..matches[0].0].chars().count();
-            c.end = c.start + c.text.chars().count();
-        }
-        located.push(c);
+    // Explicit translation markup is authoritative; legacy text matching must
+    // not renumber or overwrite already restored citations.
+    if text
+        .content
+        .iter()
+        .any(|inline| matches!(inline, Inline::Text(run) if run.style.inline_citation > 0))
+    {
+        return;
     }
-    if !located.windows(2).all(|p| p[0].end <= p[1].start) {
+    let available = candidate_spans(text);
+    let mut located = Vec::new();
+    for original in spans {
+        let exact: Vec<_> = available
+            .iter()
+            .filter(|c| c.text == original.text)
+            .collect();
+        let selected = exact
+            .iter()
+            .copied()
+            .find(|c| c.start == original.start && c.end == original.end)
+            .or_else(|| (exact.len() == 1).then(|| exact[0]));
+        let selected = selected.or_else(|| {
+            let key = citation_key(&original.text);
+            let mut matches = available.iter().filter(|c| citation_key(&c.text) == key);
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        });
+        if let Some(found) = selected {
+            located.push(found.clone());
+        }
+    }
+    // Conflicting mappings are ambiguous. Leave only those spans untouched;
+    // all other citations still receive consecutive numbers in display order.
+    let located: Vec<_> = located
+        .iter()
+        .enumerate()
+        .filter(|(index, c)| {
+            !located.iter().enumerate().any(|(other, candidate)| {
+                other != *index && c.start < candidate.end && candidate.start < c.end
+            })
+        })
+        .map(|(_, c)| c.clone())
+        .collect();
+    let mut located = located;
+    located.sort_by_key(|c| c.start);
+    if located.is_empty() {
         return;
     }
     let mut result = Vec::new();
@@ -304,9 +372,9 @@ pub(super) fn compose(blocks: &mut [Block], source: &SourceRange, spans: &[Citat
                 }
             }
             Block::Table(t) => {
-                for cell in t.rows.iter_mut().flat_map(|r| &mut r.cells) {
-                    if cell.text.source.as_ref() == Some(source) {
-                        apply(&mut cell.text, spans);
+                for cell in t.text_blocks_mut() {
+                    if cell.source.as_ref() == Some(source) {
+                        apply(cell, spans);
                     }
                 }
             }
@@ -315,4 +383,93 @@ pub(super) fn compose(blocks: &mut [Block], source: &SourceRange, spans: &[Citat
             }
         }
     }
+}
+
+pub(super) fn clear_markers(blocks: &mut [Block]) {
+    fn clear(text: &mut TextBlock) {
+        for inline in &mut text.content {
+            if let Inline::Text(run) = inline {
+                run.style.inline_citation = 0;
+            }
+        }
+    }
+    for block in blocks {
+        match block {
+            Block::Text(text) => clear(text),
+            Block::Quote(quote) => {
+                for text in &mut quote.body {
+                    clear(text);
+                }
+                if let Some(text) = &mut quote.attribution {
+                    clear(text);
+                }
+            }
+            Block::Table(table) => {
+                for text in table.text_blocks_mut() {
+                    clear(text);
+                }
+            }
+            Block::Figure(figure) => {
+                for text in &mut figure.captions {
+                    clear(text);
+                }
+            }
+            Block::Note(note) => clear_markers(&mut note.blocks),
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct WindowCandidate {
+    pub id: String,
+    pub block: usize,
+    pub paragraph: usize,
+    pub source: SourceRange,
+    pub span: Citation,
+    pub paragraph_text: String,
+}
+
+pub(super) fn window_candidates(
+    section: &Section,
+    target: std::ops::Range<usize>,
+) -> Vec<WindowCandidate> {
+    let mut out = Vec::new();
+    for block in target {
+        let mut paragraphs = Vec::new();
+        texts(&section.blocks[block..block + 1], &mut paragraphs);
+        for (paragraph, text) in paragraphs.into_iter().enumerate() {
+            for (index, span) in candidates(text).into_iter().enumerate() {
+                out.push(WindowCandidate {
+                    id: format!("c{block}_{paragraph}_{index}"),
+                    block,
+                    paragraph,
+                    source: text.source.clone().unwrap(),
+                    span,
+                    paragraph_text: text_block_text(text),
+                });
+            }
+        }
+    }
+    out
+}
+
+pub(super) fn window_annotations(
+    candidates: &[WindowCandidate],
+    ids: &[String],
+) -> Vec<Annotation> {
+    let mut out: Vec<Annotation> = Vec::new();
+    for candidate in candidates.iter().filter(|c| ids.contains(&c.id)) {
+        if let Some(Annotation::InlineCitations { spans, .. }) = out.iter_mut().find(
+            |a| matches!(a,Annotation::InlineCitations {source,..} if source==&candidate.source),
+        ) {
+            spans.push(candidate.span.clone());
+        } else {
+            out.push(Annotation::InlineCitations {
+                source: candidate.source.clone(),
+                spans: vec![candidate.span.clone()],
+            });
+        }
+    }
+    out
 }

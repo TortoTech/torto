@@ -72,8 +72,8 @@ pub(super) fn candidates(section: &Section) -> Vec<Candidate> {
                     }
                 }
                 Block::Table(table) => {
-                    for c in table.rows.iter().flat_map(|r| &r.cells) {
-                        text(&c.text, result);
+                    for c in table.text_blocks() {
+                        text(c, result);
                     }
                 }
                 Block::Note(n) => visit(&n.blocks, result),
@@ -460,8 +460,8 @@ pub(super) fn compose(blocks: &mut [Block], href: &PublicationUrl, formula: Opti
                 }
             }
             Block::Table(table) => {
-                for c in table.rows.iter_mut().flat_map(|r| &mut r.cells) {
-                    text(&mut c.text, href, formula);
+                for c in table.text_blocks_mut() {
+                    text(c, href, formula);
                 }
             }
             Block::Note(n) => compose(&mut n.blocks, href, formula),

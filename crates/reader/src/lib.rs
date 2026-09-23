@@ -507,6 +507,11 @@ impl PrefetchWorker {
                     let segment = repository
                         .load(request.key.section_index)
                         .and_then(|section| {
+                            if worker_cancelled.load(Ordering::Acquire)
+                                || worker_generation.load(Ordering::Acquire) != request.generation
+                            {
+                                return Err(ReaderError::PrefetchWorkerStopped);
+                            }
                             compile_segment(
                                 source.as_ref(),
                                 section,
@@ -593,9 +598,10 @@ impl Drop for PrefetchWorker {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
         self.requests.take();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // A reader refresh/drop runs on the UI thread. The worker owns all its
+        // inputs; let an in-progress compile finish and observe cancellation
+        // without synchronously waiting for it here.
+        self.handle.take();
     }
 }
 
@@ -666,7 +672,106 @@ pub struct ReaderSession {
     fixed_reading_units: Option<Vec<FixedReadingUnit>>,
 }
 
+pub struct ReaderRefreshRequest {
+    source: Arc<dyn BookSource>,
+    fonts: Arc<[ReaderFontBlob]>,
+    viewport: LayoutViewport,
+    style: ReaderStyle,
+    locator: LocatorV1,
+}
+
+impl ReaderRefreshRequest {
+    pub fn prepare(self) -> Result<ReaderSession, ReaderError> {
+        let mut reader = ReaderSession::open_with_fonts_at_locator(
+            self.source,
+            self.viewport,
+            self.style,
+            self.fonts,
+            &self.locator,
+        )?;
+        reader.cache_capacity = usize::MAX;
+        // Scroll/focus mode must not compile additional pages on the UI thread
+        // immediately after the refreshed current page is adopted.
+        reader.current_reading_unit_pages()?;
+        reader.cache_capacity = reader
+            .cache
+            .len()
+            .saturating_add(DEFAULT_SEGMENT_CACHE_CAPACITY);
+        Ok(reader)
+    }
+}
+
 impl ReaderSession {
+    pub fn prepare_refresh_request(&self, source: Option<SourceRange>) -> ReaderRefreshRequest {
+        let mut locator = self.current_locator();
+        if let Some(source) = source {
+            if let Some(section) = self
+                .source
+                .book()
+                .sections
+                .iter()
+                .find(|section| section.id == source.start.spine)
+            {
+                locator.href = section.href.clone();
+            }
+            locator.source = Some(source);
+        }
+        ReaderRefreshRequest {
+            source: self.source.clone(),
+            fonts: self.fonts.clone(),
+            viewport: self.viewport,
+            style: self.style.clone(),
+            locator,
+        }
+    }
+
+    /// Restore only within already-compiled pages; never start foreground work.
+    pub fn restore_cached_anchor(&mut self, anchor: &SourceAnchor) -> bool {
+        let mut cached = self.cache.iter().collect::<Vec<_>>();
+        cached.sort_by_key(|(key, _)| (key.section_index, key.segment_index));
+        let exact = cached.iter().find_map(|(key, segment)| {
+            segment
+                .pages
+                .iter()
+                .position(|page| page.contains_source_anchor(anchor))
+                .map(|page| (**key, page))
+        });
+        let target = exact.or_else(|| {
+            let mut ranges = vec![SourceRange {
+                start: anchor.clone(),
+                end: anchor.clone(),
+            }];
+            for (_, segment) in &cached {
+                for block in segment
+                    .section
+                    .fragments
+                    .iter()
+                    .flat_map(|fragment| &fragment.blocks)
+                {
+                    if block_source(block).is_some_and(|source| {
+                        source.start.spine == anchor.spine && source.start.node == anchor.node
+                    }) {
+                        append_block_geometry_sources(block, &mut ranges);
+                    }
+                }
+            }
+            cached.iter().find_map(|(key, segment)| {
+                segment
+                    .pages
+                    .iter()
+                    .position(|page| page.source_content_bounds(&ranges).is_some())
+                    .map(|page| (**key, page))
+            })
+        });
+        let Some((key, page)) = target else {
+            return false;
+        };
+        self.current_section = key.section_index;
+        self.current_segment = key.segment_index;
+        self.current_page = page;
+        self.sync_reading_unit_to_position();
+        true
+    }
     /// Opens the first section and compiles its pages once.
     pub fn open(
         source: Arc<dyn BookSource>,
@@ -1161,7 +1266,19 @@ impl ReaderSession {
         {
             append_block_geometry_sources(block, &mut ranges);
         }
-        let mut pages = self.section_pages(section_index)?;
+        // A reading unit may occupy only a small part of a large spine file.
+        // Compile intersecting segments before applying the existing page crops,
+        // rather than laying out every sibling unit just to discard its pages.
+        let segments = section
+            .segments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, segment)| {
+                (segment.fragment_range.start < unit.fragment_range.end
+                    && unit.fragment_range.start < segment.fragment_range.end)
+                    .then_some(index)
+            });
+        let mut pages = self.segment_pages(section_index, segments)?;
         let visible = pages
             .iter()
             .enumerate()
@@ -1410,10 +1527,18 @@ impl ReaderSession {
         &mut self,
         section_index: usize,
     ) -> Result<Vec<ReaderSectionPage>, ReaderError> {
-        self.poll_prefetch()?;
         let segment_count = self.repository.load(section_index)?.segments.len();
+        self.segment_pages(section_index, 0..segment_count)
+    }
+
+    fn segment_pages(
+        &mut self,
+        section_index: usize,
+        segments: impl IntoIterator<Item = usize>,
+    ) -> Result<Vec<ReaderSectionPage>, ReaderError> {
+        self.poll_prefetch()?;
         let mut pages = Vec::new();
-        for segment_index in 0..segment_count {
+        for segment_index in segments {
             let key = SegmentKey {
                 section_index,
                 segment_index,
@@ -1642,6 +1767,21 @@ impl ReaderSession {
         Ok(indices)
     }
 
+    pub fn current_visible_content_sources(
+        &mut self,
+    ) -> Result<Vec<(usize, Vec<SourceRange>)>, ReaderError> {
+        Ok(self
+            .current_spread_pages()?
+            .into_iter()
+            .map(|(position, page, _)| {
+                (
+                    position.section_index,
+                    page.visible_content_sources(0.0, page.height() as f32),
+                )
+            })
+            .collect())
+    }
+
     /// Returns the source-backed text actually retained on the currently
     /// visible logical pages. In double-page mode this includes both pages in
     /// visual order and excludes text outside the displayed spread.
@@ -1781,23 +1921,7 @@ impl ReaderSession {
         focus: &ReaderTextHit,
         granularity: SelectionGranularity,
     ) -> Result<Option<ReaderSelection>, ReaderError> {
-        let pages = if granularity == SelectionGranularity::Free
-            || anchor.position.section_index != focus.position.section_index
-        {
-            self.selection_pages(anchor, focus)?
-        } else {
-            let visible_offsets = self.current_spread_pages()?;
-            self.section_pages(anchor.position.section_index)?
-                .into_iter()
-                .map(|entry| {
-                    let offset_x = visible_offsets
-                        .iter()
-                        .find(|(position, _, _)| *position == entry.position)
-                        .map_or(0.0, |(_, _, offset_x)| *offset_x);
-                    (entry.position, entry.page, offset_x)
-                })
-                .collect()
-        };
+        let pages = self.selection_pages(anchor, focus, granularity)?;
         let Some(anchor_page) = pages
             .iter()
             .position(|(position, _, _)| *position == anchor.position)
@@ -2387,21 +2511,101 @@ impl ReaderSession {
         &mut self,
         anchor: &ReaderTextHit,
         focus: &ReaderTextHit,
-    ) -> Result<Vec<(ReaderPosition, Arc<PageDisplayList>, f32)>, ReaderError> {
-        let pages = self.current_spread_pages()?;
-        let spread_contains_both = pages
-            .iter()
-            .any(|(position, _, _)| *position == anchor.position)
-            && pages
-                .iter()
-                .any(|(position, _, _)| *position == focus.position);
-        if spread_contains_both || anchor.position.section_index != focus.position.section_index {
-            return Ok(pages);
+        granularity: SelectionGranularity,
+    ) -> Result<Vec<SelectionPage>, ReaderError> {
+        let visible = self.current_spread_pages()?;
+        if anchor.position.section_index != focus.position.section_index {
+            // Preserve the existing cross-spine selection behavior.
+            return Ok(visible);
+        }
+        if granularity == SelectionGranularity::Free
+            && [anchor, focus].iter().all(|hit| {
+                visible
+                    .iter()
+                    .any(|(position, _, _)| *position == hit.position)
+            })
+        {
+            return Ok(visible);
+        }
+        let section_index = anchor.position.section_index;
+        let mut first = anchor
+            .position
+            .segment_index
+            .min(focus.position.segment_index);
+        let mut last = anchor
+            .position
+            .segment_index
+            .max(focus.position.segment_index);
+        if granularity != SelectionGranularity::Free {
+            // Read endpoint source identities from their pages. A paragraph may
+            // have been split across layout segments at a TOC/fragment boundary.
+            // Locate its continuations in the prepared IR without compiling the
+            // other units of this spine file.
+            let mut endpoints = Vec::new();
+            for hit in [anchor, focus] {
+                let key = SegmentKey {
+                    section_index,
+                    segment_index: hit.position.segment_index,
+                };
+                self.ensure_segment(key)?;
+                if let Some(page) = self
+                    .cache
+                    .get(&key)
+                    .and_then(|s| s.pages.get(hit.position.page_index))
+                    && let Some(range) = semantic_source_range(
+                        page,
+                        hit,
+                        granularity,
+                        true,
+                        self.source
+                            .book()
+                            .metadata
+                            .languages
+                            .first()
+                            .map_or("en", String::as_str),
+                    )
+                {
+                    endpoints.push(range);
+                }
+            }
+            let section = self.repository.load(section_index)?;
+            let mut sources = Vec::new();
+            for (index, segment) in section.segments.iter().enumerate() {
+                if (first..=last).contains(&index) {
+                    continue;
+                }
+                let continues = section.fragments[segment.fragment_range.clone()]
+                    .iter()
+                    .flat_map(|fragment| &fragment.blocks)
+                    .any(|block| {
+                        sources.clear();
+                        append_block_geometry_sources(block, &mut sources);
+                        sources.iter().any(|source| {
+                            endpoints.iter().any(|endpoint| {
+                                source.start.spine == endpoint.start.spine
+                                    && source.start.node == endpoint.start.node
+                                    && (granularity == SelectionGranularity::Paragraph
+                                        || (source.start.text_offset < endpoint.end.text_offset
+                                            && endpoint.start.text_offset < source.end.text_offset))
+                            })
+                        })
+                    });
+                if continues {
+                    first = first.min(index);
+                    last = last.max(index);
+                }
+            }
         }
         Ok(self
-            .current_section_pages()?
+            .segment_pages(section_index, first..=last)?
             .into_iter()
-            .map(|entry| (entry.position, entry.page, 0.0))
+            .map(|entry| {
+                let offset = visible
+                    .iter()
+                    .find(|(position, _, _)| *position == entry.position)
+                    .map_or(0.0, |(_, _, offset)| *offset);
+                (entry.position, entry.page, offset)
+            })
             .collect())
     }
 
@@ -2754,24 +2958,21 @@ impl ReaderSession {
             self.current_reading_unit = 0;
             return;
         };
-        let position = self.current_position();
-        let starts = section
-            .reading_units
-            .iter()
-            .map(|unit| {
-                unit.start
-                    .as_ref()
-                    .and_then(|anchor| self.position_for_source_anchor(anchor).ok())
-                    .unwrap_or(ReaderPosition {
-                        section_index: self.current_section,
-                        segment_index: 0,
-                        page_index: 0,
-                    })
+        // Layout segments are split at every reading-unit boundary. Updating
+        // the visible page therefore needs only fragment metadata, never the
+        // rendered page positions of all sibling units (which compile them).
+        let fragment = section
+            .segments
+            .get(self.current_segment)
+            .map(|segment| segment.fragment_range.start);
+        self.current_reading_unit = fragment
+            .and_then(|fragment| {
+                section
+                    .reading_units
+                    .iter()
+                    .position(|unit| unit.fragment_range.contains(&fragment))
             })
-            .collect::<Vec<_>>();
-        self.current_reading_unit = starts
-            .partition_point(|start| *start <= position)
-            .saturating_sub(1);
+            .unwrap_or(0);
     }
 
     fn sync_reading_unit_to_anchor(&mut self, anchor: &SourceAnchor) {
@@ -3720,10 +3921,8 @@ fn block_text_len(block: &Block) -> usize {
             .map(|block| inline_content_len(&block.content))
             .sum(),
         Block::Table(table) => table
-            .rows
-            .iter()
-            .flat_map(|row| &row.cells)
-            .map(|cell| inline_content_len(&cell.text.content))
+            .text_blocks()
+            .map(|text| inline_content_len(&text.content))
             .sum(),
         Block::Figure(figure) => figure
             .captions
@@ -3771,13 +3970,9 @@ fn append_block_geometry_sources(block: &Block, ranges: &mut Vec<SourceRange>) {
                 .chain(quote.attribution.iter())
                 .filter_map(|text| text.source.clone()),
         ),
-        Block::Table(table) => ranges.extend(
-            table
-                .rows
-                .iter()
-                .flat_map(|row| &row.cells)
-                .filter_map(|cell| cell.text.source.clone()),
-        ),
+        Block::Table(table) => {
+            ranges.extend(table.text_blocks().filter_map(|text| text.source.clone()))
+        }
         Block::Figure(figure) => {
             ranges.extend(
                 figure
@@ -5409,6 +5604,142 @@ mod tests {
     }
 
     #[test]
+    fn selection_compiles_only_endpoint_segments_and_paragraph_continuations() {
+        let text = "alpha beta gamma delta. ".repeat(800);
+        let mut source = CountingSource::new(std::slice::from_ref(&text));
+        let data = Arc::get_mut(&mut source).unwrap();
+        let mut sibling = data.sections[0].blocks[0].clone();
+        if let Block::Text(block) = &mut sibling {
+            let range = block.source.as_mut().unwrap();
+            range.start.node = "unrelated".into();
+            range.end.node = "unrelated".into();
+        }
+        data.sections[0].blocks.push(sibling);
+        let original = block_source(&data.sections[0].blocks[0])
+            .unwrap()
+            .start
+            .clone();
+        let mut middle = original.clone();
+        middle.text_offset = (text.len() / 2) as u64;
+        let unrelated = block_source(&data.sections[0].blocks[1])
+            .unwrap()
+            .start
+            .clone();
+        data.sections[0].anchors = vec![
+            SectionAnchor {
+                fragment: "middle".into(),
+                source: middle,
+            },
+            SectionAnchor {
+                fragment: "unrelated".into(),
+                source: unrelated,
+            },
+        ];
+        data.book.table_of_contents = [
+            "section-0.xhtml",
+            "section-0.xhtml#middle",
+            "section-0.xhtml#unrelated",
+        ]
+        .into_iter()
+        .map(|href| TocEntry {
+            label: href.into(),
+            href: Some(PublicationUrl::parse(href).unwrap()),
+            children: Vec::new(),
+        })
+        .collect();
+        let mut reader = ReaderSession::open(
+            source,
+            viewport(320, 180),
+            ReaderStyle {
+                spread: SpreadMode::Single,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reader.location().segment_count, 3);
+        let hit = |reader: &mut ReaderSession, offset: u64| {
+            let mut start = original.clone();
+            start.text_offset = offset;
+            reader.go_to_source(&start).unwrap();
+            let mut end = start.clone();
+            end.text_offset += 1;
+            let rect = reader
+                .current_page()
+                .source_rects(&[SourceRange { start, end }])[0];
+            reader
+                .hit_test_current_spread(
+                    logical_coordinate(rect.center().x),
+                    logical_coordinate(rect.center().y),
+                    true,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let first = hit(&mut reader, 1);
+        for granularity in [
+            SelectionGranularity::Word,
+            SelectionGranularity::Sentence,
+            SelectionGranularity::Paragraph,
+        ] {
+            let selection = reader
+                .selection_between_with_granularity(&first, &first, granularity)
+                .unwrap()
+                .unwrap();
+            assert!(!selection.text.is_empty());
+            assert!(reader.cache.keys().all(|key| key.segment_index < 2));
+            if granularity == SelectionGranularity::Paragraph {
+                assert_eq!(selection.text, text);
+                assert_eq!(selection.ranges.first().unwrap().start.text_offset, 0);
+                assert_eq!(
+                    selection.ranges.last().unwrap().end.text_offset,
+                    text.len() as u64
+                );
+            }
+        }
+        let last = hit(&mut reader, (text.len() - 8) as u64);
+        let forward = reader.selection_between(&first, &last).unwrap().unwrap();
+        let backward = reader.selection_between(&last, &first).unwrap().unwrap();
+        // Free selection keeps its existing direction-dependent cluster edge.
+        for selection in [&forward, &backward] {
+            assert!(selection.text.len() > text.len() - 20);
+            assert!(
+                selection
+                    .rects
+                    .iter()
+                    .any(|rect| rect.position.segment_index == 0)
+            );
+            assert!(
+                selection
+                    .rects
+                    .iter()
+                    .any(|rect| rect.position.segment_index == 1)
+            );
+        }
+        let forward_paragraph = reader
+            .selection_between_with_granularity(&first, &last, SelectionGranularity::Paragraph)
+            .unwrap()
+            .unwrap();
+        let backward_paragraph = reader
+            .selection_between_with_granularity(&last, &first, SelectionGranularity::Paragraph)
+            .unwrap()
+            .unwrap();
+        assert!(forward_paragraph == backward_paragraph);
+        assert!(
+            forward
+                .rects
+                .iter()
+                .any(|rect| rect.position.segment_index == 0)
+        );
+        assert!(
+            forward
+                .rects
+                .iter()
+                .any(|rect| rect.position.segment_index == 1)
+        );
+        assert!(reader.cache.keys().all(|key| key.segment_index < 2));
+    }
+
+    #[test]
     fn visible_text_fragments_follow_the_current_page() {
         let source = CountingSource::new(&["visible page text ".repeat(1_200)]);
         let style = ReaderStyle {
@@ -6168,6 +6499,7 @@ mod tests {
         let target = PublicationUrl::parse("section-0.xhtml#chapter-3").unwrap();
         reader.go_to_href(&target).unwrap();
         assert_eq!(reader.location().segment_index, 2);
+
         assert_eq!(reader.location().page_index, 0);
     }
 
@@ -6672,6 +7004,44 @@ mod tests {
         assert_eq!(second_leaf_ranges.len(), 1);
         assert_eq!(second_leaf_ranges[0].start.node, "leaf-b");
         assert_eq!(reader.location().segment_index, 2);
+
+        // A resize invalidates every sibling layout. Asking for the current
+        // unit must not repopulate those siblings, including after navigation.
+        for (unit, width) in [(2, 510), (0, 520), (1, 530)] {
+            reader.go_to_reading_unit(0, unit).unwrap();
+            reader.resize(viewport(width, 180)).unwrap();
+            let pages = reader.current_reading_unit_pages().unwrap();
+            assert!(!pages.is_empty());
+            assert!(pages.iter().all(|page| page.position.segment_index == unit));
+            assert!(reader.cache.keys().all(|key| key.segment_index == unit));
+            assert!(pages.first().unwrap().visible_top.is_some());
+            assert!(pages.last().unwrap().visible_bottom.is_some());
+            for page in &pages {
+                reader.set_visible_position(page.position).unwrap();
+                assert_eq!(reader.reading_unit_location().index, unit);
+                assert!(reader.cache.keys().all(|key| key.segment_index == unit));
+            }
+        }
+
+        // A unit can intersect more than one layout segment. Keep every
+        // intersecting segment without pulling in the next sibling.
+        let mut prepared = prepare_section(
+            reader.source.parse_section(0).unwrap(),
+            &HashSet::new(),
+            &[None, Some("leaf-a".into()), Some("leaf-b".into())],
+        );
+        assert_eq!(prepared.segments.len(), 3);
+        prepared.reading_units[0].fragment_range.end = prepared.reading_units[1].fragment_range.end;
+        let prepared = Arc::new(prepared);
+        *reader.repository.sections[0].state.lock().unwrap() =
+            SectionSlotState::Ready(Arc::downgrade(&prepared));
+        reader.cache.clear();
+        reader.lru.clear();
+        let pages = reader.reading_unit_pages_for_section(0, 0).unwrap();
+        assert!(pages.iter().any(|page| page.position.segment_index == 0));
+        assert!(pages.iter().any(|page| page.position.segment_index == 1));
+        assert!(pages.iter().all(|page| page.position.segment_index < 2));
+        assert!(reader.cache.keys().all(|key| key.segment_index < 2));
     }
 
     #[test]
@@ -7240,7 +7610,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_reader_joins_worker_and_releases_source() {
+    fn dropping_reader_eventually_releases_worker_source() {
         let source = CountingSource::new(&["正文".into()]);
         let weak = Arc::downgrade(&source);
         let reader =
@@ -7250,6 +7620,69 @@ mod tests {
 
         assert!(weak.upgrade().is_some());
         drop(reader);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while weak.upgrade().is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn dropping_prefetch_worker_does_not_wait_for_an_active_parse() {
+        struct Blocked {
+            inner: Arc<CountingSource>,
+            started: Sender<()>,
+            release: Mutex<Receiver<()>>,
+        }
+        impl BookSource for Blocked {
+            fn book(&self) -> &Book {
+                self.inner.book()
+            }
+            fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+                self.started.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                self.inner.parse_section(index)
+            }
+            fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+                self.inner.resource(href)
+            }
+        }
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let source: Arc<dyn BookSource> = Arc::new(Blocked {
+            inner: CountingSource::new(&["Text".into()]),
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        });
+        let worker = PrefetchWorker::spawn(
+            source.clone(),
+            Arc::new(SectionRepository::new(source)),
+            Arc::default(),
+        )
+        .unwrap();
+        worker
+            .send(PrefetchRequest {
+                key: SegmentKey {
+                    section_index: 0,
+                    segment_index: 0,
+                },
+                viewport: viewport(600, 400),
+                style: ReaderStyle::default(),
+                generation: 0,
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let dropping = thread::spawn(move || {
+            drop(worker);
+            done_tx.send(()).unwrap();
+        });
+        let released = done_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        dropping.join().unwrap();
+        assert!(
+            released.is_ok(),
+            "dropping the worker must not join an unfinished parser"
+        );
     }
 }

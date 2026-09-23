@@ -554,9 +554,8 @@ impl ApplicationHandler<UserEvent> for Application {
             }
             WindowEvent::Resized(size) => {
                 state.gpu.resize(size);
-                // Windows may compose the resized client area before a queued redraw
-                // is serviced. Submit a complete frame synchronously so DWM never has
-                // to stretch the previous frame or expose its black default fill.
+                // Rendering first presents the retained UI over the themed
+                // background, before laying out content at the new size.
                 Self::render_window_state(state, &mut self.app, &self.egui_ctx);
             }
             WindowEvent::ScaleFactorChanged { .. } => {

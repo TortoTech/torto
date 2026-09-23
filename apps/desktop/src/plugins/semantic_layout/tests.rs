@@ -449,6 +449,224 @@ fn translation_indices_survive_semantic_toggle_and_changed_content_is_rejected()
 }
 
 #[test]
+fn scoped_layout_and_translation_commute_without_completing_the_whole_chapter() {
+    for mode in [TranslationMode::Replace, TranslationMode::Bilingual] {
+        let mut results = Vec::new();
+        for translate_first in [false, true] {
+            let section = section(vec![
+                text("a", "Quotation"),
+                text("c", "Credit"),
+                text("n", "Narrative"),
+            ]);
+            let original = original_source(section.clone());
+            let translations = Arc::new(TranslationBookSource::new(original.clone(), mode));
+            translations.set_enabled(true).unwrap();
+            let overlay = SemanticLayoutSource::new(translations.clone(), original);
+            let translate = || {
+                translations
+                    .store_batch(
+                        0,
+                        &[BlockTranslation {
+                            block_index: 0,
+                            segment_index: None,
+                            text: "Translated quotation".into(),
+                        }],
+                    )
+                    .unwrap()
+            };
+            if translate_first {
+                translate();
+            }
+            let scoped = scope_section(&section, 0..2);
+            let result = Recognition {
+                formulas_checked: true,
+                fingerprint: fingerprint(&scoped),
+                skipped_groups: 0,
+                annotations: vec![annotation(
+                    &Proposal::Quote {
+                        alignment: None,
+                        body: vec![0],
+                        attribution: Some(1),
+                    },
+                    &scoped,
+                )],
+            };
+            assert!(!overlay.install_scope(0, "stale", 0..2, result.clone()));
+            assert!(overlay.install_scope(0, &fingerprint(&section), 0..2, result));
+            assert!(!overlay.has_recognition(0, &fingerprint(&section)));
+            if !translate_first {
+                translate();
+            }
+            let composed = overlay.parse_section(0).unwrap();
+            assert!(
+                matches!(&composed.blocks[0], Block::Quote(q) if q.body.len() == if mode == TranslationMode::Bilingual { 2 } else { 1 })
+            );
+            assert_eq!(composed.blocks.last(), section.blocks.last());
+            let remainder = scope_section(&section, 2..3);
+            overlay.install_scope(
+                0,
+                &fingerprint(&section),
+                2..3,
+                Recognition {
+                    formulas_checked: true,
+                    fingerprint: fingerprint(&remainder),
+                    skipped_groups: 0,
+                    annotations: vec![],
+                },
+            );
+            assert_eq!(overlay.parse_section(0).unwrap(), composed);
+            // A previously cached whole chapter must not mask fresh subsection
+            // results after its original text has changed.
+            overlay.state.write().unwrap().insert(
+                0,
+                Recognition {
+                    formulas_checked: true,
+                    fingerprint: "old-content".into(),
+                    skipped_groups: 0,
+                    annotations: vec![],
+                },
+            );
+            assert_eq!(overlay.parse_section(0).unwrap(), composed);
+            results.push(composed);
+            overlay.clear();
+            assert_eq!(
+                overlay.parse_section(0).unwrap(),
+                translations.parse_section(0).unwrap()
+            );
+        }
+        assert_eq!(results[0], results[1]);
+    }
+}
+
+#[test]
+fn visible_targets_accept_related_credit_but_ignore_context_only_changes() {
+    let original = section(vec![
+        text("credit", "Mira Vale wrote:"),
+        text("quote", "Words to remember."),
+        text("other", "Unrelated context."),
+    ]);
+    let proposal = Proposal::QuoteBefore {
+        body: vec![1],
+        attribution: 0,
+        alignment: None,
+    };
+    validate_window(
+        std::slice::from_ref(&proposal),
+        &original,
+        &RecognitionRoles::default(),
+        1..2,
+        0..3,
+    )
+    .unwrap();
+    assert!(
+        validate_window(
+            std::slice::from_ref(&proposal),
+            &original,
+            &RecognitionRoles::default(),
+            2..3,
+            0..3
+        )
+        .is_err()
+    );
+    let mut result = empty_recognition(&original);
+    result.annotations = vec![
+        annotation(&proposal, &original),
+        Annotation::SectionHeading {
+            source: source(&original.blocks[2]).unwrap().clone(),
+        },
+    ];
+    let groups = recognition_groups(&original, 1..2, result);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].0, 0..2);
+    assert_eq!(groups[0].1.annotations.len(), 1);
+}
+
+#[test]
+fn independent_visible_paragraphs_get_independent_commit_groups() {
+    let original = section(vec![
+        text("a", "First"),
+        text("b", "Second"),
+        text("c", "Offscreen"),
+    ]);
+    let groups = recognition_groups(&original, 0..2, empty_recognition(&original));
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group.0.clone())
+            .collect::<Vec<_>>(),
+        vec![0..1, 1..2]
+    );
+}
+
+#[test]
+fn visible_request_sends_context_without_targeting_the_next_paragraph() {
+    use std::io::{BufRead, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let mut socket = loop {
+            if let Ok((socket, _)) = listener.accept() {
+                break socket;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(&mut socket);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes).unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        let input: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(input["target_start"], 1);
+        assert_eq!(input["target_end_exclusive"], 2);
+        assert_eq!(input["blocks"].as_array().unwrap().len(), 3);
+        let body = json!({"choices":[{"message":{"content":"{\"groups\":[]}"}}]}).to_string();
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+    });
+    let original = section(vec![
+        text("a", "Before context."),
+        text("b", "Visible paragraph."),
+        text("c", "After context."),
+    ]);
+    let mut settings = PluginSettings::default();
+    settings.semantic_layout.enabled = true;
+    settings.semantic_layout.provider = settings.providers[0].id.clone();
+    settings.semantic_layout.model = settings.providers[0].models[0].id.clone();
+    settings.providers[0].api_key = "fixture".into();
+    settings.providers[0].base_url = format!("http://{address}/v1");
+    let source = original_source(original.clone());
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(recognize_visible(
+            &original,
+            1..2,
+            "visible-only-test",
+            &settings,
+            source.as_ref(),
+        ))
+        .unwrap();
+    assert!(result.annotations.is_empty());
+    server.join().unwrap();
+}
+
+#[test]
 fn settings_migrate_disabled_and_missing_selection_is_not_replaced() {
     let mut settings: PluginSettings = serde_json::from_value(json!({})).unwrap();
     assert!(!settings.semantic_layout.enabled);
@@ -777,7 +995,12 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
                 json!(["kind", "body", "attribution", "alignment"])
             );
             assert_eq!(item["properties"]["attribution"]["type"], json!("integer"));
-            assert_eq!(request["messages"][0]["content"].as_str(), Some(PROMPT));
+            assert!(
+                request["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(PROMPT)
+            );
             let input: Value =
                 serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
             assert_eq!(input["blocks"][0]["id"], 0);
@@ -1060,5 +1283,101 @@ fn live_ramachandran_gemini_lite() {
             .count()
             >= 4,
         "expected missing epigraphs in multiple chapters"
+    );
+}
+
+#[test]
+fn unified_request_returns_groups_and_citations_in_one_call() {
+    use std::io::{BufRead, Read, Write};
+    let section = section(vec![
+        text("p", "Evidence (Smith, 2020)."),
+        text("q", "A line of verse.\n-- A poet"),
+        image("img"),
+        text("caption", "Figure 1. A diagram."),
+        text("context", "Other (Jones, 2022)."),
+    ]);
+    let candidates = citations::window_candidates(&section, 0..4);
+    assert_eq!(candidates.len(), 1);
+    let roles = RecognitionRoles::default();
+    let input = unified_window_input(&section, &roles, 0..4, 0..5, &candidates);
+    assert_eq!(input["targets"]["classify_citations"], json!(["c0_0_0"]));
+    assert_eq!(input["blocks"][4]["citation_candidates"], json!([]));
+    assert!(validate_citation_ids(&["c4_0_0".into()], &candidates).is_err());
+    assert!(validate_citation_ids(&["c0_0_0".into(), "c0_0_0".into()], &candidates).is_err());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(&mut socket);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes).unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            request["response_format"]["json_schema"]["schema"]["required"],
+            json!(["groups", "citations"])
+        );
+        let input: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(input["blocks"][0]["citation_candidates"][0]["id"], "c0_0_0");
+        assert_eq!(input["quotes_enabled"], true);
+        assert_eq!(input["captions_enabled"], true);
+        let response = json!({"groups":[{"kind":"quote_inline","body":[1],"credit":"-- A poet","alignment":"start"},{"kind":"figure","images":[2],"captions":[3]}],"citations":["c0_0_0"]});
+        let body = json!({"choices":[{"message":{"content":response.to_string()}}]}).to_string();
+        write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        // Listener drops after this one response. A second pass would fail.
+    });
+    let provider = crate::plugins::AiProvider {
+        base_url: format!("http://{address}/v1"),
+        api_key: "fixture".into(),
+        ..Default::default()
+    };
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(request_window_groups(
+            &reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            (&provider, "fixture"),
+            &input,
+            &section,
+            &roles,
+            0..4,
+            0..5,
+        ))
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(result.groups.len(), 2);
+    assert_eq!(result.citations, ["c0_0_0"]);
+    let annotations = citations::window_annotations(&candidates, &result.citations);
+    assert!(citations::validate_annotations(&section, &annotations));
+    let mut displayed = section.clone();
+    for a in &annotations {
+        compose(&mut displayed.blocks, a);
+    }
+    for group in &result.groups {
+        compose(&mut displayed.blocks, &annotation(group, &section));
+    }
+    let inputs = crate::plugins::prepare_translation_inputs(&displayed, false);
+    assert!(
+        inputs[0]
+            .0
+            .text
+            .contains("<citation id=\"1\">(Smith, 2020)</citation>")
     );
 }

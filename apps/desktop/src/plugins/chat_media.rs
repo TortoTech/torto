@@ -150,8 +150,8 @@ fn collect_images<'a>(
         }
         Block::Table(table) => {
             let selected = parent || matches_range(table.source.as_ref(), ranges);
-            for cell in table.rows.iter().flat_map(|row| &row.cells) {
-                collect_text_images(&cell.text, ranges, selected, output);
+            for cell in table.text_blocks() {
+                collect_text_images(cell, ranges, selected, output);
             }
         }
         Block::Note(note) => {

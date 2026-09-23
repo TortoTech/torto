@@ -33,6 +33,8 @@ pub(super) struct GpuState {
     page_target: Option<PageTarget>,
     retired_page_textures: Vec<TextureId>,
     clear_color: wgpu::Color,
+    last_frame: Option<wgpu::Texture>,
+    resize_pending: bool,
 }
 
 impl GpuState {
@@ -75,6 +77,9 @@ impl GpuState {
             .ok_or_else(|| "当前 GPU 不支持窗口 Surface".to_owned())?;
         surface_config.format = format;
         surface_config.usage = TextureUsages::RENDER_ATTACHMENT;
+        if capabilities.usages.contains(TextureUsages::COPY_DST) {
+            surface_config.usage |= TextureUsages::COPY_DST;
+        }
         surface_config.view_formats = vec![format];
         surface_config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &surface_config);
@@ -97,6 +102,8 @@ impl GpuState {
             vello_renderer,
             page_target: None,
             retired_page_textures: Vec::new(),
+            last_frame: None,
+            resize_pending: false,
             clear_color: wgpu::Color {
                 r: 0.965,
                 g: 0.957,
@@ -114,6 +121,7 @@ impl GpuState {
         {
             return;
         }
+        self.resize_pending = true;
         self.surface_config.width = size.width;
         self.surface_config.height = size.height;
         self.surface.configure(&self.device, &self.surface_config);
@@ -225,6 +233,10 @@ impl GpuState {
         // Always configure from the window's current client size before acquiring.
         self.resize(window.inner_size());
 
+        if self.resize_pending {
+            self.present_resize_preview(window)?;
+        }
+
         let raw_input = self.take_egui_input(window, egui_state);
         let mut viewport_info = root_viewport_info(&raw_input);
         let mut plan = None;
@@ -273,9 +285,33 @@ impl GpuState {
             self.free_egui_textures(&mut output.textures_delta);
             return Ok(());
         };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        // Retain the complete UI on the GPU, including panels and popups.
+        let retain_frame = self.surface_config.usage.contains(TextureUsages::COPY_DST);
+        if retain_frame {
+            let size = frame.texture.size();
+            if self
+                .last_frame
+                .as_ref()
+                .is_none_or(|texture| texture.size() != size)
+            {
+                self.last_frame = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("retained-window-frame"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.surface_config.format,
+                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                }));
+            }
+        }
+        let target = if retain_frame {
+            self.last_frame.as_ref().unwrap()
+        } else {
+            &frame.texture
+        };
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -308,6 +344,13 @@ impl GpuState {
             self.egui_renderer
                 .render(&mut pass.forget_lifetime(), &paint_jobs, &screen);
         }
+        if retain_frame {
+            encoder.copy_texture_to_texture(
+                self.last_frame.as_ref().unwrap().as_image_copy(),
+                frame.texture.as_image_copy(),
+                frame.texture.size(),
+            );
+        }
         self.queue
             .submit(callback_commands.into_iter().chain([encoder.finish()]));
         window.pre_present_notify();
@@ -331,6 +374,52 @@ impl GpuState {
             self.egui_renderer.free_texture(&id);
         }
         self.free_egui_textures(&mut output.textures_delta);
+        Ok(())
+    }
+
+    /// Present old pixels without scaling before expensive UI layout starts.
+    fn present_resize_preview(&mut self, window: &Window) -> Result<(), String> {
+        let Some(frame) = self.acquire_surface_frame(window)? else {
+            return Ok(());
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("resize-preview"),
+            });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("resize-background"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        if let Some(previous) = &self.last_frame {
+            encoder.copy_texture_to_texture(
+                previous.as_image_copy(),
+                frame.texture.as_image_copy(),
+                retained_frame_extent(previous.size(), frame.texture.size()),
+            );
+        }
+        self.queue.submit([encoder.finish()]);
+        window.pre_present_notify();
+        frame.present();
+        self.resize_pending = false;
+        // Keep the last complete frame, not this temporary partially empty one.
         Ok(())
     }
 
@@ -409,12 +498,18 @@ impl GpuState {
         // re-upload those pixels before the scene is replayed.
         if scene.refresh_image_atlas {
             #[cfg(debug_assertions)]
-            if !scene.images.is_empty() {
+            if !scene.images.is_empty() && {
+                // Keep the atlas workaround, but avoid opening a log file for
+                // every animation frame containing an image.
+                static SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                SAMPLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 60 == 0
+            } {
                 crate::diagnostics::log(
                     "render.reader_images",
                     &[
                         crate::diagnostics::Field::Text("action", "refresh_atlas"),
                         crate::diagnostics::Field::Usize("count", scene.images.len()),
+                        crate::diagnostics::Field::Bool("sampled", true),
                     ],
                 );
             }
@@ -520,5 +615,39 @@ mod tests {
         assert!(reader_scene_needs_render(Some((7, 1)), plan(8, 1)));
         assert!(!reader_scene_needs_render(Some((8, 1)), plan(8, 1)));
         assert!(reader_scene_needs_render(Some((8, 1)), plan(8, 2)));
+    }
+}
+
+// Copy the intersection at origin (0, 0); never scale the previous frame.
+fn retained_frame_extent(previous: wgpu::Extent3d, current: wgpu::Extent3d) -> wgpu::Extent3d {
+    wgpu::Extent3d {
+        width: previous.width.min(current.width),
+        height: previous.height.min(current.height),
+        depth_or_array_layers: 1,
+    }
+}
+
+#[cfg(test)]
+mod resize_preview_tests {
+    use super::retained_frame_extent;
+    #[test]
+    fn retained_pixels_are_clipped_not_stretched() {
+        let size = |width, height| wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        assert_eq!(
+            retained_frame_extent(size(800, 600), size(1200, 900)),
+            size(800, 600)
+        );
+        assert_eq!(
+            retained_frame_extent(size(1200, 900), size(800, 600)),
+            size(800, 600)
+        );
+        assert_eq!(
+            retained_frame_extent(size(800, 900), size(1200, 600)),
+            size(800, 600)
+        );
     }
 }

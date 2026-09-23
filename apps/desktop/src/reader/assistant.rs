@@ -13,8 +13,8 @@ use super::{
     AssistantPanel, ChatStreamMessage, ChatStreamingState, ChatTask, ChatTaskMessage,
     DesktopReader, FocusFootnoteSource, FocusedMark, MarkRetention, PdfMetadataUpdate, PdfOcrTask,
     PdfOcrTaskMessage, PdfTocTask, PdfTocTaskMessage, SearchTask, SearchTaskMessage, SidebarTab,
-    SnapshotEffects, TocTranslationTask, TocTranslationTaskMessage, TranslationTask,
-    TranslationTaskMessage, block_focus_footnotes, focus_footnote_translation_ranges_in_section,
+    SnapshotEffects, TocTranslationTask, TocTranslationTaskMessage, TranslationTaskMessage,
+    block_focus_footnotes, focus_footnote_translation_ranges_in_section,
 };
 use crate::platform::UserEvent;
 use crate::plugins::{
@@ -168,7 +168,7 @@ impl DesktopReader {
         }
         if let Some(request) = self.translation.task.take_pending() {
             let proxy = proxy.clone();
-            runtime.spawn(async move {
+            let worker = runtime.spawn(async move {
                 let id = request.id;
                 let payload = request.payload;
                 let batch_proxy = proxy.clone();
@@ -186,19 +186,20 @@ impl DesktopReader {
                     TranslationTaskMessage::Complete(crate::async_task::TaskResult { id, result }),
                 ));
             });
+            self.translation.task.attach_worker(worker);
         }
         if let Some(request) = self.translation.toc_task.take_pending() {
             let proxy = proxy.clone();
-            runtime.spawn(async move {
-                let id = request.id;
-                let payload = request.payload;
-                let result = translate_blocks(payload.settings, payload.blocks).await;
-                let _ =
-                    proxy.send_event(UserEvent::ReaderTocTranslation(TocTranslationTaskMessage {
-                        id,
-                        result,
-                    }));
-            });
+            let worker =
+                runtime.spawn(async move {
+                    let id = request.id;
+                    let payload = request.payload;
+                    let result = translate_blocks(payload.settings, payload.blocks).await;
+                    let _ = proxy.send_event(UserEvent::ReaderTocTranslation(
+                        TocTranslationTaskMessage { id, result },
+                    ));
+                });
+            self.translation.toc_task.attach_worker(worker);
         }
         self.spawn_pending_pdf_toc(runtime, proxy);
         self.spawn_pending_pdf_ocr(runtime, proxy);
@@ -417,6 +418,7 @@ impl DesktopReader {
             Ok(()) => {
                 self.persist_progress();
                 controller.set_mode(mode);
+                self.rewrite_source.clear_parsed_cache();
                 let fixed_page = mode == PdfOcrViewMode::Original;
                 self.translation_source
                     .set_fixed_page_replacement_only(fixed_page);
@@ -446,6 +448,7 @@ impl DesktopReader {
                 {
                     Ok(snapshot) => {
                         self.pdf_ocr.mode = mode;
+                        self.invalidate_semantic_plan();
                         if leave_focus_mode {
                             self.leave_focus_mode_for_pdf();
                         }
@@ -454,6 +457,7 @@ impl DesktopReader {
                     }
                     Err(error) => {
                         controller.set_mode(previous_mode);
+                        self.rewrite_source.clear_parsed_cache();
                         let previous_fixed_page = previous_mode == PdfOcrViewMode::Original;
                         self.translation_source
                             .set_fixed_page_replacement_only(previous_fixed_page);
@@ -1470,6 +1474,7 @@ impl DesktopReader {
             Ok(response) => {
                 log_completed_chat(message.id, &response);
                 if !response.rewrite_transactions.is_empty() {
+                    self.invalidate_semantic_plan();
                     match self.reader.refresh_source() {
                         Ok(snapshot) => {
                             self.apply_snapshot(
@@ -1700,57 +1705,8 @@ impl DesktopReader {
     }
 
     pub(super) fn queue_visible_section_translation(&mut self) {
-        if !self.translation.enabled || self.translation.task.is_pending() {
-            return;
-        }
-        let visible = match self.current_translation_ranges() {
-            Ok(visible) => visible,
-            Err(error) => {
-                self.translation.show_error(
-                    format!(
-                        "{}: {error}",
-                        self.language
-                            .text("读取当前页面失败", "Failed to inspect the current page")
-                    ),
-                    Instant::now(),
-                );
-                return;
-            }
-        };
-        let candidate = visible.into_iter().find_map(|(section_index, ranges)| {
-            match self
-                .translation_source
-                .untranslated_blocks_for_ranges(section_index, &ranges)
-            {
-                Ok(blocks) if blocks.is_empty() => None,
-                Ok(blocks) => Some(Ok((section_index, blocks))),
-                Err(error) => Some(Err(error)),
-            }
-        });
-        let Some(candidate) = candidate else { return };
-        let (section_index, blocks) = match candidate {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                self.translation.show_error(error, Instant::now());
-                return;
-            }
-        };
-        self.translation.clear_error();
-        let mut settings = self.plugin_settings.clone();
-        settings.target_language = settings
-            .resolved_target_language(crate::preferences::AppLanguage::system_translation_target());
-        if let Err(error) = self
-            .translation_source
-            .set_target_language(&settings.target_language)
-        {
-            self.show_error(error);
-            return;
-        }
-        self.translation.task.begin(TranslationTask {
-            section_index,
-            settings,
-            blocks,
-        });
+        // The shared visible-content scheduler observes the latest viewport on
+        // the next UI tick; it owns debounce, preemption and batch selection.
     }
 
     pub(super) fn queue_toc_translation(&mut self) {
@@ -1799,18 +1755,10 @@ impl DesktopReader {
                 else {
                     return;
                 };
-                if let Err(error) = self
-                    .translation_source
-                    .store_batch(section_index, &translations)
-                {
-                    self.translation.show_error(error, Instant::now());
-                    return;
-                }
-                self.translation.clear_error();
-                self.refresh_translation_view();
+                self.stage_translation_batch(section_index, translations);
             }
             TranslationTaskMessage::Complete(message) => {
-                let Some(_request) = self.translation.task.complete(message.id) else {
+                let Some(request) = self.translation.task.complete(message.id) else {
                     return;
                 };
                 match message.result {
@@ -1819,6 +1767,17 @@ impl DesktopReader {
                         self.queue_visible_section_translation();
                     }
                     Err(error) => {
+                        self.fail_translation_batch(&request);
+                        if let Ok((provider, model)) = self.plugin_settings.translation_endpoint() {
+                            crate::plugins::semantic_layout::translation_event(
+                                provider,
+                                model,
+                                "translation.failed",
+                                serde_json::json!({"book":self.book_id,"section_index":request.section_index,
+                                    "blocks":request.blocks.iter().map(|block| serde_json::json!({"block_index":block.block_index,"segment_index":block.segment_index})).collect::<Vec<_>>(),
+                                    "reason":error}),
+                            );
+                        }
                         self.error = Some(format!(
                             "{}: {error}",
                             self.language
@@ -1939,42 +1898,60 @@ impl DesktopReader {
         }
     }
 
-    fn current_translation_ranges(
+    pub(super) fn current_translation_ranges(
         &mut self,
     ) -> Result<Vec<(usize, Vec<SourceRange>)>, rebook_reader::ReaderError> {
-        let fragments =
-            if self.is_scroll_mode() {
-                let positions = self.scroll_section.as_ref().zip(self.scroll_viewport).map(
-                    |(layout, viewport)| {
-                        let padding = self.scroll_content_padding(viewport.size.y);
-                        layout.visible_pages(super::ScrollViewportState {
-                            offset_y: (viewport.offset_y - padding).max(0.0),
-                            size: viewport.size,
-                        })
-                    },
-                );
-                if let Some(positions) = positions {
-                    self.reader
-                        .cached_visible_text_fragments_for_pages(&positions)
-                } else {
-                    self.reader.current_visible_text_fragments()?
-                }
-            } else {
-                self.reader.current_visible_text_fragments()?
-            };
-        let mut sections = Vec::<(usize, Vec<SourceRange>)>::new();
-        for fragment in fragments {
-            let section_index = fragment.position.section_index;
-            if let Some((_, ranges)) = sections
-                .iter_mut()
-                .find(|(candidate, _)| *candidate == section_index)
-            {
-                ranges.push(fragment.range);
-            } else {
-                sections.push((section_index, vec![fragment.range]));
-            }
+        // Preserve translation's original page-level lookahead, including focus
+        // mode. Image sources let AI inspect formulas inside the same envelope.
+        if self.is_scroll_mode()
+            && let Some((layout, viewport)) = self.scroll_section.as_ref().zip(self.scroll_viewport)
+        {
+            let padding = self.scroll_content_padding(viewport.size.y);
+            let positions = layout.visible_pages(super::ScrollViewportState {
+                offset_y: (viewport.offset_y - padding).max(0.0),
+                size: viewport.size,
+            });
+            return Ok(layout
+                .pages
+                .iter()
+                .filter(|entry| positions.contains(&entry.position))
+                .map(|entry| (entry.position.section_index, entry.page.content_sources()))
+                .filter(|(_, ranges)| !ranges.is_empty())
+                .collect());
         }
-        append_linked_footnote_translation_ranges(self.source.as_ref(), &mut sections);
+        self.reader.current_visible_content_sources()
+    }
+
+    pub(super) fn current_visible_ai_ranges(
+        &mut self,
+    ) -> Result<Vec<(usize, Vec<SourceRange>)>, rebook_reader::ReaderError> {
+        let sections = if self.is_scroll_mode() {
+            if let Some((layout, viewport)) = self.scroll_section.as_ref().zip(self.scroll_viewport)
+            {
+                let top = viewport.offset_y - self.scroll_content_padding(viewport.size.y);
+                layout
+                    .pages
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, entry)| {
+                        if layout.page_tops[i] + layout.page_heights[i] <= top
+                            || layout.page_tops[i] >= top + viewport.size.y
+                        {
+                            return None;
+                        }
+                        let local_top = top - layout.page_tops[i] + layout.page_origins[i];
+                        let ranges = entry
+                            .page
+                            .visible_content_sources(local_top, local_top + viewport.size.y);
+                        (!ranges.is_empty()).then_some((entry.position.section_index, ranges))
+                    })
+                    .collect()
+            } else {
+                self.reader.current_visible_content_sources()?
+            }
+        } else {
+            self.reader.current_visible_content_sources()?
+        };
         Ok(sections)
     }
 
@@ -1991,7 +1968,7 @@ impl DesktopReader {
     }
 }
 
-fn append_linked_footnote_translation_ranges(
+pub(super) fn append_linked_footnote_translation_ranges(
     source: &dyn BookSource,
     sections: &mut Vec<(usize, Vec<SourceRange>)>,
 ) {

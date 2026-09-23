@@ -397,10 +397,8 @@ impl Block {
                 .chain(quote.attribution.iter())
                 .any(|block| block.kind.is_footnote_definition()),
             Self::Table(table) => table
-                .rows
-                .iter()
-                .flat_map(|row| &row.cells)
-                .any(|cell| cell.text.kind.is_footnote_definition()),
+                .text_blocks()
+                .any(|text| text.kind.is_footnote_definition()),
             Self::Figure(figure) => figure
                 .captions
                 .iter()
@@ -603,6 +601,12 @@ pub struct TextBlock {
 /// A structured table kept independent from HTML and renderer details.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableBlock {
+    /// Captions and explicit notes before the grid, in authored order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before: Vec<TextBlock>,
+    /// Captions and explicit notes after the grid, in authored order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<TextBlock>,
     /// Rows in authored order.
     pub rows: Vec<TableRow>,
     /// Stable source anchor for block-level navigation.
@@ -725,6 +729,33 @@ pub struct ImageBlock {
     /// Optional text geometry for fixed-layout pages such as PDF documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_layer: Option<FixedPageTextLayer>,
+}
+
+impl TableBlock {
+    /// All selectable text in reading order, including captions and notes.
+    pub fn text_blocks(&self) -> impl Iterator<Item = &TextBlock> {
+        self.before
+            .iter()
+            .chain(
+                self.rows
+                    .iter()
+                    .flat_map(|row| &row.cells)
+                    .map(|cell| &cell.text),
+            )
+            .chain(self.after.iter())
+    }
+
+    pub fn text_blocks_mut(&mut self) -> impl Iterator<Item = &mut TextBlock> {
+        self.before
+            .iter_mut()
+            .chain(
+                self.rows
+                    .iter_mut()
+                    .flat_map(|row| &mut row.cells)
+                    .map(|cell| &mut cell.text),
+            )
+            .chain(self.after.iter_mut())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

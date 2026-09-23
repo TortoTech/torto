@@ -1,6 +1,6 @@
 //! Optional source-backed semantics. Recognition uses original text; composition
 //! runs after translation, so translation's block/segment keys never change.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
@@ -15,11 +15,16 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{PluginSettings, ReasoningEffort, ai, llm_json, text_block_text};
+mod visible;
+pub(crate) use visible::{
+    block_ranges, empty_recognition, merge_recognition, needs_recognition, recognition_groups,
+};
 
 mod citations;
 mod formulas;
 mod headings;
 mod log;
+pub(crate) use log::translation_event;
 mod quote_sources;
 
 // This is the on-disk data format, not an application release or prompt revision.
@@ -100,6 +105,8 @@ enum Proposal {
 #[serde(deny_unknown_fields)]
 struct Response {
     groups: Vec<Proposal>,
+    #[serde(default)]
+    citations: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +187,7 @@ pub(crate) struct Recognition {
 #[derive(Default)]
 struct WindowResult {
     groups: Vec<Proposal>,
+    citations: Vec<String>,
     skipped_groups: usize,
 }
 
@@ -187,23 +195,35 @@ struct WindowResult {
 struct WindowCache {
     key: String,
     groups: Vec<Proposal>,
+    citations: Vec<String>,
 }
 
 pub(crate) struct SemanticLayoutSource {
+    transaction: RwLock<()>,
+    enabled: std::sync::atomic::AtomicBool,
     inner: Arc<dyn BookSource>,
     original: Arc<dyn BookSource>,
     state: RwLock<HashMap<usize, Recognition>>,
+    partial: RwLock<HashMap<usize, BTreeMap<(usize, usize), Recognition>>>,
     cache_identity: RwLock<Option<Value>>,
 }
 
 impl SemanticLayoutSource {
     pub(crate) fn new(inner: Arc<dyn BookSource>, original: Arc<dyn BookSource>) -> Self {
         Self {
+            transaction: RwLock::new(()),
+            enabled: std::sync::atomic::AtomicBool::new(true),
             inner,
             original,
             state: RwLock::new(HashMap::new()),
+            partial: RwLock::new(HashMap::new()),
             cache_identity: RwLock::new(None),
         }
+    }
+
+    pub(crate) fn commit_together<T>(&self, commit: impl FnOnce() -> T) -> T {
+        let _guard = self.transaction.write().expect("content commit lock");
+        commit()
     }
 
     pub(crate) fn original(&self) -> Arc<dyn BookSource> {
@@ -214,14 +234,86 @@ impl SemanticLayoutSource {
         if let Ok(mut state) = self.state.write() {
             state.clear();
         }
+        if let Ok(mut partial) = self.partial.write() {
+            partial.clear();
+        }
+    }
+
+    /// A subsection is cached independently, but composed using durable original
+    /// source ranges. Never mark the whole chapter complete after a partial scan.
+    #[cfg(test)]
+    pub(crate) fn install_scope(
+        &self,
+        index: usize,
+        full_hash: &str,
+        range: std::ops::Range<usize>,
+        result: Recognition,
+    ) -> bool {
+        let Ok(original) = self.original.parse_section(index) else {
+            return false;
+        };
+        if fingerprint(&original) != full_hash {
+            return false;
+        }
+        self.install_prepared_scope(index, &original, full_hash, range, result)
+    }
+
+    pub(crate) fn install_prepared_scope(
+        &self,
+        index: usize,
+        original: &Section,
+        full_hash: &str,
+        range: std::ops::Range<usize>,
+        mut result: Recognition,
+    ) -> bool {
+        if result.annotations.is_empty() {
+            return false;
+        }
+        if range.end > original.blocks.len() || range.start >= range.end {
+            return false;
+        }
+        if fingerprint(&scope_section(&original, range.clone())) != result.fingerprint {
+            return false;
+        }
+        result.fingerprint = full_hash.to_owned();
+        let changed = !result.annotations.is_empty();
+        if let Ok(mut partial) = self.partial.write() {
+            let groups = partial.entry(index).or_default();
+            groups.retain(|(start, end), _| *end <= range.start || range.end <= *start);
+            groups.insert((range.start, range.end), result);
+        }
+        changed
     }
 
     pub(crate) fn configure(&self, book_id: &str, settings: &PluginSettings) {
+        self.enabled.store(
+            settings.semantic_layout.enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Ok(mut identity) = self.cache_identity.write() {
             // Same lock order as cache installation below. A concurrent old
             // prefetch must not repopulate annotations after a model switch.
             self.clear();
             *identity = recognition_identity(book_id, settings);
+        }
+    }
+
+    /// Apply only inline citation structure to original translation input.
+    /// Keeping all block indices intact is essential for translation storage.
+    pub(crate) fn prepare_citation_input(&self, index: usize, hash: &str, section: &mut Section) {
+        if let Ok(state) = self.state.read()
+            && let Some(result) = state
+                .get(&index)
+                .filter(|result| result.fingerprint == hash)
+        {
+            apply_translation_citations(section, result);
+        }
+        if let Ok(state) = self.partial.read()
+            && let Some(results) = state.get(&index)
+        {
+            for result in results.values().filter(|result| result.fingerprint == hash) {
+                apply_translation_citations(section, result);
+            }
         }
     }
 
@@ -232,6 +324,7 @@ impl SemanticLayoutSource {
             .is_some_and(|state| state.get(&index).is_some_and(|r| r.fingerprint == hash))
     }
 
+    #[cfg(test)]
     pub(crate) fn install(&self, index: usize, result: Recognition) -> bool {
         let Ok(original) = self.original.parse_section(index) else {
             return false;
@@ -255,7 +348,14 @@ impl BookSource for SemanticLayoutSource {
         self.inner.table_of_contents_origin()
     }
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+        let _transaction = self.transaction.read().map_err(|_| {
+            PublicationError::InvalidPublication("content commit lock poisoned".into())
+        })?;
         let mut section = self.inner.parse_section(index)?;
+        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            citations::clear_markers(&mut section.blocks);
+            return Ok(section);
+        }
         let mut recognition = self
             .state
             .read()
@@ -283,11 +383,22 @@ impl BookSource for SemanticLayoutSource {
                 }
             }
         }
-        if let Some(recognition) = recognition {
-            let original = self.original.parse_section(index)?;
-            if fingerprint(&original) == recognition.fingerprint {
+        let partial = self
+            .partial
+            .read()
+            .ok()
+            .and_then(|state| state.get(&index).cloned());
+        if recognition.is_some() || partial.is_some() {
+            let hash = fingerprint(&self.original.parse_section(index)?);
+            if let Some(recognition) = recognition.filter(|result| result.fingerprint == hash) {
                 for annotation in &recognition.annotations {
                     compose(&mut section.blocks, annotation);
+                }
+            } else if let Some(results) = partial {
+                for recognition in results.values().filter(|result| result.fingerprint == hash) {
+                    for annotation in &recognition.annotations {
+                        compose(&mut section.blocks, annotation);
+                    }
                 }
             }
         }
@@ -312,6 +423,32 @@ impl BookSource for SemanticLayoutSource {
 
 pub(crate) fn fingerprint(section: &Section) -> String {
     digest(&serde_json::to_vec(section).expect("section serializes"))
+}
+
+pub(crate) fn scope_section(section: &Section, range: std::ops::Range<usize>) -> Section {
+    Section {
+        id: section.id.clone(),
+        href: section.href.clone(),
+        blocks: section.blocks[range].to_vec(),
+        anchors: section.anchors.clone(),
+    }
+}
+
+pub(crate) fn log_scope(
+    settings: &PluginSettings,
+    index: usize,
+    start: usize,
+    end: usize,
+    prefetch: bool,
+) {
+    if let Ok((provider, model)) = settings.semantic_layout_endpoint() {
+        log::event(
+            provider,
+            model,
+            "scope.scheduled",
+            json!({"section_index":index,"start":start,"end":end,"prefetch":prefetch}),
+        );
+    }
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -444,7 +581,6 @@ fn request_contract_fingerprint() -> &'static str {
                 citations::PROMPT,
                 formulas::PROMPT,
                 formulas::options(),
-                citations::options(),
                 completion_options(&RecognitionRoles {
                     quotes: true,
                     captions: false,
@@ -542,8 +678,8 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
             "name":"ebook_semantic_groups", "strict":true,
             "schema":{
                 "type":"object", "additionalProperties":false,
-                "properties":{"groups":{"type":"array","items":item}},
-                "required":["groups"]
+                "properties":{"groups":{"type":"array","items":item}, "citations":{"type":"array","items":{"type":"string"}}},
+                "required":["groups","citations"]
             }
         }
     }})
@@ -708,16 +844,27 @@ pub(crate) async fn recognize(
     book_id: &str,
     settings: &PluginSettings,
 ) -> Result<Recognition, String> {
-    recognize_impl(section, book_id, settings, None).await
+    recognize_impl(section, book_id, settings, None, None).await
 }
 
+#[cfg(test)]
 pub(crate) async fn recognize_with_source(
     section: &Section,
     book_id: &str,
     settings: &PluginSettings,
     source: &dyn BookSource,
 ) -> Result<Recognition, String> {
-    recognize_impl(section, book_id, settings, Some(source)).await
+    recognize_impl(section, book_id, settings, Some(source), None).await
+}
+
+pub(crate) async fn recognize_visible(
+    section: &Section,
+    target: std::ops::Range<usize>,
+    book_id: &str,
+    settings: &PluginSettings,
+    source: &dyn BookSource,
+) -> Result<Recognition, String> {
+    recognize_impl(section, book_id, settings, Some(source), Some(target)).await
 }
 
 async fn recognize_impl(
@@ -725,6 +872,7 @@ async fn recognize_impl(
     book_id: &str,
     settings: &PluginSettings,
     source: Option<&dyn BookSource>,
+    target: Option<std::ops::Range<usize>>,
 ) -> Result<Recognition, String> {
     let (provider, model) = settings.semantic_layout_endpoint()?;
     let started = std::time::Instant::now();
@@ -734,7 +882,7 @@ async fn recognize_impl(
         "chapter.start",
         json!({"book":book_id,"section":section.id,"href":section.href,"blocks":section.blocks.len()}),
     );
-    let result = recognize_inner(section, book_id, settings, source).await;
+    let result = recognize_inner(section, book_id, settings, source, target).await;
     let mut details = json!({"book":book_id,"section":section.id,"href":section.href,"elapsed_ms":started.elapsed().as_millis()});
     match &result {
         Ok(recognition) => {
@@ -763,11 +911,18 @@ async fn recognize_inner(
     book_id: &str,
     settings: &PluginSettings,
     book_source: Option<&dyn BookSource>,
+    target: Option<std::ops::Range<usize>>,
 ) -> Result<Recognition, String> {
     let (provider, model) = settings.semantic_layout_endpoint()?;
     let config = &RecognitionRoles::default();
     let fingerprint = fingerprint(section);
-    let identity = recognition_identity(book_id, settings);
+    let mut identity = recognition_identity(book_id, settings);
+    if let Some(target) = &target {
+        identity = identity
+            .map(|identity| json!([identity, "visible-target-v1", target.start, target.end]));
+    }
+    let target = target.unwrap_or(0..section.blocks.len());
+    let target_section = scope_section(section, target.clone());
     if let Some(identity) = &identity
         && let Some(cached) = load_recognition(section, identity)
     {
@@ -780,10 +935,11 @@ async fn recognize_inner(
         .timeout(Duration::from_secs(90))
         .build()
         .map_err(|e| e.to_string())?;
-    let formulas_checked = book_source.is_some() || formulas::candidates(section).is_empty();
+    let formulas_checked =
+        book_source.is_some() || formulas::candidates(&target_section).is_empty();
     if let Some(source) = book_source {
         let (recognized, failed) =
-            formulas::recognize(&client, provider, model, source, section).await;
+            formulas::recognize(&client, provider, model, source, &target_section).await;
         annotations.extend(recognized);
         skipped_groups += failed;
     }
@@ -792,18 +948,19 @@ async fn recognize_inner(
         compose(&mut working.blocks, annotation);
     }
     let section = &working;
-    let mut start = 0;
-    while start < section.blocks.len() {
-        let end = window_end(section, start);
+    let mut start = target.start;
+    while start < target.end {
+        let end = window_end(section, start).min(target.end);
         let lo = start.saturating_sub(OVERLAP);
         let hi = (end + OVERLAP).min(section.blocks.len());
-        if section.blocks[start..end]
-            .iter()
-            .any(|block| paragraph(block).is_some() || unattributed_quote_body(block).is_some())
+        let citation_candidates = citations::window_candidates(section, start..end);
+        if !citation_candidates.is_empty()
+            || section.blocks[start..end]
+                .iter()
+                .any(|block| paragraph(block).is_some() || unattributed_quote_body(block).is_some())
         {
-            let input = json!({"target_start":start,"target_end_exclusive":end,
-                "quotes_enabled":config.quotes,"captions_enabled":config.captions,
-                "blocks":(lo..hi).map(|i| section_input_block(section,i)).collect::<Vec<_>>()});
+            let input =
+                unified_window_input(section, config, start..end, lo..hi, &citation_candidates);
             let key = digest(
                 &serde_json::to_vec(&json!([
                     CACHE_FORMAT_VERSION,
@@ -826,12 +983,14 @@ async fn recognize_inner(
                 .and_then(|bytes| serde_json::from_slice::<WindowCache>(&bytes).ok())
                 .filter(|cache| {
                     cache.key == key
+                        && validate_citation_ids(&cache.citations, &citation_candidates).is_ok()
                         && validate_window(&cache.groups, section, config, start..end, lo..hi)
                             .is_ok()
                 });
             let window = if let Some(cache) = cached {
                 WindowResult {
                     groups: cache.groups,
+                    citations: cache.citations,
                     skipped_groups: 0,
                 }
             } else {
@@ -853,6 +1012,7 @@ async fn recognize_inner(
                         &WindowCache {
                             key,
                             groups: groups.groups.clone(),
+                            citations: groups.citations.clone(),
                         },
                     )
                 {
@@ -862,6 +1022,10 @@ async fn recognize_inner(
             };
             skipped_groups += window.skipped_groups;
             validate_window(&window.groups, section, config, start..end, lo..hi)?;
+            annotations.extend(citations::window_annotations(
+                &citation_candidates,
+                &window.citations,
+            ));
             for group in &window.groups {
                 let ids = proposal_ids(group);
                 if ids.iter().any(|id| used.contains(id)) {
@@ -896,10 +1060,6 @@ async fn recognize_inner(
                 .any(|id| source(&section.blocks[*id]) == Some(range))
         });
     }
-    annotations.splice(
-        0..0,
-        citations::recognize(&client, provider, model, section).await?,
-    );
     let result = Recognition {
         formulas_checked,
         fingerprint,
@@ -927,81 +1087,59 @@ async fn request_window_groups(
     target: std::ops::Range<usize>,
     context: std::ops::Range<usize>,
 ) -> Result<WindowResult, String> {
-    // Give captions their own pass: a cartoon's dialogue is image text, whereas
-    // the quotation pass must reject dialogue embedded in ordinary narrative.
-    let mut groups = Vec::new();
-    let mut skipped_groups = 0;
-    for roles in [
-        RecognitionRoles {
-            quotes: false,
-            captions: config.captions,
-            headings: false,
-        },
-        RecognitionRoles {
-            quotes: false,
-            captions: false,
-            headings: config.headings,
-        },
-        RecognitionRoles {
-            quotes: config.quotes,
-            captions: false,
-            headings: false,
-        },
-    ] {
-        if !(roles.captions
-            && context
-                .clone()
-                .any(|index| image_needs_caption(section, index))
-            || roles.headings
-                && target
-                    .clone()
-                    .any(|index| headings::candidate(&section.blocks[index]).is_some())
-            || roles.quotes)
-        {
-            continue;
-        }
-        let mut input = input.clone();
-        input["quotes_enabled"] = json!(roles.quotes);
-        input["captions_enabled"] = json!(roles.captions);
-        input["headings_enabled"] = json!(roles.headings);
-        if roles.headings {
-            input["numbered_candidates"] = headings::context(section, target.start);
-        }
-        // Completed figure groups are protected in the quotation pass too.
-        let protected: HashSet<_> = groups.iter().flat_map(proposal_ids).collect();
-        if let Some(blocks) = input["blocks"].as_array_mut() {
-            for block in blocks {
-                if block["id"]
-                    .as_u64()
-                    .and_then(|id| usize::try_from(id).ok())
-                    .is_some_and(|id| protected.contains(&id))
-                {
-                    *block = json!({"id": block["id"], "type": "protected_boundary"});
-                }
+    request_groups(client, endpoint, input, section, config, target, context).await
+}
+
+fn unified_window_input(
+    section: &Section,
+    config: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+    candidates: &[citations::WindowCandidate],
+) -> Value {
+    let blocks: Vec<_> = context
+        .map(|index| {
+            let mut block = section_input_block(section, index);
+            let available: Vec<_> = candidates.iter().filter(|c| c.block == index).collect();
+            block["citation_candidates"] = json!(
+                available
+                    .iter()
+                    .map(|c| json!({"id":c.id,"paragraph":c.paragraph,"text":c.span.text}))
+                    .collect::<Vec<_>>()
+            );
+            if !available.is_empty() && block.get("text").is_none() && block.get("body").is_none() {
+                let mut seen = HashSet::new();
+                block["citation_paragraphs"] = json!(
+                    available
+                        .iter()
+                        .filter(|c| seen.insert(c.paragraph))
+                        .map(|c| json!({"index":c.paragraph,"text":c.paragraph_text}))
+                        .collect::<Vec<_>>()
+                );
             }
-        }
-        let proposed = request_groups(
-            client,
-            endpoint,
-            &input,
-            section,
-            &roles,
-            target.clone(),
-            context.clone(),
-        )
-        .await?;
-        skipped_groups += proposed.skipped_groups;
-        groups.extend(
-            proposed
-                .groups
-                .into_iter()
-                .filter(|group| !proposal_ids(group).iter().any(|id| protected.contains(id))),
-        );
+            block
+        })
+        .collect();
+    json!({"target_start":target.start,"target_end_exclusive":target.end,
+        "quotes_enabled":config.quotes,"captions_enabled":config.captions,"headings_enabled":config.headings,
+        "numbered_candidates":headings::context(section,target.start),"blocks":blocks,
+        "targets":{"classify_blocks":target.clone().filter(|i|paragraph(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
+            "complete_quote_sources":target.filter(|i|unattributed_quote_body(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
+            "classify_citations":candidates.iter().map(|c|&c.id).collect::<Vec<_>>()}})
+}
+
+fn validate_citation_ids(
+    ids: &[String],
+    candidates: &[citations::WindowCandidate],
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    if ids
+        .iter()
+        .any(|id| !seen.insert(id) || !candidates.iter().any(|c| &c.id == id))
+    {
+        return Err("Use each eligible citation candidate ID at most once; never select context-only or invented IDs".into());
     }
-    Ok(WindowResult {
-        groups,
-        skipped_groups,
-    })
+    Ok(())
 }
 
 fn window_end(section: &Section, start: usize) -> usize {
@@ -1037,9 +1175,10 @@ async fn request_groups(
 ) -> Result<WindowResult, String> {
     let (provider, model) = endpoint;
     let mut messages = vec![
-        json!({"role":"system","content":PROMPT}),
+        json!({"role":"system","content":format!("{PROMPT}\n{}",citations::PROMPT.split("## Output").next().unwrap_or(citations::PROMPT))}),
         json!({"role":"user","content":input.to_string()}),
     ];
+    let candidates = citations::window_candidates(section, target.clone());
     let mut fallback: Option<WindowResult> = None;
     let mut last_error = String::new();
     for attempt in 0..2 {
@@ -1058,7 +1197,7 @@ async fn request_groups(
         let parsed = llm_json::parse::<Response>(&content)
             .map_err(|e| format!("AI排版格式无效：{e}"))
             .and_then(|response| {
-                log::event(provider, model, "window.proposals", json!({"section":section.id,"start":target.start,"end":target.end,"attempt":attempt+1,"groups":response.groups}));
+                log::event(provider, model, "window.proposals", json!({"section":section.id,"start":target.start,"end":target.end,"attempt":attempt+1,"groups":response.groups,"citations":response.citations}));
                 let validation = validate_window(
                     &response.groups,
                     section,
@@ -1066,17 +1205,21 @@ async fn request_groups(
                     target.clone(),
                     context.clone(),
                 );
+                let validation = validation.and_then(|()| validate_citation_ids(&response.citations, &candidates));
                 if validation.is_err() {
-                    let safe = retain_valid_groups(
+                    let mut safe = retain_valid_groups(
                         &response.groups,
                         section,
                         config,
                         target.clone(),
                         context.clone(),
                     );
+                    let mut seen = HashSet::new();
+                    safe.citations = response.citations.iter().filter(|id| candidates.iter().any(|c| &c.id==*id) && seen.insert((*id).clone())).cloned().collect();
+                    safe.skipped_groups += response.citations.len() - safe.citations.len();
                     if fallback
                         .as_ref()
-                        .is_none_or(|previous| safe.groups.len() > previous.groups.len())
+                        .is_none_or(|previous| safe.groups.len()+safe.citations.len() > previous.groups.len()+previous.citations.len())
                     {
                         fallback = Some(safe);
                     }
@@ -1088,6 +1231,7 @@ async fn request_groups(
             Ok(response) => {
                 return Ok(WindowResult {
                     groups: response.groups,
+                    citations: response.citations,
                     skipped_groups: 0,
                 });
             }
@@ -1191,7 +1335,7 @@ fn validate_window(
     for group in groups {
         let ids = proposal_ids(group);
         let valid_ids = consecutive(&ids)
-            && target.contains(&ids[0])
+            && ids.iter().any(|id| target.contains(id))
             && ids
                 .iter()
                 .all(|id| context.contains(id) && *id < section.blocks.len() && used.insert(*id));
@@ -1621,3 +1765,11 @@ mod tests;
 
 #[cfg(test)]
 mod attribution_tests;
+
+pub(crate) fn apply_translation_citations(section: &mut Section, result: &Recognition) {
+    for annotation in &result.annotations {
+        if let Annotation::InlineCitations { source, spans } = annotation {
+            citations::compose(&mut section.blocks, source, spans);
+        }
+    }
+}

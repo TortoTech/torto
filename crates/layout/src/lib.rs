@@ -1419,12 +1419,69 @@ impl LayoutEngine {
                     }
                 }
                 Block::Table(table) => {
-                    let prepared = self.shape_table(
-                        table,
+                    let width = (content_width - media_start_offset).max(1.0);
+                    let mut prepared = self.shape_table(table, reader_style, width);
+                    if table.before.is_empty() && table.after.is_empty()
+                        || prepared.row_heights.is_empty()
+                    {
+                        paginator.push_table(&prepared, 0.0);
+                        block_index += 1;
+                        continue;
+                    }
+                    let before = self.shape_figure_captions(
+                        source,
+                        &table.before,
                         reader_style,
-                        (content_width - media_start_offset).max(1.0),
+                        width,
+                        unified_reflow,
+                    )?;
+                    let after = self.shape_figure_captions(
+                        source,
+                        &table.after,
+                        reader_style,
+                        width,
+                        unified_reflow,
+                    )?;
+                    let gap =
+                        reader_style.typography.font_size * reader_style.typesetting.caption_gap_em;
+                    let height = |texts: &[(PreparedText, Cow<'_, TextBlock>)]| {
+                        texts
+                            .iter()
+                            .map(|(text, block)| {
+                                prepared_flow_height(text)
+                                    + block.style.margin_before.max(0.0)
+                                    + block.style.margin_after.max(0.0)
+                            })
+                            .sum::<f32>()
+                    };
+                    let before_height = height(&before) + if before.is_empty() { 0.0 } else { gap };
+                    let after_height = height(&after) + if after.is_empty() { 0.0 } else { gap };
+                    let outer_gap = prepared.block_gap;
+                    paginator.prepare_group(
+                        before_height + prepared.row_heights.iter().sum::<f32>() + after_height,
+                        outer_gap,
                     );
-                    paginator.push_table(&prepared);
+                    if !before.is_empty() {
+                        let first_end = next_safe_table_break(&prepared, 0);
+                        paginator.keep_together_if_fits(
+                            before_height + prepared.row_heights[..first_end].iter().sum::<f32>(),
+                        );
+                    }
+                    for (text, block) in &before {
+                        paginator.push_text(text, block.as_ref())?;
+                    }
+                    if !before.is_empty() {
+                        paginator.add_semantic_spacing(gap);
+                    }
+                    prepared.block_gap = 0.0;
+                    paginator.push_table(&prepared, after_height);
+                    if !after.is_empty() {
+                        paginator.add_semantic_spacing(gap);
+                    }
+                    for (text, block) in &after {
+                        paginator.push_text(text, block.as_ref())?;
+                    }
+                    paginator.ensure_minimum_spacing(outer_gap);
                 }
                 Block::Image(image) => {
                     if unified_reflow
@@ -1442,6 +1499,13 @@ impl LayoutEngine {
                         continue;
                     }
                     let raster = load_raster_image(source, image)?;
+                    let formula_presentation = (!unified_reflow)
+                        .then(|| image.formula.as_ref())
+                        .flatten()
+                        .map(|formula| FormulaPresentation {
+                            original: raster.clone(),
+                            latex: formula.latex.clone(),
+                        });
                     let mut image_style = image.style;
                     if unified_reflow {
                         let gap = reader_style.typography.font_size
@@ -1455,6 +1519,9 @@ impl LayoutEngine {
                         image.source.clone(),
                         image.text_layer.clone(),
                     );
+                    if let Some(PageItem::Image(placed)) = paginator.items.last_mut() {
+                        placed.formula_presentation = formula_presentation;
+                    }
                     for replacement in replacements {
                         let prepared =
                             self.shape_fixed_page_replacement(&replacement, reader_style);
@@ -1694,7 +1761,17 @@ impl LayoutEngine {
         content_width: f32,
         unified_reflow: bool,
     ) -> Result<(PreparedText, Cow<'a, TextBlock>), LayoutError> {
-        let mut resolved = resolve_text_block(caption, reader_style, TextContext::Flow);
+        let note = caption.kind != TextBlockKind::Caption;
+        let mut resolved = if unified_reflow && note {
+            let mut text = caption.clone();
+            text.kind = TextBlockKind::Caption;
+            let mut resolved =
+                resolve_text_block(&text, reader_style, TextContext::Flow).into_owned();
+            resolved.style.align = TextAlignment::Start;
+            Cow::Owned(resolved)
+        } else {
+            resolve_text_block(caption, reader_style, TextContext::Flow)
+        };
         let mut prepared =
             self.shape_text_from_source(source, &resolved, reader_style, content_width)?;
         if unified_reflow && prepared.layout.len() > 1 {
@@ -1731,7 +1808,9 @@ impl LayoutEngine {
         if unified_reflow
             && shaped
                 .iter()
-                .map(|(text, _)| text.layout.len())
+                .zip(captions)
+                .filter(|(_, caption)| caption.kind == TextBlockKind::Caption)
+                .map(|((text, _), _)| text.layout.len())
                 .sum::<usize>()
                 > 1
         {
@@ -3396,14 +3475,15 @@ fn prepare_inline_content(
                     inline_images.push(rendered);
                     continue;
                 }
-                inline_images.push(prepare_inline_raster(
-                    run,
-                    image,
-                    typography,
-                    available_width,
-                    id,
-                    text.len(),
-                ));
+                let mut prepared =
+                    prepare_inline_raster(run, image, typography, available_width, id, text.len());
+                if !unified_math && let Some(formula) = &run.image.formula {
+                    prepared.formula_presentation = Some(FormulaPresentation {
+                        original: prepared.image.clone(),
+                        latex: formula.latex.clone(),
+                    });
+                }
+                inline_images.push(prepared);
             }
             Inline::Break => {
                 text.push('\n');
@@ -3582,14 +3662,13 @@ fn rasterize_formula(
     let display_height = (source_height * width_scale).max(1.0);
     let view_y = -rendered.ascent - PADDING;
     let svg = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{} {} {} {}" width="{}" height="{}"><g transform="translate({}, 0)">{}</g></svg>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{} {} {} {}" width="{}" height="{}">{}</svg>"#,
         -PADDING,
         view_y,
         source_width,
         source_height,
         source_width,
         source_height,
-        PADDING,
         rendered.svg_fragment
     );
     let tree = Tree::from_data(svg.as_bytes(), svg_options).map_err(|error| error.to_string())?;
@@ -3887,7 +3966,7 @@ impl Paginator {
         Ok(())
     }
 
-    fn push_table(&mut self, table: &PreparedTable) {
+    fn push_table(&mut self, table: &PreparedTable, trailing_height: f32) {
         self.forced_page_break = false;
         self.previous_block_was_paragraph = false;
         if table.row_heights.is_empty() || table.column_widths.is_empty() {
@@ -3901,14 +3980,20 @@ impl Paginator {
             let mut last_safe_break = None;
             for row_end in row_start + 1..=table.row_heights.len() {
                 let candidate = height + table.row_heights[row_end - 1];
-                if candidate > remaining && row_end > row_start + 1 {
+                let required = candidate
+                    + if row_end == table.row_heights.len() {
+                        trailing_height
+                    } else {
+                        0.0
+                    };
+                if required > remaining && row_end > row_start + 1 {
                     break;
                 }
                 height = candidate;
                 if table_break_is_safe(table, row_end) {
                     last_safe_break = Some((row_end, height));
                 }
-                if candidate > remaining {
+                if required > remaining {
                     break;
                 }
             }
@@ -3926,7 +4011,16 @@ impl Paginator {
                 }
                 continue;
             };
-            if chunk_height > remaining && self.column_has_content {
+            let required = chunk_height
+                + if row_end == table.row_heights.len() {
+                    trailing_height
+                } else {
+                    0.0
+                };
+            if self.column_has_content
+                && (chunk_height > remaining
+                    || (required > remaining && required <= self.bottom - self.top))
+            {
                 self.advance_column();
                 continue;
             }
@@ -5486,6 +5580,8 @@ mod tests {
             header: false,
         };
         let table = TableBlock {
+            before: Vec::new(),
+            after: Vec::new(),
             rows: vec![TableRow {
                 cells: vec![cell(None), cell(Some(TextAlignment::Start))],
             }],
@@ -5541,6 +5637,8 @@ mod tests {
             header: false,
         };
         let table = TableBlock {
+            before: Vec::new(),
+            after: Vec::new(),
             rows: vec![
                 TableRow {
                     cells: vec![cell(""), cell("U.S."), cell("Norway")],
@@ -7046,6 +7144,105 @@ mod tests {
     }
 
     #[test]
+    fn table_captions_stay_with_edge_rows_across_pages() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("caption-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let text = |value: &str, kind| TextBlock {
+            kind,
+            content: vec![Inline::Text(TextRun {
+                text: value.into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: rebook_publication::BlockStyle::default(),
+            source: None,
+        };
+        for rows in [1, 9, 25] {
+            for height in [240, 360, 600] {
+                let section = Section {
+                    id: SpineItemId::new("chapter").unwrap(),
+                    href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+                    anchors: Vec::new(),
+                    blocks: vec![
+                        Block::Text(text("Preceding prose. ", TextBlockKind::Paragraph)),
+                        Block::Table(TableBlock {
+                            before: vec![text("Table 1. Results", TextBlockKind::Caption)],
+                            after: vec![text("NOTE: Rounded values.", TextBlockKind::Paragraph)],
+                            rows: (0..rows)
+                                .map(|_| TableRow {
+                                    cells: vec![TableCell {
+                                        text: text("A measured value", TextBlockKind::Paragraph),
+                                        authored_alignment: None,
+                                        column_span: 1,
+                                        row_span: 1,
+                                        header: false,
+                                    }],
+                                })
+                                .collect(),
+                            source: None,
+                        }),
+                    ],
+                };
+                let style = ReaderStyle {
+                    typesetting: ReaderTypesetting::unified(),
+                    ..ReaderStyle::default()
+                };
+                let layout = LayoutEngine::new()
+                    .layout_section(
+                        &source,
+                        &section,
+                        LayoutViewport::new(480, height).unwrap(),
+                        &style,
+                    )
+                    .unwrap();
+                let mut caption_count = 0;
+                for page in &layout.pages {
+                    for (index, item) in page.items.iter().enumerate() {
+                        if let PageItem::Text(caption) = item {
+                            if caption.text.starts_with("Table 1.") {
+                                caption_count += 1;
+                                assert!(
+                                    page.items[index + 1..]
+                                        .iter()
+                                        .any(|item| matches!(item, PageItem::Table(_))),
+                                    "title orphan: rows={rows} height={height}"
+                                );
+                            }
+                            if caption.text.starts_with("NOTE:") {
+                                caption_count += 1;
+                                let table = page.items[..index]
+                                    .iter()
+                                    .rev()
+                                    .find_map(|item| {
+                                        if let PageItem::Table(table) = item {
+                                            Some(table)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .expect("note must share last table page");
+                                assert!(caption.origin_y >= table.y + table.height);
+                                assert!(
+                                    caption.layout.get(0).unwrap().metrics().offset.abs() < 0.1,
+                                    "notes are left aligned"
+                                );
+                            }
+                        }
+                    }
+                }
+                assert_eq!(caption_count, 2);
+            }
+        }
+    }
+
+    #[test]
     fn unified_tables_adapt_columns_wrap_and_center_cell_content() {
         let source = EmptySource {
             book: Book {
@@ -7076,6 +7273,8 @@ mod tests {
             id: SpineItemId::new("chapter").unwrap(),
             href: PublicationUrl::parse("chapter.xhtml").unwrap(),
             blocks: vec![Block::Table(TableBlock {
+                before: Vec::new(),
+                after: Vec::new(),
                 rows: vec![TableRow {
                     cells: vec![
                         cell("ID"),
@@ -7194,7 +7393,12 @@ mod tests {
         let section = Section {
             id: SpineItemId::new("chapter").unwrap(),
             href: PublicationUrl::parse("chapter.xhtml").unwrap(),
-            blocks: vec![Block::Table(TableBlock { rows, source: None })],
+            blocks: vec![Block::Table(TableBlock {
+                before: Vec::new(),
+                after: Vec::new(),
+                rows,
+                source: None,
+            })],
             anchors: Vec::new(),
         };
 
@@ -7274,6 +7478,8 @@ mod tests {
             blocks: vec![
                 Block::Text(text_block("Body paragraph")),
                 Block::Table(TableBlock {
+                    before: Vec::new(),
+                    after: Vec::new(),
                     rows: vec![TableRow {
                         cells: vec![TableCell {
                             text: text_block("Cell"),

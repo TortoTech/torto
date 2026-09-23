@@ -23,7 +23,7 @@ use super::pdf_vision::{
 };
 use super::rewrite::{BlockRewrite, RewriteBookSource, RewriteTransaction};
 use super::search::{search_book, search_section, section_title, text_block_kind, text_block_text};
-use super::translation::validate_translation_math_placeholders;
+use super::translation::{validate_translation_citations, validate_translation_math_placeholders};
 use super::{
     AiProvider, BlockTranslation, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN,
     CHAT_TOOL_STEPS_MAX, CHAT_TOOL_STEPS_MIN, PluginSettings, ReasoningEffort,
@@ -675,15 +675,21 @@ async fn translate_block_batch(
     } else {
         ""
     };
+    let citation_contract = translation_citation_contract(blocks)?;
     let mut last_error = None;
-    for _ in 0..MAX_TRANSLATION_ATTEMPTS {
-        let messages = vec![
+    for attempt in 1..=MAX_TRANSLATION_ATTEMPTS {
+        let mut messages = vec![
             json!({
                 "role": "system",
-                "content": translation_system_prompt(target_language, fixed_page_hint),
+                "content": format!("{}\n{}", translation_system_prompt(target_language, fixed_page_hint), citation_contract),
             }),
             json!({ "role": "user", "content": Value::Object(input.clone()).to_string() }),
         ];
+        if let Some(error) = &last_error {
+            messages.push(json!({"role":"user","content":format!(
+                "The previous response failed validation: {error}. Translate the original input again and return all JSON keys. Preserve only citation IDs listed for each key; an empty list means NO citation tags. Do not turn ordinary author-year text into citations. JSON object keys are not citation IDs."
+            )}));
+        }
         let content = match request_completion(
             client,
             provider,
@@ -713,11 +719,12 @@ async fn translate_block_batch(
         match parse_translation_object(&content, &keys) {
             Ok(values) => {
                 if let Some(error) = blocks.iter().zip(&values).find_map(|(block, translation)| {
-                    validate_translation_math_placeholders(&block.text, translation)
-                        .err()
-                        .map(|error| {
-                            format!("第 {} 个正文块的公式结构无效：{error}", block.block_index)
-                        })
+                    translation_structure_error(block, translation).map(|(kind, error)| {
+                        super::semantic_layout::translation_event(provider, model, "translation.validation_failed",
+                            json!({"attempt":attempt,"block_index":block.block_index,"segment_index":block.segment_index,
+                                "kind":kind,"reason":error}));
+                        error
+                    })
                 }) {
                     last_error = Some(error);
                     continue;
@@ -736,6 +743,38 @@ async fn translate_block_batch(
         }
     }
     Err(last_error.unwrap_or_else(|| "翻译结果格式无效".to_owned()))
+}
+
+fn translation_citation_contract(blocks: &[TranslationBlockInput]) -> Result<String, String> {
+    let mut allowed = serde_json::Map::new();
+    for (key, block) in blocks.iter().enumerate() {
+        allowed.insert(
+            key.to_string(),
+            json!(super::translation::citation_ids(&block.text)?),
+        );
+    }
+    Ok(format!(
+        "# Citation structure\nAllowed citation IDs by input JSON key: {}. Preserve these IDs exactly once. An empty list means do not create any citation tags. JSON keys such as 0 are block keys, NOT citation IDs. Parenthesized years after author names remain ordinary text unless already tagged in the source.",
+        Value::Object(allowed)
+    ))
+}
+
+fn translation_structure_error(
+    block: &TranslationBlockInput,
+    translated: &str,
+) -> Option<(&'static str, String)> {
+    if let Err(reason) = validate_translation_math_placeholders(&block.text, translated) {
+        return Some((
+            "formula",
+            format!(
+                "\u{7b2c} {} \u{4e2a}\u{6b63}\u{6587}\u{5757}\u{7684}\u{516c}\u{5f0f}\u{7ed3}\u{6784}\u{65e0}\u{6548}\u{ff1a}{reason}",
+                block.block_index
+            ),
+        ));
+    }
+    validate_translation_citations(&block.text,translated).err().map(|reason| (
+        "inline_citation", format!("\u{7b2c} {} \u{4e2a}\u{6b63}\u{6587}\u{5757}\u{7684}\u{6587}\u{5185}\u{5f15}\u{7528}\u{6807}\u{8bb0}\u{65e0}\u{6548}\u{ff1a}{reason}",block.block_index)
+    ))
 }
 
 fn translation_system_prompt(target_language: &str, fixed_page_hint: &str) -> String {
@@ -758,6 +797,7 @@ fn translation_system_prompt(target_language: &str, fixed_page_hint: &str) -> St
 
 # 正文结构
 - 每个 JSON 值都是独立正文块。原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时保持相同类型。
+- Preserve every <citation id="N">...</citation> group and its ID exactly once. Translate its contents as a bibliographic note (keep author names and years accurate); keep it attached to the same claim. Never merge groups, invent IDs, or remove their tags. Tags may contain other inline style tags.
 - <strong>、<em>、<i>、<cite>、<torto-italic>、<torto-size scale="数值">、<u>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记。必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。
 - <torto-math-0/>、<torto-math-1/> 等自闭合标签是不可修改的公式占位符。可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。
 {fixed_page_section}
@@ -766,7 +806,7 @@ fn translation_system_prompt(target_language: &str, fixed_page_hint: &str) -> St
     )
 }
 
-fn translation_batches(
+pub(crate) fn translation_batches(
     blocks: Vec<TranslationBlockInput>,
     max_chars: usize,
 ) -> Vec<Vec<TranslationBlockInput>> {
@@ -2272,15 +2312,17 @@ fn ai_block_content(block: &Block, is_pdf: bool) -> Option<(&SourceRange, String
         Block::Table(table) => Some((
             table.source.as_ref()?,
             table
-                .rows
+                .before
                 .iter()
-                .map(|row| {
+                .map(text_block_text)
+                .chain(table.rows.iter().map(|row| {
                     row.cells
                         .iter()
                         .map(|cell| text_block_text(&cell.text))
                         .collect::<Vec<_>>()
                         .join("\t")
-                })
+                }))
+                .chain(table.after.iter().map(text_block_text))
                 .collect::<Vec<_>>()
                 .join("\n"),
             "table",
@@ -3703,5 +3745,50 @@ mod tests {
                 text: "能量为 <torto-math-0/>".into(),
             }]
         );
+    }
+}
+
+#[cfg(test)]
+mod translation_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn reports_formula_and_inline_citation_failures_separately() {
+        let input = |text: &str| TranslationBlockInput {
+            block_index: 58,
+            segment_index: None,
+            text: text.into(),
+        };
+        let (kind, message) =
+            translation_structure_error(&input("<citation id=\"1\">Smith</citation>"), "Smith")
+                .unwrap();
+        assert_eq!(kind, "inline_citation");
+        assert!(message.contains("58"));
+        assert!(message.contains("missing=[1]"));
+        assert!(!message.contains("\u{516c}\u{5f0f}"));
+        let (kind, _) = translation_structure_error(&input("<torto-math-0/>"), "omitted").unwrap();
+        assert_eq!(kind, "formula");
+        let (_, message) = translation_structure_error(
+            &input("<citation id=\"1\">Smith</citation>"),
+            "<citation id=\"2\">Smith</citation>",
+        )
+        .unwrap();
+        assert!(message.contains("unexpected=[2]"));
+        assert!(translation_structure_error(&input("Plain text"), "Translation").is_none());
+        let plain = input("Kintsch and Mross (1985) instructed subjects.");
+        let (kind, reason) = translation_structure_error(
+            &plain,
+            "Kintsch and Mross <citation id=\"0\">(1985)</citation> instructed subjects.",
+        )
+        .unwrap();
+        assert_eq!(kind, "inline_citation");
+        assert!(reason.contains("ID 0"));
+        let contract = translation_citation_contract(&[
+            plain,
+            input("Claim <citation id=\"1\">Smith</citation>"),
+        ])
+        .unwrap();
+        assert!(contract.contains(r#""0":[]"#));
+        assert!(contract.contains(r#""1":[1]"#));
+        assert!(contract.contains("NOT citation IDs"));
     }
 }
