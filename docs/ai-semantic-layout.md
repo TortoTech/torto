@@ -1,8 +1,8 @@
 # AI layout
 
 Settings → Typography → Layout contains a global, opt-in switch and a configured
-provider/model selection. Quotes, inline citations, formula images, captions and numbered section headings are always enabled. The help
-icon next to the switch shows “补充未识别的引用、文内文献引用、公式图片、图注和数字节标题” on hover.
+provider/model selection. Quotes, inline citations, formula images, captions and section headings are always enabled. The help
+icon next to the switch shows “补充未识别的引用、文内文献引用、公式图片、图注和小节标题” on hover.
 Credentials remain in the existing provider configuration. A missing or deleted
 model pauses recognition; it is never silently replaced. There are no per-book
 switches or manual chapter recognition commands.
@@ -32,14 +32,13 @@ positions: a following standalone credit (`quote`), a preceding named introducti
 ending with a colon or explicit reporting cue (`quote_before`), or the exact credit suffix of the final body
 paragraph (`quote_inline`). Unattributed prose, epigraphs and ordinary narrative
 dialogue cannot become new AI quotes. Invalid credits reject the whole new group;
-there is no body-only repair. Windows with images still use a separate caption pass.
+there is no body-only repair. Captions and other text roles share the same request.
 
 The system prompt is maintained as sectioned Markdown in
 `apps/desktop/src/plugins/semantic_layout/prompt.md`: task, input and scope,
-semantic judgment, structural requirements, output and examples. Retry feedback
+shared constraints and optional role-specific rules. Historical examples remain in test fixtures. Retry feedback
 also uses Markdown headings. Book input remains a separate JSON data message. Requests use
-`response_format.type = json_schema` and `strict = true`, with a quote-only, caption-only or
-heading-only schema for each pass (required fields, non-null new-quote attribution, nullable alignment and no
+`response_format.type = json_schema` and `strict = true`, with a unified schema for all text roles (required fields, non-null new-quote attribution, nullable alignment and no
 additional properties). This requires a compatible endpoint; API errors are
 reported rather than silently falling back to unconstrained output. Local ID,
 source-protection and relationship checks still run after parsing.
@@ -73,41 +72,36 @@ Unified layout applies caption alignment to the whole figure caption: one line
 is centered, while multiple lines share a leading edge even when the original
 ebook split them into several paragraphs. Authored book-mode alignment is retained.
 
-## Numbered section headings
+## Section headings
 
-An additional pass runs only for windows containing source-backed ordinary
-paragraphs consisting of a positive Arabic numeral (up to four digits), optionally
-followed by a period or closing parenthesis. This is candidate eligibility, not
-an automatic heading decision. The model distinguishes subsection boundaries from
-page numbers, footnotes, list/exercise numbers and other incidental numbering.
-An increasing sequence alone is insufficient; uncertain candidates stay unchanged.
-Roman numerals, spelled-out numbers and number-plus-title paragraphs are outside
-this initial candidate filter.
+Ordinary source-backed paragraphs can be headings even without heading tags.
+Candidates include textual titles, numbered titles and standalone positive numbers,
+up to 240 characters. Existing semantic roles, footnote runs, images and formulas
+remain protected. Eligibility only authorizes contextual classification: ordinary
+short prose and emphasized sentences must not automatically become headings.
 
-The pass receives the normal body window and an ordered summary of up to 64
-nearby numeric candidates across that source section, with bounded excerpts from
-their immediate neighbors. Context-only IDs outside the target cannot be changed.
-Captions are recognized first, headings second, quotes last; accepted groups are
-protected in subsequent passes. Proposed headings receive a second, chapter-level
-audit using neighboring prose and the broader numbering pattern; only IDs
-accepted in both passes are installed. Review batches and excerpts are bounded.
-The audit cannot add new candidates, and errors preserve the original content. `section_heading` returns only an existing block
-ID. Validation enforces candidate eligibility, target ownership and non-overlap.
+The unified request supplies original bold/italic ratios, relative font size,
+alignment and paragraph margins for eligible text. Context determines whether the
+paragraph introduces the following topic. TOC entries, running headers, page
+numbers, lists/exercises, captions and quote credits are negative examples. Numeric
+candidates additionally receive a bounded summary of eight nearby numbers only when
+needed. Headings have no second model audit; local validation still checks source
+IDs, eligibility, scope and group conflicts.
 
-Annotations retain the canonical source range and compose after translation,
-changing the original and its bilingual companion to `Heading(3)` without
-rewriting text. Existing small-heading layout keeps the heading with following
-body content. Focus navigation skips it in both directions while it remains
-visible. No TOC entry or reading-unit boundary is created; disabling AI layout
-restores the ordinary paragraph. Prompt/schema fingerprinting invalidates old
-cached omissions when this recognition role is introduced.
+Accepted paragraphs use the existing level-3 small-heading presentation. Source
+anchors, text, authored TOC and translation block keys remain unchanged; bilingual
+companions receive the same heading role. No inferred heading hierarchy is added.
 
-The ignored `live_numbered_headings_and_book_page_numbers` test uses the configured
-model to recognize three independent synthetic numbered subsections, then checks
-the full third chapter of the local *Phantoms in the Brain* EPUB for false positives
-on residual page numbers. Set `TORTO_SEMANTIC_BOOK` and run with `--ignored`.
-Book passages remain test input, not production prompt examples. Synthetic recall
-and this one-book rejection check do not establish cross-book accuracy.
+The Markdown prompt is divided into shared rules and task-specific sections, with
+unused sections omitted per window. Schema field descriptions carry the output
+shape; detailed historical examples remain in tests rather than every request.
+The request fingerprint invalidates old cached classifications without changing
+the application release version.
+
+`local_tinnitus_plain_paragraph_heading` checks the photographed title in a local
+copy of *Living with Tinnitus and Hyperacusis* via `TORTO_HEADING_BOOK`, without model
+requests. The optional live-numbering regression remains available without a
+second review pass.
 
 ## Scheduling and persistence
 

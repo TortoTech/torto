@@ -573,6 +573,42 @@ fn section_input_block(section: &Section, index: usize) -> Value {
 
 const PROMPT: &str = include_str!("semantic_layout/prompt.md");
 
+fn window_prompt(
+    section: &Section,
+    roles: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+) -> String {
+    let mut out = String::new();
+    for part in PROMPT.split("\n## ") {
+        let enabled = if part.starts_with("Headings") {
+            roles.headings
+                && target
+                    .clone()
+                    .any(|i| headings::candidate(&section.blocks[i]).is_some())
+        } else if part.starts_with("Quotations") {
+            roles.quotes
+                && target.clone().any(|i| {
+                    paragraph(&section.blocks[i]).is_some()
+                        || unattributed_quote_body(&section.blocks[i]).is_some()
+                })
+        } else if part.starts_with("Captions") {
+            roles.captions && context.clone().any(|i| image_needs_caption(section, i))
+        } else if part.starts_with("Inline citations") {
+            !citations::window_candidates(section, target.clone()).is_empty()
+        } else {
+            true
+        };
+        if enabled {
+            if !out.is_empty() {
+                out.push_str("\n## ");
+            }
+            out.push_str(part);
+        }
+    }
+    out
+}
+
 fn request_contract_fingerprint() -> &'static str {
     static FINGERPRINT: LazyLock<String> = LazyLock::new(|| {
         digest(
@@ -1037,29 +1073,6 @@ async fn recognize_inner(
         }
         start = end;
     }
-    let proposed = annotations
-        .iter()
-        .filter_map(|annotation| {
-            let Annotation::SectionHeading { source: range } = annotation else {
-                return None;
-            };
-            section
-                .blocks
-                .iter()
-                .position(|block| source(block) == Some(range))
-        })
-        .collect::<Vec<_>>();
-    if !proposed.is_empty() {
-        let accepted = headings::review(&client, (provider, model), section, &proposed).await?;
-        annotations.retain(|annotation| {
-            let Annotation::SectionHeading { source: range } = annotation else {
-                return true;
-            };
-            accepted
-                .iter()
-                .any(|id| source(&section.blocks[*id]) == Some(range))
-        });
-    }
     let result = Recognition {
         formulas_checked,
         fingerprint,
@@ -1100,6 +1113,11 @@ fn unified_window_input(
     let blocks: Vec<_> = context
         .map(|index| {
             let mut block = section_input_block(section, index);
+            if headings::candidate(&section.blocks[index]).is_some()
+                && let Some(text) = paragraph(&section.blocks[index])
+            {
+                block["style"] = headings::style(text);
+            }
             let available: Vec<_> = candidates.iter().filter(|c| c.block == index).collect();
             block["citation_candidates"] = json!(
                 available
@@ -1120,12 +1138,20 @@ fn unified_window_input(
             block
         })
         .collect();
-    json!({"target_start":target.start,"target_end_exclusive":target.end,
+    let mut input = json!({"target_start":target.start,"target_end_exclusive":target.end,
         "quotes_enabled":config.quotes,"captions_enabled":config.captions,"headings_enabled":config.headings,
-        "numbered_candidates":headings::context(section,target.start),"blocks":blocks,
-        "targets":{"classify_blocks":target.clone().filter(|i|paragraph(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
-            "complete_quote_sources":target.filter(|i|unattributed_quote_body(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
-            "classify_citations":candidates.iter().map(|c|&c.id).collect::<Vec<_>>()}})
+        "blocks":blocks,
+        "targets":{"classify_headings":target.clone().filter(|i|headings::candidate(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),"classify_blocks":target.clone().filter(|i|paragraph(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
+            "complete_quote_sources":target.clone().filter(|i|unattributed_quote_body(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
+            "classify_citations":candidates.iter().map(|c|&c.id).collect::<Vec<_>>()}});
+    if config.headings
+        && target
+            .clone()
+            .any(|i| headings::number(&section.blocks[i]).is_some())
+    {
+        input["numbered_candidates"] = headings::context(section, target.start);
+    }
+    input
 }
 
 fn validate_citation_ids(
@@ -1175,7 +1201,7 @@ async fn request_groups(
 ) -> Result<WindowResult, String> {
     let (provider, model) = endpoint;
     let mut messages = vec![
-        json!({"role":"system","content":format!("{PROMPT}\n{}",citations::PROMPT.split("## Output").next().unwrap_or(citations::PROMPT))}),
+        json!({"role":"system","content":window_prompt(section, config, target.clone(), context.clone())}),
         json!({"role":"user","content":input.to_string()}),
     ];
     let candidates = citations::window_candidates(section, target.clone());

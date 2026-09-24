@@ -1,0 +1,129 @@
+[
+  {
+    "groups": [
+      {
+        "kind": "quote",
+        "body": [
+          2,
+          3
+        ],
+        "attribution": 4,
+        "alignment": "start"
+      }
+    ],
+    "citations": []
+  },
+  {
+    "groups": [
+      {
+        "kind": "quote",
+        "body": [
+          7
+        ],
+        "attribution": 8,
+        "alignment": "justify"
+      }
+    ],
+    "citations": []
+  },
+  {
+    "groups": [
+      {
+        "kind": "quote",
+        "body": [
+          10
+        ],
+        "attribution": 11,
+        "alignment": "justify"
+      }
+    ],
+    "citations": []
+  },
+  {
+    "groups": [
+      {
+        "kind": "quote_inline",
+        "body": [
+          21
+        ],
+        "credit": "— A poet",
+        "alignment": "center"
+      }
+    ],
+    "citations": []
+  },
+  {
+    "groups": [
+      {
+        "kind": "figure",
+        "images": [
+          30
+        ],
+        "captions": [
+          31
+        ]
+      }
+    ],
+    "citations": []
+  },
+  {
+    "groups": [
+      {
+        "kind": "quote_inline",
+        "body": [
+          40
+        ],
+        "credit": "— A poet",
+        "alignment": "center"
+      },
+      {
+        "kind": "quote",
+        "body": [
+          41
+        ],
+        "attribution": 42,
+        "alignment": "justify"
+      }
+    ],
+    "citations": []
+  },
+  {
+    "groups": [
+      {
+        "kind": "quote_attribution",
+        "quote": 50,
+        "attribution": 51,
+        "body_index": null
+      }
+    ],
+    "citations": []
+  },
+  {
+    "groups": [
+      {
+        "kind": "quote_attribution",
+        "quote": 60,
+        "attribution": null,
+        "body_index": 1
+      }
+    ],
+    "citations": []
+  },
+  {
+    "groups": [
+      {
+        "kind": "quote_before",
+        "body": [
+          71
+        ],
+        "attribution": 70,
+        "alignment": "justify"
+      }
+    ],
+    "citations": []
+  },
+  {
+    "groups": [],
+    "citations": []
+  }
+]

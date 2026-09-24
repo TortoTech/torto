@@ -2,7 +2,7 @@ use super::*;
 
 // Eligibility is deliberately lexical, not a claim that the number is a heading.
 // Page numbers pass this filter too; the model must distinguish their context.
-pub(super) fn candidate(block: &Block) -> Option<u32> {
+pub(super) fn number(block: &Block) -> Option<u32> {
     let text = text_block_text(paragraph(block)?);
     let text = text.trim();
     let number = text.strip_suffix(['.', ')', '．', '）']).unwrap_or(text);
@@ -12,17 +12,62 @@ pub(super) fn candidate(block: &Block) -> Option<u32> {
     number.parse().ok().filter(|number| *number > 0)
 }
 
+// Eligibility only; short prose also reaches the model for contextual rejection.
+pub(super) fn candidate(block: &Block) -> Option<()> {
+    let numeric = number(block).is_some();
+    let block = paragraph(block)?;
+    let value = text_block_text(block);
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > 240 {
+        return None;
+    }
+    if block.content.iter().any(|inline| match inline {
+        Inline::Text(run) => {
+            run.style.inline_role != rebook_publication::InlineRole::Normal
+                || run.style.link_role != rebook_publication::LinkRole::Normal
+        }
+        Inline::Math(_) | Inline::Image(_) => true,
+        _ => false,
+    }) {
+        return None;
+    }
+    (value.chars().any(char::is_alphabetic) || numeric).then_some(())
+}
+
+pub(super) fn style(block: &TextBlock) -> Value {
+    let mut total = 0.0_f64;
+    let mut bold = 0.0;
+    let mut italic = 0.0;
+    let mut size = 0.0;
+    for inline in &block.content {
+        if let Inline::Text(run) = inline {
+            let count = run.text.chars().filter(|c| !c.is_whitespace()).count() as f64;
+            total += count;
+            if run.style.bold {
+                bold += count;
+            }
+            if run.style.italic {
+                italic += count;
+            }
+            size += count * f64::from(run.style.size_scale);
+        }
+    }
+    let total = total.max(1.0);
+    json!({"bold_ratio":bold/total,"italic_ratio":italic/total,"relative_font_size":size/total,
+        "align":format!("{:?}",block.style.align),"margin_before":block.style.margin_before,"margin_after":block.style.margin_after})
+}
+
 pub(super) fn context(section: &Section, start: usize) -> Value {
     let mut candidates = section
         .blocks
         .iter()
         .enumerate()
-        .filter_map(|(id, block)| candidate(block).map(|number| (id, number)))
+        .filter_map(|(id, block)| number(block).map(|number| (id, number)))
         .collect::<Vec<_>>();
     let total = candidates.len();
     // Bound input size while exposing numbering beyond a single body window.
     candidates.sort_by_key(|(id, _)| id.abs_diff(start));
-    candidates.truncate(64);
+    candidates.truncate(8);
     candidates.sort_unstable();
     let excerpt = |index: Option<usize>, tail: bool| {
         let text = index
@@ -34,11 +79,11 @@ pub(super) fn context(section: &Section, start: usize) -> Value {
             .unwrap_or_default();
         let chars = text.chars().collect::<Vec<_>>();
         if tail {
-            chars[chars.len().saturating_sub(160)..]
+            chars[chars.len().saturating_sub(100)..]
                 .iter()
                 .collect::<String>()
         } else {
-            chars.into_iter().take(160).collect()
+            chars.into_iter().take(100).collect()
         }
     };
     json!({"total":total,"items":candidates.into_iter().map(|(id,number)| json!({
@@ -66,60 +111,6 @@ pub(super) fn compose(blocks: &mut [Block], range: &SourceRange) {
     {
         companion.kind = TextBlockKind::Heading(3);
     }
-}
-
-pub(super) async fn review(
-    client: &reqwest::Client,
-    endpoint: (&super::super::AiProvider, &str),
-    section: &Section,
-    proposed: &[usize],
-) -> Result<HashSet<usize>, String> {
-    let roles = RecognitionRoles {
-        quotes: false,
-        captions: false,
-        headings: true,
-    };
-    let mut accepted = HashSet::new();
-    // Review across recognition-window boundaries; bound unusually dense chapters.
-    for batch in proposed.chunks(32) {
-        let mut indices = HashSet::new();
-        for id in batch {
-            indices.extend(id.saturating_sub(2)..(*id + 3).min(section.blocks.len()));
-        }
-        let mut indices = indices.into_iter().collect::<Vec<_>>();
-        indices.sort_unstable();
-        let input = json!({
-            "target_start":0,"target_end_exclusive":section.blocks.len(),
-            "quotes_enabled":false,"captions_enabled":false,"headings_enabled":true,
-            "review_only":true,"proposed_headings":batch,
-            "numbered_candidates":context(section,batch[0]),
-            "blocks":indices.into_iter().map(|id| {
-                let mut block = section_input_block(section,id);
-                if let Some(text) = block["text"].as_str() {
-                    block["text"] = json!(text.chars().take(600).collect::<String>());
-                }
-                block
-            }).collect::<Vec<_>>()
-        });
-        let result = request_groups(
-            client,
-            endpoint,
-            &input,
-            section,
-            &roles,
-            0..section.blocks.len(),
-            0..section.blocks.len(),
-        )
-        .await?;
-        for group in result.groups {
-            if let Proposal::SectionHeading { block } = group
-                && batch.contains(&block)
-            {
-                accepted.insert(block);
-            }
-        }
-    }
-    Ok(accepted)
 }
 
 #[cfg(test)]

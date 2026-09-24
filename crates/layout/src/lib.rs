@@ -2771,7 +2771,11 @@ fn resolve_semantic_inline_presentation(
             content.push(inline);
             continue;
         };
-        if !run.style.emphasis && !run.style.alternate_voice && !run.style.citation {
+        if !run.style.emphasis
+            && !run.style.alternate_voice
+            && !run.style.citation
+            && !run.style.italic
+        {
             content.push(Inline::Text(run));
             continue;
         }
@@ -2782,7 +2786,10 @@ fn resolve_semantic_inline_presentation(
         }
         for (range, script) in spans {
             let mut style = run.style;
-            let emphasized = style.emphasis || style.alternate_voice;
+            // CSS-only italics carry visual emphasis too. Adapt CJK spans to
+            // bold, while semantic citations retain their existing neutral rule.
+            let emphasized =
+                style.emphasis || style.alternate_voice || (style.italic && !style.citation);
             match script {
                 SemanticScriptClass::Cjk => {
                     if emphasized {
@@ -4555,6 +4562,60 @@ mod tests {
             runs.iter().any(|run| {
                 run.text.contains("杂志") && run.style.citation && !run.style.italic
             })
+        );
+    }
+
+    #[test]
+    fn unified_css_italics_become_bold_for_chinese_translation_only() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "\u{63a8}\u{8350}\u{5e8f} Scott Mitchell \u{524d}\u{8a00}".into(),
+                style: TextStyle {
+                    italic: true,
+                    display_writing_system: Some(WritingSystem::Cjk),
+                    ..Default::default()
+                },
+                link: Some(PublicationUrl::parse("preface.xhtml").unwrap()),
+            })],
+            style: Default::default(),
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            writing_system: WritingSystem::Latin,
+            ..Default::default()
+        };
+        let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+        let runs: Vec<_> = resolved
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            runs.iter()
+                .any(|run| run.text.contains("\u{63a8}\u{8350}\u{5e8f}")
+                    && run.style.bold
+                    && !run.style.italic)
+        );
+        assert!(
+            runs.iter().any(|run| run.text.contains("Scott Mitchell")
+                && !run.style.bold
+                && run.style.italic)
+        );
+        assert!(runs.iter().any(|run| run.text.contains("\u{524d}\u{8a00}")
+            && run.style.bold
+            && !run.style.italic));
+        assert!(
+            runs.iter()
+                .all(|run| run.link.as_ref().unwrap().path() == "preface.xhtml")
+        );
+        let book = resolve_text_block(&block, &ReaderStyle::default(), TextContext::Flow);
+        assert!(
+            matches!(&book.content[0],Inline::Text(run) if run.style.italic && !run.style.bold)
         );
     }
 

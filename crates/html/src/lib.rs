@@ -14,6 +14,7 @@ use roxmltree::{Document, Node};
 use thiserror::Error;
 
 mod font_size;
+mod nested_media;
 mod table_captions;
 use font_size::FontSize;
 
@@ -315,6 +316,7 @@ struct ReadingIrParser<'a> {
     paragraph_list_indents: Vec<f32>,
     suppressed_content: bool,
     inside_quote: bool,
+    inside_nested_media: bool,
     inside_note_definition: bool,
     is_decorative_separator_image: &'a mut dyn FnMut(&PublicationUrl) -> bool,
 }
@@ -340,6 +342,7 @@ impl<'a> ReadingIrParser<'a> {
             paragraph_list_indents: Vec::new(),
             suppressed_content: false,
             inside_quote: false,
+            inside_nested_media: false,
             inside_note_definition: false,
             is_decorative_separator_image,
         }
@@ -508,6 +511,7 @@ impl<'a> ReadingIrParser<'a> {
         let text_style = self
             .styles
             .text_style_for_block(container, TextBlockKind::Paragraph);
+        let inherited_link = nested_media::ancestor_link(container, &self.section_href);
         let mut collector = InlineCollector::new(false);
         let inline_caption = container
             .tag_name()
@@ -559,6 +563,20 @@ impl<'a> ReadingIrParser<'a> {
                 index += 1;
                 continue;
             }
+            if self.inside_nested_media
+                && child.is_element()
+                && nested_media::contains_blocks(child)
+            {
+                self.push_collected_text_block(
+                    TextBlockKind::Paragraph,
+                    style,
+                    std::mem::replace(&mut collector, InlineCollector::new(false)),
+                );
+                self.queue_node_anchors(child);
+                self.parse_block_container(child)?;
+                index += 1;
+                continue;
+            }
             if child.is_element() && has_descendant_image(child) && !inline_caption {
                 self.push_collected_text_block(
                     TextBlockKind::Paragraph,
@@ -577,7 +595,7 @@ impl<'a> ReadingIrParser<'a> {
             collect_inline_node(
                 child,
                 text_style,
-                None,
+                inherited_link.as_ref(),
                 &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
                     .with_inline_images(inline_caption),
                 &mut collector,
@@ -791,6 +809,9 @@ impl<'a> ReadingIrParser<'a> {
         if matches!(name.as_str(), "p" | "div") && self.try_parse_symbol_separator(node)? {
             return Ok(());
         }
+        if name == "p" && self.try_parse_nested_media(node)? {
+            return Ok(());
+        }
         match name.as_str() {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let level = name[1..].parse::<u8>().unwrap_or(1);
@@ -834,7 +855,11 @@ impl<'a> ReadingIrParser<'a> {
                                 .mul_add(1_000.0, style.margin_start);
                             indent > *root + 4.0
                         });
-                    let kind = if has_marker || markerless_nested_item {
+                    let kind = if self.inside_nested_media
+                        && is_inferred_figure_caption(node, &self.styles)
+                    {
+                        TextBlockKind::Caption
+                    } else if has_marker || markerless_nested_item {
                         TextBlockKind::ListItem {
                             ordered: false,
                             ordinal: 1,
@@ -1612,12 +1637,13 @@ impl<'a> ReadingIrParser<'a> {
         // authored text flow whenever this container also carries prose; an
         // image-only paragraph remains a semantic block even when the resource
         // itself is only a few pixels high (a common display-equation pattern).
+        let inherited_link = nested_media::ancestor_link(node, &self.section_href);
         let inline_images = node_has_visible_text(node);
         let mut collector = InlineCollector::new(matches!(kind, TextBlockKind::Preformatted));
         collect_inline(
             node,
             self.styles.text_style_for_block(node, kind),
-            None,
+            inherited_link.as_ref(),
             &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
                 .with_inline_images(inline_images),
             &mut collector,
@@ -1975,6 +2001,7 @@ fn has_caption_semantic_attribute(node: Node<'_, '_>) -> bool {
         matches!(
             token.as_str(),
             "caption"
+                | "captions"
                 | "fcaption"
                 | "figcaption"
                 | "figurecaption"

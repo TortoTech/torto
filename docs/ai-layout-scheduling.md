@@ -113,4 +113,4 @@ client-owned original source ranges; models never generate character offsets.
 The two result sets are independently checked, and safe partial results survive a
 failed retry. Window caches store both arrays. The request-contract fingerprint
 invalidates incompatible old text recognition caches without a release version bump.
-Formula-image batches and the existing proposed-heading review remain separate.
+Formula-image batches remain separate. Headings are finalized in the unified request; there is no second heading review.

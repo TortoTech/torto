@@ -24,8 +24,7 @@ fn live_numbered_headings_and_book_page_numbers() {
             let end = window_end(section, start);
             let lo = start.saturating_sub(OVERLAP);
             let hi = (end + OVERLAP).min(section.blocks.len());
-            let input = json!({"target_start":start,"target_end_exclusive":end,
-                "blocks":(lo..hi).map(|i| section_input_block(section,i)).collect::<Vec<_>>()});
+            let input = unified_window_input(section, &roles, start..end, lo..hi, &[]);
             let result = runtime
                 .block_on(request_window_groups(
                     &client,
@@ -41,11 +40,6 @@ fn live_numbered_headings_and_book_page_numbers() {
             groups.extend(result.groups);
             start = end;
         }
-        let proposed = groups.iter().flat_map(proposal_ids).collect::<Vec<_>>();
-        let accepted = runtime
-            .block_on(review(&client, endpoint, section, &proposed))
-            .unwrap();
-        groups.retain(|group| proposal_ids(group).iter().all(|id| accepted.contains(id)));
         groups
     };
     // Independent synthetic positive; never included in the production prompt.
@@ -124,7 +118,7 @@ fn headings_validate_ids_roles_and_conflicts() {
             &[Proposal::SectionHeading { block: 1 }],
             &RecognitionRoles::default()
         )
-        .is_err()
+        .is_ok()
     );
     assert!(
         validate(
@@ -170,7 +164,7 @@ fn headings_validate_ids_roles_and_conflicts() {
     for value in ["1", "12.", "3)"] {
         assert!(candidate(&text("n", value)).is_some());
     }
-    for value in ["", "0", "1.2", "-2", "2024 report", "1.."] {
+    for value in ["", "0", "1.2", "-2", "1.."] {
         assert!(candidate(&text("n", value)).is_none(), "{value}");
     }
     let mut protected = text("h", "2");
@@ -190,7 +184,7 @@ fn numbering_context_reaches_across_windows_and_is_bounded() {
     let summary = context(&section, 50);
     let items = summary["items"].as_array().unwrap();
     assert_eq!(summary["total"], 100);
-    assert_eq!(items.len(), 64);
+    assert_eq!(items.len(), 8);
     assert!(items.first().unwrap()["id"].as_u64().unwrap() < 50);
     assert!(items.last().unwrap()["id"].as_u64().unwrap() > 50);
 }
@@ -261,4 +255,106 @@ fn headings_preserve_translation_sources_toc_and_toggle() {
         result.annotations
     );
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn textual_candidates_use_original_styles_and_keep_protected_roles() {
+    let title = "Historical background to medical knowledge and treatments";
+    let mut heading = text("h", title);
+    if let Block::Text(t) = &mut heading {
+        if let Inline::Text(run) = &mut t.content[0] {
+            run.style.bold = true;
+        }
+        t.style.margin_before = 24.0;
+    }
+    assert!(candidate(&heading).is_some());
+    for title in [
+        "2024 report",
+        "1.2 Background",
+        "Why does this happen?",
+        "\u{5386}\u{53f2}\u{80cc}\u{666f}",
+    ] {
+        assert!(candidate(&text("t", title)).is_some());
+    }
+    for kind in [
+        TextBlockKind::Heading(2),
+        TextBlockKind::Caption,
+        TextBlockKind::Blockquote,
+        TextBlockKind::QuoteAttribution,
+        TextBlockKind::ListItem {
+            ordered: false,
+            ordinal: 1,
+            depth: 0,
+            marker_visible: true,
+        },
+    ] {
+        let mut protected = heading.clone();
+        if let Block::Text(t) = &mut protected {
+            t.kind = kind;
+        }
+        assert!(candidate(&protected).is_none());
+    }
+    assert!(candidate(&text("long", &"x".repeat(241))).is_none());
+    let section = section(vec![
+        heading,
+        text(
+            "body",
+            "This passage discusses the history of medical understanding.",
+        ),
+    ]);
+    let input = unified_window_input(&section, &RecognitionRoles::default(), 0..1, 0..2, &[]);
+    assert_eq!(input["blocks"][0]["style"]["bold_ratio"], 1.0);
+    assert_eq!(input["blocks"][0]["style"]["margin_before"], 24.0);
+    assert_eq!(input["targets"]["classify_headings"], json!([0]));
+    assert!(input.get("numbered_candidates").is_none());
+    let prompt = window_prompt(&section, &RecognitionRoles::default(), 0..1, 0..2);
+    assert!(prompt.contains("## Headings"));
+    assert!(!prompt.contains("## Captions"));
+    assert!(!prompt.contains("## Inline citations"));
+    assert!(PROMPT.chars().count() < 7000);
+}
+
+#[test]
+#[ignore = "requires TORTO_HEADING_BOOK local EPUB; no model requests"]
+fn local_tinnitus_plain_paragraph_heading() {
+    let book = rebook_formats::open_file(std::env::var("TORTO_HEADING_BOOK").unwrap()).unwrap();
+    let source = book.source();
+    let index = source
+        .book()
+        .sections
+        .iter()
+        .position(|s| s.href.path().ends_with("9781847091666_epub-10.html"))
+        .unwrap();
+    let section = source.parse_section(index).unwrap();
+    let id=section.blocks.iter().position(|block| matches!(block,Block::Text(t) if text_block_text(t)=="Historical background to medical knowledge and treatments")).unwrap();
+    assert!(candidate(&section.blocks[id]).is_some());
+    let input = unified_window_input(
+        &section,
+        &RecognitionRoles::default(),
+        id..id + 1,
+        id.saturating_sub(1)..(id + 2).min(section.blocks.len()),
+        &[],
+    );
+    let block = input["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["id"] == id)
+        .unwrap();
+    assert_eq!(block["style"]["bold_ratio"], 1.0);
+    let proposal = Proposal::SectionHeading { block: id };
+    validate_window(
+        &[proposal.clone()],
+        &section,
+        &RecognitionRoles::default(),
+        id..id + 1,
+        id..id + 1,
+    )
+    .unwrap();
+    let mut displayed = section.clone();
+    super::super::compose(&mut displayed.blocks, &annotation(&proposal, &section));
+    assert!(matches!(&displayed.blocks[id],Block::Text(t) if t.kind==TextBlockKind::Heading(3)));
+    println!(
+        "book section={index} block={id}; original plain paragraph becomes eligible with original bold styling"
+    );
 }

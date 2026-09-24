@@ -875,11 +875,9 @@ fn window_ownership_prevents_duplicate_groups_and_protected_boundaries_cannot_be
 
 #[test]
 fn structured_prompt_examples_match_the_output_types() {
-    let examples = PROMPT.split("```json").skip(1).collect::<Vec<_>>();
+    let examples: Vec<Value> = serde_json::from_str(include_str!("prompt_examples.json")).unwrap();
     assert!(!examples.is_empty());
-    for example in examples {
-        let value: Value =
-            serde_json::from_str(example.split("```").next().unwrap().trim()).unwrap();
+    for value in examples {
         for group in value["groups"].as_array().unwrap() {
             if group["kind"] == "quote" {
                 assert!(group.get("alignment").is_some());
@@ -999,7 +997,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
                 request["messages"][0]["content"]
                     .as_str()
                     .unwrap()
-                    .starts_with(PROMPT)
+                    .starts_with("# AI layout")
             );
             let input: Value =
                 serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
