@@ -16,9 +16,8 @@ Only `quote_inline` may split text, by copying an exact terminal credit suffix.
 Recognize ordinary paragraphs acting as section titles: textual titles, numbered
 titles and standalone numbers. Return `section_heading` with an ID from
 `targets.classify_headings`. Eligibility is NOT evidence of heading status.
-A title introduces a topic or organizes the following passage. Read both adjacent
-paragraphs. Original `style` summarizes bold/italic ratios, relative font size,
-alignment and spacing; these support a decision but are neither required nor
+Read both adjacent paragraphs. Original `style` summarizes bold/italic ratios,
+relative font size, alignment and spacing; these support a decision but are neither required nor
 sufficient. Do not promote an emphasized sentence solely because it is bold,
 short, centered or isolated. Questions can be titles when the next passage answers
 them as a new topic. Preserve the title verbatim; do not infer heading levels.

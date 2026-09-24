@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const MAX_CHARS: usize = 120;
+
 // Eligibility is deliberately lexical, not a claim that the number is a heading.
 // Page numbers pass this filter too; the model must distinguish their context.
 pub(super) fn number(block: &Block) -> Option<u32> {
@@ -18,7 +20,7 @@ pub(super) fn candidate(block: &Block) -> Option<()> {
     let block = paragraph(block)?;
     let value = text_block_text(block);
     let value = value.trim();
-    if value.is_empty() || value.chars().count() > 240 {
+    if value.is_empty() || value.chars().count() > MAX_CHARS {
         return None;
     }
     if block.content.iter().any(|inline| match inline {

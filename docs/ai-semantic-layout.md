@@ -76,7 +76,7 @@ ebook split them into several paragraphs. Authored book-mode alignment is retain
 
 Ordinary source-backed paragraphs can be headings even without heading tags.
 Candidates include textual titles, numbered titles and standalone positive numbers,
-up to 240 characters. Existing semantic roles, footnote runs, images and formulas
+up to 120 characters. Existing semantic roles, footnote runs, images and formulas
 remain protected. Eligibility only authorizes contextual classification: ordinary
 short prose and emphasized sentences must not automatically become headings.
 

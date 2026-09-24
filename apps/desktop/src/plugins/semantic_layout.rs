@@ -634,6 +634,7 @@ fn request_contract_fingerprint() -> &'static str {
                 }),
                 WINDOW_CHARS,
                 WINDOW_BLOCKS,
+                headings::MAX_CHARS,
                 OVERLAP
             ]))
             .expect("request contract serializes"),

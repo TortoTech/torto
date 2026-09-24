@@ -3,6 +3,8 @@
 #[cfg(test)]
 mod blank_lines_tests;
 mod citations;
+#[cfg(test)]
+mod table_focus_tests;
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -97,6 +99,8 @@ struct InlineContentRegion {
 struct TableRegion {
     bounds: Rect,
     sources: Vec<SourceRange>,
+    continued_before: bool,
+    continued_after: bool,
 }
 
 #[derive(Clone)]
@@ -780,6 +784,28 @@ impl PageDisplayList {
         }
     }
 
+    /// Highlights a table's surrounding captions and notes, leaving its cells
+    /// to the block-level activation outline.
+    pub fn paint_source_table_annotations(
+        &self,
+        scene: &mut impl PaintScene,
+        ranges: &[SourceRange],
+        color: Color,
+        offset_x: f32,
+    ) {
+        let annotations = ranges
+            .iter()
+            .filter(|range| {
+                !self
+                    .table_regions
+                    .iter()
+                    .any(|table| table.sources.contains(range))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.paint_source_ranges(scene, &annotations, color, offset_x);
+    }
+
     /// Paints compact footnote icons for the active focus-mode source ranges.
     pub fn paint_footnote_icons(
         &self,
@@ -829,33 +855,32 @@ impl PageDisplayList {
         offset_x: f32,
     ) {
         let transform = Affine::translate((f64::from(offset_x), 0.0));
-        let first = ranges.first();
-        let last = ranges.last();
         for table in &self.table_regions {
             if table
                 .sources
                 .iter()
                 .any(|source| ranges.iter().any(|range| range == source))
             {
-                let left = table.bounds.x0;
-                let top = table.bounds.y0;
-                let right = table.bounds.x1;
-                let bottom = table.bounds.y1;
-                let contains = |range: Option<&SourceRange>| {
-                    range.is_some_and(|range| table.sources.iter().any(|source| source == range))
-                };
+                // Strokes are centered on their paths. Shift each outer edge
+                // by half the width so activation never covers table content.
+                let stroke = Stroke::new(2.0);
+                let outset = stroke.width / 2.0;
+                let left = table.bounds.x0 - outset;
+                let top = table.bounds.y0 - if table.continued_before { 0.0 } else { outset };
+                let right = table.bounds.x1 + outset;
+                let bottom = table.bounds.y1 + if table.continued_after { 0.0 } else { outset };
                 let mut edges = vec![
                     Line::new((left, top), (left, bottom)),
                     Line::new((right, top), (right, bottom)),
                 ];
-                if contains(first) {
+                if !table.continued_before {
                     edges.push(Line::new((left, top), (right, top)));
                 }
-                if contains(last) {
+                if !table.continued_after {
                     edges.push(Line::new((left, bottom), (right, bottom)));
                 }
                 for edge in edges {
-                    scene.stroke(&Stroke::new(2.0), transform, color, None, &edge);
+                    scene.stroke(&stroke, transform, color, None, &edge);
                 }
             }
         }
@@ -2056,7 +2081,12 @@ fn table_region(table: &TablePlacement) -> Option<TableRegion> {
         .iter()
         .filter_map(|cell| cell.text.as_ref()?.source.clone())
         .collect();
-    Some(TableRegion { bounds, sources })
+    Some(TableRegion {
+        bounds,
+        sources,
+        continued_before: table.continued_before,
+        continued_after: table.continued_after,
+    })
 }
 
 fn compile_table_commands(

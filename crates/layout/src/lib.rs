@@ -754,6 +754,8 @@ pub struct TablePlacement {
     pub cells: Vec<TableCellPlacement>,
     pub y: f32,
     pub height: f32,
+    pub continued_before: bool,
+    pub continued_after: bool,
     pub border: Rgba,
     pub header_fill: Rgba,
 }
@@ -4105,6 +4107,8 @@ impl Paginator {
             cells,
             y: table_y,
             height,
+            continued_before: row_start > 0,
+            continued_after: row_end < table.row_heights.len(),
             border: table.border,
             header_fill: table.header_fill,
         }));
@@ -7263,6 +7267,20 @@ mod tests {
                         &style,
                     )
                     .unwrap();
+                let chunks = layout
+                    .pages
+                    .iter()
+                    .flat_map(|page| &page.items)
+                    .filter_map(|item| match item {
+                        PageItem::Table(table) => Some(table),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(!chunks.is_empty());
+                for (index, chunk) in chunks.iter().enumerate() {
+                    assert_eq!(chunk.continued_before, index > 0);
+                    assert_eq!(chunk.continued_after, index + 1 < chunks.len());
+                }
                 let mut caption_count = 0;
                 for page in &layout.pages {
                     for (index, item) in page.items.iter().enumerate() {

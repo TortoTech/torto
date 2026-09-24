@@ -69,8 +69,9 @@ pub fn sentence_byte_ranges_with_language(text: &str, language_hint: &str) -> Ve
     ranges
 }
 
-/// Protect only the interior of dotted initials. The last dot remains eligible
-/// as a sentence boundary, and separate paragraphs must never be joined.
+/// Protect dotted initials and their connection to a Chinese transliterated
+/// name. Otherwise the last dot remains eligible as a sentence boundary, and
+/// separate paragraphs must never be joined.
 fn initialism_byte_ranges(text: &str) -> Vec<Range<usize>> {
     let chars = text.char_indices().collect::<Vec<_>>();
     let mut ranges = Vec::new();
@@ -103,12 +104,34 @@ fn initialism_byte_ranges(text: &str) -> Vec<Range<usize>> {
                 cursor += 1;
             }
         }
-        if initials >= 2 {
+        if let Some(name_end) = transliterated_name_prefix_end(&chars, cursor) {
+            // Translation spacing can produce “由R.布鲁斯·林赛”. SentenceX's
+            // whitespace-based word lookup then misses the initial. Include
+            // the following name prefix so the initial's last dot is protected
+            // too, without hiding any punctuation after the name.
+            ranges.push(chars[start].0..chars.get(name_end).map_or(text.len(), |(byte, _)| *byte));
+        } else if initials >= 2 {
             ranges.push(chars[start].0..chars.get(end).map_or(text.len(), |(byte, _)| *byte));
         }
         index = end;
     }
     ranges
+}
+
+fn transliterated_name_prefix_end(chars: &[(usize, char)], start: usize) -> Option<usize> {
+    let is_han = |character: char| matches!(character, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}' | '\u{20000}'..='\u{2fa1f}');
+    let mut index = start;
+    while chars.get(index).is_some_and(|(_, ch)| is_han(*ch)) {
+        index += 1;
+    }
+    // A name separator between Han components supplies positive evidence;
+    // an initial before arbitrary Chinese prose (e.g. “选项A. 下一句”) does not.
+    (index > start
+        && chars
+            .get(index)
+            .is_some_and(|(_, ch)| matches!(ch, '·' | '・' | '‧'))
+        && chars.get(index + 1).is_some_and(|(_, ch)| is_han(*ch)))
+    .then_some(index + 2)
 }
 
 /// Returns sentence ranges as Unicode scalar indices. This is used by derived
@@ -5329,6 +5352,76 @@ mod tests {
                 .map(|range| &text[range.clone()])
                 .collect::<Vec<_>>(),
             ["Read C. O. D. ", "Then continue."]
+        );
+    }
+
+    #[test]
+    fn translated_caption_sentence_ranges_keep_name_initials_with_chinese_names() {
+        let expected = [
+            "图P.2由R.布鲁斯·林赛绘制的图表，展示了声学领域的覆盖范围与广度。",
+            "本书重点深入探讨的主题以深蓝色高亮标出，部分涉及的主题则以浅蓝色标出。",
+            "改编自R.布鲁斯·林赛所著《声学：历史与哲学发展》，道登、哈钦森与罗斯出版公司，宾夕法尼亚州斯特劳兹堡，1973年。",
+        ];
+        let text = expected.concat();
+        let ranges = sentence_byte_ranges_with_language(&text, "en");
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| &text[range.clone()])
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let chars = text.chars().collect::<Vec<_>>();
+        assert_eq!(
+            sentence_char_ranges(&text, "en")
+                .into_iter()
+                .map(|range| chars[range].iter().collect::<String>())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn transliterated_initials_preserve_real_sentence_and_paragraph_boundaries() {
+        for name in [
+            "R.布鲁斯·林赛",
+            "R. 布鲁斯·林赛",
+            "R.\u{a0}布鲁斯·林赛",
+            "J. R. R.约翰·托尔金",
+            "H.汉斯‧克里斯蒂安",
+        ] {
+            let first = format!("由{name}绘制，数值为3.14。");
+            let text = format!("{first}下一句。");
+            let sentences = sentence_byte_ranges_with_language(&text, "en-US");
+            assert_eq!(
+                sentences
+                    .iter()
+                    .map(|range| &text[range.clone()])
+                    .collect::<Vec<_>>(),
+                [first.as_str(), "下一句。"],
+                "{name}"
+            );
+        }
+        for text in [
+            "答案为A. 下一句。",
+            "R.\n布鲁斯·林赛",
+            "R.\r\n布鲁斯·林赛",
+            "R.\u{2028}布鲁斯·林赛",
+            "wordR.布鲁斯·林赛",
+            "3.14",
+        ] {
+            assert!(initialism_byte_ranges(text).is_empty(), "{text}");
+        }
+        let text = "改编自R.布鲁斯·林赛。下一句。";
+        let ranges = sentence_byte_ranges_with_language(text, "en");
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(text[ranges[0].clone()].chars().last(), Some('。'));
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| &text[range.clone()])
+                .collect::<String>(),
+            text
         );
     }
 

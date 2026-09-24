@@ -678,7 +678,7 @@ impl crate::highlights::HighlightRepository for EmptyHighlights {
     }
 }
 
-fn fixture() -> (DesktopReader, Section, SourceRange) {
+pub(in crate::reader) fn fixture() -> (DesktopReader, Section, SourceRange) {
     fixture_with_numbered_heading(false)
 }
 

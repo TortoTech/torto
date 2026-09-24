@@ -995,8 +995,7 @@ impl DesktopReader {
         // dismissal before any underlying panel can consume Escape.
         if self.image_preview.is_some() {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-                self.image_preview = None;
-                ctx.request_repaint();
+                self.close_image_preview(ctx);
             }
             return;
         }
@@ -4293,8 +4292,18 @@ impl DesktopReader {
             bounds,
             2.0,
             egui::Stroke::new(2.0, stroke),
-            egui::StrokeKind::Inside,
+            egui::StrokeKind::Outside,
         );
+    }
+
+    fn close_image_preview(&mut self, ctx: &egui::Context) {
+        self.image_preview = None;
+        // Opening the preview clears the image selection used by the border.
+        // Restore it from the current focus unit without moving the reader.
+        if self.is_focus_mode() {
+            self.sync_focus_selected_image();
+        }
+        ctx.request_repaint();
     }
 
     fn image_preview_overlay(&mut self, ctx: &egui::Context) {
@@ -4353,8 +4362,7 @@ impl DesktopReader {
             ctx.request_repaint();
         }
         if close {
-            self.image_preview = None;
-            ctx.request_repaint();
+            self.close_image_preview(ctx);
         }
     }
 
@@ -6784,6 +6792,78 @@ mod reference_suggestion_label_tests {
             constrained_panel_widths(720.0, SIDEBAR_MAX_WIDTH, ASSISTANT_MAX_WIDTH, false, true,),
             (SIDEBAR_MAX_WIDTH, 520.0)
         );
+    }
+
+    #[test]
+    fn closing_image_preview_restores_focus_border_for_escape_and_backdrop() {
+        for escape in [true, false] {
+            let (mut reader, _, _) = super::super::semantic_layout::tests::fixture();
+            let layout = reader.current_scroll_layout().unwrap();
+            reader.rebuild_focus_units(&layout);
+            let index = reader
+                .focus_units
+                .iter()
+                .position(|unit| unit.is_image)
+                .unwrap();
+            reader.select_focus_unit(index);
+            let selected = reader.selected_image.as_ref().unwrap();
+            let bounds = selected.bounds;
+            let position = selected.position;
+            let pixels = selected.color_image();
+            let target_offset = reader.focus_target_offset;
+            let ctx = egui::Context::default();
+            reader.open_color_image_preview(&ctx, pixels, "focus-preview-regression");
+            assert!(reader.selected_image.is_none());
+
+            let mut frame = |events| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        reader.keyboard_shortcuts(ui.ctx(), false);
+                        reader.image_preview_overlay(ui.ctx());
+                    },
+                );
+                output.textures_delta.clear();
+            };
+            frame(vec![]);
+            frame(vec![]);
+            if escape {
+                frame(vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }]);
+            } else {
+                let pos = Pos2::new(10.0, 10.0);
+                for pressed in [true, false] {
+                    frame(vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]);
+                }
+            }
+            assert!(reader.image_preview.is_none(), "preview must close");
+            assert_eq!(reader.focus_unit_index, index);
+            assert_eq!(reader.focus_target_offset, target_offset);
+            let restored = reader
+                .selected_image
+                .as_ref()
+                .expect("focus border restored");
+            assert_eq!(restored.bounds, bounds);
+            assert_eq!(restored.position, position);
+            assert!(restored.scroll_mode);
+        }
     }
 
     #[test]

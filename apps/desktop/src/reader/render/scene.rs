@@ -201,6 +201,11 @@ impl DesktopReader {
             page_scene.append(&layers.underlay, None);
             self.paint_page_overlays(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
             page_scene.append(&layers.content, None);
+            page_scene.pop_layer();
+            // Outer activation strokes may extend past the first/last content
+            // row. Keep the content clip intact and allow only the border out.
+            let border_clip = Rect::new(clip.x0, clip.y0 - 2.0, clip.x1, clip.y1 + 2.0);
+            page_scene.push_clip_layer(peniko::Fill::NonZero, Affine::IDENTITY, &border_clip);
             self.paint_focus_table_border(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
             page_scene.pop_layer();
             scene.append(
@@ -380,10 +385,18 @@ impl DesktopReader {
         }
         if let Some(unit) = focus_unit
             && activation_visible
-            && !unit.is_table
             && !unit.rectangular_activation
         {
-            page.paint_source_ranges(scene, &unit.paint_ranges, TEXT_SELECTION_COLOR, offset_x);
+            if unit.is_table {
+                page.paint_source_table_annotations(
+                    scene,
+                    &unit.paint_ranges,
+                    TEXT_SELECTION_COLOR,
+                    offset_x,
+                );
+            } else {
+                page.paint_source_ranges(scene, &unit.paint_ranges, TEXT_SELECTION_COLOR, offset_x);
+            }
         }
     }
 

@@ -877,4 +877,4 @@ impl DesktopReader {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::reader) mod tests;
