@@ -55,6 +55,7 @@ struct StoredBlockTranslation {
 
 #[derive(Default)]
 struct TranslationState {
+    formula_inputs: HashMap<(usize, usize), (Block, Block)>,
     target_writing_system: rebook_publication::WritingSystem,
     enabled: bool,
     mode: TranslationMode,
@@ -181,12 +182,35 @@ impl TranslationBookSource {
         self.fixed_page_replacement_only.load(Ordering::Acquire)
     }
 
+    pub(crate) fn remember_formula_input(
+        &self,
+        section: usize,
+        index: usize,
+        raw: &Block,
+        prepared: &Block,
+    ) {
+        let mut prepared = prepared.clone();
+        let mut has_math = false;
+        visit_note_text_blocks_mut(&mut prepared, &mut 0, &mut |_, text| {
+            has_math |= text
+                .content
+                .iter()
+                .any(|i| matches!(i,Inline::Math(m) if m.original.is_some()));
+        });
+        if has_math && let Ok(mut state) = self.state.write() {
+            state
+                .formula_inputs
+                .insert((section, index), (raw.clone(), prepared));
+        }
+    }
+
     pub fn clear(&self) -> Result<(), String> {
-        self.state
+        let mut state = self
+            .state
             .write()
-            .map_err(|_| "正文翻译状态已损坏".to_owned())?
-            .sections
-            .clear();
+            .map_err(|_| "Translation state poisoned".to_owned())?;
+        state.sections.clear();
+        state.formula_inputs.clear();
         Ok(())
     }
 
@@ -278,6 +302,23 @@ impl TranslationBookSource {
             .insert(section_index, values);
         Ok(())
     }
+}
+
+fn formula_input_matches(block: &Block, translation: &StoredBlockTranslation) -> bool {
+    let mut block = block.clone();
+    let whole = matches!(block, Block::Text(_));
+    let mut valid = true;
+    visit_note_text_blocks_mut(&mut block, &mut 0, &mut |index, text| {
+        if let Some(translated) = if whole {
+            translation.whole.as_ref()
+        } else {
+            translation.segments.get(&index)
+        } {
+            valid &=
+                validate_translation_math_placeholders(&translation_text(text), translated).is_ok();
+        }
+    });
+    valid
 }
 
 fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockInput> {
@@ -619,6 +660,13 @@ impl BookSource for TranslationBookSource {
                 rendered.push(block);
                 continue;
             };
+            let block = state
+                .formula_inputs
+                .get(&(index, block_index))
+                .filter(|(raw, prepared)| {
+                    raw == &block && formula_input_matches(prepared, translation)
+                })
+                .map_or(block, |(_, prepared)| prepared.clone());
             match block {
                 Block::Text(mut original) => {
                     let Some(translation) = translation.whole.as_deref() else {
@@ -1195,6 +1243,7 @@ fn translation_text(block: &TextBlock) -> String {
     let mut text = String::new();
     let mut math_index = 0;
     let mut citation = 0;
+    let mut website = 0;
     for inline in &block.content {
         let next = match inline {
             Inline::Text(run) => run.style.inline_citation,
@@ -1210,6 +1259,16 @@ fn translation_text(block: &TextBlock) -> String {
             citation = next;
         }
         match inline {
+            Inline::Text(run)
+                if run
+                    .link
+                    .as_ref()
+                    .and_then(PublicationUrl::website_url)
+                    .is_some() =>
+            {
+                text.push_str(&format!("<torto-web-{website}/>"));
+                website += 1;
+            }
             Inline::Text(run) => push_translation_style_markup(&mut text, run),
             Inline::Math(_) => {
                 push_math_placeholder(&mut text, math_index);
@@ -1358,6 +1417,10 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
         // formulas to the model as `$...$`.
         return original.to_vec();
     }
+    let website_count = original.iter().filter(|inline| matches!(inline, Inline::Text(run) if run.link.as_ref().and_then(PublicationUrl::website_url).is_some())).count();
+    if website_count > 0 && web_placeholder_ids(&text).ok() != Some((0..website_count).collect()) {
+        return original.to_vec();
+    }
     let style = neutral_translation_style(style, original);
     let styled = parse_inline_style_markup(&text, style)
         .unwrap_or_else(|| restore_original_baselines(&text, style, original));
@@ -1472,6 +1535,19 @@ fn append_translated_text(
     style: TextStyle,
     original: &[Inline],
 ) {
+    if let Some(start) = text.find("<torto-web-") {
+        let token = &text[start + 11..];
+        if let Some(end) = token.find("/>")
+            && let Ok(index) = token[..end].parse::<usize>()
+            && let Some(Inline::Text(run)) = original.iter().filter(|inline|matches!(inline,Inline::Text(run) if run.link.as_ref().and_then(PublicationUrl::website_url).is_some())).nth(index)
+        {
+            append_translated_text(content,&text[..start],style,original);
+            let mut run = run.clone(); run.style.inline_citation = style.inline_citation;
+            content.push(Inline::Text(run));
+            append_translated_text(content,&token[end+2..],style,original);
+            return;
+        }
+    }
     for (index, line) in text.split('\n').enumerate() {
         if index > 0 {
             content.push(Inline::Break);
@@ -2204,11 +2280,13 @@ mod tests {
     #[test]
     fn translation_preserves_structured_math_without_exposing_latex() {
         let first = rebook_publication::MathRun {
+            original: None,
             latex: r"E=mc^2".into(),
             display: false,
             size_scale: 1.0,
         };
         let second = rebook_publication::MathRun {
+            original: None,
             latex: r"\int_0^1 x\,dx".into(),
             display: true,
             size_scale: 1.25,
@@ -2264,6 +2342,7 @@ mod tests {
                 link: None,
             }),
             Inline::Math(rebook_publication::MathRun {
+                original: None,
                 latex: r"E=mc^2".into(),
                 display: false,
                 size_scale: 1.0,
@@ -2281,6 +2360,7 @@ mod tests {
         let block = TextBlock {
             kind: TextBlockKind::Paragraph,
             content: vec![Inline::Math(rebook_publication::MathRun {
+                original: None,
                 latex: r"\sum_{i=1}^n i".into(),
                 display: true,
                 size_scale: 1.0,
@@ -3339,5 +3419,58 @@ mod citation_translation_tests {
         }
         assert!(validate_translation_citations("Plain text", input).is_err());
         assert!(validate_translation_citations("Plain text", "Translated text").is_ok());
+    }
+}
+
+fn web_placeholder_ids(text: &str) -> Result<Vec<usize>, String> {
+    let mut rest = text;
+    let mut ids = Vec::new();
+    while let Some(start) = rest.find("<torto-web-") {
+        rest = &rest[start + 11..];
+        let end = rest.find("/>").ok_or("Malformed website placeholder")?;
+        let id = rest[..end]
+            .parse::<usize>()
+            .map_err(|_| "Invalid website placeholder ID")?;
+        if ids.contains(&id) {
+            return Err("Duplicate website placeholder".into());
+        }
+        ids.push(id);
+        rest = &rest[end + 2..];
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+pub(super) fn validate_translation_websites(source: &str, translated: &str) -> Result<(), String> {
+    if web_placeholder_ids(source)? != web_placeholder_ids(translated)? {
+        return Err("Website placeholders must be preserved exactly".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod website_translation_tests {
+    use super::*;
+    #[test]
+    fn website_targets_survive_translation_placeholders() {
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            style: Default::default(),
+            source: None,
+            content: vec![Inline::Text(TextRun {
+                text: "Our site".into(),
+                style: Default::default(),
+                link: PublicationUrl::website("example.com/path?q=1#part"),
+            })],
+        };
+        let input = translation_text(&block);
+        assert_eq!(input, "<torto-web-0/>");
+        assert!(validate_translation_websites(&input, "See <torto-web-0/>").is_ok());
+        assert!(validate_translation_websites(&input, "See site").is_err());
+        let result = replacement_content(
+            "See <torto-web-0/>",
+            TextStyle::default(),
+            Some(&block.content),
+        );
+        assert!(result.iter().any(|i|matches!(i,Inline::Text(r) if r.link.as_ref().and_then(PublicationUrl::website_url)==Some("https://example.com/path?q=1#part"))));
     }
 }

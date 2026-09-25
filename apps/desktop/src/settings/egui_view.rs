@@ -937,6 +937,16 @@ fn semantic_layout_rows(
             language,
         );
         ui.end_row();
+        settings_row_label(ui, language.text("思考等级", "Reasoning effort"));
+        settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+            reasoning_effort_selector(
+                ui,
+                "semantic-layout-reasoning-effort",
+                &mut settings.reasoning_effort,
+                language,
+            );
+        });
+        ui.end_row();
     }
 }
 

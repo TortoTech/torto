@@ -2355,6 +2355,7 @@ impl InlineCollector {
             return;
         }
         self.content.push(Inline::Math(MathRun {
+            original: None,
             latex,
             display,
             size_scale,
@@ -2666,8 +2667,9 @@ fn collect_inline_node_with_block_boundaries(
         }
     }
     if name == "a" {
-        let resolved =
-            attribute_local(node, "href").and_then(|href| context.base.resolve(href).ok());
+        let resolved = attribute_local(node, "href").and_then(|href| {
+            PublicationUrl::website(href).or_else(|| context.base.resolve(href).ok())
+        });
         style.link_role = context
             .footnote_links
             .get(&node.range().start)

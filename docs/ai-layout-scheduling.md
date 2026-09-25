@@ -2,30 +2,32 @@
 
 Translation retains its original page-level lookahead: it processes the complete
 layout pages intersecting the viewport, including later blocks on those pages.
-When translation and AI layout are both enabled, all AI recognition uses that same
-request envelope, including image-only formula blocks and linked footnotes.
-Standalone AI layout uses the actual screen viewport, also in focus mode: visible
-neighboring blocks are included, not only the active unit. Hidden linked notes are
-added only for translation. Switching modes invalidates the prepared range policy
-even when the visible source ranges happen to be identical.
+When translation and AI layout are both enabled, this envelope activates AI
+subsections; standalone AI uses the actual screen viewport, including visible
+neighboring blocks in focus mode. Hidden linked notes are added only for
+translation. Switching modes invalidates the prepared range policy.
 
-A 200 ms settle interval prevents request churn while navigating. No fixed number
-of successor blocks/subsections is queued beyond the translation page envelope.
-Full paragraphs, figures, quotes and tables remain
-intact. Already completed results and unchanged in-flight batches are reused.
-When an active batch no longer intersects current demand, its Tokio task is aborted
-and its callback channel/task ID is invalidated. Closing the book, disabling a
-feature, or changing its backend also cancels its owned task. Cancellation does not
-produce a failure notice. A server may still finish work already received.
+AI layout uses fixed directory-subsection batches with a 5,000-character target
+budget and no block-count limit. Complete semantic groups are not split; an
+oversized group forms its own batch. Visible batches run first, followed by the
+remaining batches in the activated subsection. Split batches carry at most one
+read-only neighboring semantic group on each side. See [AI layout batching](ai-layout-batching.md).
 
-Translation has one active body request, with approximately 2,000 characters per
-batch and no paragraph splitting. Its next batch is selected again from current
-demand. TOC translation remains a separate cancellable task. AI layout has one
-active batch of at most 16 adjacent requested blocks. Up to six neighboring blocks
-on either side supply context, bounded by resolvable TOC anchors. Context-only
-proposals are rejected; a validated body/source or image/caption relationship may
-include a context block as a dependency. Formula and citation requests target only
-the selected request envelope. The full AI batch has a 180-second deadline.
+A 200 ms settle interval prevents request churn while navigating. One AI task is
+active at a time. Scrolling within its subsection preserves it; new work in another
+subsection can preempt an offscreen task. Leaving a subsection removes its unstarted
+batches. Without competing work, an in-flight request may finish and be cached.
+Closing the book, disabling AI, or changing its configuration cancels incompatible
+tasks. Cancellation does not produce a failure notice; the server may still finish
+work already received. Diagnostic logs link scheduling, demand changes, cancellation
+reasons and completion by task ID.
+
+Translation retains one active body request of approximately 2,000 characters,
+without paragraph splitting. TOC translation remains separately cancellable.
+Image formula requests use at most five original images and approximately 6 MiB
+of encoded data per batch. Text recognition, image transcription and corrective
+retries use the selected AI layout reasoning effort. The AI task deadline remains
+180 seconds.
 
 ## Completed versus displayed
 

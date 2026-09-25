@@ -44,8 +44,11 @@ schema. Positive results and definitive negative results are reused; transient
 verification failures are not cached. Existing chapter request fingerprints also
 include this contract. Formula errors do not fail other AI layout recognizers;
 unsupported image-input errors stop the formula pass for that chapter.
-Batch transport uses a separate schema/prompt while preserving the existing
-per-image semantic cache contract and completed chapter caches. Equal image bytes
+Single-image and multi-image requests use the same `results` array schema.
+Field descriptions define classification, LaTeX syntax/JSON escaping, equation-number
+scope and ID completeness. Shared Markdown covers faithful image reading; only the
+current stage's transcription/self-check or conditional-review instructions are sent.
+Prompt/schema changes participate in both per-image and chapter cache fingerprints. Equal image bytes
 under different resource names are deduplicated within the pending batch or reused
 from results already obtained in the chapter.
 

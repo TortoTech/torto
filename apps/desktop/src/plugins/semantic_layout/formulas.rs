@@ -5,24 +5,35 @@ use rebook_publication::{ImageBlock, ImageFormula};
 use std::io::Cursor;
 
 pub(super) const PROMPT: &str = include_str!("formulas/prompt.md");
-pub(super) const BATCH_PROMPT: &str = include_str!("formulas/batch.md");
+pub(super) const TRANSCRIBE_PROMPT: &str = include_str!("formulas/transcribe.md");
+pub(super) const VERIFY_PROMPT: &str = include_str!("formulas/verify.md");
 mod batch;
 
 pub(super) fn options() -> Value {
-    image_options()
-}
-
-// Keep the per-image cache contract stable when only batching changes.
-fn image_options() -> Value {
+    let item = json!({"type":"object","additionalProperties":false,"properties":{
+        "image_id":{"type":"integer","description":"An ID from requested_ids. Preserve its original value; IDs can be nonconsecutive. Never invent an ID."},
+        "status":{"type":"string","enum":["recognized","not_formula","unreadable"],"description":"recognized: the entire meaningful image is faithfully representable as math, a symbol or a formal production rule. not_formula: a diagram, plot, table, photo, decorative art or prose, even if it contains equations. unreadable: a formula with ambiguous essential details or unsupported notation. Both latex and equation_number must be null for either negative status."},
+        "latex":{"type":["string","null"],"description":"Faithful LaTeX source without dollar delimiters or Markdown; null for a negative status. Use supported standard math commands, text operators and matrix/aligned environments; no custom macros, packages, images, URLs or executable commands. JSON-escape every literal backslash: two in the JSON source for one LaTeX backslash, four for a two-backslash row separator. Decoding must preserve command backslashes and row separators, never produce backspace, form feed, newline, carriage return or tab from a command prefix. Do not remove backslashes to make JSON valid."},
+        "equation_number":{"type":["string","null"],"description":"Separate equation number visibly printed inside this image; exclude it from latex. Never copy or infer a number from adjacent HTML or context. Null when absent or for a negative status."}
+    },"required":["image_id","status","latex","equation_number"]});
     json!({"temperature":0.0,"response_format":{"type":"json_schema","json_schema":{
-        "name":"formula_image_transcription","strict":true,"schema":{
-            "type":"object","additionalProperties":false,"properties":{
-                "status":{"type":"string","enum":["recognized","not_formula","unreadable"]},
-                "latex":{"type":["string","null"]},
-                "equation_number":{"type":["string","null"]}
-            },"required":["status","latex","equation_number"]
+        "name":"formula_image_batch","strict":true,"schema":{
+            "type":"object","additionalProperties":false,
+            "properties":{"results":{"type":"array","description":"Exactly one result per requested image ID, including negative results. Use this array even for a single image. No missing, duplicate or additional IDs; array order is irrelevant.","items":item}},
+            "required":["results"]
         }
     }}})
+}
+
+pub(super) fn request_prompt(mode: &str) -> String {
+    format!(
+        "{PROMPT}\n{}",
+        if mode == "verify" {
+            VERIFY_PROMPT
+        } else {
+            TRANSCRIBE_PROMPT
+        }
+    )
 }
 
 #[derive(Clone)]
@@ -257,6 +268,7 @@ async fn flush(
     client: &reqwest::Client,
     provider: &super::super::AiProvider,
     model: &str,
+    reasoning_effort: ReasoningEffort,
     pending: &mut Vec<batch::Pending>,
     resolved: &mut HashMap<String, Option<Response>>,
     annotations: &mut Vec<Annotation>,
@@ -267,32 +279,33 @@ async fn flush(
     }
     let batch = std::mem::take(pending);
     let mut unsupported = false;
-    let results = match batch::request_batch(client, provider, model, &batch).await {
-        Ok(results) => results,
-        Err(error) => {
-            log::event(
-                provider,
-                model,
-                "formula.batch.failed",
-                json!({"images":batch.len(),"error":error}),
-            );
-            let lower = error.to_lowercase();
-            unsupported = (lower.contains("image")
-                || lower.contains("vision")
-                || lower.contains("text-only"))
-                && [
-                    "not support",
-                    "doesn't support",
-                    "unsupported",
-                    "only supported",
-                    "not allowed",
-                    "text-only",
-                ]
-                .iter()
-                .any(|s| lower.contains(s));
-            vec![None; batch.len()]
-        }
-    };
+    let results =
+        match batch::request_batch(client, provider, model, reasoning_effort, &batch).await {
+            Ok(results) => results,
+            Err(error) => {
+                log::event(
+                    provider,
+                    model,
+                    "formula.batch.failed",
+                    json!({"images":batch.len(),"error":error}),
+                );
+                let lower = error.to_lowercase();
+                unsupported = (lower.contains("image")
+                    || lower.contains("vision")
+                    || lower.contains("text-only"))
+                    && [
+                        "not support",
+                        "doesn't support",
+                        "unsupported",
+                        "only supported",
+                        "not allowed",
+                        "text-only",
+                    ]
+                    .iter()
+                    .any(|s| lower.contains(s));
+                vec![None; batch.len()]
+            }
+        };
     for (item, result) in batch.into_iter().zip(results) {
         if let Some(response) = &result
             && !response.transient
@@ -312,6 +325,7 @@ pub(super) async fn recognize(
     client: &reqwest::Client,
     provider: &super::super::AiProvider,
     model: &str,
+    reasoning_effort: ReasoningEffort,
     source: &dyn BookSource,
     section: &Section,
 ) -> (Vec<Annotation>, usize) {
@@ -339,10 +353,13 @@ pub(super) async fn recognize(
         let key = digest(
             &serde_json::to_vec(&json!([
                 PROMPT,
-                image_options(),
+                TRANSCRIBE_PROMPT,
+                VERIFY_PROMPT,
+                options(),
                 provider.id,
                 provider.base_url,
                 model,
+                reasoning_effort,
                 digest(&resource.bytes)
             ]))
             .unwrap(),
@@ -403,6 +420,7 @@ pub(super) async fn recognize(
                 client,
                 provider,
                 model,
+                reasoning_effort,
                 &mut pending,
                 &mut resolved,
                 &mut annotations,
@@ -427,6 +445,7 @@ pub(super) async fn recognize(
         client,
         provider,
         model,
+        reasoning_effort,
         &mut pending,
         &mut resolved,
         &mut annotations,

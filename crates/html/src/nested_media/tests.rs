@@ -95,3 +95,32 @@ fn ordinary_inline_images_and_unrelated_prose_are_not_absorbed() {
     assert!(inline.content.iter().any(|i| matches!(i, Inline::Image(_))));
     assert_eq!(prose.kind, TextBlockKind::Paragraph);
 }
+
+#[test]
+fn external_text_links_preserve_targets_and_internal_links_stay_internal() {
+    let section = parse(
+        r##"<p><a href="https://example.com/path?q=1#part"><b>Visit</b> our site</a> <a href="notes.xhtml#note">note</a></p>"##,
+    );
+    let Block::Text(text) = &section.blocks[0] else {
+        panic!()
+    };
+    let runs: Vec<_> = text
+        .content
+        .iter()
+        .filter_map(|i| match i {
+            Inline::Text(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        runs.iter()
+            .filter(|r| r.text.contains("Visit") || r.text.contains("our site"))
+            .all(|r| r.link.as_ref().and_then(PublicationUrl::website_url)
+                == Some("https://example.com/path?q=1#part"))
+    );
+    assert!(runs.iter().any(|r| {
+        r.link
+            .as_ref()
+            .is_some_and(|link| link.website_url().is_none() && link.path() == "notes.xhtml")
+    }));
+}

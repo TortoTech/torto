@@ -20,18 +20,21 @@ pub(crate) use visible::{
     block_ranges, empty_recognition, merge_recognition, needs_recognition, recognition_groups,
 };
 
+mod batching;
 mod citations;
 mod formulas;
 mod headings;
 mod log;
+mod normalize;
+mod text_formulas;
+pub(crate) use batching::{fixed_batches, semantic_units};
 pub(crate) use log::translation_event;
+pub(crate) use log::{event as diagnostic_event, with_job};
 mod quote_sources;
 
 // This is the on-disk data format, not an application release or prompt revision.
 const CACHE_FORMAT_VERSION: u32 = 1;
-const WINDOW_CHARS: usize = 16_000;
-const WINDOW_BLOCKS: usize = 48;
-const OVERLAP: usize = 6;
+const OVERLAP: usize = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -39,6 +42,7 @@ pub(crate) struct SemanticLayoutSettings {
     pub enabled: bool,
     pub provider: String,
     pub model: String,
+    pub reasoning_effort: ReasoningEffort,
 }
 
 impl Default for SemanticLayoutSettings {
@@ -47,6 +51,7 @@ impl Default for SemanticLayoutSettings {
             enabled: false,
             provider: String::new(),
             model: String::new(),
+            reasoning_effort: ReasoningEffort::Default,
         }
     }
 }
@@ -107,10 +112,16 @@ struct Response {
     groups: Vec<Proposal>,
     #[serde(default)]
     citations: Vec<String>,
+    #[serde(default)]
+    formulas: Vec<text_formulas::Proposal>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Annotation {
+    TextFormulas {
+        source: SourceRange,
+        spans: Vec<text_formulas::Span>,
+    },
     UnreadableFormula {
         href: PublicationUrl,
     },
@@ -188,6 +199,7 @@ pub(crate) struct Recognition {
 struct WindowResult {
     groups: Vec<Proposal>,
     citations: Vec<String>,
+    formulas: Vec<text_formulas::Proposal>,
     skipped_groups: usize,
 }
 
@@ -196,6 +208,7 @@ struct WindowCache {
     key: String,
     groups: Vec<Proposal>,
     citations: Vec<String>,
+    formulas: Vec<text_formulas::Proposal>,
 }
 
 pub(crate) struct SemanticLayoutSource {
@@ -354,6 +367,7 @@ impl BookSource for SemanticLayoutSource {
         let mut section = self.inner.parse_section(index)?;
         if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
             citations::clear_markers(&mut section.blocks);
+            text_formulas::restore_originals(&mut section.blocks);
             return Ok(section);
         }
         let mut recognition = self
@@ -616,6 +630,8 @@ fn request_contract_fingerprint() -> &'static str {
                 PROMPT,
                 citations::PROMPT,
                 formulas::PROMPT,
+                formulas::TRANSCRIBE_PROMPT,
+                formulas::VERIFY_PROMPT,
                 formulas::options(),
                 completion_options(&RecognitionRoles {
                     quotes: true,
@@ -632,8 +648,7 @@ fn request_contract_fingerprint() -> &'static str {
                     captions: false,
                     headings: true
                 }),
-                WINDOW_CHARS,
-                WINDOW_BLOCKS,
+                batching::BATCH_CHARS,
                 headings::MAX_CHARS,
                 OVERLAP
             ]))
@@ -715,8 +730,15 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
             "name":"ebook_semantic_groups", "strict":true,
             "schema":{
                 "type":"object", "additionalProperties":false,
-                "properties":{"groups":{"type":"array","items":item}, "citations":{"type":"array","items":{"type":"string"}}},
-                "required":["groups","citations"]
+                "properties":{"groups":{"type":"array","items":item}, "citations":{"type":"array","items":{"type":"string"}},
+                    "formulas":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
+                        "block":{"type":"integer"},"paragraph":{"type":"integer"},
+                        "original":{"type":"string","minLength":1,"description":"Nonempty exact contiguous substring of the designated math_texts paragraph, including markup and escaped entities. Select the complete expression or chained relation across style tags, including operands and attached superscripts/subscripts; never select an isolated exponent or subscript. Never rewrite it or supply offsets."},
+                        "latex":{"type":"string","description":"Faithful supported LaTeX, without dollar signs or Markdown. JSON-escape each literal command backslash as two backslashes, and a two-backslash row separator as four. Never simplify, solve, correct, or invent symbols."},
+                        "before":{"type":"string","description":"Exact immediately preceding text from math_texts to disambiguate repeated occurrences, or empty when unnecessary."},
+                        "after":{"type":"string","description":"Exact immediately following text from math_texts to disambiguate repeated occurrences, or empty when unnecessary."}
+                    },"required":["block","paragraph","original","latex","before","after"]}}},
+                "required":["groups","citations","formulas"]
             }
         }
     }})
@@ -743,6 +765,7 @@ fn recognition_identity(book_id: &str, settings: &PluginSettings) -> Option<Valu
         provider.id,
         provider.base_url,
         model,
+        config.reasoning_effort,
         true,
         true
     ]))
@@ -756,7 +779,10 @@ fn load_recognition(section: &Section, identity: &Value) -> Option<Recognition> 
     let hash = fingerprint(section);
     let bytes = std::fs::read(recognition_path(identity, &hash)?).ok()?;
     let result: Recognition = serde_json::from_slice(&bytes).ok()?;
-    if !result.formulas_checked || !formulas::validate_annotations(section, &result.annotations) {
+    if !result.formulas_checked
+        || !formulas::validate_annotations(section, &result.annotations)
+        || !text_formulas::validate_annotations(section, &result.annotations)
+    {
         return None;
     }
     if result.fingerprint != hash {
@@ -775,6 +801,7 @@ fn load_recognition(section: &Section, identity: &Value) -> Option<Recognition> 
             !matches!(
                 a,
                 Annotation::InlineCitations { .. }
+                    | Annotation::TextFormulas { .. }
                     | Annotation::ImageFormula { .. }
                     | Annotation::UnreadableFormula { .. }
             )
@@ -782,6 +809,7 @@ fn load_recognition(section: &Section, identity: &Value) -> Option<Recognition> 
         .map(|a| {
             Some(match a {
                 Annotation::InlineCitations { .. }
+                | Annotation::TextFormulas { .. }
                 | Annotation::ImageFormula { .. }
                 | Annotation::UnreadableFormula { .. } => {
                     unreachable!()
@@ -958,6 +986,7 @@ async fn recognize_inner(
         identity = identity
             .map(|identity| json!([identity, "visible-target-v1", target.start, target.end]));
     }
+    let fixed_target = target.is_some();
     let target = target.unwrap_or(0..section.blocks.len());
     let target_section = scope_section(section, target.clone());
     if let Some(identity) = &identity
@@ -975,8 +1004,15 @@ async fn recognize_inner(
     let formulas_checked =
         book_source.is_some() || formulas::candidates(&target_section).is_empty();
     if let Some(source) = book_source {
-        let (recognized, failed) =
-            formulas::recognize(&client, provider, model, source, &target_section).await;
+        let (recognized, failed) = formulas::recognize(
+            &client,
+            provider,
+            model,
+            settings.semantic_layout.reasoning_effort,
+            source,
+            &target_section,
+        )
+        .await;
         annotations.extend(recognized);
         skipped_groups += failed;
     }
@@ -987,11 +1023,26 @@ async fn recognize_inner(
     let section = &working;
     let mut start = target.start;
     while start < target.end {
-        let end = window_end(section, start).min(target.end);
-        let lo = start.saturating_sub(OVERLAP);
-        let hi = (end + OVERLAP).min(section.blocks.len());
+        let end = if fixed_target {
+            target.end
+        } else {
+            window_end(section, start).min(target.end)
+        };
+        let lo = if fixed_target {
+            0
+        } else {
+            start.saturating_sub(OVERLAP)
+        };
+        let hi = if fixed_target {
+            section.blocks.len()
+        } else {
+            (end + OVERLAP).min(section.blocks.len())
+        };
         let citation_candidates = citations::window_candidates(section, start..end);
-        if !citation_candidates.is_empty()
+        if section.blocks[start..end]
+            .iter()
+            .any(|block| !text_formulas::input(block).is_empty())
+            || !citation_candidates.is_empty()
             || section.blocks[start..end]
                 .iter()
                 .any(|block| paragraph(block).is_some() || unattributed_quote_body(block).is_some())
@@ -1007,6 +1058,7 @@ async fn recognize_inner(
                     provider.id,
                     provider.base_url,
                     model,
+                    settings.semantic_layout.reasoning_effort,
                     config.quotes,
                     config.captions,
                     input
@@ -1021,6 +1073,13 @@ async fn recognize_inner(
                 .filter(|cache| {
                     cache.key == key
                         && validate_citation_ids(&cache.citations, &citation_candidates).is_ok()
+                        && resolve_text_formulas(
+                            section,
+                            start..end,
+                            &cache.formulas,
+                            &cache.citations,
+                        )
+                        .1 == 0
                         && validate_window(&cache.groups, section, config, start..end, lo..hi)
                             .is_ok()
                 });
@@ -1028,12 +1087,13 @@ async fn recognize_inner(
                 WindowResult {
                     groups: cache.groups,
                     citations: cache.citations,
+                    formulas: cache.formulas,
                     skipped_groups: 0,
                 }
             } else {
                 let groups = request_window_groups(
                     &client,
-                    (provider, model),
+                    (provider, model, settings.semantic_layout.reasoning_effort),
                     &input,
                     section,
                     config,
@@ -1050,6 +1110,7 @@ async fn recognize_inner(
                             key,
                             groups: groups.groups.clone(),
                             citations: groups.citations.clone(),
+                            formulas: groups.formulas.clone(),
                         },
                     )
                 {
@@ -1063,6 +1124,9 @@ async fn recognize_inner(
                 &citation_candidates,
                 &window.citations,
             ));
+            annotations.extend(
+                resolve_text_formulas(section, start..end, &window.formulas, &window.citations).0,
+            );
             for group in &window.groups {
                 let ids = proposal_ids(group);
                 if ids.iter().any(|id| used.contains(id)) {
@@ -1094,7 +1158,7 @@ async fn recognize_inner(
 
 async fn request_window_groups(
     client: &reqwest::Client,
-    endpoint: (&super::AiProvider, &str),
+    endpoint: (&super::AiProvider, &str, ReasoningEffort),
     input: &Value,
     section: &Section,
     config: &RecognitionRoles,
@@ -1114,6 +1178,9 @@ fn unified_window_input(
     let blocks: Vec<_> = context
         .map(|index| {
             let mut block = section_input_block(section, index);
+            if target.contains(&index) {
+                text_formulas::attach_input(&mut block, &section.blocks[index]);
+            }
             if headings::candidate(&section.blocks[index]).is_some()
                 && let Some(text) = paragraph(&section.blocks[index])
             {
@@ -1126,7 +1193,14 @@ fn unified_window_input(
                     .map(|c| json!({"id":c.id,"paragraph":c.paragraph,"text":c.span.text}))
                     .collect::<Vec<_>>()
             );
-            if !available.is_empty() && block.get("text").is_none() && block.get("body").is_none() {
+            if !available.is_empty()
+                && block.get("text").is_none()
+                && block.get("body").is_none()
+                && block
+                    .get("math_texts")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+            {
                 let mut seen = HashSet::new();
                 block["citation_paragraphs"] = json!(
                     available
@@ -1155,6 +1229,23 @@ fn unified_window_input(
     input
 }
 
+fn resolve_text_formulas(
+    section: &Section,
+    target: std::ops::Range<usize>,
+    proposals: &[text_formulas::Proposal],
+    ids: &[String],
+) -> (Vec<Annotation>, usize) {
+    if ids.is_empty() {
+        return text_formulas::resolve(section, target, proposals);
+    }
+    let mut protected = section.clone();
+    let candidates = citations::window_candidates(section, target.clone());
+    for a in citations::window_annotations(&candidates, ids) {
+        compose(&mut protected.blocks, &a);
+    }
+    text_formulas::resolve(&protected, target, proposals)
+}
+
 fn validate_citation_ids(
     ids: &[String],
     candidates: &[citations::WindowCandidate],
@@ -1170,37 +1261,21 @@ fn validate_citation_ids(
 }
 
 fn window_end(section: &Section, start: usize) -> usize {
-    let mut end = start;
-    let mut chars = 0;
-    while end < section.blocks.len() && end - start < WINDOW_BLOCKS {
-        chars += paragraph(&section.blocks[end]).map_or_else(
-            || {
-                unattributed_quote_body(&section.blocks[end]).map_or(0, |body| {
-                    body.iter()
-                        .map(|text| text_block_text(text).chars().count())
-                        .sum()
-                })
-            },
-            |text| text_block_text(text).chars().count(),
-        );
-        end += 1;
-        if chars >= WINDOW_CHARS {
-            break;
-        }
-    }
-    end
+    fixed_batches(section, start..section.blocks.len())
+        .first()
+        .map_or(start, |r| r.end)
 }
 
 async fn request_groups(
     client: &reqwest::Client,
-    endpoint: (&super::AiProvider, &str),
+    endpoint: (&super::AiProvider, &str, ReasoningEffort),
     input: &Value,
     section: &Section,
     config: &RecognitionRoles,
     target: std::ops::Range<usize>,
     context: std::ops::Range<usize>,
 ) -> Result<WindowResult, String> {
-    let (provider, model) = endpoint;
+    let (provider, model, reasoning_effort) = endpoint;
     let mut messages = vec![
         json!({"role":"system","content":window_prompt(section, config, target.clone(), context.clone())}),
         json!({"role":"user","content":input.to_string()}),
@@ -1216,15 +1291,19 @@ async fn request_groups(
             &messages,
             None,
             Some(4096),
-            ReasoningEffort::Default,
+            reasoning_effort,
             Some(&completion_options(config)),
         )
         .await?;
         let content = ai::message_content(&message).ok_or("AI排版返回了空内容")?;
         let parsed = llm_json::parse::<Response>(&content)
             .map_err(|e| format!("AI排版格式无效：{e}"))
-            .and_then(|response| {
+            .and_then(|mut response| {
                 log::event(provider, model, "window.proposals", json!({"section":section.id,"start":target.start,"end":target.end,"attempt":attempt+1,"groups":response.groups,"citations":response.citations}));
+                let ignored = normalize::response(&mut response, section, context.clone());
+                if ignored > 0 {
+                    log::event(provider, model, "window.redundant_ignored", json!({"section":section.id,"start":target.start,"end":target.end,"attempt":attempt+1,"count":ignored}));
+                }
                 let validation = validate_window(
                     &response.groups,
                     section,
@@ -1232,7 +1311,8 @@ async fn request_groups(
                     target.clone(),
                     context.clone(),
                 );
-                let validation = validation.and_then(|()| validate_citation_ids(&response.citations, &candidates));
+                let validation = validation.and_then(|()| validate_citation_ids(&response.citations, &candidates))
+                    .and_then(|()| if resolve_text_formulas(section,target.clone(),&response.formulas,&response.citations).1==0 {Ok(())} else {Err("Invalid text formula: copy an exact unique unprotected span, avoid overlaps, and use supported LaTeX".into())});
                 if validation.is_err() {
                     let mut safe = retain_valid_groups(
                         &response.groups,
@@ -1244,9 +1324,15 @@ async fn request_groups(
                     let mut seen = HashSet::new();
                     safe.citations = response.citations.iter().filter(|id| candidates.iter().any(|c| &c.id==*id) && seen.insert((*id).clone())).cloned().collect();
                     safe.skipped_groups += response.citations.len() - safe.citations.len();
+                    let (valid_math, invalid_math) = resolve_text_formulas(section,target.clone(),&response.formulas,&response.citations);
+                    safe.formulas = response.formulas.iter().filter(|proposal| {
+                        let (single,invalid)=resolve_text_formulas(section,target.clone(),std::slice::from_ref(proposal),&response.citations);
+                        invalid==0 && !single.is_empty() && single.iter().all(|a| match a { Annotation::TextFormulas {source,spans}=>valid_math.iter().any(|other|matches!(other,Annotation::TextFormulas {source:s,spans:valid} if s==source && spans.iter().all(|span|valid.contains(span)))),_=>false })
+                    }).cloned().collect();
+                    safe.skipped_groups += invalid_math;
                     if fallback
                         .as_ref()
-                        .is_none_or(|previous| safe.groups.len()+safe.citations.len() > previous.groups.len()+previous.citations.len())
+                        .is_none_or(|previous| safe.groups.len()+safe.citations.len()+safe.formulas.len() > previous.groups.len()+previous.citations.len()+previous.formulas.len())
                     {
                         fallback = Some(safe);
                     }
@@ -1259,6 +1345,7 @@ async fn request_groups(
                 return Ok(WindowResult {
                     groups: response.groups,
                     citations: response.citations,
+                    formulas: response.formulas,
                     skipped_groups: 0,
                 });
             }
@@ -1543,6 +1630,10 @@ fn annotation(group: &Proposal, section: &Section) -> Annotation {
 // Resolve against source ranges, never translated block indices. Bilingual
 // companion paragraphs have no source and stay attached to their original.
 fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
+    if let Annotation::TextFormulas { source, spans } = annotation {
+        text_formulas::compose(blocks, source, spans);
+        return;
+    }
     if let Annotation::UnreadableFormula { href } = annotation {
         formulas::compose(blocks, href, None);
         return;
@@ -1591,6 +1682,7 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteBefore { .. }
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
+        | Annotation::TextFormulas { .. }
         | Annotation::ImageFormula { .. }
         | Annotation::UnreadableFormula { .. } => unreachable!(),
     };
@@ -1676,6 +1768,7 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteBefore { .. }
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
+        | Annotation::TextFormulas { .. }
         | Annotation::ImageFormula { .. }
         | Annotation::UnreadableFormula { .. } => unreachable!(),
     };
@@ -1797,6 +1890,9 @@ pub(crate) fn apply_translation_citations(section: &mut Section, result: &Recogn
     for annotation in &result.annotations {
         if let Annotation::InlineCitations { source, spans } = annotation {
             citations::compose(&mut section.blocks, source, spans);
+        }
+        if let Annotation::TextFormulas { source, spans } = annotation {
+            text_formulas::compose(&mut section.blocks, source, spans);
         }
     }
 }

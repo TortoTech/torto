@@ -32,6 +32,76 @@ impl BookSource for Fixture {
 struct EmptyHighlights;
 
 #[test]
+fn visible_work_reuses_active_request_and_preempts_only_offscreen_work() {
+    let (mut reader, original, _) = fixture();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let worker = runtime.spawn(std::future::pending::<()>());
+    let abort = worker.abort_handle();
+    reader.semantic_layout.active = Some(super::Job {
+        id: "preemption-fixture".into(),
+        started: Instant::now(),
+        provider: reader.plugin_settings.providers[0].clone(),
+        model: "fixture".into(),
+        index: 0,
+        offset: 0,
+        target: 0..1,
+        section: original.clone(),
+        hash: super::fingerprint(&original),
+        scope_sources: super::block_ranges(&original.blocks[0]),
+    });
+    reader.semantic_layout.worker = Some(worker);
+    let current = vec![(0, super::block_ranges(&original.blocks[0]))];
+    assert!(!reader.yield_semantic_request_to_visible_work(&current));
+    assert!(!abort.is_finished());
+    assert_eq!(
+        reader.semantic_layout.active.as_ref().unwrap().id,
+        "preemption-fixture"
+    );
+    let elsewhere = vec![(0, super::block_ranges(&original.blocks[1]))];
+    reader
+        .semantic_layout
+        .active
+        .as_mut()
+        .unwrap()
+        .scope_sources = original
+        .blocks
+        .iter()
+        .flat_map(super::block_ranges)
+        .collect();
+    assert!(!reader.yield_semantic_request_to_visible_work(&elsewhere));
+    reader
+        .semantic_layout
+        .active
+        .as_mut()
+        .unwrap()
+        .scope_sources = super::block_ranges(&original.blocks[0]);
+    assert!(reader.yield_semantic_request_to_visible_work(&elsewhere));
+    assert!(reader.semantic_layout.worker.is_none());
+    assert!(reader.semantic_layout.active.is_none());
+}
+
+#[test]
+fn offscreen_completed_result_is_retained_until_visible_again() {
+    let (mut reader, original, _) = fixture();
+    reader.translation.enabled = false;
+    let hash = super::fingerprint(&original);
+    reader
+        .semantic_layout
+        .originals
+        .insert(0, Arc::new(original.clone()));
+    reader.semantic_layout.hashes.insert(0, hash.clone());
+    reader.semantic_layout.done.insert((0, 0), hash);
+    reader.stage_semantic_group(staged_group(&original, 0..1));
+    let elsewhere = vec![(0, super::block_ranges(&original.blocks[1]))];
+    reader.commit_ready_content(&elsewhere, true);
+    assert_eq!(reader.semantic_layout.groups.len(), 1);
+    let current = vec![(0, super::block_ranges(&original.blocks[0]))];
+    reader.commit_ready_content(&current, true);
+    assert!(reader.semantic_layout.groups.is_empty());
+    assert!(reader.semantic_layout.done.contains_key(&(0, 0)));
+}
+
+#[test]
 fn formula_copy_uses_latex_and_ordinary_images_still_copy_pixels() {
     let (mut reader, _, _) = fixture();
     let ctx = egui::Context::default();
@@ -1227,4 +1297,165 @@ fn staged_citations_are_in_translation_input_before_display_commit() {
             .semantic_source
             .has_recognition(0, &crate::plugins::semantic_layout::fingerprint(&original))
     );
+}
+
+#[test]
+fn footnote_popup_keeps_inside_clicks_and_closes_on_body_click() {
+    let (mut reader, _, _) = fixture();
+    reader.reading_mode = ReadingMode::Classic;
+    reader.classic_footnotes = vec![FocusFootnote {
+        text: "Footnote text for clicking.".into(),
+        citation: None,
+    }];
+    reader.ui.focus_footnotes_visible = true;
+    let ctx = egui::Context::default();
+    let page = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000., 700.));
+    let frame = |reader: &mut DesktopReader, events| {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(page),
+                events,
+                ..Default::default()
+            },
+            |_| reader.focus_footnote_overlay(&ctx, page),
+        );
+        output.textures_delta.clear();
+    };
+    frame(&mut reader, vec![]);
+    frame(&mut reader, vec![]);
+    let inside = reader.classic_footnote_overlay_rect.unwrap().center();
+    let click = |reader: &mut DesktopReader, pos| {
+        for pressed in [true, false] {
+            frame(
+                reader,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    };
+    click(&mut reader, inside);
+    assert!(reader.ui.focus_footnotes_visible);
+    click(&mut reader, egui::pos2(40., 40.));
+    assert!(!reader.ui.focus_footnotes_visible);
+    assert!(reader.classic_footnotes.is_empty());
+    assert!(reader.classic_footnote_overlay_rect.is_none());
+    drop(reader);
+    let mut cleanup = ctx.run_ui(egui::RawInput::default(), |_| {});
+    cleanup.textures_delta.clear();
+}
+
+#[test]
+fn image_border_geometry_does_not_depend_on_caption_center_or_selection() {
+    let (mut reader, _, _) = fixture();
+    let layout = reader.current_scroll_layout().unwrap();
+    reader.rebuild_focus_units(&layout);
+    let index = reader
+        .focus_units
+        .iter()
+        .position(|unit| unit.is_image)
+        .unwrap();
+    reader.select_focus_unit(index);
+    let bounds = reader.active_focus_image_bounds();
+    assert_eq!(bounds.len(), 1);
+    reader.focus_units[index].rect.max.y += 5000.;
+    reader.focus_units[index].position = layout.pages[0].position;
+    reader.selected_image = None;
+    assert_eq!(reader.active_focus_image_bounds(), bounds);
+    reader.sync_focus_selected_image();
+    let selected = reader.selected_image.as_ref().unwrap();
+    assert_eq!(selected.position, bounds[0].0);
+    assert_eq!(selected.bounds, bounds[0].1);
+}
+
+#[test]
+#[ignore = "requires TORTO_FIGURE_BOOK local EPUB; no model calls"]
+fn local_hearing_figures_keep_border_after_sentence_structure() {
+    let book = rebook_formats::open_file(std::env::var("TORTO_FIGURE_BOOK").unwrap()).unwrap();
+    let (mut reader, _, _) = fixture();
+    reader.structure_source = Arc::new(ParagraphStructureSource::new(book.source()));
+    reader.source = reader.structure_source.clone();
+    reader.reader = rebook_reader::ReaderSession::open_with_fonts(
+        reader.source.clone(),
+        rebook_layout::LayoutViewport::new(800, 600).unwrap(),
+        rebook_layout::ReaderStyle {
+            spread: SpreadMode::Scroll,
+            typesetting: ReaderTypesetting::unified(),
+            ..Default::default()
+        },
+        crate::fonts::embedded_reader_fonts(),
+    )
+    .unwrap();
+    for marker in ["Figure 1.5", "Figure 1.6"] {
+        let target = PublicationUrl::parse("ops/xhtml/ch01.html#ch01lev2sec3").unwrap();
+        // Locate by actual figure source rather than assuming TOC fragment names.
+        let section_index = reader
+            .source
+            .book()
+            .sections
+            .iter()
+            .position(|s| s.href.path() == target.path())
+            .unwrap();
+        let original = reader.source.parse_section(section_index).unwrap();
+        let caption = original
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Text(t)
+                    if t.kind == rebook_publication::TextBlockKind::Caption
+                        && crate::plugins::text_block_text(t).contains(marker) =>
+                {
+                    t.source.clone()
+                }
+                Block::Figure(f) => f
+                    .captions
+                    .iter()
+                    .find(|t| crate::plugins::text_block_text(t).contains(marker))
+                    .and_then(|t| t.source.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let snapshot = reader.reader.go_to_source(&caption.start).unwrap().snapshot;
+        reader.apply_snapshot(snapshot, super::super::SnapshotEffects::navigation());
+        for structured in [false, true] {
+            reader
+                .structure_source
+                .set_active(
+                    crate::plugins::ParagraphStructureKey {
+                        section_index,
+                        node: caption.start.node.clone(),
+                    },
+                    structured,
+                )
+                .unwrap();
+            let snapshot = reader.reader.refresh_source().unwrap();
+            reader.apply_snapshot(snapshot, super::super::SnapshotEffects::viewport_change());
+            let layout = reader.current_scroll_layout().unwrap();
+            reader.rebuild_focus_units(&layout);
+            let index = reader
+                .focus_units
+                .iter()
+                .position(|unit| unit.text.contains(marker))
+                .unwrap();
+            reader.select_focus_unit(index);
+            assert_eq!(
+                reader.active_focus_image_bounds().len(),
+                1,
+                "{marker} structured={structured}"
+            );
+            assert!(
+                reader.selected_image.is_some(),
+                "{marker} structured={structured}"
+            );
+            println!(
+                "{marker} structured={structured}: image border geometry and selection retained"
+            );
+        }
+    }
 }

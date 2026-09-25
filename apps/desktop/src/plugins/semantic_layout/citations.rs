@@ -68,7 +68,13 @@ fn candidate_spans(block: &TextBlock) -> Vec<Citation> {
                         && r.style.baseline == rebook_publication::TextBaseline::Superscript),
             ),
             Inline::Break => (1, true),
-            Inline::Math(m) => (m.latex.chars().count(), true),
+            Inline::Math(m) => (
+                m.original_text()
+                    .unwrap_or_else(|| m.latex.clone())
+                    .chars()
+                    .count(),
+                true,
+            ),
             Inline::Image(_) => (0, true),
         };
         if protected {
@@ -344,7 +350,11 @@ fn apply(text: &mut TextBlock, spans: &[Citation]) {
                 result.push(inline.clone());
             }
             Inline::Math(m) => {
-                offset += m.latex.chars().count();
+                offset += m
+                    .original_text()
+                    .unwrap_or_else(|| m.latex.clone())
+                    .chars()
+                    .count();
                 result.push(inline.clone());
             }
             _ => result.push(inline.clone()),

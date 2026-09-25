@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+mod batching;
 mod preparation;
 
 const SETTLE: Duration = Duration::from_millis(200);
@@ -17,11 +18,36 @@ type Key = (usize, usize, Option<usize>);
 type Demand = Vec<(usize, Vec<SourceRange>)>;
 #[derive(Clone)]
 struct Job {
+    id: String,
+    started: Instant,
+    provider: crate::plugins::AiProvider,
+    model: String,
     index: usize,
     offset: usize,
     target: std::ops::Range<usize>,
     section: Section,
     hash: String,
+    scope_sources: Vec<SourceRange>,
+}
+impl Job {
+    fn log(&self, event: &str, mut details: serde_json::Value) {
+        details["job_id"] = serde_json::json!(self.id);
+        details["elapsed_ms"] = serde_json::json!(self.started.elapsed().as_millis());
+        details["section_index"] = serde_json::json!(self.index);
+        details["target"] = serde_json::json!([
+            self.offset + self.target.start,
+            self.offset + self.target.end
+        ]);
+        details["context"] =
+            serde_json::json!([self.offset, self.offset + self.section.blocks.len()]);
+        details["fingerprint"] = serde_json::json!(self.hash);
+        crate::plugins::semantic_layout::diagnostic_event(
+            &self.provider,
+            &self.model,
+            event,
+            details,
+        );
+    }
 }
 struct Group {
     index: usize,
@@ -82,6 +108,12 @@ impl Drop for SemanticLayoutState {
             worker.abort();
         }
         if let Some(worker) = self.worker.take() {
+            if let Some(job) = &self.active {
+                job.log(
+                    "job.cancelled",
+                    serde_json::json!({"reason":"reader_state_dropped"}),
+                );
+            }
             worker.abort();
         }
     }
@@ -168,15 +200,42 @@ impl DesktopReader {
         }
         self.semantic_layout.groups.push(group);
     }
-    fn cancel_semantic_request(&mut self) {
+    fn cancel_semantic_request(&mut self, reason: &str) {
+        if let Some(job) = &self.semantic_layout.active {
+            job.log(
+                "job.cancelled",
+                serde_json::json!({
+                    "reason":reason, "demand":self.semantic_layout.demand,
+                    "expanded_demand":self.semantic_layout.expanded,
+                    "revision":self.semantic_layout.revision,
+                    "current_revision":self.rewrite_source.revision()
+                }),
+            );
+        }
         if let Some(worker) = self.semantic_layout.worker.take() {
             worker.abort();
         }
         self.semantic_layout.active = None;
         self.semantic_layout.receiver = None;
     }
-    pub(super) fn invalidate_semantic_plan(&mut self) {
-        self.cancel_semantic_request();
+
+    // Called only after finding visible work that really requires a new request.
+    // Going offscreen alone must not discard a request already paid for.
+    fn yield_semantic_request_to_visible_work(&mut self, demand: &Demand) -> bool {
+        if self.semantic_layout.worker.is_none() {
+            return true;
+        }
+        let Some(job) = &self.semantic_layout.active else {
+            return false;
+        };
+        if relevant(job.index, &job.scope_sources, demand) {
+            return false;
+        }
+        self.cancel_semantic_request("preempted_by_visible_work");
+        true
+    }
+    pub(super) fn invalidate_semantic_plan(&mut self, reason: &str) {
+        self.cancel_semantic_request(reason);
         self.translation.task.cancel();
         self.semantic_layout.reflow_version += 1;
         self.semantic_layout.done.clear();
@@ -248,7 +307,7 @@ impl DesktopReader {
         );
         if self.semantic_layout.semantic_config.as_ref() != Some(&semantic) {
             let had_config = self.semantic_layout.semantic_config.is_some();
-            self.cancel_semantic_request();
+            self.cancel_semantic_request("semantic_config_changed");
             self.translation.task.cancel();
             self.semantic_layout.translations.clear();
             self.semantic_layout.failed.clear();
@@ -280,7 +339,7 @@ impl DesktopReader {
     ) {
         let revision = self.rewrite_source.revision();
         if self.semantic_layout.revision != revision {
-            self.invalidate_semantic_plan();
+            self.invalidate_semantic_plan("source_revision_changed_at_tick");
             self.semantic_layout.revision = revision;
         }
         if self.sync_content_config() {
@@ -292,7 +351,7 @@ impl DesktopReader {
             self.translation.task.cancel();
         }
         if !semantic {
-            self.cancel_semantic_request();
+            self.cancel_semantic_request("semantic_disabled");
         }
         if !semantic && !self.translation.enabled {
             return;
@@ -302,6 +361,15 @@ impl DesktopReader {
         };
         let demand = canonical(demand);
         if demand != self.semantic_layout.demand {
+            if let Some(job) = &self.semantic_layout.active {
+                job.log(
+                    "job.demand_changed",
+                    serde_json::json!({
+                        "previous":self.semantic_layout.demand, "next":demand,
+                        "translation_enabled":self.translation.enabled
+                    }),
+                );
+            }
             self.semantic_layout.next_poll = None;
             self.semantic_layout.demand = demand;
             self.semantic_layout.settled = Some(Instant::now() + SETTLE);
@@ -313,6 +381,10 @@ impl DesktopReader {
             .and_then(|rx| rx.try_recv().ok())
         {
             self.semantic_layout.next_poll = None;
+            job.log(
+                "job.received",
+                serde_json::json!({"success":result.is_ok()}),
+            );
             self.semantic_layout.worker = None;
             self.semantic_layout.active = None;
             self.semantic_layout.receiver = None;
@@ -414,130 +486,119 @@ impl DesktopReader {
         }
         self.semantic_layout.next_poll = Some(Instant::now() + SETTLE);
         let demand = self.semantic_layout.expanded.clone();
-        if let Some(job) = &self.semantic_layout.active {
-            let sources = job.section.blocks[job.target.clone()]
-                .iter()
-                .flat_map(block_ranges)
-                .collect::<Vec<_>>();
-            if !relevant(job.index, &sources, &demand) {
-                self.cancel_semantic_request();
-            }
-        }
-        // AI shares translation's page-level lookahead when both are enabled;
-        // without translation only screen-visible original blocks are targeted.
+        // Visibility selects a fixed subsection plan, never a moving target range.
         let original = self.semantic_source.original();
         let originals = self.semantic_layout.originals.clone();
         if semantic {
-            'sections: for (index, ranges) in &demand {
-                let Some(section) = originals.get(index) else {
+            for batch in self.semantic_batch_plan(&demand) {
+                let index = batch.index;
+                let Some(section) = originals.get(&index) else {
                     continue;
                 };
-                let Some(hash) = self.semantic_layout.hashes.get(index).cloned() else {
+                let Some(hash) = self.semantic_layout.hashes.get(&index).cloned() else {
                     continue;
                 };
-                let complete = self.semantic_source.has_recognition(*index, &hash);
-                for start in 0..section.blocks.len() {
-                    let sources = demanded_sources(&section.blocks[start], ranges);
-                    if !sources
-                        .iter()
-                        .any(|source| ranges.iter().any(|range| overlap(source, range)))
-                    {
-                        continue;
-                    }
-                    if self.semantic_layout.done.get(&(*index, start)) == Some(&hash) {
-                        if self
+                let complete = self.semantic_source.has_recognition(index, &hash);
+                let visible_sources: Vec<_> = demand
+                    .iter()
+                    .filter(|(i, _)| *i == index)
+                    .flat_map(|(_, ranges)| ranges.iter().cloned())
+                    .collect();
+                let mut pending = false;
+                for block in batch.target.clone() {
+                    let done = self.semantic_layout.done.get(&(index, block)) == Some(&hash);
+                    if done
+                        && !self
                             .semantic_layout
                             .translations
                             .keys()
-                            .any(|(section, block, _)| *section == *index && *block == start)
-                            && !self
-                                .semantic_layout
-                                .groups
-                                .iter()
-                                .any(|group| group.index == *index && group.range.contains(&start))
-                        {
-                            self.semantic_layout.groups.push(Group {
-                                index: *index,
-                                range: start..start + 1,
-                                sources,
-                                hash: hash.clone(),
-                                result: None,
-                            });
-                        }
+                            .any(|(i, b, _)| *i == index && *b == block)
+                    {
                         continue;
                     }
-                    if complete
-                        || !needs_recognition(section, start..start + 1)
-                        || self.plugin_settings.semantic_layout_endpoint().is_err()
+                    if !done
+                        && !complete
+                        && needs_recognition(section, block..block + 1)
+                        && self.plugin_settings.semantic_layout_endpoint().is_ok()
                     {
-                        self.semantic_layout
-                            .done
-                            .insert((*index, start), hash.clone());
+                        pending = true;
+                        continue;
+                    }
+                    self.semantic_layout
+                        .done
+                        .insert((index, block), hash.clone());
+                    if !self
+                        .semantic_layout
+                        .groups
+                        .iter()
+                        .any(|g| g.index == index && g.range.contains(&block))
+                    {
                         self.semantic_layout.groups.push(Group {
-                            index: *index,
-                            range: start..start + 1,
-                            sources,
+                            index,
+                            range: block..block + 1,
+                            sources: demanded_sources(&section.blocks[block], &visible_sources),
                             hash: hash.clone(),
                             result: None,
                         });
-                        continue;
                     }
-                    if self.semantic_layout.worker.is_some() {
-                        continue;
-                    }
-                    let mut end = start + 1;
-                    while end < section.blocks.len()
-                        && end - start < 16
-                        && needs_recognition(section, end..end + 1)
-                        && self.semantic_layout.done.get(&(*index, end)) != Some(&hash)
-                        && block_ranges(&section.blocks[end])
-                            .iter()
-                            .any(|source| ranges.iter().any(|range| overlap(source, range)))
-                    {
-                        end += 1;
-                    }
-                    let mut lo = start.saturating_sub(6);
-                    let mut hi = (end + 6).min(section.blocks.len());
-                    // TOC boundaries constrain context, never enlarge the target.
-                    for item in self.reader.toc_items() {
-                        if let Some(target) = &item.target
-                            && target.path() == section.href.path()
-                            && let Some(fragment) = target.fragment()
-                            && let Some(anchor) = section
-                                .anchors
-                                .iter()
-                                .find(|anchor| anchor.fragment == fragment)
-                            && let Some(boundary) = section.blocks.iter().position(|block| {
-                                block_ranges(block)
-                                    .iter()
-                                    .any(|range| range.start.node == anchor.source.node)
-                            })
-                        {
-                            if boundary <= start {
-                                lo = lo.max(boundary);
-                            }
-                            if boundary >= end {
-                                hi = hi.min(boundary);
-                            }
-                        }
-                    }
-                    let job = Job {
-                        index: *index,
-                        offset: lo,
-                        target: start - lo..end - lo,
-                        section: scope_section(section, lo..hi),
-                        hash,
-                    };
-                    let active = job.clone();
-                    let settings = self.plugin_settings.clone();
-                    let book = self.book_id.clone();
-                    let source = original.clone();
-                    let proxy = proxy.clone();
-                    let (tx, rx) = mpsc::channel();
-                    log_scope(&settings, *index, start, end, false);
-                    self.semantic_layout.active = Some(active);
-                    self.semantic_layout.receiver = Some(rx);
-                    self.semantic_layout.worker = Some(runtime.spawn(async move {
+                }
+                if !pending {
+                    continue;
+                }
+                if !self.yield_semantic_request_to_visible_work(&demand) {
+                    continue;
+                }
+                let start = batch.target.start;
+                let end = batch.target.end;
+                let lo = batch.context.start;
+                let hi = batch.context.end;
+                let Ok((provider, model)) = self.plugin_settings.semantic_layout_endpoint() else {
+                    continue;
+                };
+                static NEXT_JOB: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                let job = Job {
+                    id: format!(
+                        "{}-{}-{}",
+                        std::process::id(),
+                        chrono::Utc::now().timestamp_millis(),
+                        NEXT_JOB.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ),
+                    started: Instant::now(),
+                    provider: provider.clone(),
+                    model: model.to_owned(),
+                    index,
+                    offset: lo,
+                    target: start - lo..end - lo,
+                    section: scope_section(section, lo..hi),
+                    hash,
+                    scope_sources: section.blocks[batch.subsection.clone()]
+                        .iter()
+                        .flat_map(block_ranges)
+                        .collect(),
+                };
+                job.log(
+                    "job.scheduled",
+                    serde_json::json!({
+                        "demand":demand, "raw_demand":self.semantic_layout.demand,
+                        "revision":self.semantic_layout.revision,
+                        "translation_enabled":self.translation.enabled,
+                        "subsection":[batch.subsection.start,batch.subsection.end],
+                        "visible_batch":batch.visible
+                    }),
+                );
+                let active = job.clone();
+                let settings = self.plugin_settings.clone();
+                let book = self.book_id.clone();
+                let source = original.clone();
+                let proxy = proxy.clone();
+                let (tx, rx) = mpsc::channel();
+                log_scope(&settings, index, start, end, !batch.visible);
+                self.semantic_layout.active = Some(active);
+                self.semantic_layout.receiver = Some(rx);
+                let job_id = job.id.clone();
+                self.semantic_layout.worker = Some(runtime.spawn(
+                    crate::plugins::semantic_layout::with_job(job_id, async move {
                         let result = tokio::time::timeout(
                             Duration::from_secs(180),
                             recognize_visible(
@@ -550,11 +611,15 @@ impl DesktopReader {
                         )
                         .await
                         .unwrap_or_else(|_| Err("AI layout batch timed out".into()));
+                        job.log(
+                            "job.finished",
+                            serde_json::json!({"success":result.is_ok()}),
+                        );
                         let _ = tx.send((job, result));
                         let _ = proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO));
-                    }));
-                    break 'sections;
-                }
+                    }),
+                ));
+                break;
             }
         }
         let mut wanted = demand.clone();
@@ -660,6 +725,12 @@ impl DesktopReader {
                         );
                     }
                 }
+                self.translation_source.remember_formula_input(
+                    index,
+                    input.block_index,
+                    &original.blocks[input.block_index],
+                    &section.blocks[0],
+                );
                 if let Some((prepared, _)) = crate::plugins::prepare_translation_inputs(
                     &section,
                     self.source.book().metadata.layout == RenditionLayout::PrePaginated,
@@ -684,7 +755,7 @@ impl DesktopReader {
     fn commit_ready_content(&mut self, demand: &Demand, semantic: bool) -> bool {
         let revision = self.rewrite_source.revision();
         if revision != self.semantic_layout.revision {
-            self.invalidate_semantic_plan();
+            self.invalidate_semantic_plan("source_revision_changed_at_commit");
             self.semantic_layout.revision = revision;
             return false;
         }

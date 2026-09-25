@@ -63,7 +63,7 @@ impl PageDisplayList {
             .find(|f| {
                 f.citation_number > 0 && f.bounds.contains(Point::new(f64::from(x), f64::from(y)))
             })
-            .map(|f| (f.source.clone(), f.citation_number))
+            .and_then(|f| f.source.clone().map(|source| (source, f.citation_number)))
     }
 }
 
@@ -83,6 +83,255 @@ mod tests {
         }
         fn resource(&self, _: &PublicationUrl) -> Result<Resource, PublicationError> {
             unreachable!()
+        }
+    }
+
+    #[test]
+    fn generated_text_math_preserves_copy_and_source_offsets() {
+        let source = Source(Book {
+            id: PublicationId::new("text-math").unwrap(),
+            metadata: Metadata::default(),
+            cover: None,
+            sections: vec![],
+            table_of_contents: vec![],
+        });
+        let original = "Before N ~ I0.301 after.";
+        let anchor = SourceAnchor {
+            spine: SpineItemId::new("chapter").unwrap(),
+            node: "p".into(),
+            text_offset: 0,
+        };
+        let range = SourceRange {
+            start: anchor.clone(),
+            end: SourceAnchor {
+                text_offset: original.chars().count() as u64,
+                ..anchor
+            },
+        };
+        let run = |text: &str| TextRun {
+            text: text.into(),
+            style: Default::default(),
+            link: None,
+        };
+        let block = Block::Text(TextBlock {
+            kind: TextBlockKind::Paragraph,
+            style: Default::default(),
+            source: Some(range.clone()),
+            content: vec![
+                Inline::Text(run("Before ")),
+                Inline::Math(MathRun {
+                    original: Some(vec![run("N ~ I0.301")]),
+                    latex: r"N \sim I^{0.301}".into(),
+                    display: false,
+                    size_scale: 1.0,
+                }),
+                Inline::Text(run(" after.")),
+            ],
+        });
+        let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(Arc::new(
+            include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice(),
+        ))]);
+        for unified in [false, true] {
+            let style = ReaderStyle {
+                typesetting: if unified {
+                    rebook_layout::ReaderTypesetting::unified()
+                } else {
+                    Default::default()
+                },
+                spread: SpreadMode::Single,
+                ..Default::default()
+            };
+            let result = engine
+                .layout_blocks(
+                    &source,
+                    std::slice::from_ref(&block),
+                    LayoutViewport::new(800, 400).unwrap(),
+                    &style,
+                )
+                .unwrap();
+            let mut copied = String::new();
+            for page in result.pages {
+                let display = DisplayListCompiler.compile(&page);
+                for region in &display.text_regions {
+                    if let TextRegion::Shaped(region) = region {
+                        if let Some(fragment) = region
+                            .visible_byte_range()
+                            .and_then(|range| region.selection_fragment(range))
+                        {
+                            copied.push_str(&fragment.quote);
+                            assert!(fragment.range.end.text_offset <= range.end.text_offset);
+                        }
+                    }
+                }
+            }
+            assert_eq!(copied, original, "unified={unified}");
+        }
+    }
+
+    #[test]
+    fn reshaped_hyphenated_ligatures_preserve_copied_text() {
+        let source = Source(Book {
+            id: PublicationId::new("ligature-copy").unwrap(),
+            metadata: Metadata::default(),
+            cover: None,
+            sections: vec![],
+            table_of_contents: vec![],
+        });
+        let original="The efficient office studies diffraction and difficult scientific effects. Officials offer sufficient information about artificial interference and different reflections. ".repeat(5);
+        let start = SourceAnchor {
+            spine: SpineItemId::new("chapter").unwrap(),
+            node: "p".into(),
+            text_offset: 0,
+        };
+        let range = SourceRange {
+            end: SourceAnchor {
+                text_offset: original.chars().count() as u64,
+                ..start.clone()
+            },
+            start,
+        };
+        let block = Block::Text(TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: original.clone(),
+                style: TextStyle {
+                    language: TextLanguage::EnglishUs,
+                    ..Default::default()
+                },
+                link: None,
+            })],
+            style: Default::default(),
+            source: Some(range),
+        });
+        let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(Arc::new(
+            include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice(),
+        ))]);
+        let style = ReaderStyle {
+            typesetting: rebook_layout::ReaderTypesetting::unified(),
+            spread: SpreadMode::Single,
+            horizontal_margin: 0.,
+            ..Default::default()
+        };
+        for width in [280, 800] {
+            let layout = engine
+                .layout_blocks(
+                    &source,
+                    std::slice::from_ref(&block),
+                    LayoutViewport::new(width, 400).unwrap(),
+                    &style,
+                )
+                .unwrap();
+            let mut copied = String::new();
+            for page in layout.pages {
+                let display = DisplayListCompiler.compile(&page);
+                for region in &display.text_regions {
+                    if let TextRegion::Shaped(region) = region {
+                        if let Some(fragment) = region
+                            .visible_byte_range()
+                            .and_then(|range| region.selection_fragment(range))
+                        {
+                            copied.push_str(&fragment.quote);
+                        }
+                    }
+                }
+            }
+            assert_eq!(copied, original);
+        }
+    }
+
+    #[test]
+    fn website_icons_keep_targets_and_copy_text_in_unified_layout() {
+        let source = Source(Book {
+            id: PublicationId::new("web").unwrap(),
+            metadata: Metadata::default(),
+            cover: None,
+            sections: vec![],
+            table_of_contents: vec![],
+        });
+        let original =
+            "Visit example.com/path?q=1 and www.example.org. Mail a@example.com. Value 3.14.";
+        let start = SourceAnchor {
+            spine: SpineItemId::new("chapter").unwrap(),
+            node: "p".into(),
+            text_offset: 0,
+        };
+        let range = SourceRange {
+            end: SourceAnchor {
+                text_offset: original.chars().count() as u64,
+                ..start.clone()
+            },
+            start,
+        };
+        let block = Block::Text(TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: original.into(),
+                style: Default::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: Some(range),
+        });
+        let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(Arc::new(
+            include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice(),
+        ))]);
+        let mut style = ReaderStyle {
+            typesetting: rebook_layout::ReaderTypesetting::unified(),
+            spread: SpreadMode::Single,
+            ..Default::default()
+        };
+        for unified in [true, false] {
+            if !unified {
+                style.typesetting = Default::default();
+            }
+            let result = engine
+                .layout_blocks(
+                    &source,
+                    std::slice::from_ref(&block),
+                    LayoutViewport::new(800, 400).unwrap(),
+                    &style,
+                )
+                .unwrap();
+            let mut urls = Vec::new();
+            let mut copied = String::new();
+            for page in result.pages {
+                let display = DisplayListCompiler.compile(&page);
+                for region in &display.text_regions {
+                    if let TextRegion::Shaped(region) = region {
+                        copied.push_str(
+                            &region
+                                .selection_fragment(region.visible_byte_range().unwrap())
+                                .unwrap()
+                                .quote,
+                        );
+                    }
+                }
+                for icon in &display.footnote_regions {
+                    if let Some(url) = &icon.website {
+                        urls.push(url.clone());
+                        let point = icon.bounds.center();
+                        assert_eq!(
+                            display.website_at(point.x as f32, point.y as f32),
+                            Some(url.clone())
+                        );
+                        assert!(
+                            display
+                                .footnote_source_at(point.x as f32, point.y as f32)
+                                .is_none()
+                        );
+                        assert!(
+                            display
+                                .inline_citation_at(point.x as f32, point.y as f32)
+                                .is_none()
+                        );
+                    }
+                }
+            }
+            assert_eq!(copied, original);
+            assert_eq!(urls.len(), if unified { 2 } else { 0 });
+            if unified {
+                assert_eq!(urls[0], "https://example.com/path?q=1");
+            }
         }
     }
 
@@ -222,7 +471,7 @@ mod tests {
         assert!(
             icons
                 .iter()
-                .all(|icon| icon.source == range && icon.bounds.height() < 40.0)
+                .all(|icon| icon.source.as_ref() == Some(&range) && icon.bounds.height() < 40.0)
         );
         assert!(icons[0].bounds.y1 < icons[2].bounds.y0);
         let shifted = display.translate_source_text(&range, 8.0);

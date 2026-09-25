@@ -185,10 +185,10 @@ pub(crate) fn text_block_text(block: &TextBlock) -> String {
         .content
         .iter()
         .map(|inline| match inline {
-            Inline::Text(run) => run.text.as_str(),
-            Inline::Math(run) => run.latex.as_str(),
-            Inline::Image(_) => "",
-            Inline::Break => "\n",
+            Inline::Text(run) => run.text.clone(),
+            Inline::Math(run) => run.original_text().unwrap_or_else(|| run.latex.clone()),
+            Inline::Image(_) => String::new(),
+            Inline::Break => "\n".to_owned(),
         })
         .collect()
 }

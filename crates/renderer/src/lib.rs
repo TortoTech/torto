@@ -116,8 +116,9 @@ struct QuoteRegion {
 
 #[derive(Clone)]
 struct FootnoteRegion {
+    website: Option<String>,
     bounds: Rect,
-    source: SourceRange,
+    source: Option<SourceRange>,
     citation_number: u32,
     citation_glyphs: Vec<GlyphCommand>,
 }
@@ -147,6 +148,33 @@ fn paint_footnote_region(
     color: Color,
     transform: Affine,
 ) {
+    if footnote.website.is_some() {
+        let bounds = footnote.bounds;
+        let center = bounds.center();
+        let radius = bounds.width().min(bounds.height()) * 0.5;
+        scene.stroke(
+            &Stroke::new(1.1),
+            transform,
+            color,
+            None,
+            &Circle::new(center, radius),
+        );
+        scene.stroke(
+            &Stroke::new(1.0),
+            transform,
+            color,
+            None,
+            &kurbo::Ellipse::new(center, (radius * 0.45, radius), 0.0),
+        );
+        scene.stroke(
+            &Stroke::new(1.0),
+            transform,
+            color,
+            None,
+            &Line::new((bounds.x0, center.y), (bounds.x1, center.y)),
+        );
+        return;
+    }
     if footnote.citation_number != 0 {
         for glyphs in &footnote.citation_glyphs {
             let mut glyphs = glyphs.clone();
@@ -816,7 +844,11 @@ impl PageDisplayList {
     ) {
         let transform = Affine::translate((f64::from(offset_x), 0.0));
         for footnote in &self.footnote_regions {
-            if !ranges.iter().any(|range| range == &footnote.source) {
+            if footnote.website.is_none()
+                && !ranges
+                    .iter()
+                    .any(|range| Some(range) == footnote.source.as_ref())
+            {
                 continue;
             }
             paint_footnote_region(scene, footnote, color, transform);
@@ -837,13 +869,27 @@ impl PageDisplayList {
     }
 
     /// Returns the source-backed paragraph owning a semantic footnote icon.
+    pub fn website_at(&self, x: f32, y: f32) -> Option<String> {
+        self.footnote_regions
+            .iter()
+            .rev()
+            .find(|region| {
+                region.website.is_some()
+                    && region
+                        .bounds
+                        .contains(Point::new(f64::from(x), f64::from(y)))
+            })
+            .and_then(|region| region.website.clone())
+    }
+
+    /// Returns the source-backed paragraph owning a semantic footnote icon.
     pub fn footnote_source_at(&self, x: f32, y: f32) -> Option<SourceRange> {
         let point = Point::new(f64::from(x), f64::from(y));
         self.footnote_regions
             .iter()
             .rev()
-            .find(|footnote| footnote.bounds.contains(point))
-            .map(|footnote| footnote.source.clone())
+            .find(|footnote| footnote.website.is_none() && footnote.bounds.contains(point))
+            .and_then(|footnote| footnote.source.clone())
     }
 
     /// Paints block-level outlines for table chunks containing any requested source range.
@@ -2417,8 +2463,9 @@ fn compile_text_commands(
                     } else {
                         compiled_citation_indices.push((number, footnote_regions.len()));
                         footnote_regions.push(FootnoteRegion {
+                            website: None,
                             bounds,
-                            source: source.clone(),
+                            source: Some(source.clone()),
                             citation_number: number,
                             citation_glyphs: vec![command],
                         });
@@ -2430,7 +2477,13 @@ fn compile_text_commands(
                 if compiled_footnote_groups.contains(&brush.footnote_reference_group) {
                     continue;
                 }
-                if let Some(source) = text.source.clone() {
+                let website = text
+                    .citations
+                    .iter()
+                    .find(|c| c.number == brush.footnote_reference_group)
+                    .and_then(|c| c.website.clone());
+                if text.source.is_some() || website.is_some() {
+                    let source = text.source.clone();
                     let center_x = text.origin_x + glyph_run.offset() + glyph_run.advance() / 2.0;
                     let bounds = footnote_icon_bounds(
                         center_x,
@@ -2438,6 +2491,11 @@ fn compile_text_commands(
                         run.font_size(),
                     );
                     footnote_regions.push(FootnoteRegion {
+                        website: text
+                            .citations
+                            .iter()
+                            .find(|c| c.number == brush.footnote_reference_group)
+                            .and_then(|c| c.website.clone()),
                         bounds,
                         source,
                         citation_number: 0,
@@ -2803,7 +2861,7 @@ mod tests {
 
         let list = DisplayListCompiler.compile(&page);
         assert_eq!(list.footnote_regions.len(), 1);
-        assert_eq!(list.footnote_regions[0].source, source);
+        assert_eq!(list.footnote_regions[0].source, Some(source.clone()));
         let icon_bounds = list.footnote_regions[0].bounds;
         assert_eq!(
             list.footnote_source_at(icon_bounds.center().x as f32, icon_bounds.center().y as f32),
@@ -3422,7 +3480,7 @@ mod tests {
             LayoutEngine::with_fonts([rebook_layout::ReaderFontBlob::new(Arc::new(LATIN))]);
         let mut hyphen_count = 0;
         let mut continuation_hyphen = false;
-        let mut exceeded_old_geometry = false;
+        let mut extends_source_glyphs = false;
         for depth in [0, 1] {
             let block = Block::Text(TextBlock {
                 kind: TextBlockKind::ListItem {
@@ -3477,9 +3535,18 @@ mod tests {
                         for hyphen in &region.discretionary_hyphens {
                             hyphen_count += 1;
                             continuation_hyphen |= hyphen.line_index > 0;
-                            exceeded_old_geometry |=
-                                hyphen.end > shared_wrapped_content_end(&region.layout) + 0.01;
                             let line = region.layout.get(hyphen.line_index).unwrap();
+                            let glyph_end = line
+                                .items()
+                                .filter_map(|item| match item {
+                                    PositionedLayoutItem::GlyphRun(run) => {
+                                        Some(run.offset() + run.advance())
+                                    }
+                                    PositionedLayoutItem::InlineBox(_) => None,
+                                })
+                                .fold(0.0_f32, f32::max)
+                                - line.metrics().trailing_whitespace;
+                            extends_source_glyphs |= hyphen.end > glyph_end + 0.01;
                             let x = f64::from(region.origin_x + hyphen.end);
                             let y = region.origin_y + line.metrics().baseline;
                             assert!(
@@ -3531,8 +3598,8 @@ mod tests {
             "fixture must exercise hyphens on hanging continuation lines"
         );
         assert!(
-            exceeded_old_geometry,
-            "fixture must reproduce the missing right-edge geometry"
+            extends_source_glyphs,
+            "fixture must exercise display-only hyphens extending past their source glyphs"
         );
     }
 

@@ -448,7 +448,7 @@ impl DesktopReader {
                 {
                     Ok(snapshot) => {
                         self.pdf_ocr.mode = mode;
-                        self.invalidate_semantic_plan();
+                        self.invalidate_semantic_plan("pdf_ocr_mode_changed");
                         if leave_focus_mode {
                             self.leave_focus_mode_for_pdf();
                         }
@@ -1474,7 +1474,7 @@ impl DesktopReader {
             Ok(response) => {
                 log_completed_chat(message.id, &response);
                 if !response.rewrite_transactions.is_empty() {
-                    self.invalidate_semantic_plan();
+                    self.invalidate_semantic_plan("chat_rewrite_completed");
                     match self.reader.refresh_source() {
                         Ok(snapshot) => {
                             self.apply_snapshot(

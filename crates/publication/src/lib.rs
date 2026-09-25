@@ -63,10 +63,80 @@ impl SpineItemId {
 pub struct PublicationUrl {
     path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    external_web: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     fragment: Option<String>,
 }
 
 impl PublicationUrl {
+    /// External website target for link interaction only, never resource lookup.
+    pub fn website(value: &str) -> Option<Self> {
+        let value = value.trim();
+        let host = value.split(['/', '?', '#', ':']).next().unwrap_or_default();
+        let bare = !value.contains('@')
+            && host.rsplit_once('.').is_some_and(|(name, suffix)| {
+                !name.is_empty()
+                    && name.split('.').all(|part| {
+                        !part.is_empty()
+                            && !part.starts_with('-')
+                            && !part.ends_with('-')
+                            && part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                    })
+                    && matches!(
+                        suffix.to_ascii_lowercase().as_str(),
+                        "com"
+                            | "org"
+                            | "net"
+                            | "edu"
+                            | "gov"
+                            | "cn"
+                            | "io"
+                            | "ai"
+                            | "app"
+                            | "dev"
+                            | "info"
+                            | "biz"
+                            | "co"
+                            | "uk"
+                            | "de"
+                            | "fr"
+                            | "jp"
+                            | "me"
+                            | "tv"
+                            | "xyz"
+                            | "online"
+                            | "site"
+                    )
+            });
+        let value = if value.starts_with("www.") || value.starts_with("//") {
+            format!(
+                "https:{}",
+                if value.starts_with("//") {
+                    value.to_owned()
+                } else {
+                    format!("//{value}")
+                }
+            )
+        } else if bare {
+            format!("https://{value}")
+        } else {
+            value.to_owned()
+        };
+        let parsed = url::Url::parse(&value).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return None;
+        }
+        Some(Self {
+            path: String::new(),
+            fragment: None,
+            external_web: Some(parsed.into()),
+        })
+    }
+
+    pub fn website_url(&self) -> Option<&str> {
+        self.external_web.as_deref()
+    }
+
     /// Parses and canonicalizes a root-relative publication path.
     pub fn parse(value: &str) -> Result<Self, PublicationError> {
         Self::resolve_from_segments(&[], value)
@@ -74,9 +144,13 @@ impl PublicationUrl {
 
     /// Resolves a relative reference against this resource URL.
     pub fn resolve(&self, reference: &str) -> Result<Self, PublicationError> {
+        if self.external_web.is_some() {
+            return Err(PublicationError::ExternalUrl(self.to_string()));
+        }
         if let Some(reference) = reference.strip_prefix('#') {
             let fragment = decode_component(reference)?;
             return Ok(Self {
+                external_web: None,
                 path: self.path.clone(),
                 fragment: non_empty(fragment),
             });
@@ -103,6 +177,7 @@ impl PublicationUrl {
     #[must_use]
     pub fn resource_url(&self) -> Self {
         Self {
+            external_web: self.external_web.clone(),
             path: self.path.clone(),
             fragment: None,
         }
@@ -145,6 +220,7 @@ impl PublicationUrl {
             .transpose()?
             .and_then(non_empty);
         Ok(Self {
+            external_web: None,
             path: segments.join("/"),
             fragment,
         })
@@ -153,6 +229,9 @@ impl PublicationUrl {
 
 impl fmt::Display for PublicationUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(url) = &self.external_web {
+            return formatter.write_str(url);
+        }
         formatter.write_str(&self.path)?;
         if let Some(fragment) = &self.fragment {
             write!(formatter, "#{fragment}")?;
@@ -690,12 +769,28 @@ pub enum InlineImageAlignment {
 /// A LaTeX formula embedded in a text block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MathRun {
+    /// Original styled text for an AI-generated formula; absent for authored math.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<Vec<TextRun>>,
     /// LaTeX source without Markdown delimiters.
     pub latex: String,
     /// Whether the author requested display-style math.
     pub display: bool,
     /// Font-size multiplier inherited from the surrounding text.
     pub size_scale: f32,
+}
+
+impl MathRun {
+    pub fn original_text(&self) -> Option<String> {
+        self.original
+            .as_ref()
+            .map(|runs| runs.iter().map(|run| run.text.as_str()).collect())
+    }
+    pub fn source_char_len(&self) -> usize {
+        self.original.as_ref().map_or(0, |runs| {
+            runs.iter().map(|run| run.text.chars().count()).sum()
+        })
+    }
 }
 
 /// Styled text span with an optional link target.
@@ -1465,5 +1560,35 @@ mod tests {
 
         assert_eq!(ambiguous.writing_system(), WritingSystem::Unknown);
         assert_eq!(author_only.writing_system(), WritingSystem::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod website_tests {
+    use super::*;
+    #[test]
+    fn website_targets_are_separate_from_archive_resources() {
+        for input in [
+            "example.com/path?q=1#section",
+            "www.example.com/path?q=1#section",
+            "https://example.com/path?q=1#section",
+        ] {
+            let target = PublicationUrl::website(input).unwrap();
+            assert!(target.website_url().unwrap().starts_with("https://"));
+            assert!(target.website_url().unwrap().ends_with("/path?q=1#section"));
+            assert_eq!(target.path(), "");
+            assert!(target.resolve("file.xhtml").is_err());
+        }
+        for value in [
+            "a@example.com",
+            "3.14",
+            "figure.png",
+            "javascript:alert(1)",
+            "mailto:a@example.com",
+            "file:///tmp/a",
+        ] {
+            assert!(PublicationUrl::website(value).is_none(), "{value}");
+        }
+        assert!(PublicationUrl::parse("https://example.com").is_err());
     }
 }

@@ -3,11 +3,13 @@
 pub mod linebreak;
 
 mod formula_images;
+mod web_links;
 
 /// Whether a paragraph consists only of a recognized formula image and an
 /// optional equation number, rendered as one display formula in unified mode.
 pub fn is_display_formula(block: &rebook_publication::TextBlock) -> bool {
     formula_images::only_formula(block).is_some()
+        || matches!(block.content.as_slice(),[Inline::Math(run)] if run.original.is_some() && run.display)
 }
 
 use std::borrow::Cow;
@@ -722,6 +724,7 @@ pub struct QuotePlacement {
 /// Original text and ownership behind a collapsed inline reference marker.
 #[derive(Clone)]
 pub struct InlineCitationPlacement {
+    pub website: Option<String>,
     pub owner: Option<SourceRange>,
     pub range: Range<usize>,
     pub original: String,
@@ -2100,18 +2103,48 @@ impl LayoutEngine {
         } else {
             0.0
         };
-        let mut optimized = should_optimize
-            && linebreak::parley::plan_optimized_with_hanging_indent(
-                &mut layout,
-                &text,
-                available_width,
-                first_line_indent,
-                continuation_indent,
-                typography.font_size,
-                &hyphen_widths,
-            )
-            .and_then(|plan| {
-                let mut adjusted = self.build_text_layout(
+        let mut optimized = false;
+        let mut shaping_breaks = Vec::new();
+        // Reshape at chosen discretionary breaks and remeasure before accepting
+        // the paragraph. This preserves ligatures within each resulting line.
+        if should_optimize {
+            for _ in 0..4 {
+                let Some(plan) = linebreak::parley::plan_optimized_with_hanging_indent(
+                    &mut layout,
+                    &text,
+                    available_width,
+                    first_line_indent,
+                    continuation_indent,
+                    typography.font_size,
+                    &hyphen_widths,
+                ) else {
+                    break;
+                };
+                let next_breaks: Vec<_> = plan.hyphen_offsets.iter().flatten().copied().collect();
+                if next_breaks != shaping_breaks {
+                    shaping_breaks = next_breaks;
+                    layout = self.build_text_layout_with_boundaries(
+                        &text,
+                        &spans,
+                        &inline_images,
+                        &font_stack,
+                        typography,
+                        block.style.line_height,
+                        reader_style.foreground,
+                        &[],
+                        &shaping_breaks,
+                    );
+                    self.apply_text_indents(
+                        &mut layout,
+                        block,
+                        &text[..source_text_start],
+                        typography,
+                        &font_stack,
+                        first_line_indent,
+                    );
+                    continue;
+                }
+                let mut adjusted = self.build_text_layout_with_boundaries(
                     &text,
                     &spans,
                     &inline_images,
@@ -2120,6 +2153,7 @@ impl LayoutEngine {
                     block.style.line_height,
                     reader_style.foreground,
                     &plan.adjustments,
+                    &shaping_breaks,
                 );
                 self.apply_text_indents(
                     &mut adjusted,
@@ -2129,7 +2163,11 @@ impl LayoutEngine {
                     &font_stack,
                     first_line_indent,
                 );
-                linebreak::parley::apply_breaks(&mut adjusted, &plan.lines, available_width)?;
+                if linebreak::parley::apply_breaks(&mut adjusted, &plan.lines, available_width)
+                    .is_none()
+                {
+                    break;
+                }
                 selected_hyphens = plan
                     .hyphen_offsets
                     .iter()
@@ -2140,9 +2178,32 @@ impl LayoutEngine {
                     })
                     .collect();
                 layout = adjusted;
-                Some(())
-            })
-            .is_some();
+                optimized = true;
+                break;
+            }
+        }
+        if !optimized && !shaping_breaks.is_empty() {
+            // Non-convergence falls back without stale shaping fences, invented
+            // hyphens, or modified source text.
+            layout = self.build_text_layout(
+                &text,
+                &spans,
+                &inline_images,
+                &font_stack,
+                typography,
+                block.style.line_height,
+                reader_style.foreground,
+                &[],
+            );
+            self.apply_text_indents(
+                &mut layout,
+                block,
+                &text[..source_text_start],
+                typography,
+                &font_stack,
+                first_line_indent,
+            );
+        }
         if !optimized {
             layout.break_all_lines(Some(available_width));
             linebreak::parley::repair_trailing_footnote_line(&mut layout, &text, available_width);
@@ -2313,6 +2374,32 @@ impl LayoutEngine {
         foreground: Rgba,
         spacing: &[linebreak::parley::SpacingAdjustment],
     ) -> Layout<TextBrush> {
+        self.build_text_layout_with_boundaries(
+            text,
+            spans,
+            inline_images,
+            font_stack,
+            typography,
+            line_height,
+            foreground,
+            spacing,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_text_layout_with_boundaries(
+        &mut self,
+        text: &str,
+        spans: &[StyledRange],
+        inline_images: &[PreparedInlineImage],
+        font_stack: &str,
+        typography: &ReaderTypography,
+        line_height: f32,
+        foreground: Rgba,
+        spacing: &[linebreak::parley::SpacingAdjustment],
+        shaping_breaks: &[usize],
+    ) -> Layout<TextBrush> {
         let mut builder =
             self.layout_context
                 .ranged_builder(&mut self.font_context, text, 1.0, false);
@@ -2388,6 +2475,20 @@ impl LayoutEngine {
                 width: image.width,
                 height: image.box_height,
             });
+        }
+        // Parley out-of-flow boxes split shaping runs but consume neither
+        // text offsets, line width, height, nor forced-break cluster counts.
+        // They are internal shaping fences, never actual rendered images.
+        for (index, offset) in shaping_breaks.iter().copied().enumerate() {
+            if offset > 0 && offset < text.len() && text.is_char_boundary(offset) {
+                builder.push_inline_box(ParleyInlineBox {
+                    id: u64::MAX - index as u64,
+                    kind: InlineBoxKind::OutOfFlow,
+                    index: offset,
+                    width: 0.0,
+                    height: 0.0,
+                });
+            }
         }
         builder.build(text)
     }
@@ -2544,16 +2645,36 @@ fn resolve_text_block<'a>(
     context: TextContext,
 ) -> Cow<'a, TextBlock> {
     if reader_style.typesetting.mode != TypesettingMode::Unified {
-        if block.style.hard_break_after {
+        let generated = block
+            .content
+            .iter()
+            .any(|i| matches!(i,Inline::Math(m) if m.original.is_some()));
+        if block.style.hard_break_after || generated {
             let mut resolved = block.clone();
-            resolved.style.margin_after +=
-                reader_style.typography.font_size * resolved.style.line_height.max(1.0);
+            if generated {
+                resolved.content = resolved
+                    .content
+                    .into_iter()
+                    .flat_map(|i| match i {
+                        Inline::Math(MathRun {
+                            original: Some(runs),
+                            ..
+                        }) => runs.into_iter().map(Inline::Text).collect(),
+                        other => vec![other],
+                    })
+                    .collect();
+            }
+            if block.style.hard_break_after {
+                resolved.style.margin_after +=
+                    reader_style.typography.font_size * resolved.style.line_height.max(1.0);
+            }
             return Cow::Owned(resolved);
         }
         return Cow::Borrowed(block);
     }
 
     let mut resolved = block.clone();
+    let generated_display = matches!(block.content.as_slice(),[Inline::Math(run)] if run.original.is_some() && run.display);
     let typography = &reader_style.typography;
     let profile = &reader_style.typesetting;
     let base_size = typography.font_size;
@@ -2739,7 +2860,14 @@ fn resolve_text_block<'a>(
             Inline::Break => {}
         }
     }
+    if generated_display {
+        resolved.style.align = TextAlignment::Center;
+        resolved.style.indent = 0.0;
+        resolved.style.margin_before = base_size * profile.media_gap_em;
+        resolved.style.margin_after = base_size * profile.media_gap_em;
+    }
     resolve_semantic_inline_presentation(&mut resolved.content, reader_style.writing_system);
+    web_links::detect(&mut resolved.content);
     if matches!(
         block.kind,
         TextBlockKind::Blockquote | TextBlockKind::QuoteAttribution
@@ -3366,6 +3494,21 @@ fn prepare_inline_content(
                 {
                     continue;
                 }
+                let website = unified_math
+                    && run.style.inline_citation == 0
+                    && run.style.inline_role == InlineRole::Normal
+                    && run.style.link_role == LinkRole::Normal
+                    && run
+                        .link
+                        .as_ref()
+                        .and_then(PublicationUrl::website_url)
+                        .is_some();
+                if website
+                    && inline_index > 0
+                    && matches!(&block.content[inline_index-1],Inline::Text(previous) if previous.link==run.link && previous.style.inline_citation==0 && previous.style.inline_role==InlineRole::Normal && previous.style.link_role==LinkRole::Normal)
+                {
+                    continue;
+                }
                 let start = text.len();
                 let mut style = run.style;
                 if style.color == Rgba::BLACK {
@@ -3380,7 +3523,26 @@ fn prepare_inline_content(
                             && run.style.baseline == TextBaseline::Superscript));
                 let footnote_reference = focus_footnote_icons
                     && (run.style.inline_role == InlineRole::Footnote || linked_footnote_reference);
-                if style.inline_citation != 0 {
+                let website_group = 0x4000_0000 | next_footnote_reference_group;
+                if website {
+                    let original: String = block.content[inline_index..].iter().take_while(|inline| matches!(inline,Inline::Text(r) if r.link==run.link && r.style.inline_citation==0 && r.style.inline_role==InlineRole::Normal && r.style.link_role==LinkRole::Normal)).filter_map(|inline|match inline {Inline::Text(r)=>Some(r.text.as_str()),_=>None}).collect();
+                    text.push_str(&footnote_icon_placeholder(&original));
+                    citations.push(InlineCitationPlacement {
+                        website: run
+                            .link
+                            .as_ref()
+                            .and_then(PublicationUrl::website_url)
+                            .map(str::to_owned),
+                        owner: block.source.clone(),
+                        range: start..text.len(),
+                        original,
+                        number: website_group,
+                    });
+                    next_footnote_reference_group = next_footnote_reference_group.saturating_add(1);
+                    style.bold = false;
+                    style.italic = false;
+                    style.baseline = TextBaseline::Normal;
+                } else if style.inline_citation != 0 {
                     let original: String = block.content[inline_index..].iter().take_while(|inline| matches!(inline, Inline::Text(r) if r.style.inline_citation == style.inline_citation)).filter_map(|i| match i { Inline::Text(r) => Some(r.text.as_str()), _ => None }).collect();
                     let label = format!("[{}]", style.inline_citation);
                     text.push_str(&label);
@@ -3388,6 +3550,7 @@ fn prepare_inline_content(
                         text.push('\u{2060}');
                     }
                     citations.push(InlineCitationPlacement {
+                        website: None,
                         owner: block.source.clone(),
                         range: start..text.len(),
                         original,
@@ -3402,7 +3565,9 @@ fn prepare_inline_content(
                 } else {
                     text.push_str(&run.text);
                 }
-                let footnote_reference_group = if style.inline_citation != 0 {
+                let footnote_reference_group = if website {
+                    website_group
+                } else if style.inline_citation != 0 {
                     0x8000_0000 | style.inline_citation
                 } else if footnote_reference {
                     let group = next_footnote_reference_group;
@@ -3424,18 +3589,50 @@ fn prepare_inline_content(
             }
             Inline::Math(run) => {
                 let id = u64::try_from(inline_images.len()).unwrap_or(u64::MAX);
+                let display_padding = run.original.is_some() && run.display;
+                let pad_x = if display_padding {
+                    (typography.font_size * 0.4)
+                        .max(6.0)
+                        .min((available_width - 1.0).max(0.0) * 0.5)
+                } else {
+                    0.0
+                };
+                let pad_y = if display_padding {
+                    (typography.font_size * 0.25).max(4.0)
+                } else {
+                    0.0
+                };
                 if let Ok(image) = rasterize_formula(
                     run,
                     typography,
                     fallback_color,
-                    available_width,
+                    (available_width - 2.0 * pad_x).max(1.0),
                     svg_options,
-                ) {
+                )
+                .and_then(|image| {
+                    if !display_padding {
+                        return Ok(image);
+                    }
+                    let height = image.2 + pad_y * 2.0;
+                    formula_images::padded_display_row(
+                        image,
+                        None,
+                        (available_width - pad_x * 2.0).max(1.0),
+                        height,
+                        pad_x,
+                        pad_y,
+                        false,
+                    )
+                    .ok_or_else(|| "Formula padding failed".to_owned())
+                }) {
                     let (box_height, offset_y) =
                         formula_images::math_vertical_metrics(run, typography, image.2)
                             .unwrap_or((image.2, 0.0));
                     inline_images.push(PreparedInlineImage {
-                        formula_presentation: None,
+                        formula_presentation: run.original.as_ref().map(|_| FormulaPresentation {
+                            original: image.0.clone(),
+                            latex: run.latex.clone(),
+                        }),
                         id,
                         index: text.len(),
                         width: image.1,
@@ -3444,6 +3641,37 @@ fn prepare_inline_content(
                         offset_y,
                         image: image.0,
                     });
+                    if let Some(original) = run.original_text() {
+                        let start = text.len();
+                        text.extend(std::iter::repeat_n('\u{2060}', original.chars().count()));
+                        citations.push(InlineCitationPlacement {
+                            website: None,
+                            owner: block.source.clone(),
+                            range: start..text.len(),
+                            original,
+                            number: 0,
+                        });
+                        spans.push(StyledRange {
+                            range: start..text.len(),
+                            style: TextStyle {
+                                color: fallback_color,
+                                ..Default::default()
+                            },
+                            footnote_reference_group: 0,
+                            hyphenation_suppressed: true,
+                        });
+                    }
+                } else if let Some(original) = &run.original {
+                    for run in original {
+                        let start = text.len();
+                        text.push_str(&run.text);
+                        spans.push(StyledRange {
+                            range: start..text.len(),
+                            style: run.style,
+                            footnote_reference_group: 0,
+                            hyphenation_suppressed: true,
+                        });
+                    }
                 } else {
                     let start = text.len();
                     text.push('$');
@@ -6736,6 +6964,148 @@ mod tests {
         }
     }
 
+    fn check_reshaped_line_ends(value: &str) -> bool {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("ligatures").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: vec![],
+                table_of_contents: vec![],
+            },
+        };
+        let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(Arc::new(
+            include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice(),
+        ))]);
+        let text_style = TextStyle {
+            language: rebook_publication::TextLanguage::EnglishUs,
+            ..Default::default()
+        };
+        let block = Block::Text(TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: value.into(),
+                style: text_style,
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        });
+        let spans = vec![StyledRange {
+            range: 0..value.len(),
+            style: text_style,
+            footnote_reference_group: 0,
+            hyphenation_suppressed: false,
+        }];
+        let mut broke_ligature = false;
+        let mut retained_ligature = false;
+        for size in [16., 20., 28.] {
+            let mut style = ReaderStyle {
+                typesetting: ReaderTypesetting::unified(),
+                spread: SpreadMode::Single,
+                horizontal_margin: 0.,
+                ..Default::default()
+            };
+            style.typography.font_size = size;
+            let mut natural = engine.build_text_layout(
+                value,
+                &spans,
+                &[],
+                "Literata",
+                &style.typography,
+                1.5,
+                Rgba::BLACK,
+                &[],
+            );
+            natural.break_all_lines(None);
+            let mut interiors = Vec::new();
+            for line in natural.lines() {
+                for run in line.runs() {
+                    for cluster in run.clusters() {
+                        if cluster.is_ligature_continuation() {
+                            interiors.push(cluster.text_range().start);
+                        }
+                    }
+                }
+            }
+            assert!(!interiors.is_empty());
+            for width in [260, 500, 788, 800] {
+                let result = engine
+                    .layout_blocks(
+                        &source,
+                        std::slice::from_ref(&block),
+                        LayoutViewport::new(width, 4000).unwrap(),
+                        &style,
+                    )
+                    .unwrap();
+                for page in result.pages {
+                    for item in page.items {
+                        if let PageItem::Text(t) = item {
+                            if t.text.as_ref() != value {
+                                continue;
+                            }
+                            assert_eq!(t.text.as_ref(), value);
+                            for item in t.layout.inline_boxes() {
+                                if item.kind == InlineBoxKind::OutOfFlow {
+                                    broke_ligature |= interiors.contains(&item.index);
+                                }
+                            }
+                            for line in t.layout.lines() {
+                                retained_ligature |= line.runs().any(|run| {
+                                    run.clusters().any(|cluster| cluster.is_ligature_start())
+                                });
+                                let mut glyph_end = 0.0_f32;
+                                for item in line.items() {
+                                    if let parley::PositionedLayoutItem::GlyphRun(run) = item {
+                                        for glyph in run.positioned_glyphs() {
+                                            glyph_end = glyph_end.max(glyph.x + glyph.advance);
+                                        }
+                                    }
+                                }
+                                let metrics = line.metrics();
+                                let actual = glyph_end - metrics.trailing_whitespace;
+                                let measured =
+                                    metrics.offset + metrics.advance - metrics.trailing_whitespace;
+                                assert!(
+                                    (actual - measured).abs() < 0.05,
+                                    "font={size} width={width} actual={actual} measured={measured} text={}",
+                                    &t.text[line.text_range()]
+                                );
+                                assert!(
+                                    !line
+                                        .runs()
+                                        .find_map(|run| run
+                                            .clusters()
+                                            .next()
+                                            .map(|c| c.is_ligature_continuation()))
+                                        .unwrap_or(false)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(retained_ligature, "unbroken ligatures must remain enabled");
+        broke_ligature
+    }
+
+    #[test]
+    fn discretionary_breaks_reshape_ligatures_and_match_actual_glyph_widths() {
+        let text="An efficient office investigates diffraction and difficult scientific problems. Different officials discuss sufficient information about reflection, effective amplification and artificial interference. The office staff carefully compare findings and offer specific explanations for difficult effects. ".repeat(3);
+        assert!(
+            check_reshaped_line_ends(&text),
+            "exercise a legal hyphenation point inside an original ligature"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_LINE_TEXT containing the local photographed paragraph"]
+    fn local_photographed_ligature_line_ends() {
+        let text = std::fs::read_to_string(std::env::var("TORTO_LINE_TEXT").unwrap()).unwrap();
+        assert!(check_reshaped_line_ends(&text));
+    }
+
     #[test]
     fn long_paragraph_is_split_into_multiple_pages() {
         let source = EmptySource {
@@ -7174,6 +7544,7 @@ mod tests {
                         link: None,
                     }),
                     Inline::Math(MathRun {
+                        original: None,
                         latex: r"E=mc^2".into(),
                         display: false,
                         size_scale: 1.0,
@@ -7450,6 +7821,7 @@ mod tests {
                 text: TextBlock {
                     kind: TextBlockKind::Paragraph,
                     content: vec![Inline::Math(MathRun {
+                        original: None,
                         latex: "E=mc^2".into(),
                         display: false,
                         size_scale: 1.0,

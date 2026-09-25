@@ -7,9 +7,17 @@ use serde_json::{Value, json};
 use crate::plugins::AiProvider;
 
 static LOG_LOCK: Mutex<()> = Mutex::new(());
+tokio::task_local! { static JOB_ID: String; }
+
+pub(crate) async fn with_job<T>(id: String, future: impl std::future::Future<Output = T>) -> T {
+    JOB_ID.scope(id, future).await
+}
 
 /// Available in release builds too. Never record request bodies or model text.
-pub(super) fn event(provider: &AiProvider, model: &str, event: &str, details: Value) {
+pub(crate) fn event(provider: &AiProvider, model: &str, event: &str, mut details: Value) {
+    if let Ok(id) = JOB_ID.try_with(Clone::clone) {
+        details["job_id"] = json!(id);
+    }
     write_event(
         provider,
         model,

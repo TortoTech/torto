@@ -1744,6 +1744,31 @@ impl ReaderSession {
         Ok(self.page_at(position)?.inline_citation_at(x, y))
     }
 
+    pub fn website_at_page(
+        &mut self,
+        position: ReaderPosition,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<String>, ReaderError> {
+        self.ensure_segment(SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        })?;
+        Ok(self.page_at(position)?.website_at(x, y))
+    }
+
+    pub fn website_at_current_spread(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<String>, ReaderError> {
+        Ok(self
+            .current_spread_pages()?
+            .iter()
+            .rev()
+            .find_map(|(_, page, offset)| page.website_at(x - *offset, y)))
+    }
+
     pub fn image_at_page(
         &mut self,
         position: ReaderPosition,
@@ -3882,7 +3907,14 @@ fn split_inline_content(content: Vec<Inline>) -> Vec<(Vec<Inline>, usize)> {
                     remaining = rest;
                 }
             }
-            Inline::Math(run) => current.push(Inline::Math(run)),
+            Inline::Math(run) => {
+                let length = run.source_char_len();
+                if current_len > 0 && current_len.saturating_add(length) > FRAGMENT_TEXT_BUDGET {
+                    flush(&mut current, &mut current_len, &mut parts);
+                }
+                current_len += length;
+                current.push(Inline::Math(run));
+            }
             Inline::Image(run) => current.push(Inline::Image(run)),
         }
     }
@@ -3927,7 +3959,7 @@ fn inline_content_len(content: &[Inline]) -> usize {
         .iter()
         .map(|inline| match inline {
             Inline::Text(run) => run.text.chars().count(),
-            Inline::Math(_) => 0,
+            Inline::Math(run) => run.source_char_len(),
             Inline::Image(_) => 0,
             Inline::Break => 1,
         })

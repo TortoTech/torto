@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const MAX_IMAGES: usize = 8;
+pub(super) const MAX_IMAGES: usize = 5;
 pub(super) const MAX_BYTES: usize = 6 * 1024 * 1024;
 
 pub(super) struct Pending {
@@ -9,21 +9,6 @@ pub(super) struct Pending {
     pub candidate: Candidate,
     pub aliases: Vec<PublicationUrl>,
     pub url: String,
-}
-
-pub(super) fn options() -> Value {
-    let mut item = image_options()["response_format"]["json_schema"]["schema"].clone();
-    item["properties"]["image_id"] = json!({"type":"integer"});
-    item["required"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!("image_id"));
-    json!({"temperature":0.0,"response_format":{"type":"json_schema","json_schema":{
-        "name":"formula_image_batch","strict":true,"schema":{
-            "type":"object","additionalProperties":false,
-            "properties":{"results":{"type":"array","items":item}},"required":["results"]
-        }
-    }}})
 }
 
 #[derive(Clone)]
@@ -42,7 +27,7 @@ impl Input {
     }
 }
 
-/// Match by ID and retain independently valid results. Missing, duplicate or
+/// Match by ID and retain independently valid results. Missing, conflicting or
 /// malformed items remain pending; a broken sibling cannot erase a good result.
 #[cfg(test)]
 fn parse(content: &str, ids: &[usize]) -> HashMap<usize, Response> {
@@ -71,7 +56,7 @@ fn parse_results(
     let Some(items) = value["results"].as_array() else {
         return HashMap::new();
     };
-    let mut seen = HashSet::new();
+    let mut seen = HashMap::new();
     let mut result = HashMap::new();
     for value in items {
         let Some(id) = value["image_id"]
@@ -81,10 +66,13 @@ fn parse_results(
         else {
             continue;
         };
-        if !seen.insert(id) {
-            result.remove(&id);
+        if let Some(previous) = seen.get(&id) {
+            if previous != &value {
+                result.remove(&id);
+            }
             continue;
         }
+        seen.insert(id, value);
         if value.get("latex").is_none() || value.get("equation_number").is_none() {
             continue;
         }
@@ -110,6 +98,7 @@ async fn stage(
     client: &reqwest::Client,
     provider: &super::super::super::AiProvider,
     model: &str,
+    reasoning_effort: ReasoningEffort,
     items: &[Input],
     mode: &str,
 ) -> Result<HashMap<usize, Response>, String> {
@@ -141,7 +130,7 @@ async fn stage(
             json!({"mode":mode,"images":ids.len(),"attempt":attempt+1}),
         );
         let messages = vec![
-            json!({"role":"system","content":format!("{PROMPT}\n{BATCH_PROMPT}")}),
+            json!({"role":"system","content":request_prompt(mode)}),
             json!({"role":"user","content":content}),
         ];
         let response = ai::request_completion(
@@ -151,7 +140,7 @@ async fn stage(
             &messages,
             None,
             Some(16384),
-            ReasoningEffort::Default,
+            reasoning_effort,
             Some(&options()),
         )
         .await;
@@ -203,6 +192,7 @@ pub(super) async fn request_batch(
     client: &reqwest::Client,
     provider: &super::super::super::AiProvider,
     model: &str,
+    reasoning_effort: ReasoningEffort,
     batch: &[Pending],
 ) -> Result<Vec<Option<Response>>, String> {
     let inputs: Vec<_> = batch
@@ -215,7 +205,15 @@ pub(super) async fn request_batch(
             rendered: None,
         })
         .collect();
-    let mut results = stage(client, provider, model, &inputs, "transcribe").await?;
+    let mut results = stage(
+        client,
+        provider,
+        model,
+        reasoning_effort,
+        &inputs,
+        "transcribe",
+    )
+    .await?;
     let mut verification = Vec::new();
     for input in &inputs {
         let Some(proposal) = results.get(&input.id) else {
@@ -269,7 +267,16 @@ pub(super) async fn request_batch(
             bytes += verification[end].bytes();
             end += 1;
         }
-        match stage(client, provider, model, &verification[start..end], "verify").await {
+        match stage(
+            client,
+            provider,
+            model,
+            reasoning_effort,
+            &verification[start..end],
+            "verify",
+        )
+        .await
+        {
             Ok(verified) => results.extend(verified),
             Err(error) => log::event(
                 provider,

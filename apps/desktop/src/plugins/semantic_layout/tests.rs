@@ -1029,7 +1029,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
         .unwrap()
         .block_on(request_groups(
             &client,
-            (&provider, "fixture"),
+            (&provider, "fixture", ReasoningEffort::High),
             &input,
             &section,
             &RecognitionRoles {
@@ -1287,13 +1287,17 @@ fn live_ramachandran_gemini_lite() {
 #[test]
 fn unified_request_returns_groups_and_citations_in_one_call() {
     use std::io::{BufRead, Read, Write};
-    let section = section(vec![
-        text("p", "Evidence (Smith, 2020)."),
+    let mut section = section(vec![
+        text("p", "Evidence (Smith, 2020). Rate x = y."),
         text("q", "A line of verse.\n-- A poet"),
         image("img"),
         text("caption", "Figure 1. A diagram."),
         text("context", "Other (Jones, 2022)."),
     ]);
+    let Block::Text(heading) = &mut section.blocks[4] else {
+        unreachable!()
+    };
+    heading.kind = TextBlockKind::Heading(2);
     let candidates = citations::window_candidates(&section, 0..4);
     assert_eq!(candidates.len(), 1);
     let roles = RecognitionRoles::default();
@@ -1324,16 +1328,28 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
         let mut bytes = vec![0; length];
         reader.read_exact(&mut bytes).unwrap();
         let request: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(request["reasoning_effort"], "high");
         assert_eq!(
             request["response_format"]["json_schema"]["schema"]["required"],
-            json!(["groups", "citations"])
+            json!(["groups", "citations", "formulas"])
         );
         let input: Value =
             serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
         assert_eq!(input["blocks"][0]["citation_candidates"][0]["id"], "c0_0_0");
         assert_eq!(input["quotes_enabled"], true);
         assert_eq!(input["captions_enabled"], true);
-        let response = json!({"groups":[{"kind":"quote_inline","body":[1],"credit":"-- A poet","alignment":"start"},{"kind":"figure","images":[2],"captions":[3]}],"citations":["c0_0_0"]});
+        let mut response = json!({"groups":[{"kind":"quote_inline","body":[1],"credit":"-- A poet","alignment":"start"},{"kind":"figure","images":[2],"captions":[3]}],"citations":["c0_0_0"],"formulas":[{"block":0,"paragraph":0,"original":"x = y","latex":"x=y","before":"","after":""}]});
+        let duplicate = response["groups"][0].clone();
+        response["groups"]
+            .as_array_mut()
+            .unwrap()
+            .extend([duplicate, json!({"kind":"section_heading","block":4})]);
+        response["citations"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("c0_0_0"));
+        let duplicate = response["formulas"][0].clone();
+        response["formulas"].as_array_mut().unwrap().push(duplicate);
         let body = json!({"choices":[{"message":{"content":response.to_string()}}]}).to_string();
         write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         // Listener drops after this one response. A second pass would fail.
@@ -1351,7 +1367,7 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
-            (&provider, "fixture"),
+            (&provider, "fixture", ReasoningEffort::High),
             &input,
             &section,
             &roles,
@@ -1362,7 +1378,10 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
     server.join().unwrap();
     assert_eq!(result.groups.len(), 2);
     assert_eq!(result.citations, ["c0_0_0"]);
-    let annotations = citations::window_annotations(&candidates, &result.citations);
+    assert_eq!(result.formulas.len(), 1);
+    let mut annotations = citations::window_annotations(&candidates, &result.citations);
+    annotations
+        .extend(resolve_text_formulas(&section, 0..4, &result.formulas, &result.citations).0);
     assert!(citations::validate_annotations(&section, &annotations));
     let mut displayed = section.clone();
     for a in &annotations {
@@ -1372,10 +1391,33 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
         compose(&mut displayed.blocks, &annotation(group, &section));
     }
     let inputs = crate::plugins::prepare_translation_inputs(&displayed, false);
+    assert!(inputs[0].0.text.contains("<torto-math-0/>"));
     assert!(
         inputs[0]
             .0
             .text
             .contains("<citation id=\"1\">(Smith, 2020)</citation>")
     );
+}
+
+#[test]
+fn layout_reasoning_defaults_roundtrips_and_changes_cache_identity() {
+    let old: SemanticLayoutSettings =
+        serde_json::from_value(json!({"enabled":true,"provider":"old","model":"old"})).unwrap();
+    assert_eq!(old.reasoning_effort, ReasoningEffort::Default);
+    let mut settings = PluginSettings::default();
+    settings.providers[0].api_key = "fixture".into();
+    settings.providers[0].base_url = "http://127.0.0.1:9/v1".into();
+    settings.semantic_layout.enabled = true;
+    settings.semantic_layout.provider = settings.providers[0].id.clone();
+    settings.semantic_layout.model = settings.providers[0].models[0].id.clone();
+    let original = recognition_identity("reasoning-fixture", &settings).unwrap();
+    settings.semantic_layout.reasoning_effort = ReasoningEffort::High;
+    assert_ne!(
+        recognition_identity("reasoning-fixture", &settings).unwrap(),
+        original
+    );
+    let restored: SemanticLayoutSettings =
+        serde_json::from_value(serde_json::to_value(&settings.semantic_layout).unwrap()).unwrap();
+    assert_eq!(restored.reasoning_effort, ReasoningEffort::High);
 }

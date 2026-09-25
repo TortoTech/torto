@@ -2207,7 +2207,7 @@ impl DesktopReader {
         }
     }
 
-    fn focus_footnote_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
+    pub(super) fn focus_footnote_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
         if !self.ui.focus_footnotes_visible {
             return;
         }
@@ -2397,6 +2397,32 @@ impl DesktopReader {
             self.classic_footnote_overlay_rect = None;
         } else {
             self.classic_footnote_overlay_rect = Some(overlay.response.rect);
+        }
+        let outside_body_click = ctx.input(|input| {
+            input
+                .pointer
+                .primary_clicked()
+                .then(|| input.pointer.interact_pos())
+                .flatten()
+                .filter(|position| {
+                    page_rect.contains(*position) && !overlay.response.rect.contains(*position)
+                })
+        });
+        if let Some(position) = outside_body_click {
+            let x = position.x - page_rect.left();
+            let y = position.y - page_rect.top();
+            // Clicking another reference switches the popup; only ordinary
+            // body clicks dismiss it. Keep popup scrolling/selection untouched.
+            if self.citation_at_canvas(x, y).is_none()
+                && self
+                    .footnote_source_at_canvas(x, y)
+                    .ok()
+                    .flatten()
+                    .is_none()
+            {
+                self.close_focus_footnotes();
+                ctx.request_repaint();
+            }
         }
     }
 
@@ -3962,6 +3988,23 @@ impl DesktopReader {
     }
 
     fn pointer_interaction(&mut self, response: &egui::Response) {
+        if let Some(position) = response.hover_pos() {
+            if let Some(url) = self.website_at_canvas(
+                position.x - response.rect.min.x,
+                position.y - response.rect.min.y,
+            ) {
+                response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                response.clone().on_hover_text(&url);
+                if response.clicked() {
+                    if let Some(target) = rebook_publication::PublicationUrl::website(&url) {
+                        response
+                            .ctx
+                            .open_url(egui::OpenUrl::new_tab(target.website_url().unwrap()));
+                    }
+                    return;
+                }
+            }
+        }
         self.classic_footnote_hover_interaction(response);
         let Some(position) = response.interact_pointer_pos() else {
             if !response.ctx.input(|input| input.pointer.primary_down()) {
@@ -4254,6 +4297,41 @@ impl DesktopReader {
     }
 
     fn selected_image_overlay(&self, ctx: &egui::Context, page_rect: Rect) {
+        if self.is_focus_mode()
+            && self.is_scroll_mode()
+            && self
+                .focus_units
+                .get(self.focus_unit_index)
+                .is_some_and(|unit| unit.is_image)
+        {
+            // Focus borders belong to the figure, not clipboard/preview selection.
+            // Draw every associated image even after caption-only reflow.
+            if let Some(layout) = &self.scroll_section
+                && let Some(viewport) = self.scroll_viewport
+            {
+                let painter = ctx
+                    .layer_painter(selected_image_layer_id())
+                    .with_clip_rect(page_rect);
+                for (position, bounds) in self.active_focus_image_bounds() {
+                    if let Some(top) = layout.content_y_for_position(position, 0.0) {
+                        let bounds = bounds.translate(Vec2::new(
+                            page_rect.left(),
+                            page_rect.top() + top + self.scroll_content_padding(viewport.size.y)
+                                - viewport.offset_y,
+                        ));
+                        if bounds.intersects(page_rect) {
+                            painter.rect_stroke(
+                                bounds,
+                                2.0,
+                                egui::Stroke::new(2.0, palette().accent),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let Some(selected) = &self.selected_image else {
             return;
         };

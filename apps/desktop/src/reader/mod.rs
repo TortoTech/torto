@@ -2784,29 +2784,48 @@ impl DesktopReader {
             .any(|unit| !unit.structure_ranges.is_empty())
     }
 
-    fn sync_focus_selected_image(&mut self) {
+    fn active_focus_image_bounds(&self) -> Vec<(ReaderPosition, egui::Rect)> {
         let Some(unit) = self
             .focus_units
             .get(self.focus_unit_index)
             .filter(|unit| unit.is_image)
-            .map(|unit| (unit.position, unit.rect))
         else {
+            return Vec::new();
+        };
+        let Some(layout) = &self.scroll_section else {
+            return Vec::new();
+        };
+        layout
+            .pages
+            .iter()
+            .flat_map(|page| {
+                page.page
+                    .image_source_rects(&unit.paint_ranges)
+                    .into_iter()
+                    .map(|rect| {
+                        (
+                            page.position,
+                            egui::Rect::from_min_max(
+                                egui::pos2(rect.x0 as f32, rect.y0 as f32),
+                                egui::pos2(rect.x1 as f32, rect.y1 as f32),
+                            ),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    fn sync_focus_selected_image(&mut self) {
+        // A figure's activation rectangle includes its caption, which can move
+        // across pages or grow when sentence structure is applied. Hit the
+        // actual source-backed image instead of the combined rectangle center.
+        let Some((position, bounds)) = self.active_focus_image_bounds().into_iter().next() else {
             self.selected_image = None;
             return;
         };
-        let Some(layout) = self.scroll_section.as_ref() else {
-            self.selected_image = None;
-            return;
-        };
-        let Some(page_index) = layout.pages.iter().position(|page| page.position == unit.0) else {
-            self.selected_image = None;
-            return;
-        };
-        let page_y =
-            unit.1.center().y - layout.page_tops[page_index] + layout.page_origins[page_index];
         let image = self
             .reader
-            .image_at_page(unit.0, unit.1.center().x, page_y)
+            .image_at_page(position, bounds.center().x, bounds.center().y)
             .ok()
             .flatten();
         if let Some(image) = image {
@@ -2817,7 +2836,7 @@ impl DesktopReader {
             {
                 return;
             }
-            self.invalidate_page_scene(unit.0);
+            self.invalidate_page_scene(position);
             self.selected_image = SelectedImage::from_reader_image(&image, true).ok();
         } else {
             self.selected_image = None;

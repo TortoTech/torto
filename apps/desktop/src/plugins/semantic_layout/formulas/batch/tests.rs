@@ -2,6 +2,11 @@ use super::*;
 
 #[test]
 fn batch_results_match_ids_and_isolate_bad_items() {
+    let item = json!({"image_id":0,"status":"recognized","latex":"x=1","equation_number":null});
+    assert_eq!(
+        parse(&json!({"results":[item.clone(),item]}).to_string(), &[0]).len(),
+        1
+    );
     let result = parse(
         r#"{"results":[
         {"image_id":2,"status":"not_formula","latex":null,"equation_number":null},
@@ -50,6 +55,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
             let mut bytes = vec![0; size];
             reader.read_exact(&mut bytes).unwrap();
             let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["reasoning_effort"], "high");
             let input = body["messages"][1]["content"].as_array().unwrap();
             let header: Value = serde_json::from_str(input[0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(
@@ -121,7 +127,13 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
         .unwrap();
     let result = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(request_batch(&client, &provider, "fixture", &batch))
+        .block_on(request_batch(
+            &client,
+            &provider,
+            "fixture",
+            ReasoningEffort::High,
+            &batch,
+        ))
         .unwrap();
     server.join().unwrap();
     assert_eq!(result.len(), 3);
@@ -168,6 +180,25 @@ fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Op
             let mut bytes = vec![0; length];
             reader.read_exact(&mut bytes).unwrap();
             let request: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request["reasoning_effort"], "high");
+            let schema = &request["response_format"]["json_schema"]["schema"];
+            assert_eq!(schema["required"], json!(["results"]));
+            assert!(schema["properties"].get("latex").is_none());
+            let fields = &schema["properties"]["results"]["items"]["properties"];
+            for field in ["image_id", "status", "latex", "equation_number"] {
+                assert!(
+                    fields[field]["description"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+                );
+            }
+            let prompt = request["messages"][0]["content"].as_str().unwrap();
+            assert!(!prompt.contains(if mode == "verify" {
+                "Transcription self-check"
+            } else {
+                "Conditional review"
+            }));
+
             let content = request["messages"][1]["content"].as_array().unwrap();
             let header: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(header["mode"], mode);
@@ -176,7 +207,11 @@ fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Op
                 request["messages"][0]["content"]
                     .as_str()
                     .unwrap()
-                    .contains("Transcription self-check")
+                    .contains(if mode == "verify" {
+                        "Conditional review"
+                    } else {
+                        "Transcription self-check"
+                    })
             );
             let (status, body) = if reply.is_null() {
                 ("500 Internal Server Error", "{}".to_owned())
@@ -222,7 +257,13 @@ fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Op
         .unwrap();
     let result = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(request_batch(&client, &provider, "fixture", &batch))
+        .block_on(request_batch(
+            &client,
+            &provider,
+            "fixture",
+            ReasoningEffort::High,
+            &batch,
+        ))
         .unwrap();
     server.join().unwrap();
     result

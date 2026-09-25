@@ -13,7 +13,7 @@ pub(super) fn ancestor_link(node: Node<'_, '_>, base: &PublicationUrl) -> Option
     node.ancestors()
         .filter(|n| n.is_element() && n.has_tag_name("a"))
         .find_map(|n| attribute_local(n, "href"))
-        .and_then(|href| base.resolve(href).ok())
+        .and_then(|href| PublicationUrl::website(href).or_else(|| base.resolve(href).ok()))
 }
 
 impl ReadingIrParser<'_> {

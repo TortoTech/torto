@@ -142,7 +142,7 @@ impl DesktopReader {
         }
     }
 
-    fn footnote_source_at_canvas(
+    pub(in crate::reader) fn footnote_source_at_canvas(
         &mut self,
         x: f32,
         y: f32,
@@ -156,6 +156,15 @@ impl DesktopReader {
                 .map(|source| source.map(|source| (position, source)))
         } else {
             self.reader.footnote_source_at_current_spread(x, y)
+        }
+    }
+
+    pub(in crate::reader) fn website_at_canvas(&mut self, x: f32, y: f32) -> Option<String> {
+        if self.is_scroll_mode() {
+            let (position, px, py) = self.scroll_page_coordinates(x, y)?;
+            self.reader.website_at_page(position, px, py).ok().flatten()
+        } else {
+            self.reader.website_at_current_spread(x, y).ok().flatten()
         }
     }
 

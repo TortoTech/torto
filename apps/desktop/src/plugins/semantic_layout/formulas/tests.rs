@@ -374,6 +374,7 @@ fn live_computational_formula_images() {
             &client,
             provider,
             "gemini/lite",
+            ReasoningEffort::Default,
             &pending,
         ))
         .unwrap();

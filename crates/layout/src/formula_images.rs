@@ -48,6 +48,7 @@ pub(super) fn inline(
         return Err("Numbered formula requires a display row".into());
     }
     let math = MathRun {
+        original: None,
         latex: formula.latex.clone(),
         display: false,
         size_scale: scale,
@@ -541,7 +542,7 @@ mod tests {
     }
 }
 
-fn padded_display_row(
+pub(super) fn padded_display_row(
     body: (RasterImage, f32, f32),
     number: Option<(RasterImage, f32, f32)>,
     inner_width: f32,
@@ -678,6 +679,7 @@ impl LayoutEngine {
             };
             rasterize_formula(
                 &MathRun {
+                    original: None,
                     latex: format!(r"\text{{{label}}}"),
                     display: false,
                     size_scale: 0.85,
@@ -706,6 +708,7 @@ impl LayoutEngine {
         };
         let Ok((raster, w, h)) = rasterize_formula(
             &MathRun {
+                original: None,
                 latex: formula.latex.clone(),
                 display: true,
                 size_scale: 1.0,

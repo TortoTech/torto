@@ -34,6 +34,7 @@ fn popup_inlines(text: &str, style: TextStyle) -> Vec<Inline> {
             }));
         }
         result.push(Inline::Math(rebook_publication::MathRun {
+            original: None,
             latex: latex.into(),
             display: false,
             size_scale: 1.0,

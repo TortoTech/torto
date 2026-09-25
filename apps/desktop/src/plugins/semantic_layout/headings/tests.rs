@@ -28,7 +28,11 @@ fn live_numbered_headings_and_book_page_numbers() {
             let result = runtime
                 .block_on(request_window_groups(
                     &client,
-                    endpoint,
+                    (
+                        endpoint.0,
+                        endpoint.1,
+                        settings.semantic_layout.reasoning_effort,
+                    ),
                     &input,
                     section,
                     &roles,

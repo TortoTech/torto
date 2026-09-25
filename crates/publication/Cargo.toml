@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 percent-encoding.workspace = true
+url = "2.5"
 serde.workspace = true
 thiserror.workspace = true
 

@@ -116,6 +116,18 @@ pub(super) fn split_credit(text: &TextBlock, credit: &str) -> Option<(TextBlock,
                     attribution.content.push(Inline::Break);
                 }
             }
+            Inline::Math(math) if math.original.is_some() => {
+                let len = math.source_char_len();
+                if remaining >= len {
+                    body.content.push(inline.clone());
+                    remaining -= len;
+                    source_offset += len as u64;
+                } else if remaining == 0 {
+                    attribution.content.push(inline.clone());
+                } else {
+                    return None;
+                }
+            }
             // Do not guess offsets through formulas or image-based text.
             _ => return None,
         }

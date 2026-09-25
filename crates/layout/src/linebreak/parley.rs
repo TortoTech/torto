@@ -502,7 +502,23 @@ pub(crate) fn apply_breaks(
         breaker.set_prior_line_width(column_width);
     }
     breaker.finish();
-    (layout.len() == lines.len()).then_some(())
+    if layout.len() != lines.len() {
+        return None;
+    }
+    for line in layout.lines().skip(1) {
+        if line
+            .runs()
+            .find_map(|run| {
+                run.clusters()
+                    .next()
+                    .map(|cluster| cluster.is_ligature_continuation())
+            })
+            .unwrap_or(false)
+        {
+            return None;
+        }
+    }
+    Some(())
 }
 
 #[cfg(test)]

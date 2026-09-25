@@ -213,7 +213,11 @@ fn paragraph_atoms_for_content_mode(
                 len
             }
             Inline::Math(run) => {
-                let len = run.latex.chars().count();
+                let len = run
+                    .original_text()
+                    .unwrap_or_else(|| run.latex.clone())
+                    .chars()
+                    .count();
                 if is_ocr_superscript_reference(run.display, &run.latex) && len > 0 {
                     footnotes.push(cursor..cursor + len);
                 }
@@ -831,10 +835,10 @@ fn inline_text(content: &[Inline]) -> String {
     content
         .iter()
         .map(|inline| match inline {
-            Inline::Text(run) => run.text.as_str(),
-            Inline::Math(run) => run.latex.as_str(),
-            Inline::Image(_) => "",
-            Inline::Break => "\n",
+            Inline::Text(run) => run.text.clone(),
+            Inline::Math(run) => run.original_text().unwrap_or_else(|| run.latex.clone()),
+            Inline::Image(_) => String::new(),
+            Inline::Break => "\n".to_owned(),
         })
         .collect()
 }
@@ -877,7 +881,11 @@ fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
     for inline in content {
         let len = match inline {
             Inline::Text(run) => run.text.chars().count(),
-            Inline::Math(run) => run.latex.chars().count(),
+            Inline::Math(run) => run
+                .original_text()
+                .unwrap_or_else(|| run.latex.clone())
+                .chars()
+                .count(),
             Inline::Image(_) => 0,
             Inline::Break => 1,
         };
@@ -1528,6 +1536,7 @@ mod tests {
     fn semicolon_splitting_preserves_formulas_and_attached_footnotes() {
         let target = PublicationUrl::parse("chapter.xhtml#note-1").unwrap();
         let formula = rebook_publication::MathRun {
+            original: None,
             latex: "f(x;y)".into(),
             display: false,
             size_scale: 1.0,
@@ -1589,6 +1598,7 @@ mod tests {
                 link: None,
             }),
             Inline::Math(rebook_publication::MathRun {
+                original: None,
                 latex: "f(x,y):=x+y".to_owned(),
                 display: false,
                 size_scale: 1.0,
@@ -1730,6 +1740,7 @@ mod tests {
                     link: None,
                 }),
                 Inline::Math(rebook_publication::MathRun {
+                    original: None,
                     latex: "^{11}".to_owned(),
                     display: false,
                     size_scale: 1.0,
