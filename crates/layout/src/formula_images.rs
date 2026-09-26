@@ -259,6 +259,91 @@ mod tests {
     }
 
     #[test]
+    fn generated_display_formula_collapses_prose_gap_and_has_no_baseline_shift() {
+        let source = Source(Book {
+            id: PublicationId::new("text-formula-gaps").unwrap(),
+            metadata: Metadata::default(),
+            cover: None,
+            sections: vec![],
+            table_of_contents: vec![],
+        });
+        let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(Arc::new(include_bytes!(
+            "../../../assets/fonts/Literata-opsz-wght.ttf"
+        )))]);
+        for size in [18.0, 32.0] {
+            let mut style = ReaderStyle {
+                typesetting: ReaderTypesetting::unified(),
+                spread: SpreadMode::Single,
+                ..Default::default()
+            };
+            style.typography.font_size = size;
+            let prose = TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: "The sine is defined geometrically as".into(),
+                    style: Default::default(),
+                    link: None,
+                })],
+                style: Default::default(),
+                source: None,
+            };
+            let formula = TextBlock {
+                content: vec![Inline::Math(MathRun {
+                    latex: r"\sin\theta=\frac{y}{r}.".into(),
+                    display: true,
+                    size_scale: 1.0,
+                    original: Some(vec![TextRun {
+                        text: "sin theta = y/r.".into(),
+                        style: Default::default(),
+                        link: None,
+                    }]),
+                })],
+                ..prose.clone()
+            };
+            let layout = engine
+                .layout_blocks(
+                    &source,
+                    &[
+                        Block::Text(prose.clone()),
+                        Block::Text(formula),
+                        Block::Text(prose),
+                    ],
+                    LayoutViewport::new(800, 1600).unwrap(),
+                    &style,
+                )
+                .unwrap();
+            let texts: Vec<_> = layout.pages[0]
+                .items
+                .iter()
+                .filter_map(|item| {
+                    if let PageItem::Text(text) = item {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(texts.len(), 3);
+            let before = texts[0];
+            let formula = texts[1];
+            assert_eq!(formula.inline_images.len(), 1);
+            assert_eq!(formula.inline_images[0].offset_y, 0.0);
+            let last = before.layout.get(before.lines.end - 1).unwrap();
+            let metrics = last.metrics();
+            let bottom = before.origin_y
+                + metrics
+                    .block_max_coord
+                    .max(metrics.block_min_coord + metrics.line_height);
+            let first = formula.layout.get(formula.lines.start).unwrap();
+            let gap = formula.origin_y + first.metrics().block_min_coord - bottom;
+            assert!(
+                (gap - size * style.typesetting.media_gap_em).abs() < 1.0,
+                "the prose gap must collapse into the formula gap: size={size}, gap={gap}"
+            );
+        }
+    }
+
+    #[test]
     fn image_gaps_use_the_paragraph_end_after_discretionary_hyphens() {
         let source = Source(Book {
             id: PublicationId::new("image-gap-test").unwrap(),

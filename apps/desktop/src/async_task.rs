@@ -38,6 +38,12 @@ impl<T> TaskSlot<T> {
             .or(self.pending.as_ref())
             .map(|task| &task.payload)
     }
+    pub fn active_id(&self) -> Option<u64> {
+        self.in_flight
+            .as_ref()
+            .or(self.pending.as_ref())
+            .map(|task| task.id)
+    }
     pub fn is_pending(&self) -> bool {
         self.pending.is_some() || self.in_flight.is_some()
     }

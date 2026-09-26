@@ -2863,6 +2863,7 @@ fn resolve_text_block<'a>(
     if generated_display {
         resolved.style.align = TextAlignment::Center;
         resolved.style.indent = 0.0;
+        resolved.style.line_height = 1.0;
         resolved.style.margin_before = base_size * profile.media_gap_em;
         resolved.style.margin_after = base_size * profile.media_gap_em;
     }
@@ -3625,9 +3626,14 @@ fn prepare_inline_content(
                     )
                     .ok_or_else(|| "Formula padding failed".to_owned())
                 }) {
-                    let (box_height, offset_y) =
+                    let (box_height, offset_y) = if display_padding {
+                        // A display row already has symmetric internal padding;
+                        // prose baseline adjustments would move it down again.
+                        (image.2, 0.0)
+                    } else {
                         formula_images::math_vertical_metrics(run, typography, image.2)
-                            .unwrap_or((image.2, 0.0));
+                            .unwrap_or((image.2, 0.0))
+                    };
                     inline_images.push(PreparedInlineImage {
                         formula_presentation: run.original.as_ref().map(|_| FormulaPresentation {
                             original: image.0.clone(),
@@ -4105,10 +4111,17 @@ impl Paginator {
     fn push_text(&mut self, prepared: &PreparedText, block: &TextBlock) -> Result<(), LayoutError> {
         self.forced_page_break = false;
         let is_paragraph = matches!(block.kind, TextBlockKind::Paragraph);
-        if is_paragraph && self.previous_block_was_paragraph {
+        let display_formula = matches!(block.content.as_slice(), [Inline::Math(run)] if run.original.is_some() && run.display);
+        if display_formula {
+            // Match standalone images: collapse the surrounding paragraph gap
+            // into the media gap instead of adding both before the formula.
+            self.ensure_minimum_spacing(block.style.margin_before);
+        } else if is_paragraph && self.previous_block_was_paragraph {
             self.ensure_minimum_spacing(self.minimum_paragraph_gap);
         }
-        self.add_preserved_spacing(block.style.margin_before);
+        if !display_formula {
+            self.add_preserved_spacing(block.style.margin_before);
+        }
         let mut line_start = 0;
         while line_start < prepared.layout.len() {
             let first = prepared

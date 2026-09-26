@@ -167,11 +167,19 @@ impl DesktopReader {
             });
         }
         if let Some(request) = self.translation.task.take_pending() {
+            super::semantic_layout::translation_task_event(
+                &request.payload,
+                request.id,
+                "translation.started",
+                serde_json::json!({}),
+            );
             let proxy = proxy.clone();
             let worker = runtime.spawn(async move {
                 let id = request.id;
                 let payload = request.payload;
                 let batch_proxy = proxy.clone();
+                let logging_task = payload.clone();
+                let started = Instant::now();
                 let result = translate_blocks_incremental(
                     payload.settings,
                     payload.blocks,
@@ -182,6 +190,7 @@ impl DesktopReader {
                     },
                 )
                 .await;
+                super::semantic_layout::translation_task_event(&logging_task, id, "translation.finished", serde_json::json!({"success":result.is_ok(),"elapsed_ms":started.elapsed().as_millis()}));
                 let _ = proxy.send_event(UserEvent::ReaderTranslation(
                     TranslationTaskMessage::Complete(crate::async_task::TaskResult { id, result }),
                 ));
@@ -1657,7 +1666,7 @@ impl DesktopReader {
         self.translation.clear_error();
         if self.translation.enabled {
             self.translation.enabled = false;
-            self.translation.task.cancel();
+            self.cancel_translation_request("translation_disabled");
             self.translation.toc_task.cancel();
             let was_rendering = self.translation.render_enabled;
             if !self.set_translation_rendering(false) {
@@ -1755,6 +1764,14 @@ impl DesktopReader {
                 else {
                     return;
                 };
+                if let Some(task) = self.translation.task.in_flight(id) {
+                    super::semantic_layout::translation_task_event(
+                        task,
+                        id,
+                        "translation.batch_received",
+                        serde_json::json!({"count":translations.len()}),
+                    );
+                }
                 self.stage_translation_batch(section_index, translations);
             }
             TranslationTaskMessage::Complete(message) => {

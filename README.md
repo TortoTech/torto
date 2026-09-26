@@ -66,10 +66,22 @@ Focus Mode is Torto's default and flagship reading experience—and the feature 
 | **Selection and annotations** | Select freely or by word, sentence, or paragraph; copy text, create highlights and notes, and return to durable source locations. | ✅ |
 | **Image preview** | Open book images in an overlay, zoom with the wheel, pan when enlarged, and copy images to the clipboard. | ✅ |
 | **Translation** | Translate book content in replacement or bilingual mode and translate the table of contents. | ✅ |
+| **AI layout** | Recover missing headings, attributed quotations and captions; turn inline citations into popup references; recognize text and image formulas and render them as mathematics. | ✅ Optional |
+| **References and links** | Read footnotes and inline citations in a shared popup; open website icons in your browser in unified typesetting. | ✅ |
 | **AI reading assistant** | Stream answers with source-backed citations and render Markdown, tables, math, SVG, and Mermaid, including enlarged visual previews. | ✅ Optional |
 | **PDF OCR and metadata recognition** | Recognize title, author, table of contents, page roles, and body content; switch between the original PDF and a reflowable OCR layout. | ✅ Optional |
 | **WebDAV sync** | Sync books, reading progress, highlights, and notes directly through your own WebDAV provider. | ✅ Optional |
 | **Windows updates** | Check GitHub Releases automatically, verify the MSI with SHA-256, and install updates after confirmation. | ✅ Windows |
+
+### AI layout and reading tools
+
+Select an AI layout model and reasoning effort in **Settings → Typesetting → Layout**. AI layout supplements the book parser: it can identify headings stored as ordinary paragraphs, quotations with explicit sources, missing attribution for existing quotations, and figure or table captions. Tables represented by images are supported too.
+
+Inline citations appear as numbered markers, restarting within each paragraph. In Focus Mode, their popup lists footnotes first, then inline citations. Formula recognition handles both images and formulas written as text, and copying a recognized formula yields its LaTeX text. Unified typesetting also turns website addresses, including common bare domains, into clickable internet icons.
+
+Recognition prioritizes the current reading area and processes the active subsection in stable batches. When translation is enabled, AI layout follows its reading range and prepares semantic markup before translation; related results are applied together to reduce layout jumps. Recognition can be imperfect, and rejected formula conversions retain the original content.
+
+In chat, type `/` for reading skills or `@` to attach references. Use the arrow keys to select a suggestion and `Tab` to insert it; when suggestions are open, `Tab` keeps the conversation open.
 
 ## Screenshots
 
@@ -101,7 +113,7 @@ After installation, import one or more books from the bookshelf and open a book 
 
 - Imported books and reading data remain in Torto's local application-data directory.
 - WebDAV passwords and AI API keys are stored in the operating system's secure credential store rather than ordinary configuration files.
-- AI and translation features are opt-in. Content is sent only when you configure and actively use a provider.
+- AI layout, translation, chat, and OCR use your configured providers. Once enabled, AI layout and translation can automatically send relevant book text or images as you read, including subsection context or upcoming content within their scheduling range.
 - WebDAV traffic goes directly from Torto to the service you choose; there is no Torto-operated relay.
 
 ## Development
@@ -115,7 +127,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-The core reading path is `parser → Reading IR → layout → renderer`. See the [native rendering architecture decision](docs/adr-0001-native-epub-renderer.md), [WebDAV sync protocol](docs/webdav-sync-v1.md), and [known upstream issues](docs/known-upstream-issues.md) for details.
+The core reading path is `parser → Reading IR → layout → renderer`. See the [native rendering architecture decision](docs/adr-0001-native-epub-renderer.md), [AI layout batching](docs/ai-layout-batching.md), [AI layout and translation scheduling](docs/ai-layout-scheduling.md), [WebDAV sync protocol](docs/webdav-sync-v1.md), and [known upstream issues](docs/known-upstream-issues.md) for details.
 
 ## Project status
 

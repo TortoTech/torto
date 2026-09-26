@@ -225,7 +225,12 @@ fn focus_chat_shortcut_action(
     input: &mut egui::InputState,
     shortcut: &egui::KeyboardShortcut,
     open: bool,
+    suggestions_active: bool,
 ) -> Option<FocusChatShortcutAction> {
+    // Leave completion keys for the composer, which runs after reader shortcuts.
+    if open && suggestions_active && input.key_pressed(egui::Key::Tab) {
+        return None;
+    }
     let fresh = shortcut_has_fresh_press(input, shortcut);
     input.consume_shortcut(shortcut).then_some(if !fresh {
         FocusChatShortcutAction::IgnoreRepeat
@@ -1415,9 +1420,15 @@ impl DesktopReader {
         }
         let open = self.ui.assistant_panel == Some(AssistantPanel::Chat)
             && self.ui.assistant_motion.target > 0.5;
-        let Some(action) = ctx
-            .input_mut(|input| focus_chat_shortcut_action(input, &self.shortcuts.focus_chat, open))
-        else {
+        let suggestions_active = if open && ctx.text_edit_focused() {
+            let (references, commands) = self.assistant_suggestions(self.chat.task.is_pending());
+            active_suggestion_count(&references, &commands) > 0
+        } else {
+            false
+        };
+        let Some(action) = ctx.input_mut(|input| {
+            focus_chat_shortcut_action(input, &self.shortcuts.focus_chat, open, suggestions_active)
+        }) else {
             return false;
         };
         if action != FocusChatShortcutAction::IgnoreRepeat {
@@ -6166,6 +6177,43 @@ mod reference_suggestion_label_tests {
     }
 
     #[test]
+    fn chat_tab_reaches_skill_completion_before_panel_toggle() {
+        let ctx = egui::Context::default();
+        let shortcut = crate::preferences::ShortcutPreferences::default().focus_chat;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |root| {
+                assert_eq!(
+                    ctx.input_mut(|input| {
+                        focus_chat_shortcut_action(input, &shortcut, true, true)
+                    }),
+                    None
+                );
+                egui::CentralPanel::default().show(root, |ui| {
+                    let input_id = ui.make_persistent_id("assistant-chat-input");
+                    ui.memory_mut(|memory| memory.request_focus(input_id));
+                    let commands = chat_command_suggestions("/");
+                    assert!(!commands.is_empty());
+                    let keys = assistant_composer_keys(ui, input_id, commands.len());
+                    assert!(keys.input_had_focus);
+                    assert!(keys.acceptance == AssistantSuggestionAcceptance::Tab);
+                    assert!(!ui.input(|input| input.key_pressed(egui::Key::Tab)));
+                });
+            },
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
     fn chat_shortcut_toggles_while_editing_and_ignores_key_repeat() {
         let ctx = egui::Context::default();
         let shortcut = crate::preferences::ShortcutPreferences::default().focus_chat;
@@ -6189,8 +6237,9 @@ mod reference_suggestion_label_tests {
                     ..Default::default()
                 },
                 |root| {
-                    let action =
-                        ctx.input_mut(|input| focus_chat_shortcut_action(input, &shortcut, open));
+                    let action = ctx.input_mut(|input| {
+                        focus_chat_shortcut_action(input, &shortcut, open, false)
+                    });
                     assert_eq!(action, expected);
                     if action == Some(FocusChatShortcutAction::Close) {
                         assert!(ctx.text_edit_focused());

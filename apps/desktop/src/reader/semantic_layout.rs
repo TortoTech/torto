@@ -236,7 +236,7 @@ impl DesktopReader {
     }
     pub(super) fn invalidate_semantic_plan(&mut self, reason: &str) {
         self.cancel_semantic_request(reason);
-        self.translation.task.cancel();
+        self.cancel_translation_request(reason);
         self.semantic_layout.reflow_version += 1;
         self.semantic_layout.done.clear();
         self.semantic_layout.originals.clear();
@@ -308,7 +308,7 @@ impl DesktopReader {
         if self.semantic_layout.semantic_config.as_ref() != Some(&semantic) {
             let had_config = self.semantic_layout.semantic_config.is_some();
             self.cancel_semantic_request("semantic_config_changed");
-            self.translation.task.cancel();
+            self.cancel_translation_request("semantic_config_changed");
             self.semantic_layout.translations.clear();
             self.semantic_layout.failed.clear();
             self.semantic_layout.done.clear();
@@ -322,7 +322,7 @@ impl DesktopReader {
             }
         }
         if self.semantic_layout.translation_config.as_ref() != Some(&translation) {
-            self.translation.task.cancel();
+            self.cancel_translation_request("translation_config_changed");
             self.semantic_layout.translations.clear();
             self.semantic_layout.failed.clear();
             self.semantic_layout.translation_config = Some(translation);
@@ -348,7 +348,7 @@ impl DesktopReader {
         self.poll_semantic_reflow(runtime, proxy);
         let semantic = self.semantic_enabled();
         if !self.translation.enabled {
-            self.translation.task.cancel();
+            self.cancel_translation_request("translation_disabled");
         }
         if !semantic {
             self.cancel_semantic_request("semantic_disabled");
@@ -639,19 +639,7 @@ impl DesktopReader {
                 }
             }
         }
-        if let Some(task) = self.translation.task.active()
-            && !task.blocks.iter().any(|input| {
-                missing.iter().any(|(key, _)| {
-                    *key == (task.section_index, input.block_index, input.segment_index)
-                })
-            })
-        {
-            self.translation.task.cancel();
-        }
-        if self.translation.enabled
-            && !self.translation.task.is_pending()
-            && self.plugin_settings.translation_endpoint().is_ok()
-        {
+        if self.translation.enabled && self.plugin_settings.translation_endpoint().is_ok() {
             let available = missing
                 .iter()
                 .filter(|(key, _)| {
@@ -671,21 +659,73 @@ impl DesktopReader {
                     .into_iter()
                     .next()
                 {
+                    if !self.translation_can_start(&missing, !blocks.is_empty()) {
+                        if self.commit_ready_content(&demand, semantic) {
+                            let _ = proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO));
+                        }
+                        return;
+                    }
                     let mut settings = self.plugin_settings.clone();
                     settings.target_language = settings.resolved_target_language(
                         crate::preferences::AppLanguage::system_translation_target(),
                     );
-                    self.translation.task.begin(TranslationTask {
+                    let id = self.translation.task.begin(TranslationTask {
                         section_index: index,
                         settings,
                         blocks,
                     });
+                    if let Some(task) = self.translation.task.active() {
+                        translation_task_event(
+                            task,
+                            id,
+                            "translation.scheduled",
+                            serde_json::json!({"demand":demand}),
+                        );
+                    }
                 }
             }
         }
         if self.commit_ready_content(&demand, semantic) {
             let _ = proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO));
         }
+    }
+
+    pub(super) fn cancel_translation_request(&mut self, reason: &str) {
+        if let (Some(id), Some(task)) = (
+            self.translation.task.active_id(),
+            self.translation.task.active(),
+        ) {
+            translation_task_event(
+                task,
+                id,
+                "translation.cancelled",
+                serde_json::json!({
+                    "reason":reason,"demand":self.semantic_layout.demand
+                }),
+            );
+        }
+        self.translation.task.cancel();
+    }
+
+    fn translation_can_start(
+        &mut self,
+        missing: &[(Key, crate::plugins::TranslationBlockInput)],
+        replacement_ready: bool,
+    ) -> bool {
+        if !replacement_ready {
+            return false;
+        }
+        if let Some(task) = self.translation.task.active() {
+            if task.blocks.iter().any(|input| {
+                missing.iter().any(|(key, _)| {
+                    *key == (task.section_index, input.block_index, input.segment_index)
+                })
+            }) {
+                return false;
+            }
+            self.cancel_translation_request("preempted_by_ready_translation");
+        }
+        true
     }
 
     fn missing_prepared(
@@ -949,3 +989,23 @@ impl DesktopReader {
 
 #[cfg(test)]
 pub(in crate::reader) mod tests;
+
+pub(super) fn translation_task_event(
+    task: &TranslationTask,
+    id: u64,
+    event: &str,
+    mut details: serde_json::Value,
+) {
+    if let Ok((provider, model)) = task.settings.translation_endpoint() {
+        details["task_id"] = serde_json::json!(id);
+        details["process_id"] = serde_json::json!(std::process::id());
+        details["section_index"] = serde_json::json!(task.section_index);
+        details["blocks"] = serde_json::json!(
+            task.blocks
+                .iter()
+                .map(|b| (b.block_index, b.segment_index))
+                .collect::<Vec<_>>()
+        );
+        crate::plugins::semantic_layout::translation_event(provider, model, event, details);
+    }
+}

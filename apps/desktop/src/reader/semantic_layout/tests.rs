@@ -32,6 +32,33 @@ impl BookSource for Fixture {
 struct EmptyHighlights;
 
 #[test]
+fn translation_keeps_inflight_work_until_a_ready_replacement_exists() {
+    let (mut reader, original, _) = fixture();
+    let inputs = crate::plugins::prepare_translation_inputs(&original, false);
+    let first = inputs[0].0.clone();
+    let next = inputs[1].0.clone();
+    let id = reader.translation.task.begin(TranslationTask {
+        section_index: 0,
+        settings: reader.plugin_settings.clone(),
+        blocks: vec![first.clone()],
+    });
+    reader.translation.task.take_pending().unwrap();
+    let elsewhere = vec![((0, next.block_index, next.segment_index), next)];
+    // No untranslated content, or new content still awaiting AI layout: retain.
+    assert!(!reader.translation_can_start(&[], false));
+    assert!(!reader.translation_can_start(&elsewhere, false));
+    assert_eq!(reader.translation.task.active_id(), Some(id));
+    // Returning before completion reuses the same request.
+    let current = vec![((0, first.block_index, first.segment_index), first)];
+    assert!(!reader.translation_can_start(&current, true));
+    assert_eq!(reader.translation.task.active_id(), Some(id));
+    // Only a ready replacement can preempt an entirely offscreen request.
+    assert!(reader.translation_can_start(&elsewhere, true));
+    assert!(reader.translation.task.active().is_none());
+    assert!(reader.translation.task.in_flight(id).is_none());
+}
+
+#[test]
 fn visible_work_reuses_active_request_and_preempts_only_offscreen_work() {
     let (mut reader, original, _) = fixture();
     let runtime = tokio::runtime::Runtime::new().unwrap();

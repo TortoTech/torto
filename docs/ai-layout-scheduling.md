@@ -24,6 +24,12 @@ reasons and completion by task ID.
 
 Translation retains one active body request of approximately 2,000 characters,
 without paragraph splitting. TOC translation remains separately cancellable.
+An offscreen body translation is retained until another untranslated batch is
+ready to run, including completion of its AI layout prerequisites. Returning to
+any block in the active batch reuses that request. Configuration changes and
+disabling translation still cancel incompatible work. Translation logs record
+task IDs, block ranges, scheduling, start, cancellation reason, completion and
+accepted result batches.
 Image formula requests use at most five original images and approximately 6 MiB
 of encoded data per batch. Text recognition, image transcription and corrective
 retries use the selected AI layout reasoning effort. The AI task deadline remains
