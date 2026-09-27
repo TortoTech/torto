@@ -63,6 +63,22 @@ impl DesktopReader {
             .filter(|note| !note.trim().is_empty())
     }
 
+    pub(in crate::reader) fn toggle_focus_highlight(&mut self) {
+        let Some((ranges, _)) = self.focus_annotation_payload() else {
+            return;
+        };
+        let existing = self
+            .highlights
+            .iter()
+            .find(|highlight| highlight.ranges == ranges)
+            .map(|highlight| highlight.id.clone());
+        if let Some(id) = existing {
+            self.remove_highlight(&id);
+        } else {
+            self.create_focus_highlight(None);
+        }
+    }
+
     pub(in crate::reader) fn create_focus_highlight(&mut self, note: Option<String>) {
         let Some((ranges, text)) = self.focus_annotation_payload() else {
             return;

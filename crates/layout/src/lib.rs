@@ -5,6 +5,52 @@ pub mod linebreak;
 mod formula_images;
 mod web_links;
 
+/// Consecutive styled runs belonging to each footnote, in paragraph order.
+pub fn paragraph_footnotes(block: &TextBlock) -> Vec<Range<usize>> {
+    let is_note = |run: &TextRun| {
+        run.style.inline_citation == 0
+            && (run.style.inline_role == InlineRole::Footnote
+                || (run
+                    .link
+                    .as_ref()
+                    .is_some_and(|link| link.fragment().is_some())
+                    && (run.style.link_role == LinkRole::FootnoteReference
+                        || (run.style.link_role == LinkRole::Normal
+                            && run.style.baseline == TextBaseline::Superscript))))
+    };
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < block.content.len() {
+        let Inline::Text(first) = &block.content[index] else {
+            index += 1;
+            continue;
+        };
+        if !is_note(first) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while let Some(Inline::Text(next)) = block.content.get(index) {
+            if !is_note(next)
+                || next.link != first.link
+                || next.style.inline_role != first.style.inline_role
+                || (first.link.is_some() && next.text == first.text)
+            {
+                break;
+            }
+            index += 1;
+        }
+        if block.content[start..index]
+            .iter()
+            .any(|inline| matches!(inline, Inline::Text(run) if !run.text.trim().is_empty()))
+        {
+            result.push(start..index);
+        }
+    }
+    result
+}
+
 /// Whether a paragraph consists only of a recognized formula image and an
 /// optional equation number, rendered as one display formula in unified mode.
 pub fn is_display_formula(block: &rebook_publication::TextBlock) -> bool {
@@ -2419,7 +2465,9 @@ impl LayoutEngine {
         builder.push_default(StyleProperty::Brush(default_brush));
 
         for span in spans {
-            let size = if span.style.inline_citation != 0 {
+            let size = if span.style.inline_citation != 0
+                || span.footnote_reference_group & 0x2000_0000 != 0
+            {
                 // Numbered reference icons follow the compact 8–12px footnote
                 // icon scale rather than the minimum body-text size.
                 (typography.font_size * span.style.size_scale).clamp(8.0, 12.0)
@@ -2466,6 +2514,26 @@ impl LayoutEngine {
                 StyleProperty::LetterSpacing(adjustment.amount),
                 adjustment.range.clone(),
             );
+        }
+        // Optical separation before numbered notes, without adding source text
+        // or a new break opportunity. Include it in every shaping pass so the
+        // line breaker and hit geometry see the same advance as the renderer.
+        for span in spans
+            .iter()
+            .filter(|span| span.footnote_reference_group & 0x2000_0000 != 0)
+        {
+            if let Some((start, previous)) = text[..span.range.start].char_indices().next_back()
+                && !previous.is_whitespace()
+            {
+                let adjustment = spacing
+                    .iter()
+                    .find(|item| item.range.contains(&start))
+                    .map_or(0.0, |item| item.amount);
+                builder.push(
+                    StyleProperty::LetterSpacing(adjustment + typography.font_size * 0.08),
+                    start..span.range.start,
+                );
+            }
         }
         for image in inline_images {
             builder.push_inline_box(ParleyInlineBox {
@@ -3470,6 +3538,11 @@ fn prepare_inline_content(
     let mut spans = Vec::new();
     let mut inline_images = Vec::new();
     let mut next_footnote_reference_group = 1_u32;
+    let numbered_notes = if focus_footnote_icons && unified_math {
+        paragraph_footnotes(block)
+    } else {
+        Vec::new()
+    };
     let prefix = list_marker_prefix(block.kind);
     if !prefix.is_empty() {
         let start = text.len();
@@ -3489,6 +3562,13 @@ fn prepare_inline_content(
     for (inline_index, inline) in block.content.iter().enumerate() {
         match inline {
             Inline::Text(run) => {
+                let numbered_note = numbered_notes
+                    .iter()
+                    .enumerate()
+                    .find(|(_, range)| range.contains(&inline_index));
+                if numbered_note.is_some_and(|(_, range)| range.start != inline_index) {
+                    continue;
+                }
                 if run.style.inline_citation != 0
                     && inline_index > 0
                     && matches!(&block.content[inline_index-1], Inline::Text(previous) if previous.style.inline_citation == run.style.inline_citation)
@@ -3562,7 +3642,37 @@ fn prepare_inline_content(
                     style.bold = false;
                     style.italic = false;
                 } else if footnote_reference {
-                    text.push_str(&footnote_icon_placeholder(&run.text));
+                    if let Some((index, range)) = numbered_note {
+                        let original: String = block.content[range.clone()]
+                            .iter()
+                            .filter_map(|inline| {
+                                if let Inline::Text(run) = inline {
+                                    Some(run.text.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        let label = (index + 1).to_string();
+                        text.push_str(&label);
+                        text.extend(std::iter::repeat_n(
+                            '\u{2060}',
+                            original.chars().count().saturating_sub(label.len()),
+                        ));
+                        citations.push(InlineCitationPlacement {
+                            website: None,
+                            owner: block.source.clone(),
+                            range: start..text.len(),
+                            original,
+                            number: 0x2000_0000 | (index as u32 + 1),
+                        });
+                        style.size_scale = 0.78;
+                        style.baseline = TextBaseline::Superscript;
+                        style.bold = false;
+                        style.italic = false;
+                    } else {
+                        text.push_str(&footnote_icon_placeholder(&run.text));
+                    }
                 } else {
                     text.push_str(&run.text);
                 }
@@ -3571,7 +3681,10 @@ fn prepare_inline_content(
                 } else if style.inline_citation != 0 {
                     0x8000_0000 | style.inline_citation
                 } else if footnote_reference {
-                    let group = next_footnote_reference_group;
+                    let group = numbered_note
+                        .map_or(next_footnote_reference_group, |(index, _)| {
+                            0x2000_0000 | (index as u32 + 1)
+                        });
                     next_footnote_reference_group = next_footnote_reference_group.saturating_add(1);
                     group
                 } else {
@@ -4967,6 +5080,124 @@ mod tests {
             &mut output,
         );
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn numbered_note_optical_gap_changes_advance_without_changing_text() {
+        let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(Arc::new(
+            include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice(),
+        ))]);
+        let typography = ReaderTypography::default();
+        for text in ["x1", "x 1"] {
+            let end = text.len() - 1;
+            let mut spans = vec![
+                StyledRange {
+                    range: 0..end,
+                    style: TextStyle::default(),
+                    footnote_reference_group: 0,
+                    hyphenation_suppressed: false,
+                },
+                StyledRange {
+                    range: end..text.len(),
+                    style: TextStyle {
+                        inline_citation: 1,
+                        size_scale: 0.78,
+                        baseline: TextBaseline::Superscript,
+                        ..Default::default()
+                    },
+                    footnote_reference_group: 0x8000_0001,
+                    hyphenation_suppressed: true,
+                },
+            ];
+            let mut normal = engine.build_text_layout(
+                text,
+                &spans,
+                &[],
+                "Literata",
+                &typography,
+                1.5,
+                Rgba::BLACK,
+                &[],
+            );
+            normal.break_all_lines(None);
+            spans[1].footnote_reference_group = 0x2000_0001;
+            let mut padded = engine.build_text_layout(
+                text,
+                &spans,
+                &[],
+                "Literata",
+                &typography,
+                1.5,
+                Rgba::BLACK,
+                &[],
+            );
+            padded.break_all_lines(None);
+            let expected = if text.contains(' ') {
+                0.0
+            } else {
+                typography.font_size * 0.08
+            };
+            assert!(
+                (padded.width() - normal.width() - expected).abs() < 0.01,
+                "{text}: padded={}, normal={}, expected={expected}",
+                padded.width(),
+                normal.width()
+            );
+            assert_eq!(padded.get(0).unwrap().text_range(), 0..text.len());
+        }
+    }
+
+    #[test]
+    fn unified_footnotes_are_numbered_per_paragraph_and_preserve_original_markers() {
+        let mut content = Vec::new();
+        for index in 0..12 {
+            content.push(Inline::Text(TextRun {
+                text: " word ".into(),
+                style: Default::default(),
+                link: None,
+            }));
+            content.push(Inline::Text(TextRun {
+                text: format!("[{}]", index + 40),
+                style: TextStyle {
+                    link_role: LinkRole::FootnoteReference,
+                    ..Default::default()
+                },
+                link: Some(PublicationUrl::parse(&format!("chapter.xhtml#note{index}")).unwrap()),
+            }));
+        }
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content,
+            style: Default::default(),
+            source: None,
+        };
+        assert_eq!(paragraph_footnotes(&block).len(), 12);
+        for _ in 0..2 {
+            let (text, spans, _, _, citations) = prepare_inline_content(
+                &block,
+                Rgba::BLACK,
+                &ReaderTypography::default(),
+                320.0,
+                &resvg::usvg::Options::default(),
+                true,
+                true,
+                &[],
+            );
+            assert_eq!(citations.len(), 12);
+            for (index, citation) in citations.iter().enumerate() {
+                assert_eq!(
+                    text[citation.range.clone()].replace('\u{2060}', ""),
+                    (index + 1).to_string()
+                );
+                assert_eq!(citation.original, format!("[{}]", index + 40));
+            }
+            assert!(
+                spans
+                    .iter()
+                    .filter(|s| s.footnote_reference_group != 0)
+                    .all(|s| s.style.baseline == TextBaseline::Superscript)
+            );
+        }
     }
 
     #[test]

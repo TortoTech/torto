@@ -175,7 +175,7 @@ fn paint_footnote_region(
         );
         return;
     }
-    if footnote.citation_number != 0 {
+    if !footnote.citation_glyphs.is_empty() {
         for glyphs in &footnote.citation_glyphs {
             let mut glyphs = glyphs.clone();
             glyphs.color = color;
@@ -2348,6 +2348,16 @@ fn compile_text_commands(
         .skip(text.lines.start)
         .take(text.lines.len())
     {
+        let body_font_size = line
+            .runs()
+            .filter(|run| {
+                run.clusters().any(|cluster| {
+                    let brush = cluster.first_style().brush;
+                    !brush.footnote_reference && brush.baseline == TextBaseline::Normal
+                })
+            })
+            .map(|run| run.font_size())
+            .fold(0.0_f32, f32::max);
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                 let PositionedLayoutItem::InlineBox(inline_box) = item else {
@@ -2416,10 +2426,13 @@ fn compile_text_commands(
             let brush = glyph_run.style().brush;
             let baseline_offset = match brush.baseline {
                 TextBaseline::Normal => 0.0,
+                TextBaseline::Superscript if brush.footnote_reference_group & 0x2000_0000 != 0 => {
+                    -body_font_size.max(run.font_size()) * 0.35
+                }
                 TextBaseline::Superscript => -run.font_size() * 0.35,
                 TextBaseline::Subscript => run.font_size() * 0.2,
             };
-            if brush.footnote_reference_group & 0x8000_0000 != 0 {
+            if brush.footnote_reference_group & 0xa000_0000 != 0 {
                 let number = brush.footnote_reference_group & 0x7fff_ffff;
                 if let Some(source) = text.source.as_ref().or_else(|| {
                     text.citations
@@ -2466,7 +2479,11 @@ fn compile_text_commands(
                             website: None,
                             bounds,
                             source: Some(source.clone()),
-                            citation_number: number,
+                            citation_number: if brush.footnote_reference_group & 0x2000_0000 != 0 {
+                                0
+                            } else {
+                                number
+                            },
                             citation_glyphs: vec![command],
                         });
                     }

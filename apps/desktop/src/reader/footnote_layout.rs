@@ -52,39 +52,77 @@ fn popup_inlines(text: &str, style: TextStyle) -> Vec<Inline> {
 }
 
 pub(super) struct FootnoteLayout {
+    #[cfg(test)]
+    line_starts: Vec<f32>,
+    #[cfg(test)]
+    font_sizes: Vec<f32>,
     pub height: f32,
     pub width: f32,
     pub content_width: f32,
-    pub first_baseline: f32,
+    pub wrapped: bool,
     svg: Arc<[u8]>,
     uri: String,
-    compact_svg: Arc<[u8]>,
-    compact_uri: String,
     fallback: Option<Arc<egui::Galley>>,
 }
 
 impl FootnoteLayout {
-    pub fn fallback(
+    pub fn fallback_marked(
         ctx: &egui::Context,
         text: &str,
+        marker: &str,
         font: &egui::FontId,
         color: egui::Color32,
+        marker_color: egui::Color32,
+        width: f32,
+        marker_slot: f32,
+    ) -> Arc<Self> {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = width;
+        let marker_width = ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(marker.to_owned(), font.clone(), marker_color)
+                .size()
+                .x
+        });
+        job.append(
+            marker,
+            (marker_slot - marker_width).max(0.0) * 0.5,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: marker_color,
+                ..Default::default()
+            },
+        );
+        job.append(
+            text,
+            font.size * 0.3 + (marker_slot - marker_width).max(0.0) * 0.5,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color,
+                ..Default::default()
+            },
+        );
+        Self::fallback_job(ctx, job, font.size, width)
+    }
+
+    fn fallback_job(
+        ctx: &egui::Context,
+        job: egui::text::LayoutJob,
+        _size: f32,
         width: f32,
     ) -> Arc<Self> {
-        let galley = ctx.fonts_mut(|fonts| fonts.layout(text.into(), font.clone(), color, width));
+        let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
         Arc::new(Self {
+            #[cfg(test)]
+            line_starts: galley.rows.iter().map(|row| row.pos.x).collect(),
+            #[cfg(test)]
+            font_sizes: vec![_size],
             height: galley.size().y,
             width,
-            content_width: galley.size().x.min(width),
-            first_baseline: galley
-                .rows
-                .first()
-                .and_then(|r| r.glyphs.first())
-                .map_or(font.size, |g| g.pos.y),
+            content_width: galley.size().x,
+            wrapped: galley.rows.len() > galley.job.text.lines().count().max(1),
             svg: Arc::from([]),
             uri: String::new(),
-            compact_svg: Arc::from([]),
-            compact_uri: String::new(),
             fallback: Some(galley),
         })
     }
@@ -93,63 +131,28 @@ impl FootnoteLayout {
             ui.label(galley.clone());
             return;
         }
-        ui.add(
-            egui::Image::from_bytes(self.uri.clone(), self.svg.clone())
-                .fit_to_exact_size(egui::vec2(self.width, self.height)),
-        );
-    }
-
-    fn paint_at(&self, ui: &egui::Ui, rect: egui::Rect, compact: bool) {
-        if let Some(galley) = &self.fallback {
-            ui.painter()
-                .galley(rect.min, galley.clone(), egui::Color32::WHITE);
-            return;
-        }
-        let (uri, svg) = if compact {
-            (&self.compact_uri, &self.compact_svg)
-        } else {
-            (&self.uri, &self.svg)
-        };
-        egui::Image::from_bytes(uri.clone(), svg.clone())
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(self.width, self.height), egui::Sense::hover());
+        // paint_at snaps the destination to physical pixels and rasterizes at
+        // that exact size. Fractional Image widget positions otherwise filter
+        // the text texture again, making some rows appear lighter than others.
+        egui::Image::from_bytes(self.uri.clone(), self.svg.clone())
             .maintain_aspect_ratio(false)
             .paint_at(ui, rect);
-    }
-
-    pub fn citation_row_height(&self, marker: &Self) -> f32 {
-        let baseline = self.first_baseline.max(marker.first_baseline);
-        (baseline - self.first_baseline + self.height)
-            .max(baseline - marker.first_baseline + marker.height)
-    }
-
-    /// Use actual shaping baselines and explicit image rectangles. Cropping the
-    /// marker's whitespace must not shrink its glyphs to the image aspect ratio.
-    pub fn paint_with_marker(&self, ui: &mut egui::Ui, marker: &Self, gap: f32) -> egui::Response {
-        let baseline = self.first_baseline.max(marker.first_baseline);
-        let (row, response) = ui.allocate_exact_size(
-            egui::vec2(
-                marker.content_width + gap + self.width,
-                self.citation_row_height(marker),
-            ),
-            egui::Sense::hover(),
-        );
-        let marker_rect = egui::Rect::from_min_size(
-            row.min + egui::vec2(0.0, baseline - marker.first_baseline),
-            egui::vec2(marker.content_width, marker.height),
-        );
-        let body_rect = egui::Rect::from_min_size(
-            row.min + egui::vec2(marker.content_width + gap, baseline - self.first_baseline),
-            egui::vec2(self.width, self.height),
-        );
-        marker.paint_at(ui, marker_rect, true);
-        self.paint_at(ui, body_rect, false);
-        response
     }
 }
 
 #[derive(Default)]
 pub(super) struct FootnoteRenderer {
     engine: Option<LayoutEngine>,
-    cache: Vec<(String, ReaderStyle, f32, Arc<FootnoteLayout>)>,
+    cache: Vec<(
+        String,
+        ReaderStyle,
+        f32,
+        f32,
+        Option<(usize, egui::Color32, f32)>,
+        Arc<FootnoteLayout>,
+    )>,
 }
 
 #[derive(Default)]
@@ -173,6 +176,7 @@ impl OutlinePen for SvgPath {
 }
 
 impl FootnoteRenderer {
+    #[cfg(test)]
     pub fn layout(
         &mut self,
         source: &dyn BookSource,
@@ -182,6 +186,124 @@ impl FootnoteRenderer {
         color: egui::Color32,
         width: f32,
     ) -> Result<Arc<FootnoteLayout>, String> {
+        self.layout_indented(source, text, reader_style, size, color, width, 0.0)
+    }
+
+    #[cfg(test)]
+    pub fn layout_indented(
+        &mut self,
+        source: &dyn BookSource,
+        text: &str,
+        reader_style: &ReaderStyle,
+        size: f32,
+        color: egui::Color32,
+        width: f32,
+        first_indent: f32,
+    ) -> Result<Arc<FootnoteLayout>, String> {
+        self.layout_marked_internal(
+            source,
+            text,
+            reader_style,
+            size,
+            color,
+            width,
+            first_indent,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn layout_marked(
+        &mut self,
+        source: &dyn BookSource,
+        text: &str,
+        marker: &str,
+        reader_style: &ReaderStyle,
+        size: f32,
+        color: egui::Color32,
+        marker_color: egui::Color32,
+        width: f32,
+    ) -> Result<Arc<FootnoteLayout>, String> {
+        let joined = format!("{marker} {text}");
+        self.layout_marked_internal(
+            source,
+            &joined,
+            reader_style,
+            size,
+            color,
+            width,
+            0.0,
+            Some((marker.len(), marker_color, 0.0)),
+        )
+    }
+
+    pub fn marker_width(
+        &mut self,
+        source: &dyn BookSource,
+        marker: &str,
+        style: &ReaderStyle,
+        size: f32,
+    ) -> Result<f32, String> {
+        let layout = self.layout_marked_internal(
+            source,
+            marker,
+            style,
+            size,
+            egui::Color32::BLACK,
+            480.0,
+            0.0,
+            None,
+        )?;
+        Ok((layout.content_width - 4.0).max(0.0))
+    }
+
+    pub fn layout_aligned_marked(
+        &mut self,
+        source: &dyn BookSource,
+        text: &str,
+        marker: &str,
+        reader_style: &ReaderStyle,
+        size: f32,
+        color: egui::Color32,
+        marker_color: egui::Color32,
+        width: f32,
+        slot: f32,
+    ) -> Result<Arc<FootnoteLayout>, String> {
+        let marker_width = self.marker_width(source, marker, reader_style, size)?;
+        let prefix = format!("{marker}\u{00a0}");
+        let prefix_width = self.marker_width(source, &prefix, reader_style, size)?;
+        // Body starts at the shared slot edge; center the marker within that
+        // slot independently so bare numbers align with bracketed numbers.
+        let shift =
+            size * 0.3 - (prefix_width - marker_width) + (slot - marker_width).max(0.0) * 0.5;
+        self.layout_marked_internal(
+            source,
+            &format!("{prefix}{text}"),
+            reader_style,
+            size,
+            color,
+            width,
+            slot.max(marker_width) + size * 0.3 - prefix_width,
+            Some((marker.len(), marker_color, shift)),
+        )
+    }
+
+    fn layout_marked_internal(
+        &mut self,
+        source: &dyn BookSource,
+        text: &str,
+        reader_style: &ReaderStyle,
+        size: f32,
+        color: egui::Color32,
+        width: f32,
+        first_indent: f32,
+        marker: Option<(usize, egui::Color32, f32)>,
+    ) -> Result<Arc<FootnoteLayout>, String> {
+        // The native reader has an 80px minimum text column. Use the popup's
+        // egui fallback below that width instead of drawing outside its bounds.
+        if width < 84.0 {
+            return Err("popup column is narrower than the reader minimum".into());
+        }
         let mut style = reader_style.clone();
         style.typography.font_size = size;
         style.typography.minimum_font_size = size;
@@ -198,11 +320,9 @@ impl FootnoteRenderer {
             blue: color.b(),
             alpha: color.a(),
         };
-        if let Some((_, _, _, layout)) = self
-            .cache
-            .iter()
-            .find(|(t, s, w, _)| t == text && s == &style && *w == width)
-        {
+        if let Some((_, _, _, _, _, layout)) = self.cache.iter().find(|(t, s, w, indent, m, _)| {
+            t == text && s == &style && *w == width && *indent == first_indent && *m == marker
+        }) {
             return Ok(layout.clone());
         }
         let english = text.chars().filter(|c| c.is_ascii_alphabetic()).count()
@@ -211,9 +331,10 @@ impl FootnoteRenderer {
                 .filter(|c| !c.is_ascii() && c.is_alphabetic())
                 .count();
         let display_text = url_line_breaks(text);
-        let blocks: Vec<_> = display_text
+        let mut blocks: Vec<_> = display_text
             .lines()
-            .map(|line| {
+            .enumerate()
+            .map(|(index, line)| {
                 Block::Text(TextBlock {
                     kind: TextBlockKind::Paragraph,
                     content: popup_inlines(
@@ -228,6 +349,7 @@ impl FootnoteRenderer {
                         },
                     ),
                     style: BlockStyle {
+                        indent: if index == 0 { first_indent } else { 0.0 },
                         align: TextAlignment::Justify,
                         margin_after: 0.0,
                         line_height: 1.45,
@@ -237,6 +359,21 @@ impl FootnoteRenderer {
                 })
             })
             .collect();
+        if let Some((length, marker_color, _)) = marker
+            && let Some(Block::Text(block)) = blocks.first_mut()
+            && let Some(Inline::Text(first)) = block.content.first_mut()
+        {
+            let mut prefix = first.clone();
+            prefix.text = first.text[..length].to_owned();
+            prefix.style.color = rebook_publication::Rgba {
+                red: marker_color.r(),
+                green: marker_color.g(),
+                blue: marker_color.b(),
+                alpha: marker_color.a(),
+            };
+            first.text = first.text[length..].to_owned();
+            block.content.insert(0, Inline::Text(prefix));
+        }
         let engine = self.engine.get_or_insert_with(|| {
             LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned())
         });
@@ -251,22 +388,33 @@ impl FootnoteRenderer {
             .map_err(|e| e.to_string())?;
         let mut paths = String::new();
         let mut content_width = 0.0_f32;
-        let mut first_baseline = None;
+        let mut wrapped = false;
         let mut height = size * 1.45;
         let mut page_y = 0.0;
+        #[cfg(test)]
+        let mut line_starts = Vec::new();
+        #[cfg(test)]
+        let mut font_sizes = Vec::new();
         for page in &layout.pages {
             let mut bottom = 0.0_f32;
             for item in &page.items {
                 let PageItem::Text(text) = item else {
                     continue;
                 };
+                wrapped |= text.layout.len() > 1;
                 for line in text
                     .layout
                     .lines()
                     .skip(text.lines.start)
                     .take(text.lines.len())
                 {
-                    first_baseline.get_or_insert(page_y + text.origin_y + line.metrics().baseline);
+                    #[cfg(test)]
+                    if let Some(run) = line.items().find_map(|item| match item {
+                        PositionedLayoutItem::GlyphRun(run) if run.advance() > 0.0 => Some(run),
+                        _ => None,
+                    }) {
+                        line_starts.push(text.origin_x + run.offset());
+                    }
                     bottom = bottom
                         .max(text.origin_y + line.metrics().baseline + line.metrics().descent);
                     for item in line.items() {
@@ -297,8 +445,8 @@ impl FootnoteRenderer {
                                     let data = base64::engine::general_purpose::STANDARD
                                         .encode(png.into_inner());
                                     let x = text.origin_x + inline_box.x;
-                                    let y = page_y + text.origin_y + inline_box.y + image.offset_y;
                                     content_width = content_width.max(x + image.width + 2.0);
+                                    let y = page_y + text.origin_y + inline_box.y + image.offset_y;
                                     bottom = bottom.max(y - page_y + image.height);
                                     paths.push_str(&format!(r#"<image x="{x}" y="{y}" width="{}" height="{}" href="data:image/png;base64,{data}"/>"#,image.width,image.height));
                                 }
@@ -308,9 +456,11 @@ impl FootnoteRenderer {
                         let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                             continue;
                         };
-                        let run = glyph_run.run();
                         content_width = content_width
                             .max(text.origin_x + glyph_run.offset() + glyph_run.advance() + 2.0);
+                        let run = glyph_run.run();
+                        #[cfg(test)]
+                        font_sizes.push(run.font_size());
                         let font = FontRef::from_index(run.font().data.as_ref(), run.font().index)
                             .map_err(|e| e.to_string())?;
                         let outlines = font.outline_glyphs();
@@ -334,8 +484,9 @@ impl FootnoteRenderer {
                                 )
                                 .map_err(|e| e.to_string())?;
                             paths.push_str(&format!(
-                                "<path transform=\"translate({} {}) scale(1 -1)\" d=\"{}\"/>",
-                                text.origin_x + glyph.x,
+                                "<path fill=\"#{:02x}{:02x}{:02x}\" transform=\"translate({} {}) scale(1 -1)\" d=\"{}\"/>",
+                                glyph_run.style().brush.color.red, glyph_run.style().brush.color.green, glyph_run.style().brush.color.blue,
+                                text.origin_x + glyph.x - marker.filter(|(_, c, _)| glyph_run.style().brush.color == rebook_publication::Rgba { red: c.r(), green: c.g(), blue: c.b(), alpha: c.a() }).map_or(0.0, |(_, _, shift)| shift),
                                 page_y + text.origin_y + glyph.y,
                                 path.0
                             ));
@@ -355,30 +506,35 @@ impl FootnoteRenderer {
                 f32::from(color.a()) / 255.0
             )
         };
-        let content_width = content_width.clamp(1.0, width.max(1.0));
         let svg = make_svg(width);
-        // Crop the SVG viewport itself. UV cropping a narrow raster would
-        // downsample then stretch the glyphs, even with a fixed widget size.
-        let compact_svg = make_svg(content_width);
         // Content-addressed image URI prevents stale textures across books/themes.
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         svg.hash(&mut hash);
         let result = Arc::new(FootnoteLayout {
+            #[cfg(test)]
+            line_starts,
+            #[cfg(test)]
+            font_sizes,
             width,
             content_width,
-            first_baseline: first_baseline.unwrap_or(size),
+            wrapped,
             height,
             fallback: None,
             svg: Arc::from(svg.into_bytes()),
             uri: format!("bytes://footnote-{:x}.svg", hash.finish()),
-            compact_svg: Arc::from(compact_svg.into_bytes()),
-            compact_uri: format!("bytes://footnote-{:x}-compact.svg", hash.finish()),
         });
-        if self.cache.len() >= 16 {
+        if self.cache.len() >= 64 {
             self.cache.remove(0);
         }
-        self.cache.push((text.into(), style, width, result.clone()));
+        self.cache.push((
+            text.into(),
+            style,
+            width,
+            first_indent,
+            marker,
+            result.clone(),
+        ));
         Ok(result)
     }
 }
@@ -406,6 +562,83 @@ mod tests {
         Book, Metadata, PublicationError, PublicationId, PublicationUrl, Resource, Section,
     };
     struct Source(Book);
+    #[test]
+    fn aligned_markers_share_first_body_edge_and_full_width_continuations() {
+        let source = Source(Book {
+            id: PublicationId::new("aligned-popup").unwrap(),
+            metadata: Metadata::default(),
+            cover: None,
+            sections: vec![],
+            table_of_contents: vec![],
+        });
+        let style = ReaderStyle::default();
+        let mut renderer = FootnoteRenderer::default();
+        let markers = ["1", "12", "[1]", "[12]"];
+        let slot = markers
+            .iter()
+            .map(|marker| {
+                renderer
+                    .marker_width(&source, marker, &style, 14.0)
+                    .unwrap()
+            })
+            .fold(0.0_f32, f32::max);
+        let mut edges = Vec::new();
+        let mut digit_edges = Vec::new();
+        for marker in markers {
+            let layout = renderer.layout_aligned_marked(&source, "According to the author this explanatory note continues across several lines of text.", marker, &style, 14.0, egui::Color32::BLACK, egui::Color32::BLUE, 180.0, slot).unwrap();
+            let svg = std::str::from_utf8(&layout.svg).unwrap();
+            let digit = svg
+                .split("<path ")
+                .filter(|path| path.starts_with("fill=\"#0000ff\"") && !path.contains("d=\"\""))
+                .nth(usize::from(marker.starts_with('[')))
+                .unwrap();
+            digit_edges.push(
+                digit
+                    .split("translate(")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<f32>()
+                    .unwrap(),
+            );
+            let body = svg
+                .split("<path ")
+                .find(|path| path.starts_with("fill=\"#000000\"") && !path.contains("d=\"\""))
+                .unwrap();
+            let x: f32 = body
+                .split("translate(")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            edges.push(x);
+            assert!(layout.line_starts.len() > 1);
+            assert!(
+                layout.line_starts[1..3]
+                    .iter()
+                    .all(|x| (*x - 2.0).abs() < 0.1),
+                "{marker}: {:?}",
+                layout.line_starts
+            );
+        }
+        assert!(
+            edges.iter().all(|x| (*x - edges[0]).abs() < 0.1),
+            "{edges:?}"
+        );
+        assert!(
+            (digit_edges[0] - digit_edges[2]).abs() < 0.2,
+            "{digit_edges:?}"
+        );
+        assert!(
+            (digit_edges[1] - digit_edges[3]).abs() < 0.2,
+            "{digit_edges:?}"
+        );
+    }
     impl BookSource for Source {
         fn book(&self) -> &Book {
             &self.0
@@ -418,76 +651,40 @@ mod tests {
         }
     }
     #[test]
-    fn citation_marker_is_cropped_without_shrinking_and_shares_first_baseline() {
+    fn popup_marker_shares_body_size_and_continuation_width() {
         let source = Source(Book {
-            id: PublicationId::new("citation-popup-test").unwrap(),
+            id: PublicationId::new("popup-marker-test").unwrap(),
             metadata: Metadata::default(),
             cover: None,
             sections: vec![],
             table_of_contents: vec![],
         });
         let mut renderer = FootnoteRenderer::default();
-        let ctx = egui::Context::default();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        crate::ui::configure(
-            &ctx,
-            &crate::preferences::InterfaceTypography::default(),
-            crate::preferences::AppLanguage::English,
-            runtime.handle(),
-        );
-        for number in [1, 12] {
-            let marker = renderer
-                .layout(
-                    &source,
-                    &format!("[{number}]"),
-                    &ReaderStyle::default(),
-                    14.0,
-                    egui::Color32::GRAY,
-                    56.0,
-                )
-                .unwrap();
-            let body = renderer
-                .layout(
+        for marker in ["1", "12", "[1]", "[12]"] {
+            let layout = renderer
+                .layout_marked(
                     &source,
                     "Churchland & Sejnowsky, 1992; Eliasmith, 2013",
+                    marker,
                     &ReaderStyle::default(),
                     14.0,
                     egui::Color32::BLACK,
-                    220.0,
+                    egui::Color32::from_rgb(30, 80, 210),
+                    180.0,
                 )
                 .unwrap();
-            assert!(marker.content_width < marker.width * 0.7);
-            assert!(body.height > marker.height);
-            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                body.paint_with_marker(ui, &marker, 4.0);
-            });
-            output.textures_delta.clear();
-            let image_rects: Vec<_> = output
-                .shapes
-                .iter()
-                .filter_map(|shape| match &shape.shape {
-                    egui::Shape::Rect(rect) if rect.brush.is_some() => {
-                        assert_eq!(rect.brush.as_ref().unwrap().uv.max, egui::pos2(1.0, 1.0));
-                        Some(rect.rect)
-                    }
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(image_rects.len(), 2, "both SVG text images must render");
+            assert!(layout.font_sizes.len() > 1);
             assert!(
-                (image_rects[0].height() - marker.height).abs() < 1.0,
-                "cropping must preserve glyph height"
+                layout
+                    .font_sizes
+                    .iter()
+                    .all(|size| (*size - 14.0).abs() < 0.001)
             );
-            assert!((image_rects[0].width() - marker.content_width).abs() < 1.0);
-            assert!(
-                (image_rects[0].top() + marker.first_baseline
-                    - image_rects[1].top()
-                    - body.first_baseline)
-                    .abs()
-                    < 1.0
-            );
-            assert!((image_rects[1].left() - image_rects[0].right() - 4.0).abs() < 1.0);
-            output.textures_delta.clear();
+            assert!(layout.line_starts.len() > 1);
+            assert!((layout.line_starts[0] - layout.line_starts[1]).abs() < 0.1);
+            let svg = std::str::from_utf8(&layout.svg).unwrap();
+            assert!(svg.contains("fill=\"#1e50d2\""));
+            assert!(svg.contains("fill=\"#000000\""));
         }
     }
 

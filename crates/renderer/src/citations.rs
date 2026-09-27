@@ -336,6 +336,114 @@ mod tests {
     }
 
     #[test]
+    fn numbered_footnotes_keep_popup_hits_and_original_copy() {
+        let source = Source(Book {
+            id: PublicationId::new("numbered-notes").unwrap(),
+            metadata: Metadata::default(),
+            cover: None,
+            sections: vec![],
+            table_of_contents: vec![],
+        });
+        let anchor = SourceAnchor {
+            spine: SpineItemId::new("chapter").unwrap(),
+            node: "p".into(),
+            text_offset: 0,
+        };
+        let original = "Body hidden note after";
+        let range = SourceRange {
+            start: anchor.clone(),
+            end: SourceAnchor {
+                text_offset: original.len() as u64,
+                ..anchor
+            },
+        };
+        let block = Block::Text(TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: [("Body ", false), ("hidden note", true), (" after", false)]
+                .into_iter()
+                .map(|(text, note)| {
+                    Inline::Text(TextRun {
+                        text: text.into(),
+                        style: TextStyle {
+                            inline_role: if note {
+                                rebook_publication::InlineRole::Footnote
+                            } else {
+                                rebook_publication::InlineRole::Normal
+                            },
+                            ..Default::default()
+                        },
+                        link: None,
+                    })
+                })
+                .collect(),
+            style: Default::default(),
+            source: Some(range.clone()),
+        });
+        let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(Arc::new(include_bytes!(
+            "../../../assets/fonts/Literata-opsz-wght.ttf"
+        )))]);
+        let style = ReaderStyle {
+            typesetting: rebook_layout::ReaderTypesetting::unified(),
+            focus_footnote_icons: true,
+            spread: SpreadMode::Single,
+            ..Default::default()
+        };
+        let result = engine
+            .layout_blocks(
+                &source,
+                &[block],
+                LayoutViewport::new(600, 800).unwrap(),
+                &style,
+            )
+            .unwrap();
+        let display = DisplayListCompiler.compile(&result.pages[0]);
+        assert_eq!(display.footnote_regions.len(), 1);
+        let icon = &display.footnote_regions[0];
+        assert!(!icon.citation_glyphs.is_empty());
+        assert_eq!(icon.citation_number, 0);
+        let body_baseline = result.pages[0]
+            .items
+            .iter()
+            .find_map(|item| {
+                let rebook_layout::PageItem::Text(text) = item else {
+                    return None;
+                };
+                Some(text.layout.get(text.lines.start)?.metrics().baseline)
+            })
+            .unwrap();
+        let marker_baseline = icon.citation_glyphs[0].glyphs[0].y;
+        assert!(
+            (body_baseline - marker_baseline - style.typography.font_size * 0.35).abs() < 0.1,
+            "superscript must rise relative to body size, not the small marker size"
+        );
+        let center = icon.bounds.center();
+        assert_eq!(
+            display.footnote_source_at(center.x as f32, center.y as f32),
+            Some(range)
+        );
+        assert_eq!(
+            display.inline_citation_at(center.x as f32, center.y as f32),
+            None
+        );
+        let copied: String = display
+            .text_regions
+            .iter()
+            .filter_map(|region| {
+                let TextRegion::Shaped(region) = region else {
+                    return None;
+                };
+                Some(
+                    region
+                        .selection_fragment(region.visible_byte_range()?)
+                        .unwrap()
+                        .quote,
+                )
+            })
+            .collect();
+        assert_eq!(copied, original);
+    }
+
+    #[test]
     fn numbered_icons_preserve_copy_geometry_and_source_offsets() {
         let source = Source(Book {
             id: PublicationId::new("citations").unwrap(),

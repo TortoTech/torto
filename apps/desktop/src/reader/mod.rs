@@ -651,6 +651,7 @@ struct FocusUnit {
 
 #[derive(Clone)]
 struct FocusFootnote {
+    number: u32,
     citation: Option<(SourceRange, u32)>,
     text: String,
 }
@@ -676,8 +677,9 @@ enum FocusFootnoteSource {
         source: SourceRange,
         number: u32,
     },
-    Inline(String),
+    Inline(String, u32),
     Reference {
+        number: u32,
         marker: String,
         target: PublicationUrl,
     },
@@ -758,42 +760,35 @@ fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, Publication
 }
 
 fn text_block_focus_footnotes(block: &TextBlock) -> Vec<FocusFootnoteSource> {
-    fn flush_inline_note(notes: &mut Vec<FocusFootnoteSource>, text: &mut String) {
-        let note = text.trim();
-        if !note.is_empty() {
-            notes.push(FocusFootnoteSource::Inline(note.to_owned()));
-        }
-        text.clear();
-    }
-
     let mut notes = Vec::new();
-    let mut inline_note = String::new();
-    for inline in &block.content {
-        let Inline::Text(run) = inline else {
-            flush_inline_note(&mut notes, &mut inline_note);
-            continue;
+    for (index, range) in rebook_layout::paragraph_footnotes(block)
+        .into_iter()
+        .enumerate()
+    {
+        let Inline::Text(first) = &block.content[range.start] else {
+            unreachable!()
         };
-        if run.style.inline_role == InlineRole::Footnote {
-            inline_note.push_str(&run.text);
-            continue;
-        }
-        flush_inline_note(&mut notes, &mut inline_note);
-        if (run.style.link_role == LinkRole::FootnoteReference
-            || (run.style.link_role == LinkRole::Normal
-                && run.style.baseline == TextBaseline::Superscript))
-            && let Some(target) = run
-                .link
-                .clone()
-                .filter(|target| target.fragment().is_some())
-            && !run.text.trim().is_empty()
-        {
+        let text: String = block.content[range]
+            .iter()
+            .filter_map(|inline| {
+                if let Inline::Text(run) = inline {
+                    Some(run.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let number = index as u32 + 1;
+        if first.style.inline_role == InlineRole::Footnote {
+            notes.push(FocusFootnoteSource::Inline(text.trim().to_owned(), number));
+        } else if let Some(target) = &first.link {
             notes.push(FocusFootnoteSource::Reference {
-                marker: run.text.trim().to_owned(),
-                target,
+                marker: text.trim().to_owned(),
+                target: target.clone(),
+                number,
             });
         }
     }
-    flush_inline_note(&mut notes, &mut inline_note);
     if let Some(source) = &block.source {
         let mut index = 0;
         while index < block.content.len() {
@@ -2156,7 +2151,6 @@ impl DesktopReader {
         current_section: &Section,
         linked_sections: &mut HashMap<usize, Section>,
     ) -> Vec<FocusFootnote> {
-        let mut seen = HashSet::new();
         let mut notes: Vec<_> = block_focus_footnotes(block)
             .into_iter()
             .filter_map(|source| match source {
@@ -2166,32 +2160,35 @@ impl DesktopReader {
                     number,
                 } => Some(FocusFootnote {
                     text,
+                    number,
                     citation: Some((source, number)),
                 }),
-                FocusFootnoteSource::Inline(text) => seen
-                    .insert(format!("inline:{text}"))
-                    .then_some(FocusFootnote {
-                        text,
-                        citation: None,
+                FocusFootnoteSource::Inline(text, number) => Some(FocusFootnote {
+                    text,
+                    number,
+                    citation: None,
+                }),
+                FocusFootnoteSource::Reference {
+                    marker,
+                    target,
+                    number,
+                } => Some(FocusFootnote {
+                    number,
+                    citation: None,
+                    text: focus_footnote_text(
+                        self.source.as_ref(),
+                        &target,
+                        &marker,
+                        current_section_index,
+                        current_section,
+                        linked_sections,
+                    )
+                    .unwrap_or_else(|| {
+                        self.language
+                            .text("未能读取脚注内容", "Footnote content is unavailable")
+                            .to_owned()
                     }),
-                FocusFootnoteSource::Reference { marker, target } => {
-                    seen.insert(target.to_string()).then(|| FocusFootnote {
-                        citation: None,
-                        text: focus_footnote_text(
-                            self.source.as_ref(),
-                            &target,
-                            &marker,
-                            current_section_index,
-                            current_section,
-                            linked_sections,
-                        )
-                        .unwrap_or_else(|| {
-                            self.language
-                                .text("未能读取脚注内容", "Footnote content is unavailable")
-                                .to_owned()
-                        }),
-                    })
-                }
+                }),
             })
             .collect();
         notes.sort_by_key(|note| note.citation.is_some());
@@ -3975,7 +3972,7 @@ mod tests {
                 .filter(|block| !block_is_footnote_definition(block))
                 .flat_map(block_focus_footnotes)
             {
-                if let FocusFootnoteSource::Reference { marker, target } = reference {
+                if let FocusFootnoteSource::Reference { marker, target, .. } = reference {
                     checked_references += 1;
                     if focus_footnote_text(
                         source.as_ref(),
@@ -4625,7 +4622,7 @@ mod tests {
         assert_eq!(text_block_focus_text(&block), "Body continues.");
         assert!(matches!(
             text_block_focus_footnotes(&block).as_slice(),
-            [FocusFootnoteSource::Inline(note)] if note == "Inline note"
+            [FocusFootnoteSource::Inline(note, 1)] if note == "Inline note"
         ));
     }
 
@@ -5133,6 +5130,7 @@ mod tests {
             rectangular_activation_rect: None,
             footnotes: vec![FocusFootnote {
                 citation: None,
+                number: 1,
                 text: "Caption note".into(),
             }],
         };
@@ -5473,6 +5471,7 @@ mod tests {
         let mut child = unit("child", "口头文化与书面文化", 160.0);
         child.footnotes.push(FocusFootnote {
             citation: None,
+            number: 1,
             text: "列表子项脚注".into(),
         });
         merge_focus_list_descendant(&mut root, child);

@@ -41,7 +41,7 @@ fn popup_keeps_footnotes_before_citations_and_merges_styled_parts() {
     };
     let items = text_block_focus_footnotes(&block);
     assert_eq!(items.len(), 3);
-    assert!(matches!(&items[0],FocusFootnoteSource::Inline(t) if t=="Note content"));
+    assert!(matches!(&items[0],FocusFootnoteSource::Inline(t, 1) if t=="Note content"));
     assert!(
         matches!(&items[1],FocusFootnoteSource::Citation{text,source,number:1} if text=="(Smith, 2020)" && source==&range)
     );

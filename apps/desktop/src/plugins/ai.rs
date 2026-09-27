@@ -779,6 +779,10 @@ fn translation_structure_error(
             format!("正文块 {} 的网站链接标记无效：{reason}", block.block_index),
         ));
     }
+    if let Err(reason) = super::translation::validate_translation_footnotes(&block.text, translated)
+    {
+        return Some(("footnote", format!("Block {}: {reason}", block.block_index)));
+    }
     validate_translation_citations(&block.text,translated).err().map(|reason| (
         "inline_citation", format!("\u{7b2c} {} \u{4e2a}\u{6b63}\u{6587}\u{5757}\u{7684}\u{6587}\u{5185}\u{5f15}\u{7528}\u{6807}\u{8bb0}\u{65e0}\u{6548}\u{ff1a}{reason}",block.block_index)
     ))
@@ -804,6 +808,7 @@ fn translation_system_prompt(target_language: &str, fixed_page_hint: &str) -> St
 
 # 正文结构
 - 每个 JSON 值都是独立正文块。原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时保持相同类型。
+- Preserve every <torto-note-N/> footnote reference exactly once, attached to its corresponding text. Never expand, translate or renumber it. Translate contents of <inlinefootnote id="N">...</inlinefootnote>, retaining each ID and complete group exactly once. IDs are source identities, not display numbers.
 - Preserve every <torto-web-N/> website placeholder exactly once. Do not translate, remove or invent it. Keep literal website addresses unchanged.
 - Preserve every <citation id="N">...</citation> group and its ID exactly once. Translate its contents as a bibliographic note (keep author names and years accurate); keep it attached to the same claim. Never merge groups, invent IDs, or remove their tags. Tags may contain other inline style tags.
 - <strong>、<em>、<i>、<cite>、<torto-italic>、<torto-size scale="数值">、<u>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记。必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。

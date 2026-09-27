@@ -828,7 +828,8 @@ impl<'a> ReadingIrParser<'a> {
                 self.push_text_block(node, TextBlockKind::Heading(level), style)?;
             }
             "p" => {
-                if self.styles.has_standalone_quote_layout(node)
+                if (!has_descendant_image(node) || node_has_visible_text(node))
+                    && self.styles.has_standalone_quote_layout(node)
                     && (has_quote_semantic_word(node)
                         || self.styles.has_distinct_quote_typography(node))
                 {
@@ -1135,12 +1136,16 @@ impl<'a> ReadingIrParser<'a> {
         let parse_result = self.push_text_block(node, TextBlockKind::Blockquote, style);
         self.inside_quote = previously_inside_quote;
         parse_result?;
-        let mut body = self
-            .blocks
-            .drain(start..)
+        let parsed = self.blocks.drain(start..).collect::<Vec<_>>();
+        let mut body = parsed
+            .into_iter()
             .filter_map(|block| match block {
                 Block::Text(block) => Some(block),
-                _ => None,
+                block => {
+                    // Mixed-content quotes can also contain block-level images.
+                    self.blocks.push(block);
+                    None
+                }
             })
             .collect::<Vec<_>>();
         if let Some(source) = quote_source_range(&body, None) {
@@ -3938,6 +3943,91 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    #[test]
+    fn centered_padded_image_paragraph_is_not_a_quote() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let section = parse_section(
+            r#"<html><head><style>.fig {margin-top:2em;margin-bottom:0.5em;padding-left:5px;padding-right:5px;padding-top:5px;text-align:center}</style></head><body>
+            <p>Before the illustration.</p>
+            <div class="pageavoid" id="f1"><p class="fig"><img src="typewriter.jpg" alt="image"/></p>
+            <p class="figleg"><span>FIGURE 1.1</span> Typewriter.</p></div>
+            <p>After the illustration.</p></body></html>"#,
+            &descriptor,
+            |_| None,
+        ).unwrap();
+        assert!(
+            matches!(&section.blocks[1], Block::Image(image) if image.href.path()=="OPS/typewriter.jpg")
+        );
+        assert!(
+            matches!(&section.blocks[2], Block::Text(text) if text.kind==TextBlockKind::Caption)
+        );
+        assert!(
+            !section
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Quote(_)))
+        );
+    }
+
+    #[test]
+    fn mixed_image_paragraphs_still_support_quote_inference() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        for image_style in ["", "display:block"] {
+            let xml = format!(
+                r#"<html><body><p style="margin:2em 5px;text-align:center">Quoted words <img src="illustration.jpg" style="{image_style}"/> continue here.</p></body></html>"#
+            );
+            let section = parse_section(&xml, &descriptor, |_| None).unwrap();
+            let quote = section
+                .blocks
+                .iter()
+                .find_map(|block| {
+                    if let Block::Quote(quote) = block {
+                        Some(quote)
+                    } else {
+                        None
+                    }
+                })
+                .expect("mixed prose must remain eligible for quote inference");
+            assert_eq!(quote.body.len(), 1);
+            assert!(text_block_text(&quote.body[0]).contains("Quoted words"));
+            let inline_count = quote.body[0]
+                .content
+                .iter()
+                .filter(|inline| matches!(inline, Inline::Image(_)))
+                .count();
+            let block_count = section
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, Block::Image(_)))
+                .count();
+            assert_eq!(
+                inline_count + block_count,
+                1,
+                "retain the image exactly once"
+            );
+            assert_eq!(inline_count, usize::from(image_style.is_empty()));
+        }
+        let explicit = parse_section(
+            r#"<html><body><blockquote><p>Explicit quotation <img src="illustration.jpg"/></p></blockquote></body></html>"#,
+            &descriptor, |_| None,
+        ).unwrap();
+        assert!(
+            matches!(&explicit.blocks[0], Block::Quote(quote) if quote.body[0].content.iter().any(|inline| matches!(inline, Inline::Image(_))))
+        );
     }
 
     #[test]

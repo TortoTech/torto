@@ -1333,6 +1333,7 @@ fn footnote_popup_keeps_inside_clicks_and_closes_on_body_click() {
     reader.classic_footnotes = vec![FocusFootnote {
         text: "Footnote text for clicking.".into(),
         citation: None,
+        number: 1,
     }];
     reader.ui.focus_footnotes_visible = true;
     let ctx = egui::Context::default();

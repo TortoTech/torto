@@ -93,7 +93,7 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
         let extra = (column_width - metrics.offset - natural_width).max(0.0);
         let end = clusters
             .iter()
-            .rposition(|(range, _, _)| !text[range.clone()].chars().all(char::is_whitespace))
+            .rposition(|(range, _, _)| !text[range.clone()].chars().all(is_reference_suffix))
             .map_or(0, |index| index + 1);
         let mut slots = Vec::new();
         for (index, (range, advance, brush)) in clusters[..end].iter().enumerate() {
@@ -557,6 +557,29 @@ struct ShapedCluster {
     hyphen_width_after: f32,
 }
 
+// Closing punctuation and invisible separators are not prose anchors.
+fn is_reference_suffix(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '\u{2060}'
+                | '\u{200b}'
+                | '.'
+                | ','
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+                | ')'
+                | ']'
+                | '}'
+                | '\''
+                | '"'
+                | '\u{2026}'
+        )
+        || is_closing_punctuation(character, true)
+}
+
 fn keep_footnotes_with_anchor(clusters: &mut [ShapedCluster]) {
     for index in 1..clusters.len() {
         if !clusters[index].footnote_reference {
@@ -564,14 +587,28 @@ fn keep_footnotes_with_anchor(clusters: &mut [ShapedCluster]) {
         }
         let mut previous = index - 1;
         loop {
-            // The displayed digit is an icon slot, not an independent number.
-            // Keep whitespace and adjacent markers attached to their text anchor.
+            if matches!(clusters[previous].last, '\n' | '\r') {
+                break;
+            }
             clusters[previous].break_after = false;
             clusters[previous].hyphen_width_after = 0.0;
-            if previous == 0 || !clusters[previous].is_breakable_space {
+            if previous == 0
+                || !(clusters[previous].footnote_reference
+                    || is_reference_suffix(clusters[previous].last))
+            {
                 break;
             }
             previous -= 1;
+        }
+        // Keep a following closing-punctuation chain with the marker as well.
+        let mut next = index + 1;
+        while next < clusters.len()
+            && !matches!(clusters[next].first, '\n' | '\r')
+            && (clusters[next].footnote_reference || is_reference_suffix(clusters[next].first))
+        {
+            clusters[next - 1].break_after = false;
+            clusters[next - 1].hyphen_width_after = 0.0;
+            next += 1;
         }
     }
 }
@@ -585,7 +622,7 @@ pub(crate) fn repair_trailing_footnote_line(
 ) {
     if layout.is_rtl()
         || !layout.inline_boxes().is_empty()
-        || text.contains(['\n', '\r', '\t'])
+        || text.contains('\t')
         || layout.len() < 2
     {
         return;
@@ -599,6 +636,11 @@ pub(crate) fn repair_trailing_footnote_line(
         return;
     }
     let lines = layout.lines().collect::<Vec<_>>();
+    // A soft wrap within the final authored paragraph can be repaired, but
+    // never pull an anchor across an explicit author/sentence break.
+    if lines[lines.len() - 2].break_reason() == parley::layout::BreakReason::Explicit {
+        return;
+    }
     let clusters = lines
         .iter()
         .map(|line| {
@@ -621,7 +663,7 @@ pub(crate) fn repair_trailing_footnote_line(
     let tail = &clusters[last];
     if !tail.iter().any(|(_, _, footnote)| *footnote)
         || tail.iter().any(|(range, _, footnote)| {
-            !*footnote && !text[range.clone()].chars().all(char::is_whitespace)
+            !*footnote && !text[range.clone()].chars().all(is_reference_suffix)
         })
     {
         return;
@@ -635,7 +677,7 @@ pub(crate) fn repair_trailing_footnote_line(
     let Some(split) = (1..previous.len()).rev().find(|&index| {
         let (range, _, footnote) = &previous[index];
         !footnote
-            && !text[range.clone()].chars().all(char::is_whitespace)
+            && !text[range.clone()].chars().all(is_reference_suffix)
             && legal.binary_search(&range.start).is_ok()
             && previous[index..]
                 .iter()
@@ -904,8 +946,15 @@ mod tests {
             "你听到的是他准备讲述的故事。” ",
             "This is the end of the story. ",
         ] {
-            for marker in ["0", "0\u{2060}\u{2060}", "00"] {
-                let text = format!("{body}{marker}");
+            for (marker, suffix) in [
+                ("0", ""),
+                ("0\u{2060}\u{2060}", ""),
+                ("00", ""),
+                ("[12]", "。\u{201d}"),
+                ("[1][2]", "."),
+                ("12", "\u{201d}"),
+            ] {
+                let text = format!("{body}{marker}{suffix}");
                 let measured = text
                     .char_indices()
                     .map(|(start, character)| MeasuredCluster {
@@ -919,10 +968,11 @@ mod tests {
                         },
                         em: 18.0,
                         ordinary_baseline: start < body.len(),
-                        footnote_reference: start >= body.len(),
+                        footnote_reference: start >= body.len()
+                            && start < body.len() + marker.len(),
                     })
                     .collect::<Vec<_>>();
-                for width in (90..200).step_by(11) {
+                for width in (180..310).step_by(11) {
                     let plan =
                         plan_measured_text(&text, &measured, width as f32, 0.0, 18.0).unwrap();
                     for line in plan.lines.iter().take(plan.lines.len() - 1) {
@@ -945,6 +995,66 @@ mod tests {
         let mut builder = layout_context.ranged_builder(&mut font_context, text, 1.0, false);
         builder.push_default(StyleProperty::FontSize(font_size));
         builder.build(text)
+    }
+
+    #[test]
+    fn native_wrapping_repairs_marker_and_punctuation_only_tail() {
+        for suffix in ["[12].", "12\u{201d}", "[1][2]。"] {
+            let body = "This is a longer paragraph ending in a word";
+            let text = format!("{body}{suffix}");
+            let marker_end = text.len() - text.chars().last().unwrap().len_utf8();
+            let mut fonts = FontContext::new();
+            let mut context = LayoutContext::<TextBrush>::new();
+            let mut builder = context.ranged_builder(&mut fonts, &text, 1.0, false);
+            builder.push_default(StyleProperty::FontSize(18.0));
+            builder.push(
+                StyleProperty::Brush(TextBrush {
+                    footnote_reference: true,
+                    ..Default::default()
+                }),
+                body.len()..marker_end,
+            );
+            let mut layout = builder.build(&text);
+            for width in 140..330 {
+                layout.break_all_lines(Some(width as f32));
+                repair_trailing_footnote_line(&mut layout, &text, width as f32);
+                let after = layout.get(layout.len() - 1).unwrap().text_range();
+                assert!(
+                    after.start < body.len(),
+                    "isolated reference at {width}: {}",
+                    &text[after]
+                );
+            }
+            // Force the otherwise font-dependent orphan boundary, then exercise
+            // the repair itself (native wrapping may already keep it together).
+            let ranges: Vec<_> = layout
+                .lines()
+                .flat_map(|line| line.runs())
+                .flat_map(|run| {
+                    run.clusters()
+                        .map(|cluster| cluster.text_range())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let split = ranges
+                .iter()
+                .position(|range| range.start == body.len())
+                .unwrap();
+            let mut breaker = layout.break_lines();
+            breaker.break_next_with_length(split as u32).unwrap();
+            breaker.set_prior_line_width(240.0);
+            breaker
+                .break_next_with_length((ranges.len() - split) as u32)
+                .unwrap();
+            breaker.finish();
+            assert_eq!(
+                layout.get(layout.len() - 1).unwrap().text_range().start,
+                body.len()
+            );
+            repair_trailing_footnote_line(&mut layout, &text, 240.0);
+            let tail = layout.get(layout.len() - 1).unwrap().text_range();
+            assert!(text[tail].starts_with("word"));
+        }
     }
 
     #[test]

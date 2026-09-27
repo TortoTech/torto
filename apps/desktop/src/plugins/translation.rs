@@ -684,7 +684,7 @@ impl BookSource for TranslationBookSource {
                     match mode {
                         TranslationMode::Replace => {
                             original.content =
-                                replacement_content(translation, style, Some(&original.content));
+                                replacement_block_content(translation, style, &original);
                             rendered.push(Block::Text(original));
                         }
                         TranslationMode::Bilingual => {
@@ -692,7 +692,7 @@ impl BookSource for TranslationBookSource {
                             let original_margin_after = original.style.margin_after;
                             original.style.margin_after = original_margin_after.min(6.0);
                             translated.content =
-                                replacement_content(translation, style, Some(&original.content));
+                                replacement_block_content(translation, style, &original);
                             translated.source = None;
                             translated.style.margin_before = 0.0;
                             translated.style.margin_after = original_margin_after;
@@ -806,7 +806,7 @@ fn apply_note_translation(
                 .unwrap_or_default();
             let original = text_block.content.clone();
             if mode == TranslationMode::Replace {
-                text_block.content = replacement_content(translation, style, Some(&original));
+                text_block.content = replacement_block_content(translation, style, text_block);
             } else {
                 text_block.content.push(Inline::Break);
                 text_block
@@ -896,13 +896,13 @@ fn translated_quote_text(
         })
         .unwrap_or_default();
     if mode == TranslationMode::Replace {
-        original.content = replacement_content(translation, style, Some(&original.content));
+        original.content = replacement_block_content(translation, style, &original);
         return vec![original];
     }
     let mut translated = original.clone();
     let original_margin_after = original.style.margin_after;
     original.style.margin_after = original_margin_after.min(6.0);
-    translated.content = replacement_content(translation, style, Some(&original.content));
+    translated.content = replacement_block_content(translation, style, &original);
     translated.source = None;
     translated.style.margin_before = 0.0;
     translated.style.margin_after = original_margin_after;
@@ -1244,7 +1244,8 @@ fn translation_text(block: &TextBlock) -> String {
     let mut math_index = 0;
     let mut citation = 0;
     let mut website = 0;
-    for inline in &block.content {
+    let notes = rebook_layout::paragraph_footnotes(block);
+    for (index, inline) in block.content.iter().enumerate() {
         let next = match inline {
             Inline::Text(run) => run.style.inline_citation,
             _ => 0,
@@ -1257,6 +1258,28 @@ fn translation_text(block: &TextBlock) -> String {
                 text.push_str(&format!("<citation id=\"{next}\">"));
             }
             citation = next;
+        }
+        if let Some(note) = notes.iter().find(|note| note.contains(&index)) {
+            if index != note.start {
+                continue;
+            }
+            let Inline::Text(first) = inline else {
+                unreachable!()
+            };
+            if first.style.inline_role == InlineRole::Footnote {
+                text.push_str(&format!("<inlinefootnote id=\"{}\">", note.start));
+                for inline in &block.content[note.clone()] {
+                    if let Inline::Text(run) = inline {
+                        let mut run = run.clone();
+                        run.style.inline_role = InlineRole::Normal;
+                        push_translation_style_markup(&mut text, &run);
+                    }
+                }
+                text.push_str("</inlinefootnote>");
+            } else {
+                text.push_str(&format!("<torto-note-{}/>", note.start));
+            }
+            continue;
         }
         match inline {
             Inline::Text(run)
@@ -1401,6 +1424,52 @@ fn push_translation_style_markup(output: &mut String, run: &TextRun) {
     }
 }
 
+fn replacement_block_content(text: &str, style: TextStyle, original: &TextBlock) -> Vec<Inline> {
+    let mut content = replacement_content(text, style, Some(&original.content));
+    if matches!(original.kind, TextBlockKind::Heading(_)) {
+        restore_heading_number_space(&original.content, &mut content);
+    }
+    content
+}
+
+fn restore_heading_number_space(original: &[Inline], translated: &mut [Inline]) {
+    let plain = |content: &[Inline]| {
+        content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>()
+    };
+    let source = plain(original);
+    let prefix_len = source
+        .bytes()
+        .take_while(|c| c.is_ascii_digit() || *c == b'.')
+        .count();
+    if prefix_len == 0
+        || !source.as_bytes()[0].is_ascii_digit()
+        || !source[prefix_len..].starts_with(char::is_whitespace)
+    {
+        return;
+    }
+    let prefix = &source[..prefix_len];
+    let text = plain(translated);
+    if !text.starts_with(prefix) || !text[prefix_len..].starts_with(char::is_alphabetic) {
+        return;
+    }
+    let mut offset = prefix_len;
+    for inline in translated {
+        if let Inline::Text(run) = inline {
+            if offset <= run.text.len() {
+                run.text.insert(offset, ' ');
+                break;
+            }
+            offset -= run.text.len();
+        }
+    }
+}
+
 fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>) -> Vec<Inline> {
     let text = normalize_translation_spacing(text);
     let original = original.unwrap_or_default();
@@ -1535,6 +1604,28 @@ fn append_translated_text(
     style: TextStyle,
     original: &[Inline],
 ) {
+    if let Some(start) = text.find("<torto-note-") {
+        let token = &text[start + "<torto-note-".len()..];
+        if let Some(end) = token.find("/>")
+            && let Ok(index) = token[..end].parse::<usize>()
+        {
+            let block = TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: original.to_vec(),
+                style: Default::default(),
+                source: None,
+            };
+            if let Some(note) = rebook_layout::paragraph_footnotes(&block)
+                .into_iter()
+                .find(|note| note.start == index)
+            {
+                append_translated_text(content, &text[..start], style, original);
+                content.extend_from_slice(&original[note]);
+                append_translated_text(content, &token[end + 2..], style, original);
+                return;
+            }
+        }
+    }
     if let Some(start) = text.find("<torto-web-") {
         let token = &text[start + 11..];
         if let Some(end) = token.find("/>")
@@ -1571,7 +1662,7 @@ fn translated_footnote_link(
         return None;
     }
     let translated_marker = translated_marker.trim();
-    original.iter().find_map(|inline| {
+    let mut matches = original.iter().filter_map(|inline| {
         let Inline::Text(run) = inline else {
             return None;
         };
@@ -1582,7 +1673,9 @@ fn translated_footnote_link(
             .then(|| run.link.clone())
             .flatten()
             .filter(|target| target.fragment().is_some())
-    })
+    });
+    let target = matches.next()?;
+    matches.all(|other| other == target).then_some(target)
 }
 
 fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextStyle {
@@ -1849,8 +1942,18 @@ fn next_translation_style_tag(text: &str) -> Option<(usize, TranslationStyleTag,
             &text[start..end],
         ))
     });
+    let note = text.find("<inlinefootnote id=\"").and_then(|start| {
+        let end = text[start..].find('>')? + start + 1;
+        Some((
+            start,
+            TranslationStyleTag::InlineFootnote,
+            true,
+            &text[start..end],
+        ))
+    });
     fixed
         .into_iter()
+        .chain(note)
         .chain(citation)
         .chain(sized)
         .min_by_key(|(index, _, opening, _)| (*index, !*opening))
@@ -2002,6 +2105,45 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn translated_heading_restores_number_separator_across_styled_runs() {
+        let inline = |text: &str| {
+            Inline::Text(TextRun {
+                text: text.into(),
+                style: TextStyle::default(),
+                link: None,
+            })
+        };
+        let mut original = TextBlock {
+            kind: TextBlockKind::Heading(2),
+            content: vec![inline("1.5.2"), inline(" Alternative Text Entry")],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        for translated in [
+            "1.5.2掌上电脑的替代文本输入方法",
+            "1.5.2 掌上电脑的替代文本输入方法",
+            "<strong>1.5.2</strong><em>掌上电脑的替代文本输入方法</em>",
+        ] {
+            let result = replacement_block_content(translated, TextStyle::default(), &original);
+            let text: String = result
+                .iter()
+                .filter_map(|item| match item {
+                    Inline::Text(run) => Some(run.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "1.5.2 掌上电脑的替代文本输入方法");
+        }
+        original.kind = TextBlockKind::Paragraph;
+        let result = replacement_block_content("1.5.2掌上电脑", TextStyle::default(), &original);
+        assert!(matches!(&result[0], Inline::Text(run) if run.text == "1.5.2掌上电脑"));
+        original.kind = TextBlockKind::Heading(2);
+        original.content = vec![inline("2020年")];
+        let result = replacement_block_content("2020年", TextStyle::default(), &original);
+        assert!(matches!(&result[0], Inline::Text(run) if run.text == "2020年"));
+    }
 
     struct TestSource {
         book: Book,
@@ -2234,7 +2376,7 @@ mod tests {
             source: None,
         };
 
-        assert_eq!(translation_text(&block), "Meaning<sup>4</sup>");
+        assert_eq!(translation_text(&block), "Meaning<torto-note-1/>");
         let marked = replacement_content("含义<sup>4</sup>", TextStyle::default(), Some(&original));
         assert!(matches!(
             marked.as_slice(),
@@ -2433,7 +2575,7 @@ mod tests {
             source: None,
         };
 
-        assert_eq!(translation_text(&block), "Meaning<noteref>【3】</noteref>");
+        assert_eq!(translation_text(&block), "Meaning<torto-note-1/>");
         let translated = replacement_content(
             "含义<noteref>【3】</noteref>",
             TextStyle::default(),
@@ -2447,6 +2589,86 @@ mod tests {
                     && run.style.baseline == TextBaseline::Normal
                     && run.link.as_ref() == Some(&target)
         )));
+    }
+
+    #[test]
+    fn translation_restores_repeated_note_markers_by_source_id() {
+        let note = |target: &str| {
+            Inline::Text(TextRun {
+                text: "*".into(),
+                style: TextStyle {
+                    link_role: LinkRole::FootnoteReference,
+                    ..Default::default()
+                },
+                link: Some(PublicationUrl::parse(target).unwrap()),
+            })
+        };
+        let original = vec![note("notes.xhtml#a"), note("notes.xhtml#b")];
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: original.clone(),
+            style: Default::default(),
+            source: None,
+        };
+        let input = translation_text(&block);
+        assert_eq!(input, "<torto-note-0/><torto-note-1/>");
+        let translated = "Second<torto-note-1/> first<torto-note-0/>";
+        assert!(validate_translation_footnotes(&input, translated).is_ok());
+        let content = replacement_content(translated, TextStyle::default(), Some(&original));
+        let links: Vec<_> = content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => run.link.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                PublicationUrl::parse("notes.xhtml#b").unwrap(),
+                PublicationUrl::parse("notes.xhtml#a").unwrap()
+            ]
+        );
+        for invalid in [
+            "<torto-note-0/>",
+            "<torto-note-0/><torto-note-0/>",
+            "<torto-note-0/><torto-note-2/>",
+            "<torto-note-x/>",
+        ] {
+            assert!(
+                validate_translation_footnotes(&input, invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(validate_translation_footnotes("Plain", "<torto-note-0/>").is_err());
+        // Ambiguous legacy markers must never silently link to the first note.
+        assert!(
+            translated_footnote_link(
+                "*",
+                TextStyle {
+                    link_role: LinkRole::FootnoteReference,
+                    ..Default::default()
+                },
+                &original
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn translated_inline_note_ids_keep_styles_and_require_complete_groups() {
+        let input = "Body<inlinefootnote id=\"4\">A note</inlinefootnote>";
+        let translated = "正文<inlinefootnote id=\"4\">一个<strong>脚注</strong></inlinefootnote>";
+        assert!(validate_translation_footnotes(input, translated).is_ok());
+        let content = replacement_content(translated, TextStyle::default(), None);
+        assert!(content.iter().any(|inline| matches!(inline, Inline::Text(run) if run.text == "脚注" && run.style.bold && run.style.inline_role == InlineRole::Footnote)));
+        for invalid in [
+            "正文",
+            "<inlinefootnote id=\"5\">note</inlinefootnote>",
+            "<inlinefootnote id=\"4\">note",
+        ] {
+            assert!(validate_translation_footnotes(input, invalid).is_err());
+        }
     }
 
     #[test]
@@ -2475,7 +2697,7 @@ mod tests {
 
         assert_eq!(
             translation_text(&block),
-            "Body<inlinefootnote>Inline note</inlinefootnote>"
+            "Body<inlinefootnote id=\"1\">Inline note</inlinefootnote>"
         );
         let translated = replacement_content(
             "正文<inlinefootnote>行内脚注</inlinefootnote>",
@@ -3473,4 +3695,46 @@ mod website_translation_tests {
         );
         assert!(result.iter().any(|i|matches!(i,Inline::Text(r) if r.link.as_ref().and_then(PublicationUrl::website_url)==Some("https://example.com/path?q=1#part"))));
     }
+}
+
+/// IDs refer to source inline positions, never to the displayed paragraph number.
+pub(super) fn validate_translation_footnotes(source: &str, translated: &str) -> Result<(), String> {
+    fn ids(text: &str) -> Result<Vec<(bool, usize)>, String> {
+        let mut ids = Vec::new();
+        for (inline, prefix, suffix) in [
+            (false, "<torto-note-", "/>"),
+            (true, "<inlinefootnote id=\"", "\">"),
+        ] {
+            let mut rest = text;
+            while let Some(start) = rest.find(prefix) {
+                rest = &rest[start + prefix.len()..];
+                let end = rest.find(suffix).ok_or("Malformed footnote ID")?;
+                let id = rest[..end]
+                    .parse::<usize>()
+                    .map_err(|_| "Invalid footnote ID")?;
+                ids.push((inline, id));
+                rest = &rest[end + suffix.len()..];
+            }
+        }
+        ids.sort_unstable();
+        Ok(ids)
+    }
+    let expected = ids(source)?;
+    let actual = ids(translated)?;
+    let changed_legacy_tags = ["<noteref>", "<inlinefootnote>"]
+        .iter()
+        .any(|tag| source.matches(tag).count() != translated.matches(tag).count());
+    if expected != actual || actual.windows(2).any(|pair| pair[0] == pair[1]) || changed_legacy_tags
+    {
+        return Err(
+            "Preserve each source footnote ID exactly once; do not add, remove or renumber IDs"
+                .into(),
+        );
+    }
+    if actual.iter().any(|(inline, _)| *inline)
+        && parse_inline_style_markup(translated, TextStyle::default()).is_none()
+    {
+        return Err("Malformed inline footnote structure".into());
+    }
+    Ok(())
 }

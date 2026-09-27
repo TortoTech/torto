@@ -63,10 +63,10 @@ pub(super) fn capture(
                     // Citation text is already retained in the paragraph sent
                     // to chat; it is not a separate footnote definition.
                     FocusFootnoteSource::Citation { .. } => continue,
-                    FocusFootnoteSource::Inline(text) => {
+                    FocusFootnoteSource::Inline(text, _) => {
                         (format!("inline:{text}"), String::new(), None, Some(text))
                     }
-                    FocusFootnoteSource::Reference { marker, target } => {
+                    FocusFootnoteSource::Reference { marker, target, .. } => {
                         (target.to_string(), marker, Some(target), None)
                     }
                 };

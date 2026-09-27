@@ -1044,6 +1044,9 @@ impl DesktopReader {
         if self.focus_footnote_shortcut(ctx, focus_footnote_requested) {
             return;
         }
+        if self.focus_action_shortcut(ctx, interaction_blocked) {
+            return;
+        }
         if self.ui.focus_footnotes_visible {
             let scroll_delta = ctx.input_mut(|input| {
                 if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
@@ -1101,9 +1104,6 @@ impl DesktopReader {
             return;
         }
         if self.layout_shortcut(ctx, interaction_blocked) {
-            return;
-        }
-        if self.focus_action_shortcut(ctx, interaction_blocked) {
             return;
         }
         if self.focus_edge_shortcut(ctx, interaction_blocked) {
@@ -1414,7 +1414,6 @@ impl DesktopReader {
             || self.ui.sidebar_open
             || self.image_preview.is_some()
             || self.annotation_note_draft.is_some()
-            || self.ui.focus_footnotes_visible
         {
             return false;
         }
@@ -1438,6 +1437,7 @@ impl DesktopReader {
                 self.close_assistant_panel();
                 ctx.memory_mut(egui::Memory::stop_text_input);
             } else {
+                self.close_focus_footnotes();
                 self.attach_current_focus_reference();
                 self.open_assistant_panel(AssistantPanel::Chat);
             }
@@ -1612,12 +1612,13 @@ impl DesktopReader {
     }
 
     fn focus_action_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
-        if !self.focus_body_accepts_shortcuts(interaction_blocked) {
+        if !self.focus_body_accepts_actions(interaction_blocked) || ctx.text_edit_focused() {
             return false;
         }
         let action = ctx.input_mut(|input| {
+            let fresh_highlight = shortcut_has_fresh_press(input, &self.shortcuts.focus_highlight);
             if input.consume_shortcut(&self.shortcuts.focus_highlight) {
-                Some(0)
+                Some(if fresh_highlight { 0 } else { 3 })
             } else if input.consume_shortcut(&self.shortcuts.focus_note) {
                 Some(1)
             } else if input.consume_shortcut(&self.shortcuts.focus_structure) {
@@ -1629,9 +1630,10 @@ impl DesktopReader {
         match action {
             Some(0) if self.focus_has_annotatable_units() => {
                 self.ui.focus_actions_visible = false;
-                self.create_focus_highlight(None);
+                self.toggle_focus_highlight();
             }
             Some(1) if self.focus_has_annotatable_units() => {
+                self.close_focus_footnotes();
                 self.ui.focus_actions_visible = true;
                 self.annotation_note_draft = Some(AnnotationDraft {
                     note: self.current_focus_note().unwrap_or_default(),
@@ -1649,6 +1651,10 @@ impl DesktopReader {
     }
 
     fn focus_body_accepts_shortcuts(&self, interaction_blocked: bool) -> bool {
+        self.focus_body_accepts_actions(interaction_blocked) && !self.ui.focus_footnotes_visible
+    }
+
+    fn focus_body_accepts_actions(&self, interaction_blocked: bool) -> bool {
         self.is_focus_mode()
             && !interaction_blocked
             && !self.ui.overlay_visible()
@@ -1656,7 +1662,6 @@ impl DesktopReader {
             && self.image_preview.is_none()
             && self.ui.assistant_panel.is_none()
             && self.annotation_note_draft.is_none()
-            && !self.ui.focus_footnotes_visible
     }
 
     fn focus_wheel_interaction(&mut self, response: &egui::Response) {
@@ -2241,105 +2246,97 @@ impl DesktopReader {
         let content_right = page_rect.left()
             + reading_content_left(page_rect.width(), &style)
             + reading_content_width(page_rect.width(), &style);
-        let preferred_x = content_right + 12.0;
-        let maximum_width = 480.0_f32.min((viewport.width() - 32.0).max(1.0));
-        let minimum_width = 180.0_f32.min(maximum_width);
-        let available_right = viewport.right() - preferred_x - 16.0;
-        let width = available_right.clamp(minimum_width, maximum_width);
-        let x = if available_right >= minimum_width {
-            preferred_x
-        } else {
-            (viewport.right() - width - 16.0).max(viewport.left() + 16.0)
+        let Some((x, minimum_width, width_cap)) =
+            footnote_popup_side_bounds(content_right, viewport.right())
+        else {
+            // Keep the popup state, but never cover the reader when the window
+            // has no room for even the frame. Resizing can reveal it again.
+            return;
         };
         let maximum_body_height = (viewport.height() * 0.52).clamp(160.0, 380.0);
         let frame_horizontal_margin = 24.0;
         let scrollbar_reserve = 8.0;
         let style = ctx.style_of(crate::ui::theme());
-        let text_width = (width - frame_horizontal_margin - scrollbar_reserve).max(1.0);
+        let text_width = (width_cap - frame_horizontal_margin - scrollbar_reserve).max(1.0);
         let body_font = egui::TextStyle::Body.resolve(style.as_ref());
         let text_color = palette().text;
-        let citation_gap = 4.0;
-        let citation_labels: Vec<_> = footnotes
+        let marker_slot = footnotes
             .iter()
             .map(|note| {
-                note.citation.as_ref().map(|(_, number)| {
+                let marker = if note.citation.is_some() {
+                    format!("[{}]", note.number)
+                } else {
+                    note.number.to_string()
+                };
+                self.footnote_layout
+                    .marker_width(
+                        self.source.as_ref(),
+                        &marker,
+                        &self.reader.style(),
+                        body_font.size,
+                    )
+                    .unwrap_or(body_font.size * 1.5)
+            })
+            .fold(0.0_f32, f32::max);
+        let mut layout_notes = |text_width| {
+            footnotes
+                .iter()
+                .map(|note| {
+                    let marker = if note.citation.is_some() {
+                        format!("[{}]", note.number)
+                    } else {
+                        note.number.to_string()
+                    };
                     self.footnote_layout
-                        .layout(
+                        .layout_aligned_marked(
                             self.source.as_ref(),
-                            &format!("[{number}]"),
+                            note.popup_text(),
+                            &marker,
                             &self.reader.style(),
                             body_font.size,
+                            text_color,
                             crate::ui::footnote_link_color(),
-                            body_font.size * (number.to_string().len() as f32 + 2.0),
+                            text_width,
+                            marker_slot,
                         )
-                        .unwrap_or_else(|_| {
-                            super::footnote_layout::FootnoteLayout::fallback(
+                        .unwrap_or_else(|error| {
+                            if text_width >= 84.0 {
+                                tracing::warn!(%error, "footnote layout failed");
+                            }
+                            super::footnote_layout::FootnoteLayout::fallback_marked(
                                 ctx,
-                                &format!("[{number}]"),
+                                note.popup_text(),
+                                &marker,
                                 &body_font,
+                                text_color,
                                 crate::ui::footnote_link_color(),
-                                body_font.size * (number.to_string().len() as f32 + 2.0),
+                                text_width,
+                                marker_slot,
                             )
                         })
                 })
-            })
-            .collect();
-        let footnote_text_layouts = footnotes
-            .iter()
-            .enumerate()
-            .map(|(index, footnote)| {
-                self.footnote_layout
-                    .layout(
-                        self.source.as_ref(),
-                        footnote.popup_text(),
-                        &self.reader.style(),
-                        body_font.size,
-                        text_color,
-                        if footnote.citation.is_some() {
-                            (text_width
-                                - citation_labels[index]
-                                    .as_ref()
-                                    .map_or(0.0, |label| label.content_width)
-                                - citation_gap)
-                                .max(1.0)
-                        } else {
-                            text_width
-                        },
-                    )
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(%error, "footnote layout failed");
-                        super::footnote_layout::FootnoteLayout::fallback(
-                            ctx,
-                            footnote.popup_text(),
-                            &body_font,
-                            text_color,
-                            if footnote.citation.is_some() {
-                                (text_width
-                                    - citation_labels[index]
-                                        .as_ref()
-                                        .map_or(0.0, |label| label.content_width)
-                                    - citation_gap)
-                                    .max(1.0)
-                            } else {
-                                text_width
-                            },
-                        )
-                    })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        };
+        let widest_layouts = layout_notes(text_width);
+        let width = footnote_popup_width(&widest_layouts, minimum_width, width_cap);
+        let footnote_text_layouts = if (width - width_cap).abs() < 0.5 {
+            widest_layouts
+        } else {
+            layout_notes((width - frame_horizontal_margin - scrollbar_reserve).max(1.0))
+        };
         let scroll_target = self.citation_popup_target.take();
         let measured_text_height = footnote_text_layouts
             .iter()
-            .enumerate()
-            .map(|(index, layout)| {
-                citation_labels[index]
-                    .as_ref()
-                    .map_or(layout.height, |label| layout.citation_row_height(label))
-            })
+            .map(|layout| layout.height)
             .sum::<f32>();
         // Each additional item has one separator plus the vertical spacing on
         // both sides. The small safety inset covers fractional glyph metrics.
-        let separator_height = footnotes.len().saturating_sub(1) as f32 * 19.0;
+        let item_spacing = 9.0;
+        let separator_spacing = style
+            .separator_style(&Default::default(), Default::default())
+            .spacing;
+        let separator_height =
+            footnotes.len().saturating_sub(1) as f32 * (item_spacing * 2.0 + separator_spacing);
         let measured_body_height = (measured_text_height + separator_height + 2.0)
             .clamp(body_font.size.max(19.0), maximum_body_height);
         let panel_height = measured_body_height + 24.0;
@@ -2359,7 +2356,14 @@ impl DesktopReader {
         let overlay = egui::Area::new("focus-footnotes".into())
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))
+            // Area's viewport constraint may otherwise shift a cached, wider
+            // popup back over the text during width changes.
+            .constrain(false)
             .show(ctx, |ui| {
+                ui.set_clip_rect(Rect::from_min_max(
+                    Pos2::new(x, viewport.top()),
+                    viewport.right_bottom(),
+                ));
                 focus_assistant_frame(egui::Margin::same(12)).show(ui, |ui| {
                     ui.set_width((width - 24.0).max(1.0));
                     let wheel_scroll = ui.input_mut(|input| {
@@ -2372,34 +2376,26 @@ impl DesktopReader {
                         let content_width = ui.available_width().max(1.0);
                         ui.vertical(|ui| {
                             ui.set_width(content_width);
-                            egui::ScrollArea::vertical()
-                                .id_salt("focus-footnotes-scroll")
-                                .max_height(maximum_body_height)
-                                .min_scrolled_height(measured_body_height)
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    if routed_scroll.abs() > f32::EPSILON {
-                                        ui.scroll_with_delta(Vec2::new(0.0, routed_scroll));
+                            footnote_scroll_area(maximum_body_height).show(ui, |ui| {
+                                if routed_scroll.abs() > f32::EPSILON {
+                                    ui.scroll_with_delta(Vec2::new(0.0, routed_scroll));
+                                }
+                                ui.set_width((ui.available_width() - 8.0).max(1.0));
+                                ui.spacing_mut().item_spacing.y = item_spacing;
+                                for (index, layout) in footnote_text_layouts.iter().enumerate() {
+                                    if index > 0 {
+                                        ui.add(
+                                            egui::Separator::default().spacing(separator_spacing),
+                                        );
                                     }
-                                    ui.set_width((ui.available_width() - 8.0).max(1.0));
-                                    ui.spacing_mut().item_spacing.y = 9.0;
-                                    for (index, layout) in footnote_text_layouts.iter().enumerate()
+                                    let row = ui.vertical(|ui| layout.paint(ui)).response;
+                                    if scroll_target.is_some()
+                                        && footnotes[index].citation == scroll_target
                                     {
-                                        if index > 0 {
-                                            ui.separator();
-                                        }
-                                        let row = if let Some(label) = &citation_labels[index] {
-                                            layout.paint_with_marker(ui, label, citation_gap)
-                                        } else {
-                                            ui.vertical(|ui| layout.paint(ui)).response
-                                        };
-                                        if scroll_target.is_some()
-                                            && footnotes[index].citation == scroll_target
-                                        {
-                                            row.scroll_to_me(Some(egui::Align::Center));
-                                        }
+                                        row.scroll_to_me(Some(egui::Align::Center));
                                     }
-                                });
+                                }
+                            });
                         });
                     });
                 });
@@ -4589,6 +4585,38 @@ fn toc_navigation_keeps_bottom_offset(
             >= maximum_offset
 }
 
+fn footnote_popup_side_bounds(content_right: f32, viewport_right: f32) -> Option<(f32, f32, f32)> {
+    let x = content_right + 12.0;
+    let maximum = (viewport_right - x - 16.0).min(480.0);
+    (maximum > 32.0).then_some((x, 240.0_f32.min(maximum), maximum))
+}
+
+fn footnote_popup_width(
+    layouts: &[std::sync::Arc<super::footnote_layout::FootnoteLayout>],
+    minimum: f32,
+    maximum: f32,
+) -> f32 {
+    if layouts.iter().any(|layout| layout.wrapped) {
+        return maximum;
+    }
+    let content = layouts
+        .iter()
+        .map(|layout| layout.content_width)
+        .fold(0.0_f32, f32::max);
+    (content + 24.0 + 8.0).ceil().clamp(minimum, maximum)
+}
+
+fn footnote_scroll_area(maximum_body_height: f32) -> egui::ScrollArea {
+    // Area remembers its previous size, and horizontal_top starts with a short
+    // row. Neither should limit this popup before its contents reach the cap.
+    // auto_shrink keeps short popups content-sized despite this viewport floor.
+    egui::ScrollArea::vertical()
+        .id_salt("focus-footnotes-scroll")
+        .max_height(maximum_body_height)
+        .min_scrolled_height(maximum_body_height)
+        .auto_shrink([false, true])
+}
+
 fn update_toc_scroll_marker(
     marker: &mut Option<String>,
     preserve_bottom_after_navigation: bool,
@@ -5720,6 +5748,189 @@ fn page_wheel_input_allowed(pointer_over_page: bool, blocked: bool) -> bool {
 #[cfg(test)]
 mod reference_suggestion_label_tests {
     use super::*;
+    use rebook_layout::ReaderStyle;
+
+    #[test]
+    fn popup_side_bounds_never_move_back_over_body() {
+        for side_space in [0.0, 25.0, 80.0, 180.0, 239.0, 240.0, 400.0, 700.0] {
+            let body_right = 825.0;
+            let viewport_right = body_right + 12.0 + 16.0 + side_space;
+            let bounds = footnote_popup_side_bounds(body_right, viewport_right);
+            if side_space <= 32.0 {
+                assert!(bounds.is_none());
+                continue;
+            }
+            let (x, minimum, maximum) = bounds.unwrap();
+            assert_eq!(x, body_right + 12.0);
+            assert!(x + maximum <= viewport_right - 16.0);
+            assert_eq!(maximum, side_space.min(480.0));
+            assert_eq!(minimum, side_space.min(240.0));
+        }
+    }
+
+    #[test]
+    fn focus_popup_allows_actions_and_highlight_toggles_without_repeats() {
+        use crate::highlights::{
+            HighlightRepository, HighlightResult, HighlightStore, StoredHighlight,
+        };
+        #[derive(Clone, Default)]
+        struct Store(std::sync::Arc<std::sync::Mutex<Vec<StoredHighlight>>>);
+        impl HighlightRepository for Store {
+            fn highlights_for_book(&self, _: &str) -> HighlightResult<Vec<StoredHighlight>> {
+                Ok(self.0.lock().unwrap().clone())
+            }
+            fn insert_highlight(&self, item: &StoredHighlight) -> HighlightResult<()> {
+                self.0.lock().unwrap().push(item.clone());
+                Ok(())
+            }
+            fn update_highlight(&self, _: &StoredHighlight) -> HighlightResult<bool> {
+                Ok(true)
+            }
+            fn remove_highlight(&self, id: &str) -> HighlightResult<bool> {
+                self.0.lock().unwrap().retain(|item| item.id != id);
+                Ok(true)
+            }
+        }
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let store = Store::default();
+        reader.highlight_store = HighlightStore::from_repository(store.clone());
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        assert!(reader.focus_has_annotatable_units());
+        reader.ui.sidebar_open = false;
+        reader.ui.focus_footnotes_visible = true;
+        let ctx = egui::Context::default();
+        let send = |reader: &mut DesktopReader, shortcut: egui::KeyboardShortcut, pressed: bool| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: shortcut.logical_key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers: shortcut.modifiers,
+                    }],
+                    ..Default::default()
+                },
+                |_| reader.keyboard_shortcuts(&ctx, false),
+            );
+            output.textures_delta.clear();
+        };
+        let highlight = reader.shortcuts.focus_highlight;
+        send(&mut reader, highlight, true);
+        assert_eq!(reader.highlights.len(), 1);
+        send(&mut reader, highlight, true);
+        assert_eq!(
+            reader.highlights.len(),
+            1,
+            "held key must not toggle repeatedly"
+        );
+        send(&mut reader, highlight, false);
+        send(&mut reader, highlight, true);
+        assert!(reader.highlights.is_empty());
+        assert!(store.0.lock().unwrap().is_empty());
+        send(&mut reader, highlight, false);
+        let mut draft = String::new();
+        let mut output = ctx.run_ui(Default::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                ui.text_edit_singleline(&mut draft).request_focus();
+            });
+        });
+        output.textures_delta.clear();
+        assert!(ctx.text_edit_focused());
+        send(&mut reader, highlight, true);
+        assert!(
+            reader.highlights.is_empty(),
+            "typing must not highlight the reader"
+        );
+        ctx.memory_mut(egui::Memory::stop_text_input);
+        assert!(!ctx.text_edit_focused());
+        let structure = reader.shortcuts.focus_structure;
+        assert!(reader.focus_has_structurable_units());
+        let unit = &reader.focus_units[reader.focus_unit_index];
+        let structure_key = crate::plugins::ParagraphStructureKey {
+            section_index: unit.position.section_index,
+            node: unit.structure_ranges[0].start.node.clone(),
+        };
+        assert!(
+            reader
+                .structure_source
+                .can_structure(&structure_key)
+                .unwrap()
+        );
+        assert!(!reader.focus_structure_is_active());
+        send(&mut reader, structure, true);
+        assert!(reader.structure_source.is_active(&structure_key));
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        reader.ui.focus_footnotes_visible = true;
+        let chat = reader.shortcuts.focus_chat;
+        send(&mut reader, chat, true);
+        assert_eq!(reader.ui.assistant_panel, Some(AssistantPanel::Chat));
+        assert!(!reader.ui.focus_footnotes_visible);
+    }
+
+    #[test]
+    fn popup_width_expands_to_fit_text_and_respects_side_space() {
+        let (reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let mut renderer = super::super::footnote_layout::FootnoteRenderer::default();
+        for (text, cap, expected) in [
+            ("Smith, 1990".to_owned(), 480.0, 240.0),
+            (
+                "An extended explanatory footnote that cannot fit on a single line. ".repeat(8),
+                480.0,
+                480.0,
+            ),
+            (
+                "An extended explanatory footnote that cannot fit on a single line. ".repeat(8),
+                300.0,
+                300.0,
+            ),
+        ] {
+            let layout = renderer
+                .layout_marked(
+                    reader.source.as_ref(),
+                    &text,
+                    "[1]",
+                    &ReaderStyle::default(),
+                    14.0,
+                    egui::Color32::BLACK,
+                    egui::Color32::BLUE,
+                    cap - 32.0,
+                )
+                .unwrap();
+            assert_eq!(footnote_popup_width(&[layout], 240.0, cap), expected);
+        }
+        let text = "Churchland & Sejnowsky, 1992; Eliasmith, 2013";
+        let layout = renderer
+            .layout_marked(
+                reader.source.as_ref(),
+                text,
+                "[1]",
+                &ReaderStyle::default(),
+                14.0,
+                egui::Color32::BLACK,
+                egui::Color32::BLUE,
+                448.0,
+            )
+            .unwrap();
+        assert!(!layout.wrapped);
+        let width = footnote_popup_width(&[layout], 240.0, 480.0);
+        assert!(width > 240.0 && width <= 480.0);
+        let fitted = renderer
+            .layout_marked(
+                reader.source.as_ref(),
+                text,
+                "[1]",
+                &ReaderStyle::default(),
+                14.0,
+                egui::Color32::BLACK,
+                egui::Color32::BLUE,
+                width - 32.0,
+            )
+            .unwrap();
+        assert!(!fitted.wrapped);
+    }
 
     #[test]
     #[ignore = "requires the local Reading in the Brain EPUB via TORTO_PRELUDE_BOOK"]
@@ -6211,6 +6422,55 @@ mod reference_suggestion_label_tests {
             },
         );
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn footnote_popup_only_scrolls_after_reaching_height_cap() {
+        let ctx = egui::Context::default();
+        // Reuse the same Area through growth and shrinkage to cover cached size.
+        for rows in [1, 3, 20, 2] {
+            for _ in 0..3 {
+                let mut sizes = None;
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    egui::Area::new("footnote-height-regression".into())
+                        .fixed_pos(egui::pos2(10.0, 10.0))
+                        .default_size(egui::vec2(300.0, 40.0))
+                        .show(ui.ctx(), |ui| {
+                            ui.horizontal_top(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.set_width(280.0);
+                                    let result = footnote_scroll_area(380.0).show(ui, |ui| {
+                                        ui.spacing_mut().item_spacing.y = 9.0;
+                                        for index in 0..rows {
+                                            if index > 0 {
+                                                ui.separator();
+                                            }
+                                            ui.allocate_exact_size(
+                                                egui::vec2(260.0, 28.0),
+                                                egui::Sense::hover(),
+                                            );
+                                        }
+                                    });
+                                    // ScrollAreaOutput.inner_rect is the pre-shrink
+                                    // viewport; inspect the allocated UI instead.
+                                    sizes = Some((result.content_size.y, ui.min_rect().height()));
+                                });
+                            });
+                        });
+                });
+                output.textures_delta.clear();
+                let (content, visible) = sizes.unwrap();
+                if rows < 20 {
+                    assert!(
+                        (content - visible).abs() < 0.5,
+                        "premature scroll: {rows} rows, content={content}, visible={visible}"
+                    );
+                } else {
+                    assert!(content > visible);
+                    assert!((visible - 380.0).abs() < 0.5);
+                }
+            }
+        }
     }
 
     #[test]
