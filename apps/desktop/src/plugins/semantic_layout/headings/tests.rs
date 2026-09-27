@@ -194,6 +194,46 @@ fn numbering_context_reaches_across_windows_and_is_bounded() {
 }
 
 #[test]
+fn stale_unnumbered_heading_annotations_do_not_apply_or_discard_other_headings() {
+    let mut known = text("known", "Chapter 3 Existing heading");
+    if let Block::Text(t) = &mut known {
+        t.kind = TextBlockKind::Heading(2);
+    }
+    let original = section(vec![
+        text("old", "Historical background"),
+        text("new", "Chapter 2 Background"),
+        known,
+    ]);
+    let result = Recognition {
+        fingerprint: fingerprint(&original),
+        formulas_checked: true,
+        skipped_groups: 0,
+        annotations: original
+            .blocks
+            .iter()
+            .map(|block| Annotation::SectionHeading {
+                source: source(block).unwrap().clone(),
+            })
+            .collect(),
+    };
+    let source = original_source(original.clone());
+    let overlay = SemanticLayoutSource::new(source.clone(), source);
+    assert!(overlay.install(0, result.clone()));
+    let displayed = overlay.parse_section(0).unwrap();
+    assert!(matches!(&displayed.blocks[0], Block::Text(t) if t.kind == TextBlockKind::Paragraph));
+    assert!(matches!(&displayed.blocks[1], Block::Text(t) if t.kind == TextBlockKind::Heading(3)));
+    assert_eq!(displayed.blocks[2], original.blocks[2]);
+    let request = unified_window_input(&original, &RecognitionRoles::default(), 0..3, 0..3, &[]);
+    assert_eq!(request["targets"]["classify_headings"], json!([1]));
+    let identity = json!(["restricted-heading-cache", std::process::id()]);
+    let path = recognition_path(&identity, &result.fingerprint).unwrap();
+    crate::persistence::write_json_atomic(&path, &result).unwrap();
+    let cached = load_recognition(&original, &identity).unwrap();
+    assert_eq!(cached.annotations, vec![result.annotations[1].clone()]);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn headings_preserve_translation_sources_toc_and_toggle() {
     let section = section(vec![text("h", "2"), text("p", "Body")]);
     let range = source(&section.blocks[0]).unwrap().clone();
@@ -262,8 +302,8 @@ fn headings_preserve_translation_sources_toc_and_toggle() {
 }
 
 #[test]
-fn textual_candidates_use_original_styles_and_keep_protected_roles() {
-    let title = "Historical background to medical knowledge and treatments";
+fn numbered_candidates_use_original_styles_and_keep_protected_roles() {
+    let title = "1.2 Historical background to medical knowledge and treatments";
     let mut heading = text("h", title);
     if let Block::Text(t) = &mut heading {
         if let Inline::Text(run) = &mut t.content[0] {
@@ -275,10 +315,28 @@ fn textual_candidates_use_original_styles_and_keep_protected_roles() {
     for title in [
         "2024 report",
         "1.2 Background",
-        "Why does this happen?",
-        "\u{5386}\u{53f2}\u{80cc}\u{666f}",
+        "Chapter 1",
+        "Part II Background",
+        "Section 2.3 Introduction",
+        "第1章 引言",
+        "第三节",
+        "（1）标题",
+        "1、标题",
+        "１．２ 标题",
     ] {
         assert!(candidate(&text("t", title)).is_some());
+    }
+    for title in [
+        "Historical background",
+        "Why does this happen?",
+        "历史背景",
+        "See Chapter 1",
+        "Chapter one",
+        "Chapter 1abc",
+        "Particular problems",
+        "(2020)",
+    ] {
+        assert!(candidate(&text("t", title)).is_none(), "{title}");
     }
     for kind in [
         TextBlockKind::Heading(2),
@@ -331,7 +389,7 @@ fn local_tinnitus_plain_paragraph_heading() {
         .unwrap();
     let section = source.parse_section(index).unwrap();
     let id=section.blocks.iter().position(|block| matches!(block,Block::Text(t) if text_block_text(t)=="Historical background to medical knowledge and treatments")).unwrap();
-    assert!(candidate(&section.blocks[id]).is_some());
+    assert!(candidate(&section.blocks[id]).is_none());
     let input = unified_window_input(
         &section,
         &RecognitionRoles::default(),
@@ -345,20 +403,20 @@ fn local_tinnitus_plain_paragraph_heading() {
         .iter()
         .find(|block| block["id"] == id)
         .unwrap();
-    assert_eq!(block["style"]["bold_ratio"], 1.0);
+    assert_eq!(block["id"], id);
+    assert_eq!(input["targets"]["classify_headings"], json!([]));
     let proposal = Proposal::SectionHeading { block: id };
-    validate_window(
-        &[proposal.clone()],
-        &section,
-        &RecognitionRoles::default(),
-        id..id + 1,
-        id..id + 1,
-    )
-    .unwrap();
-    let mut displayed = section.clone();
-    super::super::compose(&mut displayed.blocks, &annotation(&proposal, &section));
-    assert!(matches!(&displayed.blocks[id],Block::Text(t) if t.kind==TextBlockKind::Heading(3)));
+    assert!(
+        validate_window(
+            &[proposal.clone()],
+            &section,
+            &RecognitionRoles::default(),
+            id..id + 1,
+            id..id + 1,
+        )
+        .is_err()
+    );
     println!(
-        "book section={index} block={id}; original plain paragraph becomes eligible with original bold styling"
+        "book section={index} block={id}; unnumbered paragraph remains ineligible despite bold styling"
     );
 }

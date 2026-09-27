@@ -403,19 +403,25 @@ impl BookSource for SemanticLayoutSource {
             .ok()
             .and_then(|state| state.get(&index).cloned());
         if recognition.is_some() || partial.is_some() {
-            let hash = fingerprint(&self.original.parse_section(index)?);
+            let original = self.original.parse_section(index)?;
+            let hash = fingerprint(&original);
             if let Some(recognition) = recognition.filter(|result| result.fingerprint == hash) {
                 for annotation in &recognition.annotations {
-                    compose(&mut section.blocks, annotation);
+                    if headings::annotation_eligible(&original, annotation) {
+                        compose(&mut section.blocks, annotation);
+                    }
                 }
             } else if let Some(results) = partial {
                 for recognition in results.values().filter(|result| result.fingerprint == hash) {
                     for annotation in &recognition.annotations {
-                        compose(&mut section.blocks, annotation);
+                        if headings::annotation_eligible(&original, annotation) {
+                            compose(&mut section.blocks, annotation);
+                        }
                     }
                 }
             }
         }
+        text_formulas::normalize_formula_quotes(&mut section.blocks);
         Ok(section)
     }
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
@@ -692,7 +698,7 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
         "type":"object", "additionalProperties":false,
         "properties":{
             "kind":{"type":"string","enum":["section_heading"]},
-            "block":{"type":"integer"}
+            "block":{"type":"integer","description":"An ID from targets.classify_headings: an ordinary paragraph starting with a numeric or chapter/part/section ordinal prefix, not an existing heading."}
         },
         "required":["kind","block"]
     });
@@ -778,7 +784,10 @@ fn recognition_path(identity: &Value, hash: &str) -> Option<PathBuf> {
 fn load_recognition(section: &Section, identity: &Value) -> Option<Recognition> {
     let hash = fingerprint(section);
     let bytes = std::fs::read(recognition_path(identity, &hash)?).ok()?;
-    let result: Recognition = serde_json::from_slice(&bytes).ok()?;
+    let mut result: Recognition = serde_json::from_slice(&bytes).ok()?;
+    result
+        .annotations
+        .retain(|annotation| headings::annotation_eligible(section, annotation));
     if !result.formulas_checked
         || !formulas::validate_annotations(section, &result.annotations)
         || !text_formulas::validate_annotations(section, &result.annotations)

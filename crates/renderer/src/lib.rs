@@ -2407,7 +2407,17 @@ fn compile_text_commands(
                         |f| Arc::clone(&f.original.pixels),
                     ),
                     interactive: image.formula_presentation.is_some(),
-                    source: None,
+                    // A whole-paragraph text formula is painted as an inline
+                    // raster, but owns the same image interaction/outline as a
+                    // display formula originating from an image.
+                    source: text.source.clone().filter(|_| {
+                        image.formula_presentation.is_some()
+                            && text.inline_images.len() == 1
+                            && text
+                                .text
+                                .chars()
+                                .all(|c| c == '\u{2060}' || c.is_whitespace())
+                    }),
                 }));
                 if let Some(source) = &text.source {
                     inline_content_regions.push(InlineContentRegion {

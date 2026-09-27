@@ -1,5 +1,5 @@
 use super::*;
-use rebook_publication::{InlineRole, LinkRole, MathRun, TextBaseline, TextRun};
+use rebook_publication::{InlineRole, LinkRole, MathRun, TextAlignment, TextBaseline, TextRun};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -425,6 +425,104 @@ pub(super) fn compose(blocks: &mut [Block], source: &SourceRange, spans: &[Span]
         }
     });
 }
+
+/// Normalize the composed view, never the original publication or annotations.
+/// A quote with any prose or attribution retains its quotation semantics.
+pub(super) fn normalize_formula_quotes(blocks: &mut Vec<Block>) {
+    let mut result = Vec::with_capacity(blocks.len());
+    for mut block in std::mem::take(blocks) {
+        if let Block::Note(note) = &mut block {
+            normalize_formula_quotes(&mut note.blocks);
+        }
+        let converted = match &block {
+            Block::Quote(quote) if quote.attribution.is_none() && !quote.body.is_empty() => quote
+                .body
+                .iter()
+                .map(formula_paragraph)
+                .collect::<Option<Vec<_>>>(),
+            Block::Text(text) if text.kind == TextBlockKind::Blockquote => {
+                formula_paragraph(text).map(|text| vec![text])
+            }
+            _ => None,
+        };
+        if let Some(texts) = converted {
+            result.extend(texts.into_iter().map(Block::Text));
+        } else {
+            result.push(block);
+        }
+    }
+    *blocks = result;
+}
+
+fn formula_paragraph(text: &TextBlock) -> Option<TextBlock> {
+    let mut result = text.clone();
+    let recognized_image = text
+        .content
+        .iter()
+        .any(|inline| matches!(inline, Inline::Image(run) if run.image.formula.is_some()));
+    if !(recognized_image && rebook_layout::is_display_formula(text)) {
+        let mut formula = None;
+        let mut originals = Vec::new();
+        let mut leading = String::new();
+        let mut trailing = String::new();
+        for inline in &text.content {
+            match inline {
+                Inline::Math(run) if run.original.is_some() && formula.is_none() => {
+                    originals.extend(run.original.as_ref()?.iter().cloned());
+                    formula = Some(run.clone());
+                }
+                Inline::Text(run)
+                    if run.link.is_none()
+                        && run.style.inline_citation == 0
+                        && run.style.inline_role == InlineRole::Normal
+                        && run.style.link_role == LinkRole::Normal =>
+                {
+                    originals.push(run.clone());
+                    if formula.is_some() {
+                        trailing.push_str(&run.text);
+                    } else {
+                        leading.push_str(&run.text);
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let mut formula = formula?;
+        if !leading.trim().is_empty() {
+            return None;
+        }
+        let suffix = trailing.trim();
+        let punctuation = |c: char| matches!(c, ',' | '.' | ';' | ':' | '，' | '。' | '；' | '：');
+        let label = suffix.trim_end_matches(punctuation).trim();
+        let number = label
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .or_else(|| label.strip_prefix('（').and_then(|s| s.strip_suffix('）')));
+        if !label.is_empty()
+            && !number.is_some_and(|s| {
+                !s.is_empty()
+                    && s.len() <= 24
+                    && s.chars()
+                        .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | ' '))
+            })
+        {
+            return None;
+        }
+        if !suffix.is_empty() {
+            formula.latex.push_str(&format!(r"\text{{{suffix}}}"));
+        }
+        formula.display = true;
+        formula.original = Some(originals);
+        result.content = vec![Inline::Math(formula)];
+    }
+    result.kind = TextBlockKind::Paragraph;
+    result.style = rebook_publication::BlockStyle {
+        align: TextAlignment::Center,
+        ..Default::default()
+    };
+    Some(result)
+}
+
 pub(super) fn visit(blocks: &mut [Block], f: &mut impl FnMut(&mut TextBlock)) {
     for block in blocks {
         match block {

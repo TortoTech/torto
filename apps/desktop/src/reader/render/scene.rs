@@ -394,6 +394,19 @@ impl DesktopReader {
                     TEXT_SELECTION_COLOR,
                     offset_x,
                 );
+            } else if unit.is_image {
+                // Retain caption activation, but give source-backed formula
+                // rasters the same outline-only treatment as block images.
+                let text_ranges = unit
+                    .paint_ranges
+                    .iter()
+                    .filter(|range| {
+                        page.image_source_rects(std::slice::from_ref(*range))
+                            .is_empty()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                page.paint_source_ranges(scene, &text_ranges, TEXT_SELECTION_COLOR, offset_x);
             } else {
                 page.paint_source_ranges(scene, &unit.paint_ranges, TEXT_SELECTION_COLOR, offset_x);
             }

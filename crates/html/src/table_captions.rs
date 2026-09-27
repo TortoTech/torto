@@ -52,6 +52,34 @@ fn has_table_caption_semantics(node: Node<'_, '_>) -> bool {
     })
 }
 
+fn standalone_table_label(node: Node<'_, '_>) -> bool {
+    let text = node_text(node).trim().to_ascii_lowercase();
+    let Some(number) = text
+        .strip_prefix("table")
+        .or_else(|| text.strip_prefix("表格"))
+        .or_else(|| text.strip_prefix('表'))
+    else {
+        return false;
+    };
+    table_label(&text)
+        && number.chars().any(|c| c.is_ascii_digit())
+        && number
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_whitespace() || ".-–()（）:：".contains(c))
+}
+
+fn standalone_caption_text(node: Node<'_, '_>) -> bool {
+    matches!(node.tag_name().name(), "p" | "div")
+        && !node_text(node).trim().is_empty()
+        && !node.descendants().skip(1).any(|child| {
+            child.is_element()
+                && matches!(
+                    child.tag_name().name(),
+                    "p" | "div" | "table" | "figure" | "img" | "image" | "br"
+                )
+        })
+}
+
 fn annotation(node: Node<'_, '_>, scoped: bool) -> Option<bool> {
     if !matches!(node.tag_name().name(), "p" | "div" | "caption")
         || node.descendants().skip(1).any(|child| {
@@ -143,20 +171,39 @@ impl ReadingIrParser<'_> {
         node: Node<'_, '_>,
         is_note: bool,
     ) -> Vec<TextBlock> {
-        self.queue_node_anchors(node);
-        self.queue_descendant_anchors(node);
+        self.parse_table_annotation_nodes(&[node], is_note)
+    }
+
+    fn parse_table_annotation_nodes(
+        &mut self,
+        nodes: &[Node<'_, '_>],
+        is_note: bool,
+    ) -> Vec<TextBlock> {
+        let node = nodes[0];
         let start = self.blocks.len();
         let style = self.styles.block_style(node, BlockStyle::default());
         let mut collector = InlineCollector::new(false);
-        collect_table_cell_inline(
-            node,
-            self.styles
-                .text_style_for_block(node, TextBlockKind::Caption),
-            None,
-            &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
-                .with_inline_images(true),
-            &mut collector,
-        );
+        for (index, node) in nodes.iter().copied().enumerate() {
+            self.queue_node_anchors(node);
+            self.queue_descendant_anchors(node);
+            if index > 0 {
+                collector.push_text(
+                    " ",
+                    self.styles
+                        .text_style_for_block(node, TextBlockKind::Caption),
+                    None,
+                );
+            }
+            collect_table_cell_inline(
+                node,
+                self.styles
+                    .text_style_for_block(node, TextBlockKind::Caption),
+                None,
+                &InlineParseContext::new(&self.section_href, &self.styles, &self.footnote_links)
+                    .with_inline_images(true),
+                &mut collector,
+            );
+        }
         self.push_collected_text_block(TextBlockKind::Caption, style, collector);
         self.blocks
             .split_off(start)
@@ -189,6 +236,19 @@ impl ReadingIrParser<'_> {
             }
             if let Some(note) = annotation(node, scoped) {
                 before_nodes.push((node, note));
+                index += 1;
+            } else if before_nodes.len() == 1
+                && standalone_table_label(before_nodes[0].0)
+                && standalone_caption_text(node)
+                && nodes[index + 1..]
+                    .iter()
+                    .copied()
+                    .find(|next| !ignorable(*next))
+                    .is_some_and(carrier)
+            {
+                // A separate number, one title paragraph and its media form a
+                // caption group independently of publisher-specific classes.
+                before_nodes.push((node, false));
                 index += 1;
             } else {
                 break;
@@ -245,6 +305,12 @@ impl ReadingIrParser<'_> {
         let mut after = Vec::new();
         let mut parsed = Vec::new();
         let mut passed_media = false;
+        let joined_title = (before_nodes.len() == 2
+            && !before_nodes[0].1
+            && !before_nodes[1].1
+            && standalone_table_label(before_nodes[0].0)
+            && standalone_caption_text(before_nodes[1].0))
+        .then(|| (before_nodes[0].0, before_nodes[1].0));
         for node in nodes[..end].iter().copied() {
             if ignorable(node) {
                 if node.is_element() {
@@ -256,8 +322,33 @@ impl ReadingIrParser<'_> {
                 self.parse_node(media)?;
                 parsed = self.blocks.split_off(start);
                 passed_media = true;
-            } else if let Some(note) = annotation(node, scoped) {
-                let texts = self.parse_table_annotation(node, note);
+            } else if let Some((_, note)) = before_nodes
+                .iter()
+                .chain(&after_nodes)
+                .find(|(candidate, _)| *candidate == node)
+            {
+                if joined_title.is_some_and(|(_, title)| node == title) {
+                    continue;
+                }
+                let texts = if let Some((label, title)) =
+                    joined_title.filter(|(label, _)| *label == node)
+                {
+                    for spacer in nodes
+                        .iter()
+                        .copied()
+                        .skip_while(|node| *node != label)
+                        .skip(1)
+                        .take_while(|node| *node != title)
+                    {
+                        self.queue_node_anchors(spacer);
+                        self.queue_descendant_anchors(spacer);
+                    }
+                    // One semantic caption, with a normal wrapping space rather
+                    // than the paragraph break used by the source document.
+                    self.parse_table_annotation_nodes(&[label, title], false)
+                } else {
+                    self.parse_table_annotation(node, *note)
+                };
                 if passed_media {
                     after.extend(texts);
                 } else {

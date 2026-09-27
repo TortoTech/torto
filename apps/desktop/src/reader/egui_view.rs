@@ -2339,9 +2339,12 @@ impl DesktopReader {
             footnotes.len().saturating_sub(1) as f32 * (item_spacing * 2.0 + separator_spacing);
         let measured_body_height = (measured_text_height + separator_height + 2.0)
             .clamp(body_font.size.max(19.0), maximum_body_height);
-        let panel_height = measured_body_height + 24.0;
+        let height_id = egui::Id::new("focus-footnotes-measured-height");
+        let panel_height = ctx
+            .data_mut(|data| data.get_temp::<f32>(height_id))
+            .unwrap_or(measured_body_height + 24.0);
         let anchor_y = if self.is_focus_mode() {
-            self.focused_unit_screen_center_y(page_rect)
+            self.focused_footnote_screen_center_y(page_rect)
                 .unwrap_or_else(|| page_rect.center().y)
         } else {
             self.classic_footnote_anchor_y
@@ -2400,6 +2403,11 @@ impl DesktopReader {
                     });
                 });
             });
+        let actual_height = overlay.response.rect.height();
+        ctx.data_mut(|data| data.insert_temp(height_id, actual_height));
+        if (actual_height - panel_height).abs() > 0.5 {
+            ctx.request_discard("footnote popup height changed");
+        }
         if self.is_focus_mode() {
             self.classic_footnote_overlay_rect = None;
         } else {
@@ -2677,6 +2685,22 @@ impl DesktopReader {
 
     fn focused_unit_screen_center_y(&self, page_rect: Rect) -> Option<f32> {
         self.focus_unit_screen_center_y_at(self.focus_unit_index, page_rect)
+    }
+
+    fn focused_footnote_screen_center_y(&self, page_rect: Rect) -> Option<f32> {
+        let viewport = self.scroll_viewport?;
+        let unit = self.focus_units.get(self.focus_unit_index)?;
+        let layout = self.scroll_section.as_ref()?;
+        // Navigation includes leading headings; notes belong to the highlighted
+        // body only. Resolve against the current layout after translation or
+        // sentence splitting, rather than reusing the navigation rectangle.
+        let (bounds, _) = super::focus_unit_geometry(layout, &unit.paint_ranges)?;
+        Some(focus_unit_screen_center_y(
+            bounds,
+            viewport.offset_y,
+            self.scroll_content_padding(viewport.size.y),
+            page_rect,
+        ))
     }
 
     fn focus_unit_screen_center_y_at(&self, index: usize, page_rect: Rect) -> Option<f32> {
@@ -4166,6 +4190,18 @@ impl DesktopReader {
                 return false;
             }
         };
+        if let Some(latex) = image.formula.as_deref() {
+            match formula_preview_image(latex) {
+                Ok(image) => {
+                    self.open_color_image_preview(ctx, image, "reader-formula-preview");
+                    if let Some(preview) = &mut self.image_preview {
+                        preview.formula = Some(latex.to_owned());
+                    }
+                }
+                Err(error) => self.error = Some(format!("Formula preview failed: {error}")),
+            }
+            return true;
+        }
         let (Ok(width), Ok(height)) = (usize::try_from(image.width), usize::try_from(image.height))
         else {
             self.error = Some("图片尺寸超出预览范围".into());
@@ -4186,9 +4222,6 @@ impl DesktopReader {
         let color_image =
             egui::ColorImage::from_rgba_unmultiplied([width, height], &image.pixels[..byte_len]);
         self.open_color_image_preview(ctx, color_image, "reader-image-preview");
-        if let Some(preview) = &mut self.image_preview {
-            preview.formula = image.formula;
-        }
         true
     }
 
@@ -4423,15 +4456,8 @@ impl DesktopReader {
         let image_rect = Rect::from_center_size(screen.center() + preview.pan, display_size);
         let texture_id = preview.texture.id();
         let zoom_percent = preview.zoom * 100.0;
-        let interaction = show_image_preview_area(
-            ctx,
-            screen,
-            image_rect,
-            texture_id,
-            zoom_percent,
-            preview.formula.as_deref(),
-            self.language,
-        );
+        let interaction =
+            show_image_preview_area(ctx, screen, image_rect, texture_id, zoom_percent);
         close |= interaction.close;
 
         if interaction.reset {
@@ -5516,14 +5542,45 @@ struct ImagePreviewInteraction {
     drag_delta: Vec2,
 }
 
+fn formula_preview_image(latex: &str) -> Result<egui::ColorImage, String> {
+    let rendered = rebook_math::math::render_math(latex, 32.0, "#000000", true)?;
+    let padding = 12.0;
+    let width = rendered.width + padding * 2.0;
+    let height = rendered.ascent + rendered.descent + padding * 2.0;
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return Err("Invalid formula dimensions".into());
+    }
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}"><g transform="translate({padding} {})">{}</g></svg>"#,
+        padding + rendered.ascent,
+        rendered.svg_fragment
+    );
+    let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default())
+        .map_err(|error| error.to_string())?;
+    let scale = (4096.0 / width.max(height)).min(2.0);
+    let mut pixels = resvg::tiny_skia::Pixmap::new(
+        (width * scale).ceil().max(1.0) as u32,
+        (height * scale).ceil().max(1.0) as u32,
+    )
+    .ok_or("Formula preview is too large")?;
+    pixels.fill(resvg::tiny_skia::Color::WHITE);
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixels.as_mut(),
+    );
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [pixels.width() as usize, pixels.height() as usize],
+        pixels.data(),
+    ))
+}
+
 fn show_image_preview_area(
     ctx: &egui::Context,
     screen: Rect,
     image_rect: Rect,
     texture_id: TextureId,
     zoom_percent: f32,
-    formula: Option<&str>,
-    language: AppLanguage,
 ) -> ImagePreviewInteraction {
     let mut interaction = ImagePreviewInteraction {
         close: false,
@@ -5576,18 +5633,6 @@ fn show_image_preview_area(
                 egui::FontId::monospace(crate::ui::scaled_font_size(12.0)),
                 Color32::WHITE,
             );
-            if let Some(latex) = formula {
-                let button = ui.put(
-                    Rect::from_min_size(
-                        egui::pos2(screen.left() + 16.0, screen.top() + 16.0),
-                        egui::vec2(140.0, 30.0),
-                    ),
-                    egui::Button::new(language.text("复制公式", "Copy LaTeX")),
-                );
-                if button.clicked() {
-                    ctx.copy_text(latex.to_owned());
-                }
-            }
             if backdrop.clicked()
                 && backdrop
                     .interact_pointer_pos()
@@ -5749,6 +5794,63 @@ fn page_wheel_input_allowed(pointer_over_page: bool, blocked: bool) -> bool {
 mod reference_suggestion_label_tests {
     use super::*;
     use rebook_layout::ReaderStyle;
+
+    #[test]
+    fn footnote_center_tracks_translated_and_split_body_geometry() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let page = Rect::from_min_size(egui::pos2(40.0, 30.0), egui::vec2(800.0, 600.0));
+        let mut heights = Vec::new();
+        for stage in 0..3 {
+            if stage == 1 {
+                reader.translation_source.set_enabled(true).unwrap();
+                reader
+                    .translation_source
+                    .set_mode(crate::plugins::TranslationMode::Replace)
+                    .unwrap();
+                reader.translation_source.store_batch(0, &[crate::plugins::BlockTranslation { block_index: 0, segment_index: None, text: "Translated text changes paragraph height. A second sentence can be split.".into() }]).unwrap();
+                reader.refresh_translation_view();
+            } else if stage == 2 {
+                reader.toggle_current_focus_structure();
+            }
+            let layout = reader.current_scroll_layout().unwrap();
+            reader.rebuild_focus_units(&layout);
+            reader.scroll_viewport = Some(super::super::ScrollViewportState {
+                size: page.size(),
+                offset_y: 80.0,
+            });
+            let unit = &reader.focus_units[reader.focus_unit_index];
+            let (body, _) = super::super::focus_unit_geometry(&layout, &unit.paint_ranges).unwrap();
+            heights.push(body.height());
+            // Navigation may include a preceding heading, or have been cached
+            // before a reflow. Neither should change the popup's body anchor.
+            reader.focus_units[reader.focus_unit_index].rect.min.y -= 200.0;
+            let expected =
+                focus_unit_screen_center_y(body, 80.0, reader.scroll_content_padding(600.0), page);
+            assert!(
+                (reader.focused_footnote_screen_center_y(page).unwrap() - expected).abs() < 0.01
+            );
+        }
+        assert!(heights[1] < heights[0], "{heights:?}");
+        assert!(heights[2] != heights[0], "{heights:?}");
+    }
+
+    #[test]
+    fn formula_preview_renders_latex_with_paper_and_padding() {
+        let image = formula_preview_image(r"\frac{x^2}{y} = 1").unwrap();
+        assert!(image.size[0] > 48 && image.size[1] > 48);
+        assert!(image.pixels.iter().any(|pixel| pixel.r() < 128));
+        assert!(image.pixels.iter().all(|pixel| pixel.a() == 255));
+        assert!(
+            image.pixels[..image.size[0]]
+                .iter()
+                .all(|pixel| *pixel == egui::Color32::WHITE)
+        );
+        assert!(
+            image.pixels[image.pixels.len() - image.size[0]..]
+                .iter()
+                .all(|pixel| *pixel == egui::Color32::WHITE)
+        );
+    }
 
     #[test]
     fn popup_side_bounds_never_move_back_over_body() {

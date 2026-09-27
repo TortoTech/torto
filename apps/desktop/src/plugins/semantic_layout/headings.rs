@@ -14,7 +14,22 @@ pub(super) fn number(block: &Block) -> Option<u32> {
     number.parse().ok().filter(|number| *number > 0)
 }
 
-// Eligibility only; short prose also reaches the model for contextual rejection.
+fn numbered_prefix(value: &str) -> bool {
+    static PREFIX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"^(?:",
+            r"[0-9０-９]{1,4}(?:[.．][0-9０-９]{1,4})*(?:\s|[.)．）、:：]|\p{Han})",
+            r"|[（(][0-9０-９]{1,4}(?:[.．][0-9０-９]{1,4})*[）)]",
+            r"|(?i:chapter|part|section|book|volume|chap\.|sec\.|vol\.)\s+",
+            r"(?:[0-9０-９]{1,4}(?:[.．][0-9０-９]{1,4})*|(?i:[ivxlcdm]+))(?:$|\s|[.:：、)）-])",
+            r"|第[零〇一二三四五六七八九十百千两0-9０-９]+[章节篇部卷回])"
+        ))
+        .expect("heading prefix regex")
+    });
+    PREFIX.is_match(value)
+}
+
+// Eligibility only: numbered prose still needs contextual rejection by the model.
 pub(super) fn candidate(block: &Block) -> Option<()> {
     let numeric = number(block).is_some();
     let block = paragraph(block)?;
@@ -33,7 +48,17 @@ pub(super) fn candidate(block: &Block) -> Option<()> {
     }) {
         return None;
     }
-    (value.chars().any(char::is_alphabetic) || numeric).then_some(())
+    (numeric || (numbered_prefix(value) && value.chars().any(char::is_alphabetic))).then_some(())
+}
+
+pub(super) fn annotation_eligible(section: &Section, annotation: &Annotation) -> bool {
+    match annotation {
+        Annotation::SectionHeading { source: range } => section
+            .blocks
+            .iter()
+            .any(|block| source(block) == Some(range) && candidate(block).is_some()),
+        _ => true,
+    }
 }
 
 pub(super) fn style(block: &TextBlock) -> Value {

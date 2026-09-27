@@ -41,6 +41,9 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
     let preserved = reference.and_then(|(original, original_text)| {
         preserve_sentence_prefix(layout, text, original, original_text, column_width)
     });
+    // Prefix preservation rewraps the remaining sentences. Enforce reference
+    // attachment on those final breaks as well, including translated prose.
+    repair_trailing_footnote_line(layout, text, column_width);
     layout.align(
         parley::Alignment::Start,
         parley::AlignmentOptions::default(),
@@ -1054,6 +1057,48 @@ mod tests {
             repair_trailing_footnote_line(&mut layout, &text, 240.0);
             let tail = layout.get(layout.len() - 1).unwrap().text_range();
             assert!(text[tail].starts_with("word"));
+        }
+    }
+
+    #[test]
+    fn translated_sentence_prefix_keeps_references_with_prose() {
+        let prefix = "为了实现预测输入系统，系统需要词典。";
+        let body = "针对这些情况，已有文献报道了高级数据结构，特别是用于预测输入的词典数据结构";
+        for marker in ["1", "[1]", "[1][2]"] {
+            let text = format!("{prefix}\n{body}{marker}。");
+            let original_text = text.replace('\n', "");
+            let marker_start = prefix.len() + 1 + body.len();
+            let mut fonts = FontContext::new();
+            let mut context = LayoutContext::<TextBrush>::new();
+            let mut builder = context.ranged_builder(&mut fonts, &text, 1.0, false);
+            builder.push_default(StyleProperty::FontSize(18.0));
+            builder.push(
+                StyleProperty::Brush(TextBrush {
+                    footnote_reference: true,
+                    ..Default::default()
+                }),
+                marker_start..marker_start + marker.len(),
+            );
+            let mut layout = builder.build(&text);
+            let mut original = layout_for(&original_text, 18.0);
+            for width in 140..600 {
+                original.break_all_lines(Some(width as f32));
+                let plan = plan_wrapped_with_sentence_prefix(
+                    &mut layout,
+                    &text,
+                    width as f32,
+                    Some((&original, &original_text)),
+                    true,
+                )
+                .unwrap();
+                assert!(!plan.lines.is_empty());
+                let tail = layout.get(layout.len() - 1).unwrap().text_range();
+                assert!(
+                    tail.start < marker_start,
+                    "orphan at {width}: {}",
+                    &text[tail]
+                );
+            }
         }
     }
 

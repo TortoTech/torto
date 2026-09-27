@@ -20,6 +20,100 @@ fn parse(body: &str) -> Section {
 const GRID: &str = "<table><tr><td>Value</td><td>42</td></tr></table>";
 
 #[test]
+fn split_table_number_and_title_in_pagination_wrapper_are_captions() {
+    let title =
+        "Relationship between random and control variables and internal and external validity.";
+    let section = parse(&format!(
+        "<div class='pageavoid' id='cetable1'><p class='tnum'>TABLE 4.1</p><p class='ttitle'><a id='cecap14'></a><a id='spara14'></a>{title}</p>{GRID}</div><p>Following discussion.</p>"
+    ));
+    let [Block::Table(table), Block::Text(_)] = &section.blocks[..] else {
+        panic!("{:?}", section.blocks)
+    };
+    assert_eq!(table.before.len(), 1);
+    for (caption, expected) in table.before.iter().zip([format!("TABLE 4.1 {title}")]) {
+        assert_eq!(caption.kind, TextBlockKind::Caption);
+        assert!(caption.source.is_some());
+        let text: String = caption
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => Some(run.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, expected);
+    }
+    assert!(table.after.is_empty());
+    assert_eq!(section.anchors.len(), 3);
+    let source = table.before[0].source.as_ref().unwrap();
+    assert!(
+        section
+            .anchors
+            .iter()
+            .all(|anchor| anchor.source == source.start)
+    );
+    assert_eq!(
+        source.end.text_offset,
+        format!("TABLE 4.1 {title}").chars().count() as u64
+    );
+    assert!(
+        !table.before[0]
+            .content
+            .iter()
+            .any(|inline| matches!(inline, Inline::Break))
+    );
+}
+
+#[test]
+fn pagination_wrapper_does_not_make_prose_a_table_caption() {
+    for class in ["", "title", "ttitle-extra"] {
+        let section = parse(&format!(
+            "<div class='pageavoid'><p>TABLE 4.1</p><p class='{class}'>Ordinary discussion.</p><p>Another paragraph.</p>{GRID}</div>"
+        ));
+        let [
+            Block::Text(_),
+            Block::Text(_),
+            Block::Text(_),
+            Block::Table(table),
+        ] = &section.blocks[..]
+        else {
+            panic!("{:?}", section.blocks)
+        };
+        assert!(table.before.is_empty());
+        assert!(table.after.is_empty());
+    }
+}
+
+#[test]
+fn split_caption_structure_needs_no_publisher_classes() {
+    for label in ["TABLE 4.1", "表 4.1"] {
+        for media in [GRID, "<p><img src='table.png'/></p>"] {
+            let section = parse(&format!(
+                "<p>{label}</p><!-- spacer --><a id='title'/><p><b>Relationship between variables.</b></p>{media}"
+            ));
+            let captions = match &section.blocks[..] {
+                [Block::Table(table)] => &table.before,
+                [Block::Figure(figure)] => &figure.captions,
+                _ => panic!("{:?}", section.blocks),
+            };
+            assert_eq!(captions.len(), 1);
+            assert!(captions[0].content.iter().any(|inline| matches!(inline, Inline::Text(run) if run.style.bold && run.text.contains("Relationship"))));
+            assert_eq!(
+                section.anchors[0].source,
+                captions[0].source.as_ref().unwrap().start
+            );
+        }
+    }
+    let section = parse(&format!(
+        "<p>Table 4.1 shows the results.</p><p>Discussion.</p>{GRID}"
+    ));
+    assert!(matches!(
+        section.blocks.as_slice(),
+        [Block::Text(_), Block::Text(_), Block::Table(_)]
+    ));
+}
+
+#[test]
 fn imported_nested_document_wrapper_keeps_grid_and_chinese_caption() {
     let section = parse(&format!(
         "<section><p>表 7-1 三个阶段的特点</p><html><head/><body>{GRID}</body></html><p>Following prose.</p></section>"
@@ -42,14 +136,14 @@ fn ambiguous_label_between_unscoped_grids_stays_independent() {
 
 #[test]
 fn explicit_table_caption_class_works_for_grids_and_images() {
-    for media in [GRID, "<img src='table.png'/>"] {
-        let section = parse(&format!(
-            "<p class='table-caption'>Measured results</p>{media}"
-        ));
-        assert!(matches!(
-            section.blocks.as_slice(),
-            [Block::Table(_) | Block::Figure(_)]
-        ));
+    for class in ["table-caption", "table-title"] {
+        for media in [GRID, "<img src='table.png'/>"] {
+            let section = parse(&format!("<p class='{class}'>Measured results</p>{media}"));
+            assert!(matches!(
+                section.blocks.as_slice(),
+                [Block::Table(_) | Block::Figure(_)]
+            ));
+        }
     }
 }
 

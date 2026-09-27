@@ -2391,7 +2391,9 @@ impl DesktopReader {
             // not replace it with the ordinary paragraph's green activation fill.
             let preserve_quote_background = matches!(block, Block::Quote(_))
                 || matches!(block, Block::Text(text) if text.kind == TextBlockKind::Blockquote);
+            let formula_block = is_image && matches!(block, Block::Text(_));
             let structured_activation = !preserve_quote_background
+                && !formula_block
                 && structure_ranges.iter().any(|range| {
                     self.structure_source
                         .is_structured(&crate::plugins::ParagraphStructureKey {
@@ -2449,6 +2451,7 @@ impl DesktopReader {
             let target_reached = first_unit_after_anchor.is_none()
                 && focus_block_index.is_some_and(|target| block_index >= target);
             let single_image = matches!(block, Block::Image(image) if image.text_layer.is_none())
+                || formula_block
                 || matches!(block, Block::Figure(figure) if figure.images.len() == 1);
             let image_rect = single_image
                 .then(|| single_focus_image_rect(layout, &paint_ranges))

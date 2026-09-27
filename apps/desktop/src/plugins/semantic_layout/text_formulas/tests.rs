@@ -2,6 +2,175 @@ use super::*;
 use crate::plugins::semantic_layout::tests::{original_source, section, text};
 use crate::plugins::{BlockTranslation, TranslationBookSource, TranslationMode};
 
+#[test]
+fn hmm_book_formula_quotes_become_display_formulas_and_restore_when_disabled() {
+    let descriptor = rebook_publication::SpineItem {
+        id: rebook_publication::SpineItemId::new("chapter").unwrap(),
+        href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+        media_type: "application/xhtml+xml".into(),
+        linear: true,
+        properties: vec![],
+    };
+    // Text Entry Systems, formula15 / formula16: centered text formulas, not images.
+    let original = rebook_html::parse_section(r#"<html><head><style>
+        .fig {margin-top:2em;margin-bottom:0.5em;padding-left:5px;padding-right:5px;padding-top:5px;text-align:center}
+        </style></head><body>
+        <p class="fig"><a id="formula15"/><em>P</em>(article | prep)<em>P</em>(“the” | article)<em>P</em>(noun | article)<em>P</em>(“sky” | noun),</p>
+        <p>whereas that of “tie sly” is obtained by</p>
+        <p class="fig"><a id="formula16"/><em>P</em>(verb | prep) <em>P</em>(“tie” | verb) <em>P</em>(adjective | verb) <em>P</em>(“sly” | adjective) + <em>P</em>(noun | prep) <em>P</em>(“tie” | noun) <em>P</em>(adjective | noun) <em>P</em>(“sly” | adjective),</p>
+        </body></html>"#, &descriptor, |_| None).unwrap();
+    let latex = [
+        r"P(\mathrm{article}\mid\mathrm{prep})P(\text{the}\mid\mathrm{article})P(\mathrm{noun}\mid\mathrm{article})P(\text{sky}\mid\mathrm{noun})",
+        r"P(\mathrm{verb}\mid\mathrm{prep})P(\text{tie}\mid\mathrm{verb})P(\mathrm{adjective}\mid\mathrm{verb})P(\text{sly}\mid\mathrm{adjective})+P(\mathrm{noun}\mid\mathrm{prep})P(\text{tie}\mid\mathrm{noun})P(\mathrm{adjective}\mid\mathrm{noun})P(\text{sly}\mid\mathrm{adjective})",
+    ];
+    let mut proposals = Vec::new();
+    let mut originals = Vec::new();
+    for (block, latex) in [0, 2].into_iter().zip(latex) {
+        let Block::Quote(q) = &original.blocks[block] else {
+            panic!("fixture should reproduce quote inference")
+        };
+        originals.push(q.body[0].clone());
+        proposals.push(Proposal {
+            block,
+            paragraph: 0,
+            original: encode(&q.body[0]).value.trim_end_matches(',').into(),
+            latex: latex.into(),
+            before: String::new(),
+            after: ",".into(),
+        });
+    }
+    let (annotations, skipped) = resolve(&original, 0..original.blocks.len(), &proposals);
+    assert_eq!(skipped, 0);
+    assert_eq!(annotations.len(), 2);
+    let source = original_source(original.clone());
+    let overlay = SemanticLayoutSource::new(source.clone(), source);
+    assert!(overlay.install(
+        0,
+        Recognition {
+            fingerprint: fingerprint(&original),
+            annotations,
+            formulas_checked: true,
+            skipped_groups: 0
+        }
+    ));
+    let displayed = overlay.parse_section(0).unwrap();
+    let mut engine = rebook_layout::LayoutEngine::new();
+    let layout = engine
+        .layout_blocks(
+            &overlay,
+            &displayed.blocks,
+            rebook_layout::LayoutViewport::new(800, 1200).unwrap(),
+            &rebook_layout::ReaderStyle {
+                typesetting: rebook_layout::ReaderTypesetting::unified(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        !layout
+            .pages
+            .iter()
+            .flat_map(|p| &p.items)
+            .any(|item| matches!(item, rebook_layout::PageItem::Quote(_)))
+    );
+    let rendered_formulas = layout
+        .pages
+        .iter()
+        .flat_map(|p| &p.items)
+        .filter_map(|item| {
+            if let rebook_layout::PageItem::Text(t) = item {
+                Some(t.inline_images.len())
+            } else {
+                None
+            }
+        })
+        .sum::<usize>();
+    assert_eq!(rendered_formulas, 2);
+    for (index, original) in [0, 2].into_iter().zip(originals) {
+        let Block::Text(t) = &displayed.blocks[index] else {
+            panic!("quote wrapper remains")
+        };
+        assert_eq!(t.kind, TextBlockKind::Paragraph);
+        assert_eq!(t.source, original.source);
+        assert!(rebook_layout::is_display_formula(t));
+        let bounds = layout
+            .pages
+            .iter()
+            .flat_map(|page| {
+                rebook_renderer::DisplayListCompiler
+                    .compile(page)
+                    .image_source_rects(std::slice::from_ref(t.source.as_ref().unwrap()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bounds.len(),
+            1,
+            "text formula must expose a single image activation outline"
+        );
+        assert!(bounds[0].width() > 0.0 && bounds[0].height() > 0.0);
+        let [Inline::Math(math)] = t.content.as_slice() else {
+            panic!()
+        };
+        assert!(math.display);
+        assert!(math.latex.ends_with(r"\text{,}"));
+        assert_eq!(math.original_text().unwrap(), text_block_text(&original));
+    }
+    let mut settings = PluginSettings::default();
+    settings.semantic_layout.enabled = false;
+    overlay.configure("formula-quotes", &settings);
+    assert_eq!(overlay.parse_section(0).unwrap().blocks, original.blocks);
+}
+
+#[test]
+fn formula_quote_conversion_is_atomic_and_preserves_prose_and_attribution() {
+    let Block::Text(mut body) = text("formula", "x=y,") else {
+        panic!()
+    };
+    apply(
+        &mut body,
+        &[Span {
+            start: 0,
+            end: 3,
+            original: "x=y".into(),
+            latex: "x=y".into(),
+        }],
+    );
+    let Block::Text(prose) = text("prose", "An explanation.") else {
+        panic!()
+    };
+    for quote in [
+        QuoteBlock {
+            body: vec![body.clone(), prose.clone()],
+            attribution: None,
+            source: None,
+        },
+        QuoteBlock {
+            body: vec![body.clone()],
+            attribution: Some(prose),
+            source: None,
+        },
+    ] {
+        let mut blocks = vec![Block::Quote(quote.clone())];
+        normalize_formula_quotes(&mut blocks);
+        assert_eq!(blocks, vec![Block::Quote(quote)]);
+    }
+    let mut blocks = vec![Block::Quote(QuoteBlock {
+        body: vec![body.clone(), body],
+        attribution: None,
+        source: None,
+    })];
+    normalize_formula_quotes(&mut blocks);
+    assert_eq!(blocks.len(), 2);
+    assert!(
+        blocks
+            .iter()
+            .all(|b| matches!(b, Block::Text(t) if rebook_layout::is_display_formula(t)))
+    );
+    let once = blocks.clone();
+    normalize_formula_quotes(&mut blocks);
+    assert_eq!(blocks, once);
+}
+
 fn formula_section() -> Section {
     let Block::Text(mut block) = text("p", "Relation: N ~ I0.301 continues.") else {
         panic!()

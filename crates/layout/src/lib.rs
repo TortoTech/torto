@@ -51,8 +51,8 @@ pub fn paragraph_footnotes(block: &TextBlock) -> Vec<Range<usize>> {
     result
 }
 
-/// Whether a paragraph consists only of a recognized formula image and an
-/// optional equation number, rendered as one display formula in unified mode.
+/// Whether a paragraph consists only of a recognized formula image or a
+/// numbered image, rendered as one display row in unified mode.
 pub fn is_display_formula(block: &rebook_publication::TextBlock) -> bool {
     formula_images::only_formula(block).is_some()
         || matches!(block.content.as_slice(),[Inline::Math(run)] if run.original.is_some() && run.display)
@@ -1333,6 +1333,7 @@ impl LayoutEngine {
                             &run.image,
                             block.source.clone(),
                             number.as_deref(),
+                            Some(run),
                             reader_style,
                             content_width,
                         )?
@@ -1541,6 +1542,7 @@ impl LayoutEngine {
                             source,
                             image,
                             image.source.clone(),
+                            None,
                             None,
                             reader_style,
                             content_width,
@@ -1999,6 +2001,7 @@ impl LayoutEngine {
             .min(equal_column_width)
             .max(1.0);
         let mut preferred_widths = vec![minimum_column_width; column_count];
+        let mut minimum_widths = vec![minimum_column_width; column_count];
         for (_, _, column, column_span, cell) in grid_cells {
             let block = table_cell_text_block(cell);
             let block = resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
@@ -2009,6 +2012,20 @@ impl LayoutEngine {
                 + inline_slack)
                 .clamp(minimum_column_width, content_width);
             let range = *column..(*column + *column_span);
+            // The shared three-em floor is not enough for an unbreakable word
+            // (especially a bold header). Reserve its measured width and padding
+            // before distributing the remaining space to wrapping prose.
+            let minimum = (unwrapped.layout.calculate_content_widths().min.ceil()
+                + table_metrics.cell_padding * 2.0
+                + inline_slack)
+                .clamp(minimum_column_width, content_width);
+            let current_minimum = minimum_widths[range.clone()].iter().sum::<f32>();
+            if minimum > current_minimum {
+                let addition = (minimum - current_minimum) / *column_span as f32;
+                for width in &mut minimum_widths[range.clone()] {
+                    *width += addition;
+                }
+            }
             let current = preferred_widths[range.clone()].iter().sum::<f32>();
             if preferred > current {
                 let addition = (preferred - current) / *column_span as f32;
@@ -2017,7 +2034,7 @@ impl LayoutEngine {
                 }
             }
         }
-        fit_adaptive_column_widths(&preferred_widths, minimum_column_width, content_width)
+        fit_adaptive_column_widths(&preferred_widths, &minimum_widths, content_width)
     }
 
     fn shape_text_with_min_width(
@@ -2296,6 +2313,14 @@ impl LayoutEngine {
             text_alignment(block.style.align)
         };
         layout.align(alignment, AlignmentOptions::default());
+        if !inline_images.is_empty() {
+            layout.reserve_inline_box_paint_bounds(
+                &inline_images
+                    .iter()
+                    .map(|image| (image.id, image.offset_y, image.height))
+                    .collect::<Vec<_>>(),
+            );
+        }
         PreparedText {
             citations: citations.into(),
             layout: Arc::new(layout),
@@ -3383,7 +3408,7 @@ struct PreparedTableCell {
 )]
 fn fit_adaptive_column_widths(
     preferred_widths: &[f32],
-    minimum_width: f32,
+    minimum_widths: &[f32],
     available_width: f32,
 ) -> Vec<f32> {
     if preferred_widths.is_empty() || available_width <= 0.0 {
@@ -3391,15 +3416,19 @@ fn fit_adaptive_column_widths(
     }
     let column_count = preferred_widths.len();
     let equal_width = available_width / column_count as f32;
-    let minimum_width = minimum_width.min(equal_width).max(1.0);
-    let minimum_total = minimum_width * column_count as f32;
+    let minimum = minimum_widths
+        .iter()
+        .map(|width| width.max(1.0))
+        .collect::<Vec<_>>();
+    let minimum_total = minimum.iter().sum::<f32>();
     if minimum_total >= available_width {
         return vec![equal_width; column_count];
     }
 
     let preferred = preferred_widths
         .iter()
-        .map(|width| width.max(minimum_width))
+        .zip(&minimum)
+        .map(|(width, minimum)| width.max(*minimum))
         .collect::<Vec<_>>();
     let preferred_total = preferred.iter().sum::<f32>();
     if preferred_total <= available_width {
@@ -3409,13 +3438,14 @@ fn fit_adaptive_column_widths(
         let available_flex = available_width - minimum_total;
         let preferred_flex = preferred
             .iter()
-            .map(|width| width - minimum_width)
+            .zip(&minimum)
+            .map(|(width, minimum)| width - minimum)
             .sum::<f32>();
         preferred
             .iter()
-            .map(|width| {
-                minimum_width
-                    + available_flex * ((*width - minimum_width) / preferred_flex.max(1.0))
+            .zip(&minimum)
+            .map(|(width, minimum)| {
+                minimum + available_flex * ((*width - minimum) / preferred_flex.max(1.0))
             })
             .collect::<Vec<_>>()
     };
@@ -5364,6 +5394,121 @@ mod tests {
     }
 
     #[test]
+    fn mixed_inline_images_fit_line_bounds_and_do_not_overlap_following_lines() {
+        let mut engine = LayoutEngine::new();
+        let text = |value: &str| {
+            Inline::Text(TextRun {
+                text: value.into(),
+                style: Default::default(),
+                link: None,
+            })
+        };
+        for alignment in [
+            InlineImageAlignment::Baseline,
+            InlineImageAlignment::Middle,
+            InlineImageAlignment::TextTop,
+            InlineImageAlignment::TextBottom,
+            InlineImageAlignment::Super,
+            InlineImageAlignment::Sub,
+        ] {
+            for size in [18.0, 32.0] {
+                for width in [180.0, 480.0] {
+                    let image = Inline::Image(Box::new(rebook_publication::InlineImageRun {
+                        image: ImageBlock {
+                            formula_image: false,
+                            formula: None,
+                            href: PublicationUrl::parse("image.png").unwrap(),
+                            alt: String::new(),
+                            style: Default::default(),
+                            source: None,
+                            text_layer: None,
+                        },
+                        size_scale: 1.0,
+                        intrinsic_sizing: true,
+                        vertical_align: alignment,
+                        presentation: false,
+                    }));
+                    let block = TextBlock {
+                        kind: TextBlockKind::Paragraph,
+                        content: vec![
+                            text("Before "),
+                            image.clone(),
+                            text(" beside "),
+                            image,
+                            text(
+                                " after the image and more ordinary prose wrapping onto the following line.",
+                            ),
+                            Inline::Break,
+                            text("A sentence after an explicit break."),
+                        ],
+                        style: Default::default(),
+                        source: None,
+                    };
+                    let raster = RasterImage {
+                        width: 40,
+                        height: 80,
+                        pixels: vec![255; 40 * 80 * 4].into(),
+                    };
+                    let mut style = ReaderStyle::default();
+                    style.typography.font_size = size;
+                    let prepared = engine.shape_text_with_min_width_and_rasters(
+                        &block,
+                        &style,
+                        width,
+                        1.0,
+                        &[
+                            None,
+                            Some(raster.clone()),
+                            None,
+                            Some(raster),
+                            None,
+                            None,
+                            None,
+                        ],
+                    );
+                    assert_eq!(prepared.inline_images.len(), 2);
+                    for (index, line) in prepared.layout.lines().enumerate() {
+                        let m = line.metrics();
+                        let bottom = m.block_max_coord.max(m.block_min_coord + m.line_height);
+                        for item in line.items() {
+                            if let parley::PositionedLayoutItem::InlineBox(item) = item {
+                                let image = prepared
+                                    .inline_images
+                                    .iter()
+                                    .find(|image| image.id == item.id)
+                                    .unwrap();
+                                let top = item.y + image.offset_y;
+                                assert!(top >= m.block_min_coord - 0.01);
+                                assert!(
+                                    top + image.height <= bottom + 0.01,
+                                    "overflow: {alignment:?}, size={size}, width={width}"
+                                );
+                                if let Some(next) = prepared.layout.get(index + 1) {
+                                    assert!(
+                                        top + image.height <= next.metrics().block_min_coord + 0.01
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let mut again = (*prepared.layout).clone();
+                    again.reserve_inline_box_paint_bounds(
+                        &prepared
+                            .inline_images
+                            .iter()
+                            .map(|image| (image.id, image.offset_y, image.height))
+                            .collect::<Vec<_>>(),
+                    );
+                    assert!(
+                        (again.height() - prepared.layout.height()).abs() < 0.01,
+                        "must be idempotent"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn prepares_semantic_inline_images_at_their_text_position() {
         let block = TextBlock {
             kind: TextBlockKind::Heading(1),
@@ -6091,7 +6236,7 @@ mod tests {
 
     #[test]
     fn adaptive_table_widths_preserve_the_available_measure() {
-        let widths = fit_adaptive_column_widths(&[50.0, 200.0], 40.0, 300.0);
+        let widths = fit_adaptive_column_widths(&[50.0, 200.0], &[40.0, 40.0], 300.0);
         assert_eq!(widths.len(), 2);
         assert!(widths[0] < widths[1]);
         assert!((widths.iter().sum::<f32>() - 250.0).abs() < 0.001);
@@ -6210,6 +6355,91 @@ mod tests {
             table.cells.iter().all(|cell| cell.text.layout.len() == 1),
             "short table cells should remain unwrapped"
         );
+    }
+
+    #[test]
+    fn table_label_column_reserves_word_width_and_padding() {
+        let cell = |text: &str, header| TableCell {
+            text: TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            },
+            authored_alignment: Some(TextAlignment::Start),
+            column_span: 1,
+            row_span: 1,
+            header,
+        };
+        let table = TableBlock {
+            before: Vec::new(),
+            after: Vec::new(),
+            source: None,
+            rows: vec![
+                TableRow {
+                    cells: vec![
+                        cell("Variable", true),
+                        cell("Advantage", true),
+                        cell("Disadvantage", true),
+                    ],
+                },
+                TableRow {
+                    cells: vec![
+                        cell("Random", false),
+                        cell(
+                            "Improves external validity by using typical situations and people",
+                            false,
+                        ),
+                        cell(
+                            "Compromises internal validity by introducing additional variability in the measured behaviors",
+                            false,
+                        ),
+                    ],
+                },
+                TableRow {
+                    cells: vec![
+                        cell("Control", false),
+                        cell(
+                            "Improves internal validity since differences in measured behaviors are more likely due to the test conditions",
+                            false,
+                        ),
+                        cell(
+                            "Compromises external validity by limiting responses to a specific circumstance or type of person",
+                            false,
+                        ),
+                    ],
+                },
+            ],
+        };
+        let mut engine = LayoutEngine::new();
+        for size in [16.0, 24.0, 32.0] {
+            let mut style = ReaderStyle {
+                typesetting: ReaderTypesetting::unified(),
+                ..ReaderStyle::default()
+            };
+            style.typography.font_size = size;
+            for width in [size * 30.0, size * 42.0] {
+                let prepared = engine.shape_table(&table, &style, width);
+                assert!(prepared.column_widths.iter().sum::<f32>() <= width + 0.1);
+                for cell in &prepared.cells {
+                    let usable = prepared.column_widths[cell.column] - prepared.cell_padding * 2.0;
+                    assert!(
+                        cell.text.layout.width() <= usable + 0.1,
+                        "column {} paints {} into {} at size {size}, width {width}",
+                        cell.column,
+                        cell.text.layout.width(),
+                        usable
+                    );
+                    if cell.column == 0 {
+                        assert_eq!(cell.text.layout.len(), 1);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

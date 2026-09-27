@@ -17,14 +17,13 @@ formatting, not word or expression boundaries. For quotation credits, copy visib
 text without formatting tags; for formulas, copy the exact formatted substring.
 
 ## Headings
-Recognize ordinary paragraphs acting as section titles: textual titles, numbered
-titles and standalone numbers. Return `section_heading` with an ID from
+Recognize numbered section titles and standalone section numbers only among ordinary
+paragraphs in the eligible IDs. Return `section_heading` with an ID from
 `targets.classify_headings`. Eligibility is NOT evidence of heading status.
 Read both adjacent paragraphs. Original `style` summarizes bold/italic ratios,
 relative font size, alignment and spacing; these support a decision but are neither required nor
 sufficient. Do not promote an emphasized sentence solely because it is bold,
-short, centered or isolated. Questions can be titles when the next passage answers
-them as a new topic. Preserve the title verbatim; do not infer heading levels.
+short, centered or isolated. Preserve the title verbatim; do not infer heading levels.
 Exclude TOC/index entries, running headers, page numbers, list/exercise items,
 figure/table captions, quotation credits, and ordinary prose or dialogue.
 For standalone numbers, inspect topic transitions and the bounded

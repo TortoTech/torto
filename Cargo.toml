@@ -122,6 +122,7 @@ debug = 1
 strip = "none"
 
 [patch.crates-io]
+parley = { path = "third_party/parley" }
 egui = { path = "third_party/egui" }
 egui-wgpu = { path = "third_party/egui-wgpu" }
 egui_commonmark = { path = "third_party/egui_commonmark" }

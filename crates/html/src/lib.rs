@@ -655,7 +655,7 @@ impl<'a> ReadingIrParser<'a> {
                 pending_stanza_break = Some(body.len() - 1);
                 continue;
             }
-            if !is_quote_text_candidate(node) {
+            if !is_quote_text_candidate(node) || is_numbered_media_paragraph(node) {
                 break;
             }
 
@@ -744,6 +744,7 @@ impl<'a> ReadingIrParser<'a> {
             if !(node.tag_name().name().eq_ignore_ascii_case("p")
                 || node.tag_name().name().eq_ignore_ascii_case("div"))
                 || !node_has_visible_text(node)
+                || is_numbered_media_paragraph(node)
                 || node.descendants().skip(1).any(|child| {
                     if !child.is_element() {
                         return false;
@@ -829,6 +830,7 @@ impl<'a> ReadingIrParser<'a> {
             }
             "p" => {
                 if (!has_descendant_image(node) || node_has_visible_text(node))
+                    && !is_numbered_media_paragraph(node)
                     && self.styles.has_standalone_quote_layout(node)
                     && (has_quote_semantic_word(node)
                         || self.styles.has_distinct_quote_typography(node))
@@ -1040,9 +1042,9 @@ impl<'a> ReadingIrParser<'a> {
             || container.children().any(|child| {
                 child.is_text() && child.text().is_some_and(|text| !text.trim().is_empty())
             })
-            || children
-                .iter()
-                .any(|child| !is_quote_text_candidate(*child))
+            || children.iter().any(|child| {
+                !is_quote_text_candidate(*child) || is_numbered_media_paragraph(*child)
+            })
         {
             return Ok(false);
         }
@@ -2718,6 +2720,34 @@ fn is_generic_block_container(name: &str) -> bool {
     )
 }
 
+// An equation number is a media label, not prose evidence for quote inference.
+// Explicit blockquotes still retain their authored semantics and media.
+fn is_numbered_media_paragraph(node: Node<'_, '_>) -> bool {
+    if !has_descendant_image(node) {
+        return false;
+    }
+    let text = node
+        .descendants()
+        .filter(Node::is_text)
+        .filter_map(|node| node.text())
+        .collect::<String>();
+    let text = text.trim();
+    if text.is_empty() {
+        return true;
+    }
+    let number = text
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .or_else(|| text.strip_prefix('（').and_then(|s| s.strip_suffix('）')));
+    number.is_some_and(|number| {
+        !number.is_empty()
+            && number.len() <= 24
+            && number
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | ' '))
+    })
+}
+
 fn is_quote_text_candidate(node: Node<'_, '_>) -> bool {
     let has_text = node
         .descendants()
@@ -3975,6 +4005,38 @@ mod tests {
                 .iter()
                 .any(|block| matches!(block, Block::Quote(_)))
         );
+    }
+
+    #[test]
+    fn numbered_formula_images_are_not_inferred_as_quotes() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let section = parse_section(
+            r#"<html><head><style>.fig {margin-top:2em;margin-bottom:0.5em;padding-left:5px;padding-right:5px;padding-top:5px;text-align:center}.icon1 {vertical-align:middle}.eqnum {float:right}</style></head><body>
+            <p class="fig"><a id="formula7"/><img class="icon1" src="si8.gif"/> <span class="eqnum">(2.7)</span></p>
+            <p class="fig"><a id="formula8"/><img class="icon1" src="si9.gif"/> <span class="eqnum">(2.8)</span></p>
+            <p class="fig"><img class="icon1" src="si10.gif"/> <span class="eqnum">（A.9）</span></p>
+            </body></html>"#,
+            &descriptor, |_| None,
+        ).unwrap();
+        assert_eq!(section.blocks.len(), 3);
+        for block in &section.blocks {
+            let Block::Text(text) = block else {
+                panic!("expected formula paragraph: {block:?}")
+            };
+            assert_eq!(text.kind, TextBlockKind::Paragraph);
+            assert!(
+                text.content
+                    .iter()
+                    .any(|inline| matches!(inline, Inline::Image(_)))
+            );
+            assert!(text_block_text(text).contains('.'));
+        }
     }
 
     #[test]

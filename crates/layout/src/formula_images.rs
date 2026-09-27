@@ -7,9 +7,7 @@ pub(super) fn only_formula(block: &TextBlock) -> Option<(&InlineImageRun, Option
     let mut label = String::new();
     for inline in &block.content {
         match inline {
-            Inline::Image(run) if run.image.formula.is_some() && image.is_none() => {
-                image = Some(run.as_ref())
-            }
+            Inline::Image(run) if image.is_none() => image = Some(run.as_ref()),
             Inline::Text(run) => label.push_str(&run.text),
             Inline::Break => label.push(' '),
             _ => return None,
@@ -17,7 +15,8 @@ pub(super) fn only_formula(block: &TextBlock) -> Option<(&InlineImageRun, Option
     }
     let label = label.trim();
     if label.is_empty() {
-        return Some((image?, None));
+        let image = image?;
+        return image.image.formula.as_ref().map(|_| (image, None));
     }
     let inner = label
         .strip_prefix('(')
@@ -130,6 +129,8 @@ mod tests {
             r"S_i(p^*,t)=\max\left[\sum_b\mathrm{difference}_{cbi}(p^*,t)\right]",
             r"\frac{\sum_{i=1}^{n}x_i^2}{1+\sqrt{x}}",
             r"\begin{pmatrix}a&b\\c&d\\e&f\end{pmatrix}",
+            r"\begin{aligned}P(W)&=P(w_1,w_2,\ldots,w_n)\\&=P(w_1)\prod_{i=2}^{n}P(w_i\mid w_1,\ldots,w_{i-1})\end{aligned}",
+            r"x=1", // Exercise the original raster, without AI recognition.
         ];
         let mut engine = LayoutEngine::new();
         for width in [200, 480] {
@@ -148,6 +149,39 @@ mod tests {
                                 equation_number: numbered.then(|| "3.1".into()),
                             }),
                         });
+                        // The EPUB stores equations as an inline GIF followed
+                        // by a separate number, rather than a block image.
+                        let original_numbered = numbered && index == 4;
+                        let block = if numbered && index >= 3 {
+                            let Block::Image(mut image) = block else {
+                                unreachable!()
+                            };
+                            image.formula.as_mut().unwrap().equation_number = None;
+                            if original_numbered {
+                                image.formula = None;
+                            }
+                            Block::Text(TextBlock {
+                                kind: TextBlockKind::Paragraph,
+                                content: vec![
+                                    Inline::Image(Box::new(InlineImageRun {
+                                        image,
+                                        size_scale: 1.0,
+                                        intrinsic_sizing: original_numbered,
+                                        presentation: false,
+                                        vertical_align: InlineImageAlignment::Middle,
+                                    })),
+                                    Inline::Text(TextRun {
+                                        text: " (2.8)".into(),
+                                        style: Default::default(),
+                                        link: None,
+                                    }),
+                                ],
+                                style: Default::default(),
+                                source: None,
+                            })
+                        } else {
+                            block
+                        };
                         let mut style = ReaderStyle {
                             typesetting: ReaderTypesetting::unified(),
                             spread: SpreadMode::Single,
@@ -155,11 +189,21 @@ mod tests {
                             ..Default::default()
                         };
                         style.typography.font_size = font_size;
+                        let after = Block::Text(TextBlock {
+                            kind: TextBlockKind::Paragraph,
+                            content: vec![Inline::Text(TextRun {
+                                text: "Following paragraph".into(),
+                                style: Default::default(),
+                                link: None,
+                            })],
+                            style: Default::default(),
+                            source: None,
+                        });
                         let layout = engine
                             .layout_blocks(
                                 &source,
-                                &[block],
-                                LayoutViewport::new(width, 240).unwrap(),
+                                &[block, after],
+                                LayoutViewport::new(width, 1200).unwrap(),
                                 &style,
                             )
                             .unwrap();
@@ -175,7 +219,34 @@ mod tests {
                                 }
                             })
                             .unwrap();
-                        assert!(placed.formula_presentation.is_some(), "{latex}");
+                        assert_eq!(
+                            placed.formula_presentation.is_some(),
+                            !original_numbered,
+                            "{latex}"
+                        );
+                        let after = layout
+                            .pages
+                            .iter()
+                            .flat_map(|page| &page.items)
+                            .find_map(|item| {
+                                if let PageItem::Text(text) = item {
+                                    Some(text)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap();
+                        let after_top = after.origin_y
+                            + after
+                                .layout
+                                .get(after.lines.start)
+                                .unwrap()
+                                .metrics()
+                                .block_min_coord;
+                        assert!(
+                            after_top >= placed.y + placed.height,
+                            "image overlaps following paragraph"
+                        );
                         let raster = &placed.image;
                         let ink = raster
                             .pixels
@@ -731,14 +802,18 @@ impl LayoutEngine {
         image: &ImageBlock,
         owner: Option<SourceRange>,
         number: Option<&str>,
+        original_run: Option<&InlineImageRun>,
         style: &ReaderStyle,
         width: f32,
     ) -> Result<bool, LayoutError> {
-        let Some(formula) = &image.formula else {
+        let formula = image.formula.as_ref();
+        if formula.is_none() && (number.is_none() || original_run.is_none()) {
             return Ok(false);
-        };
+        }
         let original = load_raster_image(source, image)?;
-        if let (Some(authored), Some(recognized)) = (number, formula.equation_number.as_deref()) {
+        if let (Some(authored), Some(recognized)) =
+            (number, formula.and_then(|f| f.equation_number.as_deref()))
+        {
             let normalize = |s: &str| {
                 s.chars()
                     .filter(|c| !c.is_whitespace() && !matches!(c, '(' | ')' | '（' | '）'))
@@ -755,7 +830,7 @@ impl LayoutEngine {
             .max(4.0)
             .min((page_height - 1.0).max(0.0) * 0.25);
         let inner_width = (width - pad_x * 2.0).max(1.0);
-        let number = number.or(formula.equation_number.as_deref());
+        let number = number.or(formula.and_then(|f| f.equation_number.as_deref()));
         let number_image = number.and_then(|number| {
             let label = if number.starts_with(['(', '（']) {
                 number.to_owned()
@@ -791,18 +866,31 @@ impl LayoutEngine {
                 (inner_width - 2.0 * (w + number_gap)).max(1.0)
             })
         };
-        let Ok((raster, w, h)) = rasterize_formula(
-            &MathRun {
-                original: None,
-                latex: formula.latex.clone(),
-                display: true,
-                size_scale: 1.0,
-            },
-            &style.typography,
-            style.foreground,
-            usable,
-            &self.svg_options,
-        ) else {
+        let rendered = if let Some(formula) = formula {
+            rasterize_formula(
+                &MathRun {
+                    original: None,
+                    latex: formula.latex.clone(),
+                    display: true,
+                    size_scale: 1.0,
+                },
+                &style.typography,
+                style.foreground,
+                usable,
+                &self.svg_options,
+            )
+        } else {
+            let prepared = prepare_inline_raster(
+                original_run.expect("checked original run"),
+                original.clone(),
+                &style.typography,
+                usable,
+                0,
+                0,
+            );
+            Ok((prepared.image, prepared.width, prepared.height))
+        };
+        let Ok((raster, w, h)) = rendered else {
             return Ok(false);
         };
         let Some((raster, w, h)) = padded_display_row(
@@ -829,7 +917,9 @@ impl LayoutEngine {
             owner.or_else(|| image.source.clone()),
             None,
         );
-        if let Some(PageItem::Image(placed)) = paginator.items.last_mut() {
+        if let Some(formula) = formula
+            && let Some(PageItem::Image(placed)) = paginator.items.last_mut()
+        {
             placed.formula_presentation = Some(FormulaPresentation {
                 original,
                 latex: formula.latex.clone(),

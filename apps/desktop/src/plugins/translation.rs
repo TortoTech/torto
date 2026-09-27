@@ -2007,6 +2007,19 @@ fn restore_original_baselines(
     default_style: TextStyle,
     original: &[Inline],
 ) -> Vec<(String, TextStyle)> {
+    // Explicit source identities take precedence over legacy textual matching.
+    // Otherwise a note numbered "1" can style a placeholder ID (or a year in
+    // the prose), splitting the token before append_translated_text sees it.
+    let block = TextBlock {
+        kind: TextBlockKind::Paragraph,
+        content: original.to_vec(),
+        style: Default::default(),
+        source: None,
+    };
+    let explicit_notes: Vec<_> = rebook_layout::paragraph_footnotes(&block)
+        .into_iter()
+        .filter(|range| text.contains(&format!("<torto-note-{}/>", range.start)))
+        .collect();
     let original_length = original
         .iter()
         .map(|inline| match inline {
@@ -2019,10 +2032,14 @@ fn restore_original_baselines(
     let mut original_offset = 0;
     let markers = original
         .iter()
-        .filter_map(|inline| match inline {
+        .enumerate()
+        .filter_map(|(index, inline)| match inline {
             Inline::Text(run) => {
                 let offset = original_offset;
                 original_offset += run.text.chars().count();
+                if explicit_notes.iter().any(|range| range.contains(&index)) {
+                    return None;
+                }
                 (run.style.baseline != TextBaseline::Normal
                     || run.style.link_role != LinkRole::Normal
                     || run.style.inline_role != InlineRole::Normal)
@@ -2081,9 +2098,18 @@ fn best_marker_match(
     relative_offset: usize,
     target_length: usize,
 ) -> Option<usize> {
+    let protected: Vec<_> = text
+        .match_indices("<torto-")
+        .filter_map(|(start, _)| text[start..].find("/>").map(|end| start..start + end + 2))
+        .collect();
     text[cursor..]
         .match_indices(marker)
         .map(|(offset, _)| cursor + offset)
+        .filter(|start| {
+            !protected
+                .iter()
+                .any(|range| *start < range.end && *start + marker.len() > range.start)
+        })
         .min_by(|left, right| {
             let score = |byte_index: usize| {
                 let char_index = text[..byte_index].chars().count();
@@ -2589,6 +2615,58 @@ mod tests {
                     && run.style.baseline == TextBaseline::Normal
                     && run.link.as_ref() == Some(&target)
         )));
+    }
+
+    #[test]
+    fn numeric_footnote_placeholder_survives_plain_translation() {
+        let target = PublicationUrl::parse("chapter.xhtml#fn1").unwrap();
+        let original = vec![
+            Inline::Text(TextRun {
+                text: "Predictive methods".into(),
+                style: Default::default(),
+                link: None,
+            }),
+            Inline::Text(TextRun {
+                text: "1".into(),
+                style: TextStyle {
+                    baseline: TextBaseline::Superscript,
+                    ..Default::default()
+                },
+                link: Some(target.clone()),
+            }),
+            Inline::Text(TextRun {
+                text: " became prevalent in 1970.".into(),
+                style: Default::default(),
+                link: None,
+            }),
+        ];
+        for translated in [
+            "预测输入法<torto-note-1/>正逐渐普及，在1970年已有争论。",
+            "<em>预测输入法</em><torto-note-1/>正逐渐普及，在1970年已有争论。",
+        ] {
+            let content = replacement_content(translated, TextStyle::default(), Some(&original));
+            assert_eq!(content.iter().filter(|inline| matches!(inline, Inline::Text(run) if run.link.as_ref() == Some(&target) && run.text == "1" && run.style.baseline == TextBaseline::Superscript)).count(), 1);
+            assert!(!content.iter().any(
+                |inline| matches!(inline, Inline::Text(run) if run.text.contains("torto-note"))
+            ));
+            assert!(content.iter().any(|inline| matches!(inline, Inline::Text(run) if run.text.contains("1970") && run.style.baseline == TextBaseline::Normal)));
+        }
+    }
+
+    #[test]
+    fn legacy_baseline_matching_never_splits_structural_tokens() {
+        for prefix in ["note", "web", "math"] {
+            let text = format!("value<torto-{prefix}-1/> then 1");
+            assert_eq!(
+                best_marker_match(&text, "1", 0, 0, text.chars().count()),
+                Some(text.len() - 1)
+            );
+            let only_token = format!("<torto-{prefix}-1/>");
+            assert_eq!(
+                best_marker_match(&only_token, "1", 0, 0, only_token.len()),
+                None
+            );
+        }
     }
 
     #[test]
