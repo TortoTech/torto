@@ -72,14 +72,7 @@ pub(crate) enum OutputMode {
 }
 
 impl OutputMode {
-    pub(crate) const ALL: [Self; 5] = [
-        Self::Auto,
-        Self::Native,
-        Self::Tool,
-        Self::JsonObject,
-        Self::Prompt,
-    ];
-    pub(crate) const fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
             Self::Native => "Native JSON Schema",
@@ -94,26 +87,6 @@ impl OutputMode {
 // off native output for all requests to that model. Credentials are hashed.
 type CapabilityCache = HashMap<String, (Instant, HashSet<OutputMode>)>;
 static CAPABILITIES: OnceLock<Mutex<CapabilityCache>> = OnceLock::new();
-
-pub(crate) fn reset_capabilities() {
-    if let Ok(mut cache) = CAPABILITIES.get_or_init(Default::default).lock() {
-        cache.clear();
-    }
-}
-
-pub(crate) async fn test_connection(provider: &AiProvider) -> Result<(), String> {
-    let model = provider
-        .models
-        .first()
-        .map(|m| m.id.as_str())
-        .filter(|m| !m.trim().is_empty())
-        .ok_or("请先填写一个模型 ID")?;
-    budgeted(async {
-        complete(provider, model, &[json!({"role":"user","content":"Return ok=true."})], None, Some(1024), ReasoningEffort::Default,
-            Some(&schema_options(json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false})))).await?;
-        Ok(())
-    }).await
-}
 
 fn cache_key(
     provider: &AiProvider,

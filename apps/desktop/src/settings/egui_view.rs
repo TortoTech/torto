@@ -1076,11 +1076,9 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         let provider_id = state.draft_plugin_settings.providers[index].id.clone();
         let fetched_models = state.provider_models_cache.get(&provider_id).cloned();
         let fetch_error = state.provider_models_errors.get(&provider_id).cloned();
-        let test_result = state.provider_test_results.get(&provider_id).cloned();
         let loading = state.provider_models_loading.as_deref() == Some(&provider_id);
         let mut provider_changed = false;
         let mut refresh_requested = false;
-        let mut test_requested = false;
         settings_card(ui, |ui| {
             let provider = &mut state.draft_plugin_settings.providers[index];
             egui::Grid::new(("ai-provider-settings-grid", &provider.id))
@@ -1115,21 +1113,6 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                                     );
                                 }
                             });
-                        if selected_kind != provider.kind {
-                            provider.select_kind(selected_kind);
-                            provider_changed = true;
-                        }
-                    });
-                    ui.end_row();
-
-                    settings_row_label(ui, language.text("名称", "Name"));
-                    settings_row_control_sized(ui, 324.0, |ui| {
-                        text_field_sized(
-                            ui,
-                            &mut provider.name,
-                            false,
-                            SETTINGS_MODEL_SELECT_WIDTH,
-                        );
                         if can_remove_provider
                             && icon_button(ui, Icon::Trash2)
                                 .on_hover_text(language.text("删除服务", "Remove provider"))
@@ -1137,9 +1120,25 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         {
                             remove_provider = Some(index);
                         }
+                        if selected_kind != provider.kind {
+                            provider.select_kind(selected_kind);
+                            provider_changed = true;
+                        }
                     });
                     ui.end_row();
 
+                    if provider.kind == AiProviderKind::Custom {
+                        settings_row_label(ui, language.text("名称", "Name"));
+                        settings_row_control_sized(ui, 324.0, |ui| {
+                            text_field_sized(
+                                ui,
+                                &mut provider.name,
+                                false,
+                                SETTINGS_MODEL_SELECT_WIDTH,
+                            );
+                        });
+                        ui.end_row();
+                    }
                     {
                         settings_row_label(ui, language.text("接口地址", "Base URL"));
                         settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
@@ -1173,58 +1172,6 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     });
                     ui.end_row();
 
-                    settings_row_label(ui, language.text("JSON 输出", "JSON output"));
-                    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
-                        egui::ComboBox::from_id_salt(("structured-output", &provider.id))
-                            .selected_text(provider.structured_output.label())
-                            .show_ui(ui, |ui| {
-                                for mode in crate::plugins::llm::OutputMode::ALL {
-                                    provider_changed |= ui
-                                        .selectable_value(
-                                            &mut provider.structured_output,
-                                            mode,
-                                            mode.label(),
-                                        )
-                                        .changed();
-                                }
-                            });
-                    });
-                    ui.end_row();
-                    settings_row_label(
-                        ui,
-                        language.text("结构化输出工具", "Structured output tool"),
-                    );
-                    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
-                        provider_changed |= ui
-                            .checkbox(
-                                &mut provider.allow_output_tools,
-                                language.text("自动模式允许使用", "Allow in Auto mode"),
-                            )
-                            .changed();
-                        if ui
-                            .small_button(language.text("重置能力缓存", "Reset capability cache"))
-                            .clicked()
-                        {
-                            crate::plugins::llm::reset_capabilities();
-                        }
-                    });
-                    ui.end_row();
-
-                    settings_row_label(ui, language.text("连接测试", "Connection test"));
-                    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
-                        test_requested = ui
-                            .add_enabled(
-                                !loading,
-                                egui::Button::new(
-                                    language.text("测试第一个模型", "Test first model"),
-                                ),
-                            )
-                            .clicked();
-                        if let Some(result) = &test_result {
-                            ui.label(result);
-                        }
-                    });
-                    ui.end_row();
                     settings_row_label(ui, language.text("模型", "Models"));
                     settings_row_control_sized(ui, 392.0, |ui| {
                         refresh_requested = provider_models_selector(
@@ -1249,9 +1196,8 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             && !state.provider_models_task.is_pending()
             && !provider_changed
             && !provider.base_url.trim().is_empty();
-        if test_requested || refresh_requested || needs_initial_fetch {
+        if refresh_requested || needs_initial_fetch {
             state.request_provider_models(ProviderModelsRequest {
-                test_provider: test_requested.then(|| provider.clone()),
                 provider_id: provider.id,
                 kind: provider.kind,
                 base_url: provider.base_url,

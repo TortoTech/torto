@@ -56,6 +56,7 @@ const SETTINGS_FILE: &str = "plugins.json";
 const AI_CREDENTIAL_SERVICE: &str = "Rebook AI";
 const PDF_OCR_CREDENTIAL_SERVICE: &str = "Rebook PDF OCR";
 const DEFAULT_PROVIDER_ID: &str = "openai";
+#[cfg(test)]
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_CHAT_MAX_TOOL_STEPS: u16 = 24;
 const CHAT_TOOL_DEFAULTS_VERSION: u8 = 1;
@@ -201,12 +202,19 @@ pub struct AiProvider {
     pub name: String,
     pub base_url: String,
     pub models: Vec<AiModelConfig>,
+    // Internal policy only: ignore previously saved manual overrides.
+    #[serde(skip, default = "automatic_output_tools")]
     pub(crate) allow_output_tools: bool,
+    #[serde(skip)]
     pub(crate) structured_output: llm::OutputMode,
     /// Secrets are excluded from JSON and stored in Windows Credential Manager.
     /// `REBOOK_AI_API_KEY` can override the default provider at runtime.
     #[serde(skip)]
     pub api_key: String,
+}
+
+fn automatic_output_tools() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,7 +225,7 @@ pub struct AiModelConfig {
 
 impl Default for AiModelConfig {
     fn default() -> Self {
-        Self::language(DEFAULT_MODEL)
+        Self::language("")
     }
 }
 
@@ -287,7 +295,7 @@ impl Default for AiProvider {
             kind: AiProviderKind::Custom,
             name: AiProviderKind::Custom.label().into(),
             base_url: String::new(),
-            models: vec![AiModelConfig::language(DEFAULT_MODEL)],
+            models: Vec::new(),
             allow_output_tools: true,
             structured_output: llm::OutputMode::Auto,
             api_key: String::new(),
@@ -302,7 +310,10 @@ impl AiProvider {
         if let Some(base_url) = kind.base_url() {
             self.base_url = base_url.into();
         }
-        if self.name.trim().is_empty() || self.name == old_kind.label() {
+        if kind != AiProviderKind::Custom
+            || self.name.trim().is_empty()
+            || self.name == old_kind.label()
+        {
             self.name = kind.label().into();
         }
     }
@@ -359,13 +370,13 @@ impl Default for PluginSettings {
             providers: vec![AiProvider::default()],
             semantic_layout: semantic_layout::SemanticLayoutSettings::default(),
             chat_provider: DEFAULT_PROVIDER_ID.into(),
-            chat_model: DEFAULT_MODEL.into(),
+            chat_model: String::new(),
             chat_reasoning_effort: ReasoningEffort::Default,
             chat_max_tool_steps: DEFAULT_CHAT_MAX_TOOL_STEPS,
             chat_history_turns: DEFAULT_CHAT_HISTORY_TURNS,
             ocr_enabled: true,
             ocr_provider: DEFAULT_PROVIDER_ID.into(),
-            ocr_model: DEFAULT_MODEL.into(),
+            ocr_model: String::new(),
             pdf_ocr_enabled: false,
             pdf_ocr_reflow_enabled: false,
             pdf_ocr_provider: PdfOcrProviderKind::PaddleOcr,
@@ -374,7 +385,7 @@ impl Default for PluginSettings {
             mineru_model: "vlm".into(),
             mineru_token: String::new(),
             translation_provider: DEFAULT_PROVIDER_ID.into(),
-            translation_model: DEFAULT_MODEL.into(),
+            translation_model: String::new(),
             translation_reasoning_effort: ReasoningEffort::Default,
             target_language: TARGET_LANGUAGE_SYSTEM.into(),
             translation_mode: TranslationMode::Replace,
@@ -384,6 +395,17 @@ impl Default for PluginSettings {
             legacy_base_url: None,
             legacy_api_key: None,
         }
+    }
+}
+
+#[cfg(test)]
+impl PluginSettings {
+    pub(crate) fn with_test_model(mut self) -> Self {
+        self.providers[0].models = vec![AiModelConfig::language(DEFAULT_MODEL)];
+        self.chat_model = DEFAULT_MODEL.into();
+        self.ocr_model = DEFAULT_MODEL.into();
+        self.translation_model = DEFAULT_MODEL.into();
+        self
     }
 }
 
@@ -471,7 +493,9 @@ impl PluginSettings {
                     provider.id.push('-');
                 }
             }
-            if provider.name.trim().is_empty() {
+            if provider.kind != AiProviderKind::Custom {
+                provider.name = provider.kind.label().into();
+            } else if provider.name.trim().is_empty() {
                 provider.name = format!("Provider {}", index + 1);
             }
             if provider.base_url.trim().is_empty()
@@ -527,7 +551,7 @@ impl PluginSettings {
             kind: AiProviderKind::Custom,
             name: format!("Custom {suffix}"),
             base_url: String::new(),
-            models: vec![AiModelConfig::language(DEFAULT_MODEL)],
+            models: Vec::new(),
             allow_output_tools: true,
             structured_output: llm::OutputMode::Auto,
             api_key: String::new(),
@@ -775,7 +799,7 @@ fn ai_credential_entry(provider_id: &str) -> io::Result<Entry> {
 
 fn normalized_models(models: Vec<AiModelConfig>) -> Vec<AiModelConfig> {
     let mut seen = std::collections::HashSet::new();
-    let mut models = models
+    let models = models
         .into_iter()
         .map(|mut model| {
             model.id = model.id.trim().to_owned();
@@ -783,9 +807,6 @@ fn normalized_models(models: Vec<AiModelConfig>) -> Vec<AiModelConfig> {
         })
         .filter(|model| !model.id.is_empty() && seen.insert(model.id.clone()))
         .collect::<Vec<_>>();
-    if models.is_empty() {
-        models.push(AiModelConfig::language(DEFAULT_MODEL));
-    }
     models
 }
 
@@ -850,12 +871,31 @@ mod tests {
         let mut provider = AiProvider::default();
         assert_eq!(provider.kind, AiProviderKind::Custom);
         assert!(provider.base_url.is_empty());
+        assert!(provider.models.is_empty());
 
         provider.select_kind(AiProviderKind::DeepSeek);
 
         assert_eq!(provider.kind, AiProviderKind::DeepSeek);
         assert_eq!(provider.name, "DeepSeek");
         assert_eq!(provider.base_url, "https://api.deepseek.com");
+        assert!(provider.models.is_empty());
+    }
+
+    #[test]
+    fn new_provider_stays_empty_after_normalization_and_uses_preset_name() {
+        let mut settings = PluginSettings::default();
+        settings.add_provider();
+        let provider = settings.providers.last_mut().unwrap();
+        provider.name = "Custom 2".into();
+        provider.select_kind(AiProviderKind::DeepSeek);
+        settings.normalize();
+        let provider = settings.providers.last().unwrap();
+        assert_eq!(provider.name, "DeepSeek");
+        assert!(provider.models.is_empty());
+        let mut saved: PluginSettings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        saved.normalize();
+        assert!(saved.providers.last().unwrap().models.is_empty());
     }
 
     #[test]
@@ -993,6 +1033,9 @@ mod tests {
     #[test]
     fn removing_a_selected_provider_repairs_all_feature_selections() {
         let mut settings = PluginSettings::default();
+        settings.providers[0]
+            .models
+            .push(AiModelConfig::language(DEFAULT_MODEL));
         settings.add_provider();
         let second = settings.providers[1].id.clone();
         settings.chat_provider.clone_from(&second);
@@ -1038,13 +1081,16 @@ mod tests {
 
         settings.ocr_model = "not-configured".into();
         settings.normalize();
-        assert_eq!(settings.ocr_model, DEFAULT_MODEL);
+        assert_eq!(settings.ocr_model, "qwen/base");
     }
 
     #[test]
     fn configured_api_key_survives_normalization_and_enables_translation() {
         let mut settings = PluginSettings::default();
         settings.providers[0].select_kind(AiProviderKind::OpenAi);
+        settings.providers[0]
+            .models
+            .push(AiModelConfig::language(DEFAULT_MODEL));
         settings.providers[0].api_key = "  secret-key  ".into();
 
         settings.normalize();

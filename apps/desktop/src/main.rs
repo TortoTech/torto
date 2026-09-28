@@ -49,6 +49,20 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let launch = parse_arguments()?;
     diagnostics::install_panic_hook();
+    rebook_formats::set_pdf_timing_sink(|book, stage, page, hit, elapsed_ms| {
+        let thread = std::thread::current();
+        diagnostics::log(
+            "pdf.page",
+            &[
+                diagnostics::Field::Detail("book", book),
+                diagnostics::Field::Detail("thread", thread.name().unwrap_or("unnamed")),
+                diagnostics::Field::Text("stage", stage),
+                diagnostics::Field::Usize("page", page),
+                diagnostics::Field::Bool("cache_hit", hit),
+                diagnostics::Field::F32("elapsed_ms", elapsed_ms),
+            ],
+        );
+    });
     let reader_fonts = fonts::embedded_reader_fonts();
 
     let library =

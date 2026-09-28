@@ -1,4 +1,20 @@
 use crate::reader::*;
+
+#[test]
+fn classic_toc_navigation_completes_without_focus_overrides() {
+    let (mut reader, section, _) = fixture();
+    reader.reading_mode = ReadingMode::Classic;
+    reader.go_to_toc("chapter", &section.href);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while reader.pending_toc_navigation.is_some() {
+        assert!(Instant::now() < deadline);
+        reader.retry_pending_toc_navigation();
+        std::thread::yield_now();
+    }
+    assert!(reader.error.is_none(), "{:?}", reader.error);
+    assert!(reader.focus_toc_override.is_none());
+    assert_eq!(reader.snapshot.location.section_index, 0);
+}
 use rebook_publication::{
     Book, ImageBlock, Metadata, PublicationError, PublicationId, RasterResource, Resource,
     SpineItem, SpineItemId, TextBlock, TextRun, TextStyle,
@@ -840,7 +856,7 @@ href:PublicationUrl::parse("image.png").unwrap(),alt:String::new(),style:Default
         },
         section: section.clone(),
     });
-    let settings = PluginSettings::default();
+    let settings = PluginSettings::default().with_test_model();
     let rewrite_source = Arc::new(RewriteBookSource::new(original));
     let translation_source = Arc::new(TranslationBookSource::new(
         rewrite_source.clone(),

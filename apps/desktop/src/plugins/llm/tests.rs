@@ -12,7 +12,8 @@ fn legacy_provider_settings_keep_gateway_and_default_output_policy() {
     let mut settings = super::super::PluginSettings::default();
     settings.providers[0] = serde_json::from_value(json!({
         "id":"legacy", "kind":"open-ai", "name":"Gateway",
-        "base_url":"https://gateway.example/v1", "models":[{"id":"test"}]
+        "base_url":"https://gateway.example/v1", "models":[{"id":"test"}],
+        "structured_output":"prompt", "allow_output_tools":false
     }))
     .unwrap();
     settings.normalize();
@@ -21,6 +22,9 @@ fn legacy_provider_settings_keep_gateway_and_default_output_policy() {
     assert_eq!(provider.id, "legacy");
     assert_eq!(provider.structured_output, OutputMode::Auto);
     assert!(provider.allow_output_tools);
+    let saved = serde_json::to_value(provider).unwrap();
+    assert!(saved.get("structured_output").is_none());
+    assert!(saved.get("allow_output_tools").is_none());
     assert!(AiProviderKind::Anthropic.matches_search("claude"));
     assert!(AiProviderKind::Moonshot.matches_search("kimi"));
 }

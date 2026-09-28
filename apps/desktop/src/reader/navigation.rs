@@ -16,55 +16,43 @@ impl DesktopReader {
         self.completion = None;
         self.ui.focus_footnotes_visible = false;
         self.ui.focus_footnote_scroll_delta = 0.0;
-        if self.is_focus_mode() {
-            self.pending_reading_unit_turn = None;
-            self.pending_toc_navigation = Some(PendingTocNavigation {
-                id: id.to_owned(),
-                target: target.clone(),
-            });
-            self.retry_pending_toc_navigation();
-            return;
-        }
-        let result = self.reader.go_to_href(target);
-        match result {
-            Ok(result) => {
-                let focus_anchor = self.reader.source_anchor_for_href(target);
-                self.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
-                if self.is_focus_mode() {
-                    self.focus_toc_override = Some(id.to_owned());
-                    if let Some(item) = self.reader.toc_items().iter().find(|item| item.id == id) {
-                        self.snapshot.active_toc_id = Some(item.id.clone());
-                        self.snapshot.active_toc_path.clone_from(&item.ancestors);
-                        if item.has_children {
-                            self.snapshot.active_toc_path.push(item.id.clone());
-                        }
-                    }
-                    self.focus_anchor = focus_anchor.or_else(|| {
-                        self.reader
-                            .current_page()
-                            .leading_source_range()
-                            .map(|range| range.start.clone())
-                    });
-                    self.invalidate_focus_units();
-                    self.focus_unit_index = 0;
-                    self.focus_target_offset = None;
-                    self.ui.focus_scroll_motion = None;
-                }
-            }
-            Err(error) => self.error = Some(format!("目录跳转失败：{error}")),
-        }
+        self.pending_page_turn = None;
+        self.pending_reading_unit_turn = None;
+        self.pending_toc_navigation = Some(PendingTocNavigation {
+            id: id.to_owned(),
+            target: target.clone(),
+            started: std::time::Instant::now(),
+        });
+        self.retry_pending_toc_navigation();
     }
-
     pub(in crate::reader) fn retry_pending_toc_navigation(&mut self) {
         let Some(pending) = self.pending_toc_navigation.clone() else {
             return;
         };
+        let attempt_started = std::time::Instant::now();
         match self.reader.try_go_to_href(&pending.target) {
             Ok(NavigationAttempt::Pending) => {}
             Ok(NavigationAttempt::Ready(result)) => {
                 self.pending_toc_navigation = None;
                 let focus_anchor = self.reader.source_anchor_for_href(&pending.target);
                 self.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
+                crate::diagnostics::log(
+                    "reader.toc_ready",
+                    &[
+                        crate::diagnostics::Field::F32(
+                            "total_ms",
+                            pending.started.elapsed().as_secs_f32() * 1000.0,
+                        ),
+                        crate::diagnostics::Field::Bool("focus", self.is_focus_mode()),
+                        crate::diagnostics::Field::F32(
+                            "completion_ms",
+                            attempt_started.elapsed().as_secs_f32() * 1000.0,
+                        ),
+                    ],
+                );
+                if !self.is_focus_mode() {
+                    return;
+                }
                 self.focus_toc_override = Some(pending.id.clone());
                 if let Some(item) = self
                     .reader
@@ -93,6 +81,15 @@ impl DesktopReader {
                 self.pending_toc_navigation = None;
                 self.error = Some(format!("目录跳转失败：{error}"));
             }
+        }
+        if attempt_started.elapsed().as_millis() >= 16 {
+            crate::diagnostics::log(
+                "reader.toc_slow_poll",
+                &[crate::diagnostics::Field::F32(
+                    "elapsed_ms",
+                    attempt_started.elapsed().as_secs_f32() * 1000.0,
+                )],
+            );
         }
     }
 

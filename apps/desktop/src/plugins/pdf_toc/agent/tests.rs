@@ -220,7 +220,7 @@ fn agent_chooses_pages_saves_then_finishes_using_real_tool_history() {
             json!({"toc":"complete","metadata":"complete","page_roles":"complete","summary":"confirmed"}),
         ),
     ]);
-    let mut settings = PluginSettings::default();
+    let mut settings = PluginSettings::default().with_test_model();
     settings.providers[0].base_url = url;
     settings.providers[0].api_key = "fixture".into();
     let result = runtime()

@@ -26,6 +26,7 @@ use thiserror::Error;
 use self::epub::{EpubError, EpubPublication};
 
 pub use self::pdf::cjk_fallback_font_bytes;
+pub use self::pdf::{PdfTimingSink, set_pdf_timing_sink};
 
 /// E-book formats supported by the desktop application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -6,7 +6,6 @@ use crate::async_task::TaskResult;
 
 #[derive(Clone)]
 pub(super) struct ProviderModelsRequest {
-    pub(super) test_provider: Option<crate::plugins::AiProvider>,
     pub(super) provider_id: String,
     pub(super) kind: crate::plugins::AiProviderKind,
     pub(super) base_url: String,
@@ -28,10 +27,6 @@ struct ModelEntry {
 pub(super) async fn fetch_provider_models(
     request: &ProviderModelsRequest,
 ) -> Result<Vec<String>, String> {
-    if let Some(provider) = &request.test_provider {
-        crate::plugins::llm::test_connection(provider).await?;
-        return Ok(Vec::new());
-    }
     use crate::plugins::AiProviderKind as P;
     let base = request.base_url.trim().trim_end_matches('/');
     let url = match request.kind {
@@ -264,7 +259,6 @@ mod tests {
             .unwrap();
         });
         let request = ProviderModelsRequest {
-            test_provider: None,
             kind: crate::plugins::AiProviderKind::Custom,
             provider_id: "provider".into(),
             base_url: format!("http://{address}/v1/chat/completions"),

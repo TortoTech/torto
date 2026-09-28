@@ -2959,7 +2959,7 @@ mod tests {
             source
         });
         let rewrite_source = Arc::new(RewriteBookSource::new(Arc::clone(&source)));
-        let mut settings = PluginSettings::default();
+        let mut settings = PluginSettings::default().with_test_model();
         settings.providers[0].base_url = format!("http://{address}/v1");
         settings.providers[0].api_key = "secret-key".into();
         let result = tokio::runtime::Runtime::new()
@@ -3244,7 +3244,7 @@ mod tests {
             .unwrap();
         });
 
-        let mut settings = PluginSettings::default();
+        let mut settings = PluginSettings::default().with_test_model();
         settings.providers[0].base_url = format!("http://{address}/v1");
         settings.providers[0].api_key = "secret-key".into();
         settings.target_language = "简体中文".into();

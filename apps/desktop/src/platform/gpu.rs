@@ -492,6 +492,7 @@ impl GpuState {
         plan: ReaderFramePlan,
         pixels_per_point: f32,
     ) -> Result<(), String> {
+        let started = std::time::Instant::now();
         // Vello 0.10 can still omit a previously resolved ImageData on subsequent
         // render_to_texture calls (linebender/vello#1809). Explicitly marking
         // every image referenced by this scene dirty makes the persistent atlas
@@ -540,6 +541,19 @@ impl GpuState {
             )
             .map_err(|error| error.to_string())?;
         target.rendered_scene = Some((plan.scene_id, plan.scene_revision));
+        if started.elapsed().as_millis() >= 16 {
+            crate::diagnostics::log(
+                "render.reader_scene_slow",
+                &[
+                    crate::diagnostics::Field::F32(
+                        "elapsed_ms",
+                        started.elapsed().as_secs_f32() * 1000.0,
+                    ),
+                    crate::diagnostics::Field::Usize("images", scene.images.len()),
+                    crate::diagnostics::Field::Bool("refresh_atlas", scene.refresh_image_atlas),
+                ],
+            );
+        }
         Ok(())
     }
 }

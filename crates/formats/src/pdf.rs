@@ -2,7 +2,17 @@ mod catalog;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// Optional diagnostic sink; durations exclude the sink itself. Page numbers are one-based.
+pub type PdfTimingSink = fn(&str, &'static str, usize, bool, f32);
+static TIMING_SINK: OnceLock<PdfTimingSink> = OnceLock::new();
+
+pub fn set_pdf_timing_sink(sink: PdfTimingSink) {
+    let _ = TIMING_SINK.set(sink);
+}
 
 use hayro::hayro_interpret::font::{FontData, FontQuery, Glyph};
 use hayro::hayro_interpret::hayro_cmap::BfString;
@@ -214,6 +224,24 @@ impl BookSource for PdfPublication {
 }
 
 impl PdfPublication {
+    fn log_timing(&self, stage: &'static str, page: usize, hit: bool, started: Instant) {
+        // Cache hits can occur every frame; sample cheap hits to keep diagnostics cheap.
+        if hit && started.elapsed().as_millis() < 16 {
+            static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 60 != 0 {
+                return;
+            }
+        }
+        if let Some(sink) = TIMING_SINK.get() {
+            sink(
+                self.book().id.as_str(),
+                stage,
+                page + 1,
+                hit,
+                started.elapsed().as_secs_f32() * 1000.0,
+            );
+        }
+    }
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -235,7 +263,10 @@ impl PdfPublication {
     }
 
     fn page_text_layer(&self, page_index: usize) -> Result<FixedPageTextLayer, PublicationError> {
-        if let Some(layer) = self.lock_cache()?.text_layers.get(&page_index).cloned() {
+        let started = Instant::now();
+        let cached = { self.lock_cache()?.text_layers.get(&page_index).cloned() };
+        if let Some(layer) = cached {
+            self.log_timing("text_layer", page_index, true, started);
             return Ok(layer);
         }
 
@@ -243,6 +274,7 @@ impl PdfPublication {
         self.lock_cache()?
             .text_layers
             .insert(page_index, layer.clone());
+        self.log_timing("text_layer", page_index, false, started);
         Ok(layer)
     }
 
@@ -304,10 +336,13 @@ impl PdfPublication {
     }
 
     fn page_raster(&self, page_index: usize) -> Result<RasterResource, PublicationError> {
+        let started = Instant::now();
         let cached = { self.lock_cache()?.rasters.get(&page_index).cloned() };
         if let Some(raster) = cached {
             let mut cache = self.lock_cache()?;
             touch_page(&mut cache.raster_lru, page_index);
+            drop(cache);
+            self.log_timing("raster", page_index, true, started);
             return Ok(raster);
         }
 
@@ -330,6 +365,8 @@ impl PdfPublication {
             };
             cache.rasters.remove(&evicted);
         }
+        drop(cache);
+        self.log_timing("raster", page_index, false, started);
         Ok(raster)
     }
 

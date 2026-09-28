@@ -657,7 +657,7 @@ fn visible_request_sends_context_without_targeting_the_next_paragraph() {
         text("b", "Visible paragraph."),
         text("c", "After context."),
     ]);
-    let mut settings = PluginSettings::default();
+    let mut settings = PluginSettings::default().with_test_model();
     settings.semantic_layout.enabled = true;
     settings.semantic_layout.provider = settings.providers[0].id.clone();
     settings.semantic_layout.model = settings.providers[0].models[0].id.clone();
@@ -1408,7 +1408,7 @@ fn layout_reasoning_defaults_roundtrips_and_changes_cache_identity() {
     let old: SemanticLayoutSettings =
         serde_json::from_value(json!({"enabled":true,"provider":"old","model":"old"})).unwrap();
     assert_eq!(old.reasoning_effort, ReasoningEffort::Default);
-    let mut settings = PluginSettings::default();
+    let mut settings = PluginSettings::default().with_test_model();
     settings.providers[0].api_key = "fixture".into();
     settings.providers[0].base_url = "http://127.0.0.1:9/v1".into();
     settings.semantic_layout.enabled = true;

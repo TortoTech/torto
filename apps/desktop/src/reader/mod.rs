@@ -578,6 +578,7 @@ pub(super) struct DesktopReader {
 struct PendingTocNavigation {
     id: String,
     target: PublicationUrl,
+    started: Instant,
 }
 
 struct ImagePreview {
@@ -2852,6 +2853,7 @@ impl DesktopReader {
     }
 
     fn update_scroll_viewport(&mut self, ctx: &egui::Context, viewport: ScrollViewportState) {
+        let scroll_started = Instant::now();
         let previous_viewport = self.scroll_viewport;
         let height_changed = previous_viewport
             .is_some_and(|previous| focus_viewport_height_changed(previous.size, viewport.size));
@@ -2949,6 +2951,22 @@ impl DesktopReader {
                 .is_some_and(Motion::is_animating)
         {
             self.queue_visible_section_translation();
+        }
+        if scroll_started.elapsed().as_millis() >= 16 {
+            crate::diagnostics::log(
+                "reader.scroll_slow",
+                &[
+                    crate::diagnostics::Field::F32(
+                        "elapsed_ms",
+                        scroll_started.elapsed().as_secs_f32() * 1000.0,
+                    ),
+                    crate::diagnostics::Field::Bool(
+                        "materialization_pending",
+                        materialization_pending,
+                    ),
+                    crate::diagnostics::Field::Usize("ready_pages", ready_placeholders.len()),
+                ],
+            );
         }
     }
 
