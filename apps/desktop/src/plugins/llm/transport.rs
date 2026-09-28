@@ -43,6 +43,19 @@ fn normalize(mut payload: Value) -> Value {
         if choice["message"].is_object() && choice["message"].get("role").is_none() {
             choice["message"]["role"] = json!("assistant");
         }
+        // Rig parses tool arguments while decoding the response. Repair our
+        // output-only tool before that boundary; actual agent tools stay strict.
+        if let Some(calls) = choice["message"]["tool_calls"].as_array_mut() {
+            for call in calls {
+                if call["function"]["name"] == super::OUTPUT_TOOL
+                    && let Some(raw) = call["function"]["arguments"].as_str()
+                    && serde_json::from_str::<Value>(raw).is_err()
+                    && let Ok(value) = crate::plugins::llm_json::parse::<Value>(raw)
+                {
+                    call["function"]["arguments"] = Value::String(value.to_string());
+                }
+            }
+        }
         // Some gateways emit both aliases. Serde treats them as the same field
         // and rejects the whole response, including otherwise valid tool calls.
         if let Some(message) = choice["message"].as_object_mut()

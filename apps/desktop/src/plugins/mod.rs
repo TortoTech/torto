@@ -245,6 +245,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    Max,
 }
 
 impl ReasoningEffort {
@@ -265,6 +266,7 @@ impl ReasoningEffort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::Max => "max",
         }
     }
 
@@ -276,6 +278,7 @@ impl ReasoningEffort {
             Self::Low => Some("low"),
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
+            Self::Max => Some("max"),
         }
     }
 }

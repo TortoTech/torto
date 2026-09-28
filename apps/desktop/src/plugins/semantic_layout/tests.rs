@@ -658,6 +658,7 @@ fn visible_request_sends_context_without_targeting_the_next_paragraph() {
         text("c", "After context."),
     ]);
     let mut settings = PluginSettings::default().with_test_model();
+    settings.providers[0].kind = crate::plugins::AiProviderKind::OpenAi;
     settings.semantic_layout.enabled = true;
     settings.semantic_layout.provider = settings.providers[0].id.clone();
     settings.semantic_layout.model = settings.providers[0].models[0].id.clone();
@@ -1020,6 +1021,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
         }
     });
     let provider = crate::plugins::AiProvider {
+        kind: crate::plugins::AiProviderKind::OpenAi,
         base_url: format!("http://{address}/v1"),
         api_key: "test-key".into(),
         ..Default::default()
@@ -1358,6 +1360,7 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
         // Listener drops after this one response. A second pass would fail.
     });
     let provider = crate::plugins::AiProvider {
+        kind: crate::plugins::AiProviderKind::OpenAi,
         base_url: format!("http://{address}/v1"),
         api_key: "fixture".into(),
         ..Default::default()
@@ -1409,6 +1412,7 @@ fn layout_reasoning_defaults_roundtrips_and_changes_cache_identity() {
         serde_json::from_value(json!({"enabled":true,"provider":"old","model":"old"})).unwrap();
     assert_eq!(old.reasoning_effort, ReasoningEffort::Default);
     let mut settings = PluginSettings::default().with_test_model();
+    settings.providers[0].kind = crate::plugins::AiProviderKind::OpenAi;
     settings.providers[0].api_key = "fixture".into();
     settings.providers[0].base_url = "http://127.0.0.1:9/v1".into();
     settings.semantic_layout.enabled = true;

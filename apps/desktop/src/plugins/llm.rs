@@ -148,6 +148,9 @@ fn modes(provider: &AiProvider, schema: &Value, has_tools: bool) -> Vec<OutputMo
     if provider.structured_output != M::Auto {
         return vec![provider.structured_output];
     }
+    if provider.kind == P::Custom {
+        return vec![M::Prompt];
+    }
     [M::Native, M::Tool, M::JsonObject, M::Prompt]
         .into_iter()
         .filter(|mode| match mode {
@@ -268,6 +271,18 @@ fn messages_from_legacy(messages: &[Value]) -> Result<Vec<Message>, String> {
         }
         let wire: providers::openai::completion::Message =
             serde_json::from_value(message.clone()).map_err(|e| format!("AI 请求消息无效：{e}"))?;
+        // Rig's generic OpenAI-to-core conversion demotes system messages to
+        // user messages. Preserve instructions explicitly, including text parts.
+        if let providers::openai::completion::Message::System { content, .. } = wire {
+            output.push(Message::system(
+                content
+                    .into_iter()
+                    .map(|part| part.text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+            continue;
+        }
         output.push(
             wire.try_into()
                 .map_err(|e| format!("AI 消息转换失败：{e}"))?,
@@ -303,7 +318,18 @@ fn reasoning_params(kind: AiProviderKind, model: &str, effort: ReasoningEffort) 
             }
         }
         AiProviderKind::Ollama => json!({"think":budget != 0}),
-        AiProviderKind::DeepSeek | AiProviderKind::Moonshot => {
+        AiProviderKind::DeepSeek => {
+            if budget == 0 {
+                json!({"thinking":{"type":"disabled"}})
+            } else {
+                json!({"thinking":{"type":"enabled"},"reasoning_effort": match effort {
+                    ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
+                    ReasoningEffort::Max => "max",
+                    _ => "high",
+                }})
+            }
+        }
+        AiProviderKind::Moonshot => {
             json!({"thinking":{"type":if budget == 0 {"disabled"} else {"enabled"}}})
         }
         AiProviderKind::MiniMax => json!({}),
@@ -316,9 +342,8 @@ pub(crate) fn reasoning_levels(kind: AiProviderKind, model: &str) -> &'static [R
     use ReasoningEffort as R;
     match kind {
         AiProviderKind::MiniMax => &[R::Default],
-        AiProviderKind::DeepSeek | AiProviderKind::Ollama | AiProviderKind::Moonshot => {
-            &[R::Default, R::None, R::High]
-        }
+        AiProviderKind::DeepSeek => &[R::Default, R::None, R::Low, R::High, R::Max],
+        AiProviderKind::Ollama | AiProviderKind::Moonshot => &[R::Default, R::None, R::High],
         AiProviderKind::Gemini if model.contains("gemini-3") => &[R::Default, R::Low, R::High],
         AiProviderKind::Gemini if model.contains("pro") => {
             &[R::Default, R::Low, R::Medium, R::High]

@@ -105,7 +105,11 @@ async fn ask(provider: &AiProvider, schema: Value) -> Result<Value, String> {
     complete(
         provider,
         "test",
-        &[json!({"role":"user","content":"Return the result"})],
+        &[
+            json!({"role":"system","content":"Follow the task rules"}),
+            json!({"role":"system","content":[{"type":"text","text":"Additional rules"},{"type":"text","text":"Keep source data unchanged"}]}),
+            json!({"role":"user","content":"Return the result"}),
+        ],
         None,
         None,
         ReasoningEffort::Default,
@@ -137,6 +141,20 @@ fn four_modes_have_identical_results_and_distinct_wire_contracts() {
         assert_eq!(result["_structured_value"], json!({"ok":true}));
         let requests = handle.join().unwrap();
         let request = &requests[0];
+        let messages = request["messages"].as_array().unwrap();
+        for instruction in [
+            "Follow the task rules",
+            "Additional rules",
+            "Keep source data unchanged",
+        ] {
+            let matching: Vec<_> = messages
+                .iter()
+                .filter(|m| m["content"].to_string().contains(instruction))
+                .collect();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0]["role"], "system");
+        }
+        assert_eq!(messages.last().unwrap()["role"], "user");
         match mode {
             OutputMode::Native => assert_eq!(request["response_format"]["type"], "json_schema"),
             OutputMode::Tool => {
@@ -171,6 +189,7 @@ fn unsupported_modes_fall_back_once_then_are_cached() {
         (200, text_response("{\"ok\":true}")),
     ]);
     let provider = AiProvider {
+        kind: AiProviderKind::OpenAi,
         base_url: url,
         ..Default::default()
     };
@@ -182,6 +201,51 @@ fn unsupported_modes_fall_back_once_then_are_cached() {
     assert_eq!(requests.len(), 5);
     assert!(requests[4].get("response_format").is_none());
     assert!(requests[4].get("tools").is_none());
+}
+
+#[test]
+fn custom_output_defaults_to_prompt_and_deepseek_effort_is_preserved() {
+    assert_eq!(
+        modes(&AiProvider::default(), &schema(), false),
+        vec![OutputMode::Prompt]
+    );
+    for (effort, wire) in [
+        (ReasoningEffort::Low, "low"),
+        (ReasoningEffort::High, "high"),
+        (ReasoningEffort::Max, "max"),
+    ] {
+        let params = reasoning_params(AiProviderKind::DeepSeek, "deepseek-flash", effort);
+        assert_eq!(params["thinking"]["type"], "enabled");
+        assert_eq!(params["reasoning_effort"], wire);
+    }
+    let off = reasoning_params(
+        AiProviderKind::DeepSeek,
+        "deepseek-flash",
+        ReasoningEffort::None,
+    );
+    assert_eq!(off["thinking"]["type"], "disabled");
+    assert!(off.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn malformed_structured_tool_arguments_are_repaired_before_rig_deserialization() {
+    let mut response = tool_response(json!({"ok":true}));
+    response["choices"][0]["message"]["content"] = json!("");
+    response["choices"][0]["finish_reason"] = json!("tool_calls");
+    response["choices"][0]["message"]["tool_calls"][0]["index"] = json!(0);
+    response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+        json!("{\"ok\":true}}");
+    let (url, handle) = server(vec![(200, response)]);
+    let provider = AiProvider {
+        base_url: url,
+        kind: AiProviderKind::DeepSeek,
+        ..Default::default()
+    };
+    assert_eq!(
+        run(ask(&provider, schema())).unwrap()["_structured_value"],
+        json!({"ok":true})
+    );
+    assert_eq!(handle.join().unwrap().len(), 1);
 }
 
 #[test]

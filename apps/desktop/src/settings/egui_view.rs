@@ -1601,6 +1601,7 @@ fn reasoning_effort_label(language: AppLanguage, effort: ReasoningEffort) -> &'s
         ReasoningEffort::Low => "低",
         ReasoningEffort::Medium => "中",
         ReasoningEffort::High => "高",
+        ReasoningEffort::Max => "最高",
     };
     language.text(chinese, effort.label())
 }
@@ -1612,13 +1613,17 @@ fn reasoning_effort_selector(
     model: Option<&ConfiguredModel>,
     language: AppLanguage,
 ) {
+    let levels = model.map_or(&ReasoningEffort::ALL[..], |m| {
+        crate::plugins::llm::reasoning_levels(m.kind, &m.model)
+    });
+    if !levels.contains(selected) {
+        *selected = ReasoningEffort::Default;
+    }
     egui::ComboBox::from_id_salt(id_salt)
         .width(SETTINGS_MODEL_SELECT_WIDTH)
         .selected_text(reasoning_effort_label(language, *selected))
         .show_ui(ui, |ui| {
-            for &effort in model.map_or(&ReasoningEffort::ALL[..], |m| {
-                crate::plugins::llm::reasoning_levels(m.kind, &m.model)
-            }) {
+            for &effort in levels {
                 ui.selectable_value(selected, effort, reasoning_effort_label(language, effort));
             }
         });

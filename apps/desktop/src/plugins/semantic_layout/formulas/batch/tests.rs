@@ -95,6 +95,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
         }
     });
     let provider = crate::plugins::AiProvider {
+        kind: crate::plugins::AiProviderKind::OpenAi,
         base_url: format!("http://{address}/v1"),
         api_key: "fixture-key".into(),
         ..Default::default()
@@ -192,7 +193,8 @@ fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Op
                         .is_some_and(|value| !value.is_empty())
                 );
             }
-            let prompt = request["messages"][0]["content"].as_str().unwrap();
+            assert_eq!(request["messages"][0]["role"], "system");
+            let prompt = request["messages"][0]["content"].to_string();
             assert!(!prompt.contains(if mode == "verify" {
                 "Transcription self-check"
             } else {
@@ -203,16 +205,11 @@ fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Op
             let header: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(header["mode"], mode);
             assert_eq!(header["requested_ids"], json!(ids));
-            assert!(
-                request["messages"][0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains(if mode == "verify" {
-                        "Conditional review"
-                    } else {
-                        "Transcription self-check"
-                    })
-            );
+            assert!(prompt.contains(if mode == "verify" {
+                "Conditional review"
+            } else {
+                "Transcription self-check"
+            }));
             let (status, body) = if reply.is_null() {
                 ("500 Internal Server Error", "{}".to_owned())
             } else {
@@ -225,6 +222,7 @@ fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Op
         }
     });
     let provider = crate::plugins::AiProvider {
+        kind: crate::plugins::AiProviderKind::OpenAi,
         base_url: format!("http://{address}/v1"),
         api_key: "fixture".into(),
         ..Default::default()
