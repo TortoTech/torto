@@ -226,12 +226,12 @@ fn paragraph_atoms_for_content_mode(
                 }
                 len
             }
-            Inline::Image(_) => 0,
+            Inline::Image(_) => 1,
             Inline::Break => 1,
         };
         cursor += len;
     }
-    let atoms = paragraph_atoms_with_protected_ranges(&text, &protected, language_hint);
+    let atoms = paragraph_atoms_with_protected_ranges(&text, &protected, &footnotes, language_hint);
     let atoms = if split_semicolons && text.contains([';', '；']) {
         let chars = text.chars().collect::<Vec<_>>();
         let boundaries = atoms
@@ -261,6 +261,118 @@ fn text_kind_is_structurable(kind: TextBlockKind) -> bool {
 #[cfg(test)]
 mod list_structure_tests {
     use super::*;
+    #[test]
+    fn sentence_leading_recognized_formula_stays_after_the_break() {
+        let formula = Inline::Math(rebook_publication::MathRun {
+            original: None,
+            latex: "F(C=c)".into(),
+            display: false,
+            size_scale: 1.0,
+        });
+        let text = |value: &str| {
+            Inline::Text(TextRun {
+                text: value.into(),
+                style: Default::default(),
+                link: None,
+            })
+        };
+        for (before, after, language) in [
+            (
+                "因此，设计优秀的编码与概率密切相关。",
+                " 的一个典型度量是按键次数。",
+                "zh",
+            ),
+            (
+                "The code involves probability. ",
+                " measures the keystrokes.",
+                "en",
+            ),
+        ] {
+            let mut block = TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![text(before), formula.clone(), text(after)],
+                style: Default::default(),
+                source: None,
+            };
+            apply_sentence_structure(&mut block, language);
+            let break_index = block
+                .content
+                .iter()
+                .position(|item| matches!(item, Inline::Break))
+                .unwrap();
+            assert_eq!(block.content[break_index + 1], formula);
+            assert_eq!(
+                block
+                    .content
+                    .iter()
+                    .filter(|item| matches!(item, Inline::Math(_)))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn sentence_leading_image_stays_after_the_break() {
+        for (before, after, language) in [
+            ("因此，编码涉及概率。", " 的典型度量是按键次数。", "zh"),
+            (
+                "The code involves probability. ",
+                " measures the keystrokes.",
+                "en",
+            ),
+        ] {
+            let image = Inline::Image(Box::new(rebook_publication::InlineImageRun {
+                image: rebook_publication::ImageBlock {
+                    formula_image: true,
+                    formula: None,
+                    href: PublicationUrl::parse("formula.png").unwrap(),
+                    alt: "F(C=c)".into(),
+                    style: Default::default(),
+                    source: None,
+                    text_layer: None,
+                },
+                size_scale: 1.0,
+                intrinsic_sizing: false,
+                vertical_align: Default::default(),
+                presentation: false,
+            }));
+            let text = |value: &str| {
+                Inline::Text(TextRun {
+                    text: value.into(),
+                    style: Default::default(),
+                    link: None,
+                })
+            };
+            let mut block = TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![text(before), image.clone(), text(after)],
+                style: Default::default(),
+                source: None,
+            };
+            apply_sentence_structure(&mut block, language);
+            let break_index = block
+                .content
+                .iter()
+                .position(|item| matches!(item, Inline::Break))
+                .unwrap();
+            assert_eq!(block.content[break_index + 1], image);
+            assert_eq!(
+                block
+                    .content
+                    .iter()
+                    .filter(|item| matches!(item, Inline::Image(_)))
+                    .count(),
+                1
+            );
+
+            // Media at the end of a paragraph must not disappear either.
+            let original = vec![text(before), image.clone()];
+            let len = inline_text(&original).chars().count();
+            assert_eq!(slice_inlines(&original, 0, len), original);
+        }
+    }
+
     #[test]
     fn sentence_splitting_preserves_list_number_depth_and_inline_content() {
         let kind = TextBlockKind::ListItem {
@@ -719,6 +831,7 @@ fn attach_footnote_atoms(
 fn paragraph_atoms_with_protected_ranges(
     text: &str,
     protected_ranges: &[std::ops::Range<usize>],
+    trailing_references: &[std::ops::Range<usize>],
     language: &str,
 ) -> Vec<ParagraphAtom> {
     let chars = text.chars().collect::<Vec<_>>();
@@ -726,7 +839,18 @@ fn paragraph_atoms_with_protected_ranges(
     for range in protected_ranges {
         for index in range.clone() {
             if let Some(character) = segmentation_chars.get_mut(index) {
-                *character = ' ';
+                // Formulas are content, not whitespace: masking them as spaces
+                // lets the segmenter consume a sentence-leading formula as the
+                // previous sentence's trailing whitespace. References still
+                // attach backward and are normalized by attach_footnote_atoms.
+                *character = if trailing_references
+                    .iter()
+                    .any(|range| range.contains(&index))
+                {
+                    ' '
+                } else {
+                    '\u{fffc}'
+                };
             }
         }
     }
@@ -837,7 +961,9 @@ fn inline_text(content: &[Inline]) -> String {
         .map(|inline| match inline {
             Inline::Text(run) => run.text.clone(),
             Inline::Math(run) => run.original_text().unwrap_or_else(|| run.latex.clone()),
-            Inline::Image(_) => String::new(),
+            // Keep media in the segmentation coordinate space: otherwise a
+            // sentence-leading image can be swallowed by trailing whitespace.
+            Inline::Image(_) => "\u{fffc}".to_owned(),
             Inline::Break => "\n".to_owned(),
         })
         .collect()
@@ -886,7 +1012,7 @@ fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                 .unwrap_or_else(|| run.latex.clone())
                 .chars()
                 .count(),
-            Inline::Image(_) => 0,
+            Inline::Image(_) => 1,
             Inline::Break => 1,
         };
         let inline_start = cursor;
@@ -1253,7 +1379,7 @@ mod tests {
     #[test]
     fn atoms_cover_cjk_and_latin_sentences_without_rewriting() {
         let text = "首先，观察系统。其次，比较反馈；Finally, decide.";
-        let atoms = paragraph_atoms_with_protected_ranges(text, &[], "zh");
+        let atoms = paragraph_atoms_with_protected_ranges(text, &[], &[], "zh");
         assert_eq!(
             atoms
                 .iter()
@@ -1523,7 +1649,7 @@ mod tests {
     #[test]
     fn quoted_sentence_followed_by_ordinary_text_keeps_its_boundary() {
         let text = "他说：“快走！”第二天他们再次见面。";
-        let atoms = paragraph_atoms_with_protected_ranges(text, &[], "zh");
+        let atoms = paragraph_atoms_with_protected_ranges(text, &[], &[], "zh");
         let atoms = attach_paired_punctuation_atoms(atoms, text);
         let atoms = merge_leading_continuation_punctuation_atoms(atoms, text);
 

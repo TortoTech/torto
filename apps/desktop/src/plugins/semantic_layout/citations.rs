@@ -15,13 +15,12 @@ pub(super) struct Citation {
 
 #[cfg(test)]
 pub(super) fn options() -> Value {
-    json!({"temperature":0.0,"response_format":{"type":"json_schema","json_schema":{
-        "name":"inline_bibliographic_citations","strict":true,"schema":{
+    json!({"temperature":0.0,"output_schema":{
             "type":"object","additionalProperties":false,
             "properties":{"citations":{"type":"array","items":{"type":"integer"}}},
             "required":["citations"]
         }
-    }}})
+    })
 }
 
 fn texts<'a>(blocks: &'a [Block], out: &mut Vec<&'a TextBlock>) {

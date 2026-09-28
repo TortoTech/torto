@@ -1,4 +1,17 @@
 use super::*;
+fn wire_text(message: &Value) -> String {
+    message["content"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            message["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect()
+        })
+}
 use crate::plugins::{BlockTranslation, TranslationBookSource, TranslationMode};
 use rebook_publication::{
     ImageBlock, Metadata, PublicationId, SourceAnchor, SpineItem, SpineItemId, TextRun,
@@ -632,12 +645,11 @@ fn visible_request_sends_context_without_targeting_the_next_paragraph() {
         let mut bytes = vec![0; length];
         reader.read_exact(&mut bytes).unwrap();
         let request: Value = serde_json::from_slice(&bytes).unwrap();
-        let input: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let input: Value = serde_json::from_str(&wire_text(&request["messages"][1])).unwrap();
         assert_eq!(input["target_start"], 1);
         assert_eq!(input["target_end_exclusive"], 2);
         assert_eq!(input["blocks"].as_array().unwrap().len(), 3);
-        let body = json!({"choices":[{"message":{"content":"{\"groups\":[]}"}}]}).to_string();
+        let body = json!({"choices":[{"message":{"content":"{\"groups\":[],\"citations\":[],\"formulas\":[]}"}}]}).to_string();
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
     });
     let original = section(vec![
@@ -990,25 +1002,19 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
             assert_eq!(item["properties"]["kind"]["enum"], json!(["quote"]));
             assert_eq!(
                 item["required"],
-                json!(["kind", "body", "attribution", "alignment"])
+                json!(["alignment", "attribution", "body", "kind"])
             );
             assert_eq!(item["properties"]["attribution"]["type"], json!("integer"));
-            assert!(
-                request["messages"][0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("# AI layout")
-            );
-            let input: Value =
-                serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+            assert!(wire_text(&request["messages"][0]).starts_with("# AI layout"));
+            let input: Value = serde_json::from_str(&wire_text(&request["messages"][1])).unwrap();
             assert_eq!(input["blocks"][0]["id"], 0);
             if attempt == 1 {
                 let last = request["messages"].as_array().unwrap().last().unwrap();
-                let feedback = last["content"].as_str().unwrap();
+                let feedback = wire_text(last);
                 assert!(feedback.starts_with("# Correct the response"));
                 assert!(feedback.contains("## Structural error") && feedback.contains("99"));
             }
-            let result = json!({"groups":[{"kind":"quote_inline","body":[if attempt == 0 {99} else {0}],"credit":"-- A poet","alignment":"center"}]});
+            let result = json!({"groups":[{"kind":"quote_inline","body":[if attempt == 0 {99} else {0}],"credit":"-- A poet","alignment":"center"}],"citations":[],"formulas":[]});
             let body = json!({"choices":[{"message":{"content":result.to_string()}}]}).to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         }
@@ -1049,9 +1055,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
     });
     assert_eq!(
         figure
-            .pointer(
-                "/response_format/json_schema/schema/properties/groups/items/properties/kind/enum"
-            )
+            .pointer("/output_schema/properties/groups/items/properties/kind/enum")
             .unwrap(),
         &json!(["figure"])
     );
@@ -1331,10 +1335,9 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
         assert_eq!(request["reasoning_effort"], "high");
         assert_eq!(
             request["response_format"]["json_schema"]["schema"]["required"],
-            json!(["groups", "citations", "formulas"])
+            json!(["citations", "formulas", "groups"])
         );
-        let input: Value =
-            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let input: Value = serde_json::from_str(&wire_text(&request["messages"][1])).unwrap();
         assert_eq!(input["blocks"][0]["citation_candidates"][0]["id"], "c0_0_0");
         assert_eq!(input["quotes_enabled"], true);
         assert_eq!(input["captions_enabled"], true);

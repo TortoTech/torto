@@ -26,6 +26,7 @@ const SHORTCUT_CONTROL_WIDTH: f32 = 180.0;
 struct ConfiguredModel {
     provider_id: String,
     provider_name: String,
+    kind: AiProviderKind,
     model: String,
 }
 
@@ -943,6 +944,9 @@ fn semantic_layout_rows(
                 ui,
                 "semantic-layout-reasoning-effort",
                 &mut settings.reasoning_effort,
+                model_options
+                    .iter()
+                    .find(|m| m.provider_id == settings.provider && m.model == settings.model),
                 language,
             );
         });
@@ -1072,9 +1076,11 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         let provider_id = state.draft_plugin_settings.providers[index].id.clone();
         let fetched_models = state.provider_models_cache.get(&provider_id).cloned();
         let fetch_error = state.provider_models_errors.get(&provider_id).cloned();
+        let test_result = state.provider_test_results.get(&provider_id).cloned();
         let loading = state.provider_models_loading.as_deref() == Some(&provider_id);
         let mut provider_changed = false;
         let mut refresh_requested = false;
+        let mut test_requested = false;
         settings_card(ui, |ui| {
             let provider = &mut state.draft_plugin_settings.providers[index];
             egui::Grid::new(("ai-provider-settings-grid", &provider.id))
@@ -1088,7 +1094,20 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                             .width(SETTINGS_SELECT_WIDTH)
                             .selected_text(ai_provider_kind_label(language, selected_kind))
                             .show_ui(ui, |ui| {
+                                let search_id = ui.id().with("provider-search");
+                                let mut search = ui
+                                    .data_mut(|data| data.get_temp::<String>(search_id))
+                                    .unwrap_or_default();
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut search)
+                                        .hint_text(language.text("搜索供应商", "Search providers")),
+                                );
+                                ui.data_mut(|data| data.insert_temp(search_id, search.clone()));
+                                let search = search.trim().to_lowercase();
                                 for kind in AiProviderKind::ALL {
+                                    if !kind.matches_search(&search) {
+                                        continue;
+                                    }
                                     ui.selectable_value(
                                         &mut selected_kind,
                                         kind,
@@ -1096,10 +1115,6 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                                     );
                                 }
                             });
-                        field_label(
-                            ui,
-                            language.text("仅支持 OpenAI 兼容协议", "OpenAI-compatible APIs only"),
-                        );
                         if selected_kind != provider.kind {
                             provider.select_kind(selected_kind);
                             provider_changed = true;
@@ -1125,7 +1140,7 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     });
                     ui.end_row();
 
-                    if provider.kind == AiProviderKind::Custom {
+                    {
                         settings_row_label(ui, language.text("接口地址", "Base URL"));
                         settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
                             if text_field_sized_with_hint(
@@ -1158,6 +1173,58 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     });
                     ui.end_row();
 
+                    settings_row_label(ui, language.text("JSON 输出", "JSON output"));
+                    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                        egui::ComboBox::from_id_salt(("structured-output", &provider.id))
+                            .selected_text(provider.structured_output.label())
+                            .show_ui(ui, |ui| {
+                                for mode in crate::plugins::llm::OutputMode::ALL {
+                                    provider_changed |= ui
+                                        .selectable_value(
+                                            &mut provider.structured_output,
+                                            mode,
+                                            mode.label(),
+                                        )
+                                        .changed();
+                                }
+                            });
+                    });
+                    ui.end_row();
+                    settings_row_label(
+                        ui,
+                        language.text("结构化输出工具", "Structured output tool"),
+                    );
+                    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                        provider_changed |= ui
+                            .checkbox(
+                                &mut provider.allow_output_tools,
+                                language.text("自动模式允许使用", "Allow in Auto mode"),
+                            )
+                            .changed();
+                        if ui
+                            .small_button(language.text("重置能力缓存", "Reset capability cache"))
+                            .clicked()
+                        {
+                            crate::plugins::llm::reset_capabilities();
+                        }
+                    });
+                    ui.end_row();
+
+                    settings_row_label(ui, language.text("连接测试", "Connection test"));
+                    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                        test_requested = ui
+                            .add_enabled(
+                                !loading,
+                                egui::Button::new(
+                                    language.text("测试第一个模型", "Test first model"),
+                                ),
+                            )
+                            .clicked();
+                        if let Some(result) = &test_result {
+                            ui.label(result);
+                        }
+                    });
+                    ui.end_row();
                     settings_row_label(ui, language.text("模型", "Models"));
                     settings_row_control_sized(ui, 392.0, |ui| {
                         refresh_requested = provider_models_selector(
@@ -1182,9 +1249,11 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             && !state.provider_models_task.is_pending()
             && !provider_changed
             && !provider.base_url.trim().is_empty();
-        if refresh_requested || needs_initial_fetch {
+        if test_requested || refresh_requested || needs_initial_fetch {
             state.request_provider_models(ProviderModelsRequest {
+                test_provider: test_requested.then(|| provider.clone()),
                 provider_id: provider.id,
+                kind: provider.kind,
                 base_url: provider.base_url,
                 api_key: provider.api_key,
             });
@@ -1314,6 +1383,10 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         ui,
                         "chat-reasoning-effort",
                         &mut settings.chat_reasoning_effort,
+                        options.iter().find(|m| {
+                            m.provider_id == settings.chat_provider
+                                && m.model == settings.chat_model
+                        }),
                         language,
                     );
                 });
@@ -1516,6 +1589,10 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         ui,
                         "translation-reasoning-effort",
                         &mut settings.translation_reasoning_effort,
+                        options.iter().find(|m| {
+                            m.provider_id == settings.translation_provider
+                                && m.model == settings.translation_model
+                        }),
                         language,
                     );
                 });
@@ -1586,13 +1663,16 @@ fn reasoning_effort_selector(
     ui: &mut egui::Ui,
     id_salt: &'static str,
     selected: &mut ReasoningEffort,
+    model: Option<&ConfiguredModel>,
     language: AppLanguage,
 ) {
     egui::ComboBox::from_id_salt(id_salt)
         .width(SETTINGS_MODEL_SELECT_WIDTH)
         .selected_text(reasoning_effort_label(language, *selected))
         .show_ui(ui, |ui| {
-            for effort in ReasoningEffort::ALL {
+            for &effort in model.map_or(&ReasoningEffort::ALL[..], |m| {
+                crate::plugins::llm::reasoning_levels(m.kind, &m.model)
+            }) {
                 ui.selectable_value(selected, effort, reasoning_effort_label(language, effort));
             }
         });
@@ -1612,6 +1692,7 @@ fn configured_model_options(settings: &PluginSettings) -> Vec<ConfiguredModel> {
                 options.push(ConfiguredModel {
                     provider_id: provider.id.clone(),
                     provider_name: provider_name.clone(),
+                    kind: provider.kind,
                     model: id.to_owned(),
                 });
             }

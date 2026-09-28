@@ -6,7 +6,9 @@ use crate::async_task::TaskResult;
 
 #[derive(Clone)]
 pub(super) struct ProviderModelsRequest {
+    pub(super) test_provider: Option<crate::plugins::AiProvider>,
     pub(super) provider_id: String,
+    pub(super) kind: crate::plugins::AiProviderKind,
     pub(super) base_url: String,
     pub(super) api_key: String,
 }
@@ -26,38 +28,108 @@ struct ModelEntry {
 pub(super) async fn fetch_provider_models(
     request: &ProviderModelsRequest,
 ) -> Result<Vec<String>, String> {
-    let url = models_url(&request.base_url)?;
+    if let Some(provider) = &request.test_provider {
+        crate::plugins::llm::test_connection(provider).await?;
+        return Ok(Vec::new());
+    }
+    use crate::plugins::AiProviderKind as P;
+    let base = request.base_url.trim().trim_end_matches('/');
+    let url = match request.kind {
+        P::Anthropic => format!("{}/v1/models", base.trim_end_matches("/v1")),
+        P::Gemini => format!("{}/v1beta/models", base.trim_end_matches("/v1beta")),
+        P::Ollama => format!("{}/api/tags", base.trim_end_matches("/api")),
+        _ => models_url(base)?,
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| format!("创建模型请求失败：{error}"))?;
-    let mut builder = client.get(&url);
-    if !request.api_key.trim().is_empty() {
-        builder = builder.bearer_auth(request.api_key.trim());
+    let mut models = Vec::new();
+    let mut cursor = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    for _ in 0..32 {
+        let mut builder = client.get(&url);
+        match request.kind {
+            P::Anthropic => {
+                builder = builder
+                    .header("x-api-key", request.api_key.trim())
+                    .header("anthropic-version", "2023-06-01");
+                if let Some(cursor) = &cursor {
+                    builder = builder.query(&[("after_id", cursor)]);
+                }
+            }
+            P::Gemini => {
+                builder = builder.header("x-goog-api-key", request.api_key.trim());
+                if let Some(cursor) = &cursor {
+                    builder = builder.query(&[("pageToken", cursor)]);
+                }
+            }
+            _ => {
+                if !request.api_key.trim().is_empty() {
+                    builder = builder.bearer_auth(request.api_key.trim());
+                }
+            }
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| format!("获取模型失败：{e}；也可以手动填写模型 ID"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("读取模型响应失败：{e}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "获取模型失败：HTTP {status} · {}；可手动填写模型 ID",
+                clipped_error_detail(&body)
+            ));
+        }
+        let payload: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("模型列表无效：{e}"))?;
+        models.extend(parse_provider_models(request.kind, &payload)?);
+        cursor = match request.kind {
+            P::Anthropic if payload["has_more"] == true => {
+                payload["last_id"].as_str().map(str::to_owned)
+            }
+            P::Gemini => payload["nextPageToken"].as_str().map(str::to_owned),
+            _ => None,
+        };
+        if cursor
+            .as_ref()
+            .is_none_or(|c| c.is_empty() || !seen_cursors.insert(c.clone()))
+        {
+            break;
+        }
     }
-    let response = builder
-        .send()
-        .await
-        .map_err(|error| format!("获取模型失败：{error}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| format!("读取模型响应失败：{error}"))?;
-    if !status.is_success() {
-        let detail = body.trim();
-        return Err(if detail.is_empty() {
-            format!("获取模型失败：HTTP {status}")
-        } else {
-            format!(
-                "获取模型失败：HTTP {status} · {}",
-                clipped_error_detail(detail)
-            )
-        });
-    }
-    parse_models_response(&body)
+    models.sort_by_key(|m| m.to_lowercase());
+    models.dedup();
+    Ok(models)
 }
 
+fn parse_provider_models(
+    kind: crate::plugins::AiProviderKind,
+    payload: &serde_json::Value,
+) -> Result<Vec<String>, String> {
+    use crate::plugins::AiProviderKind as P;
+    match kind {
+        P::Gemini | P::Ollama => {
+            let entries = payload["models"].as_array().ok_or("模型列表缺少 models")?;
+            Ok(entries
+                .iter()
+                .filter(|m| {
+                    kind != P::Gemini
+                        || m["supportedGenerationMethods"]
+                            .as_array()
+                            .is_none_or(|methods| methods.iter().any(|v| v == "generateContent"))
+                })
+                .filter_map(|m| m["name"].as_str())
+                .map(|name| name.strip_prefix("models/").unwrap_or(name).to_owned())
+                .collect())
+        }
+        _ => parse_models_response(&payload.to_string()),
+    }
+}
 fn clipped_error_detail(detail: &str) -> String {
     const MAX_CHARS: usize = 240;
     if detail.chars().count() <= MAX_CHARS {
@@ -115,6 +187,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_model_lists_keep_chat_models_and_local_names() {
+        use crate::plugins::AiProviderKind as P;
+        use serde_json::json;
+        assert_eq!(
+            parse_provider_models(
+                P::Gemini,
+                &json!({"models":[
+                    {"name":"models/gemini-chat","supportedGenerationMethods":["generateContent"]},
+                    {"name":"models/embedding","supportedGenerationMethods":["embedContent"]}
+                ]})
+            )
+            .unwrap(),
+            vec!["gemini-chat"]
+        );
+        assert_eq!(
+            parse_provider_models(P::Ollama, &json!({"models":[{"name":"qwen3:8b"}]})).unwrap(),
+            vec!["qwen3:8b"]
+        );
+        assert_eq!(
+            parse_provider_models(
+                P::Anthropic,
+                &json!({"data":[{"id":"claude-test"}],"has_more":false})
+            )
+            .unwrap(),
+            vec!["claude-test"]
+        );
+    }
+
+    #[test]
     fn models_endpoint_is_normalized_from_common_base_urls() {
         assert_eq!(
             models_url("https://example.com/v1").unwrap(),
@@ -163,6 +264,8 @@ mod tests {
             .unwrap();
         });
         let request = ProviderModelsRequest {
+            test_provider: None,
+            kind: crate::plugins::AiProviderKind::Custom,
             provider_id: "provider".into(),
             base_url: format!("http://{address}/v1/chat/completions"),
             api_key: "secret".into(),

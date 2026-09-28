@@ -1259,6 +1259,118 @@ fn local_image_resize_ui_performance() {
 }
 
 #[test]
+#[ignore = "requires TORTO_PERF_BOOK; offline translated chapter interaction profiling"]
+fn local_translated_chapter_interaction_performance() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let book = rebook_formats::open_file(std::path::PathBuf::from(
+        std::env::var_os("TORTO_PERF_BOOK").unwrap(),
+    ))
+    .unwrap();
+    let index = std::env::var("TORTO_PERF_SECTION")
+        .unwrap_or("8".into())
+        .parse::<usize>()
+        .unwrap();
+    if let Some(notes_index) = book
+        .source()
+        .book()
+        .sections
+        .iter()
+        .position(|section| section.id.as_str() == "c10992_Mullaney-0016")
+    {
+        let notes = book.source().parse_section(notes_index).unwrap();
+        let target = notes.href.resolve("#en1").unwrap();
+        let ranges = focus_footnote_translation_ranges_in_section(&notes, &target);
+        let text = focus_footnote_text_in_section(&notes, &target, "1").unwrap();
+        println!(
+            "first_note_ranges={} first_note_chars={} top_blocks={}",
+            ranges.len(),
+            text.chars().count(),
+            notes.blocks.len()
+        );
+        assert_eq!(
+            ranges.len(),
+            1,
+            "one footnote must not expand to the notes chapter"
+        );
+    }
+    for translated in [false, true] {
+        let (mut reader, _, _) = fixture();
+        reader.rewrite_source = Arc::new(RewriteBookSource::new(book.source()));
+        reader.translation_source = Arc::new(TranslationBookSource::new(
+            reader.rewrite_source.clone(),
+            crate::plugins::TranslationMode::Replace,
+        ));
+        let original = reader.rewrite_source.parse_section(index).unwrap();
+        if translated {
+            let translations = crate::plugins::prepare_translation_inputs(&original, false).into_iter().map(|(input, _)| crate::plugins::BlockTranslation {
+                block_index: input.block_index, segment_index: input.segment_index,
+                text: "中文阅读与计算机技术的发展密切相关，这是用于比较排版交互耗时的离线测试文本。".repeat((input.text.chars().count() / 100).max(1)),
+            }).collect::<Vec<_>>();
+            reader
+                .translation_source
+                .store_batch(index, &translations)
+                .unwrap();
+            reader.translation_source.set_enabled(true).unwrap();
+        }
+        reader.semantic_source = Arc::new(SemanticLayoutSource::new(
+            reader.translation_source.clone(),
+            reader.rewrite_source.clone(),
+        ));
+        reader.structure_source = Arc::new(ParagraphStructureSource::new(
+            reader.semantic_source.clone(),
+        ));
+        reader.source = reader.structure_source.clone();
+        reader.semantic_layout = Default::default();
+        reader.reader = rebook_reader::ReaderSession::open_with_fonts(
+            reader.source.clone(),
+            rebook_layout::LayoutViewport::new(1778, 1000).unwrap(),
+            rebook_layout::ReaderStyle {
+                spread: rebook_layout::SpreadMode::Scroll,
+                typesetting: rebook_layout::ReaderTypesetting::unified(),
+                ..Default::default()
+            },
+            crate::fonts::embedded_reader_fonts(),
+        )
+        .unwrap();
+        let snapshot = reader.reader.go_to_section(index).unwrap().snapshot;
+        reader.apply_snapshot(snapshot, super::super::SnapshotEffects::navigation());
+        let ctx = egui::Context::default();
+        for frame in 0..16 {
+            let started = Instant::now();
+            if frame > 3 {
+                reader.move_focus_unit(PageDirection::Next);
+            }
+            let turn_ms = started.elapsed().as_secs_f64() * 1000.;
+            let started = Instant::now();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1778., 1000.),
+                    )),
+                    time: Some(frame as f64 / 10.),
+                    ..Default::default()
+                },
+                |ui| {
+                    reader.ui(ui, None, false);
+                },
+            );
+            output.textures_delta.clear();
+            let ui_ms = started.elapsed().as_secs_f64() * 1000.;
+            let started = Instant::now();
+            let _scene = reader.page_scene();
+            println!(
+                "translated={translated} frame={frame} blocks={} units={} turn_ms={turn_ms:.2} ui_ms={ui_ms:.2} scene_ms={:.2}",
+                original.blocks.len(),
+                reader.focus_units.len(),
+                started.elapsed().as_secs_f64() * 1000.
+            );
+        }
+    }
+}
+
+#[test]
 fn translation_waits_for_same_block_semantics_and_failure_releases_it() {
     let (mut reader, original, _) = fixture();
     let hash = crate::plugins::semantic_layout::fingerprint(&original);

@@ -662,6 +662,7 @@ async fn translate_block_batch(
     reasoning_effort: ReasoningEffort,
     blocks: &[TranslationBlockInput],
 ) -> Result<Vec<BlockTranslation>, String> {
+    crate::plugins::llm::budgeted(async {
     let keys = (0..blocks.len())
         .map(|index| index.to_string())
         .collect::<Vec<_>>();
@@ -676,6 +677,10 @@ async fn translate_block_batch(
         ""
     };
     let citation_contract = translation_citation_contract(blocks)?;
+    let schema = super::llm::schema_options(json!({
+        "type":"object", "additionalProperties":false, "required":keys,
+        "properties": keys.iter().map(|key| (key.clone(), json!({"type":"string", "minLength":1}))).collect::<serde_json::Map<_,_>>()
+    }));
     let mut last_error = None;
     for attempt in 1..=MAX_TRANSLATION_ATTEMPTS {
         let mut messages = vec![
@@ -698,7 +703,7 @@ async fn translate_block_batch(
             None,
             None,
             reasoning_effort,
-            None,
+            Some(&schema),
         )
         .await
         {
@@ -743,6 +748,7 @@ async fn translate_block_batch(
         }
     }
     Err(last_error.unwrap_or_else(|| "翻译结果格式无效".to_owned()))
+    }).await
 }
 
 fn translation_citation_contract(blocks: &[TranslationBlockInput]) -> Result<String, String> {
@@ -907,12 +913,6 @@ fn parse_translation_object(content: &str, keys: &[String]) -> Result<Vec<String
         .collect()
 }
 
-fn apply_reasoning_effort(body: &mut Value, reasoning_effort: ReasoningEffort) {
-    if let Some(value) = reasoning_effort.api_value() {
-        body["reasoning_effort"] = Value::String(value.into());
-    }
-}
-
 pub(super) async fn request_completion(
     client: &Client,
     provider: &AiProvider,
@@ -923,54 +923,18 @@ pub(super) async fn request_completion(
     reasoning_effort: ReasoningEffort,
     extra_body: Option<&Value>,
 ) -> Result<Value, String> {
-    let mut body = json!({
-        "model": if model.trim().is_empty() { "gpt-4o-mini" } else { model.trim() },
-        "messages": messages,
-        "temperature": 0.2,
-    });
-    if let Some(tools) = tools {
-        body["tools"] = tools.clone();
-        body["tool_choice"] = Value::String("auto".into());
-    }
-    if let Some(max_tokens) = max_tokens {
-        body["max_tokens"] = json!(max_tokens);
-    }
-    apply_reasoning_effort(&mut body, reasoning_effort);
-    if let Some(extra_body) = extra_body.and_then(Value::as_object) {
-        let body = body
-            .as_object_mut()
-            .expect("completion request body should be an object");
-        for (key, value) in extra_body {
-            body.insert(key.clone(), value.clone());
-        }
-    }
-    let response = client
-        .post(chat_completions_url(&provider.base_url))
-        .bearer_auth(provider.api_key.trim())
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| format!("AI 请求失败：{error}"))?;
-    let status = response.status();
-    let response_text = response
-        .text()
-        .await
-        .map_err(|error| format!("读取 AI 响应失败：{error}"))?;
-    let payload: Value = serde_json::from_str(&response_text)
-        .map_err(|error| format!("AI 响应不是有效 JSON：{error}"))?;
-    if !status.is_success() {
-        let message = payload
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or(&response_text);
-        return Err(format!("AI 服务返回 {status}：{message}"));
-    }
-    payload
-        .pointer("/choices/0/message")
-        .cloned()
-        .ok_or_else(|| "AI 响应缺少 choices[0].message".into())
+    let _ = client; // Kept at the book-task boundary during migration.
+    super::llm::complete(
+        provider,
+        model,
+        messages,
+        tools,
+        max_tokens,
+        reasoning_effort,
+        extra_body,
+    )
+    .await
 }
-
 #[derive(Clone, Debug)]
 pub enum ChatStreamEvent {
     Content(String),
@@ -1020,224 +984,17 @@ pub(super) async fn request_streaming_completion<F>(
 where
     F: FnMut(ChatStreamEvent),
 {
-    let mut body = json!({
-        "model": if model.trim().is_empty() { "gpt-4o-mini" } else { model.trim() },
-        "messages": messages,
-        "temperature": 0.2,
-        "stream": true,
-    });
-    if let Some(tools) = tools {
-        body["tools"] = tools.clone();
-        body["tool_choice"] = Value::String("auto".into());
-    }
-    apply_reasoning_effort(&mut body, reasoning_effort);
-    let mut response = client
-        .post(chat_completions_url(&provider.base_url))
-        .bearer_auth(provider.api_key.trim())
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| format!("AI 请求失败：{error}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let response_text = response
-            .text()
-            .await
-            .map_err(|error| format!("读取 AI 响应失败：{error}"))?;
-        let message = serde_json::from_str::<Value>(&response_text)
-            .ok()
-            .and_then(|payload| {
-                payload
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .unwrap_or(response_text);
-        return Err(format!("AI 服务返回 {status}：{message}"));
-    }
-
-    let mut decoder = SseDecoder::default();
-    let mut raw_response = Vec::new();
-    let mut streamed = StreamedMessage::default();
-    let mut saw_sse_data = false;
-    let mut finished = false;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("读取 AI 流式响应失败：{error}"))?
-    {
-        raw_response.extend_from_slice(&chunk);
-        for data in decoder.push(&chunk)? {
-            saw_sse_data = true;
-            if data.trim() == "[DONE]" {
-                finished = true;
-                break;
-            }
-            let payload: Value = serde_json::from_str(&data)
-                .map_err(|error| format!("AI 流式响应不是有效 JSON：{error}"))?;
-            if let Some(message) = payload.pointer("/error/message").and_then(Value::as_str) {
-                return Err(format!("AI 流式响应失败：{message}"));
-            }
-            if let Some(delta) = payload.pointer("/choices/0/delta") {
-                if let Some(reasoning) = streamed_reasoning(delta) {
-                    if !reasoning.is_empty() {
-                        on_content(ChatStreamEvent::Reasoning(reasoning.into()));
-                    }
-                }
-                if streamed.apply_delta(delta) {
-                    on_content(ChatStreamEvent::Content(streamed.content.clone()));
-                }
-            }
-        }
-        if finished {
-            break;
-        }
-    }
-
-    if !saw_sse_data {
-        let response_text = String::from_utf8(raw_response)
-            .map_err(|error| format!("AI 响应不是 UTF-8：{error}"))?;
-        let payload: Value = serde_json::from_str(&response_text)
-            .map_err(|error| format!("AI 响应不是有效 JSON：{error}"))?;
-        let message = payload
-            .pointer("/choices/0/message")
-            .cloned()
-            .ok_or_else(|| "AI 响应缺少 choices[0].message".to_owned())?;
-        if let Some(reasoning) = streamed_reasoning(&message) {
-            on_content(ChatStreamEvent::Reasoning(reasoning.into()));
-        }
-        if let Some(content) = message_content(&message) {
-            on_content(ChatStreamEvent::Content(content));
-        }
-        return Ok(message);
-    }
-
-    streamed.into_message()
+    let _ = client;
+    super::llm::stream(
+        provider,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        on_content,
+    )
+    .await
 }
-
-#[derive(Default)]
-struct SseDecoder {
-    buffer: Vec<u8>,
-}
-
-impl SseDecoder {
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
-        self.buffer.extend_from_slice(chunk);
-        let mut events = Vec::new();
-        while let Some((index, delimiter_len)) = sse_event_end(&self.buffer) {
-            let event = self.buffer.drain(..index).collect::<Vec<_>>();
-            self.buffer.drain(..delimiter_len);
-            let event = String::from_utf8(event)
-                .map_err(|error| format!("AI 流式事件不是 UTF-8：{error}"))?;
-            let data = event
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(str::trim_start)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !data.is_empty() {
-                events.push(data);
-            }
-        }
-        Ok(events)
-    }
-}
-
-fn sse_event_end(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(left), Some(right)) if left < right => Some((left, 2)),
-        (Some(_), Some(right)) => Some((right, 4)),
-        (Some(index), None) => Some((index, 2)),
-        (None, Some(index)) => Some((index, 4)),
-        (None, None) => None,
-    }
-}
-
-#[derive(Default)]
-struct StreamedMessage {
-    reasoning: String,
-    content: String,
-    tool_calls: BTreeMap<usize, StreamedToolCall>,
-}
-
-fn streamed_reasoning(delta: &Value) -> Option<&str> {
-    delta
-        .get("reasoning_content")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            delta
-                .get("reasoning")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-        })
-}
-
-impl StreamedMessage {
-    fn apply_delta(&mut self, delta: &Value) -> bool {
-        if let Some(reasoning) = streamed_reasoning(delta) {
-            self.reasoning.push_str(reasoning);
-        }
-        let mut content_changed = false;
-        if let Some(content) = delta.get("content").and_then(Value::as_str)
-            && !content.is_empty()
-        {
-            self.content.push_str(content);
-            content_changed = true;
-        }
-        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-            for (fallback_index, call) in tool_calls.iter().enumerate() {
-                let index = call
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .unwrap_or(fallback_index);
-                let accumulated = self.tool_calls.entry(index).or_default();
-                if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    accumulated.id.push_str(id);
-                }
-                if let Some(function) = call.get("function") {
-                    if let Some(name) = function.get("name").and_then(Value::as_str) {
-                        accumulated.name.push_str(name);
-                    }
-                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                        accumulated.arguments.push_str(arguments);
-                    }
-                }
-            }
-        }
-        content_changed
-    }
-
-    fn into_message(self) -> Result<Value, String> {
-        if self.content.trim().is_empty() && self.tool_calls.is_empty() {
-            return Err("AI 返回了空的流式响应".to_owned());
-        }
-        let mut message = json!({ "role": "assistant", "content": self.content });
-        if !self.reasoning.is_empty() {
-            message["reasoning_content"] = json!(self.reasoning);
-        }
-        if !self.tool_calls.is_empty() {
-            message["tool_calls"] = Value::Array(
-                self.tool_calls
-                    .into_values()
-                    .map(StreamedToolCall::into_value)
-                    .collect(),
-            );
-        }
-        Ok(message)
-    }
-}
-
-#[derive(Default)]
-struct StreamedToolCall {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct VisualEvidenceResponse {
     #[serde(default)]
@@ -1462,19 +1219,6 @@ fn spawn_visual_evidence_task(
         }
         Ok((batch_index, evidence))
     });
-}
-
-impl StreamedToolCall {
-    fn into_value(self) -> Value {
-        json!({
-            "id": if self.id.is_empty() { "tool-call" } else { &self.id },
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "arguments": self.arguments,
-            },
-        })
-    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2540,15 +2284,6 @@ fn read_unit(arguments: &Value, fallback: usize) -> usize {
         .unwrap_or(fallback)
 }
 
-fn chat_completions_url(base_url: &str) -> String {
-    let base_url = base_url.trim().trim_end_matches('/');
-    if base_url.ends_with("/chat/completions") {
-        base_url.to_owned()
-    } else {
-        format!("{base_url}/chat/completions")
-    }
-}
-
 fn clip_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_owned();
@@ -2789,18 +2524,6 @@ mod tests {
     }
 
     #[test]
-    fn openai_compatible_endpoint_is_normalized_once() {
-        assert_eq!(
-            chat_completions_url("https://api.openai.com/v1/"),
-            "https://api.openai.com/v1/chat/completions"
-        );
-        assert_eq!(
-            chat_completions_url("http://localhost:11434/v1/chat/completions"),
-            "http://localhost:11434/v1/chat/completions"
-        );
-    }
-
-    #[test]
     fn clipping_never_splits_utf8_text() {
         assert_eq!(clip_text("系统思考", 2), "系统\n…（内容已截断）");
         assert_eq!(clip_text("short", 8), "short");
@@ -2818,28 +2541,6 @@ mod tests {
         assert!(prompt.contains("尽量不保留破折号句式，仅当用于话语中断作用时才保留"));
         assert!(!prompt.contains("A—B—C"));
         assert!(prompt.contains("PDF 提示。"));
-    }
-
-    #[test]
-    fn default_reasoning_effort_is_omitted_and_explicit_levels_are_sent() {
-        let mut default_body = json!({ "model": "test" });
-        apply_reasoning_effort(&mut default_body, ReasoningEffort::Default);
-        assert!(default_body.get("reasoning_effort").is_none());
-
-        for effort in [
-            ReasoningEffort::None,
-            ReasoningEffort::Minimal,
-            ReasoningEffort::Low,
-            ReasoningEffort::Medium,
-            ReasoningEffort::High,
-        ] {
-            let mut body = json!({ "model": "test" });
-            apply_reasoning_effort(&mut body, effort);
-            assert_eq!(
-                body.get("reasoning_effort").and_then(Value::as_str),
-                effort.api_value()
-            );
-        }
     }
 
     #[test]
@@ -3484,50 +3185,6 @@ mod tests {
     }
 
     #[test]
-    fn sse_decoder_handles_fragmented_crlf_events() {
-        let mut decoder = SseDecoder::default();
-        assert!(
-            decoder
-                .push(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel")
-                .unwrap()
-                .is_empty()
-        );
-
-        let events = decoder
-            .push(b"lo\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n")
-            .unwrap();
-
-        assert_eq!(
-            events,
-            [r#"{"choices":[{"delta":{"content":"Hello"}}]}"#, "[DONE]"]
-        );
-    }
-
-    #[test]
-    fn streamed_message_accumulates_text_deltas() {
-        let mut streamed = StreamedMessage::default();
-
-        assert!(streamed.apply_delta(&json!({ "content": "你" })));
-        assert!(streamed.apply_delta(&json!({ "content": "好" })));
-
-        let message = streamed.into_message().unwrap();
-        assert_eq!(message.get("content").and_then(Value::as_str), Some("你好"));
-    }
-
-    #[test]
-    fn reasoning_is_separate_from_answer_and_preserved_for_tool_continuation() {
-        let mut streamed = StreamedMessage::default();
-        let delta = json!({"reasoning_content":"检查原文。"});
-        assert_eq!(streamed_reasoning(&delta), Some("检查原文。"));
-        assert!(!streamed.apply_delta(&delta));
-        streamed.apply_delta(&json!({"reasoning":"需要搜索。"}));
-        streamed.apply_delta(&json!({"content":"回答"}));
-        let message = streamed.into_message().unwrap();
-        assert_eq!(message["content"], "回答");
-        assert_eq!(message["reasoning_content"], "检查原文。需要搜索。");
-    }
-
-    #[test]
     fn stopping_cancels_a_pending_model_response() {
         let cancel = tokio::sync::Notify::new();
         cancel.notify_one();
@@ -3535,38 +3192,6 @@ mod tests {
             .unwrap()
             .block_on(cancellable::<Value>(&cancel, std::future::pending()));
         assert_eq!(result.unwrap_err(), "已停止生成");
-    }
-
-    #[test]
-    fn streamed_message_assembles_fragmented_tool_calls() {
-        let mut streamed = StreamedMessage::default();
-        streamed.apply_delta(&json!({
-            "tool_calls": [{
-                "index": 0,
-                "id": "call_1",
-                "function": { "name": "search", "arguments": "{\"q\":" }
-            }]
-        }));
-        streamed.apply_delta(&json!({
-            "tool_calls": [{
-                "index": 0,
-                "function": { "arguments": "\"term\"}" }
-            }]
-        }));
-
-        let message = streamed.into_message().unwrap();
-        assert_eq!(
-            message
-                .pointer("/tool_calls/0/function/arguments")
-                .and_then(Value::as_str),
-            Some(r#"{"q":"term"}"#)
-        );
-        assert_eq!(
-            message
-                .pointer("/tool_calls/0/function/name")
-                .and_then(Value::as_str),
-            Some("search")
-        );
     }
 
     #[test]

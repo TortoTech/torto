@@ -102,6 +102,7 @@ async fn stage(
     items: &[Input],
     mode: &str,
 ) -> Result<HashMap<usize, Response>, String> {
+    crate::plugins::llm::budgeted(async {
     let mut results = HashMap::new();
     for attempt in 0..2 {
         let pending: Vec<_> = items
@@ -161,6 +162,7 @@ async fn stage(
         results.extend(parse_results(&text, &ids, mode == "transcribe"));
     }
     Ok(results)
+    }).await
 }
 
 fn rendered_url(proposal: &Response) -> Result<String, String> {
@@ -195,99 +197,102 @@ pub(super) async fn request_batch(
     reasoning_effort: ReasoningEffort,
     batch: &[Pending],
 ) -> Result<Vec<Option<Response>>, String> {
-    let inputs: Vec<_> = batch
-        .iter()
-        .enumerate()
-        .map(|(id, p)| Input {
-            id,
-            context: json!({"inline":p.candidate.inline,"context":p.candidate.context}),
-            original: p.url.clone(),
-            rendered: None,
-        })
-        .collect();
-    let mut results = stage(
-        client,
-        provider,
-        model,
-        reasoning_effort,
-        &inputs,
-        "transcribe",
-    )
-    .await?;
-    let mut verification = Vec::new();
-    for input in &inputs {
-        let Some(proposal) = results.get(&input.id) else {
-            continue;
-        };
-        if proposal.status != "recognized" {
-            continue;
-        }
-        // Formula validation includes supported syntax, bounded dimensions and
-        // a real local render. Valid self-checked results need no second call.
-        let Err(error) = proposal.formula() else {
-            continue;
-        };
-        let mut item = input.clone();
-        item.context = json!({"proposal":proposal,"local_validation_error":error,
-            "inline":batch[input.id].candidate.inline,"context":batch[input.id].candidate.context});
-        item.rendered = rendered_url(proposal).ok();
-        // A render is optional for syntax errors; keep the original available.
-        if item.bytes() > MAX_BYTES {
-            item.rendered = None;
-        }
-        log::event(
-            provider,
-            model,
-            "formula.batch.review_needed",
-            json!({"image_id":input.id,"reason":error,"has_rendering":item.rendered.is_some()}),
-        );
-        if item.bytes() <= MAX_BYTES {
-            verification.push(item);
-        }
-        // Only anomalous proposals fall back while awaiting review. A broken
-        // sibling or network error cannot discard successfully validated items.
-        results.insert(
-            input.id,
-            Response {
-                status: "unreadable".into(),
-                latex: None,
-                equation_number: None,
-                transient: true,
-            },
-        );
-    }
-    let mut start = 0;
-    while start < verification.len() {
-        let mut end = start;
-        let mut bytes = 0;
-        while end < verification.len()
-            && end - start < MAX_IMAGES
-            && bytes + verification[end].bytes() <= MAX_BYTES
-        {
-            bytes += verification[end].bytes();
-            end += 1;
-        }
-        match stage(
+    crate::plugins::llm::budgeted(async {
+        let inputs: Vec<_> = batch
+            .iter()
+            .enumerate()
+            .map(|(id, p)| Input {
+                id,
+                context: json!({"inline":p.candidate.inline,"context":p.candidate.context}),
+                original: p.url.clone(),
+                rendered: None,
+            })
+            .collect();
+        let mut results = stage(
             client,
             provider,
             model,
             reasoning_effort,
-            &verification[start..end],
-            "verify",
+            &inputs,
+            "transcribe",
         )
-        .await
-        {
-            Ok(verified) => results.extend(verified),
-            Err(error) => log::event(
+        .await?;
+        let mut verification = Vec::new();
+        for input in &inputs {
+            let Some(proposal) = results.get(&input.id) else {
+                continue;
+            };
+            if proposal.status != "recognized" {
+                continue;
+            }
+            // Formula validation includes supported syntax, bounded dimensions and
+            // a real local render. Valid self-checked results need no second call.
+            let Err(error) = proposal.formula() else {
+                continue;
+            };
+            let mut item = input.clone();
+            item.context = json!({"proposal":proposal,"local_validation_error":error,
+            "inline":batch[input.id].candidate.inline,"context":batch[input.id].candidate.context});
+            item.rendered = rendered_url(proposal).ok();
+            // A render is optional for syntax errors; keep the original available.
+            if item.bytes() > MAX_BYTES {
+                item.rendered = None;
+            }
+            log::event(
                 provider,
                 model,
-                "formula.batch.verification_failed",
-                json!({"images":end-start,"error":error}),
-            ),
+                "formula.batch.review_needed",
+                json!({"image_id":input.id,"reason":error,"has_rendering":item.rendered.is_some()}),
+            );
+            if item.bytes() <= MAX_BYTES {
+                verification.push(item);
+            }
+            // Only anomalous proposals fall back while awaiting review. A broken
+            // sibling or network error cannot discard successfully validated items.
+            results.insert(
+                input.id,
+                Response {
+                    status: "unreadable".into(),
+                    latex: None,
+                    equation_number: None,
+                    transient: true,
+                },
+            );
         }
-        start = end;
-    }
-    Ok((0..batch.len()).map(|id| results.remove(&id)).collect())
+        let mut start = 0;
+        while start < verification.len() {
+            let mut end = start;
+            let mut bytes = 0;
+            while end < verification.len()
+                && end - start < MAX_IMAGES
+                && bytes + verification[end].bytes() <= MAX_BYTES
+            {
+                bytes += verification[end].bytes();
+                end += 1;
+            }
+            match stage(
+                client,
+                provider,
+                model,
+                reasoning_effort,
+                &verification[start..end],
+                "verify",
+            )
+            .await
+            {
+                Ok(verified) => results.extend(verified),
+                Err(error) => log::event(
+                    provider,
+                    model,
+                    "formula.batch.verification_failed",
+                    json!({"images":end-start,"error":error}),
+                ),
+            }
+            start = end;
+        }
+        Ok((0..batch.len()).map(|id| results.remove(&id)).collect())
+    })
+    .await
 }
 
 #[cfg(test)]

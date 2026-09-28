@@ -51,6 +51,9 @@ fontdb.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 image.workspace = true
 jsonrepair-rs.workspace = true
+jsonschema = { version = "0.46", default-features = false }
+rig-core = { version = "=0.42.0", default-features = false, features = ["reqwest", "rustls"] }
+reqwest-rig = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "stream", "rustls", "system-proxy"] }
 keyring.workspace = true
 kurbo.workspace = true
 mermaid-rs-renderer.workspace = true

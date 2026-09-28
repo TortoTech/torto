@@ -1,6 +1,7 @@
 #[derive(Clone, Copy)]
-pub(crate) enum Field {
+pub(crate) enum Field<'a> {
     Text(&'static str, &'static str),
+    Detail(&'static str, &'a str),
     Bool(&'static str, bool),
     U64(&'static str, u64),
     Usize(&'static str, usize),
@@ -21,7 +22,7 @@ mod imp {
     const MAX_LOG_BYTES: u64 = 1_048_576;
     static LOG_LOCK: Mutex<()> = Mutex::new(());
 
-    pub(super) fn log(event: &'static str, fields: &[Field]) {
+    pub(super) fn log(event: &'static str, fields: &[Field<'_>]) {
         let Ok(_guard) = LOG_LOCK.lock() else {
             return;
         };
@@ -51,6 +52,9 @@ mod imp {
                 Field::Text(key, value) => {
                     let _ = write!(line, " {key}={}", value.replace(['\r', '\n', ' '], "_"));
                 }
+                Field::Detail(key, value) => {
+                    let _ = write!(line, " {key}={value:?}");
+                }
                 Field::Bool(key, value) => {
                     let _ = write!(line, " {key}={value}");
                 }
@@ -71,17 +75,20 @@ mod imp {
     pub(super) fn install_panic_hook() {
         let default_hook = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
+            let message = info.to_string();
             if let Some(location) = info.location() {
                 log(
                     "panic",
                     &[
                         Field::Text("location", "known"),
+                        Field::Detail("file", location.file()),
+                        Field::Detail("message", &message),
                         Field::U64("line", u64::from(location.line())),
                         Field::U64("column", u64::from(location.column())),
                     ],
                 );
             } else {
-                log("panic", &[]);
+                log("panic", &[Field::Detail("message", &message)]);
             }
             default_hook(info);
         }));
@@ -93,10 +100,13 @@ mod imp {
 mod imp {
     use super::Field;
 
-    pub(super) fn log(_event: &'static str, fields: &[Field]) {
+    pub(super) fn log(_event: &'static str, fields: &[Field<'_>]) {
         for field in fields {
             match *field {
                 Field::Text(key, value) => {
+                    let _ = (key, value);
+                }
+                Field::Detail(key, value) => {
                     let _ = (key, value);
                 }
                 Field::Bool(key, value) => {
@@ -118,7 +128,7 @@ mod imp {
     pub(super) fn install_panic_hook() {}
 }
 
-pub(crate) fn log(event: &'static str, fields: &[Field]) {
+pub(crate) fn log(event: &'static str, fields: &[Field<'_>]) {
     imp::log(event, fields);
 }
 

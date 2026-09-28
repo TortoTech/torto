@@ -730,11 +730,7 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
     } else {
         json!({"anyOf":items})
     };
-    json!({"temperature":0.0,"response_format":{
-        "type":"json_schema",
-        "json_schema":{
-            "name":"ebook_semantic_groups", "strict":true,
-            "schema":{
+    json!({"temperature":0.0,"output_schema":{
                 "type":"object", "additionalProperties":false,
                 "properties":{"groups":{"type":"array","items":item}, "citations":{"type":"array","items":{"type":"string"}},
                     "formulas":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
@@ -746,8 +742,7 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
                     },"required":["block","paragraph","original","latex","before","after"]}}},
                 "required":["groups","citations","formulas"]
             }
-        }
-    }})
+    })
 }
 
 fn cache_path(key: &str) -> Option<PathBuf> {
@@ -1284,6 +1279,7 @@ async fn request_groups(
     target: std::ops::Range<usize>,
     context: std::ops::Range<usize>,
 ) -> Result<WindowResult, String> {
+    crate::plugins::llm::budgeted(async {
     let (provider, model, reasoning_effort) = endpoint;
     let mut messages = vec![
         json!({"role":"system","content":window_prompt(section, config, target.clone(), context.clone())}),
@@ -1387,6 +1383,7 @@ async fn request_groups(
         return Ok(safe);
     }
     Err(last_error)
+    }).await
 }
 
 fn retain_valid_groups(

@@ -33,7 +33,12 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
     reference: Option<(&Layout<TextBrush>, &str)>,
     justify_suffix: bool,
 ) -> Option<ParagraphPlan> {
-    if layout.is_rtl() || !layout.inline_boxes().is_empty() {
+    if layout.is_rtl()
+        || layout
+            .inline_boxes()
+            .iter()
+            .any(|item| item.kind != InlineBoxKind::InFlow)
+    {
         return None;
     }
     layout.break_all_lines(Some(column_width));
@@ -67,7 +72,13 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
                 ));
             }
         }
-        let cluster_count = u32::try_from(clusters.len()).ok()?;
+        // Explicit breaks use the same item counts as Parley's line breaker:
+        // each in-flow formula/image is one indivisible item, too.
+        let box_count = line
+            .items()
+            .filter(|item| matches!(item, parley::PositionedLayoutItem::InlineBox(_)))
+            .count();
+        let cluster_count = u32::try_from(clusters.len() + box_count).ok()?;
         if cluster_count == 0 {
             return None;
         }
@@ -103,6 +114,9 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
             let source = &text[range.clone()];
             let space = matches!(source, " " | "\u{00a0}" | "\u{3000}");
             let cjk = index + 1 < end
+                && !layout.inline_boxes().iter().any(|item| {
+                    item.index >= range.end && item.index <= clusters[index + 1].0.start
+                })
                 && source.chars().last().is_some_and(is_cjk_justification_char)
                 && text[clusters[index + 1].0.clone()]
                     .chars()
@@ -1099,6 +1113,94 @@ mod tests {
                     &text[tail]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn sentence_split_chinese_with_formulas_keeps_balanced_spacing() {
+        let text = "以使用二元语法模型的词级输入为例，候选词具有最大概率。\n在已有输入文本为“very blue”的情况下，“sky”可能是最佳候选词。\n对于使用三元语法模型的短语级输入，如果输入为“8-4-3-0-7-5-9-0”（预期的输入内容为“the sky”），且先前的文本是“fly in”，那么双词候选组将根据得分进行排序。";
+        let boxes = [
+            InlineBox {
+                id: 1,
+                kind: InlineBoxKind::InFlow,
+                index: text.find("概率").unwrap(),
+                width: 90.0,
+                height: 22.0,
+            },
+            InlineBox {
+                id: 2,
+                kind: InlineBoxKind::InFlow,
+                index: text.find("进行排序").unwrap(),
+                width: 260.0,
+                height: 22.0,
+            },
+        ];
+        let build = |adjustments: &[SpacingAdjustment]| {
+            let mut fonts = FontContext::new();
+            let mut context = LayoutContext::<TextBrush>::new();
+            let mut builder = context.ranged_builder(&mut fonts, text, 1.0, false);
+            builder.push_default(StyleProperty::FontSize(18.0));
+            for inline_box in &boxes {
+                builder.push_inline_box(inline_box.clone());
+            }
+            for adjustment in adjustments {
+                builder.push(
+                    StyleProperty::LetterSpacing(adjustment.amount),
+                    adjustment.range.clone(),
+                );
+            }
+            builder.build(text)
+        };
+        for width in [400.0, 600.0, 800.0] {
+            let mut natural = build(&[]);
+            let plan = plan_wrapped_justification(&mut natural, text, width)
+                .expect("sentence splitting with inline formulas must retain CJK justification");
+            let expected: Vec<_> = natural
+                .lines()
+                .map(|line| (line.text_range(), line.break_reason()))
+                .collect();
+            let mut adjusted = build(&plan.adjustments);
+            apply_breaks(&mut adjusted, &plan.lines, width).unwrap();
+            adjusted.align(
+                parley::Alignment::Start,
+                parley::AlignmentOptions::default(),
+            );
+            let mut box_count = 0;
+            for (line, (range, reason)) in adjusted.lines().zip(expected) {
+                assert_eq!(line.text_range(), range);
+                assert_eq!(line.break_reason(), reason);
+                for item in line.items() {
+                    if let parley::PositionedLayoutItem::InlineBox(inline_box) = item {
+                        box_count += 1;
+                        assert!(inline_box.x + inline_box.width <= width + 0.1);
+                    }
+                }
+                if matches!(
+                    reason,
+                    parley::layout::BreakReason::None | parley::layout::BreakReason::Explicit
+                ) {
+                    assert!(
+                        !plan
+                            .adjustments
+                            .iter()
+                            .any(|a| range.contains(&a.range.start))
+                    );
+                } else {
+                    assert!((positioned_line_content_end(line) - width).abs() < 0.1);
+                }
+                for run in line.runs() {
+                    for cluster in run.clusters() {
+                        if &text[cluster.text_range()] == " " {
+                            assert!(
+                                cluster.advance() < 18.0,
+                                "English space expanded to {}",
+                                cluster.advance()
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(box_count, boxes.len());
         }
     }
 

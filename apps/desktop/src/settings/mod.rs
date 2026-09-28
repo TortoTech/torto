@@ -70,6 +70,7 @@ pub(crate) struct SettingsFeature {
     provider_models_task: TaskSlot<ProviderModelsRequest>,
     provider_models_cache: HashMap<String, Vec<String>>,
     provider_models_errors: HashMap<String, String>,
+    provider_test_results: HashMap<String, String>,
     provider_models_loading: Option<String>,
     #[cfg(target_os = "windows")]
     update_check_requested: bool,
@@ -149,6 +150,7 @@ impl SettingsFeature {
             provider_models_task: TaskSlot::default(),
             provider_models_cache: HashMap::new(),
             provider_models_errors: HashMap::new(),
+            provider_test_results: HashMap::new(),
             provider_models_loading: None,
             #[cfg(target_os = "windows")]
             update_check_requested: false,
@@ -215,6 +217,16 @@ impl SettingsFeature {
         if self.provider_models_loading.as_deref() == Some(&request.provider_id) {
             self.provider_models_loading = None;
         }
+        if request.test_provider.is_some() {
+            self.provider_test_results.insert(
+                request.provider_id,
+                match message.result {
+                    Ok(_) => "✓ JSON connection test passed".to_owned(),
+                    Err(error) => error,
+                },
+            );
+            return;
+        }
         match message.result {
             Ok(models) => {
                 self.provider_models_errors.remove(&request.provider_id);
@@ -235,6 +247,7 @@ impl SettingsFeature {
     }
 
     fn invalidate_provider_models(&mut self, provider_id: &str) {
+        self.provider_test_results.remove(provider_id);
         self.provider_models_cache.remove(provider_id);
         self.provider_models_errors.remove(provider_id);
         if self.provider_models_loading.as_deref() == Some(provider_id) {

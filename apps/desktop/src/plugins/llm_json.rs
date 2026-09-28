@@ -5,6 +5,9 @@ pub(super) fn parse<T>(input: &str) -> Result<T, String>
 where
     T: DeserializeOwned,
 {
+    if let Ok(value) = serde_json::from_str(input) {
+        return Ok(value);
+    }
     let candidate = json_candidate(input);
     let repaired = jsonrepair_rs::jsonrepair(candidate)
         .map_err(|error| format!("JSON repair failed: {error}"))?;

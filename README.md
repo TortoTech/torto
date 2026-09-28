@@ -83,6 +83,16 @@ Recognition prioritizes the current reading area and processes the active subsec
 
 In chat, type `/` for reading skills or `@` to attach references. Use the arrow keys to select a suggestion and `Tab` to insert it; when suggestions are open, `Tab` keeps the conversation open.
 
+### PDF recognition
+
+PDF contents, book metadata, and special pages are discovered by a shared tool-using agent. It chooses which page overviews, full pages, crops, and existing text to inspect, saves an incremental draft, and submits results after local checks. Printed labels and physical page numbers are stored separately; no single book-wide page offset is assumed. Interrupted drafts and rendered page images are cached locally for reuse. Only confirmed navigation targets are applied; partial completion is reported explicitly. This feature uses the configured recognition model and requires both vision and tool calling. Each run is bounded to 20 model turns and ten minutes, with at most five full pages per read and bounded context history.
+
+### AI providers
+
+The searchable provider selector includes OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, SiliconFlow, xAI, Groq, Mistral, Moonshot, MiniMax, Z.ai, Ollama, llama.cpp, and custom OpenAI-compatible endpoints. Requests use Rig adapters behind a shared transport layer. Existing provider IDs, credentials, model selections, and custom gateway URLs are preserved. Model lists use the provider's protocol; model IDs can also be entered manually. The provider settings include a JSON connection test using the first configured model.
+
+For structured tasks, callers supply one JSON Schema. Automatic output selection tries native JSON Schema, then schema-based tool calling, JSON object mode with a schema prompt, and finally prompt-only JSON. Unsupported strategies are skipped or remembered temporarily for the matching endpoint, model, schema, and request capabilities. Authentication, rate-limit, and server errors do not trigger format fallback. Every result is parsed with the existing JSON repair fallback and validated locally before use. Output tools can be disabled, and a specific output mode can be selected for gateway compatibility. Structured tasks share a four-request budget across format fallback and existing correction attempts.
+
 ## Screenshots
 
 ### Local bookshelf

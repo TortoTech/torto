@@ -22,53 +22,54 @@ pub(super) async fn request_vision_json(
     model: &str,
     content: Vec<Value>,
 ) -> Result<Value, String> {
-    let messages = vec![json!({ "role": "user", "content": content })];
-    let mut extra_body = json!({
-        "response_format": { "type": "json_object" }
-    });
-    if model.to_ascii_lowercase().contains("qwen") {
-        extra_body["enable_thinking"] = Value::Bool(false);
-    }
-    for attempt in 0..=VISION_RESPONSE_RETRIES {
-        let result = request_completion(
-            client,
-            provider,
-            model,
-            &messages,
-            None,
-            None,
-            ReasoningEffort::Default,
-            Some(&extra_body),
-        )
-        .await
-        .and_then(|message| {
-            message_content(&message)
-                .filter(|content| !content.trim().is_empty())
-                .map(Value::String)
-                .ok_or_else(|| {
-                    if message
-                        .get("reasoning_content")
-                        .and_then(Value::as_str)
-                        .is_some_and(|content| !content.trim().is_empty())
-                    {
-                        "AI 视觉识别只返回了思考过程，没有返回 JSON 正文".into()
-                    } else {
-                        "AI 视觉识别响应缺少消息正文".into()
-                    }
-                })
-        });
-        match result {
-            Ok(value) => return Ok(value),
-            Err(error)
-                if attempt < VISION_RESPONSE_RETRIES
-                    && is_retryable_vision_response_error(&error) =>
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            }
-            Err(error) => return Err(error),
+    crate::plugins::llm::budgeted(async {
+        let messages = vec![json!({ "role": "user", "content": content })];
+        let mut extra_body = super::llm::schema_options(json!({"type":"object"}));
+        if model.to_ascii_lowercase().contains("qwen") {
+            extra_body["enable_thinking"] = Value::Bool(false);
         }
-    }
-    unreachable!("vision response retry loop always returns")
+        for attempt in 0..=VISION_RESPONSE_RETRIES {
+            let result = request_completion(
+                client,
+                provider,
+                model,
+                &messages,
+                None,
+                None,
+                ReasoningEffort::Default,
+                Some(&extra_body),
+            )
+            .await
+            .and_then(|message| {
+                message_content(&message)
+                    .filter(|content| !content.trim().is_empty())
+                    .map(Value::String)
+                    .ok_or_else(|| {
+                        if message
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .is_some_and(|content| !content.trim().is_empty())
+                        {
+                            "AI 视觉识别只返回了思考过程，没有返回 JSON 正文".into()
+                        } else {
+                            "AI 视觉识别响应缺少消息正文".into()
+                        }
+                    })
+            });
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if attempt < VISION_RESPONSE_RETRIES
+                        && is_retryable_vision_response_error(&error) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("vision response retry loop always returns")
+    })
+    .await
 }
 
 pub(super) fn is_retryable_vision_response_error(error: &str) -> bool {

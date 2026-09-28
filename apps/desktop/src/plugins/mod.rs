@@ -6,6 +6,7 @@ pub(crate) use ai::translation_batches;
 pub(crate) use translation::prepare_translation_inputs;
 pub(crate) mod chat_media;
 mod commands;
+pub(crate) mod llm;
 mod llm_json;
 mod pdf_ocr;
 mod pdf_toc;
@@ -105,15 +106,50 @@ pub(crate) enum AiProviderKind {
     DeepSeek,
     OpenRouter,
     SiliconFlow,
+    Anthropic,
+    Gemini,
+    Xai,
+    Groq,
+    Mistral,
+    Moonshot,
+    MiniMax,
+    Zai,
+    Ollama,
+    LlamaCpp,
 }
 
 impl AiProviderKind {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) fn matches_search(self, query: &str) -> bool {
+        let aliases = match self {
+            Self::Anthropic => "claude",
+            Self::Gemini => "google 谷歌",
+            Self::DeepSeek => "深度求索",
+            Self::Moonshot => "kimi 月之暗面",
+            Self::MiniMax => "海螺",
+            Self::Zai => "glm 智谱",
+            Self::SiliconFlow => "硅基流动",
+            Self::Xai => "grok",
+            Self::Custom => "自定义 openai compatible",
+            _ => "",
+        };
+        self.label().to_lowercase().contains(query) || aliases.contains(query)
+    }
+    pub(crate) const ALL: [Self; 15] = [
         Self::Custom,
         Self::OpenAi,
         Self::DeepSeek,
         Self::OpenRouter,
         Self::SiliconFlow,
+        Self::Anthropic,
+        Self::Gemini,
+        Self::Xai,
+        Self::Groq,
+        Self::Mistral,
+        Self::Moonshot,
+        Self::MiniMax,
+        Self::Zai,
+        Self::Ollama,
+        Self::LlamaCpp,
     ];
 
     pub(crate) const fn label(self) -> &'static str {
@@ -123,6 +159,16 @@ impl AiProviderKind {
             Self::DeepSeek => "DeepSeek",
             Self::OpenRouter => "OpenRouter",
             Self::SiliconFlow => "SiliconFlow",
+            Self::Anthropic => "Anthropic",
+            Self::Gemini => "Gemini",
+            Self::Xai => "xAI",
+            Self::Groq => "Groq",
+            Self::Mistral => "Mistral",
+            Self::Moonshot => "Moonshot",
+            Self::MiniMax => "MiniMax",
+            Self::Zai => "Z.ai",
+            Self::Ollama => "Ollama",
+            Self::LlamaCpp => "llama.cpp",
         }
     }
 
@@ -133,6 +179,16 @@ impl AiProviderKind {
             Self::DeepSeek => Some("https://api.deepseek.com"),
             Self::OpenRouter => Some("https://openrouter.ai/api/v1"),
             Self::SiliconFlow => Some("https://api.siliconflow.cn/v1"),
+            Self::Anthropic => Some("https://api.anthropic.com"),
+            Self::Gemini => Some("https://generativelanguage.googleapis.com"),
+            Self::Xai => Some("https://api.x.ai/v1"),
+            Self::Groq => Some("https://api.groq.com/openai/v1"),
+            Self::Mistral => Some("https://api.mistral.ai/v1"),
+            Self::Moonshot => Some("https://api.moonshot.ai/v1"),
+            Self::MiniMax => Some("https://api.minimax.io/v1"),
+            Self::Zai => Some("https://api.z.ai/api/paas/v4"),
+            Self::Ollama => Some("http://localhost:11434"),
+            Self::LlamaCpp => Some("http://localhost:8080/v1"),
         }
     }
 }
@@ -145,6 +201,8 @@ pub struct AiProvider {
     pub name: String,
     pub base_url: String,
     pub models: Vec<AiModelConfig>,
+    pub(crate) allow_output_tools: bool,
+    pub(crate) structured_output: llm::OutputMode,
     /// Secrets are excluded from JSON and stored in Windows Credential Manager.
     /// `REBOOK_AI_API_KEY` can override the default provider at runtime.
     #[serde(skip)]
@@ -230,6 +288,8 @@ impl Default for AiProvider {
             name: AiProviderKind::Custom.label().into(),
             base_url: String::new(),
             models: vec![AiModelConfig::language(DEFAULT_MODEL)],
+            allow_output_tools: true,
+            structured_output: llm::OutputMode::Auto,
             api_key: String::new(),
         }
     }
@@ -414,7 +474,9 @@ impl PluginSettings {
             if provider.name.trim().is_empty() {
                 provider.name = format!("Provider {}", index + 1);
             }
-            if let Some(base_url) = provider.kind.base_url() {
+            if provider.base_url.trim().is_empty()
+                && let Some(base_url) = provider.kind.base_url()
+            {
                 provider.base_url = base_url.into();
             }
             provider.models = normalized_models(std::mem::take(&mut provider.models));
@@ -466,6 +528,8 @@ impl PluginSettings {
             name: format!("Custom {suffix}"),
             base_url: String::new(),
             models: vec![AiModelConfig::language(DEFAULT_MODEL)],
+            allow_output_tools: true,
+            structured_output: llm::OutputMode::Auto,
             api_key: String::new(),
         });
     }
@@ -528,7 +592,12 @@ impl PluginSettings {
             .iter()
             .find(|provider| provider.id == provider_id)
             .ok_or_else(|| format!("请先在“设置 → {feature}”中选择 Provider"))?;
-        if provider.api_key.trim().is_empty() {
+        if provider.api_key.trim().is_empty()
+            && !matches!(
+                provider.kind,
+                AiProviderKind::Ollama | AiProviderKind::LlamaCpp | AiProviderKind::Custom
+            )
+        {
             return Err(format!(
                 "请先在“设置 → AI”中填写 {} 的 API Key",
                 provider.name

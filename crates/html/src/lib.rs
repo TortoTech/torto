@@ -1297,6 +1297,17 @@ impl<'a> ReadingIrParser<'a> {
             .filter(|node| node.is_element() && node.tag_name().name().eq_ignore_ascii_case("li"))
         {
             self.queue_node_anchors(item);
+            // A list can contain individual endnotes. Preserve each item's
+            // definition boundary (and all its paragraphs) instead of flattening
+            // it into ordinary list text inside one chapter-sized note section.
+            if is_semantic_footnote_definition(item)
+                || (!self.inside_note_definition
+                    && note_entry_starts_at(item, &self.footnote_links, false))
+            {
+                self.parse_footnote_definition(item)?;
+                ordinal = ordinal.saturating_add(1);
+                continue;
+            }
             let mut style = self.styles.block_style(item, BlockStyle::default());
             style.indent = 0.0;
             style.margin_start = style.margin_start.max(24.0 * (f32::from(depth) + 1.0));

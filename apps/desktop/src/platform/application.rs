@@ -574,10 +574,18 @@ impl ApplicationHandler<UserEvent> for Application {
                 ) {
                     crate::diagnostics::log(
                         "render.fatal",
-                        &[crate::diagnostics::Field::Usize(
-                            "error_chars",
-                            error.chars().count(),
-                        )],
+                        &[
+                            crate::diagnostics::Field::Usize("error_chars", error.chars().count()),
+                            crate::diagnostics::Field::Detail("error", &error),
+                            crate::diagnostics::Field::U64(
+                                "width",
+                                u64::from(state.window.inner_size().width),
+                            ),
+                            crate::diagnostics::Field::U64(
+                                "height",
+                                u64::from(state.window.inner_size().height),
+                            ),
+                        ],
                     );
                     self.fatal_error = Some(error);
                     event_loop.exit();

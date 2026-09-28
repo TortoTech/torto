@@ -549,7 +549,7 @@ impl DesktopReader {
         request: &super::PdfTocTask,
         mut extraction: crate::plugins::PdfMetadataExtraction,
     ) -> Option<PdfMetadataUpdate> {
-        let mut failures = Vec::new();
+        let mut failures = std::mem::take(&mut extraction.warnings);
         let mut update = None;
         let mut page_roles_updated = false;
         if request.need_page_roles

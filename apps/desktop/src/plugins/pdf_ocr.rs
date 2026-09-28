@@ -1467,7 +1467,7 @@ pub(crate) fn save_pdf_ocr_page_roles(
     Ok(())
 }
 
-fn load_pdf_ocr_page_roles(book_id: &str) -> io::Result<Vec<PdfOcrPageRoleAssignment>> {
+pub(super) fn load_pdf_ocr_page_roles(book_id: &str) -> io::Result<Vec<PdfOcrPageRoleAssignment>> {
     let bytes = match fs::read(book_directory(book_id)?.join(PAGE_ROLES_FILE)) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),

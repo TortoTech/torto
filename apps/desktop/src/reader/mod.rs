@@ -4321,6 +4321,39 @@ mod tests {
     }
 
     #[test]
+    fn endnote_section_is_not_resolved_as_one_giant_note() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("notes").unwrap(),
+            href: PublicationUrl::parse("notes.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let section = rebook_html::parse_section_with_hints_and_image_classifier(
+            "<html><body><section role='doc-endnotes'><h1>Notes</h1><section><h2>Introduction</h2><ol class='notes'><li class='endnote' id='en1'><p><a href='body.xhtml#r1' role='doc-backlink'>1</a>. First note.</p></li><li class='endnote' id='en2'><p><a href='body.xhtml#r2' role='doc-backlink'>2</a>. Second note.</p><p>Continuation.</p></li></ol></section></section></body></html>",
+            &descriptor, |_| None, |_| false, rebook_html::SectionParseHints { note_section: true },
+        ).unwrap();
+        for (id, marker, expected) in [("en1", "1", "First note."), ("en2", "2", "Second note.")] {
+            let target = descriptor.href.resolve(&format!("#{id}")).unwrap();
+            let text = focus_footnote_text_in_section(&section, &target, marker).unwrap();
+            assert!(text.starts_with(expected), "{text}");
+            assert!(!text.contains("Introduction"));
+            assert!(!text.contains(if id == "en1" {
+                "Second note"
+            } else {
+                "First note"
+            }));
+            if id == "en2" {
+                assert!(text.contains("Continuation."));
+            }
+            assert_eq!(
+                focus_footnote_translation_ranges_in_section(&section, &target).len(),
+                if id == "en1" { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
     fn focus_footnotes_reuse_current_and_linked_section_parses() {
         let current = footnote_section("current", "current.xhtml", "1 Current note");
         let linked = footnote_section("linked", "linked.xhtml", "2 Linked note");

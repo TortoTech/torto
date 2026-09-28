@@ -16,13 +16,12 @@ pub(super) fn options() -> Value {
         "latex":{"type":["string","null"],"description":"Faithful LaTeX source without dollar delimiters or Markdown; null for a negative status. Use supported standard math commands, text operators and matrix/aligned environments; no custom macros, packages, images, URLs or executable commands. JSON-escape every literal backslash: two in the JSON source for one LaTeX backslash, four for a two-backslash row separator. Decoding must preserve command backslashes and row separators, never produce backspace, form feed, newline, carriage return or tab from a command prefix. Do not remove backslashes to make JSON valid."},
         "equation_number":{"type":["string","null"],"description":"Separate equation number visibly printed inside this image; exclude it from latex. Never copy or infer a number from adjacent HTML or context. Null when absent or for a negative status."}
     },"required":["image_id","status","latex","equation_number"]});
-    json!({"temperature":0.0,"response_format":{"type":"json_schema","json_schema":{
-        "name":"formula_image_batch","strict":true,"schema":{
+    json!({"temperature":0.0,"output_schema":{
             "type":"object","additionalProperties":false,
             "properties":{"results":{"type":"array","description":"Exactly one result per requested image ID, including negative results. Use this array even for a single image. No missing, duplicate or additional IDs; array order is irrelevant.","items":item}},
             "required":["results"]
         }
-    }}})
+    })
 }
 
 pub(super) fn request_prompt(mode: &str) -> String {
