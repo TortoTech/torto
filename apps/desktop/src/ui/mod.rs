@@ -17,6 +17,31 @@ use crate::preferences::{
     AppLanguage, AppTheme, DEFAULT_INTERFACE_FONT_SIZE, InterfaceTypography, SYSTEM_INTERFACE_FONT,
 };
 
+/// Space available to page overlays, excluding the Windows caption row.
+pub(crate) fn overlay_rect(ctx: &egui::Context) -> Rect {
+    #[cfg(target_os = "windows")]
+    {
+        crate::app::window_chrome::body_rect(ctx)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        ctx.content_rect()
+    }
+}
+
+pub(crate) fn modal_area(ctx: &egui::Context, id: egui::Id) -> egui::Area {
+    egui::Modal::default_area(id)
+        // Callers control backdrop opacity explicitly; avoid an additional Area fade.
+        .fade_in(false)
+        .anchor(
+            Align2::CENTER_CENTER,
+            overlay_rect(ctx).center() - ctx.content_rect().center(),
+        )
+        // Modal uses this boundary to clip its full-window backdrop as well as its content.
+        // Keep positioning centered in the body, but allow the backdrop to reach the caption.
+        .constrain_to(ctx.content_rect())
+}
+
 const EGUI_BASE_FONT_SIZE: f32 = 13.0;
 const EGUI_BASE_EXTRA_TEXT_LINE_SPACING: f32 = 1.0;
 const TOAST_MAX_WIDTH: f32 = 400.0;
@@ -569,6 +594,8 @@ fn painted_icon_button_sized(
     icon_size: f32,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(button_size), Sense::click());
+    #[cfg(target_os = "windows")]
+    crate::app::window_chrome::exclude(ui.ctx(), rect);
     let palette = palette();
     let fill = if selected {
         palette.accent_soft
@@ -759,6 +786,82 @@ pub(crate) fn decode_color_image(bytes: &[u8]) -> Result<ColorImage, image::Imag
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn modal_backdrop_is_not_clipped_below_the_caption() {
+        use super::*;
+        use crate::app::window_chrome;
+        let ctx = egui::Context::default();
+        for fullscreen in [false, true] {
+            window_chrome::set_state(
+                &ctx,
+                window_chrome::WindowState {
+                    fullscreen,
+                    ..Default::default()
+                },
+            );
+            for (size, progress) in [
+                (Vec2::new(720.0, 520.0), 0.25),
+                (Vec2::new(720.0, 520.0), 0.5),
+                (Vec2::new(1200.0, 800.0), 1.0),
+                (Vec2::new(1200.0, 800.0), 0.5),
+                (Vec2::new(1200.0, 800.0), 0.25),
+            ] {
+                let screen = Rect::from_min_size(egui::Pos2::ZERO, size);
+                let mut output = None;
+                for _ in 0..2 {
+                    let mut frame = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |_| {
+                            window_chrome::begin_frame(&ctx);
+                            window_chrome::header(
+                                &ctx,
+                                Rect::from_min_size(
+                                    screen.min,
+                                    Vec2::new(screen.width(), window_chrome::HEIGHT),
+                                ),
+                            );
+                            let response = egui::Modal::new(egui::Id::new("caption-modal-test"))
+                                .area(modal_area(&ctx, egui::Id::new("caption-modal-test")))
+                                .backdrop_color(Color32::BLACK.gamma_multiply(0.46 * progress))
+                                .frame(egui::Frame::new().fill(Color32::WHITE))
+                                .show(&ctx, |ui| {
+                                    ui.set_width(400.0);
+                                    ui.set_height(300.0);
+                                    ui.label("Settings");
+                                });
+                            assert!(
+                                response.response.rect.top() >= window_chrome::HEIGHT,
+                                "modal content stays below the caption"
+                            );
+                            window_chrome::dim_controls(&ctx, 0.46 * progress);
+                            window_chrome::paint_controls(&ctx);
+                        },
+                    );
+                    frame.textures_delta.clear();
+                    output = Some(frame);
+                }
+                let output = output.unwrap();
+                let backdrop = output.shapes.iter().find(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == screen && rect.fill == Color32::BLACK.gamma_multiply(0.46 * progress))).expect("actual modal backdrop paint");
+                assert!(
+                    backdrop.clip_rect.contains_rect(screen),
+                    "modal backdrop clipping must include the header and all caption buttons: {:?}",
+                    backdrop.clip_rect
+                );
+                if !fullscreen {
+                    let controls = Rect::from_min_size(
+                        egui::pos2(screen.right() - 138.0, 0.0),
+                        egui::vec2(138.0, window_chrome::HEIGHT),
+                    );
+                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == controls && rect.fill == Color32::BLACK.gamma_multiply(0.46 * progress))), "caption and modal backdrop share opacity while opening and closing");
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -3,8 +3,183 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
 
+#[test]
+fn hosted_search_preserves_book_functions_on_compatible_endpoints() {
+    for kind in [AiProviderKind::OpenRouter, AiProviderKind::Zai] {
+        let (url, handle) = server(vec![(200, text_response("answer"))]);
+        let provider = AiProvider {
+            kind,
+            base_url: url,
+            ..Default::default()
+        };
+        let params = super::super::web_search::native_params(&provider, "test").unwrap();
+        let tools = json!([{"type":"function","function":{"name":"searchBook","description":"Search book","parameters":{"type":"object","properties":{}}}}]);
+        let result = run(complete(
+            &provider,
+            "test",
+            &[json!({"role":"user","content":"search"})],
+            Some(&tools),
+            None,
+            ReasoningEffort::Default,
+            Some(&params),
+        ));
+        assert!(result.is_ok(), "{kind:?}: {result:?}");
+        let requests = handle.join().unwrap();
+        let tools = requests[0]["tools"].as_array().unwrap();
+        assert!(
+            tools.iter().any(|t| t["function"]["name"] == "searchBook"),
+            "{kind:?}: {tools:?}"
+        );
+        assert!(
+            tools.iter().any(|t| t["type"] != "function"),
+            "{kind:?}: {tools:?}"
+        );
+    }
+}
+
 fn schema() -> Value {
     json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false})
+}
+
+#[test]
+fn native_search_wire_keeps_functions_and_internal_flags_private() {
+    for (kind, model) in [
+        (AiProviderKind::OpenAi, "gpt-5"),
+        (AiProviderKind::Anthropic, "claude-sonnet-4-6"),
+        (AiProviderKind::Gemini, "gemini-3-pro"),
+        (AiProviderKind::Xai, "grok-4"),
+    ] {
+        let (url, handle) = server(vec![(
+            400,
+            json!({"error":{"message":"fixture rejects request"}}),
+        )]);
+        let provider = AiProvider {
+            kind,
+            base_url: url,
+            ..Default::default()
+        };
+        let params = super::super::web_search::native_params(&provider, model).unwrap();
+        let tools = json!([{"type":"function","function":{"name":"searchBook","description":"Search book","parameters":{"type":"object","properties":{}}}}]);
+        if kind == AiProviderKind::Custom {
+            let _ = run(stream_with_search(
+                &provider,
+                model,
+                &[json!({"role":"user","content":"search"})],
+                Some(&tools),
+                ReasoningEffort::Default,
+                Some(&params),
+                &mut |_| {},
+            ));
+        } else {
+            let _ = run(complete(
+                &provider,
+                model,
+                &[json!({"role":"user","content":"search"})],
+                Some(&tools),
+                None,
+                ReasoningEffort::Default,
+                Some(&params),
+            ));
+        }
+        let requests = handle.join().unwrap();
+        let body = &requests[0];
+        assert!(body.to_string().contains("searchBook"), "{kind:?}: {body}");
+        assert!(
+            body.to_string().contains(if model.starts_with("gemini-") {
+                "googleSearch"
+            } else {
+                "web_search"
+            }),
+            "{kind:?}: {body}"
+        );
+        assert!(body.get("_torto_responses").is_none());
+        if kind == AiProviderKind::Custom {
+            assert_eq!(body["_fixture_path"], "/v1/chat/completions");
+            assert!(
+                body["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["function"]["name"] == "searchBook")
+            );
+        }
+    }
+}
+
+#[test]
+fn custom_gemini_search_keeps_chat_completions_protocol() {
+    let model = "cpa/gemini-3.8-flash-high";
+    let (url, handle) = server(vec![(200, text_response("answer"))]);
+    let provider = AiProvider {
+        kind: AiProviderKind::Custom,
+        base_url: url,
+        ..Default::default()
+    };
+    let params = super::super::web_search::native_params(&provider, model);
+    let tools = json!([{"type":"function","function":{"name":"searchBook","description":"Search book","parameters":{"type":"object","properties":{}}}}]);
+    let message = run(stream_with_search(
+        &provider,
+        model,
+        &[json!({"role":"user","content":"search"})],
+        Some(&tools),
+        ReasoningEffort::Default,
+        params.as_ref(),
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(message["content"], "answer");
+    let requests = handle.join().unwrap();
+    assert_eq!(requests[0]["_fixture_path"], "/v1/chat/completions");
+    assert_eq!(requests[0]["model"], model);
+    let tools = requests[0]["tools"].as_array().unwrap();
+    assert!(params.is_none());
+    assert!(tools.iter().all(|t| t["type"] == "function"));
+    assert!(tools.iter().any(|t| t["function"]["name"] == "searchBook"));
+}
+
+#[test]
+fn streamed_native_annotations_are_preserved_as_clickable_sources() {
+    let mut response = text_response("A sourced answer");
+    response["choices"][0]["message"]["annotations"] = json!([{"type":"url_citation","url_citation":{"url":"https://example.com/evidence","title":"Evidence","start_index":0,"end_index":16}}]);
+    let (url, handle) = server(vec![(200, response)]);
+    let provider = AiProvider {
+        kind: AiProviderKind::OpenRouter,
+        base_url: url,
+        ..Default::default()
+    };
+    let params = super::super::web_search::native_params(&provider, "test").unwrap();
+    let message = run(stream_with_search(
+        &provider,
+        "test",
+        &[json!({"role":"user","content":"search"})],
+        None,
+        ReasoningEffort::Default,
+        Some(&params),
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(
+        message["_web_sources"][0]["url"],
+        "https://example.com/evidence"
+    );
+    handle.join().unwrap();
+}
+
+#[test]
+fn best_effort_metadata_never_relaxes_primary_translation_validation() {
+    let wire = json!({"type":"object","additionalProperties":false,
+        "properties":{"0":{"type":"string","minLength":1},"glossary":{"type":"array"}},
+        "required":["0","glossary"]});
+    let options = json!({"best_effort_output_fields":["glossary"]});
+    let local = best_effort_validation_schema(&wire, Some(&options));
+    let validator = jsonschema::validator_for(&local).unwrap();
+    assert!(validator.is_valid(&json!({"0":"译文"})));
+    assert!(validator.is_valid(&json!({"0":"译文","glossary":"bad metadata"})));
+    assert!(!validator.is_valid(&json!({"glossary":[]})));
+    assert!(!validator.is_valid(&json!({"0":"","glossary":[]})));
+    assert!(!validator.is_valid(&json!({"0":12,"glossary":[]})));
+    assert_eq!(wire["required"], json!(["0", "glossary"]));
+    assert_eq!(best_effort_validation_schema(&wire, None), wire);
 }
 
 #[test]
@@ -81,7 +256,18 @@ pub(crate) fn server(responses: Vec<(u16, Value)>) -> (String, thread::JoinHandl
                         })
                         .unwrap();
                     if bytes.len() >= end + 4 + length {
-                        break serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+                        let mut body: Value =
+                            serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+                        body["_fixture_path"] = json!(
+                            headers
+                                .lines()
+                                .next()
+                                .unwrap()
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap()
+                        );
+                        break body;
                     }
                 }
             };

@@ -222,9 +222,10 @@ impl WindowsUpdater {
         };
         let mut action = None;
         let modal = egui::Modal::new(egui::Id::new("windows-update-modal"))
-            .area(egui::Modal::default_area(egui::Id::new(
-                "windows-update-modal",
-            )))
+            .area(crate::ui::modal_area(
+                ctx,
+                egui::Id::new("windows-update-modal"),
+            ))
             .backdrop_color(egui::Color32::BLACK.gamma_multiply(0.42))
             .frame(
                 egui::Frame::new()
@@ -234,7 +235,9 @@ impl WindowsUpdater {
                     .inner_margin(egui::Margin::symmetric(22, 18)),
             )
             .show(ctx, |ui| {
-                ui.set_width(460.0_f32.min((ctx.content_rect().width() - 32.0).max(280.0)));
+                ui.set_width(
+                    460.0_f32.min((crate::ui::overlay_rect(ctx).width() - 32.0).max(280.0)),
+                );
                 ui.heading(
                     RichText::new(language.text("发现新版本", "Update available"))
                         .size(crate::ui::scaled_font_size(19.0))

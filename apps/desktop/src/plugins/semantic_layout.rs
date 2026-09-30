@@ -27,6 +27,7 @@ mod headings;
 mod log;
 mod normalize;
 mod text_formulas;
+mod wire;
 pub(crate) use batching::{fixed_batches, semantic_units};
 pub(crate) use log::translation_event;
 pub(crate) use log::{event as diagnostic_event, with_job};
@@ -633,6 +634,7 @@ fn request_contract_fingerprint() -> &'static str {
     static FINGERPRINT: LazyLock<String> = LazyLock::new(|| {
         digest(
             &serde_json::to_vec(&json!([
+                "compact-wire-v1",
                 PROMPT,
                 citations::PROMPT,
                 formulas::PROMPT,
@@ -1282,8 +1284,8 @@ async fn request_groups(
     crate::plugins::llm::budgeted(async {
     let (provider, model, reasoning_effort) = endpoint;
     let mut messages = vec![
-        json!({"role":"system","content":window_prompt(section, config, target.clone(), context.clone())}),
-        json!({"role":"user","content":input.to_string()}),
+        json!({"role":"system","content":wire::instructions(&window_prompt(section, config, target.clone(), context.clone()))}),
+        json!({"role":"user","content":wire::encode(input).to_string()}),
     ];
     let candidates = citations::window_candidates(section, target.clone());
     let mut fallback: Option<WindowResult> = None;
@@ -1297,11 +1299,11 @@ async fn request_groups(
             None,
             Some(4096),
             reasoning_effort,
-            Some(&completion_options(config)),
+            Some(&wire::options(&completion_options(config))),
         )
         .await?;
         let content = ai::message_content(&message).ok_or("AI排版返回了空内容")?;
-        let parsed = llm_json::parse::<Response>(&content)
+        let parsed = llm_json::parse::<Value>(&content).and_then(|value| serde_json::from_value::<Response>(wire::decode(&value)).map_err(|error| error.to_string()))
             .map_err(|e| format!("AI排版格式无效：{e}"))
             .and_then(|mut response| {
                 log::event(provider, model, "window.proposals", json!({"section":section.id,"start":target.start,"end":target.end,"attempt":attempt+1,"groups":response.groups,"citations":response.citations}));
@@ -1369,7 +1371,7 @@ async fn request_groups(
                      - Use existing eligible IDs, preserve order and adjacency, and avoid overlaps or protected blocks.\n\
                      - Omit groups whose IDs cannot satisfy these structural requirements."
                 );
-                messages.push(json!({"role":"user","content":feedback}));
+                messages.push(json!({"role":"user","content":wire::prompt(&feedback)}));
             }
         }
     }

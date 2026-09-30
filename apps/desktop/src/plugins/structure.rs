@@ -209,6 +209,8 @@ fn paragraph_atoms_for_content_mode(
                     let range = cursor..cursor + len;
                     footnotes.push(range.clone());
                     protected.push(range);
+                } else if run.link.is_some() && len > 0 {
+                    protected.push(cursor..cursor + len);
                 }
                 len
             }
@@ -232,13 +234,14 @@ fn paragraph_atoms_for_content_mode(
         cursor += len;
     }
     let atoms = paragraph_atoms_with_protected_ranges(&text, &protected, &footnotes, language_hint);
-    let atoms = if split_semicolons && text.contains([';', '；']) {
+    let atoms = if split_semicolons && text.contains([';', '；', ':', '：']) {
         let chars = text.chars().collect::<Vec<_>>();
         let boundaries = atoms
             .iter()
             .take(atoms.len().saturating_sub(1))
             .map(|atom| atom.end)
-            .chain(semicolon_boundaries(&chars, &protected));
+            .chain(semicolon_boundaries(&chars, &protected))
+            .chain(colon_boundaries(&chars, &protected));
         atoms_from_boundaries(boundaries, &chars, atoms.len())
     } else {
         atoms
@@ -601,6 +604,88 @@ fn semicolon_boundaries(chars: &[char], protected: &[std::ops::Range<usize>]) ->
     unquoted_punctuation_boundaries(chars, protected, &['；', ';'])
 }
 
+fn colon_boundaries(chars: &[char], protected: &[std::ops::Range<usize>]) -> Vec<usize> {
+    let mut protected = protected.to_vec();
+    for (index, ch) in chars.iter().enumerate() {
+        if !matches!(ch, ':' | '：') {
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|i| chars.get(i));
+        let next = chars.get(index + 1);
+        let start = chars[..index]
+            .iter()
+            .rposition(|c| c.is_whitespace())
+            .map_or(0, |i| i + 1);
+        let prefix: String = chars[start..index].iter().collect();
+        let technical = previous.is_some_and(|c| c.is_ascii_digit())
+            && next.is_some_and(|c| c.is_ascii_digit())
+            || previous == Some(&':')
+            || next == Some(&':')
+            || matches!(next, Some('/' | '\\'))
+            || prefix.contains("://")
+            || matches!(
+                prefix.to_ascii_lowercase().as_str(),
+                "mailto" | "tel" | "urn" | "data"
+            );
+        if technical {
+            protected.push(index..index + 1);
+        }
+    }
+    unquoted_punctuation_boundaries(chars, &protected, &[':', '：'])
+}
+
+#[cfg(test)]
+mod colon_tests {
+    use super::*;
+    #[test]
+    fn sentence_structure_inserts_break_after_colon() {
+        for text in ["说明：接下来进行测试。", "Note: Next step."] {
+            let mut block = TextBlock {
+                kind: TextBlockKind::Paragraph,
+                style: Default::default(),
+                source: None,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: Default::default(),
+                    link: None,
+                })],
+            };
+            apply_sentence_structure(&mut block, "en");
+            assert_eq!(
+                block
+                    .content
+                    .iter()
+                    .filter(|i| matches!(i, Inline::Break))
+                    .count(),
+                1
+            );
+            assert_eq!(inline_text(&block.content).replace('\n', ""), text);
+        }
+    }
+    #[test]
+    fn colons_split_prose_but_preserve_technical_and_quoted_text() {
+        for (text, expected) in [
+            ("说明：接下来进行测试。", vec!["说明：", "接下来进行测试。"]),
+            ("Note: Next step.", vec!["Note: ", "Next step."]),
+            (
+                "时间12:30，比例1：2，网址https://example.com:8080/a，继续。",
+                vec!["时间12:30，比例1：2，网址https://example.com:8080/a，继续。"],
+            ),
+            (
+                "“说明：保持完整”以及（备注：不拆开）。",
+                vec!["“说明：保持完整”以及（备注：不拆开）。"],
+            ),
+        ] {
+            let chars = text.chars().collect::<Vec<_>>();
+            let atoms = atoms_from_boundaries(colon_boundaries(&chars, &[]), &chars, 1);
+            assert_eq!(
+                atoms.iter().map(|a| a.text.as_str()).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+}
+
 fn unquoted_punctuation_boundaries(
     chars: &[char],
     protected: &[std::ops::Range<usize>],
@@ -889,7 +974,7 @@ fn paragraph_atoms_with_protected_ranges(
         }
     }
     let mut quote_boundaries = nested_quote_sentence_boundaries(&segmentation_chars);
-    quote_boundaries.extend(cjk_boundaries_before_lowercase_words(&segmentation_chars));
+    quote_boundaries.extend(cjk_boundaries_before_suppressed_starts(&segmentation_chars));
     if quote_boundaries.is_empty() {
         return atoms;
     }
@@ -901,13 +986,17 @@ fn paragraph_atoms_with_protected_ranges(
     atoms_from_boundaries(boundaries, &chars, atoms.len())
 }
 
-fn cjk_boundaries_before_lowercase_words(chars: &[char]) -> Vec<usize> {
-    // SentenceX can suppress a CJK terminator glued to a lowercase English
-    // example. Share quotation/bracket protection with semicolon splitting;
+fn cjk_boundaries_before_suppressed_starts(chars: &[char]) -> Vec<usize> {
+    // SentenceX can suppress a CJK terminator before a year/number or a
+    // lowercase English example. Share quotation/bracket protection with semicolon splitting;
     // leave ASCII periods (abbreviations/decimals) to the segmenter.
     unquoted_punctuation_boundaries(chars, &[], &['。', '！', '？'])
         .into_iter()
-        .filter(|end| chars.get(*end).is_some_and(char::is_ascii_lowercase))
+        .filter(|end| {
+            chars
+                .get(*end)
+                .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        })
         .collect()
 }
 
@@ -1058,6 +1147,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn translated_sentences_before_years_are_structurable() {
+        let text = "\u{652f}\u{79c9}\u{5f5d}\u{83b7}\u{91ca}\u{4e0d}\u{4e45}\u{ff0c}\u{4e2d}\u{56fd}\u{4e0e}\u{4e16}\u{754c}\u{7684}\u{5173}\u{7cfb}\u{4fbf}\u{5f00}\u{59cb}\u{53d1}\u{751f}\u{7ffb}\u{5929}\u{8986}\u{5730}\u{7684}\u{53d8}\u{5316}\u{3002}1971 \u{5e74}\u{ff0c}\u{8054}\u{5408}\u{56fd}\u{627f}\u{8ba4}\u{5317}\u{4eac}\u{4e3a}\u{4e2d}\u{56fd}\u{7684}\u{552f}\u{4e00}\u{5408}\u{6cd5}\u{4ee3}\u{8868}\u{ff0c}\u{4e2d}\u{534e}\u{4eba}\u{6c11}\u{5171}\u{548c}\u{56fd}\u{7531}\u{6b64}\u{83b7}\u{5f97}\u{5b89}\u{7406}\u{4f1a}\u{5e2d}\u{4f4d}\u{3002}1972 \u{5e74}\u{ff0c}\u{5c3c}\u{514b}\u{677e}\u{6d3e}\u{51fa}\u{4e86}\u{7b2c}\u{4e00}\u{652f}\u{8bbf}\u{95ee}\u{7ea2}\u{8272}\u{4e2d}\u{56fd}\u{7684}\u{7f8e}\u{56fd}\u{603b}\u{7edf}\u{4ee3}\u{8868}\u{56e2}\u{ff0c}\u{9707}\u{52a8}\u{4e86}\u{5168}\u{4e16}\u{754c}\u{3002}";
+        let content = vec![Inline::Text(TextRun {
+            text: text.into(),
+            style: Default::default(),
+            link: None,
+        })];
+        let atoms = paragraph_atoms_for_content(&content, "en");
+        assert_eq!(atoms.len(), 3, "{atoms:?}");
+        assert!(atoms[1].text.starts_with("1971"));
+        assert!(atoms[2].text.starts_with("1972"));
+        assert_eq!(
+            atoms
+                .iter()
+                .map(|atom| atom.text.as_str())
+                .collect::<String>(),
+            text
+        );
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: content.clone(),
+            style: Default::default(),
+            source: None,
+        };
+        apply_sentence_structure(&mut block, "en");
+        assert!(block.style.sentence_indents);
+        assert_eq!(
+            block
+                .content
+                .iter()
+                .filter(|inline| matches!(inline, Inline::Break))
+                .count(),
+            2
+        );
+        assert_eq!(inline_text(&block.content).replace('\n', ""), text);
+        // Numeric examples inside quotes and decimal values remain intact.
+        let quoted = "\u{524d}\u{53e5}\u{3002}1971\u{5e74}\u{8bf4}\u{201c}\u{7b2c}\u{4e00}\u{53e5}\u{3002}1972\u{5e74}\u{201d}\u{ff0c}\u{6570}\u{503c}\u{662f}3.14\u{3002}";
+        assert_eq!(
+            paragraph_atoms_for_content(
+                &[Inline::Text(TextRun {
+                    text: quoted.into(),
+                    style: Default::default(),
+                    link: None
+                })],
+                "en"
+            )
+            .len(),
+            2
+        );
+        for spacing in ["", " ", "\u{3000}"] {
+            let text = text.replace('\u{3002}', &format!("\u{3002}{spacing}"));
+            let content = vec![Inline::Text(TextRun {
+                text: text.clone(),
+                style: Default::default(),
+                link: None,
+            })];
+            let atoms = paragraph_atoms_for_content(&content, "en");
+            assert_eq!(atoms.len(), 3, "{atoms:?}");
+            assert_eq!(
+                atoms
+                    .iter()
+                    .map(|atom| atom.text.as_str())
+                    .collect::<String>(),
+                text
+            );
+        }
+    }
+
+    #[test]
     fn semicolons_split_prose_but_preserve_quotations_and_brackets() {
         for (text, expected) in [
             (
@@ -1068,11 +1226,14 @@ mod tests {
                 "Read first; write later.",
                 vec!["Read first;", "write later."],
             ),
-            ("他说：“先理解；再表达。”", vec!["他说：“先理解；再表达。”"]),
+            (
+                "他说：“先理解；再表达。”",
+                vec!["他说：", "“先理解；再表达。”"],
+            ),
             ("“先理解”；“再表达”。", vec!["“先理解”；", "“再表达”。"]),
             (
                 "他说：“外层‘先甲；再乙’；继续。”；结束。",
-                vec!["他说：“外层‘先甲；再乙’；继续。”；", "结束。"],
+                vec!["他说：", "“外层‘先甲；再乙’；继续。”；", "结束。"],
             ),
             (
                 "He says \"read; write\"; continue.",
@@ -1196,10 +1357,17 @@ mod tests {
             let atoms = paragraph_atoms_for_content(&quoted, "zh");
             assert_eq!(
                 atoms.len(),
-                1,
+                if text.starts_with("作者说：") {
+                    2
+                } else {
+                    1
+                },
                 "must preserve quotation/parenthesis: {text}"
             );
-            assert_eq!(atoms[0].text, text);
+            assert_eq!(
+                atoms.iter().map(|a| a.text.as_str()).collect::<String>(),
+                text
+            );
         }
     }
 
@@ -1283,16 +1451,16 @@ mod tests {
         let atoms = paragraph_atoms_for_content(&block.content, "zh");
         assert_eq!(
             atoms.len(),
-            2,
+            3,
             "long quotation collapsed to {} atoms: {:?}",
             atoms.len(),
             atoms.iter().map(|atom| &atom.text).collect::<Vec<_>>()
         );
         assert_eq!(
-            atoms[1].text,
+            atoms[2].text,
             "这样的翻译才是活的译句，不是死的译字，才是变通，不是向英文投降。"
         );
-        assert!(atoms[0].text.ends_with("。’”"));
+        assert!(atoms[1].text.ends_with("。’”"));
         assert_eq!(
             atoms
                 .iter()
@@ -1309,7 +1477,7 @@ mod tests {
                 .contains("（they 这个字是翻译海中的‘鲨鱼’，译者碰到了它就危险了……）")
         }));
         apply_sentence_structure(&mut block, "zh");
-        assert_eq!(inline_text(&block.content).matches('\n').count(), 1);
+        assert_eq!(inline_text(&block.content).matches('\n').count(), 2);
         assert_eq!(inline_text(&block.content).replace('\n', ""), text);
     }
 
@@ -1322,8 +1490,9 @@ mod tests {
             link: None,
         })];
         let atoms = paragraph_atoms_for_content(&content, "zh");
-        assert_eq!(atoms.len(), 2);
-        assert_eq!(atoms[0].text, "他说：“她喊‘快走！’”，随后大家离开。");
+        assert_eq!(atoms.len(), 3);
+        assert_eq!(atoms[0].text, "他说：");
+        assert_eq!(atoms[1].text, "“她喊‘快走！’”，随后大家离开。");
         let text = "他说：“她念‘第一句。第二句。’”（出处）后面的解释另起一句。";
         let content = vec![Inline::Text(TextRun {
             text: text.into(),
@@ -1331,9 +1500,9 @@ mod tests {
             link: None,
         })];
         let atoms = paragraph_atoms_for_content(&content, "zh");
-        assert_eq!(atoms.len(), 2);
-        assert_eq!(atoms[0].text, "他说：“她念‘第一句。第二句。’”（出处）");
-        assert_eq!(atoms[1].text, "后面的解释另起一句。");
+        assert_eq!(atoms.len(), 3);
+        assert_eq!(atoms[1].text, "“她念‘第一句。第二句。’”（出处）");
+        assert_eq!(atoms[2].text, "后面的解释另起一句。");
     }
 
     struct StaticSource {
@@ -1813,7 +1982,7 @@ mod tests {
         assert_eq!(inline_text(&block.content).matches("【8】").count(), 1);
         assert_eq!(
             inline_text(&block.content),
-            "分手时，她说：“朝朝暮暮，阳台之下。”【8】\n这里天地交媾的古老宇宙形象已经变成一个美丽的故事。\n不过应当注意。"
+            "分手时，她说：\n“朝朝暮暮，阳台之下。”【8】\n这里天地交媾的古老宇宙形象已经变成一个美丽的故事。\n不过应当注意。"
         );
     }
 
@@ -1851,7 +2020,7 @@ mod tests {
 
         assert_eq!(
             inline_text(&block.content),
-            "他说：“唯女子与小人为难养也。近之则不孙，远之则怨。”（《论语》卷十七）【5】\n话讲得机智却相当刻薄。\n无论如何，妇女的地位非常低下。"
+            "他说：\n“唯女子与小人为难养也。近之则不孙，远之则怨。”（《论语》卷十七）【5】\n话讲得机智却相当刻薄。\n无论如何，妇女的地位非常低下。"
         );
     }
 

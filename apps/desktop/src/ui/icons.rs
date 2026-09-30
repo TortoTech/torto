@@ -24,6 +24,7 @@ pub(crate) enum Icon {
     Cloud,
     Copy,
     ExternalLink,
+    Globe,
     Highlighter,
     Info,
     Keyboard,
@@ -40,6 +41,7 @@ pub(crate) enum Icon {
     Monitor,
     Moon,
     PanelLeft,
+    PanelRight,
     Pencil,
     Pin,
     PinOff,
@@ -57,7 +59,7 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 42] = [
+    const ALL: [Self; 44] = [
         Self::Chart,
         Self::AlertCircle,
         Self::BookOpen,
@@ -71,6 +73,7 @@ impl Icon {
         Self::Cloud,
         Self::Copy,
         Self::ExternalLink,
+        Self::Globe,
         Self::Highlighter,
         Self::Info,
         Self::Keyboard,
@@ -87,6 +90,7 @@ impl Icon {
         Self::Monitor,
         Self::Moon,
         Self::PanelLeft,
+        Self::PanelRight,
         Self::Pencil,
         Self::Pin,
         Self::PinOff,
@@ -116,6 +120,7 @@ impl Icon {
             Self::Cloud => asset!("cloud"),
             Self::Copy => asset!("copy"),
             Self::ExternalLink => asset!("external-link"),
+            Self::Globe => asset!("globe"),
             Self::Highlighter => asset!("highlighter"),
             Self::Info => asset!("info"),
             Self::Keyboard => asset!("keyboard"),
@@ -133,6 +138,7 @@ impl Icon {
             Self::Monitor => asset!("monitor"),
             Self::Moon => asset!("moon"),
             Self::PanelLeft => asset!("panel-left"),
+            Self::PanelRight => asset!("panel-right"),
             Self::Pencil => asset!("pencil"),
             Self::Pin => asset!("pin"),
             Self::PinOff => asset!("pin-off"),

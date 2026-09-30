@@ -1,3 +1,6 @@
+#[cfg(target_os = "windows")]
+pub(crate) mod window_chrome;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -71,6 +74,8 @@ impl DesktopApp {
         page_texture: Option<ReaderPageTexture>,
     ) -> Option<ReaderFramePlan> {
         let ui_started = std::time::Instant::now();
+        #[cfg(target_os = "windows")]
+        window_chrome::begin_frame(ui.ctx());
         self.reconcile_state(ui.ctx());
         self.shelf.poll_sync(ui.ctx());
         let open_settings_shortcut = self.settings.applied().shortcuts.open_settings;
@@ -105,6 +110,15 @@ impl DesktopApp {
         {
             reader.report_settings_error(error);
         }
+        #[cfg(target_os = "windows")]
+        {
+            if window_chrome::geometry(ui.ctx()).header.is_none() {
+                window_chrome::fallback_header(ui);
+            }
+            if self.settings.is_open() {
+                window_chrome::block_drag(ui.ctx());
+            }
+        }
         settings_overlay(ui.ctx(), &mut self.settings);
         if ui.ctx().input_mut(|input| {
             input.consume_shortcut(&self.settings.applied().shortcuts.fullscreen)
@@ -135,6 +149,8 @@ impl DesktopApp {
                 ],
             );
         }
+        #[cfg(target_os = "windows")]
+        window_chrome::paint_controls(ui.ctx());
         plan
     }
 

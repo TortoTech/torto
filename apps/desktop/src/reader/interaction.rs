@@ -175,13 +175,35 @@ impl DesktopReader {
         }
     }
 
-    pub(in crate::reader) fn website_at_canvas(&mut self, x: f32, y: f32) -> Option<String> {
-        if self.is_scroll_mode() {
+    pub(in crate::reader) fn website_at_canvas(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Option<(String, egui::Rect)> {
+        let (url, bounds, offset) = if self.is_scroll_mode() {
             let (position, px, py) = self.scroll_page_coordinates(x, y)?;
-            self.reader.website_at_page(position, px, py).ok().flatten()
+            let (url, bounds) = self
+                .reader
+                .website_region_at_page(position, px, py)
+                .ok()
+                .flatten()?;
+            (url, bounds, egui::vec2(x - px, y - py))
         } else {
-            self.reader.website_at_current_spread(x, y).ok().flatten()
-        }
+            let (url, bounds) = self
+                .reader
+                .website_region_at_current_spread(x, y)
+                .ok()
+                .flatten()?;
+            (url, bounds, egui::Vec2::ZERO)
+        };
+        Some((
+            url,
+            egui::Rect::from_min_max(
+                egui::pos2(bounds[0], bounds[1]),
+                egui::pos2(bounds[2], bounds[3]),
+            )
+            .translate(offset),
+        ))
     }
 
     pub(in crate::reader) fn citation_at_canvas(
@@ -250,6 +272,9 @@ impl DesktopReader {
 
     pub(in crate::reader) fn request_exit(&mut self) {
         self.persist_progress();
+        self.ui.focus_footnote_scroll_positions.clear();
+        self.ui.focus_footnotes_visible = false;
+        self.ui.focus_footnote_scroll_delta = 0.0;
         self.exit_requested = true;
     }
 

@@ -402,7 +402,10 @@ fn constrained_panel_widths(
 }
 
 fn panel_resize_pointer(ctx: &egui::Context, id: &'static str, edge_x: f32) -> Option<f32> {
+    #[cfg(not(target_os = "windows"))]
     let viewport = ctx.content_rect();
+    #[cfg(target_os = "windows")]
+    let viewport = crate::app::window_chrome::body_rect(ctx);
     let response = egui::Area::new(id.into())
         .order(egui::Order::Foreground)
         .fixed_pos(Pos2::new(
@@ -573,8 +576,26 @@ impl DesktopReader {
             ctx.request_repaint_after(deadline.saturating_duration_since(now));
         }
 
+        #[cfg(target_os = "windows")]
+        {
+            let screen = ctx.content_rect();
+            crate::app::window_chrome::header(
+                &ctx,
+                Rect::from_min_size(screen.min, Vec2::new(screen.width(), TOOLBAR_HEIGHT)),
+            );
+            crate::app::window_chrome::set_background(
+                &ctx,
+                color32(self.reader.style().background),
+            );
+        }
         let (sidebar_progress, assistant_progress) = self.show_side_panels(root_ui);
+        #[cfg(target_os = "windows")]
+        self.window_menu(&ctx);
         if self.completion.is_some() {
+            #[cfg(target_os = "windows")]
+            egui::Panel::top("completion-header-space")
+                .exact_size(TOOLBAR_HEIGHT)
+                .show(root_ui, |_| {});
             return self.completion_page_ui(root_ui, interaction_blocked);
         }
 
@@ -584,7 +605,27 @@ impl DesktopReader {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(background_ui))
             .show(root_ui, |ui| {
+                #[cfg(not(target_os = "windows"))]
                 self.toolbar(ui, background_ui);
+                #[cfg(target_os = "windows")]
+                {
+                    let (row, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), TOOLBAR_HEIGHT),
+                        egui::Sense::hover(),
+                    );
+                    let right = (ctx.content_rect().right()
+                        - crate::app::window_chrome::reserve_width(&ctx)
+                        - TOOLBAR_CONTROL_SIZE
+                        - 12.0)
+                        .min(row.right());
+                    let toolbar_rect = Rect::from_min_max(
+                        row.min,
+                        Pos2::new(right.max(row.left() + 1.0), row.bottom()),
+                    );
+                    crate::app::window_chrome::bounded_ui(ui, toolbar_rect, |ui| {
+                        self.toolbar(ui, background_ui)
+                    });
+                }
                 let size = Vec2::new(ui.available_width(), (ui.available_height() - 3.0).max(1.0));
                 if self.is_scroll_mode() {
                     page_rect = self.scroll_content(
@@ -640,6 +681,7 @@ impl DesktopReader {
         if floating_sidebar_visible {
             self.floating_sidebar(&ctx, sidebar_progress);
         }
+        self.header_sidebar_toggles(&ctx, page_rect, sidebar_progress);
         if self.is_focus_mode() {
             self.focus_actions_overlay(&ctx, page_rect);
             self.focus_assistant_overlay(&ctx, page_rect);
@@ -657,19 +699,29 @@ impl DesktopReader {
             self.selection_actions(&ctx, page_rect);
         }
         self.image_preview_overlay(&ctx);
+        #[cfg(target_os = "windows")]
+        if self.image_preview.is_some() {
+            crate::app::window_chrome::block_drag(&ctx);
+        }
         self.feedback(&ctx);
         self.pdf_toc_review(&ctx);
 
-        if should_hide_reader_cursor(
-            self.is_focus_mode(),
-            super::resolved_focus_cursor_hidden(
-                self.hide_cursor_in_focus_mode,
-                self.focus_cursor_hidden_override,
-            ),
-            interaction_blocked,
-            floating_sidebar_visible,
-            self.ui.assistant_panel.is_some(),
-        ) {
+        #[cfg(target_os = "windows")]
+        let pointer_over_header = crate::app::window_chrome::state(&ctx).header_hovered;
+        #[cfg(not(target_os = "windows"))]
+        let pointer_over_header = false;
+        if !pointer_over_header
+            && should_hide_reader_cursor(
+                self.is_focus_mode(),
+                super::resolved_focus_cursor_hidden(
+                    self.hide_cursor_in_focus_mode,
+                    self.focus_cursor_hidden_override,
+                ),
+                interaction_blocked,
+                floating_sidebar_visible,
+                self.ui.assistant_panel.is_some(),
+            )
+        {
             ctx.set_cursor_icon(egui::CursorIcon::None);
         }
 
@@ -707,7 +759,6 @@ impl DesktopReader {
                 return rect;
             }
         };
-        let layout = self.locally_correct_focus_reflow(layout, size.y);
         let rebuild_focus_units = self.is_focus_mode() && self.focus_units.is_empty();
         if rebuild_focus_units {
             self.rebuild_focus_units(&layout);
@@ -731,6 +782,9 @@ impl DesktopReader {
             // texture that is actually presented, even when no animation follows.
             ui.ctx().request_repaint();
         }
+        if self.is_focus_mode() && self.resize_focus_lists(size.y) {
+            ui.ctx().request_repaint();
+        }
         let mut scroll_area = egui::ScrollArea::vertical()
             .id_salt("reader-section-scroll")
             .max_height(size.y)
@@ -741,9 +795,14 @@ impl DesktopReader {
             scroll_area = scroll_area.scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR);
         }
         if rebuild_focus_units || (self.is_focus_mode() && self.scroll_viewport.is_none()) {
-            self.focus_target_offset = self
-                .restore_focus_reflow_anchor(&layout, size.y)
-                .or_else(|| self.focus_unit_target_offset(size.y));
+            let restored = self.restore_focus_reflow_anchor(&layout, size.y);
+            #[cfg(debug_assertions)]
+            if restored.is_some() {
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new("reader-reflow-trace-frames"), 8_u8)
+                });
+            }
+            self.focus_target_offset = restored.or_else(|| self.focus_unit_target_offset(size.y));
             self.ui.focus_scroll_motion = None;
         }
         if let Some(motion) = self.ui.focus_scroll_motion {
@@ -822,6 +881,31 @@ impl DesktopReader {
                     size: viewport_size,
                 },
             );
+            #[cfg(debug_assertions)]
+            {
+                let remaining = ui.ctx().data_mut(|data| {
+                    let id = egui::Id::new("reader-reflow-trace-frames");
+                    let remaining = data.get_temp::<u8>(id).unwrap_or(0);
+                    data.insert_temp(id, remaining.saturating_sub(1));
+                    remaining
+                });
+                if remaining > 0 {
+                    crate::diagnostics::log(
+                        "reader.reflow.frame",
+                        &[
+                            crate::diagnostics::Field::Usize("remaining", remaining as usize),
+                            crate::diagnostics::Field::F32("offset", viewport.min.y),
+                            crate::diagnostics::Field::F32("width", viewport_size.x),
+                            crate::diagnostics::Field::F32("height", viewport_size.y),
+                            crate::diagnostics::Field::Bool(
+                                "motion",
+                                self.ui.focus_scroll_motion.is_some(),
+                            ),
+                            crate::diagnostics::Field::U64("scene_revision", self.scene_revision),
+                        ],
+                    );
+                }
+            }
             if self.image_preview.is_none() && !interaction_blocked {
                 self.pointer_interaction(&response);
                 if self.is_focus_mode() {
@@ -912,6 +996,13 @@ impl DesktopReader {
             assistant_consumes_width,
         );
         if sidebar_consumes_width {
+            #[cfg(target_os = "windows")]
+            let sidebar_margin = egui::Margin {
+                top: ((TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) / 2.0) as i8,
+                ..egui::Margin::same(SIDEBAR_PADDING)
+            };
+            #[cfg(not(target_os = "windows"))]
+            let sidebar_margin = egui::Margin::same(SIDEBAR_PADDING);
             egui::Panel::left("reader-sidebar")
                 .exact_size(self.ui.sidebar_width * sidebar_progress)
                 .resizable(false)
@@ -919,7 +1010,7 @@ impl DesktopReader {
                 .frame(
                     egui::Frame::new()
                         .fill(palette().surface)
-                        .inner_margin(SIDEBAR_PADDING),
+                        .inner_margin(sidebar_margin),
                 )
                 .show(root_ui, |ui| self.sidebar(ui));
         }
@@ -1001,7 +1092,31 @@ impl DesktopReader {
         if self.image_preview.is_some() {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                 self.close_image_preview(ctx);
+            } else if !ctx.text_edit_focused() {
+                let step = ctx.input_mut(|input| {
+                    if input.consume_key(egui::Modifiers::NONE, egui::Key::Minus) {
+                        -1.0
+                    } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Equals) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                });
+                if step != 0.0 {
+                    if let Some(preview) = self.image_preview.as_mut() {
+                        update_preview_zoom(
+                            preview,
+                            1.25_f32.powf(step),
+                            crate::ui::overlay_rect(ctx).center(),
+                            crate::ui::overlay_rect(ctx).center(),
+                        );
+                    }
+                    ctx.request_repaint();
+                }
             }
+            return;
+        }
+        if self.focus_image_preview_shortcut(ctx, interaction_blocked) {
             return;
         }
         if self.focus_chat_shortcut(ctx, interaction_blocked) {
@@ -1047,7 +1162,21 @@ impl DesktopReader {
         if self.focus_action_shortcut(ctx, interaction_blocked) {
             return;
         }
+        if self.operation_shortcut(ctx, interaction_blocked) {
+            return;
+        }
+        if !interaction_blocked
+            && !self.ui.overlay_visible()
+            && !ctx.text_edit_focused()
+            && ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.search))
+        {
+            self.open_search();
+            return;
+        }
         if self.ui.focus_footnotes_visible {
+            if interaction_blocked || ctx.text_edit_focused() {
+                return;
+            }
             let scroll_delta = ctx.input_mut(|input| {
                 if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
                     -ASSISTANT_KEYBOARD_SCROLL_STEP
@@ -1100,9 +1229,6 @@ impl DesktopReader {
         if self.toc_keyboard_shortcut(ctx, interaction_blocked) {
             return;
         }
-        if self.operation_shortcut(ctx, interaction_blocked) {
-            return;
-        }
         if self.layout_shortcut(ctx, interaction_blocked) {
             return;
         }
@@ -1116,13 +1242,6 @@ impl DesktopReader {
         {
             self.ui.focus_actions_visible = true;
             ctx.memory_mut(egui::Memory::stop_text_input);
-            return;
-        }
-        let open_search = !interaction_blocked
-            && !self.ui.overlay_visible()
-            && ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.search));
-        if open_search {
-            self.open_search();
             return;
         }
         let visible_focus_editor = self.is_focus_mode()
@@ -1241,6 +1360,49 @@ impl DesktopReader {
             }
         }
         ctx.request_repaint();
+        true
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "page geometry is GPU-bounded"
+    )]
+    fn focus_image_preview_shortcut(
+        &mut self,
+        ctx: &egui::Context,
+        interaction_blocked: bool,
+    ) -> bool {
+        if !self.focus_body_accepts_actions(interaction_blocked)
+            || ctx.text_edit_focused()
+            || !self.current_focus_unit_is_image()
+            || !supports_image_preview(self.format, self.pdf_ocr.mode)
+        {
+            return false;
+        }
+        if !ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_image_preview)) {
+            return false;
+        }
+        let ranges = self.focus_units[self.focus_unit_index].paint_ranges.clone();
+        let hit = self.current_scroll_layout().ok().and_then(|layout| {
+            layout.pages.iter().find_map(|page| {
+                page.page.image_source_rects(&ranges).first().map(|rect| {
+                    (
+                        page.position,
+                        rect.center().x as f32,
+                        rect.center().y as f32,
+                    )
+                })
+            })
+        });
+        if let Some((position, x, y)) = hit {
+            match self.reader.image_at_page(position, x, y) {
+                Ok(Some(image)) => {
+                    self.open_reader_image_preview(ctx, image);
+                }
+                Err(error) => self.error = Some(format!("打开图片预览失败：{error}")),
+                Ok(None) => {}
+            }
+        }
         true
     }
 
@@ -1881,6 +2043,98 @@ impl DesktopReader {
         self.turn_page(direction);
     }
 
+    #[cfg(target_os = "windows")]
+    fn window_menu(&mut self, ctx: &egui::Context) {
+        if self.ui.toolbar_motion.value <= 0.02 && self.ui.overlay != ReaderOverlay::Menu {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let origin = Pos2::new(
+            screen.right()
+                - crate::app::window_chrome::reserve_width(ctx)
+                - TOOLBAR_CONTROL_SIZE
+                - 12.0,
+            screen.top() + (TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) * 0.5,
+        );
+        egui::Area::new(egui::Id::new("reader-window-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(origin)
+            .constrain(false)
+            .default_size(Vec2::splat(TOOLBAR_CONTROL_SIZE))
+            .show(ctx, |ui| {
+                if icon_button(ui, Icon::Menu)
+                    .on_hover_text(self.language.text("菜单", "Menu"))
+                    .clicked()
+                {
+                    self.toggle_menu();
+                }
+            });
+    }
+
+    fn header_sidebar_toggles(
+        &mut self,
+        ctx: &egui::Context,
+        page_rect: Rect,
+        sidebar_progress: f32,
+    ) {
+        let hovered = self.ui.toolbar_motion.value > 0.02 || self.ui.overlay == ReaderOverlay::Menu;
+        let screen = ctx.content_rect();
+        let floating = !self.ui.sidebar_pinned && sidebar_progress > 0.001;
+        let left = if floating {
+            screen.left() + self.ui.sidebar_width * sidebar_progress
+        } else {
+            page_rect.left()
+        };
+        #[cfg(target_os = "windows")]
+        let right = page_rect.right().min(
+            screen.right()
+                - crate::app::window_chrome::reserve_width(ctx)
+                - TOOLBAR_CONTROL_SIZE
+                - 12.0,
+        );
+        #[cfg(not(target_os = "windows"))]
+        let right = page_rect.right() - TOOLBAR_CONTROL_SIZE - 12.0;
+        let y = screen.top() + (TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) * 0.5;
+        if hovered || self.ui.sidebar_open || floating {
+            egui::Area::new(egui::Id::new("reader-left-sidebar-toggle"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(Pos2::new(left + f32::from(SIDEBAR_PADDING), y))
+                .constrain(false)
+                .default_size(Vec2::splat(TOOLBAR_CONTROL_SIZE))
+                .show(ctx, |ui| {
+                    if icon_button(ui, Icon::PanelLeft)
+                        .on_hover_text(if self.ui.sidebar_open {
+                            self.language.text("收起左侧栏", "Close left sidebar")
+                        } else {
+                            self.language.text("展开左侧栏", "Open left sidebar")
+                        })
+                        .clicked()
+                    {
+                        self.set_sidebar_open(!self.ui.sidebar_open);
+                    }
+                });
+        }
+        if !self.is_focus_mode() && (hovered || self.ui.assistant_panel.is_some()) {
+            egui::Area::new(egui::Id::new("reader-right-sidebar-toggle"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(Pos2::new(right - TOOLBAR_CONTROL_SIZE - 12.0, y))
+                .constrain(false)
+                .default_size(Vec2::splat(TOOLBAR_CONTROL_SIZE))
+                .show(ctx, |ui| {
+                    if icon_button(ui, Icon::PanelRight)
+                        .on_hover_text(if self.ui.assistant_motion.target > 0.5 {
+                            self.language.text("收起右侧栏", "Close right sidebar")
+                        } else {
+                            self.language.text("展开右侧栏", "Open right sidebar")
+                        })
+                        .clicked()
+                    {
+                        self.toggle_assistant_panel(AssistantPanel::Chat);
+                    }
+                });
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui, background: Color32) {
         let vertical_padding = ((TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) / 2.0) as i8;
         let toolbar_width = ui.available_width();
@@ -1900,21 +2154,29 @@ impl DesktopReader {
                 ui.set_min_height(TOOLBAR_CONTROL_SIZE);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    let left_control_count = if self.ui.sidebar_open { 2.0 } else { 3.0 }
-                        + self.pdf_ocr_toolbar_control_count();
+                    let left_control_count = 3.0 + self.pdf_ocr_toolbar_control_count();
                     let left_controls_width = TOOLBAR_CONTROL_SIZE * left_control_count;
+                    #[cfg(target_os = "windows")]
+                    if toolbar_actions_visible {
+                        crate::app::window_chrome::exclude(
+                            ui.ctx(),
+                            Rect::from_min_max(
+                                Pos2::new(hover_rect.left(), hover_rect.top()),
+                                Pos2::new(
+                                    hover_rect.left()
+                                        + f32::from(SIDEBAR_PADDING)
+                                        + left_controls_width,
+                                    hover_rect.bottom(),
+                                ),
+                            ),
+                        );
+                    }
                     // Keep the first toolbar action clear of the sidebar divider.
                     // Only the spacer after the action group may collapse on narrow layouts.
                     let button_left = f32::from(SIDEBAR_PADDING);
                     ui.add_space(button_left);
                     if toolbar_actions_visible {
-                        if !self.ui.sidebar_open
-                            && icon_button(ui, Icon::PanelLeft)
-                                .on_hover_text(self.language.text("展开侧栏", "Open sidebar"))
-                                .clicked()
-                        {
-                            self.set_sidebar_open(true);
-                        }
+                        ui.allocate_space(Vec2::splat(TOOLBAR_CONTROL_SIZE));
                         if icon_button(ui, Icon::Library)
                             .on_hover_text(self.language.text("返回书架", "Back to library"))
                             .clicked()
@@ -1943,20 +2205,15 @@ impl DesktopReader {
                                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
                             |ui| {
                                 ui.add_space(12.0);
+                                #[cfg(not(target_os = "windows"))]
                                 if icon_button(ui, Icon::Menu)
                                     .on_hover_text(self.language.text("菜单", "Menu"))
                                     .clicked()
                                 {
                                     self.toggle_menu();
                                 }
-                                if !self.is_focus_mode()
-                                    && icon_button(ui, Icon::MessageCircle)
-                                        .on_hover_text(
-                                            self.language.text("AI 助手", "AI assistant"),
-                                        )
-                                        .clicked()
-                                {
-                                    self.toggle_assistant_panel(AssistantPanel::Chat);
+                                if !self.is_focus_mode() {
+                                    ui.allocate_space(Vec2::splat(TOOLBAR_CONTROL_SIZE));
                                 }
                             },
                         );
@@ -1966,6 +2223,9 @@ impl DesktopReader {
         if toolbar_actions_visible {
             paint_toolbar_title(ui, hover_rect, content_left, true, &chapter_title);
         }
+        #[cfg(target_os = "windows")]
+        let hovered = crate::app::window_chrome::state(ui.ctx()).header_hovered;
+        #[cfg(not(target_os = "windows"))]
         let hovered = ui.ctx().input(|input| {
             input
                 .pointer
@@ -2064,12 +2324,6 @@ impl DesktopReader {
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if icon_button(ui, Icon::PanelLeft)
-                .on_hover_text(self.language.text("收起侧栏", "Close sidebar"))
-                .clicked()
-            {
-                self.set_sidebar_open(false);
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !self.is_focus_mode()
                     && icon_button(
@@ -2133,38 +2387,75 @@ impl DesktopReader {
     }
 
     fn floating_sidebar(&mut self, ctx: &egui::Context, progress: f32) {
+        // A floating navigation drawer spans the whole window, including the caption row.
+        // The backdrop also covers the caption row; window controls receive the same dimming.
         let screen = ctx.content_rect();
+        let scrim_rect = screen;
+        #[cfg(target_os = "windows")]
+        crate::app::window_chrome::dim_header(
+            ctx,
+            0.31 * progress,
+            screen.left() + self.ui.sidebar_width * progress,
+        );
         egui::Area::new("reader-sidebar-scrim".into())
+            .fade_in(false)
             .order(egui::Order::Middle)
-            .fixed_pos(screen.min)
+            .fixed_pos(scrim_rect.min)
+            .constrain(false)
+            .default_size(scrim_rect.size())
             .show(ctx, |ui| {
-                let (rect, response) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
-                ui.painter()
-                    .rect_filled(rect, 0.0, Color32::BLACK.gamma_multiply(0.31 * progress));
+                ui.set_clip_rect(scrim_rect);
+                let (rect, response) =
+                    ui.allocate_exact_size(scrim_rect.size(), egui::Sense::click());
+                #[cfg(target_os = "windows")]
+                let paint_rect = Rect::from_min_max(
+                    Pos2::new(screen.left(), screen.top() + TOOLBAR_HEIGHT),
+                    screen.max,
+                );
+                #[cfg(not(target_os = "windows"))]
+                let paint_rect = screen;
+                ui.painter().with_clip_rect(paint_rect).rect_filled(
+                    rect,
+                    0.0,
+                    Color32::BLACK.gamma_multiply(0.31 * progress),
+                );
                 if response.clicked() {
                     self.set_sidebar_open(false);
                 }
             });
         egui::Area::new("reader-sidebar-floating".into())
+            .fade_in(false)
             .order(egui::Order::Foreground)
-            .fixed_pos(Pos2::new(-self.ui.sidebar_width * (1.0 - progress), 0.0))
+            .fixed_pos(Pos2::new(
+                screen.left() - self.ui.sidebar_width * (1.0 - progress),
+                screen.top(),
+            ))
+            .constrain(false)
+            .default_size(Vec2::new(self.ui.sidebar_width, screen.height()))
             .show(ctx, |ui| {
-                egui::Frame::new()
+                ui.set_clip_rect(screen);
+                let frame = egui::Frame::new()
                     .fill(palette().surface)
                     .stroke(egui::Stroke::new(1.0, palette().border))
-                    .inner_margin(SIDEBAR_PADDING)
-                    .show(ui, |ui| {
-                        let sidebar_inset = f32::from(SIDEBAR_PADDING) * 2.0;
-                        ui.set_width(self.ui.sidebar_width - sidebar_inset);
-                        ui.set_height(ctx.content_rect().height() - sidebar_inset);
-                        self.sidebar(ui);
+                    .inner_margin(egui::Margin {
+                        top: ((TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) / 2.0) as i8 - 1,
+                        ..egui::Margin::same(SIDEBAR_PADDING)
                     });
+                let inset = frame.total_margin().sum();
+                frame.show(ui, |ui| {
+                    ui.set_width((self.ui.sidebar_width - inset.x).max(1.0));
+                    ui.set_height((screen.height() - inset.y).max(1.0));
+                    self.sidebar(ui);
+                });
             });
     }
 
     fn focus_assistant_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
         self.sync_focus_chat_session();
+        #[cfg(not(target_os = "windows"))]
         let viewport = ctx.content_rect();
+        #[cfg(target_os = "windows")]
+        let viewport = crate::app::window_chrome::body_rect(ctx);
         let style = self.reader.style();
         let content_right = page_rect.left()
             + reading_content_left(page_rect.width(), &style)
@@ -2223,6 +2514,38 @@ impl DesktopReader {
         }
     }
 
+    fn footnote_scroll_key(&self) -> egui::Id {
+        if self.is_focus_mode()
+            && let Some(unit) = self.focus_units.get(self.focus_unit_index)
+        {
+            // Source identity survives translation, sentence splitting and reflow.
+            return egui::Id::new((
+                "focus-footnotes",
+                &self.book_id,
+                &unit
+                    .list_group
+                    .as_ref()
+                    .map_or(&unit.range, |g| &g.range)
+                    .start
+                    .spine,
+                &unit
+                    .list_group
+                    .as_ref()
+                    .map_or(&unit.range, |g| &g.range)
+                    .start
+                    .node,
+            ));
+        }
+        egui::Id::new((
+            "classic-footnotes",
+            &self.book_id,
+            self.classic_footnotes
+                .iter()
+                .map(|note| note.popup_text())
+                .collect::<Vec<_>>(),
+        ))
+    }
+
     pub(super) fn focus_footnote_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
         if !self.ui.focus_footnotes_visible {
             return;
@@ -2241,7 +2564,18 @@ impl DesktopReader {
             return;
         }
 
+        let scroll_key = self.footnote_scroll_key();
+        let scroll_offset = self
+            .ui
+            .focus_footnote_scroll_positions
+            .get(&scroll_key)
+            .copied()
+            .unwrap_or(0.0);
+        let mut next_scroll_offset = scroll_offset;
+        #[cfg(not(target_os = "windows"))]
         let viewport = ctx.content_rect();
+        #[cfg(target_os = "windows")]
+        let viewport = crate::app::window_chrome::body_rect(ctx);
         let style = self.reader.style();
         let content_right = page_rect.left()
             + reading_content_left(page_rect.width(), &style)
@@ -2339,7 +2673,7 @@ impl DesktopReader {
             footnotes.len().saturating_sub(1) as f32 * (item_spacing * 2.0 + separator_spacing);
         let measured_body_height = (measured_text_height + separator_height + 2.0)
             .clamp(body_font.size.max(19.0), maximum_body_height);
-        let height_id = egui::Id::new("focus-footnotes-measured-height");
+        let height_id = scroll_key.with("measured-height");
         let panel_height = ctx
             .data_mut(|data| data.get_temp::<f32>(height_id))
             .unwrap_or(measured_body_height + 24.0);
@@ -2379,30 +2713,39 @@ impl DesktopReader {
                         let content_width = ui.available_width().max(1.0);
                         ui.vertical(|ui| {
                             ui.set_width(content_width);
-                            footnote_scroll_area(maximum_body_height).show(ui, |ui| {
-                                if routed_scroll.abs() > f32::EPSILON {
-                                    ui.scroll_with_delta(Vec2::new(0.0, routed_scroll));
-                                }
-                                ui.set_width((ui.available_width() - 8.0).max(1.0));
-                                ui.spacing_mut().item_spacing.y = item_spacing;
-                                for (index, layout) in footnote_text_layouts.iter().enumerate() {
-                                    if index > 0 {
-                                        ui.add(
-                                            egui::Separator::default().spacing(separator_spacing),
-                                        );
+                            let scroll = footnote_scroll_area(maximum_body_height)
+                                .id_salt(scroll_key)
+                                .vertical_scroll_offset(scroll_offset)
+                                .show(ui, |ui| {
+                                    if routed_scroll.abs() > f32::EPSILON {
+                                        ui.scroll_with_delta(Vec2::new(0.0, routed_scroll));
                                     }
-                                    let row = ui.vertical(|ui| layout.paint(ui)).response;
-                                    if scroll_target.is_some()
-                                        && footnotes[index].citation == scroll_target
+                                    ui.set_width((ui.available_width() - 8.0).max(1.0));
+                                    ui.spacing_mut().item_spacing.y = item_spacing;
+                                    for (index, layout) in footnote_text_layouts.iter().enumerate()
                                     {
-                                        row.scroll_to_me(Some(egui::Align::Center));
+                                        if index > 0 {
+                                            ui.add(
+                                                egui::Separator::default()
+                                                    .spacing(separator_spacing),
+                                            );
+                                        }
+                                        let row = ui.vertical(|ui| layout.paint(ui)).response;
+                                        if scroll_target.is_some()
+                                            && footnotes[index].citation == scroll_target
+                                        {
+                                            row.scroll_to_me(Some(egui::Align::Center));
+                                        }
                                     }
-                                }
-                            });
+                                });
+                            next_scroll_offset = scroll.state.offset.y;
                         });
                     });
                 });
             });
+        self.ui
+            .focus_footnote_scroll_positions
+            .insert(scroll_key, next_scroll_offset);
         let actual_height = overlay.response.rect.height();
         ctx.data_mut(|data| data.insert_temp(height_id, actual_height));
         if (actual_height - panel_height).abs() > 0.5 {
@@ -2530,7 +2873,7 @@ impl DesktopReader {
         if !self.ui.focus_actions_visible {
             return;
         }
-        let viewport = ctx.content_rect();
+        let viewport = crate::ui::overlay_rect(ctx);
         let anchor_y = self
             .focused_unit_screen_center_y(page_rect)
             .unwrap_or_else(|| page_rect.center().y);
@@ -3013,9 +3356,10 @@ impl DesktopReader {
         let mut cancel = false;
         let mut remove = None;
         let modal = egui::Modal::new(egui::Id::new("pdf-toc-review-modal"))
-            .area(egui::Modal::default_area(egui::Id::new(
-                "pdf-toc-review-modal",
-            )))
+            .area(crate::ui::modal_area(
+                ctx,
+                egui::Id::new("pdf-toc-review-modal"),
+            ))
             .backdrop_color(Color32::BLACK.gamma_multiply(0.42))
             .frame(
                 egui::Frame::new()
@@ -3025,7 +3369,7 @@ impl DesktopReader {
                     .inner_margin(egui::Margin::symmetric(22, 18)),
             )
             .show(ctx, |ui| {
-                let width = 600.0_f32.min((ctx.content_rect().width() - 32.0).max(320.0));
+                let width = 600.0_f32.min((crate::ui::overlay_rect(ctx).width() - 32.0).max(320.0));
                 ui.set_width(width);
                 ui.heading(
                     self.language
@@ -3053,7 +3397,7 @@ impl DesktopReader {
                     draft,
                     self.language,
                     self.source.book().sections.len(),
-                    (ctx.content_rect().height() - 210.0).clamp(220.0, 520.0),
+                    (crate::ui::overlay_rect(ctx).height() - 210.0).clamp(120.0, 520.0),
                 );
                 ui.add_space(14.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3194,7 +3538,25 @@ impl DesktopReader {
     }
 
     fn assistant(&mut self, ui: &mut egui::Ui) {
+        #[cfg(not(target_os = "windows"))]
         self.assistant_header(ui);
+        #[cfg(target_os = "windows")]
+        {
+            let (row, _) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), TOOLBAR_HEIGHT),
+                egui::Sense::hover(),
+            );
+            let right = (ui.ctx().content_rect().right()
+                - crate::app::window_chrome::reserve_width(ui.ctx())
+                - TOOLBAR_CONTROL_SIZE
+                - 12.0)
+                .min(row.right());
+            let rect = Rect::from_min_max(
+                row.min,
+                Pos2::new(right.max(row.left() + 1.0), row.bottom()),
+            );
+            crate::app::window_chrome::bounded_ui(ui, rect, |ui| self.assistant_header(ui));
+        }
 
         let busy = self.chat.task.is_pending();
         let reference_rows =
@@ -3228,20 +3590,15 @@ impl DesktopReader {
             Vec2::new(width, TOOLBAR_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.add(icon(Icon::MessageCircle).color(palette().muted));
-                ui.label(
-                    RichText::new(self.language.text("对话", "Chat"))
-                        .size(crate::ui::scaled_font_size(14.0))
-                        .strong()
-                        .color(palette().text),
-                );
+                if ui.available_width() >= 100.0 {
+                    ui.label(
+                        RichText::new(self.language.text("对话", "Chat"))
+                            .size(crate::ui::scaled_font_size(14.0))
+                            .strong()
+                            .color(palette().text),
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icon_button(ui, Icon::X)
-                        .on_hover_text(self.language.text("关闭", "Close"))
-                        .clicked()
-                    {
-                        self.close_assistant_panel();
-                    }
                     ui.add_enabled_ui(!self.chat.messages.is_empty(), |ui| {
                         if icon_button(ui, Icon::Trash2)
                             .on_hover_text(self.language.text("清空", "Clear"))
@@ -3596,7 +3953,7 @@ impl DesktopReader {
                 remove_reference = chat_reference_chips(ui, &references, self.language);
             }
             ui.horizontal(|ui| {
-                let input_width = (ui.available_width() - 38.0).max(48.0);
+                let input_width = (ui.available_width() - 76.0).max(48.0);
                 let hint_text = self.language.text(
                     "询问这本书，输入 / 使用技能或 @ 引用…",
                     "Ask this book, type / for skills or @ to reference…",
@@ -3626,6 +3983,19 @@ impl DesktopReader {
                     self.chat.cursor_char_index = cursor.index.into();
                 }
                 input_response = Some(output.response.response.clone());
+                let enabled = self
+                    .chat
+                    .web_search_enabled
+                    .unwrap_or(self.plugin_settings.web_search.enabled);
+                if crate::ui::selectable_icon_button(ui, Icon::Globe, enabled)
+                    .on_hover_text(
+                        self.language
+                            .text("\u{8054}\u{7f51}\u{641c}\u{7d22}", "Web search"),
+                    )
+                    .clicked()
+                {
+                    self.chat.web_search_enabled = Some(!enabled);
+                }
                 submit = icon_button(ui, Icon::Send)
                     .on_hover_text(self.language.text("发送", "Send"))
                     .clicked();
@@ -3705,11 +4075,14 @@ impl DesktopReader {
         if progress <= 0.001 {
             return;
         }
+        #[cfg(not(target_os = "windows"))]
         let assistant_inset = if self.is_focus_mode() {
             0.0
         } else {
             ASSISTANT_WIDTH * self.ui.assistant_motion.value.clamp(0.0, 1.0)
         };
+        #[cfg(target_os = "windows")]
+        let assistant_inset = crate::app::window_chrome::reserve_width(ctx);
         let menu = egui::Area::new("reader-menu".into())
             .order(egui::Order::Tooltip)
             .anchor(
@@ -4020,12 +4393,16 @@ impl DesktopReader {
 
     fn pointer_interaction(&mut self, response: &egui::Response) {
         if let Some(position) = response.hover_pos() {
-            if let Some(url) = self.website_at_canvas(
+            if let Some((url, bounds)) = self.website_at_canvas(
                 position.x - response.rect.min.x,
                 position.y - response.rect.min.y,
             ) {
                 response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                response.clone().on_hover_text(&url);
+                super::footnote_layout::website_tooltip(
+                    response,
+                    bounds.translate(response.rect.min.to_vec2()),
+                    &url,
+                );
                 if response.clicked() {
                     if let Some(target) = rebook_publication::PublicationUrl::website(&url) {
                         response
@@ -4190,6 +4567,10 @@ impl DesktopReader {
                 return false;
             }
         };
+        self.open_reader_image_preview(ctx, image)
+    }
+
+    fn open_reader_image_preview(&mut self, ctx: &egui::Context, image: ReaderImage) -> bool {
         if let Some(latex) = image.formula.as_deref() {
             match formula_preview_image(latex) {
                 Ok(image) => {
@@ -4429,25 +4810,20 @@ impl DesktopReader {
         let Some(preview) = self.image_preview.as_mut() else {
             return;
         };
-        let screen = ctx.content_rect();
+        let screen = crate::ui::overlay_rect(ctx);
         let available = Vec2::new(
             (screen.width() - IMAGE_PREVIEW_MARGIN * 2.0).max(1.0),
             (screen.height() - IMAGE_PREVIEW_MARGIN * 2.0).max(1.0),
         );
-        let fit_scale = (available.x / preview.source_size.x)
-            .min(available.y / preview.source_size.y)
-            .min(1.0);
+        let fit_scale = preview_fit_scale(preview.source_size, available);
 
         let wheel_delta = ctx.input(preview_wheel_delta);
         if wheel_delta != 0.0 {
-            let old_zoom = preview.zoom;
-            preview.zoom = zoom_from_wheel(preview.zoom, wheel_delta);
-            let ratio = preview.zoom / old_zoom;
+            let factor = zoom_from_wheel(preview.zoom, wheel_delta) / preview.zoom;
             let pointer = ctx
                 .input(|input| input.pointer.hover_pos())
                 .unwrap_or_else(|| screen.center());
-            let current_center = screen.center() + preview.pan;
-            preview.pan -= (pointer - current_center) * (ratio - 1.0);
+            update_preview_zoom(preview, factor, pointer, screen.center());
             ctx.request_repaint();
         }
 
@@ -4455,7 +4831,7 @@ impl DesktopReader {
         preview.pan = clamp_preview_pan(preview.pan, display_size, available);
         let image_rect = Rect::from_center_size(screen.center() + preview.pan, display_size);
         let texture_id = preview.texture.id();
-        let zoom_percent = preview.zoom * 100.0;
+        let zoom_percent = fit_scale * preview.zoom * 100.0;
         let interaction =
             show_image_preview_area(ctx, screen, image_rect, texture_id, zoom_percent);
         close |= interaction.close;
@@ -5590,7 +5966,10 @@ fn show_image_preview_area(
     egui::Area::new("reader-image-preview".into())
         .order(egui::Order::Tooltip)
         .fixed_pos(screen.min)
+        .constrain(false)
+        .default_size(screen.size())
         .show(ctx, |ui| {
+            ui.set_clip_rect(screen);
             // The backdrop only owns clicks used to close the preview. Registering it for
             // dragging as well competes with the image's drag response on the same layer.
             let (backdrop_rect, backdrop) =
@@ -5711,6 +6090,17 @@ fn show_chat_progress(
     }
 }
 
+fn preview_fit_scale(source: Vec2, available: Vec2) -> f32 {
+    (available.x / source.x.max(1.0)).min(available.y / source.y.max(1.0))
+}
+
+fn update_preview_zoom(preview: &mut super::ImagePreview, factor: f32, anchor: Pos2, center: Pos2) {
+    let old_zoom = preview.zoom;
+    preview.zoom = (old_zoom * factor).clamp(IMAGE_PREVIEW_MIN_ZOOM, IMAGE_PREVIEW_MAX_ZOOM);
+    let ratio = preview.zoom / old_zoom;
+    preview.pan -= (anchor - (center + preview.pan)) * (ratio - 1.0);
+}
+
 fn zoom_from_wheel(zoom: f32, wheel_delta: f32) -> f32 {
     (zoom * (wheel_delta * IMAGE_PREVIEW_WHEEL_SPEED).exp())
         .clamp(IMAGE_PREVIEW_MIN_ZOOM, IMAGE_PREVIEW_MAX_ZOOM)
@@ -5762,15 +6152,39 @@ fn paint_toolbar_title(
             toolbar_rect.max,
         )
     };
-    ui.painter().with_clip_rect(title_clip).text(
-        Pos2::new(title_x, toolbar_rect.center().y),
-        if toolbar_visible {
-            egui::Align2::CENTER_CENTER
-        } else {
-            egui::Align2::LEFT_CENTER
-        },
-        title,
+    let mut title_clip = title_clip;
+    #[cfg(target_os = "windows")]
+    for rect in crate::app::window_chrome::geometry(ui.ctx()).excluded {
+        if rect.intersects(toolbar_rect) {
+            if rect.center().x < title_x {
+                title_clip.min.x = title_clip.min.x.max(rect.right() + 8.0);
+            } else {
+                title_clip.max.x = title_clip.max.x.min(rect.left() - 8.0);
+            }
+        }
+    }
+    let width = if toolbar_visible {
+        ((title_x - title_clip.left()).min(title_clip.right() - title_x) * 2.0).max(0.0)
+    } else {
+        title_clip.width().max(0.0)
+    };
+    let mut job = egui::text::LayoutJob::simple(
+        title.to_owned(),
         egui::FontId::proportional(crate::ui::scaled_font_size(TOOLBAR_TITLE_SIZE)),
+        palette().text,
+        width,
+    );
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = ui.painter().layout_job(job);
+    let left = if toolbar_visible {
+        title_x - galley.size().x * 0.5
+    } else {
+        title_x
+    };
+    ui.painter().with_clip_rect(title_clip).galley(
+        Pos2::new(left, toolbar_rect.center().y - galley.size().y * 0.5),
+        galley,
         palette().text,
     );
 }
@@ -5793,7 +6207,294 @@ fn page_wheel_input_allowed(pointer_over_page: bool, blocked: bool) -> bool {
 #[cfg(test)]
 mod reference_suggestion_label_tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn window_header_spans_pinned_panels_and_native_hover_reveals_reader_actions() {
+        use crate::app::window_chrome;
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        reader.reading_mode = crate::preferences::ReadingMode::Classic;
+        reader.ui.sidebar_pinned = true;
+        reader.ui.sidebar_open = true;
+        reader.ui.sidebar_motion.value = 1.0;
+        reader.ui.sidebar_motion.target = 1.0;
+        reader.ui.toolbar_motion.value = 0.0;
+        reader.ui.toolbar_motion.target = 0.0;
+        let ctx = egui::Context::default();
+        window_chrome::set_state(
+            &ctx,
+            window_chrome::WindowState {
+                header_hovered: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                    ..Default::default()
+                },
+                |root| {
+                    window_chrome::begin_frame(&ctx);
+                    let plan = reader.ui(root, None, false);
+                    assert!(
+                        plan.rect.left() > 200.0,
+                        "pinned sidebar still consumes page width"
+                    );
+                    assert!(
+                        plan.rect.top() >= TOOLBAR_HEIGHT,
+                        "page starts below its column header"
+                    );
+                    window_chrome::paint_controls(&ctx);
+                },
+            );
+            output.textures_delta.clear();
+        }
+        let geometry = window_chrome::geometry(&ctx);
+        assert_eq!(geometry.header.unwrap().width(), 1200.0);
+        assert_eq!(geometry.header.unwrap().height(), TOOLBAR_HEIGHT);
+        assert_eq!(reader.ui.toolbar_motion.target, 1.0);
+        let first_button = geometry.buttons[0].unwrap();
+        assert!(
+            geometry
+                .excluded
+                .iter()
+                .filter(|rect| rect.left() < first_button.left())
+                .all(|rect| rect.right() <= first_button.left()),
+            "reader actions must leave space for window controls"
+        );
+        window_chrome::set_state(
+            &ctx,
+            window_chrome::WindowState {
+                header_hovered: false,
+                ..Default::default()
+            },
+        );
+        let mut output = ctx.run_ui(Default::default(), |root| {
+            window_chrome::begin_frame(&ctx);
+            reader.ui(root, None, false);
+            window_chrome::paint_controls(&ctx);
+        });
+        output.textures_delta.clear();
+        assert!(
+            reader.ui.toolbar_hide_at.is_some(),
+            "native caption leave retains delayed hiding"
+        );
+        assert!(
+            window_chrome::geometry(&ctx)
+                .buttons
+                .iter()
+                .all(Option::is_some)
+        );
+    }
     use rebook_layout::ReaderStyle;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn three_column_headers_leave_caption_buttons_and_menu_clear() {
+        use crate::app::window_chrome;
+        for width in [720.0, 1200.0] {
+            for fullscreen in [false, true] {
+                for assistant in [false, true] {
+                    let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+                    reader.reading_mode = crate::preferences::ReadingMode::Classic;
+                    reader.ui.sidebar_pinned = true;
+                    reader.ui.sidebar_open = true;
+                    reader.ui.sidebar_motion.value = 1.0;
+                    reader.ui.sidebar_motion.target = 1.0;
+                    reader.ui.toolbar_motion.value = 1.0;
+                    reader.ui.toolbar_motion.target = 1.0;
+                    if assistant {
+                        reader.ui.assistant_panel = Some(AssistantPanel::Chat);
+                        reader.ui.assistant_motion.value = 1.0;
+                        reader.ui.assistant_motion.target = 1.0;
+                    }
+                    let ctx = egui::Context::default();
+                    window_chrome::set_state(
+                        &ctx,
+                        window_chrome::WindowState {
+                            fullscreen,
+                            header_hovered: true,
+                            ..Default::default()
+                        },
+                    );
+                    for _ in 0..2 {
+                        let mut output = ctx.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(
+                                    Pos2::ZERO,
+                                    Vec2::new(width, 800.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |root| {
+                                window_chrome::begin_frame(&ctx);
+                                let plan = reader.ui(root, None, false);
+                                assert!(plan.rect.left() > 100.0);
+                                assert!(plan.rect.top() >= TOOLBAR_HEIGHT);
+                                window_chrome::paint_controls(&ctx);
+                            },
+                        );
+                        output.textures_delta.clear();
+                    }
+                    let geometry = window_chrome::geometry(&ctx);
+                    let caption_left = width - window_chrome::reserve_width(&ctx);
+                    let menu = geometry
+                        .excluded
+                        .iter()
+                        .find(|rect| {
+                            (rect.width() - TOOLBAR_CONTROL_SIZE).abs() < 0.01
+                                && (rect.right() - (caption_left - 12.0)).abs() < 0.01
+                        })
+                        .expect("menu stays immediately left of window controls");
+                    assert!(menu.top() >= 0.0 && menu.bottom() <= TOOLBAR_HEIGHT);
+                    assert!(
+                        geometry
+                            .excluded
+                            .iter()
+                            .filter(|rect| rect.left() < caption_left)
+                            .all(|rect| rect.right() <= caption_left),
+                        "page controls cannot overlap native caption controls"
+                    );
+                    let left_toggle = ctx
+                        .memory(|memory| {
+                            memory.area_rect(egui::Id::new("reader-left-sidebar-toggle"))
+                        })
+                        .unwrap();
+                    let right_toggle = ctx
+                        .memory(|memory| {
+                            memory.area_rect(egui::Id::new("reader-right-sidebar-toggle"))
+                        })
+                        .unwrap();
+                    assert!(
+                        (left_toggle.left() - reader.ui.sidebar_width - f32::from(SIDEBAR_PADDING))
+                            .abs()
+                            < 0.01,
+                        "left toggle stays outside its sidebar"
+                    );
+                    assert!(
+                        right_toggle.right() <= menu.left(),
+                        "right toggle stays inside content header"
+                    );
+                    if assistant {
+                        assert!(
+                            right_toggle.right() <= width - reader.ui.assistant_width,
+                            "right toggle stays outside the assistant column"
+                        );
+                        let assistant_left = width - reader.ui.assistant_width;
+                        assert!(
+                            geometry
+                                .excluded
+                                .iter()
+                                .any(|rect| rect.left() >= assistant_left
+                                    && rect.right() <= menu.left()
+                                    && rect.top() < TOOLBAR_HEIGHT),
+                            "assistant header controls stay on their own column row"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn focus_sidebar_spans_caption_and_scrim_dims_window_controls() {
+        use crate::app::window_chrome;
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        reader.reading_mode = crate::preferences::ReadingMode::Focus;
+        reader.ui.sidebar_pinned = false;
+        reader.ui.sidebar_open = true;
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+        for fullscreen in [false, true] {
+            window_chrome::set_state(
+                &ctx,
+                window_chrome::WindowState {
+                    fullscreen,
+                    ..Default::default()
+                },
+            );
+            for progress in [0.25, 0.5, 1.0, 0.5, 0.25] {
+                let mut painted = None;
+                for _ in 0..2 {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |_| {
+                            window_chrome::begin_frame(&ctx);
+                            window_chrome::header(
+                                &ctx,
+                                Rect::from_min_size(
+                                    screen.min,
+                                    Vec2::new(screen.width(), TOOLBAR_HEIGHT),
+                                ),
+                            );
+                            reader.floating_sidebar(&ctx, progress);
+                            reader.header_sidebar_toggles(
+                                &ctx,
+                                window_chrome::body_rect(&ctx),
+                                progress,
+                            );
+                            window_chrome::paint_controls(&ctx);
+                        },
+                    );
+                    output.textures_delta.clear();
+                    painted = Some(output);
+                }
+                let output = painted.unwrap();
+                let opacity = Color32::BLACK.gamma_multiply(0.31 * progress);
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == screen && rect.fill == opacity)), "body scrim uses shared opacity while opening and closing");
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect.top() == screen.top() && rect.rect.bottom() == TOOLBAR_HEIGHT && rect.fill == opacity)), "header scrim uses shared opacity while opening and closing");
+                let drawer = ctx
+                    .memory(|memory| memory.area_rect(egui::Id::new("reader-sidebar-floating")))
+                    .unwrap();
+                let scrim = ctx
+                    .memory(|memory| memory.area_rect(egui::Id::new("reader-sidebar-scrim")))
+                    .unwrap();
+                assert_eq!(drawer.top(), screen.top());
+                assert!((drawer.bottom() - screen.bottom()).abs() < 0.01);
+                assert!((drawer.left() + reader.ui.sidebar_width * (1.0 - progress)).abs() < 0.01);
+                assert_eq!(scrim.top(), screen.top());
+                assert_eq!(scrim.bottom(), screen.bottom());
+                assert_eq!(scrim.width(), screen.width());
+                let toggle = ctx
+                    .memory(|memory| memory.area_rect(egui::Id::new("reader-left-sidebar-toggle")))
+                    .unwrap();
+                assert!(
+                    toggle.left() >= drawer.right(),
+                    "drawer cannot cover the header toggle"
+                );
+                assert!(
+                    toggle.bottom() <= TOOLBAR_HEIGHT,
+                    "toggle remains on the caption row"
+                );
+                assert!(!window_chrome::geometry(&ctx).drag_enabled);
+                assert!(
+                    (window_chrome::geometry(&ctx).header_masks[0].1 - 0.31 * progress).abs()
+                        < 0.001
+                );
+                assert!(
+                    window_chrome::geometry(&ctx)
+                        .excluded
+                        .iter()
+                        .filter(|rect| (rect.width() - TOOLBAR_CONTROL_SIZE).abs() < 0.01
+                            && rect.left() < drawer.right())
+                        .all(|rect| (rect.center().y - toggle.center().y).abs() < 0.01),
+                    "drawer header buttons align with the external toggle"
+                );
+                assert_eq!(
+                    window_chrome::geometry(&ctx)
+                        .buttons
+                        .iter()
+                        .all(Option::is_some),
+                    !fullscreen
+                );
+            }
+        }
+    }
 
     #[test]
     fn footnote_center_tracks_translated_and_split_body_geometry() {
@@ -5850,6 +6551,80 @@ mod reference_suggestion_label_tests {
                 .iter()
                 .all(|pixel| *pixel == egui::Color32::WHITE)
         );
+    }
+
+    #[test]
+    fn image_preview_shortcuts_respect_typing_and_keep_zoom_in_the_modal() {
+        for typing in [false, true] {
+            let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+            let layout = reader.current_scroll_layout().unwrap();
+            reader.rebuild_focus_units(&layout);
+            let index = reader
+                .focus_units
+                .iter()
+                .position(|unit| unit.is_image)
+                .unwrap();
+            reader.select_focus_unit(index);
+            reader.ui.sidebar_open = false;
+            reader.ui.focus_footnotes_visible = true;
+            let ctx = egui::Context::default();
+            let mut draft = String::new();
+            if typing {
+                let mut output = ctx.run_ui(Default::default(), |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        ui.text_edit_singleline(&mut draft).request_focus();
+                    });
+                });
+                output.textures_delta.clear();
+                assert!(ctx.text_edit_focused());
+            }
+            let frame = |reader: &mut DesktopReader, key| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                        events: vec![egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    },
+                    |_| reader.keyboard_shortcuts(&ctx, false),
+                );
+                output.textures_delta.clear();
+            };
+            frame(&mut reader, egui::Key::Num0);
+            assert_eq!(reader.image_preview.is_some(), !typing);
+            if typing {
+                continue;
+            }
+            assert!(!reader.ui.focus_footnotes_visible);
+            frame(&mut reader, egui::Key::Equals);
+            assert!((reader.image_preview.as_ref().unwrap().zoom - 1.25).abs() < 0.001);
+            frame(&mut reader, egui::Key::Minus);
+            assert!((reader.image_preview.as_ref().unwrap().zoom - 1.0).abs() < 0.001);
+            assert_eq!(reader.focus_unit_index, index);
+            frame(&mut reader, egui::Key::Escape);
+            assert!(reader.image_preview.is_none());
+        }
+    }
+
+    #[test]
+    fn preview_default_fit_enlarges_small_images_and_contains_wide_formulas() {
+        let available = Vec2::new(960.0, 640.0);
+        for source in [
+            Vec2::new(320.0, 200.0),
+            Vec2::new(3200.0, 2000.0),
+            Vec2::new(1800.0, 60.0),
+        ] {
+            let scale = preview_fit_scale(source, available);
+            let fitted = source * scale;
+            assert!(fitted.x <= available.x + 0.01 && fitted.y <= available.y + 0.01);
+            assert!((fitted.x - available.x).abs() < 0.01 || (fitted.y - available.y).abs() < 0.01);
+        }
+        assert_eq!(preview_fit_scale(Vec2::new(320.0, 200.0), available), 3.0);
     }
 
     #[test]
@@ -5970,6 +6745,114 @@ mod reference_suggestion_label_tests {
         send(&mut reader, chat, true);
         assert_eq!(reader.ui.assistant_panel, Some(AssistantPanel::Chat));
         assert!(!reader.ui.focus_footnotes_visible);
+    }
+
+    #[test]
+    fn popup_allows_global_shortcuts_but_not_when_typing() {
+        for action in 0..3 {
+            for typing in [false, true] {
+                let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+                reader.ui.sidebar_open = false;
+                reader.ui.focus_footnotes_visible = true;
+                reader.translation.enabled = true;
+                let shortcut = match action {
+                    0 => reader.shortcuts.return_to_shelf,
+                    1 => reader.shortcuts.toggle_translation,
+                    _ => reader.shortcuts.search,
+                };
+                let ctx = egui::Context::default();
+                let mut draft = String::new();
+                if typing {
+                    let mut output = ctx.run_ui(Default::default(), |root| {
+                        egui::CentralPanel::default().show(root, |ui| {
+                            ui.text_edit_singleline(&mut draft).request_focus();
+                        });
+                    });
+                    output.textures_delta.clear();
+                    assert!(ctx.text_edit_focused());
+                }
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key: shortcut.logical_key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: shortcut.modifiers,
+                        }],
+                        ..Default::default()
+                    },
+                    |_| reader.keyboard_shortcuts(&ctx, false),
+                );
+                output.textures_delta.clear();
+                match action {
+                    0 => assert_eq!(reader.exit_requested, !typing),
+                    1 => assert_eq!(reader.translation.enabled, typing),
+                    _ => {
+                        assert_eq!(reader.ui.sidebar_open, !typing);
+                        if !typing {
+                            assert_eq!(reader.ui.sidebar_tab, SidebarTab::Search);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn footnote_scroll_is_per_source_block_and_cleared_on_exit() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        let mut first = reader.focus_units[0].clone();
+        first.footnotes = vec![super::super::FocusFootnote {
+            number: 1,
+            citation: None,
+            text: "A long footnote with enough text to scroll. ".repeat(200),
+        }];
+        let mut second = first.clone();
+        second.range.start.node.push_str("-another-block");
+        reader.focus_units = vec![first, second];
+        reader.focus_unit_index = 0;
+        reader.ui.focus_footnotes_visible = true;
+        let a = reader.footnote_scroll_key();
+        reader.ui.focus_footnote_scroll_positions.insert(a, 180.0);
+        let ctx = egui::Context::default();
+        let render = |reader: &mut DesktopReader| {
+            for _ in 0..3 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            egui::vec2(1920.0, 1080.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |_| {
+                        reader.focus_footnote_overlay(
+                            &ctx,
+                            Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 900.0)),
+                        )
+                    },
+                );
+                output.textures_delta.clear();
+            }
+        };
+        render(&mut reader);
+        assert!((reader.ui.focus_footnote_scroll_positions[&a] - 180.0).abs() < 1.0);
+        reader.focus_unit_index = 1;
+        let b = reader.footnote_scroll_key();
+        assert_ne!(a, b);
+        render(&mut reader);
+        assert_eq!(reader.ui.focus_footnote_scroll_positions[&b], 0.0);
+        reader.focus_unit_index = 0;
+        render(&mut reader);
+        assert!((reader.ui.focus_footnote_scroll_positions[&a] - 180.0).abs() < 1.0);
+        reader.focus_units[0].footnotes[0].text = "Shortened translation.".into();
+        render(&mut reader);
+        assert_eq!(reader.ui.focus_footnote_scroll_positions[&a], 0.0);
+        reader.request_exit();
+        assert!(reader.ui.focus_footnote_scroll_positions.is_empty());
     }
 
     #[test]

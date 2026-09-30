@@ -365,7 +365,10 @@ fn build_request(
     let mut params = reasoning_params(provider.kind, model, effort);
     if let Some(extra) = extra.and_then(Value::as_object) {
         for (key, value) in extra {
-            if key != "response_format" && key != "output_schema" {
+            if key != "response_format"
+                && key != "output_schema"
+                && key != "best_effort_output_fields"
+            {
                 params[key] = value.clone();
             }
         }
@@ -560,6 +563,10 @@ fn response_message(response: &CompletionResponse) -> Value {
         content: response.choice.clone(),
     })
     .unwrap_or_default();
+    let mut sources = Vec::new();
+    super::web_search::collect_sources(&response.raw, &mut sources);
+    super::web_search::collect_sources(&message["_rig_message"], &mut sources);
+    message["_web_sources"] = json!(sources);
     message
 }
 
@@ -621,6 +628,31 @@ fn structured_value(
     }
 }
 
+// Wire schemas stay strict for providers. Callers may validate optional enrichment
+// themselves, without throwing away valid primary output or making a paid retry.
+fn best_effort_validation_schema(schema: &Value, extra: Option<&Value>) -> Value {
+    let mut validation = schema.clone();
+    if let Some(fields) = extra
+        .and_then(|v| v.get("best_effort_output_fields"))
+        .and_then(Value::as_array)
+    {
+        for field in fields.iter().filter_map(Value::as_str) {
+            if validation
+                .get("properties")
+                .and_then(|v| v.get(field))
+                .is_none()
+            {
+                continue;
+            }
+            validation["properties"][field] = json!({});
+            if let Some(required) = validation.get_mut("required").and_then(Value::as_array_mut) {
+                required.retain(|v| v.as_str() != Some(field));
+            }
+        }
+    }
+    validation
+}
+
 pub(super) async fn complete(
     provider: &AiProvider,
     model: &str,
@@ -649,8 +681,9 @@ pub(super) async fn complete(
             check_finish(&response)?;
             return Ok(response_message(&response));
         };
-        let validator =
-            jsonschema::validator_for(&schema).map_err(|e| format!("输出 Schema 无效：{e}"))?;
+        let validation_schema = best_effort_validation_schema(&schema, extra);
+        let validator = jsonschema::validator_for(&validation_schema)
+            .map_err(|e| format!("输出 Schema 无效：{e}"))?;
         let key = cache_key(provider, model, &schema, &request);
         let disabled = unsupported_modes(&key);
         let strategies: Vec<_> = modes(provider, &schema, !request.tools.is_empty())
@@ -737,7 +770,20 @@ pub(super) async fn stream(
     effort: ReasoningEffort,
     callback: &mut impl FnMut(ChatStreamEvent),
 ) -> Result<Value, String> {
-    let (request, _) = build_request(provider, model, messages, tools, None, effort, None)?;
+    stream_with_search(provider, model, messages, tools, effort, None, callback).await
+}
+
+pub(super) async fn stream_with_search(
+    provider: &AiProvider,
+    model: &str,
+    messages: &[Value],
+    tools: Option<&Value>,
+    effort: ReasoningEffort,
+    search: Option<&Value>,
+    callback: &mut impl FnMut(ChatStreamEvent),
+) -> Result<Value, String> {
+    // Model-name inference selects search declarations, never the gateway protocol.
+    let (request, _) = build_request(provider, model, messages, tools, None, effort, search)?;
     let response = tokio::time::timeout(
         REQUEST_TIMEOUT,
         dispatch(provider, model, request, callback, true),
@@ -761,6 +807,7 @@ async fn execute<M: CompletionModel>(
     let mut stream = model.stream(request).await?;
     let mut text = String::new();
     let mut reasoning_seen = HashSet::new();
+    let mut sources = Vec::new();
     while let Some(part) = stream.next().await {
         match part? {
             StreamedAssistantContent::Text(delta) => {
@@ -776,16 +823,24 @@ async fn execute<M: CompletionModel>(
             {
                 callback(ChatStreamEvent::Reasoning(reasoning.display_text()))
             }
+            StreamedAssistantContent::Unknown(payload) => {
+                super::web_search::native_event(payload.value(), callback);
+                super::web_search::collect_sources(payload.value(), &mut sources);
+            }
             _ => {}
         }
     }
-    Ok(stream.into())
+    let mut response: CompletionResponse = stream.into();
+    if let Some(raw) = response.raw.as_object_mut() {
+        raw.insert("_torto_web_sources".into(), json!(sources));
+    }
+    Ok(response)
 }
 
 async fn dispatch(
     provider: &AiProvider,
     model: &str,
-    request: CompletionRequest,
+    mut request: CompletionRequest,
     callback: &mut impl FnMut(ChatStreamEvent),
     streaming: bool,
 ) -> Result<CompletionResponse, CompletionError> {
@@ -799,7 +854,39 @@ async fn dispatch(
                 .expect("HTTP client initialization")
         })
         .clone();
-    let http = transport::CompatHttp(http);
+    // Compatible completion builders replace, rather than merge, raw tool arrays.
+    // Append hosted tools only after Rig has serialized the ordinary functions.
+    let hosted = if matches!(
+        provider.kind,
+        AiProviderKind::Custom
+            | AiProviderKind::OpenRouter
+            | AiProviderKind::Moonshot
+            | AiProviderKind::Zai
+    ) {
+        request
+            .additional_params
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .and_then(|params| params.remove("tools"))
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let source_capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let capture = !hosted.is_empty()
+        || request
+            .additional_params
+            .as_ref()
+            .is_some_and(|p| p.get("tools").is_some());
+    let http = transport::CompatHttp(http, hosted, capture.then(|| source_capture.clone()));
+    let responses = request
+        .additional_params
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .and_then(|params| params.remove("_torto_responses"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let base = provider
         .base_url
         .trim()
@@ -821,7 +908,15 @@ async fn dispatch(
             execute(client.completion_model(model), request, callback, streaming).await
         }};
     }
-    match provider.kind {
+    let mut response = match provider.kind {
+        AiProviderKind::OpenAi if responses => {
+            let client = providers::openai::Client::builder()
+                .api_key(key)
+                .base_url(base)
+                .http_client(http)
+                .build()?;
+            execute(client.completion_model(model), request, callback, streaming).await
+        }
         AiProviderKind::Anthropic => {
             let client = providers::anthropic::Client::builder()
                 .api_key(key)
@@ -864,5 +959,16 @@ async fn dispatch(
             }
             execute(engine, request, callback, streaming).await
         }
+    }?;
+    if capture {
+        if !response.raw.is_object() {
+            response.raw = json!({});
+        }
+        response.raw["_torto_captured_sources"] = json!(
+            *source_capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        );
     }
+    Ok(response)
 }

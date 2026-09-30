@@ -22,7 +22,7 @@ use crate::plugins::{
     ChatRequestKind, ChatResponse, ChatRole, ChatSelection, ChatTurn, PDF_PAGE_ANCHOR_PREFIX,
     PdfOcrViewMode, TranslationBlockInput, chat_citation_link, chat_with_book,
     extract_pdf_metadata, recognize_pdf, resolve_chat_command, search_book, section_title,
-    set_pdf_ocr_view_mode, translate_blocks, translate_blocks_incremental,
+    set_pdf_ocr_view_mode,
 };
 
 impl DesktopReader {
@@ -167,6 +167,7 @@ impl DesktopReader {
             });
         }
         if let Some(request) = self.translation.task.take_pending() {
+            let book_id = self.book_id.clone();
             super::semantic_layout::translation_task_event(
                 &request.payload,
                 request.id,
@@ -180,9 +181,13 @@ impl DesktopReader {
                 let batch_proxy = proxy.clone();
                 let logging_task = payload.clone();
                 let started = Instant::now();
-                let result = translate_blocks_incremental(
+                let glossary = crate::plugins::glossary::Context::new(
+                    &book_id, &payload.settings.target_language, Some(payload.section_index),
+                );
+                let result = crate::plugins::translate_blocks_with_glossary(
                     payload.settings,
                     payload.blocks,
+                    Some(glossary),
                     move |translations| {
                         let _ = batch_proxy.send_event(UserEvent::ReaderTranslation(
                             TranslationTaskMessage::Batch { id, translations },
@@ -198,12 +203,26 @@ impl DesktopReader {
             self.translation.task.attach_worker(worker);
         }
         if let Some(request) = self.translation.toc_task.take_pending() {
+            let book_id = self.book_id.clone();
             let proxy = proxy.clone();
             let worker =
                 runtime.spawn(async move {
                     let id = request.id;
                     let payload = request.payload;
-                    let result = translate_blocks(payload.settings, payload.blocks).await;
+                    let glossary = crate::plugins::glossary::Context::new(
+                        &book_id,
+                        &payload.settings.target_language,
+                        None,
+                    );
+                    let mut translations = Vec::new();
+                    let result = crate::plugins::translate_blocks_with_glossary(
+                        payload.settings,
+                        payload.blocks,
+                        Some(glossary),
+                        |batch| translations.extend(batch),
+                    )
+                    .await
+                    .map(|()| translations);
                     let _ = proxy.send_event(UserEvent::ReaderTocTranslation(
                         TocTranslationTaskMessage { id, result },
                     ));
@@ -1363,7 +1382,14 @@ impl DesktopReader {
             book_id: self.book_id.clone(),
             selection,
             annotations: self.highlights.clone(),
-            settings: self.plugin_settings.clone(),
+            settings: {
+                let mut settings = self.plugin_settings.clone();
+                settings.web_search.enabled = self
+                    .chat
+                    .web_search_enabled
+                    .unwrap_or(settings.web_search.enabled);
+                settings
+            },
             history,
             question,
             current,

@@ -159,6 +159,34 @@ impl DesktopReader {
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
             )
+            && let Some(group) = self
+                .focus_units
+                .get(self.focus_unit_index)
+                .and_then(|u| u.list_group.as_ref())
+            && group.split
+        {
+            let rect = group.rect;
+            let background = RoundedRect::from_rect(
+                Rect::new(
+                    f64::from(rect.left()),
+                    f64::from(rect.top() + content_padding - viewport.offset_y),
+                    f64::from(rect.right()),
+                    f64::from(rect.bottom() + content_padding - viewport.offset_y),
+                ),
+                7.0,
+            );
+            let neutral = if crate::ui::palette().dark {
+                Color::from_rgba8(180, 180, 180, 24)
+            } else {
+                Color::from_rgba8(90, 90, 90, 20)
+            };
+            scene.fill(Fill::NonZero, Affine::IDENTITY, neutral, None, &background);
+        }
+        if self.is_focus_mode()
+            && focus_unit_activation_visible(
+                self.selection.is_some(),
+                self.focus_selection_anchor.is_some(),
+            )
             && let Some(rect) = self
                 .focus_units
                 .get(self.focus_unit_index)
@@ -367,7 +395,9 @@ impl DesktopReader {
         if let Some(unit) = focus_unit {
             page.paint_footnote_icons(
                 scene,
-                &unit.paint_ranges,
+                unit.list_group
+                    .as_ref()
+                    .map_or(&unit.paint_ranges, |group| &group.paint_ranges),
                 focus_footnote_icon_color(),
                 offset_x,
             );

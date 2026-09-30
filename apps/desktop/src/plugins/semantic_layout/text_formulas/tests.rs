@@ -459,7 +459,7 @@ fn translation_restores_prepared_math_and_disabled_layout_restores_source_runs()
         source.clone(),
         TranslationMode::Replace,
     ));
-    translation.remember_formula_input(0, 0, &original.blocks[0], &prepared.blocks[0]);
+    translation.remember_translation_input(0, 0, &original.blocks[0], &prepared.blocks[0]);
     let inputs = crate::plugins::prepare_translation_inputs(&prepared, false);
     assert!(inputs[0].0.text.contains("<torto-math-0/>"));
     let overlay = SemanticLayoutSource::new(translation.clone(), source);

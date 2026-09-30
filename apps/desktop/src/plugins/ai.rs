@@ -307,20 +307,59 @@ pub async fn chat_with_book(
             annotation_actions: Vec::new(),
         });
     }
-    let tools = book_tools();
+    let mut tools = book_tools();
+    let route = super::web_search::route(&settings.web_search, provider, model)?;
+    crate::diagnostics::log(
+        "chat.search.route",
+        &[
+            crate::diagnostics::Field::Bool("enabled", settings.web_search.enabled),
+            crate::diagnostics::Field::Detail("model", model),
+            crate::diagnostics::Field::Text(
+                "route",
+                match &route {
+                    super::web_search::SearchRoute::Off => "off",
+                    super::web_search::SearchRoute::Native(_) => "official_declaration",
+                    super::web_search::SearchRoute::Official(_) => "official_service",
+                    super::web_search::SearchRoute::External => "external",
+                },
+            ),
+        ],
+    );
+    let mut native_search = None;
+    let mut official_search = None;
+    let mut search = super::web_search::SearchExecution::new();
+    match route {
+        super::web_search::SearchRoute::Off => {}
+        super::web_search::SearchRoute::Native(params) => native_search = Some(params),
+        super::web_search::SearchRoute::Official(service) => {
+            official_search = Some(service);
+            tools
+                .as_array_mut()
+                .unwrap()
+                .push(super::web_search::tool());
+        }
+        super::web_search::SearchRoute::External => tools
+            .as_array_mut()
+            .unwrap()
+            .push(super::web_search::tool()),
+    }
+    if settings.web_search.enabled {
+        let prompt = messages[0]["content"].as_str().unwrap_or_default();
+        messages[0]["content"] = json!(format!("{prompt}{}", super::web_search::PROMPT));
+    }
     let mut rewrites = Vec::new();
     let mut rewrite_transactions = Vec::new();
     let mut annotation_actions = Vec::new();
     for _ in 0..max_tool_steps {
         let completion = cancellable(
             &cancel,
-            request_streaming_completion(
-                &client,
+            super::llm::stream_with_search(
                 provider,
                 model,
                 &messages,
                 Some(&tools),
                 reasoning_effort,
+                native_search.as_ref(),
                 &mut on_stream,
             ),
         )
@@ -328,6 +367,33 @@ pub async fn chat_with_book(
         let message = match completion {
             Ok(message) => message,
             Err(error) => {
+                if native_search.is_some() && super::web_search::official_search_error(&error) {
+                    super::web_search::remember_unsupported(provider, model);
+                    crate::diagnostics::log(
+                        "chat.search.unavailable",
+                        &[
+                            crate::diagnostics::Field::Bool(
+                                "custom_gateway",
+                                provider.kind == super::AiProviderKind::Custom,
+                            ),
+                            crate::diagnostics::Field::Bool(
+                                "external_fallback",
+                                settings.web_search.selected().is_some(),
+                            ),
+                        ],
+                    );
+                    if settings.web_search.selected().is_none() {
+                        rollback_rewrite_transactions(&rewrite_source, rewrite_transactions);
+                        return Err(super::web_search::OFFICIAL_UNAVAILABLE.into());
+                    }
+                    native_search = None;
+                    tools
+                        .as_array_mut()
+                        .unwrap()
+                        .push(super::web_search::tool());
+                    on_stream(ChatStreamEvent::Content(String::new()));
+                    continue;
+                }
                 rollback_rewrite_transactions(&rewrite_source, rewrite_transactions);
                 return Err(if has_images && error != "已停止生成" {
                     format!("图文聊天请求失败，请确认当前对话模型支持图片输入。\n{error}")
@@ -336,12 +402,25 @@ pub async fn chat_with_book(
                 });
             }
         };
+        if native_search.is_some() {
+            super::web_search::collect_sources(&message["_web_sources"], &mut search.sources);
+        }
         let tool_calls = message
             .get("tool_calls")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
         if tool_calls.is_empty() {
+            if native_search.is_some()
+                && message_content(&message).is_none_or(|s| s.trim().is_empty())
+                && message
+                    .pointer("/_rig_message/content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| !parts.is_empty())
+            {
+                messages.push(message);
+                continue;
+            }
             let Some(content) =
                 message_content(&message).filter(|content| !content.trim().is_empty())
             else {
@@ -349,7 +428,7 @@ pub async fn chat_with_book(
                 return Err("AI 返回了空内容".to_owned());
             };
             return Ok(ChatResponse {
-                content,
+                content: super::web_search::append_sources(content, &search.sources),
                 rewrites,
                 rewrite_transactions,
                 annotation_actions,
@@ -386,6 +465,61 @@ pub async fn chat_with_book(
                 done: false,
             });
             let result = match llm_json::parse::<Value>(arguments) {
+                Ok(arguments)
+                    if arguments.is_object()
+                        && name == "searchWeb"
+                        && settings.web_search.enabled =>
+                {
+                    match official_search
+                        .as_ref()
+                        .or_else(|| settings.web_search.selected())
+                    {
+                        Some(service) => {
+                            match cancellable(&cancel, search.execute(&client, service, &arguments))
+                                .await
+                            {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    if error == "已停止生成" {
+                                        rollback_rewrite_transactions(
+                                            &rewrite_source,
+                                            rewrite_transactions,
+                                        );
+                                        return Err(error);
+                                    }
+                                    if official_search.is_some()
+                                        && super::web_search::official_search_error(&error)
+                                        && let Some(fallback) = settings.web_search.selected()
+                                    {
+                                        super::web_search::remember_unsupported(provider, model);
+                                        official_search = None;
+                                        match cancellable(
+                                            &cancel,
+                                            search.execute(&client, fallback, &arguments),
+                                        )
+                                        .await
+                                        {
+                                            Ok(result) => result,
+                                            Err(error) => {
+                                                if error == "已停止生成" {
+                                                    rollback_rewrite_transactions(
+                                                        &rewrite_source,
+                                                        rewrite_transactions,
+                                                    );
+                                                    return Err(error);
+                                                }
+                                                json!({"error":error})
+                                            }
+                                        }
+                                    } else {
+                                        json!({"error":error})
+                                    }
+                                }
+                            }
+                        }
+                        None => json!({"error":"No search service configured"}),
+                    }
+                }
                 Ok(arguments) if arguments.is_object() && name == "getVisualContent" => {
                     if format == BookFormat::Pdf {
                         get_visual_content(
@@ -612,23 +746,28 @@ fn compact_annotation(source: &dyn BookSource, annotation: &StoredHighlight) -> 
     })
 }
 
-pub async fn translate_blocks(
-    settings: PluginSettings,
-    blocks: Vec<TranslationBlockInput>,
-) -> Result<Vec<BlockTranslation>, String> {
-    let mut translations = Vec::new();
-    translate_blocks_incremental(settings, blocks, |batch| translations.extend(batch)).await?;
-    Ok(translations)
-}
-
+#[cfg(test)]
 pub async fn translate_blocks_incremental<F>(
     settings: PluginSettings,
     blocks: Vec<TranslationBlockInput>,
+    on_batch: F,
+) -> Result<(), String>
+where
+    F: FnMut(Vec<BlockTranslation>),
+{
+    translate_blocks_with_glossary(settings, blocks, None, on_batch).await
+}
+
+pub(crate) async fn translate_blocks_with_glossary<F>(
+    settings: PluginSettings,
+    blocks: Vec<TranslationBlockInput>,
+    glossary: Option<super::glossary::Context>,
     mut on_batch: F,
 ) -> Result<(), String>
 where
     F: FnMut(Vec<BlockTranslation>),
 {
+    let glossary = glossary.filter(|_| settings.expert_translation);
     let reasoning_effort = settings.translation_reasoning_effort;
     let (provider, model) = settings.translation_endpoint()?;
     if blocks.is_empty() {
@@ -647,6 +786,7 @@ where
             settings.target_language.trim(),
             reasoning_effort,
             &batch,
+            glossary.as_ref(),
         )
         .await?;
         on_batch(translations);
@@ -661,6 +801,7 @@ async fn translate_block_batch(
     target_language: &str,
     reasoning_effort: ReasoningEffort,
     blocks: &[TranslationBlockInput],
+    glossary: Option<&super::glossary::Context>,
 ) -> Result<Vec<BlockTranslation>, String> {
     crate::plugins::llm::budgeted(async {
     let keys = (0..blocks.len())
@@ -677,16 +818,31 @@ async fn translate_block_batch(
         ""
     };
     let citation_contract = translation_citation_contract(blocks)?;
-    let schema = super::llm::schema_options(json!({
-        "type":"object", "additionalProperties":false, "required":keys,
-        "properties": keys.iter().map(|key| (key.clone(), json!({"type":"string", "minLength":1}))).collect::<serde_json::Map<_,_>>()
+    let mut properties = keys.iter().map(|key| (key.clone(), json!({"type":"string", "minLength":1}))).collect::<serde_json::Map<_,_>>();
+    let mut required = keys.clone();
+    let mut system = format!("{}\n{}", translation_system_prompt(target_language, fixed_page_hint), citation_contract);
+    if let Some(glossary) = glossary {
+        properties.insert("g".into(), super::glossary::schema());
+        required.push("g".into());
+        let (prompt, hits) = glossary.prompt(blocks);
+        system = system.replace("保留完全相同的键；每个值只能是对应译文字符串。", "保留所有原段落键，其值仍是对应译文字符串；另外新增 g 数组。");
+        system.push_str(&prompt);
+        super::semantic_layout::translation_event(provider, model, "translation.glossary_selected", json!({"hits":hits}));
+    }
+    let mut schema = super::llm::schema_options(json!({
+        "type":"object", "additionalProperties":false, "required":required,
+        "properties": properties
     }));
+    if glossary.is_some() {
+        // Request a strict glossary shape, but never reject valid prose over optional metadata.
+        schema["best_effort_output_fields"] = json!(["g"]);
+    }
     let mut last_error = None;
     for attempt in 1..=MAX_TRANSLATION_ATTEMPTS {
         let mut messages = vec![
             json!({
                 "role": "system",
-                "content": format!("{}\n{}", translation_system_prompt(target_language, fixed_page_hint), citation_contract),
+                "content": system,
             }),
             json!({ "role": "user", "content": Value::Object(input.clone()).to_string() }),
         ];
@@ -733,6 +889,10 @@ async fn translate_block_batch(
                 }) {
                     last_error = Some(error);
                     continue;
+                }
+                if let Some(glossary) = glossary {
+                    let stats = glossary.merge(&content, blocks, &values);
+                    super::semantic_layout::translation_event(provider, model, "translation.glossary_merged", stats);
                 }
                 return Ok(blocks
                     .iter()
@@ -964,6 +1124,7 @@ async fn cancellable<T>(
 
 fn tool_progress_label(name: &str) -> &str {
     match name {
+        "searchWeb" | "$web_search" => "搜索网页",
         "searchBook" => "搜索书籍",
         "getContent" => "读取正文",
         "getCurrentContext" => "读取当前阅读内容",
@@ -2310,6 +2471,108 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_external_search_keeps_book_tools_and_returns_real_sources() {
+        use super::super::web_search::{SearchMode, SearchService};
+        for variant in 0..3 {
+            let native = variant == 1;
+            let response = |message: Value| json!({"id":"test","object":"chat.completion","created":0,"model":"test","choices":[{"index":0,"message":message,"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+            let tool_call = response(
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":"web-1","type":"function","function":{"name":"searchWeb","arguments":"{\"query\":\"latest research\"}"}}]}),
+            );
+            let (search_url, search_server) = super::super::llm::tests::server(vec![(
+                200,
+                json!({"results":[{"title":"Actual source","url":"https://example.com/evidence","content":"Retrieved evidence"}]}),
+            )]);
+            let mut responses = vec![
+                (200, tool_call),
+                (
+                    200,
+                    response(json!({"role":"assistant","content":"Evidence-based answer"})),
+                ),
+            ];
+            if native {
+                responses.insert(
+                    0,
+                    (
+                        400,
+                        json!({"error":{"message": "web_search is not supported"}}),
+                    ),
+                );
+            }
+            let (url, server) = super::super::llm::tests::server(responses);
+            let source: Arc<dyn BookSource> = Arc::new(fixed_page_test_source());
+            let rewrite = Arc::new(RewriteBookSource::new(source.clone()));
+            let mut settings = PluginSettings::default().with_test_model();
+            settings.providers[0].base_url = url;
+            settings.providers[0].api_key = "fixture-provider-key".into();
+            settings.web_search.enabled = true;
+            settings.web_search.mode = if native {
+                SearchMode::Native
+            } else {
+                SearchMode::External
+            };
+            if native {
+                settings.providers[0].kind = super::super::AiProviderKind::OpenRouter;
+            }
+            if variant == 2 {
+                settings.providers[0].kind = super::super::AiProviderKind::Custom;
+                settings.chat_model = "cpa/gemini-3.8-flash-high".into();
+                settings.providers[0].models[0].id = settings.chat_model.clone();
+            }
+            settings.web_search.default_service = "test".into();
+            settings.web_search.services.push(SearchService {
+                id: "test".into(),
+                endpoint: search_url,
+                api_key: "search-key".into(),
+                ..Default::default()
+            });
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(chat_with_book(
+                    source,
+                    BookFormat::Pdf,
+                    ChatRequestKind::Normal,
+                    rewrite,
+                    "test".into(),
+                    None,
+                    Vec::new(),
+                    settings,
+                    Vec::new(),
+                    "Search for research".into(),
+                    fixed_page_context(),
+                    "English".into(),
+                    Arc::new(tokio::sync::Notify::new()),
+                    |_| {},
+                ))
+                .unwrap();
+            assert!(result.content.contains("https://example.com/evidence"));
+            let requests = server.join().unwrap();
+            assert!(
+                requests[usize::from(native)]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["function"]["name"] == "searchBook")
+            );
+            assert!(
+                requests[usize::from(native)]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["function"]["name"] == "searchWeb")
+            );
+            assert!(
+                requests.last().unwrap()["messages"]
+                    .to_string()
+                    .contains("Retrieved evidence")
+            );
+            assert_eq!(search_server.join().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn figure_caption_is_exposed_as_source_backed_ai_content() {
         let spine = SpineItemId::new("chapter").unwrap();
         let range = SourceRange {
@@ -3319,6 +3582,7 @@ mod tests {
                     segment_index: None,
                     text: "Hello".into(),
                 }],
+                None,
             ));
 
         server.join().unwrap();
@@ -3371,6 +3635,7 @@ mod tests {
                     segment_index: None,
                     text: "Energy is <torto-math-0/>".into(),
                 }],
+                None,
             ))
             .unwrap();
 
@@ -3383,6 +3648,87 @@ mod tests {
                 text: "能量为 <torto-math-0/>".into(),
             }]
         );
+    }
+
+    #[test]
+    fn expert_translation_reuses_glossary_without_retrying_bad_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for step in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let wire: Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert!(wire.get("best_effort_output_fields").is_none());
+                let messages = wire["messages"].as_array().unwrap();
+                let system = messages
+                    .iter()
+                    .filter(|m| m["role"] == "system")
+                    .map(|m| match &m["content"] {
+                        Value::String(s) => s.clone(),
+                        Value::Array(parts) => parts
+                            .iter()
+                            .filter_map(|p| p["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        _ => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let user = messages.iter().find(|m| m["role"] == "user").unwrap()["content"]
+                    .as_str()
+                    .unwrap();
+                let input: Value = serde_json::from_str(user).unwrap();
+                assert!(input["0"].is_string());
+                assert_eq!(input.as_object().unwrap().len(), 1);
+                if step < 3 {
+                    assert!(system.contains("Expert translation and glossary"));
+                    assert!(!system.contains("保留完全相同的键；每个值只能是对应译文字符串"));
+                    if step > 0 {
+                        assert!(system.contains("输入法编辑器"));
+                    }
+                } else {
+                    assert!(!system.contains("Expert translation and glossary"));
+                    assert!(!system.contains("输入法编辑器"));
+                }
+                let content = match step {
+                    0 => {
+                        json!({"0":"输入法编辑器", "g":[{"s":"input method editor", "t":"输入法编辑器"}]})
+                    }
+                    1 => json!({"0":"输入法编辑器", "g":"invalid metadata"}),
+                    _ => json!({"0":"输入法编辑器"}),
+                };
+                let body = json!({"choices":[{"message":{"role":"assistant","content":content.to_string()}}]}).to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let path = std::env::temp_dir().join(format!("torto-expert-{}.json", uuid::Uuid::new_v4()));
+        let glossary = super::super::glossary::Context::at_path(path.clone());
+        let mut settings = PluginSettings::default().with_test_model();
+        settings.providers[0].base_url = format!("http://{address}/v1");
+        settings.target_language = "简体中文".into();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for step in 0..4 {
+            settings.expert_translation = step < 3;
+            let mut result = Vec::new();
+            runtime
+                .block_on(translate_blocks_with_glossary(
+                    settings.clone(),
+                    vec![TranslationBlockInput {
+                        block_index: step,
+                        segment_index: None,
+                        text: "input method editor".into(),
+                    }],
+                    Some(glossary.clone()),
+                    |batch| result.extend(batch),
+                ))
+                .unwrap();
+            assert_eq!(result[0].text, "输入法编辑器");
+            assert_eq!(result[0].block_index, step);
+        }
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 }
 

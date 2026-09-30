@@ -58,6 +58,7 @@ struct Group {
 }
 #[derive(Default)]
 pub(super) struct SemanticLayoutState {
+    expert_translation: bool,
     semantic_config: Option<(
         crate::plugins::semantic_layout::SemanticLayoutSettings,
         Option<crate::plugins::AiProvider>,
@@ -141,6 +142,17 @@ fn canonical(mut demand: Demand) -> Demand {
         ranges.dedup();
     }
     demand
+}
+
+// Linked endnotes live outside the visible chapter. They must not wait behind
+// every body batch while their original text is already visible in a popup.
+fn next_translation_section(
+    indices: impl IntoIterator<Item = usize>,
+    visible: &Demand,
+) -> Option<usize> {
+    indices
+        .into_iter()
+        .min_by_key(|index| visible.iter().any(|(i, _)| i == index))
 }
 
 fn demanded_sources(
@@ -286,6 +298,12 @@ impl DesktopReader {
     }
     fn sync_content_config(&mut self) -> bool {
         let mut refreshed = false;
+        if self.semantic_layout.expert_translation != self.plugin_settings.expert_translation {
+            // Preserve completed prose and in-flight request snapshots. Only retry
+            // previously failed inputs with the new mode; there is no disk prose cache.
+            self.semantic_layout.expert_translation = self.plugin_settings.expert_translation;
+            self.semantic_layout.failed.clear();
+        }
         let provider = |id: &str| {
             self.plugin_settings
                 .providers
@@ -648,8 +666,10 @@ impl DesktopReader {
                         && (!semantic || self.translation_semantics_ready(key.0, key.1))
                 })
                 .collect::<Vec<_>>();
-            if let Some((first, _)) = available.first() {
-                let index = first.0;
+            if let Some(index) = next_translation_section(
+                available.iter().map(|(key, _)| key.0),
+                &self.semantic_layout.demand,
+            ) {
                 let inputs = available
                     .into_iter()
                     .filter(|(key, _)| key.0 == index)
@@ -765,7 +785,7 @@ impl DesktopReader {
                         );
                     }
                 }
-                self.translation_source.remember_formula_input(
+                self.translation_source.remember_translation_input(
                     index,
                     input.block_index,
                     &original.blocks[input.block_index],

@@ -72,6 +72,7 @@ mod chat_markdown;
 mod citation_tests;
 mod completion;
 mod egui_view;
+mod focus_lists;
 mod footnote_layout;
 mod interaction;
 mod navigation;
@@ -633,6 +634,7 @@ struct ScrollQuoteBridge {
 
 #[derive(Clone)]
 struct FocusUnit {
+    list_group: Option<Arc<focus_lists::ListGroup>>,
     range: SourceRange,
     paint_ranges: Vec<SourceRange>,
     structure_ranges: Vec<SourceRange>,
@@ -689,6 +691,7 @@ enum FocusFootnoteSource {
 fn merge_focus_list_descendant(root: &mut FocusUnit, descendant: FocusUnit) {
     root.range.end = descendant.range.end;
     root.paint_ranges.extend(descendant.paint_ranges);
+    root.structure_ranges.extend(descendant.structure_ranges);
     if !descendant.text.trim().is_empty() {
         if !root.text.is_empty() {
             root.text.push('\n');
@@ -779,7 +782,11 @@ fn text_block_focus_footnotes(block: &TextBlock) -> Vec<FocusFootnoteSource> {
                 }
             })
             .collect();
-        let number = index as u32 + 1;
+        let number = if first.style.footnote_number == 0 {
+            index as u32 + 1
+        } else {
+            first.style.footnote_number
+        };
         if first.style.inline_role == InlineRole::Footnote {
             notes.push(FocusFootnoteSource::Inline(text.trim().to_owned(), number));
         } else if let Some(target) = &first.link {
@@ -850,7 +857,11 @@ fn block_is_footnote_definition(block: &Block) -> bool {
 }
 
 fn block_focus_footnotes(block: &Block) -> Vec<FocusFootnoteSource> {
-    match block {
+    if let Block::Text(text) = block {
+        return text_block_focus_footnotes(text);
+    }
+    let numbered = rebook_layout::numbered_semantic_footnotes(block);
+    match numbered.as_ref() {
         Block::Text(block) => text_block_focus_footnotes(block),
         Block::Quote(quote) => quote
             .body
@@ -1889,6 +1900,26 @@ impl ScrollSectionLayout {
         })
     }
 
+    #[cfg(any(debug_assertions, test))]
+    fn source_line_rects(&self, range: &SourceRange) -> Vec<egui::Rect> {
+        self.pages
+            .iter()
+            .enumerate()
+            .flat_map(|(index, entry)| {
+                entry
+                    .page
+                    .source_rects(std::slice::from_ref(range))
+                    .into_iter()
+                    .map(move |rect| {
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.x0 as f32, self.content_y(index, rect.y0 as f32)),
+                            egui::pos2(rect.x1 as f32, self.content_y(index, rect.y1 as f32)),
+                        )
+                    })
+            })
+            .collect()
+    }
+
     fn source_baseline(&self, range: &SourceRange) -> Option<f32> {
         self.pages.iter().enumerate().find_map(|(index, entry)| {
             entry
@@ -1933,8 +1964,11 @@ struct FocusReflowAnchor {
     range: SourceRange,
     screen_y: f32,
     uses_baseline: bool,
-    visible_start_offset: Option<f32>,
-    viewport_height: f32,
+    stationary_viewport: Option<ScrollViewportState>,
+    #[cfg(debug_assertions)]
+    previous_lines: Vec<(SourceRange, Vec<egui::Rect>)>,
+    #[cfg(debug_assertions)]
+    previous_offset: f32,
     image_progress: Option<f32>,
 }
 
@@ -1970,6 +2004,16 @@ impl DesktopReader {
         let padding = self.scroll_content_padding(viewport.size.y);
         let visible_top = viewport.offset_y - padding;
         let mut range = unit.paint_ranges.first()?.clone();
+        #[cfg(debug_assertions)]
+        let previous_lines = self
+            .focus_units
+            .iter()
+            .take(self.focus_unit_index)
+            .rev()
+            .take(8)
+            .flat_map(|unit| unit.paint_ranges.iter())
+            .map(|range| (range.clone(), layout.source_line_rects(range)))
+            .collect();
         if let Some((start, end)) = image_caption_scroll_bounds(unit, viewport.size.y) {
             return Some(FocusReflowAnchor {
                 section_index: layout.section_index,
@@ -1977,8 +2021,11 @@ impl DesktopReader {
                 range,
                 screen_y: 0.0,
                 uses_baseline: false,
-                visible_start_offset: None,
-                viewport_height: viewport.size.y,
+                stationary_viewport: None,
+                #[cfg(debug_assertions)]
+                previous_lines,
+                #[cfg(debug_assertions)]
+                previous_offset: viewport.offset_y,
                 image_progress: Some(
                     ((viewport.offset_y - start) / (end - start).max(1.0)).clamp(0.0, 1.0),
                 ),
@@ -1992,8 +2039,23 @@ impl DesktopReader {
                 layout.page_at_content_y(visible_top.max(unit.rect.top()))?;
             let page = &layout.pages[page_index].page;
             let hit = page.hit_test_text(unit.rect.left(), page_y, false)?;
-            let fragment =
-                page.selection_fragment(hit.region_index, hit.cluster_start..hit.cluster_end)?;
+            let bytes = if hit.cluster_start < hit.cluster_end {
+                hit.cluster_start..hit.cluster_end
+            } else {
+                // Inexact hit testing returns a cursor, not a selected cluster.
+                // Resolve a real UTF-8 character so an empty selection cannot
+                // discard the visible anchor inside a long paragraph.
+                let text = page.text_region_text(hit.region_index)?;
+                let visible = page.text_region_visible_range(hit.region_index)?;
+                let start = hit.byte_index.clamp(visible.start, visible.end);
+                if let Some(character) = text.get(start..visible.end)?.chars().next() {
+                    start..start + character.len_utf8()
+                } else {
+                    let (index, _) = text.get(visible.clone())?.char_indices().next_back()?;
+                    visible.start + index..visible.end
+                }
+            };
+            let fragment = page.selection_fragment(hit.region_index, bytes)?;
             if !unit
                 .paint_ranges
                 .iter()
@@ -2011,54 +2073,19 @@ impl DesktopReader {
             range,
             screen_y: anchor_y + padding - viewport.offset_y,
             uses_baseline: baseline.is_some(),
-            // Whole-document changes must preserve the viewport, not translate
-            // one paragraph independently of neighboring text and images.
-            visible_start_offset: (kind == FocusReflowKind::ParagraphStructure
+            // Sentence splitting changes this paragraph in place. Keep the whole
+            // viewport stationary when its beginning is still visible, so earlier
+            // text does not move to compensate for this paragraph's line metrics.
+            stationary_viewport: (kind == FocusReflowKind::ParagraphStructure
                 && top >= visible_top
                 && top < visible_top + viewport.size.y)
-                .then_some(viewport.offset_y),
-            viewport_height: viewport.size.y,
+                .then_some(viewport),
+            #[cfg(debug_assertions)]
+            previous_lines,
+            #[cfg(debug_assertions)]
+            previous_offset: viewport.offset_y,
             image_progress: None,
         })
-    }
-
-    fn locally_correct_focus_reflow(
-        &mut self,
-        layout: Arc<ScrollSectionLayout>,
-        viewport_height: f32,
-    ) -> Arc<ScrollSectionLayout> {
-        let Some(anchor) = self.focus_reflow_anchor.as_ref() else {
-            return layout;
-        };
-        if !anchor.uses_baseline
-            || anchor.section_index != layout.section_index
-            || anchor.reading_unit_index != layout.reading_unit_index
-            || (anchor.viewport_height - viewport_height).abs() > MOTION_EPSILON
-        {
-            return layout;
-        }
-        let Some(offset) = anchor.visible_start_offset else {
-            return layout;
-        };
-        let Some(baseline) = layout.source_baseline(&anchor.range) else {
-            return layout;
-        };
-        let dy = anchor.screen_y + offset - viewport_height * 0.5 - baseline;
-        if dy.abs() < 0.001 {
-            return layout;
-        }
-        let mut corrected = (*layout).clone();
-        for entry in &mut corrected.pages {
-            if entry.page.source_text_baseline(&anchor.range).is_some() {
-                entry.page = Arc::new(entry.page.translate_source_text(&anchor.range, dy));
-            }
-        }
-        let corrected = Arc::new(corrected);
-        self.scroll_section = Some(corrected.clone());
-        self.page_scenes.clear();
-        self.page_scene_lru.clear();
-        self.bump_scene_revision();
-        corrected
     }
 
     fn restore_focus_reflow_anchor(
@@ -2089,12 +2116,70 @@ impl DesktopReader {
         } else {
             layout.source_top(&anchor.range)?
         };
-        Some(reflow_anchor_offset(
-            top,
-            anchor.screen_y,
-            viewport_height,
-            layout.content_height,
-        ))
+        let stationary = anchor
+            .stationary_viewport
+            .filter(|viewport| (viewport.size.y - viewport_height).abs() <= MOTION_EPSILON);
+        let offset = stationary.map_or_else(
+            || reflow_anchor_offset(top, anchor.screen_y, viewport_height, layout.content_height),
+            |viewport| {
+                viewport.offset_y.clamp(
+                    0.0,
+                    (focus_scroll_content_height(layout.content_height, viewport_height)
+                        - viewport_height)
+                        .max(0.0),
+                )
+            },
+        );
+        #[cfg(debug_assertions)]
+        {
+            use crate::diagnostics::{Field, log};
+            log(
+                "reader.reflow.restore",
+                &[
+                    Field::Detail("node", &anchor.range.start.node),
+                    Field::Usize("section", layout.section_index),
+                    Field::Bool("stationary", stationary.is_some()),
+                    Field::F32("before_offset", anchor.previous_offset),
+                    Field::F32("after_offset", offset),
+                    Field::F32("offset_delta", offset - anchor.previous_offset),
+                    Field::F32("height", viewport_height),
+                ],
+            );
+            for (range, before) in &anchor.previous_lines {
+                let after = layout.source_line_rects(range);
+                let mut min = f32::INFINITY;
+                let mut max = f32::NEG_INFINITY;
+                let deltas = before
+                    .iter()
+                    .zip(&after)
+                    .map(|(a, b)| b.top() - a.top())
+                    .collect::<Vec<_>>();
+                for delta in &deltas {
+                    min = min.min(*delta);
+                    max = max.max(*delta);
+                }
+                let sample = before
+                    .iter()
+                    .zip(&after)
+                    .take(8)
+                    .map(|(a, b)| format!("{:.3}>{:.3}", a.top(), b.top()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                log(
+                    "reader.reflow.previous_lines",
+                    &[
+                        Field::Detail("node", &range.start.node),
+                        Field::Usize("before_lines", before.len()),
+                        Field::Usize("after_lines", after.len()),
+                        Field::F32("doc_delta_min", if deltas.is_empty() { 0.0 } else { min }),
+                        Field::F32("doc_delta_max", if deltas.is_empty() { 0.0 } else { max }),
+                        Field::F32("scroll_delta", offset - anchor.previous_offset),
+                        Field::Detail("sample_y", &sample),
+                    ],
+                );
+            }
+        }
+        Some(offset)
     }
 
     fn focus_mode_allowed(&self) -> bool {
@@ -2230,6 +2315,9 @@ impl DesktopReader {
             .iter()
             .flat_map(|(_, section)| section.blocks.iter().cloned())
             .collect();
+        if self.reader.style().typesetting.mode == rebook_layout::TypesettingMode::Unified {
+            rebook_layout::number_list_footnotes(&mut section.blocks);
+        }
         let block_sections = sections
             .iter()
             .flat_map(|(index, section)| {
@@ -2249,7 +2337,13 @@ impl DesktopReader {
         let mut active_list_root: Option<(usize, u8)> = None;
         for (block_index, block) in section.blocks.iter().enumerate() {
             let (source_section_index, source_section) = block_sections[block_index];
-            if block_source_range(block).is_some_and(|range| !reading_ranges.contains(range)) {
+            if block_source_range(block).is_some_and(|range| {
+                !reading_ranges.iter().any(|visible| {
+                    visible == range
+                        || source_range_contains_anchor(range, &visible.start)
+                        || source_range_contains_anchor(visible, &range.start)
+                })
+            }) {
                 active_list_root = None;
                 continue;
             }
@@ -2468,6 +2562,7 @@ impl DesktopReader {
                 None
             };
             let unit = FocusUnit {
+                list_group: None,
                 range,
                 paint_ranges,
                 structure_ranges,
@@ -2522,15 +2617,39 @@ impl DesktopReader {
             }
         }
         let current = snapshot_position(&self.snapshot);
+        let fallback = first_unit_after_anchor
+            .and_then(|i| units.get(i))
+            .map(|u| u.range.start.clone());
+        let units = focus_lists::group(
+            units,
+            &section.blocks,
+            layout,
+            self.scroll_viewport
+                .map_or(INITIAL_HEIGHT as f32, |v| v.size.y),
+        );
+        let first_unit_after_anchor = fallback.as_ref().and_then(|anchor| {
+            units.iter().position(|u| {
+                u.paint_ranges
+                    .iter()
+                    .any(|r| source_range_contains_anchor(r, anchor))
+            })
+        });
         self.focus_unit_index = resolved_focus_unit_index(
             &units,
             self.focus_anchor.as_ref(),
             first_unit_after_anchor,
             current,
         );
-        self.focus_anchor = units
-            .get(self.focus_unit_index)
-            .map(|unit| unit.range.start.clone());
+        if let Some(unit) = units.get(self.focus_unit_index) {
+            if self.focus_anchor.as_ref().is_none_or(|anchor| {
+                !unit
+                    .paint_ranges
+                    .iter()
+                    .any(|r| source_range_contains_anchor(r, anchor))
+            }) {
+                self.focus_anchor = Some(unit.range.start.clone());
+            }
+        }
         self.focus_units = units;
         self.focus_units_ready = true;
         self.sync_focus_chat_session();
@@ -2666,7 +2785,25 @@ impl DesktopReader {
             FocusNavigationDestination::AdjacentSection => {
                 self.go_to_adjacent_section(direction);
             }
-            FocusNavigationDestination::Unit(index) => self.set_focus_unit(index),
+            FocusNavigationDestination::Unit(index) => {
+                self.set_focus_unit(index);
+                // Reverse entry into a long list item starts at its last screen,
+                // so repeated Up steps read it backwards instead of skipping it.
+                if direction == PageDirection::Previous
+                    && let Some(viewport) = self.scroll_viewport
+                    && let Some(unit) = self
+                        .focus_units
+                        .get(index)
+                        .filter(|u| u.list_group.is_some())
+                    && let Some((_, bottom)) = oversized_focus_unit_scroll_bounds(
+                        unit.rect,
+                        viewport.size.y,
+                        self.scroll_content_padding(viewport.size.y),
+                    )
+                {
+                    self.animate_focus_scroll_to(bottom);
+                }
+            }
         }
     }
 
@@ -3174,6 +3311,7 @@ struct ChatStreamingState {
 }
 
 struct ChatUiState {
+    web_search_enabled: Option<bool>,
     session_id: u64,
     input: String,
     cursor_char_index: usize,
@@ -3194,6 +3332,7 @@ struct ChatUiState {
 impl Default for ChatUiState {
     fn default() -> Self {
         Self {
+            web_search_enabled: None,
             session_id: NEXT_CHAT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             input: String::new(),
             cursor_char_index: 0,
@@ -3566,6 +3705,7 @@ struct ReaderUiState {
     focus_actions_visible: bool,
     focus_footnotes_visible: bool,
     focus_footnote_scroll_delta: f32,
+    focus_footnote_scroll_positions: HashMap<egui::Id, f32>,
     focus_footnote_modifier_tap: egui_view::ModifierTapState,
 }
 
@@ -3828,6 +3968,7 @@ impl DesktopReader {
                 focus_actions_visible: false,
                 focus_footnotes_visible: false,
                 focus_footnote_scroll_delta: 0.0,
+                focus_footnote_scroll_positions: HashMap::new(),
                 focus_footnote_modifier_tap: egui_view::ModifierTapState::Idle,
             },
             plugin_settings,
@@ -5147,6 +5288,7 @@ mod tests {
         let image_range = range("image", 0);
         let caption_range = range("caption", 18);
         let mut image = FocusUnit {
+            list_group: None,
             range: image_range.clone(),
             paint_ranges: vec![image_range],
             structure_ranges: Vec::new(),
@@ -5168,6 +5310,7 @@ mod tests {
             footnotes: Vec::new(),
         };
         let caption = FocusUnit {
+            list_group: None,
             range: caption_range.clone(),
             paint_ranges: vec![caption_range.clone()],
             structure_ranges: vec![caption_range.clone()],
@@ -5212,6 +5355,7 @@ mod tests {
             text_offset: 0,
         };
         FocusUnit {
+            list_group: None,
             range: SourceRange {
                 start: anchor.clone(),
                 end: anchor,
@@ -5498,6 +5642,7 @@ mod tests {
             page_index: 0,
         };
         let unit = |node: &str, text: &str, y: f32| FocusUnit {
+            list_group: None,
             range: range(node),
             paint_ranges: vec![range(node)],
             structure_ranges: Vec::new(),
@@ -5574,6 +5719,7 @@ mod tests {
             page_index: 0,
         };
         let units = ["previous", "target"].map(|node| FocusUnit {
+            list_group: None,
             range: range(node),
             paint_ranges: vec![range(node)],
             structure_ranges: Vec::new(),
@@ -6031,6 +6177,7 @@ mod tests {
             focus_actions_visible: false,
             focus_footnotes_visible: false,
             focus_footnote_scroll_delta: 0.0,
+            focus_footnote_scroll_positions: HashMap::new(),
             focus_footnote_modifier_tap: super::egui_view::ModifierTapState::Idle,
         };
 
@@ -6073,6 +6220,7 @@ mod tests {
             focus_actions_visible: false,
             focus_footnotes_visible: false,
             focus_footnote_scroll_delta: 0.0,
+            focus_footnote_scroll_positions: HashMap::new(),
             focus_footnote_modifier_tap: super::egui_view::ModifierTapState::Idle,
         };
 

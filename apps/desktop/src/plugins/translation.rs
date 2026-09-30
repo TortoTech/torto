@@ -55,7 +55,7 @@ struct StoredBlockTranslation {
 
 #[derive(Default)]
 struct TranslationState {
-    formula_inputs: HashMap<(usize, usize), (Block, Block)>,
+    prepared_inputs: HashMap<(usize, usize), (Block, Block)>,
     target_writing_system: rebook_publication::WritingSystem,
     enabled: bool,
     mode: TranslationMode,
@@ -182,25 +182,23 @@ impl TranslationBookSource {
         self.fixed_page_replacement_only.load(Ordering::Acquire)
     }
 
-    pub(crate) fn remember_formula_input(
+    // Footnote IDs refer to inline positions in the exact request input. Citation
+    // decoration can split runs and shift those IDs even when no math is present.
+    pub(crate) fn remember_translation_input(
         &self,
         section: usize,
         index: usize,
         raw: &Block,
         prepared: &Block,
     ) {
-        let mut prepared = prepared.clone();
-        let mut has_math = false;
-        visit_note_text_blocks_mut(&mut prepared, &mut 0, &mut |_, text| {
-            has_math |= text
-                .content
-                .iter()
-                .any(|i| matches!(i,Inline::Math(m) if m.original.is_some()));
-        });
-        if has_math && let Ok(mut state) = self.state.write() {
-            state
-                .formula_inputs
-                .insert((section, index), (raw.clone(), prepared));
+        if let Ok(mut state) = self.state.write() {
+            if raw != prepared {
+                state
+                    .prepared_inputs
+                    .insert((section, index), (raw.clone(), prepared.clone()));
+            } else {
+                state.prepared_inputs.remove(&(section, index));
+            }
         }
     }
 
@@ -210,7 +208,7 @@ impl TranslationBookSource {
             .write()
             .map_err(|_| "Translation state poisoned".to_owned())?;
         state.sections.clear();
-        state.formula_inputs.clear();
+        state.prepared_inputs.clear();
         Ok(())
     }
 
@@ -304,7 +302,7 @@ impl TranslationBookSource {
     }
 }
 
-fn formula_input_matches(block: &Block, translation: &StoredBlockTranslation) -> bool {
+fn prepared_input_matches(block: &Block, translation: &StoredBlockTranslation) -> bool {
     let mut block = block.clone();
     let whole = matches!(block, Block::Text(_));
     let mut valid = true;
@@ -314,8 +312,11 @@ fn formula_input_matches(block: &Block, translation: &StoredBlockTranslation) ->
         } else {
             translation.segments.get(&index)
         } {
-            valid &=
-                validate_translation_math_placeholders(&translation_text(text), translated).is_ok();
+            let source = translation_text(text);
+            valid &= validate_translation_math_placeholders(&source, translated).is_ok()
+                && validate_translation_footnotes(&source, translated).is_ok()
+                && validate_translation_websites(&source, translated).is_ok()
+                && validate_translation_citations(&source, translated).is_ok();
         }
     });
     valid
@@ -661,10 +662,10 @@ impl BookSource for TranslationBookSource {
                 continue;
             };
             let block = state
-                .formula_inputs
+                .prepared_inputs
                 .get(&(index, block_index))
                 .filter(|(raw, prepared)| {
-                    raw == &block && formula_input_matches(prepared, translation)
+                    raw == &block && prepared_input_matches(prepared, translation)
                 })
                 .map_or(block, |(_, prepared)| prepared.clone());
             match block {
@@ -1472,6 +1473,7 @@ fn restore_heading_number_space(original: &[Inline], translated: &mut [Inline]) 
 
 fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>) -> Vec<Inline> {
     let text = normalize_translation_spacing(text);
+    let has_source = original.is_some();
     let original = original.unwrap_or_default();
     let math = original
         .iter()
@@ -1489,6 +1491,17 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
     let website_count = original.iter().filter(|inline| matches!(inline, Inline::Text(run) if run.link.as_ref().and_then(PublicationUrl::website_url).is_some())).count();
     if website_count > 0 && web_placeholder_ids(&text).ok() != Some((0..website_count).collect()) {
         return original.to_vec();
+    }
+    if has_source && (text.contains("<torto-note-") || text.contains("<inlinefootnote id=")) {
+        let source = translation_text(&TextBlock {
+            content: original.to_vec(),
+            kind: TextBlockKind::Paragraph,
+            style: Default::default(),
+            source: None,
+        });
+        if validate_translation_footnotes(&source, &text).is_err() {
+            return original.to_vec();
+        }
     }
     let style = neutral_translation_style(style, original);
     let styled = parse_inline_style_markup(&text, style)
@@ -2403,6 +2416,11 @@ mod tests {
         };
 
         assert_eq!(translation_text(&block), "Meaning<torto-note-1/>");
+        assert_eq!(
+            replacement_content("??<torto-note-23/>", TextStyle::default(), Some(&original)),
+            original,
+            "Unknown source note identities must never leak into the reading view"
+        );
         let marked = replacement_content("含义<sup>4</sup>", TextStyle::default(), Some(&original));
         assert!(matches!(
             marked.as_slice(),

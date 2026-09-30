@@ -348,9 +348,10 @@ pub(super) async fn recognize(
         if resource.bytes.len() > 12 * 1024 * 1024 {
             continue;
         }
-        // Same per-image contract as before batching: existing verified caches remain valid.
+        // The wire contract participates in the fingerprint, not the cache format.
         let key = digest(
             &serde_json::to_vec(&json!([
+                "compact-wire-v1",
                 PROMPT,
                 TRANSCRIBE_PROMPT,
                 VERIFY_PROMPT,

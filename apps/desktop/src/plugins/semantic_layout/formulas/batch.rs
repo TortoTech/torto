@@ -50,6 +50,7 @@ fn parse_results(
     let Ok(value) = llm_json::parse::<Value>(content) else {
         return HashMap::new();
     };
+    let value = super::super::wire::decode(&value);
     if value.as_object().is_none_or(|o| o.len() != 1) {
         return HashMap::new();
     }
@@ -114,13 +115,13 @@ async fn stage(
         }
         let ids: Vec<_> = pending.iter().map(|i| i.id).collect();
         let mut content = vec![
-            json!({"type":"text","text":json!({"mode":mode,"requested_ids":ids,"retry":attempt>0}).to_string()}),
+            json!({"type":"text","text":super::super::wire::encode(&json!({"mode":mode,"requested_ids":ids,"retry":attempt>0})).to_string()}),
         ];
         for item in pending {
-            content.push(json!({"type":"text","text":json!({"image_id":item.id,"metadata":item.context,"next_image":"original"}).to_string()}));
+            content.push(json!({"type":"text","text":super::super::wire::encode(&json!({"image_id":item.id,"metadata":item.context,"next_image":"original"})).to_string()}));
             content.push(json!({"type":"image_url","image_url":{"url":item.original}}));
             if let Some(rendered) = &item.rendered {
-                content.push(json!({"type":"text","text":format!("image_id {}: proposed rendering",item.id)}));
+                content.push(json!({"type":"text","text":format!("ii {}: proposed rendering",item.id)}));
                 content.push(json!({"type":"image_url","image_url":{"url":rendered}}));
             }
         }
@@ -131,7 +132,7 @@ async fn stage(
             json!({"mode":mode,"images":ids.len(),"attempt":attempt+1}),
         );
         let messages = vec![
-            json!({"role":"system","content":request_prompt(mode)}),
+            json!({"role":"system","content":super::super::wire::instructions(&request_prompt(mode))}),
             json!({"role":"user","content":content}),
         ];
         let response = ai::request_completion(
@@ -142,7 +143,7 @@ async fn stage(
             None,
             Some(16384),
             reasoning_effort,
-            Some(&options()),
+            Some(&super::super::wire::options(&options())),
         )
         .await;
         let message = match response {

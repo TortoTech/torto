@@ -751,6 +751,17 @@ fn hidden_linked_notes_join_translation_requests_but_not_standalone_ai() {
 }
 
 #[test]
+fn linked_note_translation_does_not_wait_behind_visible_chapter_batches() {
+    let visible = vec![(8, Vec::new())];
+    assert_eq!(
+        super::next_translation_section([8, 8, 19], &visible),
+        Some(19)
+    );
+    assert_eq!(super::next_translation_section([8, 8], &visible), Some(8));
+    assert_eq!(super::next_translation_section([], &visible), None);
+}
+
+#[test]
 fn viewport_sources_include_images_and_exclude_offscreen_paragraphs() {
     let (mut reader, original, _) = fixture();
     let image = block_source_range(&original.blocks[2]).unwrap();
@@ -796,6 +807,19 @@ pub(in crate::reader) fn fixture() -> (DesktopReader, Section, SourceRange) {
 }
 
 fn fixture_with_numbered_heading(numbered_heading: bool) -> (DesktopReader, Section, SourceRange) {
+    fixture_with_optional_blocks(numbered_heading, None)
+}
+
+pub(in crate::reader) fn fixture_with_blocks(
+    blocks: Vec<Block>,
+) -> (DesktopReader, Section, SourceRange) {
+    fixture_with_optional_blocks(false, Some(blocks))
+}
+
+fn fixture_with_optional_blocks(
+    numbered_heading: bool,
+    blocks: Option<Vec<Block>>,
+) -> (DesktopReader, Section, SourceRange) {
     let spine = SpineItemId::new("chapter").unwrap();
     let href = PublicationUrl::parse("chapter.xhtml").unwrap();
     let text = |node: &str, text: String| {
@@ -833,6 +857,9 @@ fn fixture_with_numbered_heading(numbered_heading: bool) -> (DesktopReader, Sect
 formula: None,
 href:PublicationUrl::parse("image.png").unwrap(),alt:String::new(),style:Default::default(),source:Some(SourceRange {start:image_anchor.clone(),end:image_anchor}),text_layer:None}),
     ]};
+    if let Some(blocks) = blocks {
+        section.blocks = blocks;
+    }
     let target = block_source_range(&section.blocks[1]).unwrap().clone();
     if numbered_heading {
         section.blocks.insert(1, text("section-number", "2".into()));
@@ -997,6 +1024,214 @@ fn focus_navigation_waits_for_units_after_content_refresh() {
 }
 
 #[test]
+fn splitting_adjacent_paragraphs_keeps_previous_paragraph_geometry_stable() {
+    for translated in [false, true] {
+        let (_, mut original, _) = fixture();
+        if !translated {
+            let Block::Text(first) = &mut original.blocks[0] else {
+                unreachable!()
+            };
+            first.content = [
+                ("Short sentence. ", None),
+                ("Tall sentence. ", Some(2.0)),
+                ("Last sentence.", None),
+            ]
+            .into_iter()
+            .map(|(text, keyword_size_scale)| {
+                Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle {
+                        keyword_size_scale,
+                        ..Default::default()
+                    },
+                    link: None,
+                })
+            })
+            .collect();
+            first.source.as_mut().unwrap().end.text_offset = 45;
+        }
+        let (mut reader, original, b) = fixture_with_blocks(original.blocks);
+        let a = block_source_range(&original.blocks[0]).unwrap().clone();
+        if translated {
+            reader.translation_source.set_enabled(true).unwrap();
+            reader
+                .translation_source
+                .set_mode(crate::plugins::TranslationMode::Replace)
+                .unwrap();
+            reader.translation_source.store_batch(0, &[0, 1].map(|block_index| crate::plugins::BlockTranslation {
+                block_index,
+                segment_index: None,
+                text: "Translated first sentence. Another translated sentence follows. A final sentence ends here. ".repeat(6),
+            })).unwrap();
+            reader.refresh_translation_view();
+        }
+        let height = 600.0;
+        let mut layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        reader.select_focus_unit(0);
+        reader.scroll_viewport = Some(ScrollViewportState {
+            size: egui::vec2(800.0, height),
+            offset_y: layout.source_top(&a).unwrap() + height * 0.5 - 120.0,
+        });
+        reader.toggle_current_focus_structure();
+        layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        let offset = reader.restore_focus_reflow_anchor(&layout, height).unwrap();
+        reader.scroll_viewport = Some(ScrollViewportState {
+            size: egui::vec2(800.0, height),
+            offset_y: offset,
+        });
+        let a_top = layout.source_top(&a).unwrap();
+        let a_baseline = layout.source_baseline(&a).unwrap();
+        let a_rect = focus_unit_geometry(&layout, &reader.focus_units[0].paint_ranges)
+            .unwrap()
+            .0;
+        reader.move_focus_unit(PageDirection::Next);
+        assert_eq!(reader.focus_anchor.as_ref(), Some(&b.start));
+        for _ in 0..2 {
+            let screen_y = 120.0;
+            let before = layout.source_baseline(&b).unwrap();
+            reader.scroll_viewport = Some(ScrollViewportState {
+                size: egui::vec2(800.0, height),
+                offset_y: before + height * 0.5 - screen_y,
+            });
+            reader.toggle_current_focus_structure();
+            layout = reader.current_scroll_layout().unwrap();
+            reader.rebuild_focus_units(&layout);
+            let offset = reader.restore_focus_reflow_anchor(&layout, height).unwrap();
+            assert!(
+                (layout.source_baseline(&b).unwrap() + height * 0.5 - offset - screen_y).abs()
+                    < 0.01,
+                "active paragraph keeps its screen baseline"
+            );
+            assert!(
+                (layout.source_top(&a).unwrap() - a_top).abs() < 0.01,
+                "splitting or merging B must not reset A's retained geometry (translated={translated})"
+            );
+            assert!((layout.source_baseline(&a).unwrap() - a_baseline).abs() < 0.01);
+            assert_eq!(
+                focus_unit_geometry(&layout, &reader.focus_units[0].paint_ranges)
+                    .unwrap()
+                    .0,
+                a_rect
+            );
+        }
+    }
+}
+
+#[test]
+fn splitting_and_restoring_visible_paragraph_keeps_all_previous_lines_on_screen() {
+    let (_, original, _) = fixture();
+    let mut c = original.blocks[1].clone();
+    let Block::Text(text) = &mut c else {
+        unreachable!()
+    };
+    text.content = [
+        ("Short sentence. ", None),
+        ("Tall sentence. ", Some(2.0)),
+        ("Last sentence.", None),
+    ]
+    .into_iter()
+    .map(|(text, keyword_size_scale)| {
+        Inline::Text(TextRun {
+            text: text.into(),
+            style: TextStyle {
+                keyword_size_scale,
+                ..Default::default()
+            },
+            link: None,
+        })
+    })
+    .collect();
+    text.source.as_mut().unwrap().start.node = "c".into();
+    text.source.as_mut().unwrap().end.node = "c".into();
+    text.source.as_mut().unwrap().end.text_offset = 45;
+    let c_range = block_source_range(&c).unwrap().clone();
+    let (mut reader, original, _) = fixture_with_blocks(vec![
+        original.blocks[0].clone(),
+        original.blocks[1].clone(),
+        c,
+    ]);
+    let previous = original.blocks[..2]
+        .iter()
+        .map(|block| block_source_range(block).unwrap().clone())
+        .collect::<Vec<_>>();
+    let height = 600.0;
+    let mut layout = reader.current_scroll_layout().unwrap();
+    reader.rebuild_focus_units(&layout);
+    reader.select_focus_unit(2);
+    let offset = layout.source_top(&c_range).unwrap() + height * 0.5 - 360.0;
+    let previous_lines = previous
+        .iter()
+        .map(|range| layout.source_line_rects(range))
+        .collect::<Vec<_>>();
+    for active in [true, false] {
+        reader.scroll_viewport = Some(ScrollViewportState {
+            size: egui::vec2(800.0, height),
+            offset_y: offset,
+        });
+        let old_baseline = layout.source_baseline(&c_range).unwrap();
+        reader.toggle_current_focus_structure();
+        assert!(
+            reader
+                .focus_reflow_anchor
+                .as_ref()
+                .unwrap()
+                .stationary_viewport
+                .is_some()
+        );
+        layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        let restored = reader.restore_focus_reflow_anchor(&layout, height).unwrap();
+        assert!(
+            (layout.source_baseline(&c_range).unwrap() - old_baseline).abs() > 1.0,
+            "mixed-size fixture changes C's first-line metrics while splitting and restoring"
+        );
+        assert!(
+            (restored - offset).abs() < 0.001,
+            "splitting={active}: C's changed baseline must not scroll preceding paragraphs"
+        );
+        for (range, old_lines) in previous.iter().zip(&previous_lines) {
+            let new_lines = layout.source_line_rects(range);
+            assert_eq!(old_lines.len(), new_lines.len());
+            for (old, new) in old_lines.iter().zip(&new_lines) {
+                assert!((old.top() - offset - (new.top() - restored)).abs() < 0.001);
+                assert!((old.bottom() - offset - (new.bottom() - restored)).abs() < 0.001);
+                assert_eq!(old.x_range(), new.x_range());
+            }
+        }
+    }
+}
+
+#[test]
+fn splitting_a_clipped_long_paragraph_preserves_the_visible_text_anchor() {
+    let (mut reader, original, _) = fixture();
+    let range = block_source_range(&original.blocks[0]).unwrap().clone();
+    let height = 300.0;
+    let layout = reader.current_scroll_layout().unwrap();
+    reader.rebuild_focus_units(&layout);
+    reader.select_focus_unit(0);
+    reader.scroll_viewport = Some(ScrollViewportState {
+        size: egui::vec2(800.0, height),
+        offset_y: layout.source_line_rects(&range)[3].center().y + height * 0.5,
+    });
+    reader.toggle_current_focus_structure();
+    let anchor = reader
+        .focus_reflow_anchor
+        .as_ref()
+        .expect("capture a visible line inside the long paragraph");
+    assert!(anchor.stationary_viewport.is_none());
+    let range = anchor.range.clone();
+    let screen_y = anchor.screen_y;
+    let layout = reader.current_scroll_layout().unwrap();
+    reader.rebuild_focus_units(&layout);
+    let restored = reader.restore_focus_reflow_anchor(&layout, height).unwrap();
+    assert!(
+        (layout.source_baseline(&range).unwrap() + height * 0.5 - restored - screen_y).abs() < 0.01
+    );
+}
+
+#[test]
 fn ai_reflow_moves_the_viewport_instead_of_detaching_text_from_its_image() {
     let (mut reader, original, target) = fixture();
     let mut layout = reader.current_scroll_layout().unwrap();
@@ -1031,11 +1266,7 @@ fn ai_reflow_moves_the_viewport_instead_of_detaching_text_from_its_image() {
             (after - before).abs() > 1.0,
             "fixture must change the active paragraph's document position"
         );
-        let displayed = reader.locally_correct_focus_reflow(fresh.clone(), height);
-        assert!(
-            Arc::ptr_eq(&fresh, &displayed),
-            "AI reflow must never translate only the active text"
-        );
+        let displayed = fresh;
         reader.rebuild_focus_units(&displayed);
         let offset = reader
             .restore_focus_reflow_anchor(&displayed, height)
@@ -1384,6 +1615,241 @@ fn local_translated_chapter_interaction_performance() {
             );
         }
     }
+}
+
+#[test]
+#[ignore = "requires TORTO_PERF_BOOK; offline linked note translation diagnostic"]
+fn local_linked_note_translation() {
+    let book = rebook_formats::open_file(std::path::PathBuf::from(
+        std::env::var_os("TORTO_PERF_BOOK").unwrap(),
+    ))
+    .unwrap();
+    let source = book.source();
+    let section = source.parse_section(8).unwrap();
+    let table = section.blocks.iter().find(|b| matches!(b, Block::Table(t) if t.text_blocks().map(|p| rebook_layout::paragraph_footnotes(p).len()).sum::<usize>() >= 2)).expect("table 0.1 with multiple footnotes");
+    verify_semantic_footnote_sequence(table);
+    let mut engine = rebook_layout::LayoutEngine::with_fonts(
+        crate::fonts::embedded_reader_fonts().iter().cloned(),
+    );
+    for width in [400, 800] {
+        let layout = engine
+            .layout_blocks(
+                source.as_ref(),
+                std::slice::from_ref(table),
+                rebook_layout::LayoutViewport::new(width, 240).unwrap(),
+                &rebook_layout::ReaderStyle {
+                    typesetting: rebook_layout::ReaderTypesetting::unified(),
+                    focus_footnote_icons: true,
+                    spread: rebook_layout::SpreadMode::Single,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut ordinals = std::collections::BTreeSet::new();
+        for page in &layout.pages {
+            for item in &page.items {
+                let texts: Vec<_> = match item {
+                    rebook_layout::PageItem::Text(t) => vec![t],
+                    rebook_layout::PageItem::Table(t) => {
+                        t.cells.iter().filter_map(|c| c.text.as_ref()).collect()
+                    }
+                    _ => vec![],
+                };
+                for t in texts {
+                    for c in t.citations.iter().filter(|c| c.number & 0x2000_0000 != 0) {
+                        let number = c.number & 0x1fff_ffff;
+                        assert_eq!(
+                            t.text[c.range.clone()].replace('\u{2060}', ""),
+                            number.to_string()
+                        );
+                        ordinals.insert(number);
+                    }
+                }
+            }
+        }
+        assert!(layout.pages.len() > 1);
+        assert_eq!(
+            ordinals.into_iter().collect::<Vec<_>>(),
+            (1..=block_focus_footnotes(table).len() as u32).collect::<Vec<_>>()
+        );
+    }
+    let raw = vec![(
+        8,
+        section
+            .blocks
+            .iter()
+            .flat_map(super::block_ranges)
+            .collect(),
+    )];
+    let prepared = super::preparation::prepare(source.clone(), raw, HashMap::new(), false, true);
+    let translated =
+        TranslationBookSource::new(source.clone(), crate::plugins::TranslationMode::Replace);
+    translated.set_enabled(true).unwrap();
+    let table_index = section
+        .blocks
+        .iter()
+        .position(|b| std::ptr::eq(b, table))
+        .unwrap();
+    let table_translations = crate::plugins::prepare_translation_inputs(&section, false)
+        .into_iter()
+        .filter(|(i, _)| i.block_index == table_index)
+        .map(|(i, _)| crate::plugins::BlockTranslation {
+            block_index: i.block_index,
+            segment_index: i.segment_index,
+            text: format!("译文 {}", i.text),
+        })
+        .collect::<Vec<_>>();
+    translated.store_batch(8, &table_translations).unwrap();
+    verify_semantic_footnote_sequence(&translated.parse_section(8).unwrap().blocks[table_index]);
+    for (index, ranges) in &prepared.demand {
+        let inputs = translated
+            .untranslated_prepared(*index, &prepared.inputs[index], ranges)
+            .unwrap();
+        println!(
+            "section={index} demanded={} inputs={}",
+            ranges.len(),
+            inputs.len()
+        );
+        if *index == 8 {
+            continue;
+        }
+        assert!(!inputs.is_empty());
+        let translations = inputs
+            .into_iter()
+            .map(|i| crate::plugins::BlockTranslation {
+                block_index: i.block_index,
+                segment_index: i.segment_index,
+                text: "脚注翻译测试".into(),
+            })
+            .collect::<Vec<_>>();
+        translated.store_batch(*index, &translations).unwrap();
+        let notes = translated.parse_section(*index).unwrap();
+        let target = notes.href.resolve("#en1").unwrap();
+        let text = focus_footnote_text_in_section(&notes, &target, "1").unwrap();
+        println!("resolved={text}");
+        assert!(text.contains("脚注翻译测试"));
+    }
+}
+
+fn verify_semantic_footnote_sequence(block: &Block) {
+    let numbered = rebook_layout::numbered_semantic_footnotes(block);
+    let Block::Table(table) = numbered.as_ref() else {
+        panic!()
+    };
+    let display: Vec<_> = table
+        .text_blocks()
+        .flat_map(|t| {
+            rebook_layout::paragraph_footnotes(t).into_iter().map(|r| {
+                let Inline::Text(run) = &t.content[r.start] else {
+                    panic!()
+                };
+                run.style.footnote_number
+            })
+        })
+        .collect();
+    let popup: Vec<_> = block_focus_footnotes(block)
+        .into_iter()
+        .filter_map(|n| match n {
+            FocusFootnoteSource::Reference { number, .. }
+            | FocusFootnoteSource::Inline(_, number) => Some(number),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(display, (1..=display.len() as u32).collect::<Vec<_>>());
+    assert_eq!(popup, display);
+}
+
+#[test]
+#[ignore = "requires TORTO_PERF_BOOK; offline original figure caption check"]
+fn local_chinese_computer_figure_captions() {
+    let book = rebook_formats::open_file(std::path::PathBuf::from(
+        std::env::var_os("TORTO_PERF_BOOK").unwrap(),
+    ))
+    .unwrap();
+    let source = book.source();
+    let index = source
+        .book()
+        .sections
+        .iter()
+        .position(|s| s.href.path().ends_with("10992_Mullaney-0007.xhtml"))
+        .unwrap();
+    let section = source.parse_section(index).unwrap();
+    for (image, caption) in [
+        ("10992_002_fig_006.jpeg", "Figure 2.6"),
+        ("10992_002_fig_007.jpg", "Figure 2.7"),
+    ] {
+        let figure = section
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Figure(f) if f.images.iter().any(|i| i.href.path().ends_with(image)) => {
+                    Some(f)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let text = figure
+            .captions
+            .iter()
+            .map(|c| {
+                c.content
+                    .iter()
+                    .filter_map(|i| match i {
+                        Inline::Text(r) => Some(r.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{image}: {text}");
+        assert!(text.contains(caption));
+    }
+}
+
+#[test]
+fn composite_footnotes_share_numbers_across_captions_and_cells() {
+    let (_, section, _) = fixture();
+    let Block::Text(mut text) = section.blocks[0].clone() else {
+        panic!()
+    };
+    text.content = vec![Inline::Text(TextRun {
+        text: "9".into(),
+        link: Some(section.href.resolve("#note").unwrap()),
+        style: TextStyle {
+            link_role: rebook_publication::LinkRole::FootnoteReference,
+            ..Default::default()
+        },
+    })];
+    let table = Block::Table(rebook_publication::TableBlock {
+        before: vec![text.clone()],
+        after: vec![text.clone()],
+        source: None,
+        rows: vec![rebook_publication::TableRow {
+            cells: vec![
+                rebook_publication::TableCell {
+                    text: text.clone(),
+                    authored_alignment: None,
+                    column_span: 2,
+                    row_span: 2,
+                    header: false,
+                },
+                rebook_publication::TableCell {
+                    text: text.clone(),
+                    authored_alignment: None,
+                    column_span: 1,
+                    row_span: 1,
+                    header: false,
+                },
+            ],
+        }],
+    });
+    verify_semantic_footnote_sequence(&table);
+    verify_semantic_footnote_sequence(&table); // No state leaks between blocks/reflows.
+    assert!(matches!(
+        block_focus_footnotes(&Block::Text(text)).as_slice(),
+        [FocusFootnoteSource::Reference { number: 1, .. }]
+    ));
 }
 
 #[test]

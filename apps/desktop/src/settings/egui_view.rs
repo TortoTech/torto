@@ -40,8 +40,10 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
         return;
     }
     ctx.request_repaint();
+    #[cfg(target_os = "windows")]
+    crate::app::window_chrome::dim_controls(ctx, 0.46 * visible);
 
-    let screen = ctx.content_rect();
+    let screen = crate::ui::overlay_rect(ctx);
     let modal_size = Vec2::new(
         (screen.width() - 40.0)
             .clamp(420.0, 720.0)
@@ -52,7 +54,10 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
     );
     let offset = Vec2::new(0.0, (1.0 - visible) * 12.0);
     let modal_id = egui::Id::new("settings-modal");
-    let modal_area = egui::Modal::default_area(modal_id).anchor(Align2::CENTER_CENTER, offset);
+    let modal_area = crate::ui::modal_area(ctx, modal_id).anchor(
+        Align2::CENTER_CENTER,
+        screen.center() - ctx.content_rect().center() + offset,
+    );
     let response = egui::Modal::new(modal_id)
         .area(modal_area)
         .backdrop_color(Color32::BLACK.gamma_multiply(0.46 * visible))
@@ -379,6 +384,10 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
             (
                 ShortcutAction::FocusFootnotes,
                 language.text("脚注开关", "Toggle footnotes"),
+            ),
+            (
+                ShortcutAction::FocusImagePreview,
+                language.text("预览图片", "Preview image"),
             ),
             (
                 ShortcutAction::FocusExtendSelectionPrevious,
@@ -1354,8 +1363,99 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     CHAT_HISTORY_TURNS_MAX,
                     1,
                 );
+                let official = settings.prepare_search_selection();
+                settings_row_label(
+                    ui,
+                    language.text("\u{8054}\u{7f51}\u{641c}\u{7d22}", "Web search"),
+                );
+                settings_row_control_sized(ui, 44.0, |ui| {
+                    toggle_switch(ui, &mut settings.web_search.enabled);
+                });
+                ui.end_row();
+                if settings.web_search.enabled {
+                    web_search_settings(ui, &mut settings.web_search, official, language);
+                }
             });
     });
+}
+
+fn web_search_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::plugins::web_search::SearchSettings,
+    official: bool,
+    language: AppLanguage,
+) {
+    use crate::plugins::web_search::{SearchKind, SearchMode};
+    settings_row_label(
+        ui,
+        language.text(
+            "\u{641c}\u{7d22}\u{63d0}\u{4f9b}\u{5546}",
+            "Search provider",
+        ),
+    );
+    let mut selected = if settings.mode == SearchMode::Native {
+        None
+    } else {
+        Some(settings.ensure_service().kind)
+    };
+    let previous = selected;
+    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+        egui::ComboBox::from_id_salt("web-search-provider")
+            .width(SETTINGS_MODEL_SELECT_WIDTH)
+            .selected_text(selected.map_or(
+                language.text("\u{5b98}\u{65b9}\u{670d}\u{52a1}", "Official service"),
+                SearchKind::label,
+            ))
+            .show_ui(ui, |ui| {
+                if official {
+                    ui.selectable_value(
+                        &mut selected,
+                        None,
+                        language.text("\u{5b98}\u{65b9}\u{670d}\u{52a1}", "Official service"),
+                    );
+                }
+                for kind in SearchKind::ALL {
+                    ui.selectable_value(&mut selected, Some(kind), kind.label());
+                }
+            });
+    });
+    ui.end_row();
+    if selected != previous {
+        settings.mode = if selected.is_none() {
+            SearchMode::Native
+        } else {
+            SearchMode::External
+        };
+        if let Some(kind) = selected {
+            settings.select_service(kind);
+        }
+    }
+    if settings.mode == SearchMode::Native {
+        return;
+    }
+    let service = settings.ensure_service();
+    settings_row_label(
+        ui,
+        language.text("\u{63a5}\u{53e3}\u{5730}\u{5740}", "Endpoint"),
+    );
+    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+        ui.push_id((&service.id, "endpoint"), |ui| {
+            text_field_sized(
+                ui,
+                &mut service.endpoint,
+                false,
+                SETTINGS_MODEL_SELECT_WIDTH,
+            );
+        });
+    });
+    ui.end_row();
+    settings_row_label(ui, "API Key");
+    settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+        ui.push_id((&service.id, "api-key"), |ui| {
+            text_field_sized(ui, &mut service.api_key, true, SETTINGS_MODEL_SELECT_WIDTH);
+        });
+    });
+    ui.end_row();
 }
 
 fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
@@ -1568,6 +1668,15 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                                 "English",
                             );
                         });
+                });
+                ui.end_row();
+
+                settings_row_label(ui, language.text("专家翻译", "Expert translation"));
+                settings_row_control_sized(ui, 44.0, |ui| {
+                    toggle_switch(ui, &mut settings.expert_translation).on_hover_text(language.text(
+                        "自动积累本书的专业术语译法，用于后续翻译，保持术语一致。已有译文不会自动重译。",
+                        "Remember this book's terminology for consistent future translations. Existing translations are kept.",
+                    ));
                 });
                 ui.end_row();
 

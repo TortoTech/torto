@@ -72,22 +72,17 @@ fn toggle_fullscreen(state: &mut WindowState) {
     {
         if let Some(placement) = state.windowed_placement.take() {
             state.window.set_decorations(true);
-            let _ = state.window.request_inner_size(placement.inner_size);
-            state.window.set_outer_position(placement.outer_position);
-            state.window.set_maximized(placement.maximized);
+            state.native_frame.set_fullscreen(false);
+            state.native_frame.restore_placement(&placement.native);
         } else {
             let Some(monitor) = state.window.current_monitor() else {
                 return;
             };
-            let Ok(outer_position) = state.window.outer_position() else {
+            let Ok(native) = state.native_frame.save_placement() else {
                 return;
             };
-            let placement = WindowedPlacement {
-                outer_position,
-                inner_size: state.window.inner_size(),
-                maximized: state.window.is_maximized(),
-            };
-            if placement.maximized {
+            let placement = WindowedPlacement { native };
+            if state.window.is_maximized() {
                 state.window.set_maximized(false);
             }
             // Do not call winit's set_fullscreen on Windows. Besides changing the
@@ -95,6 +90,7 @@ fn toggle_fullscreen(state: &mut WindowState) {
             // special compositor path can invalidate a wgpu flip-model surface when
             // an IME candidate window appears, producing a black frame while typing.
             let (position, size) = compositor_fullscreen_bounds(monitor.position(), monitor.size());
+            state.native_frame.set_fullscreen(true);
             state.window.set_decorations(false);
             state.window.set_outer_position(position);
             let _ = state.window.request_inner_size(size);
@@ -111,6 +107,41 @@ fn toggle_fullscreen(state: &mut WindowState) {
         state.window.set_fullscreen(fullscreen);
     }
     state.window.request_redraw();
+}
+
+#[cfg(target_os = "windows")]
+fn sync_window_chrome(state: &WindowState, ctx: &egui::Context) {
+    use crate::app::window_chrome;
+    let fullscreen = state.windowed_placement.is_some();
+    window_chrome::set_state(
+        ctx,
+        window_chrome::WindowState {
+            fullscreen,
+            maximized: state.window.is_maximized(),
+            header_hovered: state.native_frame.header_hovered(),
+            hovered_button: state.native_frame.hovered_button(),
+            pressed_button: state.native_frame.pressed_button(),
+        },
+    );
+    let geometry = window_chrome::geometry(ctx);
+    let scale = ctx.pixels_per_point();
+    let physical = |rect: egui::Rect| {
+        [
+            (rect.left() * scale).round() as i32,
+            (rect.top() * scale).round() as i32,
+            (rect.right() * scale).round() as i32,
+            (rect.bottom() * scale).round() as i32,
+        ]
+    };
+    state
+        .native_frame
+        .set_layout(rebook_windows_window_background::FrameLayout {
+            fullscreen,
+            header: geometry.header.map(physical),
+            excluded: geometry.excluded.into_iter().map(physical).collect(),
+            buttons: geometry.buttons.map(|rect| rect.map(physical)),
+            drag_enabled: geometry.drag_enabled,
+        });
 }
 
 #[cfg(target_os = "windows")]
@@ -202,6 +233,8 @@ struct WindowState {
     window: Arc<Window>,
     #[cfg(target_os = "windows")]
     native_background: rebook_windows_window_background::WindowBackground,
+    #[cfg(target_os = "windows")]
+    native_frame: rebook_windows_window_background::WindowFrame,
     gpu: GpuState,
     egui_state: egui_winit::State,
     #[cfg(target_os = "windows")]
@@ -210,9 +243,7 @@ struct WindowState {
 
 #[cfg(target_os = "windows")]
 struct WindowedPlacement {
-    outer_position: PhysicalPosition<i32>,
-    inner_size: PhysicalSize<u32>,
-    maximized: bool,
+    native: rebook_windows_window_background::WindowPlacement,
 }
 
 struct Application {
@@ -283,6 +314,8 @@ impl Application {
         app: &mut DesktopApp,
         egui_ctx: &egui::Context,
     ) {
+        #[cfg(target_os = "windows")]
+        sync_window_chrome(state, egui_ctx);
         if let Err(error) = state
             .gpu
             .render(&state.window, app, egui_ctx, &mut state.egui_state)
@@ -290,6 +323,8 @@ impl Application {
             tracing::warn!(%error, "failed to present resized window frame");
             state.window.request_redraw();
         }
+        #[cfg(target_os = "windows")]
+        sync_window_chrome(state, egui_ctx);
     }
 }
 
@@ -324,7 +359,7 @@ impl ApplicationHandler<UserEvent> for Application {
         };
         crate::smoke::stage("window-created");
         #[cfg(target_os = "windows")]
-        let native_background = {
+        let (native_background, native_frame) = {
             let hwnd = match window.window_handle().map(|handle| handle.as_raw()) {
                 Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
                 Ok(_) => {
@@ -342,7 +377,16 @@ impl ApplicationHandler<UserEvent> for Application {
                 hwnd,
                 native_background_color(),
             ) {
-                Ok(background) => background,
+                Ok(background) => {
+                    match rebook_windows_window_background::WindowFrame::install(hwnd) {
+                        Ok(frame) => (background, frame),
+                        Err(error) => {
+                            self.fatal_error = Some(error.to_string());
+                            event_loop.exit();
+                            return;
+                        }
+                    }
+                }
                 Err(error) => {
                     self.fatal_error = Some(error.to_string());
                     event_loop.exit();
@@ -372,6 +416,8 @@ impl ApplicationHandler<UserEvent> for Application {
             window,
             #[cfg(target_os = "windows")]
             native_background,
+            #[cfg(target_os = "windows")]
+            native_frame,
             gpu,
             egui_state,
             #[cfg(target_os = "windows")]
@@ -566,6 +612,8 @@ impl ApplicationHandler<UserEvent> for Application {
                 if state.window.inner_size() == PhysicalSize::new(0, 0) {
                     return;
                 }
+                #[cfg(target_os = "windows")]
+                sync_window_chrome(state, &self.egui_ctx);
                 if let Err(error) = state.gpu.render(
                     &state.window,
                     &mut self.app,
@@ -590,6 +638,13 @@ impl ApplicationHandler<UserEvent> for Application {
                     self.fatal_error = Some(error);
                     event_loop.exit();
                 } else {
+                    #[cfg(target_os = "windows")]
+                    {
+                        sync_window_chrome(state, &self.egui_ctx);
+                        if crate::app::window_chrome::take_close_request(&self.egui_ctx) {
+                            event_loop.exit();
+                        }
+                    }
                     // A theme switch lands during render; keep the surface
                     // clear color in step for the next frame.
                     state.gpu.set_clear_color(clear_color());

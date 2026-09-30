@@ -1309,6 +1309,11 @@ impl<'a> ReadingIrParser<'a> {
                 continue;
             }
             let mut style = self.styles.block_style(item, BlockStyle::default());
+            style.list_group = list
+                .ancestors()
+                .filter(|node| node.is_element() && matches!(node.tag_name().name(), "ul" | "ol"))
+                .last()
+                .map(|node| node.range().start as u64);
             style.indent = 0.0;
             style.margin_start = style.margin_start.max(24.0 * (f32::from(depth) + 1.0));
             self.push_structured_item(
@@ -1547,13 +1552,30 @@ impl<'a> ReadingIrParser<'a> {
     }
 
     fn parse_figure(&mut self, figure: Node<'_, '_>) -> Result<(), HtmlError> {
+        // EPUBs commonly use ordinary paragraphs/divs inside an explicit
+        // figure. Its structure already establishes the caption relationship.
+        let caption_container = |node: Node<'_, '_>| {
+            node.has_tag_name("figcaption")
+                || (matches!(node.tag_name().name(), "p" | "div")
+                    && node_has_visible_text(node)
+                    && !has_descendant_image(node)
+                    && !node
+                        .descendants()
+                        .skip(1)
+                        .any(|n| n.has_tag_name("table") || n.has_tag_name("figure")))
+        };
         let caption_nodes = figure
             .descendants()
             .skip(1)
             .filter(|node| {
                 node.is_element()
-                    && node.tag_name().name().eq_ignore_ascii_case("figcaption")
+                    && caption_container(*node)
                     && !has_named_ancestor(*node, figure, "figure")
+                    && !node
+                        .ancestors()
+                        .skip(1)
+                        .take_while(|n| *n != figure)
+                        .any(caption_container)
             })
             .collect::<Vec<_>>();
         let image_nodes = figure
@@ -1582,7 +1604,14 @@ impl<'a> ReadingIrParser<'a> {
                     }
             })
         });
-        if image_nodes.is_empty() || unsupported_caption {
+        let unclaimed_text = figure.descendants().any(|node| {
+            node.is_text()
+                && node.text().is_some_and(|t| !t.trim().is_empty())
+                && !node
+                    .ancestors()
+                    .any(|parent| caption_nodes.contains(&parent))
+        });
+        if image_nodes.is_empty() || unsupported_caption || unclaimed_text {
             return self.parse_block_container(figure);
         }
 
@@ -1595,6 +1624,9 @@ impl<'a> ReadingIrParser<'a> {
             .find_map(|node| {
                 if !node.is_element() || has_named_ancestor(node, figure, "figure") {
                     return None;
+                }
+                if caption_nodes.contains(&node) {
+                    return Some(CaptionPosition::Before);
                 }
                 match node.tag_name().name().to_ascii_lowercase().as_str() {
                     "figcaption" => Some(CaptionPosition::Before),

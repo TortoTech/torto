@@ -113,3 +113,8 @@ mod windows {
 
 #[cfg(target_os = "windows")]
 pub use windows::WindowBackground;
+
+#[cfg(target_os = "windows")]
+mod frame;
+#[cfg(target_os = "windows")]
+pub use frame::{FrameLayout, WindowFrame, WindowPlacement};

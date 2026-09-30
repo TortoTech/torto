@@ -2,10 +2,12 @@
 //! stable source-backed results; none of them depend on Xilem or the renderer.
 
 mod ai;
+pub(crate) use ai::translate_blocks_with_glossary;
 pub(crate) use ai::translation_batches;
 pub(crate) use translation::prepare_translation_inputs;
 pub(crate) mod chat_media;
 mod commands;
+pub(crate) mod glossary;
 pub(crate) mod llm;
 mod llm_json;
 mod pdf_ocr;
@@ -16,6 +18,7 @@ mod search;
 pub(crate) mod semantic_layout;
 mod structure;
 mod translation;
+pub(crate) mod web_search;
 
 use std::env;
 use std::fs;
@@ -33,7 +36,6 @@ pub(crate) use ai::{
 };
 pub use ai::{
     ChatReadingContext, ChatResponse, ChatRole, ChatStreamEvent, ChatTurn, chat_with_book,
-    translate_blocks, translate_blocks_incremental,
 };
 pub use commands::{
     ChatCommand, ChatCommandResolution, ChatRequestKind, chat_command_suggestions,
@@ -338,6 +340,7 @@ pub struct PluginSettings {
     pub chat_reasoning_effort: ReasoningEffort,
     pub chat_max_tool_steps: u16,
     pub chat_history_turns: u16,
+    pub(crate) web_search: web_search::SearchSettings,
     pub ocr_enabled: bool,
     pub ocr_provider: String,
     pub ocr_model: String,
@@ -354,6 +357,8 @@ pub struct PluginSettings {
     pub translation_model: String,
     #[serde(default)]
     pub translation_reasoning_effort: ReasoningEffort,
+    #[serde(default)]
+    pub expert_translation: bool,
     pub target_language: String,
     pub translation_mode: TranslationMode,
     pub translate_toc: bool,
@@ -377,6 +382,7 @@ impl Default for PluginSettings {
             chat_reasoning_effort: ReasoningEffort::Default,
             chat_max_tool_steps: DEFAULT_CHAT_MAX_TOOL_STEPS,
             chat_history_turns: DEFAULT_CHAT_HISTORY_TURNS,
+            web_search: web_search::SearchSettings::default(),
             ocr_enabled: true,
             ocr_provider: DEFAULT_PROVIDER_ID.into(),
             ocr_model: String::new(),
@@ -390,6 +396,7 @@ impl Default for PluginSettings {
             translation_provider: DEFAULT_PROVIDER_ID.into(),
             translation_model: String::new(),
             translation_reasoning_effort: ReasoningEffort::Default,
+            expert_translation: false,
             target_language: TARGET_LANGUAGE_SYSTEM.into(),
             translation_mode: TranslationMode::Replace,
             translate_toc: true,
@@ -534,6 +541,21 @@ impl PluginSettings {
             "pipeline" => "pipeline".into(),
             _ => "vlm".into(),
         };
+        self.prepare_search_selection();
+    }
+
+    pub(crate) fn prepare_search_selection(&mut self) -> bool {
+        let provider = self.providers.iter().find(|p| p.id == self.chat_provider);
+        let official = provider.is_some_and(|p| web_search::supports_official(p, &self.chat_model));
+        let model_key = format!(
+            "{}|{:?}|{}",
+            self.chat_provider,
+            provider.map(|p| p.kind),
+            self.chat_model
+        );
+        self.web_search
+            .prepare_model_selection(&model_key, official);
+        official
     }
 
     pub fn add_provider(&mut self) {
@@ -686,6 +708,7 @@ impl PluginSettings {
     }
 
     fn load_api_keys(&mut self) -> io::Result<()> {
+        self.web_search.load_keys()?;
         for provider in &mut self.providers {
             match ai_credential_entry(&provider.id)?.get_password() {
                 Ok(api_key) => provider.api_key = api_key,
@@ -697,6 +720,7 @@ impl PluginSettings {
     }
 
     fn save_api_keys(&self) -> io::Result<()> {
+        self.web_search.save_keys()?;
         for provider in &self.providers {
             let entry = ai_credential_entry(&provider.id)?;
             if provider.api_key.trim().is_empty() {
@@ -997,6 +1021,12 @@ mod tests {
     #[test]
     fn reasoning_effort_defaults_and_option_order_match_the_settings_contract() {
         let settings: PluginSettings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.expert_translation);
+        let mut expert = settings.clone();
+        expert.expert_translation = true;
+        let restored: PluginSettings =
+            serde_json::from_value(serde_json::to_value(expert).unwrap()).unwrap();
+        assert!(restored.expert_translation);
         assert_eq!(settings.chat_reasoning_effort, ReasoningEffort::Default);
         assert_eq!(
             settings.translation_reasoning_effort,

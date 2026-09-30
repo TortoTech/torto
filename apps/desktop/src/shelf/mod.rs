@@ -843,6 +843,8 @@ impl ShelfFeature {
 
     pub(crate) fn ui(&mut self, root_ui: &mut egui::Ui, interaction_blocked: bool) {
         if self.statistics.open {
+            #[cfg(target_os = "windows")]
+            crate::app::window_chrome::fallback_header(root_ui);
             self.statistics.ui(
                 root_ui,
                 self.language,
@@ -860,18 +862,42 @@ impl ShelfFeature {
         if import_books && !self.import_task.is_pending() {
             self.import_task.begin(());
         }
+        #[cfg(target_os = "windows")]
+        let search_response = egui::Panel::top("shelf-window-header")
+            .exact_size(crate::app::window_chrome::HEIGHT)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(palette().background))
+            .show(root_ui, |ui| {
+                let rect = ui.max_rect();
+                crate::app::window_chrome::header(ui.ctx(), rect);
+                let reserved = crate::app::window_chrome::reserve_width(ui.ctx());
+                let actions = egui::Rect::from_min_max(
+                    rect.min + egui::vec2(f32::from(SHELF_CONTENT_LEFT_MARGIN), 0.0),
+                    egui::pos2(
+                        (rect.right() - reserved - 12.0)
+                            .max(rect.left() + f32::from(SHELF_CONTENT_LEFT_MARGIN) + 1.0),
+                        rect.bottom(),
+                    ),
+                );
+                crate::app::window_chrome::bounded_ui(ui, actions, |ui| {
+                    self.shelf_header(ui, interaction_blocked)
+                })
+            })
+            .inner;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(palette().background)
                     .inner_margin(egui::Margin {
-                        left: 36,
+                        left: SHELF_CONTENT_LEFT_MARGIN,
                         right: 16,
                         top: 28,
                         bottom: 28,
                     }),
             )
             .show(root_ui, |ui| {
+                #[cfg(not(target_os = "windows"))]
                 let search_response = self.shelf_header(ui, interaction_blocked);
                 if interaction_blocked && search_response.has_focus() {
                     search_response.surrender_focus();
@@ -934,42 +960,76 @@ impl ShelfFeature {
             Vec2::new(ui.available_width(), 44.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                let search_response = shelf_search_field(ui, &mut self.shelf.query, &search_hint);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let settings = icon_button(ui, Icon::Settings);
-                    if self.sync.settings.enabled
-                        && self
-                            .sync
-                            .button
-                            .show(ui, interaction_blocked, self.language)
-                            .clicked()
-                    {
-                        self.start_sync(SyncMode::Full {
-                            force_statistics: true,
-                        });
-                    }
-                    if ui
-                        .add_enabled_ui(!interaction_blocked, |ui| icon_button(ui, Icon::Chart))
-                        .inner
-                        .on_hover_text(self.language.text("阅读统计", "Reading statistics"))
-                        .clicked()
-                    {
-                        self.statistics
-                            .open(self.shelf.library.books(), self.local_store.as_ref());
-                    }
-                    if !interaction_blocked {
-                        if settings
-                            .on_hover_text(self.language.text("设置", "Settings"))
+                let row = ui.max_rect();
+                let actions_left = (row.right() - 160.0).max(row.left());
+                let search_rect = egui::Rect::from_min_max(
+                    row.min,
+                    egui::pos2((actions_left - 16.0).max(row.left() + 1.0), row.bottom()),
+                );
+                let search_response = ui
+                    .scope_builder(egui::UiBuilder::new().max_rect(search_rect), |ui| {
+                        ui.set_clip_rect(ui.clip_rect().intersect(search_rect));
+                        shelf_search_field(ui, &mut self.shelf.query, &search_hint)
+                    })
+                    .inner;
+                #[cfg(target_os = "windows")]
+                {
+                    crate::app::window_chrome::exclude(ui.ctx(), search_response.rect);
+                    let rect = ui.max_rect();
+                    crate::app::window_chrome::exclude(
+                        ui.ctx(),
+                        egui::Rect::from_min_max(
+                            egui::pos2((rect.right() - 160.0).max(rect.left()), rect.top()),
+                            rect.max,
+                        ),
+                    );
+                }
+                let actions_rect =
+                    egui::Rect::from_min_max(egui::pos2(actions_left, row.top()), row.max);
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(actions_rect)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                    |ui| {
+                        ui.set_clip_rect(ui.clip_rect().intersect(actions_rect));
+                        let settings = icon_button(ui, Icon::Settings);
+                        if self.sync.settings.enabled
+                            && self
+                                .sync
+                                .button
+                                .show(ui, interaction_blocked, self.language)
+                                .clicked()
+                        {
+                            self.start_sync(SyncMode::Full {
+                                force_statistics: true,
+                            });
+                        }
+                        if ui
+                            .add_enabled_ui(!interaction_blocked, |ui| icon_button(ui, Icon::Chart))
+                            .inner
+                            .on_hover_text(self.language.text("阅读统计", "Reading statistics"))
                             .clicked()
                         {
-                            self.settings_requested = true;
+                            self.statistics
+                                .open(self.shelf.library.books(), self.local_store.as_ref());
                         }
-                    }
-                    let import = shelf_import_button(ui, self.language.text("导入", "Import"));
-                    if !interaction_blocked && import.clicked() && !self.import_task.is_pending() {
-                        self.import_task.begin(());
-                    }
-                });
+                        if !interaction_blocked {
+                            if settings
+                                .on_hover_text(self.language.text("设置", "Settings"))
+                                .clicked()
+                            {
+                                self.settings_requested = true;
+                            }
+                        }
+                        let import = shelf_import_button(ui, self.language.text("导入", "Import"));
+                        if !interaction_blocked
+                            && import.clicked()
+                            && !self.import_task.is_pending()
+                        {
+                            self.import_task.begin(());
+                        }
+                    },
+                );
                 search_response
             },
         )
@@ -1217,9 +1277,10 @@ impl ShelfFeature {
         if let Some(confirmation) = confirmation {
             let mut cancel = false;
             let mut remove = false;
-            let screen_width = ctx.content_rect().width();
+            let screen_width = crate::ui::overlay_rect(ctx).width();
             let modal_width = (screen_width - 48.0).clamp(280.0, 380.0).min(screen_width);
             let modal = egui::Modal::new(egui::Id::new("shelf-remove-book-modal"))
+                .area(crate::ui::modal_area(ctx, egui::Id::new("shelf-remove-book-modal")))
                 .backdrop_color(Color32::BLACK.gamma_multiply(0.42))
                 .frame(
                     egui::Frame::new()
@@ -1417,66 +1478,41 @@ fn move_shelf_selection(
     }
 }
 
+const SHELF_CONTENT_LEFT_MARGIN: i8 = 36;
+
 fn shelf_search_field(ui: &mut egui::Ui, query: &mut String, hint: &str) -> egui::Response {
-    let width = ui.available_width().clamp(180.0, 320.0);
-    egui::Frame::new()
-        .fill(palette().surface)
-        .stroke(egui::Stroke::new(1.0, palette().border))
-        .corner_radius(8.0)
-        .inner_margin(egui::Margin::symmetric(10, 5))
-        .show(ui, |ui| {
-            ui.set_width(width - 22.0);
-            ui.horizontal_centered(|ui| {
-                ui.add(icon(Icon::Search).size(15.0).color(palette().muted));
-                ui.add(
-                    egui::TextEdit::singleline(query)
-                        .hint_text(hint)
-                        .desired_width(ui.available_width())
-                        .frame(egui::Frame::NONE)
-                        .vertical_align(egui::Align::Center),
-                )
-            })
-            .inner
-        })
-        .inner
+    let width = ui.available_width().clamp(32.0, 260.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 32.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 8.0, palette().surface);
+    ui.painter().rect_stroke(
+        rect,
+        8.0,
+        egui::Stroke::new(1.0, palette().border),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink2(Vec2::new(10.0, 4.0));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(inner));
+            ui.add(icon(Icon::Search).size(15.0).color(palette().muted));
+            ui.add(
+                egui::TextEdit::singleline(query)
+                    .hint_text(hint)
+                    .desired_width(ui.available_width())
+                    .margin(egui::Margin::ZERO)
+                    .frame(egui::Frame::NONE)
+                    .vertical_align(egui::Align::Center),
+            )
+        },
+    )
+    .inner
 }
 
 fn shelf_import_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(80.0, 36.0), egui::Sense::click());
-    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let fill = if response.is_pointer_button_down_on() {
-        palette().accent.gamma_multiply(0.84)
-    } else if response.hovered() {
-        palette().accent.gamma_multiply(0.92)
-    } else {
-        palette().accent
-    };
-    let painter = ui.painter();
-    painter.rect_filled(rect, 8.0, fill);
-    let icon_size = 15.0;
-    let text_font = egui::FontId::proportional(crate::ui::scaled_font_size(13.0));
-    let text_galley = painter.layout_no_wrap(label.into(), text_font, Color32::WHITE);
-    let gap = 6.0;
-    let content_width = icon_size + gap + text_galley.size().x;
-    let start_x = rect.center().x - content_width / 2.0;
-    paint_icon(
-        ui,
-        egui::Rect::from_min_size(
-            egui::pos2(start_x, rect.center().y - icon_size / 2.0),
-            Vec2::splat(icon_size),
-        ),
-        Icon::Plus,
-        Color32::WHITE,
-    );
-    painter.galley(
-        egui::pos2(
-            start_x + content_width - text_galley.size().x,
-            rect.center().y - text_galley.size().y / 2.0,
-        ),
-        text_galley,
-        Color32::WHITE,
-    );
-    response
+    icon_button(ui, Icon::Plus).on_hover_text(label)
 }
 
 fn cover_uv_rect(bounds_size: Vec2, image_size: Vec2) -> egui::Rect {
@@ -1586,6 +1622,64 @@ mod tests {
             cover_bytes: None,
             added_at,
         }
+    }
+
+    #[test]
+    fn shelf_search_stays_inset_and_import_is_a_standard_icon() {
+        let ctx = egui::Context::default();
+        let mut query = String::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(720.0, 520.0),
+                )),
+                ..Default::default()
+            },
+            |root| {
+                let row = egui::Rect::from_min_size(
+                    egui::pos2(f32::from(SHELF_CONTENT_LEFT_MARGIN), 0.0),
+                    Vec2::new(300.0, 44.0),
+                );
+                root.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(row)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        let search = shelf_search_field(ui, &mut query, "Search books");
+                        assert!(search.rect.top() >= 6.0 && search.rect.bottom() <= 38.0);
+                    },
+                );
+                root.scope_builder(
+                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                        egui::pos2(400.0, 6.0),
+                        Vec2::new(32.0, 32.0),
+                    )),
+                    |ui| {
+                        assert_eq!(
+                            shelf_import_button(ui, "Import").rect.size(),
+                            Vec2::splat(32.0)
+                        );
+                    },
+                );
+            },
+        );
+        let field = output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Rect(rect) = &shape.shape {
+                    if rect.fill == palette().surface {
+                        return Some(rect.rect);
+                    }
+                }
+                None
+            })
+            .expect("search field background");
+        assert_eq!(field.left(), f32::from(SHELF_CONTENT_LEFT_MARGIN));
+        assert_eq!(field.top(), 6.0);
+        assert_eq!(field.size(), Vec2::new(260.0, 32.0));
+        output.textures_delta.clear();
     }
 
     #[test]

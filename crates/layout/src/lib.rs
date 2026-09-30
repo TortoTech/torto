@@ -2,8 +2,104 @@
 
 pub mod linebreak;
 
+mod caption_labels;
 mod formula_images;
+mod note_spacing;
+mod semantic_lists;
 mod web_links;
+pub use semantic_lists::semantic_list_groups;
+
+/// Avoid copying blocks without footnotes, especially image-heavy chapters.
+pub fn numbered_semantic_footnotes(block: &Block) -> Cow<'_, Block> {
+    fn has_notes(block: &Block) -> bool {
+        let has = |t: &TextBlock| !paragraph_footnotes(t).is_empty();
+        match block {
+            Block::Text(t) => has(t),
+            Block::Quote(q) => q.body.iter().chain(q.attribution.iter()).any(has),
+            Block::Table(t) => t.text_blocks().any(has),
+            Block::Figure(f) => f.captions.iter().any(has),
+            Block::Note(n) => n.blocks.iter().any(has_notes),
+            _ => false,
+        }
+    }
+    if !has_notes(block) {
+        return Cow::Borrowed(block);
+    }
+    let mut result = block.clone();
+    number_semantic_footnotes(&mut result);
+    Cow::Owned(result)
+}
+
+/// Shared display numbering for a complete semantic block, before pagination.
+pub fn number_semantic_footnotes(block: &mut Block) {
+    number_semantic_footnotes_from(block, &mut 0);
+}
+
+fn number_semantic_footnotes_from(block: &mut Block, next: &mut u32) {
+    fn text(block: &mut TextBlock, next: &mut u32) {
+        for range in paragraph_footnotes(block) {
+            *next += 1;
+            for inline in &mut block.content[range] {
+                if let Inline::Text(run) = inline {
+                    run.style.footnote_number = *next;
+                }
+            }
+        }
+    }
+    fn visit(block: &mut Block, next: &mut u32) {
+        match block {
+            Block::Text(t) => text(t, next),
+            Block::Quote(q) => {
+                for t in q.body.iter_mut().chain(q.attribution.iter_mut()) {
+                    text(t, next);
+                }
+            }
+            Block::Table(t) => {
+                for p in &mut t.before {
+                    text(p, next);
+                }
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        text(&mut cell.text, next);
+                    }
+                }
+                for p in &mut t.after {
+                    text(p, next);
+                }
+            }
+            Block::Figure(f) => {
+                for p in &mut f.captions {
+                    text(p, next);
+                }
+            }
+            Block::Note(n) => {
+                for b in &mut n.blocks {
+                    visit(b, next);
+                }
+            }
+            _ => {}
+        }
+    }
+    visit(block, next);
+}
+
+/// List introductions and all list items share one numbering scope.
+pub fn number_list_footnotes(blocks: &mut [Block]) {
+    let refs: Vec<_> = blocks.iter().collect();
+    let groups = semantic_list_groups(&refs);
+    for group in groups {
+        let mut next = 0;
+        let mut previous_start = 0;
+        for block in &mut blocks[group] {
+            if matches!(block, Block::Text(t) if t.source.is_none()) {
+                number_semantic_footnotes_from(block, &mut previous_start.clone());
+            } else {
+                previous_start = next;
+                number_semantic_footnotes_from(block, &mut next);
+            }
+        }
+    }
+}
 
 /// Consecutive styled runs belonging to each footnote, in paragraph order.
 pub fn paragraph_footnotes(block: &TextBlock) -> Vec<Range<usize>> {
@@ -167,6 +263,8 @@ pub struct ReaderStyle {
     pub spread: SpreadMode,
     /// Replaces linked superscript markers with semantic footnote icon slots.
     pub focus_footnote_icons: bool,
+    /// Use website icons while retaining authored text metrics (e.g. popups).
+    pub website_icons: bool,
     pub foreground: Rgba,
     pub background: Rgba,
 }
@@ -536,6 +634,7 @@ impl Default for ReaderStyle {
             minimum_paragraph_gap: 0.0,
             spread: SpreadMode::Double,
             focus_footnote_icons: false,
+            website_icons: false,
             foreground: Rgba::BLACK,
             background: Rgba {
                 red: 250,
@@ -1276,6 +1375,37 @@ impl LayoutEngine {
         for blocks in fragments {
             collect_layout_blocks(blocks, reader_style, &mut layout_blocks);
         }
+        let mut numbered_blocks: Vec<_> = layout_blocks
+            .iter()
+            .map(|block| {
+                if unified_reflow {
+                    numbered_semantic_footnotes(block)
+                } else {
+                    Cow::Borrowed(*block)
+                }
+            })
+            .collect();
+        if unified_reflow {
+            for group in semantic_list_groups(&layout_blocks) {
+                let mut next = 0;
+                let mut previous_start = 0;
+                for block in &mut numbered_blocks[group] {
+                    // The per-block pass already owns blocks with notes; don't
+                    // clone image-free prose merely to visit an empty scope.
+                    if let Cow::Owned(block) = block {
+                        if matches!(block, Block::Text(t) if t.source.is_none()) {
+                            number_semantic_footnotes_from(block, &mut previous_start.clone());
+                        } else {
+                            previous_start = next;
+                            number_semantic_footnotes_from(block, &mut next);
+                        }
+                    } else if !matches!(block.as_ref(), Block::Text(t) if t.source.is_none()) {
+                        previous_start = next;
+                    }
+                }
+            }
+        }
+        let layout_blocks: Vec<_> = numbered_blocks.iter().map(|b| b.as_ref()).collect();
         let mut block_index = 0;
         while block_index < layout_blocks.len() {
             if unified_reflow
@@ -2095,6 +2225,7 @@ impl LayoutEngine {
             &self.svg_options,
             reader_style.focus_footnote_icons,
             reader_style.typesetting.mode == TypesettingMode::Unified,
+            reader_style.typesetting.mode == TypesettingMode::Unified || reader_style.website_icons,
             inline_rasters,
         );
         let sentence_reference = sentence_reference.filter(|reference| {
@@ -2471,6 +2602,53 @@ impl LayoutEngine {
         spacing: &[linebreak::parley::SpacingAdjustment],
         shaping_breaks: &[usize],
     ) -> Layout<TextBrush> {
+        let mut layout = self.build_text_layout_raw(
+            text,
+            spans,
+            inline_images,
+            font_stack,
+            typography,
+            line_height,
+            foreground,
+            spacing,
+            shaping_breaks,
+            &[],
+        );
+        if note_spacing::needs_measurement(text, spans) {
+            layout.break_all_lines(None);
+            let optical = note_spacing::measure(&layout, text, spans, typography.font_size);
+            if !optical.is_empty() {
+                layout = self.build_text_layout_raw(
+                    text,
+                    spans,
+                    inline_images,
+                    font_stack,
+                    typography,
+                    line_height,
+                    foreground,
+                    spacing,
+                    shaping_breaks,
+                    &optical,
+                );
+            }
+        }
+        layout
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_text_layout_raw(
+        &mut self,
+        text: &str,
+        spans: &[StyledRange],
+        inline_images: &[PreparedInlineImage],
+        font_stack: &str,
+        typography: &ReaderTypography,
+        line_height: f32,
+        foreground: Rgba,
+        spacing: &[linebreak::parley::SpacingAdjustment],
+        shaping_breaks: &[usize],
+        optical: &[linebreak::parley::SpacingAdjustment],
+    ) -> Layout<TextBrush> {
         let mut builder =
             self.layout_context
                 .ranged_builder(&mut self.font_context, text, 1.0, false);
@@ -2540,6 +2718,30 @@ impl LayoutEngine {
                 adjustment.range.clone(),
             );
         }
+        // Website placeholders hide a digit whose advance may be narrower than
+        // the painted globe. Reserve the icon and optical padding in shaping,
+        // so line breaking, popup SVGs and retained rendering agree. Restrict
+        // this to the first scalar: the remaining source-offset word joiners
+        // must keep their zero advance.
+        for span in spans.iter().filter(|span| {
+            span.footnote_reference_group & 0x4000_0000 != 0
+                && span.footnote_reference_group & 0xa000_0000 == 0
+        }) {
+            if let Some(first) = text[span.range.clone()].chars().next() {
+                let size = (typography.font_size * span.style.size_scale.clamp(0.5, 3.0))
+                    .max(typography.minimum_font_size);
+                let adjustment = spacing
+                    .iter()
+                    .find(|item| item.range.contains(&span.range.start))
+                    .map_or(0.0, |item| item.amount);
+                builder.push(
+                    StyleProperty::LetterSpacing(
+                        adjustment + (size * 0.78).clamp(8.0, 12.0) + size * 0.16,
+                    ),
+                    span.range.start..span.range.start + first.len_utf8(),
+                );
+            }
+        }
         // Optical separation before numbered notes, without adding source text
         // or a new break opportunity. Include it in every shaping pass so the
         // line breaker and hit geometry see the same advance as the renderer.
@@ -2559,6 +2761,27 @@ impl LayoutEngine {
                     start..span.range.start,
                 );
             }
+        }
+        for item in optical {
+            let base = spacing
+                .iter()
+                .find(|entry| entry.range.contains(&item.range.start))
+                .map_or(0.0, |entry| entry.amount);
+            let leading = spans.iter().any(|span| {
+                span.footnote_reference_group & 0x2000_0000 != 0
+                    && span.range.start == item.range.end
+            });
+            builder.push(
+                StyleProperty::LetterSpacing(
+                    base + item.amount
+                        + if leading {
+                            typography.font_size * 0.08
+                        } else {
+                            0.0
+                        },
+                ),
+                item.range.clone(),
+            );
         }
         for image in inline_images {
             builder.push_inline_box(ParleyInlineBox {
@@ -2742,7 +2965,7 @@ fn resolve_text_block<'a>(
             .content
             .iter()
             .any(|i| matches!(i,Inline::Math(m) if m.original.is_some()));
-        if block.style.hard_break_after || generated {
+        if block.style.hard_break_after || generated || reader_style.website_icons {
             let mut resolved = block.clone();
             if generated {
                 resolved.content = resolved
@@ -2760,6 +2983,9 @@ fn resolve_text_block<'a>(
             if block.style.hard_break_after {
                 resolved.style.margin_after +=
                     reader_style.typography.font_size * resolved.style.line_height.max(1.0);
+            }
+            if reader_style.website_icons {
+                web_links::detect(&mut resolved.content);
             }
             return Cow::Owned(resolved);
         }
@@ -2938,10 +3164,9 @@ fn resolve_text_block<'a>(
                     run.style.italic = false;
                 }
                 if block.kind == TextBlockKind::Caption {
-                    // Unified captions use one neutral presentation regardless of
-                    // publisher CSS or semantic tags that would recreate bold or
-                    // italic styling in the later script-aware pass.
-                    run.style.bold = false;
+                    // Preserve authored bold text; numbered labels are emphasized
+                    // separately after resolving the caption presentation. Keep the
+                    // existing neutral italic/semantic decoration policy.
                     run.style.italic = false;
                     run.style.emphasis = false;
                     run.style.alternate_voice = false;
@@ -2959,6 +3184,9 @@ fn resolve_text_block<'a>(
         resolved.style.line_height = 1.0;
         resolved.style.margin_before = base_size * profile.media_gap_em;
         resolved.style.margin_after = base_size * profile.media_gap_em;
+    }
+    if block.kind == TextBlockKind::Caption {
+        caption_labels::normalize(&mut resolved.content);
     }
     resolve_semantic_inline_presentation(&mut resolved.content, reader_style.writing_system);
     web_links::detect(&mut resolved.content);
@@ -3555,6 +3783,7 @@ fn prepare_inline_content(
     svg_options: &resvg::usvg::Options<'_>,
     focus_footnote_icons: bool,
     unified_math: bool,
+    website_icons: bool,
     inline_rasters: &[Option<RasterImage>],
 ) -> (
     String,
@@ -3605,7 +3834,7 @@ fn prepare_inline_content(
                 {
                     continue;
                 }
-                let website = unified_math
+                let website = website_icons
                     && run.style.inline_citation == 0
                     && run.style.inline_role == InlineRole::Normal
                     && run.style.link_role == LinkRole::Normal
@@ -3683,7 +3912,12 @@ fn prepare_inline_content(
                                 }
                             })
                             .collect();
-                        let label = (index + 1).to_string();
+                        let number = if run.style.footnote_number == 0 {
+                            index as u32 + 1
+                        } else {
+                            run.style.footnote_number
+                        };
+                        let label = number.to_string();
                         text.push_str(&label);
                         text.extend(std::iter::repeat_n(
                             '\u{2060}',
@@ -3694,7 +3928,7 @@ fn prepare_inline_content(
                             owner: block.source.clone(),
                             range: start..text.len(),
                             original,
-                            number: 0x2000_0000 | (index as u32 + 1),
+                            number: 0x2000_0000 | number,
                         });
                         style.size_scale = 0.78;
                         style.baseline = TextBaseline::Superscript;
@@ -3711,9 +3945,14 @@ fn prepare_inline_content(
                 } else if style.inline_citation != 0 {
                     0x8000_0000 | style.inline_citation
                 } else if footnote_reference {
-                    let group = numbered_note
-                        .map_or(next_footnote_reference_group, |(index, _)| {
-                            0x2000_0000 | (index as u32 + 1)
+                    let group =
+                        numbered_note.map_or(next_footnote_reference_group, |(index, _)| {
+                            0x2000_0000
+                                | if run.style.footnote_number == 0 {
+                                    index as u32 + 1
+                                } else {
+                                    run.style.footnote_number
+                                }
                         });
                     next_footnote_reference_group = next_footnote_reference_group.saturating_add(1);
                     group
@@ -5211,6 +5450,7 @@ mod tests {
                 &resvg::usvg::Options::default(),
                 true,
                 true,
+                true,
                 &[],
             );
             assert_eq!(citations.len(), 12);
@@ -5298,6 +5538,7 @@ mod tests {
             &svg_options,
             true,
             false,
+            false,
             &[],
         );
         assert_eq!(
@@ -5322,6 +5563,7 @@ mod tests {
             &ReaderTypography::default(),
             320.0,
             &svg_options,
+            false,
             false,
             false,
             &[],
@@ -5553,6 +5795,7 @@ mod tests {
             &svg_options,
             false,
             false,
+            false,
             &[Some(raster), None],
         );
 
@@ -5604,6 +5847,7 @@ mod tests {
             &typography,
             320.0,
             &svg_options,
+            false,
             false,
             false,
             &[Some(raster)],
@@ -5947,7 +6191,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_captions_clear_all_authored_bold_and_italic_sources() {
+    fn unified_captions_preserve_authored_bold_and_clear_italic_sources() {
         let block = TextBlock {
             kind: TextBlockKind::Caption,
             content: vec![Inline::Text(TextRun {
@@ -5981,7 +6225,13 @@ mod tests {
         };
         assert!(classic_run.style.bold);
         assert!(classic_run.style.italic);
-        assert!(!unified_run.style.bold);
+        assert!(unified_run.style.bold);
+        assert!(
+            unified
+                .content
+                .iter()
+                .all(|inline| matches!(inline, Inline::Text(run) if run.style.bold))
+        );
         assert!(!unified_run.style.italic);
         assert!(!unified_run.style.emphasis);
         assert!(!unified_run.style.alternate_voice);

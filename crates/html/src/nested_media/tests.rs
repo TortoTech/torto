@@ -1,5 +1,40 @@
 use super::*;
 
+#[test]
+fn explicit_figures_preserve_ordinary_paragraph_captions() {
+    let section = parse(
+        r#"<figure id="fig0306"><p><span id="p80"/><img src="entities.jpeg"/></p><p class="figh" id="caption6"><span>Figure 2.6</span> “Entities” developed by Caldwell</p></figure><figure id="fig0307"><p><img src="keyboard.jpg"/></p><p><span data-locator="p81"/><span>Figure 2.7</span> Keyboard of the Sinotype</p></figure>"#,
+    );
+    assert_eq!(section.blocks.len(), 2);
+    for (block, expected) in section.blocks.iter().zip([
+        "Figure 2.6 “Entities” developed by Caldwell",
+        "Figure 2.7 Keyboard of the Sinotype",
+    ]) {
+        let Block::Figure(figure) = block else {
+            panic!("expected figure")
+        };
+        assert_eq!(figure.images.len(), 1);
+        assert_eq!(figure.captions.len(), 1);
+        assert_eq!(content(&figure.captions[0]), expected);
+        assert_eq!(figure.caption_position, CaptionPosition::After);
+    }
+    assert!(section.anchors.iter().any(|a| a.fragment == "caption6"));
+}
+
+#[test]
+fn ordinary_figure_caption_wrappers_preserve_order_without_duplicates() {
+    let section = parse(
+        r#"<figure><div><p>First caption.</p><p>Second caption.</p></div><p><img src="image.jpg"/></p><figcaption>Final caption.</figcaption></figure>"#,
+    );
+    let [Block::Figure(figure)] = section.blocks.as_slice() else {
+        panic!()
+    };
+    assert_eq!(
+        figure.captions.iter().map(content).collect::<Vec<_>>(),
+        ["First caption.", "Second caption.", "Final caption."]
+    );
+}
+
 fn parse(body: &str) -> Section {
     let descriptor = SpineItem {
         id: SpineItemId::new("chapter").unwrap(),

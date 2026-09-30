@@ -1,5 +1,160 @@
 use super::super::tests::{section, text};
 use super::*;
+use rebook_publication::TextRun;
+
+fn assert_prepared_note_translation(original: Section) {
+    let Block::Text(block) = &original.blocks[0] else {
+        panic!()
+    };
+    let raw_notes = rebook_layout::paragraph_footnotes(block);
+    assert_eq!(raw_notes.len(), 1);
+    let recognition = Recognition {
+        fingerprint: fingerprint(&original),
+        annotations: vec![Annotation::InlineCitations {
+            source: block.source.clone().unwrap(),
+            spans: candidates(block)
+                .into_iter()
+                .filter(|span| span.text.contains("figure 3.11"))
+                .collect(),
+        }],
+        formulas_checked: true,
+        skipped_groups: 0,
+    };
+    let mut prepared = original.clone();
+    apply_translation_citations(&mut prepared, &recognition);
+    let Block::Text(prepared_text) = &prepared.blocks[0] else {
+        panic!()
+    };
+    let prepared_notes = rebook_layout::paragraph_footnotes(prepared_text);
+    assert_ne!(
+        raw_notes[0].start, prepared_notes[0].start,
+        "citation preparation must split source runs"
+    );
+    let note_id = prepared_notes[0].start;
+    for mode in [
+        crate::plugins::TranslationMode::Replace,
+        crate::plugins::TranslationMode::Bilingual,
+    ] {
+        let source = super::super::tests::original_source(original.clone());
+        let translation = Arc::new(crate::plugins::TranslationBookSource::new(
+            source.clone(),
+            mode,
+        ));
+        translation.remember_translation_input(0, 0, &original.blocks[0], &prepared.blocks[0]);
+        let overlay = SemanticLayoutSource::new(translation.clone(), source);
+        assert!(overlay.install(0, recognition.clone()));
+        for translated in [
+            format!("译文正文<citation id=\"1\">图3.11</citation>。<torto-note-{note_id}/>"),
+            format!(
+                "译文正文<citation id=\"1\">图3.11</citation>。<torto-note-{note_id}/>后续句子。"
+            ),
+        ] {
+            let input = crate::plugins::prepare_translation_inputs(&prepared, false);
+            assert!(
+                crate::plugins::translation::validate_translation_footnotes(
+                    &input[0].0.text,
+                    &translated
+                )
+                .is_ok()
+            );
+            translation
+                .store_batch(
+                    0,
+                    &[crate::plugins::BlockTranslation {
+                        block_index: 0,
+                        segment_index: None,
+                        text: translated,
+                    }],
+                )
+                .unwrap();
+            translation.set_enabled(true).unwrap();
+            let displayed = overlay.parse_section(0).unwrap();
+            let Block::Text(text) = displayed.blocks.last().unwrap() else {
+                panic!()
+            };
+            assert!(
+                !text_block_text(text).contains("torto-note"),
+                "footnote source identity was resolved against the wrong inline snapshot: {}",
+                text_block_text(text)
+            );
+            let notes = rebook_layout::paragraph_footnotes(text);
+            assert_eq!(notes.len(), 1);
+            let identity = |inlines: &[Inline]| {
+                inlines
+                    .iter()
+                    .filter_map(|inline| match inline {
+                        Inline::Text(run) => Some((
+                            run.text.clone(),
+                            run.link.clone(),
+                            run.style.link_role,
+                            run.style.baseline,
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                identity(&text.content[notes[0].clone()]),
+                identity(&block.content[raw_notes[0].clone()])
+            );
+            assert!(text_block_text(text).starts_with("译文正文"));
+        }
+    }
+}
+
+#[test]
+fn translated_tail_note_survives_citation_run_splitting() {
+    let Block::Text(mut block) = text("tail-note", "Body (figure 3.11).52") else {
+        panic!()
+    };
+    let Inline::Text(template) = block.content[0].clone() else {
+        panic!()
+    };
+    block.content = (0..20)
+        .map(|index| {
+            Inline::Text(TextRun {
+                text: format!("Part {index}. "),
+                ..template.clone()
+            })
+        })
+        .collect();
+    block.content.push(Inline::Text(TextRun {
+        text: "Body (figure 3.11).".into(),
+        ..template.clone()
+    }));
+    block.content.push(Inline::Text(TextRun {
+        text: "52".into(),
+        link: Some(PublicationUrl::parse("notes.xhtml#en231").unwrap()),
+        style: rebook_publication::TextStyle {
+            baseline: rebook_publication::TextBaseline::Superscript,
+            link_role: rebook_publication::LinkRole::FootnoteReference,
+            ..Default::default()
+        },
+    }));
+    block.source.as_mut().unwrap().end.text_offset =
+        text_block_text(&block).chars().count().try_into().unwrap();
+    assert_prepared_note_translation(section(vec![Block::Text(block)]));
+}
+
+#[test]
+#[ignore = "requires TORTO_PERF_BOOK; offline Chinese Computer figure 3.11 footnote regression"]
+fn local_chinese_computer_translated_tail_note() {
+    let book = rebook_formats::open_file(std::path::PathBuf::from(
+        std::env::var_os("TORTO_PERF_BOOK").unwrap(),
+    ))
+    .unwrap();
+    let source = book.source();
+    let index = source
+        .book()
+        .sections
+        .iter()
+        .position(|s| s.href.to_string().ends_with("10992_Mullaney-0008.xhtml"))
+        .unwrap();
+    let mut original = source.parse_section(index).unwrap();
+    let target = original.blocks.iter().find(|block| matches!(block, Block::Text(text) if text_block_text(text).contains("Divisible type") && text_block_text(text).contains("1830s"))).unwrap().clone();
+    original.blocks = vec![target];
+    assert_prepared_note_translation(original);
+}
 
 #[test]
 fn citations_keep_original_text_and_number_across_style_runs() {

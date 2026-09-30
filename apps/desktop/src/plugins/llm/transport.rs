@@ -8,7 +8,66 @@ use rig_core::http_client::{
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug, Default)]
-pub(super) struct CompatHttp(pub reqwest_rig::Client);
+pub(super) struct CompatHttp(
+    pub reqwest_rig::Client,
+    pub Vec<Value>,
+    pub Option<std::sync::Arc<std::sync::Mutex<Vec<crate::plugins::web_search::WebSource>>>>,
+);
+
+impl CompatHttp {
+    fn prepare<T: Into<Bytes>>(&self, request: Request<T>) -> Request<Bytes> {
+        let (parts, body) = request.into_parts();
+        let mut bytes = body.into();
+        if !self.1.is_empty()
+            && let Ok(mut payload) = serde_json::from_slice::<Value>(&bytes)
+        {
+            if !payload["tools"].is_array() {
+                payload["tools"] = json!([]);
+            }
+            payload["tools"]
+                .as_array_mut()
+                .unwrap()
+                .extend(self.1.iter().cloned());
+            bytes = Bytes::from(payload.to_string());
+        }
+        #[cfg(debug_assertions)]
+        if let Ok(payload) = serde_json::from_slice::<Value>(&bytes) {
+            // Capture the final wire declarations after Rig serialization and merging.
+            // Never include headers, credentials, messages or function arguments.
+            let declarations = payload
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .map(|tool| {
+                            if tool["type"] == "function" {
+                                json!({"type":"function", "name":tool["function"]["name"]})
+                            } else {
+                                tool.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let declarations = serde_json::to_string(&declarations).unwrap_or_default();
+            crate::diagnostics::log(
+                "llm.wire.tools",
+                &[
+                    crate::diagnostics::Field::Detail("path", parts.uri.path()),
+                    crate::diagnostics::Field::Detail(
+                        "model",
+                        payload["model"].as_str().unwrap_or_default(),
+                    ),
+                    crate::diagnostics::Field::Detail("tools", &declarations),
+                ],
+            );
+        }
+        let mut request = Request::from_parts(parts, bytes);
+        request.headers_mut().remove("content-length");
+        request
+    }
+}
 
 fn normalize(mut payload: Value) -> Value {
     if !payload["choices"].is_array() {
@@ -108,8 +167,10 @@ impl HttpClientExt for CompatHttp {
         T: Into<Bytes> + Send,
         U: From<Bytes> + Send + 'static,
     {
+        let request = self.prepare(request);
         let compatible = request.uri().path().ends_with("/chat/completions");
-        let pending = self.0.send::<T, Bytes>(request);
+        let pending = self.0.send::<Bytes, Bytes>(request);
+        let sources = self.2.clone();
         async move {
             let response = pending.await?;
             let success = response.status().is_success();
@@ -121,6 +182,14 @@ impl HttpClientExt for CompatHttp {
                     && success
                     && let Ok(payload) = serde_json::from_slice::<Value>(&bytes)
                 {
+                    if let Some(sources) = sources {
+                        crate::plugins::web_search::collect_sources(
+                            &payload,
+                            &mut sources
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        );
+                    }
                     return Ok(U::from(Bytes::from(normalize(payload).to_string())));
                 }
                 Ok(U::from(bytes))
@@ -146,7 +215,9 @@ impl HttpClientExt for CompatHttp {
     where
         T: Into<Bytes> + Send,
     {
+        let request = self.prepare(request);
         let compatible = request.uri().path().ends_with("/chat/completions");
+        let sources = self.2.clone();
         async move {
             let response = self.0.send_streaming(request).await?;
             let is_json = response
@@ -155,6 +226,36 @@ impl HttpClientExt for CompatHttp {
                 .and_then(|h| h.to_str().ok())
                 .is_some_and(|h| h.contains("application/json"));
             if !compatible || !is_json || !response.status().is_success() {
+                if response.status().is_success()
+                    && let Some(sources) = sources
+                {
+                    let (parts, stream) = response.into_parts();
+                    let mut pending = Vec::new();
+                    let stream: http::sse::BoxedStream = Box::pin(stream.map(move |chunk| {
+                        if let Ok(bytes) = &chunk {
+                            if pending.len() + bytes.len() <= 2 * 1024 * 1024 {
+                                pending.extend_from_slice(bytes);
+                            } else {
+                                pending.clear();
+                            }
+                            while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+                                let line: Vec<_> = pending.drain(..=end).collect();
+                                if let Some(data) = line.strip_prefix(b"data:")
+                                    && let Ok(value) = serde_json::from_slice::<Value>(data)
+                                {
+                                    crate::plugins::web_search::collect_sources(
+                                        &value,
+                                        &mut sources
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                                    );
+                                }
+                            }
+                        }
+                        chunk
+                    }));
+                    return Ok(Response::from_parts(parts, stream));
+                }
                 return Ok(response);
             }
             let (mut parts, mut stream) = response.into_parts();
@@ -164,6 +265,14 @@ impl HttpClientExt for CompatHttp {
             }
             let payload: Value =
                 serde_json::from_slice(&bytes).map_err(|e| http::Error::Instance(Box::new(e)))?;
+            if let Some(sources) = sources {
+                crate::plugins::web_search::collect_sources(
+                    &payload,
+                    &mut sources
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+            }
             let mut payload = normalize(payload);
             let choices = payload["choices"]
                 .as_array_mut()

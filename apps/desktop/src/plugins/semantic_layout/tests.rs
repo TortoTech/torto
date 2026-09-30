@@ -645,11 +645,15 @@ fn visible_request_sends_context_without_targeting_the_next_paragraph() {
         let mut bytes = vec![0; length];
         reader.read_exact(&mut bytes).unwrap();
         let request: Value = serde_json::from_slice(&bytes).unwrap();
-        let input: Value = serde_json::from_str(&wire_text(&request["messages"][1])).unwrap();
+        let compact: Value = serde_json::from_str(&wire_text(&request["messages"][1])).unwrap();
+        assert!(compact.get("bs").is_some());
+        assert!(compact.get("blocks").is_none());
+        let input = wire::decode(&compact);
         assert_eq!(input["target_start"], 1);
         assert_eq!(input["target_end_exclusive"], 2);
         assert_eq!(input["blocks"].as_array().unwrap().len(), 3);
-        let body = json!({"choices":[{"message":{"content":"{\"groups\":[],\"citations\":[],\"formulas\":[]}"}}]}).to_string();
+        let body =
+            json!({"choices":[{"message":{"content":"{\"g\":[],\"c\":[],\"f\":[]}"}}]}).to_string();
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
     });
     let original = section(vec![
@@ -988,27 +992,24 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
             let contract = &request["response_format"]["json_schema"];
             assert_eq!(contract["strict"], true);
             assert_eq!(contract["schema"]["additionalProperties"], false);
-            let alternatives = contract["schema"]["properties"]["groups"]["items"]["anyOf"]
+            let alternatives = contract["schema"]["properties"]["g"]["items"]["anyOf"]
                 .as_array()
                 .unwrap();
             let item = alternatives
                 .iter()
-                .find(|item| item["properties"]["kind"]["enum"] == json!(["quote"]))
+                .find(|item| item["properties"]["k"]["enum"] == json!(["q"]))
                 .unwrap();
             assert!(
                 alternatives
                     .iter()
-                    .any(|item| item["properties"]["kind"]["enum"] == json!(["quote_attribution"]))
+                    .any(|item| item["properties"]["k"]["enum"] == json!(["qa"]))
             );
-            assert_eq!(item["properties"]["kind"]["enum"], json!(["quote"]));
-            assert_eq!(
-                item["required"],
-                json!(["alignment", "attribution", "body", "kind"])
-            );
-            assert_eq!(item["properties"]["attribution"]["type"], json!("integer"));
+            assert_eq!(item["properties"]["k"]["enum"], json!(["q"]));
+            assert_eq!(item["required"], json!(["a", "al", "d", "k"]));
+            assert_eq!(item["properties"]["a"]["type"], json!("integer"));
             assert!(wire_text(&request["messages"][0]).starts_with("# AI layout"));
             let input: Value = serde_json::from_str(&wire_text(&request["messages"][1])).unwrap();
-            assert_eq!(input["blocks"][0]["id"], 0);
+            assert_eq!(input["bs"][0]["i"], 0);
             if attempt == 1 {
                 let last = request["messages"].as_array().unwrap().last().unwrap();
                 let feedback = wire_text(last);
@@ -1016,7 +1017,9 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
                 assert!(feedback.contains("## Structural error") && feedback.contains("99"));
             }
             let result = json!({"groups":[{"kind":"quote_inline","body":[if attempt == 0 {99} else {0}],"credit":"-- A poet","alignment":"center"}],"citations":[],"formulas":[]});
-            let body = json!({"choices":[{"message":{"content":result.to_string()}}]}).to_string();
+            let body =
+                json!({"choices":[{"message":{"content":wire::encode(&result).to_string()}}]})
+                    .to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         }
     });
@@ -1337,9 +1340,10 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
         assert_eq!(request["reasoning_effort"], "high");
         assert_eq!(
             request["response_format"]["json_schema"]["schema"]["required"],
-            json!(["citations", "formulas", "groups"])
+            json!(["c", "f", "g"])
         );
         let input: Value = serde_json::from_str(&wire_text(&request["messages"][1])).unwrap();
+        let input = wire::decode(&input);
         assert_eq!(input["blocks"][0]["citation_candidates"][0]["id"], "c0_0_0");
         assert_eq!(input["quotes_enabled"], true);
         assert_eq!(input["captions_enabled"], true);
@@ -1355,7 +1359,8 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
             .push(json!("c0_0_0"));
         let duplicate = response["formulas"][0].clone();
         response["formulas"].as_array_mut().unwrap().push(duplicate);
-        let body = json!({"choices":[{"message":{"content":response.to_string()}}]}).to_string();
+        let body = json!({"choices":[{"message":{"content":wire::encode(&response).to_string()}}]})
+            .to_string();
         write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         // Listener drops after this one response. A second pass would fail.
     });

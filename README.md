@@ -44,6 +44,7 @@ Unlike browser-based readers, Torto parses, lays out, paginates, and renders boo
 Focus Mode is Torto's default and flagship reading experience—and the feature that most clearly sets it apart from conventional ebook readers.
 
 - **Read by meaning, not by page.** One semantic unit is active at a time. Images are valid reading units, nested list descendants stay with their parent item, and large tables or media remain scrollable instead of being skipped.
+- **Browse lists with their context.** A list includes its immediately preceding ordinary paragraph. A fitting group gets one green rounded activation; a taller group has a subtle gray background and green activation for its introduction or current top-level item. Oversized items scroll internally before navigation advances, and list footnotes share one numbering scope.
 - **Keep your place visually.** Short units begin at a stable position inside a centered reading stage; taller content expands only when it needs more room. Moving between units avoids the constant vertical jump caused by paragraphs of different lengths.
 - **Navigate consistently.** The mouse wheel, arrow keys, and the reader scrollbar move through reading units. When a table of contents, chat, footnote panel, or text editor owns input, scrolling stays inside that surface.
 - **Act on the current passage.** Open the action toolbar with `Space`, chat with `Tab`, highlight with `1`, add a note with `2`, use **Split by sentence** with `3`, and toggle contextual footnotes with `Left Alt`. Shortcuts are configurable.
@@ -64,7 +65,7 @@ Focus Mode is Torto's default and flagship reading experience—and the feature 
 | **Navigation and search** | Use a hierarchical table of contents, chapter tracking, full-book search, keyboard navigation, mouse-wheel paging, and `F11` fullscreen. | ✅ |
 | **Typography and themes** | Configure default, CJK, code, and interface fonts; choose unified or book-authored typography; and follow the system, Light, or Dark theme. | ✅ |
 | **Selection and annotations** | Select freely or by word, sentence, or paragraph; copy text, create highlights and notes, and return to durable source locations. | ✅ |
-| **Image preview** | Open book images in an overlay, zoom with the wheel, pan when enlarged, and copy images to the clipboard. | ✅ |
+| **Image preview** | Press `0` on an active image in Focus Mode, or open it with the pointer. Images initially fit the window, including enlargement of small images; zoom with `-` / `=` or the wheel, pan when enlarged, and copy images to the clipboard. Recognized formulas preview their rendered LaTeX. | ✅ |
 | **Translation** | Translate book content in replacement or bilingual mode and translate the table of contents. | ✅ |
 | **AI layout** | Recover missing headings, attributed quotations and captions; turn inline citations into popup references; recognize text and image formulas and render them as mathematics. | ✅ Optional |
 | **References and links** | Read footnotes and inline citations in a shared popup; open website icons in your browser in unified typesetting. | ✅ |
@@ -88,6 +89,8 @@ In chat, type `/` for reading skills or `@` to attach references. Use the arrow 
 PDF contents, book metadata, and special pages are discovered by a shared tool-using agent. It chooses which page overviews, full pages, crops, and existing text to inspect, saves an incremental draft, and submits results after local checks. Printed labels and physical page numbers are stored separately; no single book-wide page offset is assumed. Interrupted drafts and rendered page images are cached locally for reuse. Only confirmed navigation targets are applied; partial completion is reported explicitly. This feature uses the configured recognition model and requires both vision and tool calling. Each run is bounded to 20 model turns and ten minutes, with at most five full pages per read and bounded context history.
 
 ### AI providers
+
+Expert translation is an optional switch in Settings → Translation, off by default. It collects up to eight useful new terms alongside each translation, keeping the existing paragraph-keyed response and adding a compact `g` array of `s` (source) / `t` (translation) pairs. Terminology is saved locally per book and target language; subsequent requests receive only matching terms, within a bounded prompt budget. Extraction excludes ordinary phrases and widely established names such as Steve Jobs and McDonald's. Conflicting suggestions never overwrite established terms, and invalid glossary metadata does not discard valid translations. Enabling the switch affects future requests without automatically retranslating existing text; disabling it retains the glossary for later use.
 
 The searchable provider selector includes OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, SiliconFlow, xAI, Groq, Mistral, Moonshot, MiniMax, Z.ai, Ollama, llama.cpp, and custom OpenAI-compatible endpoints. Requests use Rig adapters behind a shared transport layer. Existing provider IDs, credentials, model selections, and custom gateway URLs are preserved. Model lists use the provider's protocol; model IDs can also be entered manually.
 

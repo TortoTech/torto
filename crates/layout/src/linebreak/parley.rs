@@ -644,7 +644,7 @@ pub(crate) fn repair_trailing_footnote_line(
     {
         return;
     }
-    if !layout.get(layout.len() - 1).is_some_and(|line| {
+    if !layout.lines().any(|line| {
         line.runs().any(|run| {
             run.clusters()
                 .any(|cluster| cluster.first_style().brush.footnote_reference)
@@ -653,11 +653,6 @@ pub(crate) fn repair_trailing_footnote_line(
         return;
     }
     let lines = layout.lines().collect::<Vec<_>>();
-    // A soft wrap within the final authored paragraph can be repaired, but
-    // never pull an anchor across an explicit author/sentence break.
-    if lines[lines.len() - 2].break_reason() == parley::layout::BreakReason::Explicit {
-        return;
-    }
     let clusters = lines
         .iter()
         .map(|line| {
@@ -676,38 +671,48 @@ pub(crate) fn repair_trailing_footnote_line(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let last = clusters.len() - 1;
-    let tail = &clusters[last];
-    if !tail.iter().any(|(_, _, footnote)| *footnote)
-        || tail.iter().any(|(range, _, footnote)| {
-            !*footnote && !text[range.clone()].chars().all(is_reference_suffix)
-        })
-    {
-        return;
-    }
-    let previous = &clusters[last - 1];
+    let mut counts = clusters.iter().map(Vec::len).collect::<Vec<_>>();
+    let mut changed = false;
     let legal = LineSegmenter::new_auto(LineBreakOptions::default())
         .segment_str(text)
         .collect::<Vec<_>>();
-    let tail_width: f32 = tail.iter().map(|(_, advance, _)| advance).sum();
-    let available = width - lines[last].metrics().offset;
-    let Some(split) = (1..previous.len()).rev().find(|&index| {
-        let (range, _, footnote) = &previous[index];
-        !footnote
-            && !text[range.clone()].chars().all(is_reference_suffix)
-            && legal.binary_search(&range.start).is_ok()
-            && previous[index..]
-                .iter()
-                .map(|(_, advance, _)| advance)
-                .sum::<f32>()
-                + tail_width
-                <= available
-    }) else {
+    for last in 1..clusters.len() {
+        // Repair every sentence's soft-wrapped tail, without crossing a hard break.
+        if lines[last - 1].break_reason() == parley::layout::BreakReason::Explicit {
+            continue;
+        }
+        let tail = &clusters[last];
+        if !tail.iter().any(|(_, _, footnote)| *footnote)
+            || tail.iter().any(|(range, _, footnote)| {
+                !*footnote && !text[range.clone()].chars().all(is_reference_suffix)
+            })
+        {
+            continue;
+        }
+        let previous = &clusters[last - 1];
+        let tail_width: f32 = tail.iter().map(|(_, advance, _)| advance).sum();
+        let available = width - lines[last].metrics().offset;
+        let Some(split) = (1..previous.len()).rev().find(|&index| {
+            let (range, _, footnote) = &previous[index];
+            !footnote
+                && !text[range.clone()].chars().all(is_reference_suffix)
+                && legal.binary_search(&range.start).is_ok()
+                && previous[index..]
+                    .iter()
+                    .map(|(_, advance, _)| advance)
+                    .sum::<f32>()
+                    + tail_width
+                    <= available
+        }) else {
+            continue;
+        };
+        counts[last] += counts[last - 1] - split;
+        counts[last - 1] = split;
+        changed = true;
+    }
+    if !changed {
         return;
-    };
-    let mut counts = clusters.iter().map(Vec::len).collect::<Vec<_>>();
-    counts[last] += counts[last - 1] - split;
-    counts[last - 1] = split;
+    }
     let mut breaker = layout.break_lines();
     for count in counts {
         let Ok(count) = u32::try_from(count) else {
@@ -1079,7 +1084,9 @@ mod tests {
         let prefix = "为了实现预测输入系统，系统需要词典。";
         let body = "针对这些情况，已有文献报道了高级数据结构，特别是用于预测输入的词典数据结构";
         for marker in ["1", "[1]", "[1][2]"] {
-            let text = format!("{prefix}\n{body}{marker}。");
+            let text = format!(
+                "{prefix}\n{body}{marker}。\n中文排字机项目由此获得了至少五年的充足经费保障。"
+            );
             let original_text = text.replace('\n', "");
             let marker_start = prefix.len() + 1 + body.len();
             let mut fonts = FontContext::new();
@@ -1106,11 +1113,67 @@ mod tests {
                 )
                 .unwrap();
                 assert!(!plan.lines.is_empty());
-                let tail = layout.get(layout.len() - 1).unwrap().text_range();
+                let tail = layout
+                    .lines()
+                    .find(|line| line.text_range().contains(&marker_start))
+                    .unwrap()
+                    .text_range();
                 assert!(
                     tail.start < marker_start,
                     "orphan at {width}: {}",
                     &text[tail]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_only_line_before_another_sentence_is_repaired() {
+        for body in [
+            "紧接着捷报频传，美国陆军和空军又联合注资15万美元，折算至今日已超过150万美元。",
+            "Then it paid off again, from the US Army and Air Force.",
+        ] {
+            for marker in ["1", "[1]。", "[1][2]。"] {
+                let text = format!("{body}{marker}\nThe project was fully funded.");
+                let mut fonts = FontContext::new();
+                let mut context = LayoutContext::<TextBrush>::new();
+                let mut builder = context.ranged_builder(&mut fonts, &text, 1.0, false);
+                builder.push_default(StyleProperty::FontSize(18.0));
+                builder.push(
+                    StyleProperty::Brush(TextBrush {
+                        footnote_reference: true,
+                        ..Default::default()
+                    }),
+                    body.len()..body.len() + marker.len(),
+                );
+                let mut layout = builder.build(&text);
+                layout.break_all_lines(Some(2000.0));
+                let ranges: Vec<_> = layout
+                    .lines()
+                    .flat_map(|l| l.runs())
+                    .flat_map(|r| r.clusters().map(|c| c.text_range()).collect::<Vec<_>>())
+                    .collect();
+                let split = ranges.iter().position(|r| r.start == body.len()).unwrap();
+                let end = ranges
+                    .iter()
+                    .position(|r| r.start == body.len() + marker.len() + 1)
+                    .unwrap();
+                let mut breaker = layout.break_lines();
+                for count in [split, end - split, ranges.len() - end] {
+                    breaker.break_next_with_length(count as u32).unwrap();
+                    breaker.set_prior_line_width(2000.0);
+                }
+                breaker.finish();
+                assert_eq!(layout.get(1).unwrap().text_range().start, body.len());
+                repair_trailing_footnote_line(&mut layout, &text, 2000.0);
+                assert!(layout.get(1).unwrap().text_range().start < body.len());
+                assert_eq!(
+                    layout.get(2).unwrap().text_range().start,
+                    body.len() + marker.len() + 1
+                );
+                assert_eq!(
+                    layout.get(1).unwrap().break_reason(),
+                    parley::layout::BreakReason::Explicit
                 );
             }
         }

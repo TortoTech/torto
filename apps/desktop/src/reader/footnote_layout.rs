@@ -56,6 +56,8 @@ pub(super) struct FootnoteLayout {
     line_starts: Vec<f32>,
     #[cfg(test)]
     font_sizes: Vec<f32>,
+    #[cfg(test)]
+    text_bounds: Vec<egui::Rect>,
     pub height: f32,
     pub width: f32,
     pub content_width: f32,
@@ -63,6 +65,7 @@ pub(super) struct FootnoteLayout {
     svg: Arc<[u8]>,
     uri: String,
     fallback: Option<Arc<egui::Galley>>,
+    websites: Vec<(egui::Rect, String)>,
 }
 
 impl FootnoteLayout {
@@ -117,6 +120,8 @@ impl FootnoteLayout {
             line_starts: galley.rows.iter().map(|row| row.pos.x).collect(),
             #[cfg(test)]
             font_sizes: vec![_size],
+            #[cfg(test)]
+            text_bounds: Vec::new(),
             height: galley.size().y,
             width,
             content_width: galley.size().x,
@@ -124,6 +129,7 @@ impl FootnoteLayout {
             svg: Arc::from([]),
             uri: String::new(),
             fallback: Some(galley),
+            websites: Vec::new(),
         })
     }
     pub fn paint(&self, ui: &mut egui::Ui) {
@@ -139,7 +145,38 @@ impl FootnoteLayout {
         egui::Image::from_bytes(self.uri.clone(), self.svg.clone())
             .maintain_aspect_ratio(false)
             .paint_at(ui, rect);
+        for (index, (bounds, url)) in self.websites.iter().enumerate() {
+            let response = ui
+                .interact(
+                    bounds.translate(rect.min.to_vec2()),
+                    ui.id().with(("website", index)),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            website_tooltip(&response, response.rect, url);
+            if response.clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            }
+        }
     }
+}
+
+pub(super) fn website_tooltip(response: &egui::Response, anchor: egui::Rect, url: &str) {
+    let mut tooltip = egui::Tooltip::for_enabled(response);
+    tooltip.popup = tooltip
+        .popup
+        .anchor(anchor)
+        .align(egui::emath::RectAlign::TOP)
+        .align_alternatives(&[egui::emath::RectAlign::TOP])
+        .gap(6.0);
+    tooltip.show(|ui| {
+        ui.set_max_width(
+            420.0_f32
+                .min(ui.ctx().content_rect().width() - 24.0)
+                .max(1.0),
+        );
+        ui.add(egui::Label::new(url).wrap());
+    });
 }
 
 #[derive(Default)]
@@ -312,6 +349,7 @@ impl FootnoteRenderer {
         style.top_margin = 0.0;
         style.bottom_margin = 0.0;
         style.spread = SpreadMode::Single;
+        style.website_icons = reader_style.typesetting.mode == TypesettingMode::Unified;
         style.typesetting.mode = TypesettingMode::Book;
         style.typesetting.line_break_strategy = rebook_layout::LineBreakStrategy::Optimized;
         style.foreground = rebook_publication::Rgba {
@@ -330,7 +368,11 @@ impl FootnoteRenderer {
                 .chars()
                 .filter(|c| !c.is_ascii() && c.is_alphabetic())
                 .count();
-        let display_text = url_line_breaks(text);
+        let display_text = if style.website_icons {
+            text.to_owned()
+        } else {
+            url_line_breaks(text)
+        };
         let mut blocks: Vec<_> = display_text
             .lines()
             .enumerate()
@@ -387,6 +429,7 @@ impl FootnoteRenderer {
             )
             .map_err(|e| e.to_string())?;
         let mut paths = String::new();
+        let mut websites = Vec::new();
         let mut content_width = 0.0_f32;
         let mut wrapped = false;
         let mut height = size * 1.45;
@@ -395,12 +438,15 @@ impl FootnoteRenderer {
         let mut line_starts = Vec::new();
         #[cfg(test)]
         let mut font_sizes = Vec::new();
+        #[cfg(test)]
+        let mut text_bounds = Vec::new();
         for page in &layout.pages {
             let mut bottom = 0.0_f32;
             for item in &page.items {
                 let PageItem::Text(text) = item else {
                     continue;
                 };
+                let mut painted_websites = std::collections::HashSet::new();
                 wrapped |= text.layout.len() > 1;
                 for line in text
                     .layout
@@ -459,8 +505,51 @@ impl FootnoteRenderer {
                         content_width = content_width
                             .max(text.origin_x + glyph_run.offset() + glyph_run.advance() + 2.0);
                         let run = glyph_run.run();
+                        if let Some(url) = text
+                            .citations
+                            .iter()
+                            .find(|c| c.number == glyph_run.style().brush.footnote_reference_group)
+                            .and_then(|c| c.website.as_ref())
+                        {
+                            if !painted_websites
+                                .insert(glyph_run.style().brush.footnote_reference_group)
+                            {
+                                continue;
+                            }
+                            let diameter = (run.font_size() * 0.78).clamp(8.0, 12.0);
+                            let radius = diameter / 2.0;
+                            let x = text.origin_x + glyph_run.offset() + glyph_run.advance() / 2.0;
+                            let metrics = run.metrics();
+                            let y = page_y + text.origin_y + glyph_run.baseline()
+                                - (metrics.ascent - metrics.descent) * 0.5;
+                            let icon_color =
+                                marker.map_or(egui::Color32::from_rgb(70, 100, 220), |(_, c, _)| c);
+                            paths.push_str(&format!(r##"<g fill="none" stroke="#{:02x}{:02x}{:02x}" stroke-width="1"><circle cx="{x}" cy="{y}" r="{radius}"/><ellipse cx="{x}" cy="{y}" rx="{}" ry="{radius}"/><path d="M{} {y}H{}"/></g>"##, icon_color.r(), icon_color.g(), icon_color.b(), radius * 0.45, x-radius, x+radius));
+                            websites.push((
+                                egui::Rect::from_center_size(
+                                    egui::pos2(x, y),
+                                    egui::vec2(diameter, diameter),
+                                ),
+                                url.clone(),
+                            ));
+                            continue;
+                        }
                         #[cfg(test)]
                         font_sizes.push(run.font_size());
+                        #[cfg(test)]
+                        if glyph_run.advance() > 0.0 {
+                            let baseline = page_y + text.origin_y + glyph_run.baseline();
+                            text_bounds.push(egui::Rect::from_min_max(
+                                egui::pos2(
+                                    text.origin_x + glyph_run.offset(),
+                                    baseline - run.metrics().ascent,
+                                ),
+                                egui::pos2(
+                                    text.origin_x + glyph_run.offset() + glyph_run.advance(),
+                                    baseline + run.metrics().descent,
+                                ),
+                            ));
+                        }
                         let font = FontRef::from_index(run.font().data.as_ref(), run.font().index)
                             .map_err(|e| e.to_string())?;
                         let outlines = font.outline_glyphs();
@@ -516,11 +605,14 @@ impl FootnoteRenderer {
             line_starts,
             #[cfg(test)]
             font_sizes,
+            #[cfg(test)]
+            text_bounds,
             width,
             content_width,
             wrapped,
             height,
             fallback: None,
+            websites,
             svg: Arc::from(svg.into_bytes()),
             uri: format!("bytes://footnote-{:x}.svg", hash.finish()),
         });
@@ -686,6 +778,134 @@ mod tests {
             assert!(svg.contains("fill=\"#1e50d2\""));
             assert!(svg.contains("fill=\"#000000\""));
         }
+    }
+
+    #[test]
+    fn popup_websites_are_compact_clickable_icons_only_in_unified_mode() {
+        let source = Source(Book {
+            id: PublicationId::new("popup-websites").unwrap(),
+            metadata: Metadata::default(),
+            cover: None,
+            sections: vec![],
+            table_of_contents: vec![],
+        });
+        let mut renderer = FootnoteRenderer::default();
+        let mut style = ReaderStyle::default();
+        let text = "网址 https://example.com/long/path?q=1，以及 example.org。";
+        style.typesetting.mode = TypesettingMode::Unified;
+        let unified = renderer
+            .layout_marked(
+                &source,
+                text,
+                "1",
+                &style,
+                14.0,
+                egui::Color32::BLACK,
+                egui::Color32::from_rgb(30, 80, 210),
+                460.0,
+            )
+            .unwrap();
+        assert_eq!(unified.websites.len(), 2);
+        assert_eq!(unified.websites[0].1, "https://example.com/long/path?q=1");
+        assert_eq!(unified.websites[1].1, "https://example.org/");
+        assert!(
+            std::str::from_utf8(&unified.svg)
+                .unwrap()
+                .contains("stroke=\"#1e50d2\"")
+        );
+        assert!(unified.websites.iter().all(|(rect, _)| rect.min.x >= 0.0
+            && rect.max.x <= unified.width
+            && rect.max.y <= unified.height));
+        style.typesetting.mode = TypesettingMode::Book;
+        let original = renderer
+            .layout_marked(
+                &source,
+                text,
+                "1",
+                &style,
+                14.0,
+                egui::Color32::BLACK,
+                egui::Color32::from_rgb(30, 80, 210),
+                460.0,
+            )
+            .unwrap();
+        assert!(original.websites.is_empty());
+        assert!(unified.content_width < original.content_width);
+    }
+
+    #[test]
+    fn popup_globe_reserves_space_before_punctuation_and_centers_with_body_text() {
+        let source = Source(Book {
+            id: PublicationId::new("popup-globe-spacing").unwrap(),
+            metadata: Metadata::default(),
+            cover: None,
+            sections: vec![],
+            table_of_contents: vec![],
+        });
+        let mut renderer = FootnoteRenderer::default();
+        let mut style = ReaderStyle::default();
+        style.typesetting.mode = TypesettingMode::Unified;
+        for size in [10.0, 14.0, 20.0] {
+            for width in [180.0, 460.0] {
+                for text in [
+                    "Museum of Printing https://example.com/long/path?q=1, email from Bruce Rosenblum to the author, March 26, 2017.",
+                    "参见 https://example.com/long/path?q=1，作者邮件说明。",
+                ] {
+                    let layout = renderer
+                        .layout_marked(
+                            &source,
+                            text,
+                            "2",
+                            &style,
+                            size,
+                            egui::Color32::BLACK,
+                            egui::Color32::BLUE,
+                            width,
+                        )
+                        .unwrap();
+                    assert_eq!(layout.websites.len(), 1);
+                    let icon = layout.websites[0].0;
+                    let same_line = layout
+                        .text_bounds
+                        .iter()
+                        .filter(|bounds| {
+                            bounds.min.y < icon.center().y && bounds.max.y > icon.center().y
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(!same_line.is_empty());
+                    for bounds in same_line {
+                        assert!(
+                            bounds.max.x <= icon.min.x + 0.1 || bounds.min.x >= icon.max.x - 0.1,
+                            "icon={icon:?}, text={bounds:?}, size={size}, width={width}"
+                        );
+                        // The marker font can differ; compare nearby body text.
+                        if (bounds.min.x - icon.max.x).abs() < size * 2.0 {
+                            assert!(
+                                (bounds.center().y - icon.center().y).abs() < size * 0.15,
+                                "icon and following body should share a vertical center"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let multiline = renderer
+            .layout_marked(
+                &source,
+                "First https://example.com/.\nSecond https://example.org/.",
+                "2",
+                &style,
+                14.0,
+                egui::Color32::BLACK,
+                egui::Color32::BLUE,
+                460.0,
+            )
+            .unwrap();
+        assert_eq!(
+            multiline.websites.len(),
+            2,
+            "website IDs are paragraph-local"
+        );
     }
 
     #[test]

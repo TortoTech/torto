@@ -59,7 +59,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
             let input = body["messages"][1]["content"].as_array().unwrap();
             let header: Value = serde_json::from_str(input[0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(
-                header["requested_ids"],
+                header["ri"],
                 match turn {
                     0 => json!([0, 1, 2]),
                     1 => json!([1]),
@@ -67,7 +67,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
                 }
             );
             assert_eq!(
-                header["mode"],
+                super::super::super::wire::decode(&header)["mode"],
                 if turn == 2 { "verify" } else { "transcribe" }
             );
             assert_eq!(
@@ -80,7 +80,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
             );
             assert_eq!(
                 body["response_format"]["json_schema"]["schema"]["required"],
-                json!(["results"])
+                json!(["r"])
             );
             let item = |id, latex: Option<&str>| json!({"image_id":id,"status":if latex.is_some(){"recognized"}else{"not_formula"},"latex":latex,"equation_number":null});
             let results = match turn {
@@ -89,7 +89,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
                 _ => vec![item(1, Some("y=2")), item(0, Some("x=1"))],
             };
             let response =
-                json!({"choices":[{"message":{"content":json!({"results":results}).to_string()}}]})
+                json!({"choices":[{"message":{"content":super::super::super::wire::encode(&json!({"results":results})).to_string()}}]})
                     .to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
         }
@@ -183,10 +183,10 @@ fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Op
             let request: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(request["reasoning_effort"], "high");
             let schema = &request["response_format"]["json_schema"]["schema"];
-            assert_eq!(schema["required"], json!(["results"]));
+            assert_eq!(schema["required"], json!(["r"]));
             assert!(schema["properties"].get("latex").is_none());
-            let fields = &schema["properties"]["results"]["items"]["properties"];
-            for field in ["image_id", "status", "latex", "equation_number"] {
+            let fields = &schema["properties"]["r"]["items"]["properties"];
+            for field in ["ii", "ss", "l", "n"] {
                 assert!(
                     fields[field]["description"]
                         .as_str()
@@ -203,8 +203,8 @@ fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Op
 
             let content = request["messages"][1]["content"].as_array().unwrap();
             let header: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
-            assert_eq!(header["mode"], mode);
-            assert_eq!(header["requested_ids"], json!(ids));
+            assert_eq!(super::super::super::wire::decode(&header)["mode"], mode);
+            assert_eq!(header["ri"], json!(ids));
             assert!(prompt.contains(if mode == "verify" {
                 "Conditional review"
             } else {
@@ -215,7 +215,7 @@ fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Op
             } else {
                 (
                     "200 OK",
-                    json!({"choices":[{"message":{"content":reply.to_string()}}]}).to_string(),
+                    json!({"choices":[{"message":{"content":super::super::super::wire::encode(&reply).to_string()}}]}).to_string(),
                 )
             };
             write!(socket,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();

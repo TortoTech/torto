@@ -1769,6 +1769,38 @@ impl ReaderSession {
             .find_map(|(_, page, offset)| page.website_at(x - *offset, y)))
     }
 
+    pub fn website_region_at_page(
+        &mut self,
+        position: ReaderPosition,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<(String, [f32; 4])>, ReaderError> {
+        self.ensure_segment(SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        })?;
+        Ok(self.page_at(position)?.website_region_at(x, y))
+    }
+
+    pub fn website_region_at_current_spread(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<(String, [f32; 4])>, ReaderError> {
+        Ok(self
+            .current_spread_pages()?
+            .iter()
+            .rev()
+            .find_map(|(_, page, offset)| {
+                page.website_region_at(x - *offset, y)
+                    .map(|(url, mut bounds)| {
+                        bounds[0] += *offset;
+                        bounds[2] += *offset;
+                        (url, bounds)
+                    })
+            }))
+    }
+
     pub fn image_at_page(
         &mut self,
         position: ReaderPosition,

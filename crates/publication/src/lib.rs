@@ -1000,6 +1000,9 @@ pub struct TextStyle {
     /// The text run retains the original text; only layout collapses its presentation.
     #[serde(default)]
     pub inline_citation: u32,
+    /// Derived display ordinal within the enclosing semantic block.
+    #[serde(skip)]
+    pub footnote_number: u32,
     /// Display language override for translated text; None retains book defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_writing_system: Option<WritingSystem>,
@@ -1045,6 +1048,7 @@ impl Default for TextStyle {
     fn default() -> Self {
         Self {
             inline_citation: 0,
+            footnote_number: 0,
             display_writing_system: None,
             bold: false,
             italic: false,
@@ -1158,6 +1162,10 @@ pub enum TextAlignment {
 /// Portable block style subset, expressed in CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BlockStyle {
+    /// Source-local identity of the outermost authored list container.
+    /// Absent for inferred paragraph lists and older serialized content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_group: Option<u64>,
     pub align: TextAlignment,
     /// Horizontal alignment explicitly supplied by the publication. This stays
     /// `None` when `align` only contains the reader/parser default, allowing
@@ -1194,6 +1202,7 @@ pub struct BlockStyle {
 impl Default for BlockStyle {
     fn default() -> Self {
         Self {
+            list_group: None,
             align: TextAlignment::Start,
             authored_alignment: None,
             semantic_alignment: None,

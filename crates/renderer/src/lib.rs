@@ -870,6 +870,15 @@ impl PageDisplayList {
 
     /// Returns the source-backed paragraph owning a semantic footnote icon.
     pub fn website_at(&self, x: f32, y: f32) -> Option<String> {
+        self.website_region_at(x, y).map(|(url, _)| url)
+    }
+
+    /// URL and icon bounds in page coordinates, for anchored URL hints.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "page geometry uses f32 at the UI boundary"
+    )]
+    pub fn website_region_at(&self, x: f32, y: f32) -> Option<(String, [f32; 4])> {
         self.footnote_regions
             .iter()
             .rev()
@@ -879,7 +888,19 @@ impl PageDisplayList {
                         .bounds
                         .contains(Point::new(f64::from(x), f64::from(y)))
             })
-            .and_then(|region| region.website.clone())
+            .and_then(|region| {
+                region.website.clone().map(|url| {
+                    (
+                        url,
+                        [
+                            region.bounds.x0 as f32,
+                            region.bounds.y0 as f32,
+                            region.bounds.x1 as f32,
+                            region.bounds.y1 as f32,
+                        ],
+                    )
+                })
+            })
     }
 
     /// Returns the source-backed paragraph owning a semantic footnote icon.
@@ -2512,11 +2533,23 @@ fn compile_text_commands(
                 if text.source.is_some() || website.is_some() {
                     let source = text.source.clone();
                     let center_x = text.origin_x + glyph_run.offset() + glyph_run.advance() / 2.0;
-                    let bounds = footnote_icon_bounds(
-                        center_x,
-                        text.origin_y + glyph_run.baseline(),
-                        run.font_size(),
-                    );
+                    let bounds = if website.is_some() {
+                        let size = (run.font_size() * 0.78).clamp(8.0, 12.0);
+                        let center_y = text.origin_y + glyph_run.baseline()
+                            - (run.metrics().ascent - run.metrics().descent) * 0.5;
+                        Rect::new(
+                            f64::from(center_x - size * 0.5),
+                            f64::from(center_y - size * 0.5),
+                            f64::from(center_x + size * 0.5),
+                            f64::from(center_y + size * 0.5),
+                        )
+                    } else {
+                        footnote_icon_bounds(
+                            center_x,
+                            text.origin_y + glyph_run.baseline(),
+                            run.font_size(),
+                        )
+                    };
                     footnote_regions.push(FootnoteRegion {
                         website: text
                             .citations
