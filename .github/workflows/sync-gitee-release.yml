@@ -1,0 +1,60 @@
+name: Sync releases to Gitee
+
+on:
+  workflow_run:
+    workflows: [Build Windows installer, Build macOS installers]
+    types: [completed]
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to mirror (or latest)
+        default: latest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitee-release-mirror
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: >-
+      github.repository == 'TortoTech/torto' &&
+      (github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # Always use trusted default-branch scripts, never code from a triggering build.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test mirror protocol
+        run: node --test scripts/sync-gitee-release.test.mjs
+      - name: Sync release notes and attachments
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          BUILD_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            node scripts/sync-gitee-release.mjs --commit "$BUILD_COMMIT" --skip-incomplete
+          elif [[ "$EVENT_NAME" == "release" ]]; then
+            node scripts/sync-gitee-release.mjs --tag "$RELEASE_TAG" --skip-incomplete
+          else
+            node scripts/sync-gitee-release.mjs --tag "$INPUT_TAG"
+          fi
