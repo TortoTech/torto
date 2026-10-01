@@ -23,6 +23,10 @@ including lost upload responses. Conflicting attachment names/sizes or tag
 commits fail explicitly. Historical releases and attachments are never deleted.
 Gitee can expose a partial release while files upload; clients must not assume
 `latest` has all files until synchronization finishes.
+After all source attachments pass verification, `torto-update.json` is published
+as the completion marker with the Windows installer's version, size and SHA-256.
+Clients reject mirrors without this marker or whose marker does not match the
+release tag and installer name. The manifest contains no credentials.
 
 To retry or backfill, use Actions → Sync releases to Gitee → Run workflow and
 enter `v0.7.0` or `latest`. This requires no installer rebuild.

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease } from './sync-gitee-release.mjs';
+import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease, updateManifest } from './sync-gitee-release.mjs';
 
 const bytes = Buffer.from('installer fixture');
 const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -54,12 +54,13 @@ test('resumes partial uploads without duplicate files and propagates edited note
     if (method === 'PATCH') { assert.equal(data.body, 'Updated notes'); patches++; return target; }
     throw new Error(`Unexpected operation ${method} ${suffix}`);
   };
-  await assert.rejects(syncRelease(source, api, async () => bytes));
+  const download = async asset => asset.name === 'torto-update.json' ? updateManifest(source).bytes : bytes;
+  await assert.rejects(syncRelease(source, api, download));
   assert.equal(patches, 0);
-  await syncRelease(source, api, async () => bytes);
-  await syncRelease(source, api, async () => bytes);
+  await syncRelease(source, api, download);
+  await syncRelease(source, api, download);
   assert.equal(creates, 1);
-  assert.equal(files.length, source.assets.length);
+  assert.equal(files.length, source.assets.length + 1);
   assert.equal(patches, 2);
 });
 

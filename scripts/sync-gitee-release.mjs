@@ -56,6 +56,18 @@ export function planAssets(source, target) {
   });
 }
 
+export function updateManifest(release) {
+  const name = `Torto-${release.tag_name.replace(/^v/, '')}-x86_64.msi`;
+  const installer = release.assets.find(asset => asset.name === name);
+  if (!installer) throw new Error('Missing Windows installer for update manifest');
+  const bytes = Buffer.from(JSON.stringify({
+    version: release.tag_name.replace(/^v/, ''), tag: release.tag_name,
+    asset: { name, size: installer.size, sha256: installer.digest.replace(/^sha256:/, '') },
+  }) + '\n');
+  return { bytes, asset: { name: 'torto-update.json', size: bytes.length,
+    digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` } };
+}
+
 async function request(url, { token, method = 'GET', json, form, optional = false, binary = false } = {}) {
   const headers = { 'User-Agent': 'Torto-release-mirror', Accept: binary ? 'application/octet-stream' : 'application/json' };
   if (token) headers.Authorization = `token ${token}`;
@@ -140,6 +152,13 @@ export async function syncRelease(release, api, download) {
     const url = `https://gitee.com/TortoTech/torto/releases/download/${tag}/${encodeURIComponent(asset.name)}`;
     verifyAsset(asset, await download({ ...asset, browser_download_url: url }));
   }
+  // Completion marker for clients: publish only after all installers are verified.
+  const manifest = updateManifest(release);
+  if (planAssets([manifest.asset], final).length) {
+    await api('UPLOAD', `/releases/${target.id}/attach_files`, manifest);
+  }
+  verifyAsset(manifest.asset, await download({ ...manifest.asset,
+    browser_download_url: `https://gitee.com/TortoTech/torto/releases/download/${tag}/torto-update.json` }));
   // Update notes after every attachment has been verified; reruns also propagate edited notes.
   await api('PATCH', `/releases/${target.id}`, metadata);
 }
