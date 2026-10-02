@@ -105,3 +105,6 @@ rebook-macos-open-file = { path = "../../crates/macos-open-file" }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 wgpu = { workspace = true, features = ["vulkan", "gles"] }
+
+[dev-dependencies]
+rcgen = "0.14.10"
