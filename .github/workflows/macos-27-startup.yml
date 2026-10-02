@@ -126,6 +126,8 @@ jobs:
 
       - name: Upload startup diagnostics
         if: always()
+        # Keep actual startup failures fatal, but tolerate diagnostic upload outages.
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: macos-27-startup-arm64-${{ github.run_attempt }}

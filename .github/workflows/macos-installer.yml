@@ -203,6 +203,9 @@ jobs:
 
       - name: Upload startup diagnostics
         if: always()
+        # Diagnostic transport failures must not invalidate successful builds/tests.
+        # Installer artifacts below remain mandatory.
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: macos-startup-${{ matrix.arch }}-${{ github.run_attempt }}
