@@ -38,6 +38,7 @@ const SHELF_TOAST_TOP_OFFSET: f32 = 84.0;
 const SHELF_SCROLLBAR_GUTTER: f32 = 16.0;
 const CARD_WIDTH: f32 = 180.0;
 const CARD_HEIGHT: f32 = 300.0;
+const COVER_INSET: i8 = 10;
 const COVER_WIDTH: f32 = 160.0;
 const COVER_HEIGHT: f32 = 228.0;
 const SHELF_TITLE_BOLD_OFFSET: f32 = 0.45;
@@ -843,8 +844,6 @@ impl ShelfFeature {
 
     pub(crate) fn ui(&mut self, root_ui: &mut egui::Ui, interaction_blocked: bool) {
         if self.statistics.open {
-            #[cfg(target_os = "windows")]
-            crate::app::window_chrome::fallback_header(root_ui);
             self.statistics.ui(
                 root_ui,
                 self.language,
@@ -863,7 +862,7 @@ impl ShelfFeature {
             self.import_task.begin(());
         }
         #[cfg(target_os = "windows")]
-        let search_response = egui::Panel::top("shelf-window-header")
+        egui::Panel::top("shelf-window-header")
             .exact_size(crate::app::window_chrome::HEIGHT)
             .resizable(false)
             .show_separator_line(false)
@@ -883,8 +882,7 @@ impl ShelfFeature {
                 crate::app::window_chrome::bounded_ui(ui, actions, |ui| {
                     self.shelf_header(ui, interaction_blocked)
                 })
-            })
-            .inner;
+            });
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -892,13 +890,24 @@ impl ShelfFeature {
                     .inner_margin(egui::Margin {
                         left: SHELF_CONTENT_LEFT_MARGIN,
                         right: 16,
-                        top: 28,
+                        top: 12,
                         bottom: 28,
                     }),
             )
             .show(root_ui, |ui| {
                 #[cfg(not(target_os = "windows"))]
-                let search_response = self.shelf_header(ui, interaction_blocked);
+                self.shelf_header(ui, interaction_blocked);
+                let search_hint =
+                    shelf_search_hint(self.language, self.shelf.library.books().len());
+                let search_response = egui::Frame::NONE
+                    .inner_margin(egui::Margin {
+                        left: COVER_INSET,
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| {
+                        shelf_search_field(ui, &mut self.shelf.query, &search_hint)
+                    })
+                    .inner;
                 if interaction_blocked && search_response.has_focus() {
                     search_response.surrender_focus();
                 }
@@ -906,7 +915,7 @@ impl ShelfFeature {
                     search_response.request_focus();
                     self.shelf.focus_selected_book = false;
                 }
-                ui.add_space(26.0);
+                ui.add_space(12.0);
 
                 let query = self.shelf.query.trim().to_lowercase();
                 let mut books: Vec<LibraryBook> = self
@@ -953,28 +962,15 @@ impl ShelfFeature {
         }
     }
 
-    fn shelf_header(&mut self, ui: &mut egui::Ui, interaction_blocked: bool) -> egui::Response {
-        let book_count = self.shelf.library.books().len();
-        let search_hint = shelf_search_hint(self.language, book_count);
+    fn shelf_header(&mut self, ui: &mut egui::Ui, interaction_blocked: bool) {
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), 44.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 let row = ui.max_rect();
                 let actions_left = (row.right() - 160.0).max(row.left());
-                let search_rect = egui::Rect::from_min_max(
-                    row.min,
-                    egui::pos2((actions_left - 16.0).max(row.left() + 1.0), row.bottom()),
-                );
-                let search_response = ui
-                    .scope_builder(egui::UiBuilder::new().max_rect(search_rect), |ui| {
-                        ui.set_clip_rect(ui.clip_rect().intersect(search_rect));
-                        shelf_search_field(ui, &mut self.shelf.query, &search_hint)
-                    })
-                    .inner;
                 #[cfg(target_os = "windows")]
                 {
-                    crate::app::window_chrome::exclude(ui.ctx(), search_response.rect);
                     let rect = ui.max_rect();
                     crate::app::window_chrome::exclude(
                         ui.ctx(),
@@ -1030,10 +1026,8 @@ impl ShelfFeature {
                         }
                     },
                 );
-                search_response
             },
-        )
-        .inner
+        );
     }
 
     fn empty_shelf(&mut self, ui: &mut egui::Ui, no_books: bool) {
@@ -1164,7 +1158,7 @@ impl ShelfFeature {
             painter.rect_filled(rect, 10.0, palette().accent_soft.gamma_multiply(0.42));
         }
         let cover_rect = egui::Rect::from_min_size(
-            rect.min + Vec2::splat(10.0),
+            rect.min + Vec2::splat(f32::from(COVER_INSET)),
             Vec2::new(COVER_WIDTH, COVER_HEIGHT),
         );
         if let Some(texture) = texture {

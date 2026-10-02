@@ -84,6 +84,7 @@ pub(super) struct SemanticLayoutState {
     inputs: HashMap<usize, Vec<(crate::plugins::TranslationBlockInput, SourceRange)>>,
     prepared_raw: Option<Demand>,
     prepared_with_translation: bool,
+    translation_input_revision: u64,
     expanded: Demand,
     prepare_worker: Option<tokio::task::JoinHandle<()>>,
     prepare_receiver: Option<mpsc::Receiver<preparation::Prepared>>,
@@ -705,7 +706,9 @@ impl DesktopReader {
                 }
             }
         }
-        if self.commit_ready_content(&demand, semantic) {
+        let content_changed = self.commit_ready_content(&demand, semantic);
+        let snapshots_changed = self.refresh_changed_translation_inputs(content_changed);
+        if content_changed || snapshots_changed {
             let _ = proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO));
         }
     }
@@ -725,6 +728,18 @@ impl DesktopReader {
             );
         }
         self.translation.task.cancel();
+    }
+
+    fn refresh_changed_translation_inputs(&mut self, already_refreshed: bool) -> bool {
+        let revision = self.translation_source.prepared_revision();
+        if revision == self.semantic_layout.translation_input_revision {
+            return false;
+        }
+        self.semantic_layout.translation_input_revision = revision;
+        if !already_refreshed {
+            self.refresh_semantic_layout();
+        }
+        true
     }
 
     fn translation_can_start(
@@ -758,15 +773,18 @@ impl DesktopReader {
             .inputs
             .get(&index)
             .ok_or_else(|| "content snapshot pending".to_owned())?;
-        let mut missing = self
-            .translation_source
-            .untranslated_prepared(index, inputs, ranges)?;
-        if self.semantic_enabled()
+        // Restore structural snapshots for cached translations as well as new requests.
+        // Filtering cache hits before this step loses the formula IDs on reopening.
+        let mut prepared = crate::plugins::TranslationBookSource::inputs_for_ranges(inputs, ranges);
+        if (self.semantic_enabled()
+            || self.reader.style().typesetting.mode == rebook_layout::TypesettingMode::Unified)
             && let Some(original) = self.semantic_layout.originals.get(&index)
             && let Some(hash) = self.semantic_layout.hashes.get(&index)
         {
-            for input in &mut missing {
-                if !self.translation_semantics_ready(index, input.block_index) {
+            for (input, _) in &mut prepared {
+                if self.semantic_enabled()
+                    && !self.translation_semantics_ready(index, input.block_index)
+                {
                     continue;
                 }
                 let mut section = scope_section(original, input.block_index..input.block_index + 1);
@@ -802,7 +820,8 @@ impl DesktopReader {
                 }
             }
         }
-        Ok(missing)
+        self.translation_source
+            .untranslated_prepared(index, &prepared, ranges)
     }
 
     fn translation_semantics_ready(&self, index: usize, block: usize) -> bool {

@@ -10,7 +10,7 @@ use rebook_formats::{BookFormat, open_file_for_reading as open_publication_file_
 use rebook_layout::{LayoutViewport, ReaderStyle, ReaderTypesetting, SpreadMode};
 use rebook_publication::{
     Block, BookSource, Inline, InlineRole, LinkRole, PublicationUrl, RenditionLayout, Rgba,
-    Section, SourceAnchor, SourceRange, TableBlock, TableOfContentsOrigin, TextBaseline, TextBlock,
+    Section, SourceAnchor, SourceRange, TableBlock, TableOfContentsOrigin, TextBlock,
     TextBlockKind,
 };
 use rebook_reader::{
@@ -256,6 +256,9 @@ pub(super) fn open_reader(
         style.column_gap = 0.0;
     }
     apply_theme_colors(&mut style, crate::ui::theme());
+    semantic_source.set_unified_citations(
+        !fixed_page && style.typesetting.mode == rebook_layout::TypesettingMode::Unified,
+    );
     let sync_settings = SyncSettings::load_default().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load WebDAV settings; using defaults");
         SyncSettings::new_device()
@@ -753,7 +756,7 @@ fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, Publication
             };
             (run.style.link_role == LinkRole::FootnoteReference
                 || (run.style.link_role == LinkRole::Normal
-                    && run.style.baseline == TextBaseline::Superscript))
+                    && run.style.baseline == rebook_publication::TextBaseline::Superscript))
                 .then(|| run.link.clone())
                 .flatten()
                 .filter(|target| target.fragment().is_some())

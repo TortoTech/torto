@@ -14,6 +14,7 @@ use crate::preferences::AppLanguage;
 use crate::ui::{dialog_action_button, palette};
 
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/TortoTech/torto/releases/latest";
+const GITEE_RELEASE_URL: &str = "https://gitee.com/api/v5/repos/TortoTech/torto/releases/latest";
 const RELEASE_DOWNLOAD_PREFIX: &str = "/TortoTech/torto/releases/download/";
 const CHINESE_RELEASE_NOTES_SUMMARY: &str = "中文更新说明";
 const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
@@ -483,10 +484,27 @@ pub(crate) fn manual_updates_supported() -> bool {
 }
 
 async fn check_for_update() -> Result<Option<UpdateRelease>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+    check_for_update_version(env!("CARGO_PKG_VERSION")).await
+}
+
+async fn check_for_update_version(current: &str) -> Result<Option<UpdateRelease>, String> {
+    let client = crate::http::builder()
+        .timeout(Duration::from_secs(6))
+        .connect_timeout(Duration::from_secs(4))
         .build()
         .map_err(|error| error.to_string())?;
+    let (github, gitee) = futures_util::future::join(
+        check_github(&client, current),
+        check_gitee(&client, current),
+    )
+    .await;
+    select_update(github, gitee)
+}
+
+async fn check_github(
+    client: &reqwest::Client,
+    current: &str,
+) -> Result<Option<UpdateRelease>, String> {
     let response = client
         .get(LATEST_RELEASE_URL)
         .header(USER_AGENT, format!("Torto/{}", env!("CARGO_PKG_VERSION")))
@@ -501,32 +519,107 @@ async fn check_for_update() -> Result<Option<UpdateRelease>, String> {
         .json::<GitHubRelease>()
         .await
         .map_err(|error| error.to_string())?;
-    release_from_github(release, env!("CARGO_PKG_VERSION"))
+    release_from_github(release, current)
 }
 
-async fn download_update(release: UpdateRelease) -> Result<DownloadedUpdate, String> {
-    validate_asset(&release.asset)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_mins(3))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let response = client
-        .get(&release.asset.url)
+async fn check_gitee(
+    client: &reqwest::Client,
+    current: &str,
+) -> Result<Option<UpdateRelease>, String> {
+    let release = client
+        .get(GITEE_RELEASE_URL)
         .header(USER_AGENT, format!("Torto/{}", env!("CARGO_PKG_VERSION")))
-        .header(ACCEPT, "application/octet-stream")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
+        .json::<GiteeRelease>()
+        .await
+        .map_err(|error| error.to_string())?;
+    if release.prerelease
+        || AppVersion::parse(release.tag_name.trim_start_matches('v'))?
+            <= AppVersion::parse(current)?
+    {
+        return Ok(None);
+    }
+    // The sync job uploads this marker last. No marker means an incomplete mirror.
+    let marker_url = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == "torto-update.json")
+        .ok_or_else(|| "The Gitee release has not finished synchronization".to_string())?
+        .browser_download_url
+        .clone();
+    validate_release_url(
+        &marker_url,
+        "gitee.com",
+        &release.tag_name,
+        "torto-update.json",
+    )?;
+    let mut response = client
+        .get(&marker_url)
         .send()
         .await
         .map_err(|error| error.to_string())?
         .error_for_status()
         .map_err(|error| error.to_string())?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_INSTALLER_BYTES || length != release.asset.size)
-    {
-        return Err("The installer response has an unexpected file size".into());
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if bytes.len() + chunk.len() > 16 * 1024 {
+            return Err("The Gitee update manifest is too large".into());
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-    verify_installer_bytes(&release.asset, &bytes)?;
+    let manifest =
+        serde_json::from_slice::<GiteeManifest>(&bytes).map_err(|error| error.to_string())?;
+    release_from_gitee(release, manifest, current)
+}
+
+fn select_update(
+    github: Result<Option<UpdateRelease>, String>,
+    gitee: Result<Option<UpdateRelease>, String>,
+) -> Result<Option<UpdateRelease>, String> {
+    match (github, gitee) {
+        (Ok(Some(first)), Ok(Some(second))) => {
+            if first.version == second.version
+                && (first.asset.name != second.asset.name
+                    || first.asset.size != second.asset.size
+                    || first.asset.sha256 != second.asset.sha256)
+            {
+                return Err("GitHub and Gitee disagree about the installer checksum".into());
+            }
+            if AppVersion::parse(&second.version)? > AppVersion::parse(&first.version)? {
+                Ok(Some(second))
+            } else {
+                Ok(Some(first))
+            }
+        }
+        (Ok(Some(update)), _) | (_, Ok(Some(update))) => Ok(Some(update)),
+        (Ok(None), _) | (_, Ok(None)) => Ok(None),
+        (Err(first), Err(second)) => Err(format!("GitHub: {first}\nGitee: {second}")),
+    }
+}
+
+async fn download_update(release: UpdateRelease) -> Result<DownloadedUpdate, String> {
+    validate_asset(&release.asset)?;
+    let client = crate::http::builder()
+        .timeout(Duration::from_mins(3))
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 8 || !trusted_download_redirect(attempt.url()) {
+                attempt.error("Untrusted installer redirect")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let bytes = download_with_fallback(&release.asset, |url| {
+        download_installer_bytes(&client, url, &release.asset)
+    })
+    .await?;
     let project = crate::smoke::project_dirs()
         .ok_or_else(|| "Unable to resolve the local update directory".to_string())?;
     let path = project
@@ -539,6 +632,84 @@ async fn download_update(release: UpdateRelease) -> Result<DownloadedUpdate, Str
         release,
         installer_path: path,
     })
+}
+
+fn trusted_download_redirect(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(
+            url.host_str(),
+            Some(
+                "github.com"
+                    | "release-assets.githubusercontent.com"
+                    | "objects.githubusercontent.com"
+                    | "gitee.com"
+                    | "foruda.gitee.com"
+            )
+        )
+}
+
+async fn download_with_fallback<F, Fut>(
+    asset: &UpdateAsset,
+    mut fetch: F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    validate_asset(asset)?;
+    let mut alternative = reqwest::Url::parse(&asset.url).map_err(|error| error.to_string())?;
+    let host = if alternative.host_str() == Some("github.com") {
+        "gitee.com"
+    } else {
+        "github.com"
+    };
+    alternative
+        .set_host(Some(host))
+        .map_err(|error| error.to_string())?;
+    let mut errors = Vec::new();
+    for url in [asset.url.clone(), alternative.to_string()] {
+        let result = fetch(url).await.and_then(|bytes| {
+            verify_installer_bytes(asset, &bytes)?;
+            Ok(bytes)
+        });
+        match result {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => errors.push(error),
+        }
+    }
+    Err(errors.join("\n"))
+}
+
+async fn download_installer_bytes(
+    client: &reqwest::Client,
+    url: String,
+    asset: &UpdateAsset,
+) -> Result<Vec<u8>, String> {
+    let mut response = client
+        .get(url)
+        .header(USER_AGENT, format!("Torto/{}", env!("CARGO_PKG_VERSION")))
+        .header(ACCEPT, "application/octet-stream")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_INSTALLER_BYTES || length != asset.size)
+    {
+        return Err("The installer response has an unexpected file size".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if bytes.len() as u64 + chunk.len() as u64 > asset.size {
+            return Err("The installer response exceeds its declared size".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn verify_installer_file(update: &DownloadedUpdate) -> Result<(), String> {
@@ -579,6 +750,12 @@ fn release_from_github(
         .into_iter()
         .find(|asset| asset.name.ends_with("-x86_64.msi"))
         .ok_or_else(|| "The latest release does not include a Windows x86_64 MSI".to_string())?;
+    validate_release_url(
+        &asset.browser_download_url,
+        "github.com",
+        &release.tag_name,
+        &asset.name,
+    )?;
     let digest = asset
         .digest
         .and_then(|digest| digest.strip_prefix("sha256:").map(str::to_owned))
@@ -598,7 +775,69 @@ fn release_from_github(
         },
     };
     validate_asset(&update.asset)?;
+    if update.asset.name != format!("Torto-{latest}-x86_64.msi") {
+        return Err("The Windows installer does not match the release version".into());
+    }
     Ok(Some(update))
+}
+
+fn release_from_gitee(
+    release: GiteeRelease,
+    manifest: GiteeManifest,
+    current: &str,
+) -> Result<Option<UpdateRelease>, String> {
+    let version = AppVersion::parse(release.tag_name.trim_start_matches('v'))?;
+    if release.prerelease || version <= AppVersion::parse(current)? {
+        return Ok(None);
+    }
+    if manifest.tag != release.tag_name
+        || manifest.version != version.to_string()
+        || manifest.asset.name != format!("Torto-{version}-x86_64.msi")
+    {
+        return Err("The Gitee update manifest does not match its release".into());
+    }
+    let attachment = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == manifest.asset.name)
+        .ok_or_else(|| "The Gitee installer has not been uploaded".to_string())?;
+    validate_release_url(
+        &attachment.browser_download_url,
+        "gitee.com",
+        &release.tag_name,
+        &attachment.name,
+    )?;
+    let asset = UpdateAsset {
+        name: manifest.asset.name,
+        url: attachment.browser_download_url.clone(),
+        sha256: manifest.asset.sha256,
+        size: manifest.asset.size,
+    };
+    validate_asset(&asset)?;
+    Ok(Some(UpdateRelease {
+        version: version.to_string(),
+        notes: release
+            .body
+            .filter(|body| !body.trim().is_empty())
+            .unwrap_or_else(|| "This release does not include release notes.".into()),
+        asset,
+    }))
+}
+
+fn validate_release_url(value: &str, host: &str, tag: &str, name: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(value).map_err(|error| error.to_string())?;
+    if url.scheme() != "https"
+        || url.host_str() != Some(host)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != format!("{RELEASE_DOWNLOAD_PREFIX}{tag}/{name}")
+    {
+        return Err("The release download URL is not trusted".into());
+    }
+    Ok(())
 }
 
 fn validate_asset(asset: &UpdateAsset) -> Result<(), String> {
@@ -612,13 +851,54 @@ fn validate_asset(asset: &UpdateAsset) -> Result<(), String> {
         return Err("The Windows installer has an invalid SHA-256 digest".into());
     }
     let url = reqwest::Url::parse(&asset.url).map_err(|error| error.to_string())?;
-    if url.scheme() != "https"
-        || url.host_str() != Some("github.com")
-        || !url.path().starts_with(RELEASE_DOWNLOAD_PREFIX)
-    {
+    if !matches!(url.host_str(), Some("github.com" | "gitee.com")) {
         return Err("The Windows installer download URL is not trusted".into());
     }
-    Ok(())
+    let suffix = url
+        .path()
+        .strip_prefix(RELEASE_DOWNLOAD_PREFIX)
+        .ok_or_else(|| "The Windows installer URL has an invalid repository".to_string())?;
+    let (tag, _) = suffix
+        .split_once('/')
+        .ok_or_else(|| "Missing release tag".to_string())?;
+    let version = AppVersion::parse(tag.trim_start_matches('v'))?;
+    if asset.name != format!("Torto-{version}-x86_64.msi") {
+        return Err("The Windows installer file name does not match the URL version".into());
+    }
+    validate_release_url(
+        &asset.url,
+        url.host_str().unwrap_or_default(),
+        tag,
+        &asset.name,
+    )
+}
+
+#[derive(Deserialize)]
+struct GiteeRelease {
+    tag_name: String,
+    body: Option<String>,
+    prerelease: bool,
+    assets: Vec<GiteeAsset>,
+}
+
+#[derive(Deserialize)]
+struct GiteeAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Deserialize)]
+struct GiteeManifest {
+    version: String,
+    tag: String,
+    asset: ManifestAsset,
+}
+
+#[derive(Deserialize)]
+struct ManifestAsset {
+    name: String,
+    sha256: String,
+    size: u64,
 }
 
 #[derive(Deserialize)]
@@ -762,6 +1042,170 @@ mod tests {
 
         assert!(verify_installer_bytes(&asset, bytes).is_ok());
         assert!(verify_installer_bytes(&asset, b"tampered installer").is_err());
+    }
+
+    fn gitee_fixture() -> (GiteeRelease, GiteeManifest) {
+        let release = GiteeRelease {
+            tag_name: "v0.2.12".into(), body: Some("中文说明".into()), prerelease: false,
+            assets: vec![GiteeAsset { name: "Torto-0.2.12-x86_64.msi".into(),
+                browser_download_url: "https://gitee.com/TortoTech/torto/releases/download/v0.2.12/Torto-0.2.12-x86_64.msi".into() }],
+        };
+        let manifest = GiteeManifest {
+            version: "0.2.12".into(),
+            tag: "v0.2.12".into(),
+            asset: ManifestAsset {
+                name: "Torto-0.2.12-x86_64.msi".into(),
+                sha256: "a".repeat(64),
+                size: 32 * 1024 * 1024,
+            },
+        };
+        (release, manifest)
+    }
+
+    #[test]
+    fn gitee_manifest_must_match_release_and_uploaded_installer() {
+        let (release, manifest) = gitee_fixture();
+        let update = release_from_gitee(release, manifest, "0.2.11")
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.notes, "中文说明");
+        for invalid in 0..4 {
+            let (mut release, mut manifest) = gitee_fixture();
+            match invalid {
+                0 => manifest.version = "0.2.13".into(),
+                1 => manifest.tag = "v0.2.13".into(),
+                2 => release.assets.clear(),
+                _ => manifest.asset.sha256.clear(),
+            }
+            assert!(release_from_gitee(release, manifest, "0.2.11").is_err());
+        }
+    }
+
+    #[test]
+    fn update_selection_uses_available_newest_source_and_rejects_conflicts() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let github = release_from_github(github_release("v0.2.12", Some(&digest)), "0.2.11")
+            .unwrap()
+            .unwrap();
+        let (release, manifest) = gitee_fixture();
+        let gitee = release_from_gitee(release, manifest, "0.2.11")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            select_update(Err("unreachable".into()), Ok(Some(gitee.clone()))).unwrap(),
+            Some(gitee.clone())
+        );
+        assert_eq!(
+            select_update(Ok(Some(github.clone())), Err("incomplete mirror".into())).unwrap(),
+            Some(github.clone())
+        );
+        assert!(
+            select_update(Err("unreachable".into()), Ok(None))
+                .unwrap()
+                .is_none()
+        );
+        assert!(select_update(Err("unreachable".into()), Err("unreachable".into())).is_err());
+        let older = release_from_github(github_release("v0.2.11", Some(&digest)), "0.2.10")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            select_update(Ok(Some(older)), Ok(Some(gitee.clone()))).unwrap(),
+            Some(gitee.clone())
+        );
+        let mut conflict = gitee;
+        conflict.asset.sha256 = "b".repeat(64);
+        assert!(select_update(Ok(Some(github)), Ok(Some(conflict))).is_err());
+    }
+
+    #[test]
+    fn both_download_origins_require_exact_version_filename_and_https() {
+        let (release, manifest) = gitee_fixture();
+        let asset = release_from_gitee(release, manifest, "0.2.11")
+            .unwrap()
+            .unwrap()
+            .asset;
+        assert!(validate_asset(&asset).is_ok());
+        for url in [
+            asset.url.replace("https:", "http:"),
+            asset.url.replace("gitee.com", "gitee.com.evil.example"),
+            asset.url.replace("TortoTech", "another-owner"),
+            asset.url.replace("v0.2.12/", "v0.2.13/"),
+            format!("{}?redirect=evil", asset.url),
+            asset.url.replace("gitee.com", "gitee.com:444"),
+            asset.url.replace("gitee.com", "user@gitee.com"),
+        ] {
+            assert!(
+                validate_asset(&UpdateAsset {
+                    url,
+                    ..asset.clone()
+                })
+                .is_err()
+            );
+        }
+        assert!(trusted_download_redirect(
+            &reqwest::Url::parse("https://foruda.gitee.com/attach_file/1/file.msi").unwrap()
+        ));
+        assert!(!trusted_download_redirect(
+            &reqwest::Url::parse("https://evil.example/file.msi").unwrap()
+        ));
+    }
+
+    #[test]
+    fn failed_or_corrupt_primary_download_retries_same_asset_from_other_origin() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let bytes = b"verified installer";
+        let (release, manifest) = gitee_fixture();
+        let mut asset = release_from_gitee(release, manifest, "0.2.11")
+            .unwrap()
+            .unwrap()
+            .asset;
+        asset.sha256 = format!("{:x}", Sha256::digest(bytes));
+        asset.size = bytes.len() as u64;
+        for corrupt in [false, true] {
+            let mut calls = Vec::new();
+            let result = runtime
+                .block_on(download_with_fallback(&asset, |url| {
+                    calls.push(url);
+                    let result = if calls.len() == 1 {
+                        if corrupt {
+                            Ok(vec![0; bytes.len()])
+                        } else {
+                            Err("offline".into())
+                        }
+                    } else {
+                        Ok(bytes.to_vec())
+                    };
+                    std::future::ready(result)
+                }))
+                .unwrap();
+            assert_eq!(result, bytes);
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1], asset.url.replace("gitee.com", "github.com"));
+        }
+        assert!(
+            runtime
+                .block_on(download_with_fallback(&asset, |_| std::future::ready(Err(
+                    "offline".into()
+                ))))
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "uses public release APIs; run explicitly after mirror synchronization"]
+    fn live_gitee_update_manifest_is_usable() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let update = runtime
+            .block_on(check_gitee(&crate::http::client(), "0.0.0"))
+            .unwrap()
+            .unwrap();
+        validate_asset(&update.asset).unwrap();
+        assert!(
+            update
+                .asset
+                .url
+                .starts_with("https://gitee.com/TortoTech/torto/releases/download/")
+        );
     }
 
     #[test]

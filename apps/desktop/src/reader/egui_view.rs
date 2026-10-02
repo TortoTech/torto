@@ -1090,7 +1090,12 @@ impl DesktopReader {
         // The image preview is above the chat, TOC and reader menus. Handle its
         // dismissal before any underlying panel can consume Escape.
         if self.image_preview.is_some() {
-            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+                || (!ctx.text_edit_focused()
+                    && ctx.input_mut(|input| {
+                        input.consume_shortcut(&self.shortcuts.focus_image_preview)
+                    }))
+            {
                 self.close_image_preview(ctx);
             } else if !ctx.text_edit_focused() {
                 let step = ctx.input_mut(|input| {
@@ -5958,6 +5963,8 @@ fn show_image_preview_area(
     texture_id: TextureId,
     zoom_percent: f32,
 ) -> ImagePreviewInteraction {
+    let backdrop_screen = ctx.content_rect();
+    crate::app::window_chrome::dim_controls(ctx, 190.0 / 255.0);
     let mut interaction = ImagePreviewInteraction {
         close: false,
         reset: false,
@@ -5965,15 +5972,16 @@ fn show_image_preview_area(
     };
     egui::Area::new("reader-image-preview".into())
         .order(egui::Order::Tooltip)
-        .fixed_pos(screen.min)
+        .fade_in(false)
+        .fixed_pos(backdrop_screen.min)
         .constrain(false)
-        .default_size(screen.size())
+        .default_size(backdrop_screen.size())
         .show(ctx, |ui| {
-            ui.set_clip_rect(screen);
+            ui.set_clip_rect(backdrop_screen);
             // The backdrop only owns clicks used to close the preview. Registering it for
             // dragging as well competes with the image's drag response on the same layer.
             let (backdrop_rect, backdrop) =
-                ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                ui.allocate_exact_size(backdrop_screen.size(), egui::Sense::click());
             ui.painter()
                 .rect_filled(backdrop_rect, 0.0, Color32::from_black_alpha(190));
             // Transparent book illustrations often contain black formulas or line art.
@@ -6606,8 +6614,75 @@ mod reference_suggestion_label_tests {
             frame(&mut reader, egui::Key::Minus);
             assert!((reader.image_preview.as_ref().unwrap().zoom - 1.0).abs() < 0.001);
             assert_eq!(reader.focus_unit_index, index);
+            frame(&mut reader, egui::Key::Num0);
+            assert!(reader.image_preview.is_none());
+            frame(&mut reader, egui::Key::Num0);
+            assert!(reader.image_preview.is_some());
             frame(&mut reader, egui::Key::Escape);
             assert!(reader.image_preview.is_none());
+        }
+    }
+
+    #[test]
+    fn image_preview_backdrop_covers_header_and_caption_controls() {
+        use crate::app::window_chrome;
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        for fullscreen in [false, true] {
+            window_chrome::set_state(
+                &ctx,
+                window_chrome::WindowState {
+                    fullscreen,
+                    ..Default::default()
+                },
+            );
+            for frame in 0..2 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |_| {
+                        window_chrome::begin_frame(&ctx);
+                        window_chrome::header(
+                            &ctx,
+                            Rect::from_min_size(
+                                screen.min,
+                                Vec2::new(800.0, window_chrome::HEIGHT),
+                            ),
+                        );
+                        show_image_preview_area(
+                            &ctx,
+                            crate::ui::overlay_rect(&ctx),
+                            Rect::from_min_size(Pos2::new(200.0, 150.0), Vec2::new(400.0, 300.0)),
+                            TextureId::default(),
+                            100.0,
+                        );
+                        window_chrome::paint_controls(&ctx);
+                    },
+                );
+                output.textures_delta.clear();
+                if frame == 0 {
+                    continue; // egui's first Area pass measures its size without painting.
+                }
+                assert!(output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Rect(rect)
+                        if rect.rect == screen
+                        && rect.fill == Color32::from_black_alpha(190)
+                        && shape.clip_rect.contains_rect(screen))
+                }));
+                if !fullscreen {
+                    let controls = Rect::from_min_size(
+                        Pos2::new(screen.right() - 138.0, 0.0),
+                        Vec2::new(138.0, window_chrome::HEIGHT),
+                    );
+                    assert!(output.shapes.iter().any(|shape| {
+                        matches!(&shape.shape, egui::Shape::Rect(rect)
+                            if rect.rect == controls
+                            && rect.fill == Color32::BLACK.gamma_multiply(190.0 / 255.0))
+                    }));
+                }
+            }
         }
     }
 

@@ -39,6 +39,24 @@ pub(crate) fn translation_event(provider: &AiProvider, model: &str, event: &str,
     );
 }
 
+pub(crate) fn local_translation_event(event: &str, details: Value) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let provider = AiProvider {
+        id: "local-translation".into(),
+        ..Default::default()
+    };
+    write_event(
+        &provider,
+        "local",
+        event,
+        details,
+        "translation-render.log",
+        "translation-render.previous.log",
+    );
+}
+
 fn write_event(
     provider: &AiProvider,
     model: &str,

@@ -2757,7 +2757,7 @@ impl LayoutEngine {
                     .find(|item| item.range.contains(&start))
                     .map_or(0.0, |item| item.amount);
                 builder.push(
-                    StyleProperty::LetterSpacing(adjustment + typography.font_size * 0.08),
+                    StyleProperty::LetterSpacing(adjustment + typography.font_size * 0.12),
                     start..span.range.start,
                 );
             }
@@ -2775,7 +2775,7 @@ impl LayoutEngine {
                 StyleProperty::LetterSpacing(
                     base + item.amount
                         + if leading {
-                            typography.font_size * 0.08
+                            typography.font_size * 0.12
                         } else {
                             0.0
                         },
@@ -5404,7 +5404,7 @@ mod tests {
             let expected = if text.contains(' ') {
                 0.0
             } else {
-                typography.font_size * 0.08
+                typography.font_size * 0.12
             };
             assert!(
                 (padded.width() - normal.width() - expected).abs() < 0.01,

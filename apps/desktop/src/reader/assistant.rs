@@ -470,6 +470,10 @@ impl DesktopReader {
                     );
                     style.minimum_paragraph_gap = 0.0;
                 }
+                self.semantic_source.set_unified_citations(
+                    !fixed_page
+                        && style.typesetting.mode == rebook_layout::TypesettingMode::Unified,
+                );
                 match self
                     .reader
                     .refresh_source_with_style_at_href(style, navigation_target.as_ref())

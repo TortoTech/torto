@@ -987,7 +987,7 @@ mod tests {
                 .build()
                 .unwrap()
                 .block_on(SearchExecution::new().execute(
-                    &reqwest::Client::new(),
+                    &crate::http::client(),
                     &service,
                     &json!({"query":"research keywords"}),
                 ))
@@ -1076,7 +1076,7 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let mut execution = SearchExecution::new();
-                let client = reqwest::Client::new();
+                let client = crate::http::client();
                 let args = json!({"query":"a \"quoted\" term"});
                 let result = execution.execute(&client, &service, &args).await.unwrap();
                 assert_eq!(

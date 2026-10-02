@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::dpi::LogicalSize;
+#[cfg(target_os = "windows")]
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 #[cfg(target_os = "windows")]
@@ -599,6 +601,17 @@ impl ApplicationHandler<UserEvent> for Application {
                     .log_reader_diagnostics("window.occluded.reader", None);
             }
             WindowEvent::Resized(size) => {
+                let minimized = state.window.is_minimized() == Some(true);
+                if minimized || size.width == 0 || size.height == 0 {
+                    crate::diagnostics::log(
+                        "window.minimize",
+                        &[
+                            crate::diagnostics::Field::Bool("observed", minimized),
+                            crate::diagnostics::Field::U64("width", u64::from(size.width)),
+                            crate::diagnostics::Field::U64("height", u64::from(size.height)),
+                        ],
+                    );
+                }
                 state.gpu.resize(size);
                 // Rendering first presents the retained UI over the themed
                 // background, before laying out content at the new size.
@@ -609,7 +622,7 @@ impl ApplicationHandler<UserEvent> for Application {
                 Self::render_window_state(state, &mut self.app, &self.egui_ctx);
             }
             WindowEvent::RedrawRequested => {
-                if state.window.inner_size() == PhysicalSize::new(0, 0) {
+                if !super::gpu::window_can_render(&state.window) {
                     return;
                 }
                 #[cfg(target_os = "windows")]
@@ -672,6 +685,13 @@ impl ApplicationHandler<UserEvent> for Application {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if crate::smoke::enabled() {
+            if let Some(state) = &self.window
+                && let Err(error) = crate::smoke::window_tick(&self.egui_ctx, &state.window)
+            {
+                self.fatal_error = Some(error);
+                event_loop.exit();
+                return;
+            }
             match crate::smoke::should_exit() {
                 Ok(true) => {
                     event_loop.exit();

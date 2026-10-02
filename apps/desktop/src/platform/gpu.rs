@@ -148,6 +148,11 @@ impl GpuState {
     ) -> Result<Option<wgpu::SurfaceTexture>, String> {
         let mut recovery_attempted = false;
         loop {
+            // Viewport commands can minimize the window in the middle of this
+            // frame, before Windows delivers its zero-sized Resized event.
+            if !window_can_render(window) {
+                return Ok(None);
+            }
             match self.surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(frame) => return Ok(Some(frame)),
                 wgpu::CurrentSurfaceTexture::Suboptimal(frame) if !recovery_attempted => {
@@ -229,6 +234,9 @@ impl GpuState {
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
     ) -> Result<(), String> {
+        if !window_can_render(window) {
+            return Ok(());
+        }
         // Fullscreen transitions can deliver a redraw before their Resized event.
         // Always configure from the window's current client size before acquiring.
         self.resize(window.inner_size());
@@ -576,6 +584,14 @@ fn process_root_viewport_commands(
         return;
     };
     let mut actions_requested = Vec::new();
+    for command in &root_output.commands {
+        if let egui::ViewportCommand::Minimized(minimized) = command {
+            crate::diagnostics::log(
+                "window.minimize",
+                &[crate::diagnostics::Field::Bool("requested", *minimized)],
+            );
+        }
+    }
     egui_winit::process_viewport_commands(
         egui_ctx,
         viewport_info,
@@ -592,6 +608,11 @@ fn process_root_viewport_commands(
             )],
         );
     }
+}
+
+pub(super) fn window_can_render(window: &Window) -> bool {
+    let size = window.inner_size();
+    size.width > 0 && size.height > 0 && window.is_minimized() != Some(true)
 }
 
 fn reader_scene_needs_render(rendered_scene: Option<(u64, u64)>, plan: ReaderFramePlan) -> bool {

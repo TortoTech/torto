@@ -57,10 +57,10 @@ impl WebDavClient {
         }
         let allowed_origin = root.origin();
         let download_allowed_origin = allowed_origin.clone();
-        let mut client_builder = Client::builder()
+        let mut client_builder = crate::http::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT);
-        let mut download_client_builder = Client::builder()
+        let mut download_client_builder = crate::http::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(DOWNLOAD_READ_TIMEOUT);
         let compatibility_user_agent = settings.user_agent();

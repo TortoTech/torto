@@ -35,7 +35,7 @@ pub(super) async fn fetch_provider_models(
         P::Ollama => format!("{}/api/tags", base.trim_end_matches("/api")),
         _ => models_url(base)?,
     };
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| format!("创建模型请求失败：{error}"))?;

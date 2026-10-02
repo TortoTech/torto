@@ -52,11 +52,11 @@ struct Ink {
 fn compression(previous: Ink, note: Ink, em: f32) -> f32 {
     let gap = previous.advance - previous.right + note.left;
     // Keep a visible gap, and retain at least 20% of the punctuation's advance.
-    (em * 0.08 - gap).clamp(-(em * 0.65).min(previous.advance * 0.8), 0.0)
+    (em * 0.10 - gap).clamp(-(em * 0.65).min(previous.advance * 0.8), 0.0)
 }
 fn separation(note: Ink, next: Ink, em: f32) -> f32 {
     let gap = note.advance - note.right + next.left;
-    (em * 0.10 - gap).clamp(0.0, em * 0.20)
+    (em * 0.16 - gap).clamp(0.0, em * 0.20)
 }
 pub(super) fn measure(
     layout: &Layout<TextBrush>,
@@ -304,7 +304,7 @@ mod tests {
             right: 19.0,
             advance: 20.0,
         };
-        assert!((separation(note, han, 20.0) - 1.0).abs() < 0.001);
+        assert!((separation(note, han, 20.0) - 2.2).abs() < 0.001);
         assert_eq!(
             separation(
                 Ink {

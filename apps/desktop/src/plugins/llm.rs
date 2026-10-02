@@ -490,10 +490,24 @@ fn prepare_output(
                     }
                 }
             }
-            request.chat_history.insert(0, Message::system(format!(
+            request.chat_history.push(Message::system(format!(
                 "Return only one complete JSON value matching this JSON Schema. Do not include Markdown fences or commentary. Preserve all field constraints and descriptions. JSON Schema:\n{wire_schema}")));
         }
         OutputMode::Auto => return Err("内部错误：未选择结构化输出模式".into()),
+    }
+    let mut instructions = request.preamble.take().into_iter().collect::<Vec<_>>();
+    request.chat_history.retain(|message| {
+        if let Message::System { content } = message {
+            instructions.push(content.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if !instructions.is_empty() {
+        request
+            .chat_history
+            .insert(0, Message::system(instructions.join("\n\n")));
     }
     Ok((request, wrapped))
 }
@@ -845,10 +859,10 @@ async fn dispatch(
     streaming: bool,
 ) -> Result<CompletionResponse, CompletionError> {
     consume_attempt()?;
-    static HTTP: OnceLock<reqwest_rig::Client> = OnceLock::new();
+    static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
     let http = HTTP
         .get_or_init(|| {
-            reqwest_rig::Client::builder()
+            crate::http::builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("HTTP client initialization")

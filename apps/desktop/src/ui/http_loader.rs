@@ -32,7 +32,7 @@ impl ReqwestBytesLoader {
     fn new(runtime: Handle) -> Self {
         Self {
             cache: Arc::default(),
-            client: Client::builder()
+            client: crate::http::builder()
                 .timeout(Duration::from_secs(90))
                 .build()
                 .map_err(|error| error.to_string()),

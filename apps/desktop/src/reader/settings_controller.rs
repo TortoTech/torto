@@ -149,7 +149,16 @@ impl DesktopReader {
         style.typesetting = super::effective_typesetting(self.reading_mode, &settings.typesetting);
         self.selection_granularity = settings.selection_granularity;
         super::apply_theme_colors(&mut style, crate::ui::theme());
-        match self.reader.set_style(style) {
+        let citation_mode_changed = self.semantic_source.set_unified_citations(
+            style.focus_footnote_icons
+                && style.typesetting.mode == rebook_layout::TypesettingMode::Unified,
+        );
+        let updated = if citation_mode_changed {
+            self.reader.refresh_source_with_style(style)
+        } else {
+            self.reader.set_style(style)
+        };
+        match updated {
             Ok(snapshot) => {
                 self.plugin_settings = plugin_settings;
                 self.language = language;

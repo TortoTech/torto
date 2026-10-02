@@ -1,8 +1,11 @@
 use super::*;
 use rebook_publication::{InlineRole, LinkRole};
 
+mod heuristics;
 #[cfg(test)]
 mod tests;
+pub(super) use heuristics::annotations as heuristic_annotations;
+pub(super) use heuristics::apply_display_fallback as apply_heuristic_fallback;
 
 pub(super) const PROMPT: &str = include_str!("citations/prompt.md");
 
@@ -120,6 +123,47 @@ fn candidate_spans(block: &TextBlock) -> Vec<Citation> {
             });
         }
     }
+    // Authored <cite> semantics can carry an unbracketed author/date group.
+    let mut offset = 0;
+    let mut authored: Option<(usize, String)> = None;
+    for inline in block.content.iter().chain(std::iter::once(&Inline::Break)) {
+        let is_authored = matches!(inline, Inline::Text(run) if run.style.citation
+            && run.style.inline_citation == 0 && run.style.inline_role == InlineRole::Normal
+            && run.style.link_role == LinkRole::Normal
+            && run.style.baseline != rebook_publication::TextBaseline::Superscript);
+        if !is_authored && let Some((start, value)) = authored.take() {
+            if heuristics::author_date(&value)
+                && !out.iter().any(|c| c.start < offset && c.end > start)
+            {
+                out.push(Citation {
+                    start,
+                    end: offset,
+                    text: value,
+                });
+            }
+        }
+        match inline {
+            Inline::Text(run) => {
+                if is_authored {
+                    authored
+                        .get_or_insert_with(|| (offset, String::new()))
+                        .1
+                        .push_str(&run.text);
+                }
+                offset += run.text.chars().count();
+            }
+            Inline::Break => offset += 1,
+            Inline::Math(math) => {
+                offset += math
+                    .original_text()
+                    .unwrap_or_else(|| math.latex.clone())
+                    .chars()
+                    .count()
+            }
+            Inline::Image(_) => {}
+        }
+    }
+    out.sort_by_key(|c| c.start);
     out
 }
 
@@ -264,13 +308,6 @@ fn citation_key(value: &str) -> String {
 fn apply(text: &mut TextBlock, spans: &[Citation]) {
     // Explicit translation markup is authoritative; legacy text matching must
     // not renumber or overwrite already restored citations.
-    if text
-        .content
-        .iter()
-        .any(|inline| matches!(inline, Inline::Text(run) if run.style.inline_citation > 0))
-    {
-        return;
-    }
     let available = candidate_spans(text);
     let mut located = Vec::new();
     for original in spans {
@@ -293,6 +330,52 @@ fn apply(text: &mut TextBlock, spans: &[Citation]) {
             located.push(found.clone());
         }
     }
+    if located.is_empty() {
+        return;
+    }
+    // Merge existing (including restored translation) marks by their positions,
+    // never by their current numbering. Only genuinely new spans reach here.
+    let mut offset = 0;
+    let mut last_number = 0;
+    for inline in &text.content {
+        match inline {
+            Inline::Text(run) => {
+                let end = offset + run.text.chars().count();
+                if run.style.inline_citation != 0 {
+                    if last_number == run.style.inline_citation {
+                        let last = located.last_mut().unwrap();
+                        last.end = end;
+                        last.text.push_str(&run.text);
+                    } else {
+                        located.push(Citation {
+                            start: offset,
+                            end,
+                            text: run.text.clone(),
+                        });
+                    }
+                }
+                last_number = run.style.inline_citation;
+                offset = end;
+            }
+            Inline::Break => {
+                offset += 1;
+                last_number = 0;
+            }
+            Inline::Math(math) => {
+                offset += math
+                    .original_text()
+                    .unwrap_or_else(|| math.latex.clone())
+                    .chars()
+                    .count();
+                last_number = 0;
+            }
+            Inline::Image(_) => {
+                last_number = 0;
+            }
+        }
+    }
+    located.sort_by_key(|c| (c.start, c.end));
+    located.dedup_by(|a, b| a.start == b.start && a.end == b.end);
     // Conflicting mappings are ambiguous. Leave only those spans untouched;
     // all other citations still receive consecutive numbers in display order.
     let located: Vec<_> = located

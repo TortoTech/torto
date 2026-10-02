@@ -29,6 +29,7 @@ mod normalize;
 mod text_formulas;
 mod wire;
 pub(crate) use batching::{fixed_batches, semantic_units};
+pub(crate) use log::local_translation_event;
 pub(crate) use log::translation_event;
 pub(crate) use log::{event as diagnostic_event, with_job};
 mod quote_sources;
@@ -52,7 +53,7 @@ impl Default for SemanticLayoutSettings {
             enabled: false,
             provider: String::new(),
             model: String::new(),
-            reasoning_effort: ReasoningEffort::Default,
+            reasoning_effort: ReasoningEffort::None,
         }
     }
 }
@@ -213,6 +214,8 @@ struct WindowCache {
 }
 
 pub(crate) struct SemanticLayoutSource {
+    unified_citations: std::sync::atomic::AtomicBool,
+    heuristic_cache: RwLock<HashMap<usize, (String, Vec<Annotation>)>>,
     transaction: RwLock<()>,
     enabled: std::sync::atomic::AtomicBool,
     inner: Arc<dyn BookSource>,
@@ -225,6 +228,8 @@ pub(crate) struct SemanticLayoutSource {
 impl SemanticLayoutSource {
     pub(crate) fn new(inner: Arc<dyn BookSource>, original: Arc<dyn BookSource>) -> Self {
         Self {
+            unified_citations: std::sync::atomic::AtomicBool::new(false),
+            heuristic_cache: RwLock::new(HashMap::new()),
             transaction: RwLock::new(()),
             enabled: std::sync::atomic::AtomicBool::new(true),
             inner,
@@ -242,6 +247,27 @@ impl SemanticLayoutSource {
 
     pub(crate) fn original(&self) -> Arc<dyn BookSource> {
         self.original.clone()
+    }
+
+    pub(crate) fn set_unified_citations(&self, enabled: bool) -> bool {
+        self.unified_citations
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed)
+            != enabled
+    }
+
+    fn cached_heuristics(&self, index: usize, original: &Section) -> Vec<Annotation> {
+        let hash = fingerprint(original);
+        if let Ok(cache) = self.heuristic_cache.read()
+            && let Some((cached_hash, annotations)) = cache.get(&index)
+            && cached_hash == &hash
+        {
+            return annotations.clone();
+        }
+        let annotations = citations::heuristic_annotations(original);
+        if let Ok(mut cache) = self.heuristic_cache.write() {
+            cache.insert(index, (hash, annotations.clone()));
+        }
+        annotations
     }
 
     pub(crate) fn clear(&self) {
@@ -315,6 +341,12 @@ impl SemanticLayoutSource {
     /// Apply only inline citation structure to original translation input.
     /// Keeping all block indices intact is essential for translation storage.
     pub(crate) fn prepare_citation_input(&self, index: usize, hash: &str, section: &mut Section) {
+        if self
+            .unified_citations
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            citations::apply_heuristic_fallback(section);
+        }
         if let Ok(state) = self.state.read()
             && let Some(result) = state
                 .get(&index)
@@ -366,9 +398,21 @@ impl BookSource for SemanticLayoutSource {
             PublicationError::InvalidPublication("content commit lock poisoned".into())
         })?;
         let mut section = self.inner.parse_section(index)?;
+        let unified_citations = self
+            .unified_citations
+            .load(std::sync::atomic::Ordering::Relaxed);
         if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
-            citations::clear_markers(&mut section.blocks);
+            if !unified_citations {
+                citations::clear_markers(&mut section.blocks);
+            }
             text_formulas::restore_originals(&mut section.blocks);
+            if unified_citations {
+                let original = self.original.parse_section(index)?;
+                for annotation in self.cached_heuristics(index, &original) {
+                    compose(&mut section.blocks, &annotation);
+                }
+                citations::apply_heuristic_fallback(&mut section);
+            }
             return Ok(section);
         }
         let mut recognition = self
@@ -423,6 +467,13 @@ impl BookSource for SemanticLayoutSource {
             }
         }
         text_formulas::normalize_formula_quotes(&mut section.blocks);
+        if unified_citations {
+            let original = self.original.parse_section(index)?;
+            for annotation in self.cached_heuristics(index, &original) {
+                compose(&mut section.blocks, &annotation);
+            }
+            citations::apply_heuristic_fallback(&mut section);
+        }
         Ok(section)
     }
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
@@ -1003,7 +1054,7 @@ async fn recognize_inner(
     let mut annotations = Vec::new();
     let mut skipped_groups = 0;
     let mut used = HashSet::new();
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .timeout(Duration::from_secs(90))
         .build()
         .map_err(|e| e.to_string())?;

@@ -1029,6 +1029,16 @@ mod tests {
         assert!(restored.expert_translation);
         assert_eq!(settings.chat_reasoning_effort, ReasoningEffort::Default);
         assert_eq!(
+            settings.semantic_layout.reasoning_effort,
+            ReasoningEffort::None
+        );
+        let explicit: PluginSettings =
+            serde_json::from_str(r#"{"semantic_layout":{"reasoning_effort":"high"}}"#).unwrap();
+        assert_eq!(
+            explicit.semantic_layout.reasoning_effort,
+            ReasoningEffort::High
+        );
+        assert_eq!(
             settings.translation_reasoning_effort,
             ReasoningEffort::Default
         );

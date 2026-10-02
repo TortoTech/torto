@@ -8,7 +8,6 @@ pub(crate) enum Field<'a> {
     F32(&'static str, f32),
 }
 
-#[cfg(debug_assertions)]
 mod imp {
     use std::fmt::Write as _;
     use std::fs::{self, OpenOptions};
@@ -23,6 +22,15 @@ mod imp {
     static LOG_LOCK: Mutex<()> = Mutex::new(());
 
     pub(super) fn log(event: &'static str, fields: &[Field<'_>]) {
+        // Release builds only write rare lifecycle/error events, never per-frame
+        // reading diagnostics or request bodies.
+        #[cfg(not(debug_assertions))]
+        if !matches!(
+            event,
+            "app.start" | "app.exit" | "panic" | "render.fatal" | "window.minimize"
+        ) {
+            return;
+        }
         let Ok(_guard) = LOG_LOCK.lock() else {
             return;
         };
@@ -33,7 +41,11 @@ mod imp {
         if fs::create_dir_all(&log_dir).is_err() {
             return;
         }
-        let path = log_dir.join("reader-ui.log");
+        let path = log_dir.join(if cfg!(debug_assertions) {
+            "reader-ui.log"
+        } else {
+            "runtime.log"
+        });
         if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > MAX_LOG_BYTES)
             && fs::write(&path, []).is_err()
         {
@@ -46,7 +58,11 @@ mod imp {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let mut line = format!("[{timestamp_ms}] event={event}");
+        let mut line = format!(
+            "[{timestamp_ms}] event={event} pid={} version={}",
+            std::process::id(),
+            env!("CARGO_PKG_VERSION")
+        );
         for field in fields {
             match *field {
                 Field::Text(key, value) => {
@@ -70,12 +86,20 @@ mod imp {
             }
         }
         let _ = writeln!(file, "{line}");
+        if event == "panic" {
+            // Persist the crash record before abort/unwind can terminate the process.
+            // Normal UI diagnostics do not pay the synchronous disk flush cost.
+            let _ = file.sync_data();
+        }
     }
 
     pub(super) fn install_panic_hook() {
         let default_hook = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             let message = info.to_string();
+            let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+            let thread = std::thread::current();
+            let thread_id = format!("{:?}", thread.id());
             if let Some(location) = info.location() {
                 log(
                     "panic",
@@ -83,49 +107,31 @@ mod imp {
                         Field::Text("location", "known"),
                         Field::Detail("file", location.file()),
                         Field::Detail("message", &message),
+                        Field::Detail("backtrace", &backtrace),
+                        Field::Detail("thread", thread.name().unwrap_or("unnamed")),
+                        Field::Detail("thread_id", &thread_id),
                         Field::U64("line", u64::from(location.line())),
                         Field::U64("column", u64::from(location.column())),
                     ],
                 );
             } else {
-                log("panic", &[Field::Detail("message", &message)]);
+                log(
+                    "panic",
+                    &[
+                        Field::Detail("message", &message),
+                        Field::Detail("backtrace", &backtrace),
+                        Field::Detail("thread", thread.name().unwrap_or("unnamed")),
+                        Field::Detail("thread_id", &thread_id),
+                    ],
+                );
             }
             default_hook(info);
         }));
-        log("app.start", &[]);
+        let executable = std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        log("app.start", &[Field::Detail("executable", &executable)]);
     }
-}
-
-#[cfg(not(debug_assertions))]
-mod imp {
-    use super::Field;
-
-    pub(super) fn log(_event: &'static str, fields: &[Field<'_>]) {
-        for field in fields {
-            match *field {
-                Field::Text(key, value) => {
-                    let _ = (key, value);
-                }
-                Field::Detail(key, value) => {
-                    let _ = (key, value);
-                }
-                Field::Bool(key, value) => {
-                    let _ = (key, value);
-                }
-                Field::U64(key, value) => {
-                    let _ = (key, value);
-                }
-                Field::Usize(key, value) => {
-                    let _ = (key, value);
-                }
-                Field::F32(key, value) => {
-                    let _ = (key, value);
-                }
-            }
-        }
-    }
-
-    pub(super) fn install_panic_hook() {}
 }
 
 pub(crate) fn log(event: &'static str, fields: &[Field<'_>]) {

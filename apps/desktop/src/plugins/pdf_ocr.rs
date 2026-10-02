@@ -439,7 +439,7 @@ where
         return Err("请先在“设置 → OCR”中启用正文识别".into());
     }
     progress("正在上传 PDF…".into());
-    let client = Client::builder()
+    let client = crate::http::builder()
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_mins(3))
         .build()

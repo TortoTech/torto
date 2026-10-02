@@ -461,7 +461,7 @@ fn translation_restores_prepared_math_and_disabled_layout_restores_source_runs()
     ));
     translation.remember_translation_input(0, 0, &original.blocks[0], &prepared.blocks[0]);
     let inputs = crate::plugins::prepare_translation_inputs(&prepared, false);
-    assert!(inputs[0].0.text.contains("<torto-math-0/>"));
+    assert!(inputs[0].0.text.contains("<t-math-0/>"));
     let overlay = SemanticLayoutSource::new(translation.clone(), source);
     assert!(overlay.install(0, recognition));
     translation.set_enabled(true).unwrap();
@@ -471,7 +471,7 @@ fn translation_restores_prepared_math_and_disabled_layout_restores_source_runs()
             &[BlockTranslation {
                 block_index: 0,
                 segment_index: None,
-                text: "Translated <torto-math-0/> continues.".into(),
+                text: "Translated <t-math-0/> continues.".into(),
             }],
         )
         .unwrap();
@@ -559,7 +559,7 @@ fn local_hearing_text_formulas_preserve_original_math_styles() {
         3
     );
     let inputs = crate::plugins::prepare_translation_inputs(&rendered, false);
-    assert_eq!(inputs[0].0.text.matches("<torto-math-").count(), 3);
+    assert_eq!(inputs[0].0.text.matches("<t-math-").count(), 3);
     restore_originals(&mut rendered.blocks);
     let Block::Text(restored) = &rendered.blocks[0] else {
         panic!()

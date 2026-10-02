@@ -251,7 +251,7 @@ pub async fn chat_with_book(
     }).await.map_err(|e| format!("准备聊天图片失败：{e}"))??;
     messages.extend(user_messages);
 
-    let client = Client::builder()
+    let client = crate::http::builder()
         .timeout(Duration::from_secs(if direct_pdf_summary {
             180
         } else {
@@ -773,7 +773,7 @@ where
     if blocks.is_empty() {
         return Ok(());
     }
-    let client = Client::builder()
+    let client = crate::http::builder()
         .timeout(Duration::from_secs(90))
         .build()
         .map_err(|error| format!("创建翻译客户端失败：{error}"))?;
@@ -817,26 +817,20 @@ async fn translate_block_batch(
     } else {
         ""
     };
-    let citation_contract = translation_citation_contract(blocks)?;
-    let mut properties = keys.iter().map(|key| (key.clone(), json!({"type":"string", "minLength":1}))).collect::<serde_json::Map<_,_>>();
-    let mut required = keys.clone();
-    let mut system = format!("{}\n{}", translation_system_prompt(target_language, fixed_page_hint), citation_contract);
+    for block in blocks { super::translation::citation_ids(&block.text)?; }
+    let mut system = translation_system_prompt(target_language, fixed_page_hint);
+    let mut user_content = Value::Object(input.clone()).to_string();
     if let Some(glossary) = glossary {
-        properties.insert("g".into(), super::glossary::schema());
-        required.push("g".into());
         let (prompt, hits) = glossary.prompt(blocks);
-        system = system.replace("保留完全相同的键；每个值只能是对应译文字符串。", "保留所有原段落键，其值仍是对应译文字符串；另外新增 g 数组。");
-        system.push_str(&prompt);
+        system.push_str(super::glossary::instructions());
+        user_content.push('\n');
+        user_content.push_str(&prompt);
         super::semantic_layout::translation_event(provider, model, "translation.glossary_selected", json!({"hits":hits}));
+    } else {
+        system.push_str("\nTerminology extraction is disabled for this task.");
     }
-    let mut schema = super::llm::schema_options(json!({
-        "type":"object", "additionalProperties":false, "required":required,
-        "properties": properties
-    }));
-    if glossary.is_some() {
-        // Request a strict glossary shape, but never reject valid prose over optional metadata.
-        schema["best_effort_output_fields"] = json!(["g"]);
-    }
+    let mut schema = super::llm::schema_options(translation_response_schema());
+    schema["best_effort_output_fields"] = json!(["g"]);
     let mut last_error = None;
     for attempt in 1..=MAX_TRANSLATION_ATTEMPTS {
         let mut messages = vec![
@@ -844,11 +838,11 @@ async fn translate_block_batch(
                 "role": "system",
                 "content": system,
             }),
-            json!({ "role": "user", "content": Value::Object(input.clone()).to_string() }),
+            json!({ "role": "user", "content": user_content }),
         ];
         if let Some(error) = &last_error {
             messages.push(json!({"role":"user","content":format!(
-                "The previous response failed validation: {error}. Translate the original input again and return all JSON keys. Preserve only citation IDs listed for each key; an empty list means NO citation tags. Do not turn ordinary author-year text into citations. JSON object keys are not citation IDs."
+                "The previous response failed validation: {error}. Translate the original input again. Preserve only citation IDs already tagged in each input paragraph; untagged paragraphs must not acquire citation tags."
             )}));
         }
         let content = match request_completion(
@@ -911,18 +905,19 @@ async fn translate_block_batch(
     }).await
 }
 
-fn translation_citation_contract(blocks: &[TranslationBlockInput]) -> Result<String, String> {
-    let mut allowed = serde_json::Map::new();
-    for (key, block) in blocks.iter().enumerate() {
-        allowed.insert(
-            key.to_string(),
-            json!(super::translation::citation_ids(&block.text)?),
-        );
-    }
-    Ok(format!(
-        "# Citation structure\nAllowed citation IDs by input JSON key: {}. Preserve these IDs exactly once. An empty list means do not create any citation tags. JSON keys such as 0 are block keys, NOT citation IDs. Parenthesized years after author names remain ordinary text unless already tagged in the source.",
-        Value::Object(allowed)
-    ))
+fn translation_response_schema() -> Value {
+    json!({
+        "type":"object",
+        "description":"Map each input paragraph key directly to its translated text. Include exactly the paragraph keys specified by the task and the glossary field g.",
+        "properties":{"g":super::glossary::schema()},
+        "required":["g"],
+        "patternProperties":{"^[0-9]+$":{"type":"string","minLength":1,"description":"Translation of the input paragraph with the same key."}},
+        "additionalProperties":false
+    })
+}
+
+fn translation_citation_contract() -> &'static str {
+    "# Citation structure\nPreserve exactly the citation IDs already tagged in each input paragraph, each exactly once. If a paragraph has no citation tags, do not create any. JSON keys such as 0 are block keys, NOT citation IDs. Parenthesized years after author names remain ordinary text unless already tagged in the source."
 }
 
 fn translation_structure_error(
@@ -955,6 +950,7 @@ fn translation_structure_error(
 }
 
 fn translation_system_prompt(target_language: &str, fixed_page_hint: &str) -> String {
+    let citation_contract = translation_citation_contract();
     let fixed_page_section = if fixed_page_hint.is_empty() {
         String::new()
     } else {
@@ -974,14 +970,13 @@ fn translation_system_prompt(target_language: &str, fixed_page_hint: &str) -> St
 
 # 正文结构
 - 每个 JSON 值都是独立正文块。原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时保持相同类型。
-- Preserve every <torto-note-N/> footnote reference exactly once, attached to its corresponding text. Never expand, translate or renumber it. Translate contents of <inlinefootnote id="N">...</inlinefootnote>, retaining each ID and complete group exactly once. IDs are source identities, not display numbers.
-- Preserve every <torto-web-N/> website placeholder exactly once. Do not translate, remove or invent it. Keep literal website addresses unchanged.
+- Preserve every <t-note-N/> footnote reference exactly once, attached to its corresponding text. Never expand, translate or renumber it. Translate contents of <inlinefootnote id="N">...</inlinefootnote>, retaining each ID and complete group exactly once. IDs are source identities, not display numbers.
+- Preserve every <t-web-N/> website placeholder exactly once. Do not translate, remove or invent it. Keep literal website addresses unchanged.
 - Preserve every <citation id="N">...</citation> group and its ID exactly once. Translate its contents as a bibliographic note (keep author names and years accurate); keep it attached to the same claim. Never merge groups, invent IDs, or remove their tags. Tags may contain other inline style tags.
-- <strong>、<em>、<i>、<cite>、<torto-italic>、<torto-size scale="数值">、<u>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记。必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。
-- <torto-math-0/>、<torto-math-1/> 等自闭合标签是不可修改的公式占位符。可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。
-{fixed_page_section}
-# 输出格式
-- 只返回一个 JSON 对象，保留完全相同的键；每个值只能是对应译文字符串。"#
+- <strong>、<em>、<i>、<cite>、<t-italic>、<t-size scale="数值">、<u>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记。必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。
+- <t-math-0/>、<t-math-1/> 等自闭合标签是不可修改的公式占位符。可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。
+{citation_contract}
+{fixed_page_section}"#
     )
 }
 
@@ -1061,6 +1056,12 @@ fn parse_translation_object(content: &str, keys: &[String]) -> Result<Vec<String
     let output = output
         .as_object()
         .ok_or_else(|| "翻译结果必须是 JSON 对象".to_owned())?;
+    if let Some(unexpected) = output
+        .keys()
+        .find(|key| key.as_str() != "g" && !keys.contains(key))
+    {
+        return Err(format!("翻译结果包含未请求的正文块 {unexpected}"));
+    }
     keys.iter()
         .map(|key| {
             output
@@ -2795,15 +2796,33 @@ mod tests {
     fn translation_prompt_uses_structured_chinese_style_rules() {
         let prompt = translation_system_prompt("简体中文", "PDF 提示。");
 
-        for heading in ["# 翻译任务", "# 中文表达", "# 正文结构", "# 输出格式"] {
+        for heading in ["# 翻译任务", "# 中文表达", "# 正文结构"] {
             assert!(prompt.contains(heading));
         }
+        assert!(!prompt.contains("# 输出格式"));
         assert!(prompt.contains(
             "人名、地名、书名、机构名、专业术语等外文专名，显示译名即可，不需要用括号附原文"
         ));
         assert!(prompt.contains("尽量不保留破折号句式，仅当用于话语中断作用时才保留"));
         assert!(!prompt.contains("A—B—C"));
         assert!(prompt.contains("PDF 提示。"));
+    }
+
+    #[test]
+    fn translation_schema_is_a_fixed_map_with_local_key_validation() {
+        let schema = translation_response_schema();
+        assert_eq!(schema["required"], json!(["g"]));
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&json!({"0":"one","g":[]})));
+        assert!(validator.is_valid(&json!({"0":"one","1":"two","g":[]})));
+        assert!(!validator.is_valid(&json!({"0":3,"g":[]})));
+        assert!(!validator.is_valid(&json!({"other":"text","g":[]})));
+        let keys = vec!["0".to_owned()];
+        assert!(parse_translation_object(r#"{"0":"text","g":[]}"#, &keys).is_ok());
+        assert!(parse_translation_object(r#"{"0":"text","1":"extra","g":[]}"#, &keys).is_err());
+        assert!(parse_translation_object(r#"{"g":[]}"#, &keys).is_err());
+        assert!(parse_translation_object(r#"{"0":false,"g":[]}"#, &keys).is_err());
     }
 
     #[test]
@@ -3289,7 +3308,7 @@ mod tests {
             .expect("test PDF should open");
         let source = opened.source();
         let settings = PluginSettings::load_default().expect("AI settings should load");
-        let client = Client::builder()
+        let client = crate::http::builder()
             .timeout(Duration::from_secs(90))
             .build()
             .expect("HTTP client should build");
@@ -3572,7 +3591,7 @@ mod tests {
         let result = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(translate_block_batch(
-                &Client::new(),
+                &crate::http::client(),
                 &provider,
                 "test-model",
                 "简体中文",
@@ -3607,7 +3626,7 @@ mod tests {
                 let body = if attempt == 0 {
                     r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"能量为 $E=mc^2$\"}"}}]}"#
                 } else {
-                    r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"能量为 <torto-math-0/>\"}"}}]}"#
+                    r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"能量为 <t-math-0/>\"}"}}]}"#
                 };
                 write!(
                     stream,
@@ -3625,7 +3644,7 @@ mod tests {
         let result = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(translate_block_batch(
-                &Client::new(),
+                &crate::http::client(),
                 &provider,
                 "test-model",
                 "简体中文",
@@ -3633,7 +3652,7 @@ mod tests {
                 &[TranslationBlockInput {
                     block_index: 8,
                     segment_index: None,
-                    text: "Energy is <torto-math-0/>".into(),
+                    text: "Energy is <t-math-0/>".into(),
                 }],
                 None,
             ))
@@ -3645,7 +3664,7 @@ mod tests {
             vec![BlockTranslation {
                 block_index: 8,
                 segment_index: None,
-                text: "能量为 <torto-math-0/>".into(),
+                text: "能量为 <t-math-0/>".into(),
             }]
         );
     }
@@ -3655,6 +3674,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
+            let mut expert_system = None;
             for step in 0..4 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_request(&mut stream);
@@ -3662,6 +3682,8 @@ mod tests {
                     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
                 assert!(wire.get("best_effort_output_fields").is_none());
                 let messages = wire["messages"].as_array().unwrap();
+                assert_eq!(messages.iter().filter(|m| m["role"] == "system").count(), 1);
+                assert_eq!(messages.iter().filter(|m| m["role"] == "user").count(), 1);
                 let system = messages
                     .iter()
                     .filter(|m| m["role"] == "system")
@@ -3679,14 +3701,27 @@ mod tests {
                 let user = messages.iter().find(|m| m["role"] == "user").unwrap()["content"]
                     .as_str()
                     .unwrap();
-                let input: Value = serde_json::from_str(user).unwrap();
+                let input: Value =
+                    serde_json::from_str(user.split("\n\n").next().unwrap()).unwrap();
+                assert!(!user.contains("Expected paragraph keys"));
+                assert!(!user.contains("# Citation structure"));
+                assert!(system.contains("# Citation structure"));
                 assert!(input["0"].is_string());
                 assert_eq!(input.as_object().unwrap().len(), 1);
                 if step < 3 {
+                    if let Some(previous) = &expert_system {
+                        assert_eq!(previous, &system);
+                    }
+                    expert_system = Some(system.clone());
                     assert!(system.contains("Expert translation and glossary"));
                     assert!(!system.contains("保留完全相同的键；每个值只能是对应译文字符串"));
                     if step > 0 {
-                        assert!(system.contains("输入法编辑器"));
+                        assert!(
+                            messages
+                                .iter()
+                                .filter(|m| m["role"] == "user")
+                                .any(|m| m["content"].to_string().contains("输入法编辑器"))
+                        );
                     }
                 } else {
                     assert!(!system.contains("Expert translation and glossary"));
@@ -3749,7 +3784,7 @@ mod translation_diagnostic_tests {
         assert!(message.contains("58"));
         assert!(message.contains("missing=[1]"));
         assert!(!message.contains("\u{516c}\u{5f0f}"));
-        let (kind, _) = translation_structure_error(&input("<torto-math-0/>"), "omitted").unwrap();
+        let (kind, _) = translation_structure_error(&input("<t-math-0/>"), "omitted").unwrap();
         assert_eq!(kind, "formula");
         let (_, message) = translation_structure_error(
             &input("<citation id=\"1\">Smith</citation>"),
@@ -3766,13 +3801,9 @@ mod translation_diagnostic_tests {
         .unwrap();
         assert_eq!(kind, "inline_citation");
         assert!(reason.contains("ID 0"));
-        let contract = translation_citation_contract(&[
-            plain,
-            input("Claim <citation id=\"1\">Smith</citation>"),
-        ])
-        .unwrap();
-        assert!(contract.contains(r#""0":[]"#));
-        assert!(contract.contains(r#""1":[1]"#));
+        let contract = translation_citation_contract();
+        assert!(contract.contains("already tagged in each input paragraph"));
+        assert!(contract.contains("do not create any"));
         assert!(contract.contains("NOT citation IDs"));
     }
 }

@@ -655,6 +655,59 @@ impl Page {
                 self.open = false;
             }
         }
+        egui::Panel::top("statistics-header")
+            .exact_size(44.0)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(palette().background))
+            .show(root, |ui| {
+                let header = ui.max_rect();
+                let content = header.shrink2(egui::vec2(16.0, 0.0));
+                #[cfg(target_os = "windows")]
+                let content = {
+                    crate::app::window_chrome::header(ui.ctx(), header);
+                    let right = (content.right()
+                        - crate::app::window_chrome::reserve_width(ui.ctx()))
+                    .max(content.left() + 1.0);
+                    egui::Rect::from_min_max(content.min, egui::pos2(right, content.bottom()))
+                };
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(content)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        ui.set_clip_rect(ui.clip_rect().intersect(content));
+                        ui.add_enabled_ui(!blocked, |ui| {
+                            let detail = self.selected.is_some();
+                            let back =
+                                icon_button(ui, Icon::ChevronLeft).on_hover_text(if detail {
+                                    language.text("返回概览", "Back to overview")
+                                } else {
+                                    language.text("返回书架", "Back to library")
+                                });
+                            #[cfg(target_os = "windows")]
+                            crate::app::window_chrome::exclude(ui.ctx(), back.rect);
+                            if back.clicked() {
+                                if detail {
+                                    self.selected = None;
+                                } else {
+                                    self.open = false;
+                                }
+                            }
+                            if detail {
+                                let library = icon_button(ui, Icon::Library)
+                                    .on_hover_text(language.text("返回书架", "Back to library"));
+                                #[cfg(target_os = "windows")]
+                                crate::app::window_chrome::exclude(ui.ctx(), library.rect);
+                                if library.clicked() {
+                                    self.selected = None;
+                                    self.open = false;
+                                }
+                            }
+                        });
+                    },
+                );
+            });
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -675,45 +728,6 @@ impl Page {
                 );
                 ui.scope_builder(egui::UiBuilder::new().max_rect(centered), |ui| {
                     ui.add_enabled_ui(!blocked, |ui| {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 44.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if self.selected.is_some() {
-                                    if icon_button(ui, Icon::ChevronLeft)
-                                        .on_hover_text(
-                                            language.text("返回概览", "Back to overview"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.selected = None;
-                                    }
-                                } else {
-                                    if icon_button(ui, Icon::ChevronLeft)
-                                        .on_hover_text(language.text("返回书架", "Back to library"))
-                                        .clicked()
-                                    {
-                                        self.open = false;
-                                    }
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if self.selected.is_some()
-                                            && icon_button(ui, Icon::Library)
-                                                .on_hover_text(
-                                                    language.text("返回书架", "Back to library"),
-                                                )
-                                                .clicked()
-                                        {
-                                            self.selected = None;
-                                            self.open = false;
-                                        }
-                                    },
-                                );
-                            },
-                        );
-                        ui.add_space(20.0);
                         if let Some(error) = &self.error {
                             ui.colored_label(palette().error_text, error);
                         }

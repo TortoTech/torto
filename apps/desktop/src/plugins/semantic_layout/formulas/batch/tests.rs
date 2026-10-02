@@ -121,7 +121,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
             },
         })
         .collect();
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .no_proxy()
         .timeout(Duration::from_secs(10))
         .build()
@@ -248,7 +248,7 @@ fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Op
             },
         })
         .collect();
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()

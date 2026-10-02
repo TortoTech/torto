@@ -31,6 +31,13 @@ not replace Developer ID signing/notarization or testing downloaded apps under
 Gatekeeper on independent Macs. The installer workflow tests macOS 15, not older
 systems.
 
+`torto --smoke-test-minimize OUTPUT [BOOK]` also sends the caption button's
+minimize viewport command after initial presentation, verifies that the native
+window minimized, restores it, and requires five seconds of successful rendering
+afterward. `OUTPUT` must be a fresh absolute directory. The report includes
+`minimize_check` and `minimize_restored` so a startup-only pass cannot be mistaken
+for a minimize/restore pass.
+
 The separate `Test macOS 27 startup` workflow runs on main pushes or manual
 dispatch. It builds the ARM64 Release app on macOS 15, transfers the signed app
 without rebuilding/re-signing, and runs the same five checks on `xcode-27`.

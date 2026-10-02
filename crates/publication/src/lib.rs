@@ -996,7 +996,7 @@ impl Default for Rgba {
 /// Renderer-independent inline presentation and semantic subset.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
-    /// AI-recognized inline bibliographic citation, numbered within its source paragraph.
+    /// Recognized inline bibliographic citation, numbered within its source paragraph.
     /// The text run retains the original text; only layout collapses its presentation.
     #[serde(default)]
     pub inline_citation: u32,

@@ -9,6 +9,7 @@ mod fonts;
 mod generated_metadata;
 mod generated_toc;
 mod highlights;
+mod http;
 mod library;
 mod persistence;
 mod platform;
@@ -36,6 +37,13 @@ use library::LocalLibrary;
 fn main() -> ExitCode {
     let result = run();
     let error = result.as_ref().err().map(ToString::to_string);
+    diagnostics::log(
+        "app.exit",
+        &[
+            diagnostics::Field::Bool("success", error.is_none()),
+            diagnostics::Field::Detail("error", error.as_deref().unwrap_or_default()),
+        ],
+    );
     let smoke_result = smoke::finish(error.as_deref());
     match result.and_then(|()| smoke_result.map_err(Into::into)) {
         Ok(()) => ExitCode::SUCCESS,
@@ -88,14 +96,21 @@ fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
     let Some(first) = arguments.next() else {
         return Ok(LaunchMode::Shelf);
     };
-    if first == "--smoke-test" || first == "--smoke-test-open-event" {
+    if first == "--smoke-test"
+        || first == "--smoke-test-open-event"
+        || first == "--smoke-test-minimize"
+    {
         let expects_open_event = first == "--smoke-test-open-event";
         let output = arguments.next().ok_or("missing smoke output directory")?;
         let book = arguments.next().map(PathBuf::from);
         if arguments.next().is_some() {
             return Err(usage(&executable).into());
         }
-        smoke::start(PathBuf::from(output), expects_open_event || book.is_some())?;
+        smoke::start(
+            PathBuf::from(output),
+            expects_open_event || book.is_some(),
+            first == "--smoke-test-minimize",
+        )?;
         return Ok(book.map_or(LaunchMode::Shelf, LaunchMode::Open));
     }
     let launch = LaunchMode::Open(PathBuf::from(first));

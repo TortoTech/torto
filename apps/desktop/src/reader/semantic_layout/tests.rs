@@ -48,6 +48,89 @@ impl BookSource for Fixture {
 struct EmptyHighlights;
 
 #[test]
+fn cached_formula_translation_recovers_its_snapshot_without_a_new_request() {
+    let (_, initial, _) = fixture();
+    let mut blocks = initial.blocks;
+    let raw = "In Jurafsky's examples, p = 0.92 and p = 0.28.";
+    if let Block::Text(block) = &mut blocks[1] {
+        block.content = vec![Inline::Text(TextRun {
+            text: raw.into(),
+            style: Default::default(),
+            link: None,
+        })];
+        block.source.as_mut().unwrap().end.text_offset = raw.chars().count() as u64;
+    }
+    let (mut reader, original, range) = fixture_with_blocks(blocks);
+    reader.plugin_settings.semantic_layout.enabled = true;
+    reader
+        .semantic_source
+        .configure("cached-formula-regression", &reader.plugin_settings);
+    let spans: Vec<_> = ["p = 0.92", "p = 0.28"].iter().map(|formula| {
+        let start = raw.find(formula).unwrap();
+        serde_json::json!({"start":start,"end":start+formula.len(),"original":formula,"latex":formula})
+    }).collect();
+    let recognition = serde_json::from_value(serde_json::json!({
+        "fingerprint":crate::plugins::semantic_layout::fingerprint(&original),
+        "formulas_checked":true,"skipped_groups":0,
+        "annotations":[{"TextFormulas":{"source":range,"spans":spans}}]
+    }))
+    .unwrap();
+    assert!(reader.semantic_source.install(0, recognition));
+    reader.translation.enabled = true;
+    reader.translation_source.set_enabled(true).unwrap();
+    reader
+        .translation_source
+        .set_mode(crate::plugins::TranslationMode::Replace)
+        .unwrap();
+    reader
+        .translation_source
+        .store_batch(
+            0,
+            &[crate::plugins::BlockTranslation {
+                block_index: 1,
+                segment_index: None,
+                text: "条件概率分别为 <t-math-0/> 和 <t-math-1/>。".into(),
+            }],
+        )
+        .unwrap();
+    // Reproduce reopening: translated text is cached, but the prepared snapshot is absent.
+    let before = reader.semantic_source.parse_section(0).unwrap();
+    assert!(!super::super::block_focus_text(&before.blocks[1]).contains("条件概率"));
+    assert_eq!(reader.translation_source.prepared_revision(), 0);
+    assert!(
+        reader
+            .missing_prepared(0, std::slice::from_ref(&range))
+            .unwrap()
+            .is_empty()
+    );
+    let restored = reader.semantic_source.parse_section(0).unwrap();
+    assert!(super::super::block_focus_text(&restored.blocks[1]).contains("条件概率"));
+    let Block::Text(text) = &restored.blocks[1] else {
+        panic!("paragraph expected")
+    };
+    assert_eq!(
+        text.content
+            .iter()
+            .filter(|i| matches!(i, Inline::Math(_)))
+            .count(),
+        2
+    );
+    let revision = reader.translation_source.prepared_revision();
+    assert!(revision > 0);
+    assert!(reader.refresh_changed_translation_inputs(false));
+    let reflow = reader.semantic_layout.reflow_version;
+    assert!(
+        reader
+            .missing_prepared(0, std::slice::from_ref(&range))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(reader.translation_source.prepared_revision(), revision);
+    assert!(!reader.refresh_changed_translation_inputs(false));
+    assert_eq!(reader.semantic_layout.reflow_version, reflow);
+}
+
+#[test]
 fn translation_keeps_inflight_work_until_a_ready_replacement_exists() {
     let (mut reader, original, _) = fixture();
     let inputs = crate::plugins::prepare_translation_inputs(&original, false);

@@ -7,12 +7,18 @@ use rig_core::http_client::{
 };
 use serde_json::{Value, json};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct CompatHttp(
-    pub reqwest_rig::Client,
+    pub reqwest::Client,
     pub Vec<Value>,
     pub Option<std::sync::Arc<std::sync::Mutex<Vec<crate::plugins::web_search::WebSource>>>>,
 );
+
+impl Default for CompatHttp {
+    fn default() -> Self {
+        Self(crate::http::client(), Vec::new(), None)
+    }
+}
 
 impl CompatHttp {
     fn prepare<T: Into<Bytes>>(&self, request: Request<T>) -> Request<Bytes> {

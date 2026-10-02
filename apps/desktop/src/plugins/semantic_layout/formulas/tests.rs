@@ -332,7 +332,7 @@ fn live_computational_formula_images() {
         .find(|p| p.models.iter().any(|m| m.id == "gemini/lite"))
         .unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .timeout(Duration::from_secs(90))
         .build()
         .unwrap();

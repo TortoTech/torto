@@ -328,6 +328,13 @@ fn four_modes_have_identical_results_and_distinct_wire_contracts() {
         let requests = handle.join().unwrap();
         let request = &requests[0];
         let messages = request["messages"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .count(),
+            1
+        );
         for instruction in [
             "Follow the task rules",
             "Additional rules",
@@ -341,6 +348,13 @@ fn four_modes_have_identical_results_and_distinct_wire_contracts() {
             assert_eq!(matching[0]["role"], "system");
         }
         assert_eq!(messages.last().unwrap()["role"], "user");
+        if matches!(mode, OutputMode::Prompt | OutputMode::JsonObject) {
+            let system = messages[0]["content"].to_string();
+            assert!(
+                system.find("Follow the task rules").unwrap()
+                    < system.find("JSON Schema:").unwrap()
+            );
+        }
         match mode {
             OutputMode::Native => assert_eq!(request["response_format"]["type"], "json_schema"),
             OutputMode::Tool => {
@@ -499,13 +513,13 @@ fn invalid_json_schema_and_invalid_results_are_not_capability_failures() {
 fn only_explicit_capability_errors_allow_fallback() {
     for status in [401, 403, 429, 500] {
         let error = CompletionError::from_http_response(
-            reqwest_rig::StatusCode::from_u16(status).unwrap(),
+            reqwest::StatusCode::from_u16(status).unwrap(),
             r#"{"error":{"message":"response_format unsupported"}}"#,
         );
         assert!(!can_fallback(&error));
     }
     let error = CompletionError::from_http_response(
-        reqwest_rig::StatusCode::BAD_REQUEST,
+        reqwest::StatusCode::BAD_REQUEST,
         r#"{"error":{"message":"invalid schema: required is missing"}}"#,
     );
     assert!(!can_fallback(&error));

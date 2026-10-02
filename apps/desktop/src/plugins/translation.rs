@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use rebook_publication::{
@@ -10,11 +10,21 @@ use rebook_publication::{
 };
 
 use super::TranslationMode;
+mod diagnostics;
 #[cfg(test)]
 use super::search::text_block_text;
 
-const MATH_PLACEHOLDER_PREFIX: &str = "<torto-math-";
+const MATH_PLACEHOLDER_PREFIX: &str = "<t-math-";
 const MATH_PLACEHOLDER_SUFFIX: &str = "/>";
+
+// Normalize old cached protocol tags on read; newly generated requests use t-.
+fn normalize_legacy_placeholder_tags(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains("<torto-") || text.contains("</torto-") {
+        std::borrow::Cow::Owned(text.replace("<torto-", "<t-").replace("</torto-", "</t-"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranslationBlockInput {
@@ -68,10 +78,29 @@ struct TranslationState {
 pub struct TranslationBookSource {
     inner: Arc<dyn BookSource>,
     fixed_page_replacement_only: AtomicBool,
+    prepared_revision: AtomicU64,
     state: RwLock<TranslationState>,
 }
 
 impl TranslationBookSource {
+    pub(crate) fn prepared_revision(&self) -> u64 {
+        self.prepared_revision.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn inputs_for_ranges(
+        inputs: &[(TranslationBlockInput, SourceRange)],
+        ranges: &[SourceRange],
+    ) -> Vec<(TranslationBlockInput, SourceRange)> {
+        inputs
+            .iter()
+            .filter(|(_, source)| {
+                ranges
+                    .iter()
+                    .any(|range| source_range_nodes_overlap(source, range))
+            })
+            .cloned()
+            .collect()
+    }
     pub(crate) fn untranslated_prepared(
         &self,
         index: usize,
@@ -149,6 +178,7 @@ impl TranslationBookSource {
         Self {
             inner,
             fixed_page_replacement_only: AtomicBool::new(fixed_page_replacement_only),
+            prepared_revision: AtomicU64::new(0),
             state: RwLock::new(TranslationState {
                 mode,
                 ..TranslationState::default()
@@ -192,12 +222,28 @@ impl TranslationBookSource {
         prepared: &Block,
     ) {
         if let Ok(mut state) = self.state.write() {
-            if raw != prepared {
+            let changed = if raw != prepared {
+                if state.prepared_inputs.get(&(section, index)).is_some_and(
+                    |(old_raw, old_prepared)| old_raw == raw && old_prepared == prepared,
+                ) {
+                    return;
+                }
                 state
                     .prepared_inputs
                     .insert((section, index), (raw.clone(), prepared.clone()));
+                true
             } else {
-                state.prepared_inputs.remove(&(section, index));
+                state.prepared_inputs.remove(&(section, index)).is_some()
+            };
+            // New requests publish via store_batch/commit_together. Only repairing
+            // an already cached translation needs an additional reader reflow.
+            if changed
+                && state
+                    .sections
+                    .get(&section)
+                    .is_some_and(|entries| entries.contains_key(&index))
+            {
+                self.prepared_revision.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -208,6 +254,9 @@ impl TranslationBookSource {
             .write()
             .map_err(|_| "Translation state poisoned".to_owned())?;
         state.sections.clear();
+        if !state.prepared_inputs.is_empty() {
+            self.prepared_revision.fetch_add(1, Ordering::Relaxed);
+        }
         state.prepared_inputs.clear();
         Ok(())
     }
@@ -227,6 +276,7 @@ impl TranslationBookSource {
         ))
     }
 
+    #[cfg(test)]
     pub fn untranslated_blocks_for_ranges(
         &self,
         section_index: usize,
@@ -661,12 +711,41 @@ impl BookSource for TranslationBookSource {
                 rendered.push(block);
                 continue;
             };
-            let block = state
-                .prepared_inputs
-                .get(&(index, block_index))
-                .filter(|(raw, prepared)| {
-                    raw == &block && prepared_input_matches(prepared, translation)
-                })
+            let candidate = state.prepared_inputs.get(&(index, block_index));
+            let raw_matches = candidate.is_some_and(|(raw, _)| raw == &block);
+            let prepared_matches = raw_matches
+                && candidate
+                    .is_some_and(|(_, prepared)| prepared_input_matches(prepared, translation));
+            if cfg!(debug_assertions)
+                && translation
+                    .whole
+                    .iter()
+                    .chain(translation.segments.values())
+                    .any(|text| text.contains("<t-math-") || text.contains("<torto-math-"))
+                && diagnostics::formula_mismatch(
+                    candidate
+                        .filter(|_| prepared_matches)
+                        .map_or(&block, |(_, prepared)| prepared),
+                    translation,
+                )
+            {
+                diagnostics::event(
+                    "translation.prepared_input_unavailable",
+                    serde_json::json!({
+                    "book":self.book().id,"title":self.book().metadata.title,"section":index,"block":block_index,
+                    "selected_input":if prepared_matches { "prepared" } else { "raw" },
+                    "raw_matches_snapshot":raw_matches,"prepared_structure_matches":prepared_matches,
+                    "reason":if prepared_matches { "prepared_formula_mismatch" } else if candidate.is_none() { "missing_snapshot" } else if !raw_matches { "raw_changed" } else { "prepared_structure_mismatch" },
+                        "current_raw":diagnostics::block(&block),
+                        "remembered_raw":candidate.map(|(raw,_)| diagnostics::block(raw)),
+                        "prepared":candidate.map(|(_,prepared)| diagnostics::block(prepared)),
+                        "translation_whole":translation.whole.as_deref().map(diagnostics::translated),
+                        "translation_segments":translation.segments.iter().take(12).map(|(segment,text)| serde_json::json!({"segment":segment,"text":diagnostics::translated(text)})).collect::<Vec<_>>()
+                    }),
+                );
+            }
+            let block = candidate
+                .filter(|_| prepared_matches)
                 .map_or(block, |(_, prepared)| prepared.clone());
             match block {
                 Block::Text(mut original) => {
@@ -1278,7 +1357,7 @@ fn translation_text(block: &TextBlock) -> String {
                 }
                 text.push_str("</inlinefootnote>");
             } else {
-                text.push_str(&format!("<torto-note-{}/>", note.start));
+                text.push_str(&format!("<t-note-{}/>", note.start));
             }
             continue;
         }
@@ -1290,7 +1369,7 @@ fn translation_text(block: &TextBlock) -> String {
                     .and_then(PublicationUrl::website_url)
                     .is_some() =>
             {
-                text.push_str(&format!("<torto-web-{website}/>"));
+                text.push_str(&format!("<t-web-{website}/>"));
                 website += 1;
             }
             Inline::Text(run) => push_translation_style_markup(&mut text, run),
@@ -1329,6 +1408,8 @@ fn push_math_placeholder(output: &mut String, index: usize) {
 }
 
 fn math_placeholder_indices(text: &str) -> Result<Vec<usize>, ()> {
+    let normalized = normalize_legacy_placeholder_tags(text);
+    let text = normalized.as_ref();
     let mut rest = text;
     let mut indices = Vec::new();
     while let Some(start) = rest.find(MATH_PLACEHOLDER_PREFIX) {
@@ -1365,8 +1446,8 @@ pub(super) fn validate_translation_math_placeholders(
 fn push_translation_style_markup(output: &mut String, run: &TextRun) {
     let mut closing = Vec::new();
     if let Some(scale) = run.style.keyword_size_scale {
-        output.push_str(&format!("<torto-size scale=\"{scale}\">"));
-        closing.push("</torto-size>");
+        output.push_str(&format!("<t-size scale=\"{scale}\">"));
+        closing.push("</t-size>");
     }
     if run.style.inline_role == InlineRole::Footnote {
         output.push_str("<inlinefootnote>");
@@ -1401,8 +1482,8 @@ fn push_translation_style_markup(output: &mut String, run: &TextRun) {
     }
     if run.style.italic && !run.style.emphasis && !run.style.alternate_voice && !run.style.citation
     {
-        output.push_str("<torto-italic>");
-        closing.push("</torto-italic>");
+        output.push_str("<t-italic>");
+        closing.push("</t-italic>");
     }
     if run.style.underline {
         output.push_str("<u>");
@@ -1426,6 +1507,21 @@ fn push_translation_style_markup(output: &mut String, run: &TextRun) {
 }
 
 fn replacement_block_content(text: &str, style: TextStyle, original: &TextBlock) -> Vec<Inline> {
+    let math_count = original
+        .content
+        .iter()
+        .filter(|inline| matches!(inline, Inline::Math(_)))
+        .count();
+    if cfg!(debug_assertions) && validate_math_placeholder_count(text, math_count).is_err() {
+        diagnostics::event(
+            "translation.formula_restore_fallback",
+            serde_json::json!({
+                "source":original.source,"kind":format!("{:?}",original.kind),
+                "original":diagnostics::inlines(&original.content),"translation":diagnostics::translated(text),
+                "expected_ids":(0..math_count).take(40).collect::<Vec<_>>(), "action":"keep_original"
+            }),
+        );
+    }
     let mut content = replacement_content(text, style, Some(&original.content));
     if matches!(original.kind, TextBlockKind::Heading(_)) {
         restore_heading_number_space(&original.content, &mut content);
@@ -1482,17 +1578,27 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
             Inline::Text(_) | Inline::Image(_) | Inline::Break => None,
         })
         .collect::<Vec<_>>();
-    if !math.is_empty() && validate_math_placeholder_count(&text, math.len()).is_err() {
+    if validate_math_placeholder_count(&text, math.len()).is_err() {
         // Never degrade structured formulas into untranslated LaTeX text. This
         // also safely handles translations cached by versions that exposed
         // formulas to the model as `$...$`.
-        return original.to_vec();
+        return if has_source {
+            original.to_vec()
+        } else {
+            // Without a source, preserve the supplied text rather than interpreting
+            // an unresolved placeholder as an index into an empty formula list.
+            vec![Inline::Text(TextRun {
+                text,
+                style,
+                link: None,
+            })]
+        };
     }
     let website_count = original.iter().filter(|inline| matches!(inline, Inline::Text(run) if run.link.as_ref().and_then(PublicationUrl::website_url).is_some())).count();
     if website_count > 0 && web_placeholder_ids(&text).ok() != Some((0..website_count).collect()) {
         return original.to_vec();
     }
-    if has_source && (text.contains("<torto-note-") || text.contains("<inlinefootnote id=")) {
+    if has_source && (text.contains("<t-note-") || text.contains("<inlinefootnote id=")) {
         let source = translation_text(&TextBlock {
             content: original.to_vec(),
             kind: TextBlockKind::Paragraph,
@@ -1602,10 +1708,17 @@ fn append_translated_span(
         append_translated_text(content, &rest[..start], style, original);
         let token = &rest[start + MATH_PLACEHOLDER_PREFIX.len()..];
         let digit_count = token.bytes().take_while(u8::is_ascii_digit).count();
-        let index = token[..digit_count]
+        let formula = token[..digit_count]
             .parse::<usize>()
-            .expect("validated formula placeholder should contain an index");
-        content.push(Inline::Math(math[index].clone()));
+            .ok()
+            .and_then(|index| math.get(index));
+        let Some(formula) =
+            formula.filter(|_| token[digit_count..].starts_with(MATH_PLACEHOLDER_SUFFIX))
+        else {
+            append_translated_text(content, rest, style, original);
+            return;
+        };
+        content.push(Inline::Math(formula.clone()));
         rest = &token[digit_count + MATH_PLACEHOLDER_SUFFIX.len()..];
     }
     append_translated_text(content, rest, style, original);
@@ -1617,8 +1730,8 @@ fn append_translated_text(
     style: TextStyle,
     original: &[Inline],
 ) {
-    if let Some(start) = text.find("<torto-note-") {
-        let token = &text[start + "<torto-note-".len()..];
+    if let Some(start) = text.find("<t-note-") {
+        let token = &text[start + "<t-note-".len()..];
         if let Some(end) = token.find("/>")
             && let Ok(index) = token[..end].parse::<usize>()
         {
@@ -1639,8 +1752,8 @@ fn append_translated_text(
             }
         }
     }
-    if let Some(start) = text.find("<torto-web-") {
-        let token = &text[start + 11..];
+    if let Some(start) = text.find("<t-web-") {
+        let token = &text[start + "<t-web-".len()..];
         if let Some(end) = token.find("/>")
             && let Ok(index) = token[..end].parse::<usize>()
             && let Some(Inline::Text(run)) = original.iter().filter(|inline|matches!(inline,Inline::Text(run) if run.link.as_ref().and_then(PublicationUrl::website_url).is_some())).nth(index)
@@ -1727,6 +1840,8 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
 }
 
 fn normalize_translation_spacing(text: &str) -> String {
+    let normalized = normalize_legacy_placeholder_tags(text);
+    let text = normalized.as_ref();
     text.split('\n')
         .map(normalize_translation_line_spacing)
         .collect::<Vec<_>>()
@@ -1864,7 +1979,7 @@ fn parse_inline_style_markup(
             }
             if tag == TranslationStyleTag::KeywordSize {
                 let scale = token
-                    .strip_prefix("<torto-size scale=\"")?
+                    .strip_prefix("<t-size scale=\"")?
                     .strip_suffix("\">")?
                     .parse::<f32>()
                     .ok()?;
@@ -1892,7 +2007,7 @@ fn parse_inline_style_markup(
 fn next_translation_style_tag(text: &str) -> Option<(usize, TranslationStyleTag, bool, &str)> {
     let fixed = [
         ("</citation>", TranslationStyleTag::InlineCitation, false),
-        ("</torto-size>", TranslationStyleTag::KeywordSize, false),
+        ("</t-size>", TranslationStyleTag::KeywordSize, false),
         ("<strong>", TranslationStyleTag::Bold, true),
         ("</strong>", TranslationStyleTag::Bold, false),
         ("<b>", TranslationStyleTag::Bold, true),
@@ -1903,13 +2018,9 @@ fn next_translation_style_tag(text: &str) -> Option<(usize, TranslationStyleTag,
         ("</i>", TranslationStyleTag::AlternateVoice, false),
         ("<cite>", TranslationStyleTag::Citation, true),
         ("</cite>", TranslationStyleTag::Citation, false),
+        ("<t-italic>", TranslationStyleTag::PresentationItalic, true),
         (
-            "<torto-italic>",
-            TranslationStyleTag::PresentationItalic,
-            true,
-        ),
-        (
-            "</torto-italic>",
+            "</t-italic>",
             TranslationStyleTag::PresentationItalic,
             false,
         ),
@@ -1937,7 +2048,7 @@ fn next_translation_style_tag(text: &str) -> Option<(usize, TranslationStyleTag,
     .into_iter()
     .filter_map(|(token, tag, opening)| text.find(token).map(|index| (index, tag, opening, token)))
     .min_by_key(|(index, _, opening, _)| (*index, !*opening));
-    let sized = text.find("<torto-size scale=\"").and_then(|start| {
+    let sized = text.find("<t-size scale=\"").and_then(|start| {
         let end = text[start..].find('>')? + start + 1;
         Some((
             start,
@@ -2031,7 +2142,7 @@ fn restore_original_baselines(
     };
     let explicit_notes: Vec<_> = rebook_layout::paragraph_footnotes(&block)
         .into_iter()
-        .filter(|range| text.contains(&format!("<torto-note-{}/>", range.start)))
+        .filter(|range| text.contains(&format!("<t-note-{}/>", range.start)))
         .collect();
     let original_length = original
         .iter()
@@ -2112,7 +2223,7 @@ fn best_marker_match(
     target_length: usize,
 ) -> Option<usize> {
     let protected: Vec<_> = text
-        .match_indices("<torto-")
+        .match_indices("<t-")
         .filter_map(|(start, _)| text[start..].find("/>").map(|end| start..start + end + 2))
         .collect();
     text[cursor..]
@@ -2415,9 +2526,9 @@ mod tests {
             source: None,
         };
 
-        assert_eq!(translation_text(&block), "Meaning<torto-note-1/>");
+        assert_eq!(translation_text(&block), "Meaning<t-note-1/>");
         assert_eq!(
-            replacement_content("??<torto-note-23/>", TextStyle::default(), Some(&original)),
+            replacement_content("??<t-note-23/>", TextStyle::default(), Some(&original)),
             original,
             "Unknown source note identities must never leak into the reading view"
         );
@@ -2500,12 +2611,12 @@ mod tests {
 
         assert_eq!(
             translation_text(&block),
-            "First <torto-math-0/>, then <torto-math-1/>"
+            "First <t-math-0/>, then <t-math-1/>"
         );
         assert!(!translation_text(&block).contains("E=mc"));
 
         let translated = replacement_content(
-            "先计算 <torto-math-1/>，再使用 <strong><torto-math-0/></strong>。",
+            "先计算 <t-math-1/>，再使用 <strong><t-math-0/></strong>。",
             TextStyle::default(),
             Some(&original),
         );
@@ -2542,6 +2653,89 @@ mod tests {
     }
 
     #[test]
+    fn cached_formula_placeholders_without_current_source_math_do_not_panic() {
+        let original = vec![Inline::Text(TextRun {
+            text: "Current paragraph without recognized formulas.".into(),
+            style: TextStyle::default(),
+            link: None,
+        })];
+        for text in [
+            "译文 <t-math-0/>",
+            "<strong><t-math-0/></strong>",
+            "<t-math-99/>",
+            "<t-math-bad/>",
+            "<t-math-0>",
+        ] {
+            assert_eq!(
+                replacement_content(text, TextStyle::default(), Some(&original)),
+                original
+            );
+            assert!(replacement_content(text, TextStyle::default(), Some(&[])).is_empty());
+            let content = replacement_content(text, TextStyle::default(), None);
+            assert!(matches!(&content[..], [Inline::Text(run)] if run.text == text));
+        }
+        let mut content = Vec::new();
+        append_translated_span(
+            &mut content,
+            "<t-math-0/>",
+            TextStyle::default(),
+            &original,
+            &[],
+        );
+        assert!(!content.is_empty());
+    }
+
+    #[test]
+    fn compact_protocol_preserves_legacy_cached_tags() {
+        let original = vec![
+            Inline::Text(TextRun {
+                text: "Value ".into(),
+                style: TextStyle {
+                    italic: true,
+                    keyword_size_scale: Some(0.75),
+                    ..Default::default()
+                },
+                link: None,
+            }),
+            Inline::Math(rebook_publication::MathRun {
+                original: None,
+                latex: "x".into(),
+                display: false,
+                size_scale: 1.0,
+            }),
+        ];
+        let block = TextBlock {
+            content: original.clone(),
+            kind: TextBlockKind::Paragraph,
+            style: Default::default(),
+            source: None,
+        };
+        let compact = translation_text(&block);
+        assert!(compact.contains("<t-math-0/>"));
+        assert!(compact.contains("<t-italic>"));
+        assert!(compact.contains("<t-size"));
+        assert!(!compact.contains("torto-"));
+        let legacy = compact
+            .replace("<t-", "<torto-")
+            .replace("</t-", "</torto-");
+        assert_eq!(
+            replacement_content(&compact, TextStyle::default(), Some(&original)),
+            replacement_content(&legacy, TextStyle::default(), Some(&original))
+        );
+        assert!(validate_translation_math_placeholders(&compact, &legacy).is_ok());
+        assert!(validate_translation_footnotes("Text<t-note-1/>", "译文<torto-note-1/>").is_ok());
+        assert!(validate_translation_websites("<t-web-0/>", "<torto-web-0/>").is_ok());
+        assert!(
+            validate_translation_math_placeholders("<t-math-0/>", "<torto-math-0/><t-math-0/>")
+                .is_err()
+        );
+        assert_eq!(
+            normalize_legacy_placeholder_tags("https://example.com/torto-note-0"),
+            "https://example.com/torto-note-0"
+        );
+    }
+
+    #[test]
     fn formula_only_blocks_are_not_sent_for_translation() {
         let block = TextBlock {
             kind: TextBlockKind::Paragraph,
@@ -2562,35 +2756,31 @@ mod tests {
     fn translated_math_placeholders_must_be_complete_and_unique() {
         assert!(
             validate_translation_math_placeholders(
-                "Use <torto-math-0/> and <torto-math-1/>.",
-                "使用 <torto-math-1/> 和 <torto-math-0/>。"
+                "Use <t-math-0/> and <t-math-1/>.",
+                "使用 <t-math-1/> 和 <t-math-0/>。"
             )
             .is_ok()
         );
         assert!(
             validate_translation_math_placeholders(
-                "Use <torto-math-0/> and <torto-math-1/>.",
-                "使用 <torto-math-0/>。"
+                "Use <t-math-0/> and <t-math-1/>.",
+                "使用 <t-math-0/>。"
             )
             .is_err()
         );
         assert!(
             validate_translation_math_placeholders(
-                "Use <torto-math-0/> and <torto-math-1/>.",
-                "使用 <torto-math-0/>、<torto-math-1/> 和 <torto-math-1/>。"
+                "Use <t-math-0/> and <t-math-1/>.",
+                "使用 <t-math-0/>、<t-math-1/> 和 <t-math-1/>。"
             )
             .is_err()
         );
         assert!(
-            validate_translation_math_placeholders(
-                "Use <torto-math-0/>.",
-                "使用 <torto-math-0 />。"
-            )
-            .is_err()
-        );
-        assert!(
-            validate_translation_math_placeholders("No formula.", "无公式 <torto-math-0/>。")
+            validate_translation_math_placeholders("Use <t-math-0/>.", "使用 <t-math-0 />。")
                 .is_err()
+        );
+        assert!(
+            validate_translation_math_placeholders("No formula.", "无公式 <t-math-0/>。").is_err()
         );
     }
 
@@ -2619,7 +2809,7 @@ mod tests {
             source: None,
         };
 
-        assert_eq!(translation_text(&block), "Meaning<torto-note-1/>");
+        assert_eq!(translation_text(&block), "Meaning<t-note-1/>");
         let translated = replacement_content(
             "含义<noteref>【3】</noteref>",
             TextStyle::default(),
@@ -2659,14 +2849,16 @@ mod tests {
             }),
         ];
         for translated in [
-            "预测输入法<torto-note-1/>正逐渐普及，在1970年已有争论。",
-            "<em>预测输入法</em><torto-note-1/>正逐渐普及，在1970年已有争论。",
+            "预测输入法<t-note-1/>正逐渐普及，在1970年已有争论。",
+            "<em>预测输入法</em><t-note-1/>正逐渐普及，在1970年已有争论。",
         ] {
             let content = replacement_content(translated, TextStyle::default(), Some(&original));
             assert_eq!(content.iter().filter(|inline| matches!(inline, Inline::Text(run) if run.link.as_ref() == Some(&target) && run.text == "1" && run.style.baseline == TextBaseline::Superscript)).count(), 1);
-            assert!(!content.iter().any(
-                |inline| matches!(inline, Inline::Text(run) if run.text.contains("torto-note"))
-            ));
+            assert!(
+                !content.iter().any(
+                    |inline| matches!(inline, Inline::Text(run) if run.text.contains("t-note"))
+                )
+            );
             assert!(content.iter().any(|inline| matches!(inline, Inline::Text(run) if run.text.contains("1970") && run.style.baseline == TextBaseline::Normal)));
         }
     }
@@ -2674,12 +2866,12 @@ mod tests {
     #[test]
     fn legacy_baseline_matching_never_splits_structural_tokens() {
         for prefix in ["note", "web", "math"] {
-            let text = format!("value<torto-{prefix}-1/> then 1");
+            let text = format!("value<t-{prefix}-1/> then 1");
             assert_eq!(
                 best_marker_match(&text, "1", 0, 0, text.chars().count()),
                 Some(text.len() - 1)
             );
-            let only_token = format!("<torto-{prefix}-1/>");
+            let only_token = format!("<t-{prefix}-1/>");
             assert_eq!(
                 best_marker_match(&only_token, "1", 0, 0, only_token.len()),
                 None
@@ -2707,8 +2899,8 @@ mod tests {
             source: None,
         };
         let input = translation_text(&block);
-        assert_eq!(input, "<torto-note-0/><torto-note-1/>");
-        let translated = "Second<torto-note-1/> first<torto-note-0/>";
+        assert_eq!(input, "<t-note-0/><t-note-1/>");
+        let translated = "Second<t-note-1/> first<t-note-0/>";
         assert!(validate_translation_footnotes(&input, translated).is_ok());
         let content = replacement_content(translated, TextStyle::default(), Some(&original));
         let links: Vec<_> = content
@@ -2726,17 +2918,17 @@ mod tests {
             ]
         );
         for invalid in [
-            "<torto-note-0/>",
-            "<torto-note-0/><torto-note-0/>",
-            "<torto-note-0/><torto-note-2/>",
-            "<torto-note-x/>",
+            "<t-note-0/>",
+            "<t-note-0/><t-note-0/>",
+            "<t-note-0/><t-note-2/>",
+            "<t-note-x/>",
         ] {
             assert!(
                 validate_translation_footnotes(&input, invalid).is_err(),
                 "{invalid}"
             );
         }
-        assert!(validate_translation_footnotes("Plain", "<torto-note-0/>").is_err());
+        assert!(validate_translation_footnotes("Plain", "<t-note-0/>").is_err());
         // Ambiguous legacy markers must never silently link to the first note.
         assert!(
             translated_footnote_link(
@@ -2964,10 +3156,10 @@ mod tests {
         };
         assert_eq!(
             translation_text(&block),
-            "<torto-size scale=\"0.75\">text</torto-size>text<torto-size scale=\"1.5\">text</torto-size>"
+            "<t-size scale=\"0.75\">text</t-size>text<t-size scale=\"1.5\">text</t-size>"
         );
         let translated = replacement_content(
-            "<torto-size scale=\"0.75\">小字</torto-size>正文<torto-size scale=\"1.5\"><em>大字</em></torto-size>",
+            "<t-size scale=\"0.75\">小字</t-size>正文<t-size scale=\"1.5\"><em>大字</em></t-size>",
             TextStyle::default(),
             Some(&block.content),
         );
@@ -3029,10 +3221,10 @@ mod tests {
 
         assert_eq!(
             translation_text(&block),
-            "<em>emphasis</em><i> alternate</i><torto-italic> visual</torto-italic>"
+            "<em>emphasis</em><i> alternate</i><t-italic> visual</t-italic>"
         );
         let translated = replacement_content(
-            "<em>强调</em><i>术语</i><torto-italic>视觉斜体</torto-italic>",
+            "<em>强调</em><i>术语</i><t-italic>视觉斜体</t-italic>",
             TextStyle::default(),
             Some(&original),
         );
@@ -3093,11 +3285,11 @@ mod tests {
         };
         assert_eq!(
             translation_text(&block),
-            "<strong><torto-italic>Look at this sentence</torto-italic></strong>. The rest is normal.<sup>54</sup>"
+            "<strong><t-italic>Look at this sentence</t-italic></strong>. The rest is normal.<sup>54</sup>"
         );
 
         let translated = replacement_content(
-            "<strong><torto-italic>看看这个句子</torto-italic></strong>。其余内容正常。<sup>54</sup>",
+            "<strong><t-italic>看看这个句子</t-italic></strong>。其余内容正常。<sup>54</sup>",
             emphasized,
             Some(&original),
         );
@@ -3741,10 +3933,12 @@ mod citation_translation_tests {
 }
 
 fn web_placeholder_ids(text: &str) -> Result<Vec<usize>, String> {
+    let normalized = normalize_legacy_placeholder_tags(text);
+    let text = normalized.as_ref();
     let mut rest = text;
     let mut ids = Vec::new();
-    while let Some(start) = rest.find("<torto-web-") {
-        rest = &rest[start + 11..];
+    while let Some(start) = rest.find("<t-web-") {
+        rest = &rest[start + "<t-web-".len()..];
         let end = rest.find("/>").ok_or("Malformed website placeholder")?;
         let id = rest[..end]
             .parse::<usize>()
@@ -3781,14 +3975,11 @@ mod website_translation_tests {
             })],
         };
         let input = translation_text(&block);
-        assert_eq!(input, "<torto-web-0/>");
-        assert!(validate_translation_websites(&input, "See <torto-web-0/>").is_ok());
+        assert_eq!(input, "<t-web-0/>");
+        assert!(validate_translation_websites(&input, "See <t-web-0/>").is_ok());
         assert!(validate_translation_websites(&input, "See site").is_err());
-        let result = replacement_content(
-            "See <torto-web-0/>",
-            TextStyle::default(),
-            Some(&block.content),
-        );
+        let result =
+            replacement_content("See <t-web-0/>", TextStyle::default(), Some(&block.content));
         assert!(result.iter().any(|i|matches!(i,Inline::Text(r) if r.link.as_ref().and_then(PublicationUrl::website_url)==Some("https://example.com/path?q=1#part"))));
     }
 }
@@ -3796,9 +3987,11 @@ mod website_translation_tests {
 /// IDs refer to source inline positions, never to the displayed paragraph number.
 pub(super) fn validate_translation_footnotes(source: &str, translated: &str) -> Result<(), String> {
     fn ids(text: &str) -> Result<Vec<(bool, usize)>, String> {
+        let normalized = normalize_legacy_placeholder_tags(text);
+        let text = normalized.as_ref();
         let mut ids = Vec::new();
         for (inline, prefix, suffix) in [
-            (false, "<torto-note-", "/>"),
+            (false, "<t-note-", "/>"),
             (true, "<inlinefootnote id=\"", "\">"),
         ] {
             let mut rest = text;

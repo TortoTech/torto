@@ -8,6 +8,7 @@ struct Check {
     output: PathBuf,
     started: Instant,
     expects_book: bool,
+    exercise_minimize: bool,
     state: Mutex<State>,
 }
 #[derive(Default)]
@@ -17,6 +18,8 @@ struct State {
     frames: u64,
     completed: bool,
     gpu_error: Option<String>,
+    minimized_at: Option<Instant>,
+    restored: bool,
 }
 
 impl State {
@@ -40,7 +43,11 @@ impl State {
     }
 }
 
-pub(crate) fn start(output: PathBuf, expects_book: bool) -> Result<(), String> {
+pub(crate) fn start(
+    output: PathBuf,
+    expects_book: bool,
+    exercise_minimize: bool,
+) -> Result<(), String> {
     if !output.is_absolute() {
         return Err("smoke output directory must be absolute".into());
     }
@@ -52,6 +59,7 @@ pub(crate) fn start(output: PathBuf, expects_book: bool) -> Result<(), String> {
             output,
             started: Instant::now(),
             expects_book,
+            exercise_minimize,
             state: Mutex::new(State::default()),
         })
         .map_err(|_| "smoke check already initialized")?;
@@ -66,6 +74,53 @@ pub(crate) fn start(output: PathBuf, expects_book: bool) -> Result<(), String> {
 
 pub(crate) fn enabled() -> bool {
     CHECK.get().is_some()
+}
+
+/// Exercise the same viewport command as the caption button, then restore the
+/// native window without needing a rendered frame while it is minimized.
+pub(crate) fn window_tick(
+    ctx: &egui::Context,
+    window: &winit::window::Window,
+) -> Result<(), String> {
+    let Some(check) = CHECK.get().filter(|check| check.exercise_minimize) else {
+        return Ok(());
+    };
+    let action = {
+        let mut state = check.state.lock().unwrap();
+        if state.minimized_at.is_none() && state.frames >= 2 {
+            state.minimized_at = Some(Instant::now());
+            state.ready_at = None;
+            state.frames = 0;
+            state.completed = false;
+            Some(true)
+        } else if !state.restored
+            && state
+                .minimized_at
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            state.restored = true;
+            Some(false)
+        } else {
+            None
+        }
+    };
+    match action {
+        Some(true) => {
+            stage("minimize-requested");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            window.request_redraw();
+        }
+        Some(false) => {
+            if window.is_minimized() != Some(true) {
+                return Err("smoke window did not minimize".into());
+            }
+            stage("restore-requested");
+            window.set_minimized(false);
+            window.request_redraw();
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn project_dirs() -> Option<directories::ProjectDirs> {
@@ -207,11 +262,16 @@ pub(crate) fn finish(error: Option<&str>) -> Result<(), String> {
     let state = check.state.lock().unwrap();
     let error = error
         .or(state.gpu_error.as_deref())
+        .or_else(|| {
+            (check.exercise_minimize && !state.restored)
+                .then_some("minimize/restore check did not complete")
+        })
         .or_else(|| (!state.completed).then_some("exited before startup check completed"));
     let report = serde_json::json!({
         "success": error.is_none(), "error": error, "pid": std::process::id(),
         "arch": std::env::consts::ARCH, "os": std::env::consts::OS,
         "book": check.expects_book, "frames": state.frames,
+        "minimize_check": check.exercise_minimize, "minimize_restored": state.restored,
         "elapsed_ms": check.started.elapsed().as_millis(),
     });
     std::fs::write(

@@ -2,6 +2,316 @@ use super::super::tests::{section, text};
 use super::*;
 use rebook_publication::TextRun;
 
+#[test]
+fn heuristic_author_groups_handle_multiple_works_years_and_name_periods() {
+    for value in [
+        "(Just & Carpenter, 1992; Just & Varma, 2002)",
+        "(McClelland et al., 1989; St. John & McClelland, 1990, 1992)",
+        "(Smith,2020a, pp. 12–15)",
+        "(van der Waals, 1910)",
+        "(Smith, Jones, & Brown, 2020)",
+        "（张三等，2020；李四与王五，2021）",
+        "（张三，2020，2021）",
+        "(e.g., Smith & Jones, 2020)",
+    ] {
+        assert!(heuristics::author_date(value), "{value}");
+    }
+    for value in [
+        "(2020)",
+        "(in 2020)",
+        "(born in 2020)",
+        "(updated 2020)",
+        "(May, 2020)",
+        "(Figure 2.3)",
+        "(Table, 2020)",
+        "(Chapter 2, 2020)",
+        "(Smith 23–25)",
+        "[1, 3–5]",
+        "(P(W), 2020)",
+        "(Smith, 2020, this is explanatory prose)",
+    ] {
+        assert!(!heuristics::author_date(value), "{value}");
+    }
+}
+
+#[test]
+fn unified_heuristics_work_without_ai_and_book_mode_preserves_original_text() {
+    let original = section(vec![text(
+        "p",
+        "Claim (Just & Carpenter, 1992; Just & Varma, 2002). More (McClelland et al., 1989; St. John & McClelland, 1990, 1992).",
+    )]);
+    let inner = super::super::tests::original_source(original.clone());
+    let source = SemanticLayoutSource::new(inner.clone(), inner);
+    source.configure("local-citations", &PluginSettings::default());
+    source.set_unified_citations(true);
+    for _ in 0..2 {
+        let displayed = source.parse_section(0).unwrap();
+        let Block::Text(block) = &displayed.blocks[0] else {
+            panic!()
+        };
+        assert_eq!(
+            marked_citations(block),
+            [
+                (1, "(Just & Carpenter, 1992; Just & Varma, 2002)".into()),
+                (
+                    2,
+                    "(McClelland et al., 1989; St. John & McClelland, 1990, 1992)".into()
+                ),
+            ]
+        );
+        assert_eq!(
+            text_block_text(block),
+            text_block_text(match &original.blocks[0] {
+                Block::Text(t) => t,
+                _ => unreachable!(),
+            })
+        );
+    }
+    source.set_unified_citations(false);
+    assert_eq!(source.parse_section(0).unwrap(), original);
+}
+
+#[test]
+fn numeric_heuristics_require_bibliographic_evidence_and_reject_array_context() {
+    let mut original = section(vec![
+        text("cue", "See [12] and cf. [1, 3–5]."),
+        text(
+            "plain",
+            "A value [12]. Smith (2020) argues. An array [1, 2, 3].",
+        ),
+        text("math", "See array [12]."),
+        text("linked", "A supported claim [24]."),
+    ]);
+    if let Block::Text(block) = &mut original.blocks[3] {
+        if let Inline::Text(run) = &mut block.content[0] {
+            run.link = Some(PublicationUrl::parse("references.xhtml#ref24").unwrap());
+        }
+    }
+    citations::apply_heuristic_fallback(&mut original);
+    let marked: Vec<_> = original
+        .blocks
+        .iter()
+        .map(|block| match block {
+            Block::Text(text) => marked_citations(text),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(marked[0], [(1, "[12]".into()), (2, "[1, 3–5]".into())]);
+    assert!(marked[1].is_empty());
+    assert!(marked[2].is_empty());
+    assert_eq!(marked[3], [(1, "[24]".into())]);
+}
+
+#[test]
+fn heuristic_and_ai_citations_merge_in_text_order_without_duplicate_marks() {
+    let original = section(vec![text(
+        "p",
+        "Claim (Smith, 2020), supported (Jones 23–25).",
+    )]);
+    let Block::Text(block) = &original.blocks[0] else {
+        panic!()
+    };
+    let inner = super::super::tests::original_source(original.clone());
+    let source = SemanticLayoutSource::new(inner.clone(), inner);
+    source.set_unified_citations(true);
+    assert!(source.install(
+        0,
+        Recognition {
+            fingerprint: fingerprint(&original),
+            formulas_checked: true,
+            skipped_groups: 0,
+            annotations: vec![Annotation::InlineCitations {
+                source: block.source.clone().unwrap(),
+                spans: candidates(block),
+            }],
+        }
+    ));
+    let displayed = source.parse_section(0).unwrap();
+    let Block::Text(block) = &displayed.blocks[0] else {
+        panic!()
+    };
+    assert_eq!(
+        marked_citations(block),
+        [(1, "(Smith, 2020)".into()), (2, "(Jones 23–25)".into())]
+    );
+    let mut mixed = original;
+    if let Block::Text(block) = &mut mixed.blocks[0] {
+        let spans: Vec<_> = candidates(block)
+            .into_iter()
+            .filter(|c| c.text.contains("Jones"))
+            .collect();
+        apply(block, &spans);
+    }
+    citations::apply_heuristic_fallback(&mut mixed);
+    let Block::Text(block) = &mixed.blocks[0] else {
+        panic!()
+    };
+    assert_eq!(
+        marked_citations(block),
+        [(1, "(Smith, 2020)".into()), (2, "(Jones 23–25)".into())]
+    );
+}
+
+#[test]
+fn heuristic_translation_placeholders_survive_without_ai_layout_in_both_modes() {
+    for mode in [
+        crate::plugins::TranslationMode::Replace,
+        crate::plugins::TranslationMode::Bilingual,
+    ] {
+        let mut original = section(vec![text(
+            "p",
+            "Claim (Just & Carpenter, 1992; Just & Varma, 2002).",
+        )]);
+        if let Block::Text(block) = &mut original.blocks[0] {
+            block.content.push(Inline::Text(TextRun {
+                text: "52".into(),
+                style: rebook_publication::TextStyle {
+                    baseline: rebook_publication::TextBaseline::Superscript,
+                    link_role: LinkRole::FootnoteReference,
+                    ..Default::default()
+                },
+                link: Some(PublicationUrl::parse("notes.xhtml#en52").unwrap()),
+            }));
+        }
+        let inner = super::super::tests::original_source(original.clone());
+        let translation = Arc::new(crate::plugins::TranslationBookSource::new(
+            inner.clone(),
+            mode,
+        ));
+        let source = SemanticLayoutSource::new(translation.clone(), inner);
+        source.configure("heuristic-translation", &PluginSettings::default());
+        source.set_unified_citations(true);
+        let mut prepared = original.clone();
+        source.prepare_citation_input(0, &fingerprint(&original), &mut prepared);
+        let inputs = crate::plugins::prepare_translation_inputs(&prepared, false);
+        assert!(inputs[0].0.text.contains("<citation id=\"1\">"));
+        let Block::Text(prepared_text) = &prepared.blocks[0] else {
+            panic!()
+        };
+        let note_id = rebook_layout::paragraph_footnotes(prepared_text)[0].start;
+        translation.remember_translation_input(0, 0, &original.blocks[0], &prepared.blocks[0]);
+        translation.store_batch(0, &[crate::plugins::BlockTranslation {
+            block_index: 0, segment_index: None,
+                    text: format!("论述<citation id=\"1\">贾斯特与卡彭特，1992；贾斯特与瓦尔马，2002</citation>。<t-note-{note_id}/>"),
+        }]).unwrap();
+        translation.set_enabled(true).unwrap();
+        let displayed = source.parse_section(0).unwrap();
+        let paragraphs: Vec<_> = displayed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            paragraphs
+                .iter()
+                .all(|paragraph| marked_citations(paragraph).len() == 1)
+        );
+        assert!(
+            paragraphs
+                .iter()
+                .all(|paragraph| rebook_layout::paragraph_footnotes(paragraph).len() == 1)
+        );
+        assert!(
+            paragraphs
+                .iter()
+                .any(|paragraph| marked_citations(paragraph)
+                    == [(1, "贾斯特与卡彭特，1992；贾斯特与瓦尔马，2002".into())])
+        );
+        source.set_unified_citations(false);
+        assert!(
+            source
+                .parse_section(0)
+                .unwrap()
+                .blocks
+                .iter()
+                .all(|block| match block {
+                    Block::Text(t) => marked_citations(t).is_empty(),
+                    _ => true,
+                })
+        );
+    }
+}
+
+#[test]
+fn heuristic_fallback_handles_legacy_bilingual_companions_without_sources() {
+    let mut original = section(vec![
+        text("p", "Claim (Smith, 2020)."),
+        text("translated", "论述（史密斯，2020）。"),
+    ]);
+    if let Block::Text(block) = &mut original.blocks[1] {
+        block.source = None;
+    }
+    apply_heuristic_fallback(&mut original);
+    for block in &original.blocks {
+        let Block::Text(block) = block else { panic!() };
+        assert_eq!(marked_citations(block).len(), 1);
+    }
+}
+
+#[test]
+fn authored_unbracketed_references_and_split_styles_keep_their_full_group() {
+    let mut original = section(vec![text(
+        "p",
+        "Just & Carpenter, 1992; Just & Varma, 2002",
+    )]);
+    let Block::Text(block) = &mut original.blocks[0] else {
+        panic!()
+    };
+    let Inline::Text(run) = &block.content[0] else {
+        panic!()
+    };
+    let mut first = run.clone();
+    first.text = "Just & Carpenter, 1992; ".into();
+    first.style.citation = true;
+    let mut second = run.clone();
+    second.text = "Just & Varma, 2002".into();
+    second.style.citation = true;
+    second.style.bold = true;
+    block.content = vec![Inline::Text(first), Inline::Text(second)];
+    apply_heuristic_fallback(&mut original);
+    let Block::Text(block) = &original.blocks[0] else {
+        panic!()
+    };
+    assert_eq!(
+        marked_citations(block),
+        [(1, "Just & Carpenter, 1992; Just & Varma, 2002".into())]
+    );
+    assert!(block.content.iter().any(|inline| matches!(inline, Inline::Text(run) if run.style.bold && run.style.inline_citation == 1)));
+}
+
+#[test]
+fn heuristic_cache_rechecks_rewritten_source_text() {
+    let original = section(vec![text("p", "Claim (Smith, 2020).")]);
+    let inner = Arc::new(crate::plugins::rewrite::RewriteBookSource::new(
+        super::super::tests::original_source(original),
+    ));
+    let source = SemanticLayoutSource::new(inner.clone(), inner.clone());
+    source.configure("rewrite-citations", &PluginSettings::default());
+    source.set_unified_citations(true);
+    assert!(
+        text_block_text(match &source.parse_section(0).unwrap().blocks[0] {
+            Block::Text(t) => t,
+            _ => unreachable!(),
+        })
+        .contains("Smith")
+    );
+    inner
+        .apply_rewrites(&[crate::plugins::rewrite::BlockRewrite {
+            section_index: 0,
+            block_id: "p".into(),
+            text: "Claim (Jones, 2021).".into(),
+        }])
+        .unwrap();
+    let displayed = source.parse_section(0).unwrap();
+    let Block::Text(block) = &displayed.blocks[0] else {
+        panic!()
+    };
+    assert_eq!(marked_citations(block), [(1, "(Jones, 2021)".into())]);
+}
+
 fn assert_prepared_note_translation(original: Section) {
     let Block::Text(block) = &original.blocks[0] else {
         panic!()
@@ -44,10 +354,8 @@ fn assert_prepared_note_translation(original: Section) {
         let overlay = SemanticLayoutSource::new(translation.clone(), source);
         assert!(overlay.install(0, recognition.clone()));
         for translated in [
-            format!("译文正文<citation id=\"1\">图3.11</citation>。<torto-note-{note_id}/>"),
-            format!(
-                "译文正文<citation id=\"1\">图3.11</citation>。<torto-note-{note_id}/>后续句子。"
-            ),
+            format!("译文正文<citation id=\"1\">图3.11</citation>。<t-note-{note_id}/>"),
+            format!("译文正文<citation id=\"1\">图3.11</citation>。<t-note-{note_id}/>后续句子。"),
         ] {
             let input = crate::plugins::prepare_translation_inputs(&prepared, false);
             assert!(
@@ -73,7 +381,7 @@ fn assert_prepared_note_translation(original: Section) {
                 panic!()
             };
             assert!(
-                !text_block_text(text).contains("torto-note"),
+                !text_block_text(text).contains("t-note"),
                 "footnote source identity was resolved against the wrong inline snapshot: {}",
                 text_block_text(text)
             );
@@ -261,7 +569,7 @@ fn live_computational_models_inline_citations() {
     let result = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(recognize(
-            &reqwest::Client::new(),
+            &crate::http::client(),
             provider,
             "gemini/lite",
             &s,

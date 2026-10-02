@@ -1031,7 +1031,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
     };
     let section = section(vec![text("p", "A line of verse.\n-- A poet")]);
     let input = json!({"target_start":0,"target_end_exclusive":1,"blocks":[section_input_block(&section,0)]});
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .no_proxy()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -1373,7 +1373,7 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
     let result = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(request_window_groups(
-            &reqwest::Client::builder()
+            &crate::http::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(5))
                 .build()
@@ -1402,7 +1402,7 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
         compose(&mut displayed.blocks, &annotation(group, &section));
     }
     let inputs = crate::plugins::prepare_translation_inputs(&displayed, false);
-    assert!(inputs[0].0.text.contains("<torto-math-0/>"));
+    assert!(inputs[0].0.text.contains("<t-math-0/>"));
     assert!(
         inputs[0]
             .0
@@ -1415,7 +1415,7 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
 fn layout_reasoning_defaults_roundtrips_and_changes_cache_identity() {
     let old: SemanticLayoutSettings =
         serde_json::from_value(json!({"enabled":true,"provider":"old","model":"old"})).unwrap();
-    assert_eq!(old.reasoning_effort, ReasoningEffort::Default);
+    assert_eq!(old.reasoning_effort, ReasoningEffort::None);
     let mut settings = PluginSettings::default().with_test_model();
     settings.providers[0].kind = crate::plugins::AiProviderKind::OpenAi;
     settings.providers[0].api_key = "fixture".into();

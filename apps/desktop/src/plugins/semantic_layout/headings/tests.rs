@@ -7,7 +7,7 @@ use crate::plugins::{BlockTranslation, TranslationBookSource, TranslationMode};
 fn live_numbered_headings_and_book_page_numbers() {
     let settings = PluginSettings::load_default().unwrap();
     let endpoint = settings.semantic_layout_endpoint().unwrap();
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .timeout(Duration::from_secs(90))
         .build()
         .unwrap();
