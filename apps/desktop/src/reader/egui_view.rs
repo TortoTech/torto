@@ -5964,6 +5964,7 @@ fn show_image_preview_area(
     zoom_percent: f32,
 ) -> ImagePreviewInteraction {
     let backdrop_screen = ctx.content_rect();
+    #[cfg(target_os = "windows")]
     crate::app::window_chrome::dim_controls(ctx, 190.0 / 255.0);
     let mut interaction = ImagePreviewInteraction {
         close: false,
@@ -6160,17 +6161,20 @@ fn paint_toolbar_title(
             toolbar_rect.max,
         )
     };
-    let mut title_clip = title_clip;
     #[cfg(target_os = "windows")]
-    for rect in crate::app::window_chrome::geometry(ui.ctx()).excluded {
-        if rect.intersects(toolbar_rect) {
-            if rect.center().x < title_x {
-                title_clip.min.x = title_clip.min.x.max(rect.right() + 8.0);
-            } else {
-                title_clip.max.x = title_clip.max.x.min(rect.left() - 8.0);
+    let title_clip = {
+        let mut title_clip = title_clip;
+        for rect in crate::app::window_chrome::geometry(ui.ctx()).excluded {
+            if rect.intersects(toolbar_rect) {
+                if rect.center().x < title_x {
+                    title_clip.min.x = title_clip.min.x.max(rect.right() + 8.0);
+                } else {
+                    title_clip.max.x = title_clip.max.x.min(rect.left() - 8.0);
+                }
             }
         }
-    }
+        title_clip
+    };
     let width = if toolbar_visible {
         ((title_x - title_clip.left()).min(title_clip.right() - title_x) * 2.0).max(0.0)
     } else {
@@ -6624,6 +6628,7 @@ mod reference_suggestion_label_tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn image_preview_backdrop_covers_header_and_caption_controls() {
         use crate::app::window_chrome;
         let ctx = egui::Context::default();

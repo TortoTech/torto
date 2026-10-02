@@ -7,6 +7,11 @@ on:
     tags:
       - "*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to publish rebuilt installers to (optional)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -62,12 +67,19 @@ jobs:
         run: rustup target add "${{ matrix.target }}"
 
       - name: Validate tag and package version
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
         id: version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
-          tag_version="${GITHUB_REF_NAME#v}"
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag" >&2
+            exit 1
+          fi
+          git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null
+          tag_version="${RELEASE_TAG#v}"
           package_version="$({ cargo metadata --no-deps --format-version 1; } | jq -r '.packages[] | select(.name == "rebook-desktop") | .version')"
 
           if [[ -z "$package_version" || "$package_version" == "null" ]]; then
@@ -76,7 +88,7 @@ jobs:
           fi
 
           if [[ "$tag_version" != "$package_version" ]]; then
-            echo "Tag '$GITHUB_REF_NAME' does not match rebook-desktop version '$package_version'. Use tag 'v$package_version'." >&2
+            echo "Tag '$RELEASE_TAG' does not match rebook-desktop version '$package_version'. Use tag 'v$package_version'." >&2
             exit 1
           fi
 
@@ -138,12 +150,12 @@ jobs:
           otool -L "$executable"
 
       - name: Check application startup
-        if: "!startsWith(github.ref, 'refs/tags/')"
+        if: "!startsWith(github.ref, 'refs/tags/') && inputs.release_tag == ''"
         timeout-minutes: 10
         run: node scripts/smoke/macos.mjs "target/${{ matrix.target }}/release/bundle/osx/Torto.app" "$RUNNER_TEMP/torto-smoke"
 
       - name: Build and verify DMG
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
         env:
           TARGET: ${{ matrix.target }}
           ARCH: ${{ matrix.arch }}
@@ -187,7 +199,7 @@ jobs:
           (cd dist && shasum -a 256 "$dmg_name" > "$dmg_name.sha256")
 
       - name: Check startup from final DMG
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
         timeout-minutes: 10
         shell: bash
         run: |
@@ -214,7 +226,7 @@ jobs:
           retention-days: 14
 
       - name: Upload workflow artifact
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
         uses: actions/upload-artifact@v7
         with:
           name: Torto-${{ steps.version.outputs.version }}-macos-${{ matrix.arch }}
@@ -225,7 +237,7 @@ jobs:
 
   publish-macos-installers:
     name: Publish macOS installers
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
     needs: build-macos-installer
     runs-on: ubuntu-latest
     permissions:
@@ -234,6 +246,9 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Download macOS artifacts
         uses: actions/download-artifact@v8
@@ -245,9 +260,17 @@ jobs:
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           files: |
             dist/*.dmg
             dist/*.sha256
           fail_on_unmatched_files: true
           # Release notes are created once by the publishing flow. Asset jobs
           # must not append a second generated changelog to an existing release.
+      - name: Mirror rebuilt release to Gitee
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: node scripts/sync-gitee-release.mjs --tag "$RELEASE_TAG"
