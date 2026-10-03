@@ -68,25 +68,53 @@ export function updateManifest(release) {
     digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` } };
 }
 
-async function request(url, { token, method = 'GET', json, form, optional = false, binary = false } = {}) {
+const transportCodes = new Set([
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_SOCKET', 'UND_ERR_ABORTED', 'UND_ERR_REQ_CONTENT_LENGTH_MISMATCH',
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN',
+  'ENETUNREACH', 'EHOSTUNREACH', 'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+]);
+const transportNames = new Set(['Error', 'TypeError', 'TimeoutError', 'AbortError', 'AggregateError', 'SyntaxError']);
+
+function transportDiagnostics(error, seen = new Set()) {
+  if (!error || typeof error !== 'object' || seen.has(error) || seen.size >= 8) return [];
+  seen.add(error);
+  const details = [];
+  if (transportNames.has(error.name)) details.push(error.name);
+  if (transportCodes.has(error.code)) details.push(error.code);
+  details.push(...transportDiagnostics(error.cause, seen));
+  if (Array.isArray(error.errors)) {
+    for (const nested of error.errors.slice(0, 8)) details.push(...transportDiagnostics(nested, seen));
+  }
+  return [...new Set(details)];
+}
+
+export async function request(url, { token, method = 'GET', json, form, optional = false, binary = false } = {}) {
   const headers = { 'User-Agent': 'Torto-release-mirror', Accept: binary ? 'application/octet-stream' : 'application/json' };
   if (token) headers.Authorization = `token ${token}`;
   if (json) headers['Content-Type'] = 'application/json';
+  const started = performance.now();
+  const timeoutMs = binary || form ? 600_000 : 60_000;
+  let phase = 'waiting-for-response-headers';
   let response;
   try {
     response = await fetch(url, {
       method, headers, body: form ?? (json ? JSON.stringify(json) : undefined),
-      signal: AbortSignal.timeout(binary || form ? 600_000 : 60_000),
+      signal: AbortSignal.timeout(timeoutMs),
       // Authenticated API calls must never redirect credentials to another host.
       redirect: token ? 'error' : 'follow',
     });
     if (optional && response.status === 404) return null;
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    phase = 'reading-response-body';
     return binary ? Buffer.from(await response.arrayBuffer()) : await response.json();
   } catch (error) {
-    // Do not print response bodies, headers or nested transport errors containing credentials.
+    // Only allowlisted names/codes: never serialize transport objects or messages,
+    // which can contain authenticated URLs, headers or response bodies.
     const status = response ? `HTTP ${response.status}` : 'network/timeout failure';
-    throw new Error(`${method} ${new URL(url).pathname}: ${status}`);
+    const elapsedMs = Math.round(performance.now() - started);
+    const details = transportDiagnostics(error).join(', ') || 'unknown';
+    throw new Error(`${method} ${new URL(url).pathname}: ${status}; phase=${phase}; elapsed_ms=${elapsedMs}; timeout_ms=${timeoutMs}; transport=${details}`);
   }
 }
 
@@ -201,6 +229,7 @@ async function main() {
     const api = async (method, suffix, data, optional = false) => {
       if (method === 'LIST') return attachments(Number(suffix.split('/')[2]), token);
       if (method === 'UPLOAD') {
+        console.log(`Uploading ${data.asset.name} (${data.bytes.length} bytes)`);
         const form = new FormData();
         form.append('file', new Blob([data.bytes]), data.asset.name);
         return request(`${gitee}${suffix}`, { token, method: 'POST', form });
@@ -214,7 +243,7 @@ async function main() {
         break;
       } catch (error) {
         if (attempt === 3) throw error;
-        console.log(`Sync attempt ${attempt} failed; retrying from remote attachment state`);
+        console.log(`Sync attempt ${attempt} failed: ${error.message}; retrying from remote attachment state`);
         await new Promise(resolve => setTimeout(resolve, 10_000));
       }
     }

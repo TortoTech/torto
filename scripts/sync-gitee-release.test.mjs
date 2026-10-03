@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease, updateManifest } from './sync-gitee-release.mjs';
+import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease, updateManifest, request } from './sync-gitee-release.mjs';
 
 const bytes = Buffer.from('installer fixture');
 const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -9,6 +9,49 @@ const release = () => ({
   tag_name: 'v0.7.0', name: 'Torto 0.7.0', body: 'Updated notes', draft: false, prerelease: false,
   assets: requiredAssets('v0.7.0').map(name => ({ name, size: bytes.length, digest,
     browser_download_url: `https://github.com/TortoTech/torto/releases/download/v0.7.0/${name}` })),
+});
+
+test('reports nested transport failures without leaking credentials or arbitrary messages', async () => {
+  const originalFetch = globalThis.fetch;
+  const cause = Object.assign(new Error('secret-token in transport message'), {
+    code: 'UND_ERR_HEADERS_TIMEOUT', headers: { Authorization: 'secret-token' },
+  });
+  cause.cause = cause; // Cycles must not break diagnostic reporting.
+  globalThis.fetch = async () => { throw new TypeError('secret-token', { cause }); };
+  try {
+    await assert.rejects(request('https://example.com/upload?access_token=secret-token', {
+      token: 'secret-token', method: 'POST', form: new FormData(),
+    }), error => {
+      assert.match(error.message, /phase=waiting-for-response-headers/);
+      assert.match(error.message, /elapsed_ms=\d+; timeout_ms=600000/);
+      assert.match(error.message, /UND_ERR_HEADERS_TIMEOUT/);
+      assert.doesNotMatch(error.message, /secret-token|access_token|Authorization/);
+      return true;
+    });
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('distinguishes response body failures and aggregate connection errors', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    status: 200, ok: true,
+    json: async () => { throw Object.assign(new Error('private response'), { code: 'UND_ERR_BODY_TIMEOUT' }); },
+  });
+  try {
+    await assert.rejects(request('https://example.com/api'), /HTTP 200; phase=reading-response-body;.*UND_ERR_BODY_TIMEOUT/);
+    globalThis.fetch = async () => {
+      throw new TypeError('private URL', { cause: new AggregateError([
+        Object.assign(new Error('private address'), { code: 'ECONNREFUSED' }),
+        Object.assign(new Error('private address'), { code: 'ENETUNREACH' }),
+      ]) });
+    };
+    await assert.rejects(request('https://example.com/api'), error => {
+      assert.match(error.message, /ECONNREFUSED/);
+      assert.match(error.message, /ENETUNREACH/);
+      assert.doesNotMatch(error.message, /private/);
+      return true;
+    });
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test('does not mirror incomplete multi-platform releases', () => {
