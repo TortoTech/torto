@@ -2224,6 +2224,7 @@ fn markdown_to_html_with_toc_anchors(markdown: &str, anchors: &[OcrTocAnchor]) -
     let normalized = normalize_ocr_math_delimiters(markdown);
     let mut events = Parser::new_ext(&normalized, options).collect::<Vec<_>>();
     normalize_plain_ocr_hard_breaks(&mut events);
+    let literal_html = unpaired_inline_ocr_tags(&events);
     let mut anchors_at_event = HashMap::<usize, String>::new();
     let mut matched = vec![false; anchors.len()];
     let mut cursor = 0;
@@ -2275,6 +2276,7 @@ fn markdown_to_html_with_toc_anchors(markdown: &str, anchors: &[OcrTocAnchor]) -
                 classes,
                 attrs,
             }),
+            Event::InlineHtml(value) if literal_html.contains(&index) => Event::Text(value),
             Event::Html(value) | Event::InlineHtml(value) => {
                 Event::Html(CowStr::Boxed(sanitize_ocr_html(&value).into_boxed_str()))
             }
@@ -2297,6 +2299,44 @@ fn markdown_to_html_with_toc_anchors(markdown: &str, anchors: &[OcrTocAnchor]) -
     let mut output = String::new();
     html::push_html(&mut output, parser);
     output
+}
+
+// OCR often omits code quoting around tag names in prose. A bare <div> in
+// such a paragraph is text, while paired tags in captions/tables are markup.
+// Pair across HTML event boundaries so genuine multi-event wrappers survive.
+fn unpaired_inline_ocr_tags(events: &[Event<'_>]) -> BTreeSet<usize> {
+    static TAGS: OnceLock<Regex> = OnceLock::new();
+    let tags = TAGS.get_or_init(|| {
+        Regex::new(r"(?i)</?(div|table|thead|tbody|tfoot|tr|td|th|caption)\b[^>]*>")
+            .expect("static OCR structure tag regex")
+    });
+    let mut stack = Vec::<(String, Option<usize>)>::new();
+    let mut literal = BTreeSet::new();
+    for (index, event) in events.iter().enumerate() {
+        let (value, inline) = match event {
+            Event::Html(value) => (value.as_ref(), false),
+            Event::InlineHtml(value) => (value.as_ref(), true),
+            _ => continue,
+        };
+        for capture in tags.captures_iter(value) {
+            let tag = capture.get(0).unwrap().as_str();
+            let name = capture[1].to_ascii_lowercase();
+            if tag.ends_with("/>") {
+                continue;
+            }
+            if tag.starts_with("</") {
+                if let Some(position) = stack.iter().rposition(|(open, _)| open == &name) {
+                    stack.remove(position);
+                } else if inline {
+                    literal.insert(index);
+                }
+            } else {
+                stack.push((name, inline.then_some(index)));
+            }
+        }
+    }
+    literal.extend(stack.into_iter().filter_map(|(_, index)| index));
+    literal
 }
 
 fn normalize_plain_ocr_hard_breaks(events: &mut [Event<'_>]) {
@@ -2997,6 +3037,34 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "validates every OCR section of an explicitly selected local PDF"]
+    fn diagnose_cached_ocr_section_markup() {
+        let book_id = std::env::var("TORTO_DIAG_BOOK_ID").unwrap();
+        let path = std::env::var("TORTO_DIAG_PDF_PATH").unwrap();
+        let original = rebook_formats::open_file(path).unwrap().source();
+        for reflow in [false, true] {
+            let source = OcrReflowBookSource::new(
+                original.clone(),
+                load_document(&book_id).unwrap().unwrap(),
+                reflow,
+            )
+            .unwrap();
+            let mut failures = Vec::new();
+            for index in 0..source.book.sections.len() {
+                if let Err(error) = source.parse_section(index) {
+                    println!(
+                        "reflow={reflow} section={} pages={:?}: {error}",
+                        index + 1,
+                        source.page_ranges[index]
+                    );
+                    failures.push(index);
+                }
+            }
+            assert!(failures.is_empty(), "invalid OCR sections: {failures:?}");
+        }
+    }
+
+    #[test]
     fn synced_ocr_supersedes_local_job_and_stops_provider_without_overwriting_cloud_text() {
         let book_id = uuid::Uuid::new_v4().simple().to_string();
         let directory = book_directory(&book_id).unwrap();
@@ -3689,6 +3757,32 @@ mod tests {
         assert!(html.contains("after"));
         assert!(!html.contains("onclick"));
         assert!(!html.contains("color:red"));
+    }
+
+    #[test]
+    fn unquoted_html_tag_names_in_ocr_prose_remain_readable_and_parseable() {
+        let markdown = "HTML elements (such as <div>) divide a page into regions.\n\n\
+            <div style=\"text-align:center\">A genuine caption</div>\n\n\
+            The <table> element contains data; </td> names a closing tag.";
+        let body = markdown_to_html(markdown);
+        assert!(body.contains("&lt;div&gt;"));
+        assert!(body.contains("&lt;table&gt;"));
+        assert!(body.contains("&lt;/td&gt;"));
+        assert!(body.contains("<div style=\"text-align:center\">A genuine caption</div>"));
+        let descriptor = SpineItem {
+            id: SpineItemId::new("html-tag-prose").unwrap(),
+            href: PublicationUrl::parse("Text/html-tag-prose.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let section = rebook_html::parse_section(
+            &format!("<html><body>{body}</body></html>"),
+            &descriptor,
+            |_| None,
+        )
+        .unwrap();
+        assert!(!section.blocks.is_empty());
     }
 
     #[test]
