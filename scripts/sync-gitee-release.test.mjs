@@ -87,7 +87,7 @@ test('reports nested transport failures without leaking credentials or arbitrary
       token: 'secret-token', method: 'POST', form: new FormData(),
     }), error => {
       assert.match(error.message, /phase=waiting-for-response-headers/);
-      assert.match(error.message, /elapsed_ms=\d+; timeout_ms=600000/);
+      assert.match(error.message, /elapsed_ms=\d+; timeout_ms=3600000/);
       assert.match(error.message, /UND_ERR_HEADERS_TIMEOUT/);
       assert.doesNotMatch(error.message, /secret-token|access_token|Authorization/);
       return true;

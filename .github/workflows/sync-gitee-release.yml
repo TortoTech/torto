@@ -30,7 +30,7 @@ jobs:
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
     steps:
       # Always use trusted default-branch scripts, never code from a triggering build.
       - uses: actions/checkout@v7

@@ -94,7 +94,7 @@ export async function request(url, { token, method = 'GET', json, form, optional
   if (token) headers.Authorization = `${new URL(url).hostname === 'gitee.com' ? 'Bearer' : 'token'} ${token}`;
   if (json) headers['Content-Type'] = 'application/json';
   const started = performance.now();
-  const timeoutMs = binary || form ? 600_000 : 60_000;
+  const timeoutMs = binary || form ? 3_600_000 : 60_000;
   let phase = 'waiting-for-response-headers';
   let response;
   try {
@@ -127,7 +127,7 @@ async function attachments(id, token) {
   }
 }
 
-export async function uploadAttachment(url, token, { asset, bytes }, { log = console.log, timeoutSeconds = 600 } = {}) {
+export async function uploadAttachment(url, token, { asset, bytes }, { log = console.log, timeoutSeconds = 3600 } = {}) {
   verifyAsset(asset, bytes);
   if (/[\r\n\0]/.test(token)) throw new Error('Invalid Gitee token');
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'torto-upload-'));
