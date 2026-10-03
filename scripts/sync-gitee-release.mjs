@@ -46,6 +46,117 @@ export function verifyAsset(asset, bytes) {
   if (bytes.length !== asset.size || digest !== asset.digest) throw new Error(`Attachment verification failed: ${asset.name}`);
 }
 
+// Actions downloads do not access Release asset URLs. Always compare extracted
+// files against Release digests: a rebuilt version can have several artifacts.
+export function artifactName(asset) {
+  const mac = /^(Torto-\d+\.\d+\.\d+-macos-(?:arm64|x86_64))\.dmg(?:\.sha256)?$/.exec(asset.name);
+  if (mac) return mac[1];
+  const windows = /^(Torto-\d+\.\d+\.\d+)-x86_64\.msi$/.exec(asset.name);
+  return windows ? `${windows[1]}-windows-x86_64` : null;
+}
+
+export function createArtifactSource(directory, token, {
+  list = name => request(`${github}/actions/artifacts?name=${encodeURIComponent(name)}&per_page=100`, { token }),
+  extract = (artifact, destination) => execFileSync('gh', ['run', 'download', String(artifact.workflow_run.id),
+    '--repo', 'TortoTech/torto', '--name', artifact.name, '--dir', destination], {
+    env: { ...process.env, GH_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'], timeout: 600_000,
+  }),
+  log = console.log,
+} = {}) {
+  const groups = new Map();
+  return async asset => {
+    const name = artifactName(asset);
+    if (!name || !token) return null;
+    if (!groups.has(name)) {
+      let candidates = [];
+      try {
+        const response = await list(name);
+        candidates = response.artifacts.filter(item => item.name === name && !item.expired &&
+          Number.isSafeInteger(item.id) && Number.isSafeInteger(item.workflow_run?.id))
+          .sort((a, b) => b.id - a.id).slice(0, 3);
+      } catch { log(`Actions artifacts unavailable for ${name}; Release fallback may be needed`); }
+      groups.set(name, candidates.map(artifact => ({ artifact, extracted: false, unavailable: false })));
+    }
+    for (const candidate of groups.get(name)) {
+      if (candidate.unavailable) continue;
+      const destination = path.join(directory, String(candidate.artifact.id));
+      if (!candidate.extracted) {
+        try { await extract(candidate.artifact, destination); candidate.extracted = true; }
+        catch {
+          candidate.unavailable = true;
+          log(`Actions artifact ${candidate.artifact.id} unavailable; checking other sources`);
+          continue;
+        }
+      }
+      try {
+        const bytes = fs.readFileSync(path.join(destination, asset.name));
+        verifyAsset(asset, bytes);
+        return bytes;
+      } catch { /* Missing or stale rebuild: never upload unverified artifact bytes. */ }
+    }
+    return null;
+  };
+}
+
+export function createAssetDownloader(directory, {
+  artifactDirectory, artifactSource = async () => null,
+  download = asset => request(asset.browser_download_url, { binary: true }), log = console.log,
+} = {}) {
+  fs.mkdirSync(directory, { recursive: true });
+  const records = new Map();
+  const get = async asset => {
+    // Gitee verification must read the remote file, never a cached source copy.
+    if (new URL(asset.browser_download_url).hostname !== 'github.com') return download(asset);
+    const key = createHash('sha256').update(`${asset.browser_download_url}\n${asset.digest}`).digest('hex');
+    const file = path.join(directory, key);
+    if (!records.has(key)) records.set(key, { name: asset.name, requests: 0, verified: 0, reused: 0, source: '' });
+    const record = records.get(key);
+    if (fs.existsSync(file)) {
+      const bytes = fs.readFileSync(file);
+      verifyAsset(asset, bytes);
+      record.reused++;
+      log(`Reusing verified source: ${asset.name}`);
+      return bytes;
+    }
+    let bytes;
+    if (artifactDirectory) {
+      try {
+        bytes = fs.readFileSync(path.join(artifactDirectory, asset.name));
+        verifyAsset(asset, bytes);
+        record.source = 'local build';
+      } catch { bytes = null; }
+    }
+    if (!bytes) {
+      bytes = await artifactSource(asset);
+      if (bytes) { verifyAsset(asset, bytes); record.source = 'Actions artifact'; }
+    }
+    if (!bytes) {
+      record.requests++;
+      record.source = 'GitHub Release';
+      log(`Automatic Release download request #${record.requests}: ${asset.name}`);
+      bytes = await download(asset);
+      verifyAsset(asset, bytes);
+      record.verified++;
+    }
+    fs.writeFileSync(file, bytes);
+    log(`Verified source ${asset.name}: ${record.source}`);
+    return bytes;
+  };
+  get.audit = () => [...records.values()].map(record => ({ ...record }));
+  return get;
+}
+
+function reportDownloads(tag, download) {
+  const rows = download.audit();
+  const report = [`### Gitee mirror download accounting: ${tag}`, '',
+    '| File | Source | Release requests | Verified Release downloads | Cache reuse |',
+    '| --- | --- | ---: | ---: | ---: |',
+    ...rows.map(row => `| ${row.name.replaceAll('|', '\\|')} | ${row.source} | ${row.requests} | ${row.verified} | ${row.reused} |`), '',
+    'Requests include failed attempts; GitHub exposes no exact per-request download-count attribution. Gitee verification downloads are separate.', ''].join('\n');
+  console.log(report);
+  if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, report);
+}
+
 export function planAssets(source, target) {
   return source.filter(asset => {
     const matches = target.filter(file => file.name === asset.name);
@@ -269,6 +380,10 @@ async function main() {
   }
   if (!token) throw new Error('GITEE_TOKEN is required');
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'torto-gitee-'));
+  const download = createAssetDownloader(path.join(directory, 'source-cache'), {
+    artifactDirectory: value('--artifact-dir'),
+    artifactSource: createArtifactSource(path.join(directory, 'artifacts'), githubToken),
+  });
   try {
     await mirrorTag(release.tag_name, token, directory);
     const api = async (method, suffix, data, optional = false) => {
@@ -280,7 +395,7 @@ async function main() {
     };
     for (let attempt = 1; ; attempt++) {
       try {
-        await syncRelease(release, api, asset => request(asset.browser_download_url, { binary: true }));
+        await syncRelease(release, api, download);
         console.log(`Gitee mirror verified: ${release.tag_name}`);
         break;
       } catch (error) {
@@ -290,6 +405,7 @@ async function main() {
       }
     }
   } finally {
+    reportDownloads(release.tag_name, download);
     fs.rmSync(directory, { recursive: true, force: true });
   }
 }

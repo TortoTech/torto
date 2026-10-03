@@ -2,6 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createArtifactSource, createAssetDownloader, artifactName } from './sync-gitee-release.mjs';
 import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease, updateManifest, request, uploadAttachment } from './sync-gitee-release.mjs';
 
 const bytes = Buffer.from('installer fixture');
@@ -10,6 +14,84 @@ const release = () => ({
   tag_name: 'v0.7.0', name: 'Torto 0.7.0', body: 'Updated notes', draft: false, prerelease: false,
   assets: requiredAssets('v0.7.0').map(name => ({ name, size: bytes.length, digest,
     browser_download_url: `https://github.com/TortoTech/torto/releases/download/v0.7.0/${name}` })),
+});
+
+function temporary(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'torto-source-test-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  return directory;
+}
+
+test('verified Release downloads survive upload retries while remote verification bypasses source cache', async t => {
+  const asset = release().assets[0];
+  const calls = [];
+  const download = createAssetDownloader(temporary(t), {
+    download: async item => { calls.push(item.browser_download_url); return bytes; }, log: () => {},
+  });
+  assert.deepEqual(await download(asset), bytes);
+  assert.deepEqual(await download(asset), bytes);
+  const remote = { ...asset, browser_download_url: 'https://gitee.com/remote.msi' };
+  await download(remote);
+  await download(remote);
+  assert.deepEqual(calls, [asset.browser_download_url, remote.browser_download_url, remote.browser_download_url]);
+  assert.deepEqual(download.audit(), [{ name: asset.name, requests: 1, verified: 1, reused: 1, source: 'GitHub Release' }]);
+});
+
+test('corrupt downloads are never cached and failed requests remain in accounting', async t => {
+  let attempt = 0;
+  const download = createAssetDownloader(temporary(t), {
+    download: async () => { attempt++; return attempt === 1 ? Buffer.alloc(bytes.length) : bytes; }, log: () => {},
+  });
+  await assert.rejects(download(release().assets[0]), /verification failed/);
+  await download(release().assets[0]);
+  assert.equal(attempt, 2);
+  assert.equal(download.audit()[0].requests, 2);
+  assert.equal(download.audit()[0].verified, 1);
+});
+
+test('local build files avoid Release downloads and stale local files fall back to Actions', async t => {
+  const directory = temporary(t);
+  const local = path.join(directory, 'dist');
+  fs.mkdirSync(local);
+  const assets = release().assets;
+  fs.writeFileSync(path.join(local, assets[0].name), bytes);
+  fs.writeFileSync(path.join(local, assets[1].name), Buffer.alloc(bytes.length));
+  let artifactCalls = 0;
+  const download = createAssetDownloader(path.join(directory, 'cache'), {
+    artifactDirectory: local,
+    artifactSource: async () => { artifactCalls++; return bytes; },
+    download: async () => { throw new Error('Release download must not happen'); }, log: () => {},
+  });
+  await download(assets[0]);
+  await download(assets[1]);
+  assert.equal(artifactCalls, 1);
+  assert.deepEqual(download.audit().map(row => row.source), ['local build', 'Actions artifact']);
+  assert.ok(download.audit().every(row => row.requests === 0));
+});
+
+test('Actions selection rejects stale rebuilds, skips expired artifacts and extracts a group only once', async t => {
+  const assets = release().assets.slice(1, 3);
+  const name = artifactName(assets[0]);
+  assert.equal(name, 'Torto-0.7.0-macos-arm64');
+  assert.equal(artifactName(release().assets[0]), 'Torto-0.7.0-windows-x86_64');
+  let lists = 0;
+  const extracted = [];
+  const source = createArtifactSource(temporary(t), 'test-token', {
+    list: async () => { lists++; return { artifacts: [
+      { id: 3, name, expired: true, workflow_run: { id: 30 } },
+      { id: 2, name, expired: false, workflow_run: { id: 20 } },
+      { id: 1, name, expired: false, workflow_run: { id: 10 } },
+    ] }; },
+    extract: async (artifact, destination) => {
+      extracted.push(artifact.id);
+      fs.mkdirSync(destination, { recursive: true });
+      for (const asset of assets) fs.writeFileSync(path.join(destination, asset.name), artifact.id === 2 ? Buffer.alloc(bytes.length) : bytes);
+    }, log: () => {},
+  });
+  assert.deepEqual(await source(assets[0]), bytes);
+  assert.deepEqual(await source(assets[1]), bytes);
+  assert.equal(lists, 1);
+  assert.deepEqual(extracted, [2, 1]);
 });
 
 test('curl uploads authenticated multipart bytes, reports metrics and redacts HTTP errors', async () => {

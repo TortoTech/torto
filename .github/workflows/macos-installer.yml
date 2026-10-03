@@ -243,6 +243,7 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: write
+      actions: read
 
     steps:
       - name: Check out repository
@@ -274,4 +275,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
-        run: node scripts/sync-gitee-release.mjs --tag "$RELEASE_TAG"
+        run: node scripts/sync-gitee-release.mjs --tag "$RELEASE_TAG" --artifact-dir dist
