@@ -421,8 +421,28 @@ impl DesktopReader {
         }
     }
 
+    pub(crate) fn refresh_synced_pdf_ocr(&mut self) {
+        if self.format != rebook_formats::BookFormat::Pdf
+            || self.pdf_ocr.available
+            || self.pdf_ocr.task.is_pending()
+        {
+            return;
+        }
+        match crate::plugins::load_pdf_ocr_source(
+            Arc::clone(&self.source),
+            self.plugin_settings.pdf_ocr_reflow_enabled,
+        ) {
+            Ok(loaded) if loaded.available => {
+                self.persist_progress();
+                self.reopen_requested = Some(self.source_path.clone());
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "failed to refresh synced PDF OCR result"),
+        }
+    }
+
     pub(super) fn toggle_pdf_ocr_view(&mut self) -> bool {
-        if !self.pdf_ocr.available || self.pdf_ocr.task.is_pending() {
+        if !self.pdf_ocr.available {
             return false;
         }
         let Some(controller) = self.pdf_ocr_controller.clone() else {

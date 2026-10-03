@@ -388,41 +388,79 @@ pub(crate) async fn recognize_pdf<F>(
 where
     F: FnMut(String) + Send,
 {
-    let follower = {
+    let (receiver, follower) = {
         let tasks = PDF_OCR_TASKS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut tasks = tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sender) = tasks.get(&book_id) {
-            Some(sender.subscribe())
+            (sender.subscribe(), true)
         } else {
             let (sender, _receiver) = watch::channel(None);
+            let receiver = sender.subscribe();
             tasks.insert(book_id.clone(), sender);
-            None
+            (receiver, false)
         }
     };
-    if let Some(mut receiver) = follower {
+    if follower {
         progress("该 PDF 正在识别，正在等待现有任务…".into());
-        loop {
-            if let Some(result) = receiver.borrow().clone() {
-                return result;
-            }
-            if receiver.changed().await.is_err() {
-                return Err("现有 PDF OCR 任务意外结束".into());
-            }
-        }
+        return wait_for_ocr_result(receiver).await;
     }
 
-    let result = recognize_pdf_inner(path, &book_id, page_count, settings, &mut progress).await;
+    // A verified cloud import publishes success to this channel. Dropping the
+    // provider future stops local polling/downloads instead of repeating OCR.
+    let result = recognize_or_import(
+        receiver,
+        recognize_pdf_inner(path, &book_id, page_count, settings, &mut progress),
+    )
+    .await;
     let sender = PDF_OCR_TASKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&book_id);
+    let result = sender
+        .as_ref()
+        .and_then(|sender| sender.borrow().clone())
+        .unwrap_or(result);
     if let Some(sender) = sender {
         sender.send_replace(Some(result.clone()));
     }
     result
+}
+
+async fn wait_for_ocr_result(
+    mut receiver: watch::Receiver<Option<SharedOcrResult>>,
+) -> SharedOcrResult {
+    loop {
+        if let Some(result) = receiver.borrow().clone() {
+            return result;
+        }
+        if receiver.changed().await.is_err() {
+            return Err("现有 PDF OCR 任务意外结束".into());
+        }
+    }
+}
+
+async fn recognize_or_import(
+    receiver: watch::Receiver<Option<SharedOcrResult>>,
+    recognition: impl std::future::Future<Output = SharedOcrResult>,
+) -> SharedOcrResult {
+    match futures_util::future::select(
+        Box::pin(wait_for_ocr_result(receiver)),
+        Box::pin(recognition),
+    )
+    .await
+    {
+        futures_util::future::Either::Left((result, _))
+        | futures_util::future::Either::Right((result, _)) => result,
+    }
+}
+
+fn imported_result_available(tasks: &HashMap<String, SharedOcrSender>, book_id: &str) -> bool {
+    tasks
+        .get(book_id)
+        .is_some_and(|sender| matches!(*sender.borrow(), Some(Ok(()))))
 }
 
 async fn recognize_pdf_inner<F>(
@@ -801,6 +839,13 @@ fn load_paddle_job(book_id: &str) -> io::Result<Option<StoredPaddleJob>> {
 }
 
 fn save_paddle_job(job: &StoredPaddleJob) -> io::Result<()> {
+    let tasks = PDF_OCR_TASKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let tasks = tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if imported_result_available(&tasks, &job.book_id) {
+        return Ok(());
+    }
     write_json_atomic(&paddle_job_path(&job.book_id)?, job)
 }
 
@@ -1411,6 +1456,15 @@ fn normalize_page_range(pages: &mut Vec<StoredOcrPage>, start_page: usize, end_p
 }
 
 fn save_document(book_id: &str, parsed: ParsedOcrDocument) -> io::Result<()> {
+    // Serialize final local writes with cloud imports so a finishing provider
+    // cannot replace the result which just superseded its task.
+    let tasks = PDF_OCR_TASKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let tasks = tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if imported_result_available(&tasks, book_id) {
+        return Ok(());
+    }
     let directory = book_directory(book_id)?;
     let resource_directory = directory.join("resources");
     fs::create_dir_all(&resource_directory)?;
@@ -1563,6 +1617,10 @@ pub(crate) fn import_pdf_ocr_sync_data(book_id: &str, data: PdfOcrSyncData) -> i
         validate_sync_resource_name(&resource.file_name)?;
     }
 
+    let tasks = PDF_OCR_TASKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let tasks = tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let directory = book_directory(book_id)?;
     let resource_directory = directory.join("resources");
     fs::create_dir_all(&resource_directory)?;
@@ -1571,6 +1629,10 @@ pub(crate) fn import_pdf_ocr_sync_data(book_id: &str, data: PdfOcrSyncData) -> i
         write_bytes_atomic(&resource_directory.join(file_name), bytes)?;
     }
     write_json_atomic(&directory.join(DOCUMENT_FILE), &document)?;
+    clear_paddle_job(book_id)?;
+    if let Some(sender) = tasks.get(book_id) {
+        sender.send_replace(Some(Ok(())));
+    }
     if let Ok(entries) = fs::read_dir(&resource_directory) {
         for entry in entries.flatten() {
             let file_name = entry.file_name().to_string_lossy().into_owned();
@@ -2933,6 +2995,109 @@ fn value_as_usize(value: &Value) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synced_ocr_supersedes_local_job_and_stops_provider_without_overwriting_cloud_text() {
+        let book_id = uuid::Uuid::new_v4().simple().to_string();
+        let directory = book_directory(&book_id).unwrap();
+        let job = StoredPaddleJob {
+            version: PADDLE_JOB_VERSION,
+            book_id: book_id.clone(),
+            model: "fixture".into(),
+            page_count: 1,
+            chunks: paddle_page_chunks(1),
+        };
+        save_paddle_job(&job).unwrap();
+        let mut settings = PluginSettings::default();
+        settings.paddle_ocr_model = "fixture".into();
+        assert!(has_pending_pdf_ocr_task(&book_id, &settings).unwrap());
+        let (sender, receiver) = watch::channel(None);
+        PDF_OCR_TASKS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .insert(book_id.clone(), sender.clone());
+        let synced = || PdfOcrSyncData {
+            document: serde_json::to_vec(&json!({
+                "version": 1, "book_id": book_id, "provider": "paddle-ocr", "model": "cloud",
+                "view_mode": "reflow", "pages": [{"markdown": "completed on B"}], "resources": []
+            }))
+            .unwrap(),
+            resources: Vec::new(),
+        };
+        // Invalid imports must leave A's resumable task and active worker intact.
+        assert!(
+            import_pdf_ocr_sync_data(
+                &book_id,
+                PdfOcrSyncData {
+                    document: b"invalid".to_vec(),
+                    resources: Vec::new(),
+                }
+            )
+            .is_err()
+        );
+        assert!(sender.borrow().is_none());
+        assert!(paddle_job_path(&book_id).unwrap().exists());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            struct Dropped(Arc<AtomicBool>);
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let dropped = Arc::new(AtomicBool::new(false));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let flag = dropped.clone();
+            let notify = started.clone();
+            let worker = tokio::spawn(recognize_or_import(receiver, async move {
+                let _drop = Dropped(flag);
+                notify.notify_one();
+                std::future::pending().await
+            }));
+            started.notified().await;
+            import_pdf_ocr_sync_data(&book_id, synced()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(dropped.load(Ordering::SeqCst));
+        });
+        assert!(!has_pending_pdf_ocr_task(&book_id, &settings).unwrap());
+        // A provider already finishing on another thread cannot resurrect its
+        // pending job or replace B's document after the import wins the lock.
+        save_paddle_job(&job).unwrap();
+        save_document(
+            &book_id,
+            ParsedOcrDocument {
+                provider: PdfOcrProviderKind::PaddleOcr,
+                model: "local".into(),
+                pages: vec![StoredOcrPage {
+                    markdown: "stale A result".into(),
+                }],
+                resources: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(!paddle_job_path(&book_id).unwrap().exists());
+        assert_eq!(
+            load_document(&book_id).unwrap().unwrap().pages[0].markdown,
+            "completed on B"
+        );
+        PDF_OCR_TASKS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&book_id);
+        // Import must also clear a paused task when no worker is currently running.
+        save_paddle_job(&job).unwrap();
+        import_pdf_ocr_sync_data(&book_id, synced()).unwrap();
+        assert!(!has_pending_pdf_ocr_task(&book_id, &settings).unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn legacy_ocr_documents_default_to_no_special_page_roles() {

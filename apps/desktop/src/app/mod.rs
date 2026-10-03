@@ -187,7 +187,11 @@ impl DesktopApp {
     }
 
     pub(crate) fn complete_shelf_sync(&mut self, message: SyncTaskMessage) {
+        let succeeded = message.result.is_ok();
         self.shelf.complete_sync(message);
+        if succeeded && let Some(reader) = self.reader.as_mut() {
+            reader.refresh_synced_pdf_ocr();
+        }
     }
 
     pub(crate) fn update_shelf_sync_progress(&mut self, message: SyncProgressMessage) {
