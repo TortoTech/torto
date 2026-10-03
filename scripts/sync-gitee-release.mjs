@@ -91,7 +91,7 @@ function transportDiagnostics(error, seen = new Set()) {
 
 export async function request(url, { token, method = 'GET', json, form, optional = false, binary = false } = {}) {
   const headers = { 'User-Agent': 'Torto-release-mirror', Accept: binary ? 'application/octet-stream' : 'application/json' };
-  if (token) headers.Authorization = `token ${token}`;
+  if (token) headers.Authorization = `${new URL(url).hostname === 'gitee.com' ? 'Bearer' : 'token'} ${token}`;
   if (json) headers['Content-Type'] = 'application/json';
   const started = performance.now();
   const timeoutMs = binary || form ? 600_000 : 60_000;
@@ -154,7 +154,7 @@ export async function uploadAttachment(url, token, { asset, bytes }, { log = con
       child.on('error', () => reject(new Error('Could not start curl for Gitee upload')));
       child.on('close', (code, signal) => resolve({ code, signal, output }));
       // Keep credentials out of argv and logs. Never follow upload redirects.
-      child.stdin.end(`header = ${quote(`Authorization: token ${token}`)}\n`);
+      child.stdin.end(`form-string = ${quote(`access_token=${token}`)}\n`);
     });
     const values = result.output.trim().split(/\s+/);
     const metrics = values.length === stats.length && values.every(value => /^\d+(\.\d+)?$/.test(value))

@@ -16,12 +16,13 @@ test('curl uploads authenticated multipart bytes, reports metrics and redacts HT
   let status = 200;
   const asset = { ...release().assets[0], name: 'installer with spaces.msi' };
   const server = createServer(async (req, res) => {
-    assert.equal(req.headers.authorization, 'token secret-token');
+    assert.equal(req.headers.authorization, undefined);
     assert.match(req.headers['content-type'], /^multipart\/form-data; boundary=/);
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const body = Buffer.concat(chunks).toString();
     assert.match(body, /filename="installer with spaces.msi"/);
+    assert.match(body, /name="access_token"\r\n\r\nsecret-token/);
     assert.ok(body.includes(bytes.toString()));
     res.writeHead(status, { 'Content-Type': 'application/json' });
     res.end(status === 200 ? '{"id":123}' : 'secret-token private response');
@@ -40,6 +41,20 @@ test('curl uploads authenticated multipart bytes, reports metrics and redacts HT
     });
     assert.doesNotMatch(logs.join('\n'), /secret-token|Authorization|private response/);
   } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('uses Gitee Bearer authentication and retains GitHub token authentication', async () => {
+  const originalFetch = globalThis.fetch;
+  const authorization = [];
+  globalThis.fetch = async (_url, options) => {
+    authorization.push(options.headers.Authorization);
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    await request('https://gitee.com/api/v5/user', { token: 'fixture-token' });
+    await request('https://api.github.com/user', { token: 'fixture-token' });
+    assert.deepEqual(authorization, ['Bearer fixture-token', 'token fixture-token']);
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test('curl timeout reports actual bytes sent when the server withholds its response', async () => {
