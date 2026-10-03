@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const github = 'https://api.github.com/repos/TortoTech/torto';
@@ -127,6 +127,50 @@ async function attachments(id, token) {
   }
 }
 
+export async function uploadAttachment(url, token, { asset, bytes }, { log = console.log, timeoutSeconds = 600 } = {}) {
+  verifyAsset(asset, bytes);
+  if (/[\r\n\0]/.test(token)) throw new Error('Invalid Gitee token');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'torto-upload-'));
+  const file = path.join(directory, 'attachment');
+  const responseFile = path.join(directory, 'response.json');
+  const quote = value => `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
+  const started = performance.now();
+  try {
+    fs.writeFileSync(file, bytes, { mode: 0o600 });
+    log(`Uploading ${asset.name} (${bytes.length} bytes) with curl`);
+    const stats = ['http_code', 'size_upload', 'speed_upload', 'time_connect', 'time_starttransfer', 'time_total'];
+    const args = ['--disable', '--config', '-', '--silent', '--show-error',
+      '--connect-timeout', '30', '--max-time', String(timeoutSeconds),
+      '--user-agent', 'Torto-release-mirror', '--header', 'Accept: application/json',
+      '--form', `file=@${quote(file)};filename=${quote(asset.name)}`,
+      '--output', responseFile, '--write-out', stats.map(key => `%{${key}}`).join(' '), url];
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn('curl', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+      let output = '';
+      child.stdout.on('data', chunk => { if (output.length < 4096) output += chunk.toString(); });
+      // Consume but never print curl errors: they can include authenticated URLs.
+      child.stderr.resume();
+      child.stdin.on('error', () => {});
+      child.on('error', () => reject(new Error('Could not start curl for Gitee upload')));
+      child.on('close', (code, signal) => resolve({ code, signal, output }));
+      // Keep credentials out of argv and logs. Never follow upload redirects.
+      child.stdin.end(`header = ${quote(`Authorization: token ${token}`)}\n`);
+    });
+    const values = result.output.trim().split(/\s+/);
+    const metrics = values.length === stats.length && values.every(value => /^\d+(\.\d+)?$/.test(value))
+      ? stats.map((key, index) => `${key}=${values[index]}`).join('; ') : 'metrics=unavailable';
+    log(`Upload result ${asset.name}: curl_exit=${result.code}; elapsed_ms=${Math.round(performance.now() - started)}; ${metrics}`);
+    const httpCode = Number(values[0]);
+    if (result.code !== 0 || result.signal || !(httpCode >= 200 && httpCode < 300)) {
+      throw new Error(`Gitee upload failed for ${asset.name}: curl_exit=${result.code}; ${metrics}`);
+    }
+    try { return JSON.parse(fs.readFileSync(responseFile, 'utf8')); }
+    catch { throw new Error(`Invalid Gitee upload response for ${asset.name}`); }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 function tagCommit(tag) {
   return execFileSync('git', ['rev-parse', '--verify', `refs/tags/${tag}^{commit}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
 }
@@ -166,7 +210,8 @@ export async function syncRelease(release, api, download) {
   };
   if (!target) target = await api('POST', '/releases', metadata);
   const files = await api('LIST', `/releases/${target.id}/attach_files`);
-  const missing = planAssets(release.assets, files);
+  // Test the same authenticated upload path with small real checksum files first.
+  const missing = planAssets(release.assets, files).sort((a, b) => a.size - b.size);
   for (const asset of missing) {
     const bytes = await download(asset);
     verifyAsset(asset, bytes);
@@ -229,10 +274,7 @@ async function main() {
     const api = async (method, suffix, data, optional = false) => {
       if (method === 'LIST') return attachments(Number(suffix.split('/')[2]), token);
       if (method === 'UPLOAD') {
-        console.log(`Uploading ${data.asset.name} (${data.bytes.length} bytes)`);
-        const form = new FormData();
-        form.append('file', new Blob([data.bytes]), data.asset.name);
-        return request(`${gitee}${suffix}`, { token, method: 'POST', form });
+        return uploadAttachment(`${gitee}${suffix}`, token, data);
       }
       return request(`${gitee}${suffix}`, { token, method, json: data, optional });
     };

@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease, updateManifest, request } from './sync-gitee-release.mjs';
+import { createServer } from 'node:http';
+import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease, updateManifest, request, uploadAttachment } from './sync-gitee-release.mjs';
 
 const bytes = Buffer.from('installer fixture');
 const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -9,6 +10,54 @@ const release = () => ({
   tag_name: 'v0.7.0', name: 'Torto 0.7.0', body: 'Updated notes', draft: false, prerelease: false,
   assets: requiredAssets('v0.7.0').map(name => ({ name, size: bytes.length, digest,
     browser_download_url: `https://github.com/TortoTech/torto/releases/download/v0.7.0/${name}` })),
+});
+
+test('curl uploads authenticated multipart bytes, reports metrics and redacts HTTP errors', async () => {
+  let status = 200;
+  const asset = { ...release().assets[0], name: 'installer with spaces.msi' };
+  const server = createServer(async (req, res) => {
+    assert.equal(req.headers.authorization, 'token secret-token');
+    assert.match(req.headers['content-type'], /^multipart\/form-data; boundary=/);
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks).toString();
+    assert.match(body, /filename="installer with spaces.msi"/);
+    assert.ok(body.includes(bytes.toString()));
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(status === 200 ? '{"id":123}' : 'secret-token private response');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const logs = [];
+  const url = `http://127.0.0.1:${server.address().port}/upload`;
+  try {
+    assert.deepEqual(await uploadAttachment(url, 'secret-token', { asset, bytes }, { log: line => logs.push(line) }), { id: 123 });
+    assert.ok(logs.some(line => /http_code=200; size_upload=\d+; speed_upload=/.test(line)));
+    status = 401;
+    await assert.rejects(uploadAttachment(url, 'secret-token', { asset, bytes }, { log: line => logs.push(line) }), error => {
+      assert.match(error.message, /http_code=401/);
+      assert.doesNotMatch(error.message, /secret-token|private response/);
+      return true;
+    });
+    assert.doesNotMatch(logs.join('\n'), /secret-token|Authorization|private response/);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('curl timeout reports actual bytes sent when the server withholds its response', async () => {
+  let received = 0;
+  const server = createServer(async req => {
+    for await (const chunk of req) received += chunk.length;
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await assert.rejects(uploadAttachment(`http://127.0.0.1:${server.address().port}/upload`, 'secret-token',
+      { asset: release().assets[0], bytes }, { timeoutSeconds: 0.3, log: () => {} }), error => {
+      assert.match(error.message, /curl_exit=28/);
+      assert.match(error.message, /http_code=000/);
+      assert.ok(Number(/size_upload=(\d+)/.exec(error.message)[1]) >= bytes.length);
+      return true;
+    });
+    assert.ok(received >= bytes.length);
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });
 
 test('reports nested transport failures without leaking credentials or arbitrary messages', async () => {
