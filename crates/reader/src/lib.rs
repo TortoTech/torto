@@ -4679,7 +4679,14 @@ fn active_toc_item_for_location<'a>(
     mut resolve: impl FnMut(&PublicationUrl) -> Option<ReaderPosition>,
 ) -> Option<&'a TocViewItem> {
     let mut first_in_current_section = None;
-    let mut best = None;
+    // Previous-section entries only stand in while the current section has no
+    // entry at or before the reading position (for example when a section is not
+    // itself listed in the table of contents). Their segment and page indexes are
+    // measured inside their own section, so they must never be ranked against the
+    // current section's entries: a long previous chapter would otherwise keep
+    // winning well into the next one.
+    let mut best_preceding = None;
+    let mut best_current = None;
 
     for &order in preceding_section_items {
         let Some(item) = items.get(order) else {
@@ -4692,8 +4699,8 @@ fn active_toc_item_for_location<'a>(
             continue;
         }
         let key = (position.segment_index, position.page_index, order);
-        if best.is_none_or(|(best_key, _)| key > best_key) {
-            best = Some((key, item));
+        if best_preceding.is_none_or(|(best_key, _)| key > best_key) {
+            best_preceding = Some((key, item));
         }
     }
 
@@ -4719,12 +4726,15 @@ fn active_toc_item_for_location<'a>(
             continue;
         }
         let key = (segment_index, page_index, order);
-        if best.is_none_or(|(best_key, _)| key > best_key) {
-            best = Some((key, item));
+        if best_current.is_none_or(|(best_key, _)| key > best_key) {
+            best_current = Some((key, item));
         }
     }
 
-    best.map(|(_, item)| item).or(first_in_current_section)
+    best_current
+        .or(best_preceding)
+        .map(|(_, item)| item)
+        .or(first_in_current_section)
 }
 
 fn total_progression(location: ReaderLocation, section_count: usize) -> f64 {
@@ -7728,6 +7738,68 @@ mod tests {
         );
         assert_eq!(
             active_toc_item_for_location(&items, &[1, 2], &[0], 1, 2, 0, resolve)
+                .unwrap()
+                .id,
+            "subsection"
+        );
+    }
+
+    #[test]
+    fn previous_section_entries_never_outrank_the_current_section() {
+        let items = vec![
+            TocViewItem {
+                id: "previous".into(),
+                label: "Previous".into(),
+                target: Some(PublicationUrl::parse("section-0.xhtml#late").unwrap()),
+                depth: 0,
+                ancestors: Vec::new(),
+                has_children: false,
+            },
+            TocViewItem {
+                id: "chapter".into(),
+                label: "Chapter".into(),
+                target: Some(PublicationUrl::parse("section-1.xhtml#chapter").unwrap()),
+                depth: 0,
+                ancestors: Vec::new(),
+                has_children: false,
+            },
+            TocViewItem {
+                id: "subsection".into(),
+                label: "Subsection".into(),
+                target: Some(PublicationUrl::parse("section-1.xhtml#subsection").unwrap()),
+                depth: 1,
+                ancestors: vec!["chapter".into()],
+                has_children: false,
+            },
+        ];
+        let position = |section_index, segment_index, page_index| ReaderPosition {
+            section_index,
+            segment_index,
+            page_index,
+        };
+        // The previous section's last entry sits deep inside a long chapter,
+        // while the current section starts on its first page.
+        let resolve = |target: &PublicationUrl| match (target.path(), target.fragment()) {
+            ("section-0.xhtml", _) => Some(position(0, 8, 9)),
+            ("section-1.xhtml", Some("chapter")) => Some(position(1, 0, 0)),
+            ("section-1.xhtml", Some("subsection")) => Some(position(1, 3, 0)),
+            _ => None,
+        };
+
+        assert_eq!(
+            active_toc_item_for_location(&items, &[1, 2], &[0], 1, 0, 0, resolve)
+                .unwrap()
+                .id,
+            "chapter"
+        );
+        assert_eq!(
+            active_toc_item_for_location(&items, &[1, 2], &[0], 1, 2, 0, resolve)
+                .unwrap()
+                .id,
+            "chapter"
+        );
+        assert_eq!(
+            active_toc_item_for_location(&items, &[1, 2], &[0], 1, 3, 0, resolve)
                 .unwrap()
                 .id,
             "subsection"
