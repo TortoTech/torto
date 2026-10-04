@@ -7,6 +7,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { createArtifactSource, createAssetDownloader, artifactName } from './sync-gitee-release.mjs';
 import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease, updateManifest, request, uploadAttachment } from './sync-gitee-release.mjs';
+import { gitPushDiagnostics } from './sync-gitee-release.mjs';
+
+test('git push errors distinguish transport, permission and timeout failures without printing secrets', () => {
+  const details = gitPushDiagnostics({status:128, stderr:Buffer.from('error: RPC failed; HTTP 502 curl 92 HTTP/2 stream 3 was not closed cleanly\nfatal: the remote end hung up unexpectedly\nsecret-token https://user:secret-token@example.test/private')});
+  for (const expected of ['exit=128', 'http=502', 'curl=92', 'http2-failure', 'rpc-failed', 'remote-disconnected']) assert.ok(details.includes(expected));
+  for (const secret of ['secret-token', 'example.test', 'user:']) assert.ok(!details.includes(secret));
+  assert.ok(gitPushDiagnostics({status:128,stderr:'fatal: Authentication failed'}).includes('authentication-failed'));
+  assert.ok(gitPushDiagnostics({status:128,stderr:'remote: permission denied'}).includes('permission-denied'));
+  assert.ok(gitPushDiagnostics({signal:'SIGTERM',code:'ETIMEDOUT',stderr:''}).includes('code=ETIMEDOUT'));
+});
 
 const bytes = Buffer.from('installer fixture');
 const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;

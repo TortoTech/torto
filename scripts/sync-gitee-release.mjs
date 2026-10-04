@@ -286,6 +286,36 @@ function tagCommit(tag) {
   return execFileSync('git', ['rev-parse', '--verify', `refs/tags/${tag}^{commit}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
 }
 
+export function gitPushDiagnostics(error) {
+  // Never print arbitrary stderr: remote servers can echo credentials or URLs.
+  // Preserve only numeric exit information and recognized transport messages.
+  const stderr = String(error?.stderr || '');
+  const details = [];
+  if (Number.isInteger(error?.status)) details.push(`exit=${error.status}`);
+  if (/^SIG[A-Z0-9]+$/.test(error?.signal || '')) details.push(`signal=${error.signal}`);
+  if (['ETIMEDOUT', 'ENOENT', 'ENOBUFS'].includes(error?.code)) details.push(`code=${error.code}`);
+  const patterns = [
+    ['authentication-failed', /Authentication failed|could not read Username|could not read Password/i],
+    ['permission-denied', /permission denied|access denied|not allowed to push|403 Forbidden/i],
+    ['connection-timeout', /timed out|timeout was reached/i],
+    ['connection-reset', /connection reset|recv failure/i],
+    ['connection-refused', /failed to connect|connection refused/i],
+    ['dns-failure', /could not resolve host/i],
+    ['tls-failure', /SSL certificate|SSL connect error|TLS connection|SSL_ERROR/i],
+    ['http2-failure', /HTTP\/2 stream|HTTP2 framing/i],
+    ['rpc-failed', /RPC failed/i],
+    ['remote-disconnected', /remote end hung up|unexpected disconnect/i],
+    ['remote-rejected', /remote rejected|pre-receive hook declined/i],
+    ['ref-conflict', /already exists|would clobber|non-fast-forward/i],
+    ['repository-not-found', /repository .*not found/i],
+  ];
+  for (const [label, pattern] of patterns) if (pattern.test(stderr)) details.push(label);
+  for (const match of stderr.matchAll(/(?:HTTP(?: error)?[: ]+|returned error: )(\d{3})\b/gi)) details.push(`http=${match[1]}`);
+  for (const match of stderr.matchAll(/\bcurl[ :]+(\d{1,3})\b/gi)) details.push(`curl=${match[1]}`);
+  details.push(`stderr_bytes=${Buffer.byteLength(stderr)}`);
+  return [...new Set(details)].join('; ');
+}
+
 async function mirrorTag(tag, token, directory) {
   const commit = tagCommit(tag);
   let remote;
@@ -301,13 +331,16 @@ async function mirrorTag(tag, token, directory) {
   const user = await request('https://gitee.com/api/v5/user', { token });
   const askpass = path.join(directory, 'askpass.sh');
   fs.writeFileSync(askpass, '#!/bin/sh\ncase "$1" in *Username*) printf "%s\\n" "$TORTO_GITEE_LOGIN" ;; *) printf "%s\\n" "$GITEE_TOKEN" ;; esac\n', { mode: 0o700 });
+  const started = performance.now();
   try {
+    console.log(`Pushing Gitee tag ${tag} at ${commit}; timeout_ms=600000`);
     execFileSync('git', ['-c', 'credential.helper=', 'push', 'https://gitee.com/TortoTech/torto.git', `refs/tags/${tag}:refs/tags/${tag}`], {
       env: { ...process.env, GIT_ASKPASS: askpass, GIT_TERMINAL_PROMPT: '0', TORTO_GITEE_LOGIN: user.login, GITEE_TOKEN: token },
       stdio: ['ignore', 'pipe', 'pipe'], timeout: 600_000,
     });
-  } catch {
-    throw new Error('Could not push the release tag to Gitee (check token repository write permissions)');
+    console.log(`Gitee tag push completed: ${tag}; elapsed_ms=${Math.round(performance.now() - started)}`);
+  } catch (error) {
+    throw new Error(`Could not push the release tag to Gitee: elapsed_ms=${Math.round(performance.now() - started)}; ${gitPushDiagnostics(error)}`);
   }
 }
 
