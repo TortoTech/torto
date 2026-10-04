@@ -1,5 +1,6 @@
 mod http_loader;
 mod icons;
+mod interface_fonts;
 mod svg_loader;
 
 use std::collections::BTreeSet;
@@ -7,9 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use egui::emath::GuiRounding;
 use egui::{
-    Align2, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, Rect,
-    Response, RichText, Sense, Stroke, TextStyle, Ui, Vec2, WidgetInfo, WidgetType,
+    Align2, Color32, ColorImage, CornerRadius, Rect, Response, RichText, Sense, Stroke, TextStyle,
+    Ui, Vec2, WidgetInfo, WidgetType,
 };
+
+pub(crate) use interface_fonts::resolve as resolve_interface_font_fallbacks;
 
 pub(crate) use icons::{Icon, IconWidget, paint_icon};
 
@@ -230,6 +233,9 @@ pub(crate) fn configure(
     ctx.options_mut(|options| {
         options.max_passes = 1.try_into().expect("one is non-zero");
         options.sync_window_theme = true;
+        // Once uploaded, images can be reconstructed from their URI instead of
+        // retaining compressed bytes and decoded pixels alongside the texture.
+        options.reduce_texture_memory = true;
     });
     configure_tessellation(ctx);
     apply_interface_typography(ctx, interface_typography, language);
@@ -284,69 +290,7 @@ pub(crate) fn apply_interface_typography(
     INTERFACE_FONT_SIZE_BITS.store(interface_typography.font_size.to_bits(), Ordering::Relaxed);
     let extra_text_line_spacing = interface_extra_text_line_spacing(interface_typography.font_size);
 
-    let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert(
-        "reader-cjk".into(),
-        FontData::from_static(crate::fonts::cjk_font_bytes()).into(),
-    );
-    let mut database = fontdb::Database::new();
-    database.load_system_fonts();
-    let requested_families = if interface_typography.font_family == SYSTEM_INTERFACE_FONT {
-        system_ui_font_candidates(language)
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-    } else {
-        std::iter::once(interface_typography.font_family.clone())
-            .chain(
-                system_ui_font_candidates(language)
-                    .iter()
-                    .map(ToString::to_string),
-            )
-            .collect()
-    };
-    let mut interface_fonts = Vec::new();
-    let mut interface_bold_fonts = Vec::new();
-    for family in requested_families {
-        if interface_fonts.iter().any(|loaded| loaded == &family) {
-            continue;
-        }
-        if let Some(key) = load_system_font(
-            &database,
-            &family,
-            fontdb::Weight::NORMAL,
-            "regular",
-            &mut fonts,
-        ) {
-            interface_fonts.push(key);
-        }
-        if let Some(key) =
-            load_system_font(&database, &family, fontdb::Weight::BOLD, "bold", &mut fonts)
-        {
-            interface_bold_fonts.push(key);
-        }
-    }
-    let proportional_fallbacks = fonts
-        .families
-        .get(&FontFamily::Proportional)
-        .cloned()
-        .unwrap_or_default();
-    interface_fonts.extend(proportional_fallbacks);
-    interface_fonts.push("reader-cjk".into());
-    interface_fonts.dedup();
-    fonts
-        .families
-        .insert(FontFamily::Proportional, interface_fonts.clone());
-    interface_bold_fonts.extend(interface_fonts);
-    interface_bold_fonts.dedup();
-    fonts.families.insert(
-        FontFamily::Name(egui_commonmark_backend::STRONG_FONT_FAMILY.into()),
-        interface_bold_fonts,
-    );
-
-    let monospace_fonts = fonts.families.entry(FontFamily::Monospace).or_default();
-    monospace_fonts.push("reader-cjk".into());
-    ctx.set_fonts(fonts);
+    interface_fonts::configure(ctx, &interface_typography, language);
 
     ctx.all_styles_mut(|style| {
         style.text_styles = egui::style::default_text_styles();
@@ -380,30 +324,6 @@ pub(crate) fn available_interface_font_families() -> Vec<String> {
     families.retain(|family| family != SYSTEM_INTERFACE_FONT);
     families.insert(0, SYSTEM_INTERFACE_FONT.into());
     families
-}
-
-fn load_system_font(
-    database: &fontdb::Database,
-    family: &str,
-    weight: fontdb::Weight,
-    variant: &str,
-    fonts: &mut FontDefinitions,
-) -> Option<String> {
-    let families = [fontdb::Family::Name(family)];
-    let id = database.query(&fontdb::Query {
-        families: &families,
-        weight,
-        stretch: fontdb::Stretch::Normal,
-        style: fontdb::Style::Normal,
-    })?;
-    let key = format!("system-ui-{variant}-{family}");
-    let data = database.with_face_data(id, |bytes, index| {
-        let mut data = FontData::from_owned(bytes.to_vec());
-        data.index = index;
-        data
-    })?;
-    fonts.font_data.insert(key.clone(), data.into());
-    Some(key)
 }
 
 #[cfg(target_os = "windows")]

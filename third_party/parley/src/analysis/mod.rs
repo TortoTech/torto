@@ -535,15 +535,35 @@ pub(crate) fn analyze_text<B: Brush>(
             next_mandatory_linebreak
         });
 
-    if needs_bidi_resolution {
+    if needs_bidi_resolution || lcx.base_level_override.is_some() {
         lcx.bidi.resolve(
             text.chars().zip(
                 lcx.info
                     .iter()
                     .map(|info| (info.0.bidi_class, info.0.bracket)),
             ),
-            None,
+            lcx.base_level_override,
         );
+        for range in &lcx.ltr_ranges {
+            if range.start > range.end
+                || !text.is_char_boundary(range.start)
+                || !text.is_char_boundary(range.end)
+            {
+                continue;
+            }
+            let start = text[..range.start].chars().count();
+            let count = text[range.clone()].chars().count();
+            let mut paragraph = crate::bidi::BidiResolver::new();
+            paragraph.resolve(
+                text[range.clone()].chars().zip(
+                    lcx.info[start..start + count]
+                        .iter()
+                        .map(|info| (info.0.bidi_class, info.0.bracket)),
+                ),
+                Some(0),
+            );
+            lcx.bidi.set_range_levels(start, paragraph.levels());
+        }
     }
 }
 

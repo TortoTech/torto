@@ -1,6 +1,57 @@
 use crate::reader::*;
 
 #[test]
+#[ignore = "requires TORTO_PERF_BOOK; profiles cached local content without model requests"]
+fn local_cached_semantic_source_performance() {
+    let book = rebook_formats::open_file(std::path::PathBuf::from(
+        std::env::var_os("TORTO_PERF_BOOK").unwrap(),
+    ))
+    .unwrap();
+    let settings = crate::plugins::PluginSettings::load_default().unwrap();
+    let rewrite = Arc::new(RewriteBookSource::new(book.source()));
+    let translations = Arc::new(TranslationBookSource::new(
+        rewrite.clone(),
+        crate::plugins::TranslationMode::Replace,
+    ));
+    let semantic = Arc::new(SemanticLayoutSource::new(translations, rewrite));
+    semantic.configure(book.source().book().id.as_str(), &settings);
+    semantic.set_unified_citations(true);
+    for index in [17, 18, 16] {
+        let started = Instant::now();
+        let section = semantic.parse_section(index).unwrap();
+        println!(
+            "cached section={index} blocks={} elapsed_ms={:.2}",
+            section.blocks.len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    let raw_started = Instant::now();
+    let raw = book.source().parse_section(19).unwrap();
+    println!(
+        "raw references blocks={} elapsed_ms={:.2}",
+        raw.blocks.len(),
+        raw_started.elapsed().as_secs_f64() * 1000.0
+    );
+    let background = semantic.clone();
+    let worker = std::thread::spawn(move || {
+        let started = Instant::now();
+        background.parse_section(19).unwrap();
+        println!(
+            "background references elapsed_ms={:.2}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let commit_started = Instant::now();
+    semantic.commit_together(|| ());
+    println!(
+        "foreground empty commit wait_ms={:.2}",
+        commit_started.elapsed().as_secs_f64() * 1000.0
+    );
+    worker.join().unwrap();
+}
+
+#[test]
 fn classic_toc_navigation_completes_without_focus_overrides() {
     let (mut reader, section, _) = fixture();
     reader.reading_mode = ReadingMode::Classic;
@@ -526,6 +577,61 @@ fn staged_group(original: &Section, range: std::ops::Range<usize>) -> super::Gro
         )),
         range,
     }
+}
+
+#[test]
+fn busy_content_transaction_skips_empty_groups_and_retains_translation_until_retry() {
+    let (mut reader, original, range) = fixture();
+    let demand = vec![(0, vec![range])];
+    let mut empty = staged_group(&original, 1..2);
+    empty.result = None;
+    reader.semantic_layout.hashes.insert(0, empty.hash.clone());
+    reader.semantic_layout.groups.push(empty);
+    let source = reader.semantic_source.clone();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        source.commit_together(|| {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        })
+    });
+    entered_rx.recv().unwrap();
+    let started = Instant::now();
+    assert!(!reader.commit_ready_content(&demand, true));
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(
+        reader.semantic_layout.groups.is_empty(),
+        "empty groups need no transaction"
+    );
+    reader.translation.enabled = true;
+    reader.translation_source.set_enabled(true).unwrap();
+    reader.plugin_settings.providers[0].api_key = "fixture".into();
+    reader.plugin_settings.providers[0].base_url = "http://127.0.0.1:9".into();
+    reader.stage_translation_batch(
+        0,
+        vec![crate::plugins::BlockTranslation {
+            block_index: 1,
+            segment_index: None,
+            text: "Retained translation".into(),
+        }],
+    );
+    reader
+        .semantic_layout
+        .groups
+        .push(staged_group(&original, 1..2));
+    let started = Instant::now();
+    assert!(!reader.commit_ready_content(&demand, true));
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(reader.semantic_layout.groups.len(), 1);
+    assert_eq!(reader.semantic_layout.translations.len(), 1);
+    release_tx.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(reader.commit_ready_content(&demand, true));
+    assert!(reader.semantic_layout.groups.is_empty());
+    assert!(reader.semantic_layout.translations.is_empty());
+    let displayed = reader.semantic_source.parse_section(0).unwrap();
+    assert!(super::super::block_focus_text(&displayed.blocks[1]).contains("Retained translation"));
 }
 
 #[test]
@@ -2008,6 +2114,8 @@ fn footnote_popup_keeps_inside_clicks_and_closes_on_body_click() {
     let (mut reader, _, _) = fixture();
     reader.reading_mode = ReadingMode::Classic;
     reader.classic_footnotes = vec![FocusFootnote {
+        owner: None,
+        stable_id: None,
         text: "Footnote text for clicking.".into(),
         citation: None,
         number: 1,

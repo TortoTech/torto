@@ -82,7 +82,23 @@ impl DesktopReader {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     ) {
+        let tick_started = std::time::Instant::now();
         self.tick_semantic_layout(runtime, proxy);
+        if tick_started.elapsed().as_millis() >= 100 {
+            crate::diagnostics::log(
+                "reader.background_tick_slow",
+                &[
+                    crate::diagnostics::Field::F32(
+                        "elapsed_ms",
+                        tick_started.elapsed().as_secs_f32() * 1000.0,
+                    ),
+                    crate::diagnostics::Field::Usize(
+                        "section",
+                        self.reader.location().section_index,
+                    ),
+                ],
+            );
+        }
         if let Some(request) = self.search.task.take_pending() {
             let proxy = proxy.clone();
             runtime.spawn(async move {

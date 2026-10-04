@@ -186,6 +186,7 @@ pub(crate) fn text_block_text(block: &TextBlock) -> String {
         .iter()
         .map(|inline| match inline {
             Inline::Text(run) => run.text.clone(),
+            Inline::Ruby(run) => run.base_text(),
             Inline::Math(run) => run.original_text().unwrap_or_else(|| run.latex.clone()),
             Inline::Image(_) => String::new(),
             Inline::Break => "\n".to_owned(),

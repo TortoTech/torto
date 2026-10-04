@@ -74,6 +74,7 @@ mod completion;
 mod egui_view;
 mod focus_lists;
 mod footnote_layout;
+mod footnote_navigation;
 mod interaction;
 mod navigation;
 pub(super) mod render;
@@ -549,6 +550,7 @@ pub(super) struct DesktopReader {
     focus_units_ready: bool,
     classic_footnotes: Vec<FocusFootnote>,
     citation_popup_target: Option<(SourceRange, u32)>,
+    active_footnote_reference: Option<(SourceRange, u32)>,
     classic_footnote_anchor_y: Option<f32>,
     classic_footnote_overlay_rect: Option<egui::Rect>,
     focus_unit_index: usize,
@@ -657,12 +659,22 @@ struct FocusUnit {
 
 #[derive(Clone)]
 struct FocusFootnote {
+    stable_id: Option<egui::Id>,
+    owner: Option<SourceRange>,
     number: u32,
     citation: Option<(SourceRange, u32)>,
     text: String,
 }
 
 impl FocusFootnote {
+    fn reference(&self) -> Option<(SourceRange, u32)> {
+        self.citation.clone().or_else(|| {
+            self.owner
+                .clone()
+                .map(|source| (source, 0x2000_0000 | self.number))
+        })
+    }
+
     fn popup_text(&self) -> &str {
         if self.citation.is_none() {
             return &self.text;
@@ -1068,6 +1080,7 @@ fn text_block_focus_text(block: &TextBlock) -> String {
         .content
         .iter()
         .filter_map(|inline| match inline {
+            Inline::Ruby(run) => Some(run.base_text()),
             Inline::Text(run) if run.style.inline_role == InlineRole::Footnote => None,
             Inline::Text(run) => Some(run.text.clone()),
             Inline::Math(run) => Some(run.latex.clone()),
@@ -2242,17 +2255,27 @@ impl DesktopReader {
     ) -> Vec<FocusFootnote> {
         let mut notes: Vec<_> = block_focus_footnotes(block)
             .into_iter()
-            .filter_map(|source| match source {
+            .enumerate()
+            .filter_map(|(slot, source)| match source {
                 FocusFootnoteSource::Citation {
                     text,
                     source,
                     number,
                 } => Some(FocusFootnote {
+                    owner: None,
+                    stable_id: Some(egui::Id::new((
+                        "citation",
+                        &source.start.spine,
+                        &source.start.node,
+                        number,
+                    ))),
                     text,
                     number,
                     citation: Some((source, number)),
                 }),
                 FocusFootnoteSource::Inline(text, number) => Some(FocusFootnote {
+                    owner: None,
+                    stable_id: Some(egui::Id::new(("inline-note-slot", slot))),
                     text,
                     number,
                     citation: None,
@@ -2262,6 +2285,13 @@ impl DesktopReader {
                     target,
                     number,
                 } => Some(FocusFootnote {
+                    owner: None,
+                    stable_id: Some(egui::Id::new((
+                        "linked-note-slot",
+                        target.path(),
+                        target.fragment(),
+                        slot,
+                    ))),
                     number,
                     citation: None,
                     text: focus_footnote_text(
@@ -2280,6 +2310,47 @@ impl DesktopReader {
                 }),
             })
             .collect();
+        let numbered = rebook_layout::numbered_semantic_footnotes(block);
+        fn collect_sources(block: &Block, out: &mut HashMap<u32, SourceRange>) {
+            let mut text = |text: &TextBlock| {
+                if let Some(source) = &text.source {
+                    for note in text_block_focus_footnotes(text) {
+                        let number = match note {
+                            FocusFootnoteSource::Inline(_, number)
+                            | FocusFootnoteSource::Reference { number, .. } => number,
+                            FocusFootnoteSource::Citation { .. } => continue,
+                        };
+                        out.insert(number, source.clone());
+                    }
+                }
+            };
+            match block {
+                Block::Text(t) => text(t),
+                Block::Quote(q) => {
+                    for t in q.body.iter().chain(q.attribution.iter()) {
+                        text(t);
+                    }
+                }
+                Block::Table(t) => {
+                    for t in t.text_blocks() {
+                        text(t);
+                    }
+                }
+                Block::Figure(f) => {
+                    for t in &f.captions {
+                        text(t);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut owners = HashMap::new();
+        collect_sources(&numbered, &mut owners);
+        for note in &mut notes {
+            if note.citation.is_none() {
+                note.owner = owners.get(&note.number).cloned();
+            }
+        }
         notes.sort_by_key(|note| note.citation.is_some());
         notes
     }
@@ -3995,6 +4066,7 @@ impl DesktopReader {
             focus_units_ready: false,
             classic_footnotes: Vec::new(),
             citation_popup_target: None,
+            active_footnote_reference: None,
             classic_footnote_anchor_y: None,
             classic_footnote_overlay_rect: None,
             focus_unit_index: 0,
@@ -5329,6 +5401,8 @@ mod tests {
             structured_activation: false,
             rectangular_activation_rect: None,
             footnotes: vec![FocusFootnote {
+                owner: None,
+                stable_id: None,
                 citation: None,
                 number: 1,
                 text: "Caption note".into(),
@@ -5672,6 +5746,8 @@ mod tests {
         let child_range = range("child");
         let mut child = unit("child", "口头文化与书面文化", 160.0);
         child.footnotes.push(FocusFootnote {
+            owner: None,
+            stable_id: None,
             citation: None,
             number: 1,
             text: "列表子项脚注".into(),

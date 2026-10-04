@@ -382,12 +382,12 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
                 language.text("按句分段", "Split by sentence"),
             ),
             (
-                ShortcutAction::FocusFootnotes,
-                language.text("脚注开关", "Toggle footnotes"),
-            ),
-            (
                 ShortcutAction::FocusImagePreview,
                 language.text("预览图片", "Preview image"),
+            ),
+            (
+                ShortcutAction::FocusFootnotes,
+                language.text("脚注开关", "Toggle footnotes"),
             ),
             (
                 ShortcutAction::FocusExtendSelectionPrevious,

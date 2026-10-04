@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+anyrender.workspace = true
+anyrender_vello_cpu = { version = "0.17.0", default-features = false }
 base64.workspace = true
 crc32fast.workspace = true
 encoding_rs.workspace = true
@@ -16,6 +18,8 @@ kurbo.workspace = true
 libchm.workspace = true
 quick-xml.workspace = true
 rebook-html = { path = "../html" }
+rebook-layout = { path = "../layout" }
+rebook-renderer = { path = "../renderer" }
 rebook-publication = { path = "../publication" }
 roxmltree.workspace = true
 scraper.workspace = true

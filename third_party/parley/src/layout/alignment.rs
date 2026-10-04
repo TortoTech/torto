@@ -102,6 +102,16 @@ fn align_impl<B: Brush, const UNDO_JUSTIFICATION: bool>(
 
     // Apply alignment to line items
     for line in &mut layout.lines {
+        let translated = layout
+            .left_aligned_ranges
+            .iter()
+            .any(|range| range.contains(&line.text_range.start));
+        let alignment = if translated {
+            Alignment::Left
+        } else {
+            alignment
+        };
+        let is_rtl = is_rtl && !translated;
         let indent = line.indent;
 
         if is_rtl {

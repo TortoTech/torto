@@ -50,6 +50,12 @@ impl BidiResolver {
         &self.levels
     }
 
+    pub(crate) fn set_range_levels(&mut self, start: usize, levels: &[BidiLevel]) {
+        if let Some(target) = self.levels.get_mut(start..start + levels.len()) {
+            target.copy_from_slice(levels);
+        }
+    }
+
     /// Clears the resolver state.
     pub(crate) fn clear(&mut self) {
         self.initial_types.clear();

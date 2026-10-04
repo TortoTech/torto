@@ -522,8 +522,9 @@ impl FootnoteRenderer {
                             let metrics = run.metrics();
                             let y = page_y + text.origin_y + glyph_run.baseline()
                                 - (metrics.ascent - metrics.descent) * 0.5;
-                            let icon_color =
-                                marker.map_or(egui::Color32::from_rgb(70, 100, 220), |(_, c, _)| c);
+                            // Website links keep their link color independently
+                            // of the active footnote number.
+                            let icon_color = crate::ui::footnote_link_color();
                             paths.push_str(&format!(r##"<g fill="none" stroke="#{:02x}{:02x}{:02x}" stroke-width="1"><circle cx="{x}" cy="{y}" r="{radius}"/><ellipse cx="{x}" cy="{y}" rx="{}" ry="{radius}"/><path d="M{} {y}H{}"/></g>"##, icon_color.r(), icon_color.g(), icon_color.b(), radius * 0.45, x-radius, x+radius));
                             websites.push((
                                 egui::Rect::from_center_size(
@@ -801,17 +802,28 @@ mod tests {
                 &style,
                 14.0,
                 egui::Color32::BLACK,
-                egui::Color32::from_rgb(30, 80, 210),
+                egui::Color32::from_rgb(250, 204, 21),
                 460.0,
             )
             .unwrap();
         assert_eq!(unified.websites.len(), 2);
         assert_eq!(unified.websites[0].1, "https://example.com/long/path?q=1");
         assert_eq!(unified.websites[1].1, "https://example.org/");
+        let svg = std::str::from_utf8(&unified.svg).unwrap();
+        let link_color = crate::ui::footnote_link_color();
+        assert!(svg.contains(&format!(
+            "stroke=\"#{:02x}{:02x}{:02x}\"",
+            link_color.r(),
+            link_color.g(),
+            link_color.b(),
+        )));
         assert!(
-            std::str::from_utf8(&unified.svg)
-                .unwrap()
-                .contains("stroke=\"#1e50d2\"")
+            !svg.contains("stroke=\"#facc15\""),
+            "website icons must not inherit active yellow"
+        );
+        assert!(
+            svg.contains("fill=\"#facc15\""),
+            "the active note number stays yellow"
         );
         assert!(unified.websites.iter().all(|(rect, _)| rect.min.x >= 0.0
             && rect.max.x <= unified.width

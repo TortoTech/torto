@@ -303,6 +303,37 @@ impl LocalLibrary {
         self.persist_books(&self.books)
     }
 
+    /// Persist background-generated covers only for books still present and missing one.
+    pub(crate) fn update_missing_covers(
+        &mut self,
+        covers: &[(String, Vec<u8>)],
+    ) -> LibraryResult<()> {
+        if covers.is_empty() {
+            return Ok(());
+        }
+        let mut books = self.books.clone();
+        let mut changed = false;
+        for (id, bytes) in covers {
+            let Some(book) = books
+                .iter_mut()
+                .find(|book| &book.id == id && book.cover_bytes.is_none())
+            else {
+                continue;
+            };
+            fs::write(
+                self.root.join(COVERS_DIRECTORY).join(format!("{id}.cover")),
+                bytes,
+            )?;
+            book.cover_bytes = Some(bytes.clone());
+            changed = true;
+        }
+        if changed {
+            self.persist_books(&books)?;
+            self.books = books;
+        }
+        Ok(())
+    }
+
     fn persist_books(&self, books: &[LibraryBook]) -> LibraryResult<()> {
         let stored = StoredLibrary {
             version: LIBRARY_VERSION,
@@ -410,6 +441,59 @@ mod tests {
 
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
+
+    #[test]
+    fn missing_cover_backfill_persists_without_overwriting_existing_covers() {
+        let root = test_directory("cover-backfill");
+        let mut library = LocalLibrary::load_from(root.clone()).unwrap();
+        for (id, cover) in [("missing", None), ("existing", Some(b"original".to_vec()))] {
+            library.books.push(LibraryBook {
+                id: id.into(),
+                title: id.into(),
+                authors: Vec::new(),
+                file_name: format!("{id}.epub"),
+                path: root.join(BOOKS_DIRECTORY).join(format!("{id}.epub")),
+                cover_bytes: cover,
+                added_at: 1,
+            });
+        }
+        fs::write(
+            root.join(COVERS_DIRECTORY).join("existing.cover"),
+            b"original",
+        )
+        .unwrap();
+        library.persist().unwrap();
+        library
+            .update_missing_covers(&[
+                ("missing".into(), b"generated".to_vec()),
+                ("existing".into(), b"replacement".to_vec()),
+                ("removed".into(), b"orphan".to_vec()),
+            ])
+            .unwrap();
+        let loaded = LocalLibrary::load_from(root.clone()).unwrap();
+        assert_eq!(
+            loaded
+                .books
+                .iter()
+                .find(|b| b.id == "missing")
+                .unwrap()
+                .cover_bytes
+                .as_deref(),
+            Some(b"generated".as_slice())
+        );
+        assert_eq!(
+            loaded
+                .books
+                .iter()
+                .find(|b| b.id == "existing")
+                .unwrap()
+                .cover_bytes
+                .as_deref(),
+            Some(b"original".as_slice())
+        );
+        assert!(!root.join(COVERS_DIRECTORY).join("removed.cover").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn metadata_batch_skips_unchanged_writes_and_commits_atomically() {

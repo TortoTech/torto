@@ -1730,6 +1730,19 @@ impl ReaderSession {
         Ok(self.page_at(position)?.footnote_source_at(x, y))
     }
 
+    pub fn footnote_reference_at_page(
+        &mut self,
+        position: ReaderPosition,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<(u64, u32)>, ReaderError> {
+        self.ensure_segment(SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        })?;
+        Ok(self.page_at(position)?.footnote_reference_at(x, y))
+    }
+
     pub fn inline_citation_at_page(
         &mut self,
         position: ReaderPosition,
@@ -1963,6 +1976,21 @@ impl ReaderSession {
             .find_map(|(position, page, offset_x)| {
                 page.footnote_source_at(x - *offset_x, y)
                     .map(|source| (*position, source))
+            }))
+    }
+
+    pub fn footnote_reference_at_current_spread(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<(ReaderPosition, (u64, u32))>, ReaderError> {
+        Ok(self
+            .current_spread_pages()?
+            .iter()
+            .rev()
+            .find_map(|(position, page, offset)| {
+                page.footnote_reference_at(x - *offset, y)
+                    .map(|reference| (*position, reference))
             }))
     }
 
@@ -3913,8 +3941,16 @@ fn split_inline_content(content: Vec<Inline>) -> Vec<(Vec<Inline>, usize)> {
 
     for inline in content {
         match inline {
+            Inline::Ruby(run) => {
+                let length: usize = run.base.iter().map(|r| r.text.chars().count()).sum();
+                if current_len > 0 && current_len.saturating_add(length) > FRAGMENT_TEXT_BUDGET {
+                    flush(&mut current, &mut current_len, &mut parts);
+                }
+                current_len += length;
+                current.push(Inline::Ruby(run));
+            }
             Inline::Break => {
-                if current_len == FRAGMENT_TEXT_BUDGET {
+                if current_len >= FRAGMENT_TEXT_BUDGET {
                     flush(&mut current, &mut current_len, &mut parts);
                 }
                 current.push(Inline::Break);
@@ -3924,7 +3960,7 @@ fn split_inline_content(content: Vec<Inline>) -> Vec<(Vec<Inline>, usize)> {
                 let TextRun { text, style, link } = run;
                 let mut remaining = text.as_str();
                 while !remaining.is_empty() {
-                    if current_len == FRAGMENT_TEXT_BUDGET {
+                    if current_len >= FRAGMENT_TEXT_BUDGET {
                         flush(&mut current, &mut current_len, &mut parts);
                     }
                     let capacity = FRAGMENT_TEXT_BUDGET - current_len;
@@ -3990,6 +4026,7 @@ fn inline_content_len(content: &[Inline]) -> usize {
     content
         .iter()
         .map(|inline| match inline {
+            Inline::Ruby(run) => run.base.iter().map(|r| r.text.chars().count()).sum(),
             Inline::Text(run) => run.text.chars().count(),
             Inline::Math(run) => run.source_char_len(),
             Inline::Image(_) => 0,
@@ -6117,6 +6154,38 @@ mod tests {
         assert_eq!(ranges[1].end.text_offset, 8_192);
         assert_eq!(ranges[2].start.text_offset, 8_192);
         assert_eq!(ranges[2].end.text_offset, 8_209);
+    }
+
+    #[test]
+    fn ruby_fragment_boundaries_count_only_prose_and_keep_pairs_intact() {
+        let run = |text: String| TextRun {
+            text,
+            style: Default::default(),
+            link: None,
+        };
+        let ruby = |text: String| {
+            Inline::Ruby(Box::new(rebook_publication::RubyRun {
+                base: vec![run(text)],
+                annotation: vec![run("やまみち".into())],
+                below: false,
+            }))
+        };
+        let parts = split_inline_content(vec![
+            Inline::Text(run("前".repeat(FRAGMENT_TEXT_BUDGET - 1))),
+            ruby("山路".into()),
+            Inline::Text(run("後".into())),
+        ]);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].1, FRAGMENT_TEXT_BUDGET - 1);
+        assert_eq!(parts[1].1, 3);
+        assert!(matches!(parts[1].0[0], Inline::Ruby(_)));
+        let parts = split_inline_content(vec![
+            ruby("山".repeat(FRAGMENT_TEXT_BUDGET + 1)),
+            Inline::Text(run("後".into())),
+        ]);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].1, FRAGMENT_TEXT_BUDGET + 1);
+        assert_eq!(parts[1].1, 1);
     }
 
     #[test]

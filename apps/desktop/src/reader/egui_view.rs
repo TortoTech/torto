@@ -1183,9 +1183,15 @@ impl DesktopReader {
                 return;
             }
             let scroll_delta = ctx.input_mut(|input| {
-                if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                    || self.is_focus_mode()
+                        && input.consume_shortcut(&self.shortcuts.previous_page_or_paragraph)
+                {
                     -ASSISTANT_KEYBOARD_SCROLL_STEP
-                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                    || self.is_focus_mode()
+                        && input.consume_shortcut(&self.shortcuts.next_page_or_paragraph)
+                {
                     ASSISTANT_KEYBOARD_SCROLL_STEP
                 } else {
                     0.0
@@ -1469,11 +1475,23 @@ impl DesktopReader {
 
     fn close_focus_footnotes(&mut self) {
         self.citation_popup_target = None;
+        self.set_active_footnote_reference(None);
         self.ui.focus_footnotes_visible = false;
         self.ui.focus_footnote_scroll_delta = 0.0;
         self.classic_footnotes.clear();
         self.classic_footnote_anchor_y = None;
         self.classic_footnote_overlay_rect = None;
+    }
+
+    fn set_active_footnote_reference(
+        &mut self,
+        reference: Option<(rebook_publication::SourceRange, u32)>,
+    ) {
+        if self.active_footnote_reference != reference {
+            self.active_footnote_reference = reference;
+            // A UI repaint alone can reuse the previous GPU reader texture.
+            self.bump_scene_revision();
+        }
     }
 
     fn operation_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
@@ -2694,6 +2712,67 @@ impl DesktopReader {
             (viewport.bottom() - panel_height - 16.0).max(viewport.top() + 16.0),
         );
         let keyboard_scroll = std::mem::take(&mut self.ui.focus_footnote_scroll_delta);
+        let focus_popup = self.is_focus_mode();
+        let row_keys: Vec<_> = footnotes
+            .iter()
+            .map(|note| {
+                let owner = note
+                    .reference()
+                    .map(|(source, _)| rebook_publication::source_block_identity(&source));
+                let slot = note
+                    .stable_id
+                    .unwrap_or_else(|| egui::Id::new((note.number, note.citation.is_some())));
+                scroll_key.with(("footnote-entry", owner, slot))
+            })
+            .collect();
+        let navigation_key = scroll_key.with("block-navigation");
+        let mut block_navigation = focus_popup.then(|| {
+            let mut navigation = if self
+                .ui
+                .focus_footnote_scroll_positions
+                .contains_key(&scroll_key)
+            {
+                ctx.data_mut(|data| {
+                    data.get_temp::<super::footnote_navigation::Navigation>(navigation_key)
+                })
+                .unwrap_or_default()
+            } else {
+                super::footnote_navigation::Navigation::default()
+            };
+            if navigation.active.is_none() {
+                navigation.offset = scroll_offset;
+            }
+            let mut top = 0.0;
+            let rows = footnote_text_layouts
+                .iter()
+                .zip(&row_keys)
+                .map(|(layout, key)| {
+                    let row = super::footnote_navigation::Row {
+                        key: *key,
+                        top,
+                        height: layout.height,
+                    };
+                    top += layout.height + item_spacing * 2.0 + separator_spacing;
+                    row
+                })
+                .collect();
+            navigation.synchronize(
+                rows,
+                measured_body_height,
+                measured_text_height + separator_height,
+            );
+            if let Some(target) = &scroll_target {
+                if let Some(index) = footnotes
+                    .iter()
+                    .position(|note| note.reference().as_ref() == Some(target))
+                {
+                    navigation.select(row_keys[index]);
+                }
+            }
+            navigation
+        });
+        let mut marker_return = None;
+        let return_to_marker_text = self.language.text("??????", "Return to reference");
 
         let overlay = egui::Area::new("focus-footnotes".into())
             .order(egui::Order::Foreground)
@@ -2713,7 +2792,25 @@ impl DesktopReader {
                         input.smooth_scroll_delta.y = 0.0;
                         delta
                     });
-                    let routed_scroll = wheel_scroll - keyboard_scroll;
+                    let routed_scroll = if let Some(navigation) = &mut block_navigation {
+                        navigation.wheel(wheel_scroll, WHEEL_PAGE_THRESHOLD, WHEEL_TURN_COOLDOWN);
+                        if keyboard_scroll != 0.0 {
+                            navigation.navigate(if keyboard_scroll < 0.0 {
+                                PageDirection::Previous
+                            } else {
+                                PageDirection::Next
+                            });
+                        }
+                        if navigation.advance(Instant::now()) {
+                            ctx.request_repaint();
+                        }
+                        0.0
+                    } else {
+                        wheel_scroll - keyboard_scroll
+                    };
+                    let scroll_offset = block_navigation
+                        .as_ref()
+                        .map_or(scroll_offset, |navigation| navigation.offset);
                     ui.horizontal_top(|ui| {
                         let content_width = ui.available_width().max(1.0);
                         ui.vertical(|ui| {
@@ -2735,8 +2832,59 @@ impl DesktopReader {
                                                     .spacing(separator_spacing),
                                             );
                                         }
-                                        let row = ui.vertical(|ui| layout.paint(ui)).response;
-                                        if scroll_target.is_some()
+                                        let active = block_navigation.as_ref().is_some_and(|navigation| {
+                                            navigation.active == Some(row_keys[index])
+                                        });
+                                        let active_layout = active.then(|| {
+                                            let note = &footnotes[index];
+                                            let marker = if note.citation.is_some() {
+                                                format!("[{}]", note.number)
+                                            } else {
+                                                note.number.to_string()
+                                            };
+                                            let marker_color = super::render::active_footnote_marker_color();
+                                            self.footnote_layout.layout_aligned_marked(
+                                                self.source.as_ref(), note.popup_text(), &marker,
+                                                &self.reader.style(), body_font.size, text_color,
+                                                marker_color, layout.width, marker_slot,
+                                            ).unwrap_or_else(|_| {
+                                                super::footnote_layout::FootnoteLayout::fallback_marked(
+                                                    ctx, note.popup_text(), &marker, &body_font,
+                                                    text_color, marker_color, layout.width, marker_slot,
+                                                )
+                                            })
+                                        });
+                                        let row = ui.push_id(row_keys[index], |ui| {
+                                            if focus_popup && !active {
+                                                ui.multiply_opacity(0.45);
+                                            }
+                                            active_layout.as_ref().unwrap_or(layout).paint(ui);
+                                        }).response;
+                                        if focus_popup {
+                                            let marker_rect = Rect::from_min_size(
+                                                row.rect.min,
+                                                Vec2::new(
+                                                    marker_slot + body_font.size * 0.3,
+                                                    body_font.size * 1.5,
+                                                ),
+                                            );
+                                            let response = ui
+                                                .interact(
+                                                    marker_rect,
+                                                    row_keys[index].with("return-to-marker"),
+                                                    egui::Sense::click(),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text(return_to_marker_text);
+                                            if response.clicked() {
+                                                marker_return = footnotes[index].reference();
+                                                if let Some(navigation) = &mut block_navigation {
+                                                    navigation.select(row_keys[index]);
+                                                }
+                                            }
+                                        }
+                                        if !focus_popup
+                                            && scroll_target.is_some()
                                             && footnotes[index].citation == scroll_target
                                         {
                                             row.scroll_to_me(Some(egui::Align::Center));
@@ -2744,10 +2892,31 @@ impl DesktopReader {
                                     }
                                 });
                             next_scroll_offset = scroll.state.offset.y;
+                            if let Some(navigation) = &mut block_navigation {
+                                if ctx.input(|input| input.pointer.any_down()) {
+                                    navigation.accept_manual_scroll(next_scroll_offset);
+                                } else {
+                                    navigation.offset = next_scroll_offset;
+                                }
+                            }
                         });
                     });
                 });
             });
+        if let Some(navigation) = block_navigation {
+            let active = footnotes
+                .get(navigation.index())
+                .and_then(super::FocusFootnote::reference);
+            if active != self.active_footnote_reference {
+                self.set_active_footnote_reference(active);
+                ctx.request_repaint();
+            }
+            ctx.data_mut(|data| data.insert_temp(navigation_key, navigation));
+        }
+        if let Some(reference) = marker_return {
+            self.scroll_to_footnote_reference(&reference);
+            ctx.request_repaint();
+        }
         self.ui
             .focus_footnote_scroll_positions
             .insert(scroll_key, next_scroll_offset);
@@ -3033,6 +3202,31 @@ impl DesktopReader {
 
     fn focused_unit_screen_center_y(&self, page_rect: Rect) -> Option<f32> {
         self.focus_unit_screen_center_y_at(self.focus_unit_index, page_rect)
+    }
+
+    fn scroll_to_footnote_reference(&mut self, reference: &(rebook_publication::SourceRange, u32)) {
+        let Some(viewport) = self.scroll_viewport else {
+            return;
+        };
+        let Some(layout) = &self.scroll_section else {
+            return;
+        };
+        let target = layout.pages.iter().enumerate().find_map(|(index, page)| {
+            page.page
+                .footnote_reference_bounds(&reference.0, reference.1)
+                .first()
+                .map(|bounds| {
+                    layout.page_tops[index] + (bounds[1] + bounds[3]) * 0.5
+                        - layout.page_origins[index]
+                })
+        });
+        if let Some(target) = target {
+            let padding = self.scroll_content_padding(viewport.size.y);
+            let maximum = (layout.content_height + padding * 2.0 - viewport.size.y).max(0.0);
+            self.animate_focus_scroll_to(
+                (target + padding - viewport.size.y * 0.5).clamp(0.0, maximum),
+            );
+        }
     }
 
     fn focused_footnote_screen_center_y(&self, page_rect: Rect) -> Option<f32> {
@@ -3645,9 +3839,6 @@ impl DesktopReader {
             .min_scrolled_height(height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if routed_scroll != 0.0 {
-                    ui.scroll_with_delta(Vec2::new(0.0, routed_scroll));
-                }
                 let content_width =
                     (ui.available_width() - ASSISTANT_SCROLLBAR_GUTTER).max(1.0);
                 ui.set_width(content_width);
@@ -3728,6 +3919,12 @@ impl DesktopReader {
                         ),
                     );
                     }
+                }
+                // egui applies programmatic scroll deltas to the next ScrollArea
+                // that finishes. Submit after nested tool/markdown areas finish
+                // so the conversation receives its keyboard and focus-wheel input.
+                if routed_scroll != 0.0 {
+                    ui.scroll_with_delta(Vec2::new(0.0, routed_scroll));
                 }
             });
         let clicked_visual_preview = self.chat_markdown.take_clicked_visual_preview();
@@ -4418,6 +4615,19 @@ impl DesktopReader {
                 }
             }
         }
+        if self.is_focus_mode()
+            && let Some(position) = response.hover_pos()
+        {
+            if self
+                .footnote_reference_at_canvas(
+                    position.x - response.rect.min.x,
+                    position.y - response.rect.min.y,
+                )
+                .is_some()
+            {
+                response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
         self.classic_footnote_hover_interaction(response);
         let Some(position) = response.interact_pointer_pos() else {
             if !response.ctx.input(|input| input.pointer.primary_down()) {
@@ -4448,7 +4658,12 @@ impl DesktopReader {
                 self.image_pointer_state = ImagePointerState::Idle;
                 return;
             }
-            if let Some(target) = self.citation_at_canvas(x, y) {
+            let reference = if self.is_focus_mode() {
+                self.footnote_reference_at_canvas(x, y)
+            } else {
+                self.citation_at_canvas(x, y)
+            };
+            if let Some(target) = reference {
                 if self.is_focus_mode() {
                     self.cancel_text_selection();
                     self.focus_clicked_unit(x, y);
@@ -6220,6 +6435,94 @@ fn page_wheel_input_allowed(pointer_over_page: bool, blocked: bool) -> bool {
 mod reference_suggestion_label_tests {
     use super::*;
 
+    #[test]
+    fn chat_keyboard_scroll_reaches_conversation_with_expanded_tools() {
+        for focus in [false, true] {
+            for expanded in [false, true] {
+                let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+                reader.reading_mode = if focus {
+                    crate::preferences::ReadingMode::Focus
+                } else {
+                    crate::preferences::ReadingMode::Classic
+                };
+                reader.ui.assistant_panel = Some(AssistantPanel::Chat);
+                reader.chat.messages.push(crate::plugins::ChatTurn {
+                    thinking_seconds: None,
+                    progress: Vec::new(),
+                    images: Vec::new(),
+                    role: ChatRole::Assistant,
+                    content: "A long answer paragraph.\n\n".repeat(40),
+                    display_content: None,
+                });
+                reader.chat.streaming = Some(super::super::ChatStreamingState {
+                    thinking_seconds: None,
+                    started: Instant::now(),
+                    task_id: 1,
+                    content: String::new(),
+                    progress: (0..30)
+                        .map(|i| format!("Tool call {i}: searchBook"))
+                        .collect(),
+                    reasoning_index: None,
+                    tools: Default::default(),
+                });
+                let ctx = egui::Context::default();
+                ctx.all_styles_mut(|style| {
+                    style.scroll_animation = egui::style::ScrollAnimation::none()
+                });
+                let mut offsets = Vec::new();
+                for frame in 0..6 {
+                    let key = match frame {
+                        2 => Some(egui::Key::ArrowUp),
+                        4 => Some(egui::Key::ArrowDown),
+                        _ => None,
+                    };
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(500.0, 400.0),
+                            )),
+                            time: Some(frame as f64),
+                            events: key
+                                .into_iter()
+                                .map(|key| egui::Event::Key {
+                                    key,
+                                    physical_key: None,
+                                    pressed: true,
+                                    repeat: false,
+                                    modifiers: egui::Modifiers::NONE,
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        |root| {
+                            if focus {
+                                reader.keyboard_shortcuts(&ctx, false);
+                            }
+                            egui::CentralPanel::default().show(root, |ui| {
+                                let id = ui.make_persistent_id(egui::IdSalt::new("scroll_area"));
+                                reader.assistant_conversation(ui, 200.0, expanded);
+                                offsets.push(
+                                    egui::scroll_area::State::load(&ctx, id).unwrap().offset.y,
+                                );
+                            });
+                        },
+                    );
+                    output.textures_delta.clear();
+                }
+                assert!(offsets[1] > ASSISTANT_KEYBOARD_SCROLL_STEP);
+                assert!(
+                    (offsets[3] - (offsets[1] - ASSISTANT_KEYBOARD_SCROLL_STEP)).abs() < 1.0,
+                    "Up did not scroll conversation: focus={focus}, expanded={expanded}, {offsets:?}"
+                );
+                assert!(
+                    (offsets[5] - offsets[1]).abs() < 1.0,
+                    "Down did not scroll conversation: focus={focus}, expanded={expanded}, {offsets:?}"
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn window_header_spans_pinned_panels_and_native_hover_reveals_reader_actions() {
@@ -6880,12 +7183,103 @@ mod reference_suggestion_label_tests {
     }
 
     #[test]
+    fn focus_note_target_keyboard_and_reopen_share_reference_without_moving_body() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        let owner = reader.focus_units[0].range.clone();
+        reader.focus_units[0].footnotes = (1..=2)
+            .map(|number| super::super::FocusFootnote {
+                owner: Some(owner.clone()),
+                stable_id: None,
+                number,
+                citation: None,
+                text: format!("Footnote {number}. https://example.com/note/{number}"),
+            })
+            .collect();
+        reader.focus_unit_index = 0;
+        reader.ui.focus_footnotes_visible = true;
+        reader.citation_popup_target = Some((owner.clone(), 0x2000_0002));
+        let body_offset = reader.scroll_viewport.map(|viewport| viewport.offset_y);
+        let ctx = egui::Context::default();
+        let render = |reader: &mut DesktopReader| {
+            for _ in 0..3 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1920.0, 1080.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |_| {
+                        reader.focus_footnote_overlay(
+                            &ctx,
+                            Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 900.0)),
+                        )
+                    },
+                );
+                assert!(
+                    output.shapes.iter().all(|shape| {
+                        !matches!(&shape.shape, egui::Shape::Text(text)
+                        if text.galley.job.text.contains("use of widget ID"))
+                    }),
+                    "separate note website icons must not share a widget ID"
+                );
+                output.textures_delta.clear();
+            }
+        };
+        let revision = reader.scene_revision;
+        render(&mut reader);
+        assert_eq!(
+            reader.active_footnote_reference,
+            Some((owner.clone(), 0x2000_0002))
+        );
+        assert!(
+            reader.scene_revision > revision,
+            "opening must refresh the GPU scene"
+        );
+        let revision = reader.scene_revision;
+        render(&mut reader);
+        assert_eq!(
+            reader.scene_revision, revision,
+            "unchanged active note should reuse the scene"
+        );
+        reader.ui.focus_footnote_scroll_delta = -100.0;
+        render(&mut reader);
+        assert_eq!(
+            reader.active_footnote_reference,
+            Some((owner.clone(), 0x2000_0001))
+        );
+        assert!(
+            reader.scene_revision > revision,
+            "switching notes must refresh the GPU scene"
+        );
+        assert_eq!(
+            reader.scroll_viewport.map(|viewport| viewport.offset_y),
+            body_offset
+        );
+        let revision = reader.scene_revision;
+        reader.close_focus_footnotes();
+        assert!(reader.active_footnote_reference.is_none());
+        assert!(
+            reader.scene_revision > revision,
+            "closing must remove the GPU highlight"
+        );
+        reader.ui.focus_footnotes_visible = true;
+        render(&mut reader);
+        assert_eq!(reader.active_footnote_reference, Some((owner, 0x2000_0001)));
+    }
+
+    #[test]
     fn footnote_scroll_is_per_source_block_and_cleared_on_exit() {
         let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
         let layout = reader.current_scroll_layout().unwrap();
         reader.rebuild_focus_units(&layout);
         let mut first = reader.focus_units[0].clone();
         first.footnotes = vec![super::super::FocusFootnote {
+            owner: None,
+            stable_id: None,
             number: 1,
             citation: None,
             text: "A long footnote with enough text to scroll. ".repeat(200),

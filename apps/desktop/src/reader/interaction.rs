@@ -206,6 +206,34 @@ impl DesktopReader {
         ))
     }
 
+    pub(in crate::reader) fn footnote_reference_at_canvas(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Option<(SourceRange, u32)> {
+        let identity = if self.is_scroll_mode() {
+            let (position, px, py) = self.scroll_page_coordinates(x, y)?;
+            self.reader
+                .footnote_reference_at_page(position, px, py)
+                .ok()
+                .flatten()?
+        } else {
+            self.reader
+                .footnote_reference_at_current_spread(x, y)
+                .ok()
+                .flatten()?
+                .1
+        };
+        self.focus_units
+            .iter()
+            .flat_map(|unit| &unit.footnotes)
+            .filter_map(super::FocusFootnote::reference)
+            .find(|(source, number)| {
+                rebook_publication::source_block_identity(source) == identity.0
+                    && *number == identity.1
+            })
+    }
+
     pub(in crate::reader) fn citation_at_canvas(
         &mut self,
         x: f32,

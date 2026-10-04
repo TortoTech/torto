@@ -308,6 +308,7 @@ pub(crate) struct LayoutData<B: Brush> {
     pub(crate) alignment: Option<super::Alignment>,
     /// Whether the layout is aligned with [`crate::Alignment::Justify`].
     pub(crate) is_aligned_justified: bool,
+    pub(crate) left_aligned_ranges: Vec<Range<usize>>,
     /// The text-indent amount in layout units.
     pub(crate) indent_amount: f32,
     /// Options controlling text-indent behavior (each-line, hanging).
@@ -337,6 +338,7 @@ impl<B: Brush> Default for LayoutData<B> {
             #[cfg(feature = "accesskit")]
             alignment: None,
             is_aligned_justified: false,
+            left_aligned_ranges: Vec::new(),
             layout_max_advance: 0.0,
             indent_amount: 0.0,
             indent_options: IndentOptions::default(),
@@ -363,6 +365,7 @@ impl<B: Brush> LayoutData<B> {
         self.glyphs.clear();
         self.lines.clear();
         self.line_items.clear();
+        self.left_aligned_ranges.clear();
     }
 
     /// Push an inline box to the list of items

@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::sync::SyncMode;
 
-const FULL_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const FULL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const MAX_READING_DELAY: Duration = Duration::from_secs(15);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 

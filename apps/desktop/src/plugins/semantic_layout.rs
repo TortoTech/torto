@@ -197,6 +197,12 @@ pub(crate) struct Recognition {
     skipped_groups: usize,
 }
 
+impl Recognition {
+    pub(crate) fn has_annotations(&self) -> bool {
+        !self.annotations.is_empty()
+    }
+}
+
 #[derive(Default)]
 struct WindowResult {
     groups: Vec<Proposal>,
@@ -240,8 +246,28 @@ impl SemanticLayoutSource {
         }
     }
 
+    pub(crate) fn try_commit_together<T>(&self, commit: impl FnOnce() -> T) -> Option<T> {
+        let _guard = match self.transaction.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("content commit lock poisoned"),
+        };
+        Some(commit())
+    }
+
+    #[cfg(test)]
     pub(crate) fn commit_together<T>(&self, commit: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
         let _guard = self.transaction.write().expect("content commit lock");
+        if started.elapsed().as_millis() >= 100 {
+            crate::diagnostics::log(
+                "reader.content_commit_lock_slow",
+                &[crate::diagnostics::Field::F32(
+                    "wait_ms",
+                    started.elapsed().as_secs_f32() * 1000.0,
+                )],
+            );
+        }
         commit()
     }
 

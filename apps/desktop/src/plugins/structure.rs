@@ -203,6 +203,11 @@ fn paragraph_atoms_for_content_mode(
     let mut footnotes = Vec::new();
     for inline in content {
         let len = match inline {
+            Inline::Ruby(run) => {
+                let len = run.source_char_len();
+                protected.push(cursor..cursor + len);
+                len
+            }
             Inline::Text(run) => {
                 let len = run.text.chars().count();
                 if (is_focus_footnote(run) || run.style.inline_citation != 0) && len > 0 {
@@ -1049,6 +1054,7 @@ fn inline_text(content: &[Inline]) -> String {
         .iter()
         .map(|inline| match inline {
             Inline::Text(run) => run.text.clone(),
+            Inline::Ruby(run) => run.base_text(),
             Inline::Math(run) => run.original_text().unwrap_or_else(|| run.latex.clone()),
             // Keep media in the segmentation coordinate space: otherwise a
             // sentence-leading image can be swallowed by trailing whitespace.
@@ -1096,6 +1102,7 @@ fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
     for inline in content {
         let len = match inline {
             Inline::Text(run) => run.text.chars().count(),
+            Inline::Ruby(run) => run.source_char_len(),
             Inline::Math(run) => run
                 .original_text()
                 .unwrap_or_else(|| run.latex.clone())
@@ -1117,6 +1124,7 @@ fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
             continue;
         }
         match inline {
+            Inline::Ruby(run) => sliced.push(Inline::Ruby(run.clone())),
             Inline::Text(run) => {
                 let local_start = start.saturating_sub(inline_start);
                 let local_end = (end - inline_start).min(len);

@@ -13,6 +13,7 @@ members = [
     "crates/windows-window-background",
 ]
 exclude = [
+    "third_party/epaint",
     "third_party/egui",
     "third_party/egui-wgpu",
     "third_party/egui_commonmark",
@@ -21,7 +22,7 @@ exclude = [
 resolver = "3"
 
 [workspace.package]
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 rust-version = "1.97"
 license = "AGPL-3.0-only"
@@ -124,6 +125,7 @@ strip = "none"
 [patch.crates-io]
 parley = { path = "third_party/parley" }
 egui = { path = "third_party/egui" }
+epaint = { path = "third_party/epaint" }
 egui-wgpu = { path = "third_party/egui-wgpu" }
 egui_commonmark = { path = "third_party/egui_commonmark" }
 egui_commonmark_backend = { path = "third_party/egui_commonmark_backend" }

@@ -77,6 +77,8 @@ pub(crate) struct ShelfFeature {
     refresh_generation: u64,
     refresh_requested: bool,
     refresh_job: BackgroundJob<(u64, Result<ShelfSnapshot, String>)>,
+    cover_job: BackgroundJob<Vec<(String, Vec<u8>)>>,
+    cover_attempts: std::collections::HashSet<String>,
 }
 
 struct ShelfState {
@@ -269,6 +271,8 @@ impl ShelfFeature {
             refresh_generation: 0,
             refresh_requested: false,
             refresh_job: BackgroundJob::default(),
+            cover_job: BackgroundJob::default(),
+            cover_attempts: std::collections::HashSet::new(),
         };
         feature.refresh_read_activity();
         feature.register_local_membership();
@@ -452,6 +456,11 @@ impl ShelfFeature {
     }
 
     fn poll_background(&mut self) {
+        if let Some(covers) = self.cover_job.poll()
+            && let Err(error) = self.shelf.library.update_missing_covers(&covers)
+        {
+            tracing::warn!(%error, "failed to persist generated covers");
+        }
         if let Some((generation, result)) = self.refresh_job.poll()
             && generation == self.refresh_generation
         {
@@ -600,6 +609,40 @@ impl ShelfFeature {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<crate::platform::UserEvent>,
     ) {
+        if !self.cover_job.is_running() {
+            let books = self
+                .shelf
+                .library
+                .books()
+                .iter()
+                .filter(|book| {
+                    book.cover_bytes.is_none() && !self.cover_attempts.contains(&book.id)
+                })
+                .take(8)
+                .map(|book| (book.id.clone(), book.path.clone()))
+                .collect::<Vec<_>>();
+            if !books.is_empty() {
+                self.cover_attempts
+                    .extend(books.iter().map(|(id, _)| id.clone()));
+                let wake = proxy.clone();
+                self.cover_job.start(
+                    runtime,
+                    move || {
+                        books
+                            .into_iter()
+                            .filter_map(|(id, path)| {
+                                let publication = rebook_formats::open_file(path).ok()?;
+                                publication.cover_bytes().map(|bytes| (id, bytes.to_vec()))
+                            })
+                            .collect()
+                    },
+                    move || {
+                        let _ = wake
+                            .send_event(crate::platform::UserEvent::RepaintAfter(Duration::ZERO));
+                    },
+                );
+            }
+        }
         if self.refresh_requested && !self.refresh_job.is_running() {
             self.refresh_requested = false;
             let generation = self.refresh_generation;

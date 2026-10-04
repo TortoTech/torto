@@ -28,6 +28,19 @@ pub struct RangedBuilder<'a, B: Brush> {
 }
 
 impl<'b, B: Brush> RangedBuilder<'b, B> {
+    /// Sets the paragraph base direction without adding synthetic characters.
+    /// None detects direction from text; even levels mean LTR and odd levels RTL.
+    pub fn set_base_level(&mut self, level: Option<u8>) {
+        self.lcx.base_level_override = level.map(|value| value & 1);
+    }
+
+    /// Gives independently translated paragraphs an LTR base direction.
+    /// Ranges use UTF-8 byte offsets and should cover complete paragraphs.
+    pub fn set_ltr_ranges(&mut self, ranges: &[Range<usize>]) {
+        self.lcx.ltr_ranges.clear();
+        self.lcx.ltr_ranges.extend_from_slice(ranges);
+    }
+
     pub fn push_default<'a>(&mut self, property: impl Into<StyleProperty<'a, B>>) {
         let resolved = self
             .lcx

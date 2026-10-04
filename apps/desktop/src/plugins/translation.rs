@@ -758,6 +758,7 @@ impl BookSource for TranslationBookSource {
                         .iter()
                         .find_map(|inline| match inline {
                             Inline::Text(run) => Some(run.style),
+                            Inline::Ruby(run) => run.base.first().map(|r| r.style),
                             Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
                         })
                         .unwrap_or_default();
@@ -765,6 +766,7 @@ impl BookSource for TranslationBookSource {
                         TranslationMode::Replace => {
                             original.content =
                                 replacement_block_content(translation, style, &original);
+                            normalize_rtl_translation(&mut original);
                             rendered.push(Block::Text(original));
                         }
                         TranslationMode::Bilingual => {
@@ -773,6 +775,11 @@ impl BookSource for TranslationBookSource {
                             original.style.margin_after = original_margin_after.min(6.0);
                             translated.content =
                                 replacement_block_content(translation, style, &original);
+                            normalize_rtl_translation(&mut translated);
+                            translated.style.reference_owner = original
+                                .source
+                                .as_ref()
+                                .map(rebook_publication::source_block_identity);
                             translated.source = None;
                             translated.style.margin_before = 0.0;
                             translated.style.margin_after = original_margin_after;
@@ -881,12 +888,14 @@ fn apply_note_translation(
                 .iter()
                 .find_map(|inline| match inline {
                     Inline::Text(run) => Some(run.style),
+                    Inline::Ruby(run) => run.base.first().map(|r| r.style),
                     Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
                 })
                 .unwrap_or_default();
             let original = text_block.content.clone();
             if mode == TranslationMode::Replace {
                 text_block.content = replacement_block_content(translation, style, text_block);
+                normalize_rtl_translation(text_block);
             } else {
                 text_block.content.push(Inline::Break);
                 text_block
@@ -912,6 +921,16 @@ fn translated_table(
     translations: &HashMap<usize, String>,
     mode: TranslationMode,
 ) -> rebook_publication::TableBlock {
+    let rtl_cells: Vec<_> = table
+        .rows
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.text.style.direction == rebook_publication::TextDirection::Rtl)
+                .collect::<Vec<_>>()
+        })
+        .collect();
     for (cell_index, cell) in table.text_blocks_mut().enumerate() {
         let Some(translated) = translations.get(&cell_index) else {
             continue;
@@ -921,17 +940,28 @@ fn translated_table(
             .iter()
             .find_map(|inline| match inline {
                 Inline::Text(run) => Some(run.style),
+                Inline::Ruby(run) => run.base.first().map(|r| r.style),
                 Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .unwrap_or_default();
         if mode == TranslationMode::Replace {
             let original = cell.content.clone();
             cell.content = replacement_content(translated, style, Some(&original));
+            normalize_rtl_translation(cell);
         } else {
             let original = cell.content.clone();
             cell.content.push(Inline::Break);
             cell.content
                 .extend(replacement_content(translated, style, Some(&original)));
+        }
+    }
+    if mode == TranslationMode::Replace {
+        for (row, rtl) in table.rows.iter_mut().zip(rtl_cells) {
+            for (cell, was_rtl) in row.cells.iter_mut().zip(rtl) {
+                if was_rtl && cell.text.style.direction == rebook_publication::TextDirection::Ltr {
+                    cell.authored_alignment = Some(rebook_publication::TextAlignment::Start);
+                }
+            }
         }
     }
     table
@@ -972,17 +1002,24 @@ fn translated_quote_text(
         .iter()
         .find_map(|inline| match inline {
             Inline::Text(run) => Some(run.style),
+            Inline::Ruby(run) => run.base.first().map(|r| r.style),
             Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
         })
         .unwrap_or_default();
     if mode == TranslationMode::Replace {
         original.content = replacement_block_content(translation, style, &original);
+        normalize_rtl_translation(&mut original);
         return vec![original];
     }
     let mut translated = original.clone();
     let original_margin_after = original.style.margin_after;
     original.style.margin_after = original_margin_after.min(6.0);
     translated.content = replacement_block_content(translation, style, &original);
+    normalize_rtl_translation(&mut translated);
+    translated.style.reference_owner = original
+        .source
+        .as_ref()
+        .map(rebook_publication::source_block_identity);
     translated.source = None;
     translated.style.margin_before = 0.0;
     translated.style.margin_after = original_margin_after;
@@ -1003,12 +1040,14 @@ fn translated_figure(
             .iter()
             .find_map(|inline| match inline {
                 Inline::Text(run) => Some(run.style),
+                Inline::Ruby(run) => run.base.first().map(|r| r.style),
                 Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .unwrap_or_default();
         let original = caption.content.clone();
         if mode == TranslationMode::Replace {
             caption.content = replacement_content(translated, style, Some(&original));
+            normalize_rtl_translation(caption);
         } else {
             caption.content.push(Inline::Break);
             caption
@@ -1372,6 +1411,11 @@ fn translation_text(block: &TextBlock) -> String {
                 text.push_str(&format!("<t-web-{website}/>"));
                 website += 1;
             }
+            Inline::Ruby(run) => {
+                for base in &run.base {
+                    push_translation_style_markup(&mut text, base);
+                }
+            }
             Inline::Text(run) => push_translation_style_markup(&mut text, run),
             Inline::Math(_) => {
                 push_math_placeholder(&mut text, math_index);
@@ -1391,9 +1435,8 @@ fn translatable_text(block: &TextBlock) -> Option<String> {
     block
         .content
         .iter()
-        .any(|inline| {
-            matches!(inline, Inline::Text(run) if run.text.chars().any(|character| !character.is_whitespace()))
-        })
+        .flat_map(Inline::text_runs)
+        .any(|run| run.text.chars().any(|character| !character.is_whitespace()))
         .then(|| translation_text(block))
 }
 
@@ -1506,6 +1549,18 @@ fn push_translation_style_markup(output: &mut String, run: &TextRun) {
     }
 }
 
+/// A translated RTL paragraph uses LTR left alignment; other source styles stay intact.
+fn normalize_rtl_translation(block: &mut TextBlock) {
+    use rebook_publication::{TextAlignment, TextDirection};
+    if block.style.direction == TextDirection::Rtl {
+        block.style.direction = TextDirection::Ltr;
+        block.style.align = TextAlignment::Start;
+        block.style.authored_alignment = Some(TextAlignment::Start);
+        block.style.semantic_alignment = None;
+        block.style.logical_alignment = false;
+    }
+}
+
 fn replacement_block_content(text: &str, style: TextStyle, original: &TextBlock) -> Vec<Inline> {
     let math_count = original
         .content
@@ -1575,7 +1630,7 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
         .iter()
         .filter_map(|inline| match inline {
             Inline::Math(run) => Some(run.clone()),
-            Inline::Text(_) | Inline::Image(_) | Inline::Break => None,
+            Inline::Ruby(_) | Inline::Text(_) | Inline::Image(_) | Inline::Break => None,
         })
         .collect::<Vec<_>>();
     if validate_math_placeholder_count(&text, math.len()).is_err() {
@@ -1650,6 +1705,7 @@ fn restore_inline_images(content: &mut Vec<Inline>, original: &[Inline]) {
 fn inline_translation_units(inline: &Inline) -> usize {
     match inline {
         Inline::Text(run) => run.text.chars().count(),
+        Inline::Ruby(run) => run.source_char_len(),
         Inline::Math(_) | Inline::Break => 1,
         Inline::Image(_) => 0,
     }
@@ -1809,7 +1865,11 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
         .iter()
         .find_map(|inline| match inline {
             Inline::Text(run) if run.style.baseline == TextBaseline::Normal => Some(run.style),
-            Inline::Text(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+            Inline::Ruby(_)
+            | Inline::Text(_)
+            | Inline::Math(_)
+            | Inline::Image(_)
+            | Inline::Break => None,
         })
         .unwrap_or(fallback);
     // Only a uniform paragraph-wide keyword can safely survive old unmarked
@@ -2148,6 +2208,7 @@ fn restore_original_baselines(
         .iter()
         .map(|inline| match inline {
             Inline::Text(run) => run.text.chars().count(),
+            Inline::Ruby(run) => run.source_char_len(),
             Inline::Break => 1,
             Inline::Math(_) | Inline::Image(_) => 0,
         })
@@ -2158,6 +2219,10 @@ fn restore_original_baselines(
         .iter()
         .enumerate()
         .filter_map(|(index, inline)| match inline {
+            Inline::Ruby(run) => {
+                original_offset += run.source_char_len();
+                None
+            }
             Inline::Text(run) => {
                 let offset = original_offset;
                 original_offset += run.text.chars().count();
@@ -2247,6 +2312,78 @@ fn best_marker_match(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_rtl_translation_changes_alignment_and_bilingual_keeps_original() {
+        use rebook_publication::{TextAlignment, TextDirection};
+        for direction in [TextDirection::Rtl, TextDirection::Ltr, TextDirection::Auto] {
+            let original = TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: "source".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle {
+                    direction,
+                    align: TextAlignment::Center,
+                    authored_alignment: Some(TextAlignment::Center),
+                    ..Default::default()
+                },
+                source: None,
+            };
+            let translation = "??".to_owned();
+            for mode in [TranslationMode::Replace, TranslationMode::Bilingual] {
+                let blocks = translated_quote_text(original.clone(), Some(&translation), mode);
+                if mode == TranslationMode::Bilingual {
+                    assert_eq!(blocks[0].style.direction, original.style.direction);
+                    assert_eq!(blocks[0].style.align, original.style.align);
+                    assert_eq!(
+                        blocks[0].style.authored_alignment,
+                        original.style.authored_alignment
+                    );
+                }
+                let translated = blocks.last().unwrap();
+                if direction == TextDirection::Rtl {
+                    assert_eq!(translated.style.direction, TextDirection::Ltr);
+                    assert_eq!(translated.style.align, TextAlignment::Start);
+                    assert_eq!(
+                        translated.style.authored_alignment,
+                        Some(TextAlignment::Start)
+                    );
+                    assert!(!translated.style.logical_alignment);
+                } else {
+                    assert_eq!(translated.style, original.style);
+                }
+            }
+        }
+    }
+    #[test]
+    fn ruby_only_prose_is_translatable_without_pronunciation_text() {
+        use rebook_publication::{RubyRun, TextBlockKind};
+        let base = TextRun {
+            text: "山路".into(),
+            style: Default::default(),
+            link: None,
+        };
+        let annotation = TextRun {
+            text: "やまみち".into(),
+            style: Default::default(),
+            link: None,
+        };
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Ruby(Box::new(RubyRun {
+                base: vec![base],
+                annotation: vec![annotation],
+                below: false,
+            }))],
+            style: Default::default(),
+            source: None,
+        };
+        assert_eq!(translatable_text(&block).as_deref(), Some("山路"));
+        assert_eq!(crate::plugins::search::text_block_text(&block), "山路");
+    }
     use rebook_publication::{
         BlockStyle, FigureBlock, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan,
         ImageBlock, ImageStyle, Metadata, NoteBlockKind, PublicationId, QuoteBlock,
@@ -2561,7 +2698,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<String>();
         assert_eq!(rendered, "这是主要优势。4");
@@ -2624,7 +2761,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Math(run) => Some(run),
-                Inline::Text(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Text(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(formulas, [&second, &first]);
@@ -3316,7 +3453,7 @@ mod tests {
         );
         assert!(cached.iter().all(|inline| match inline {
             Inline::Text(run) => !run.style.bold && !run.style.italic,
-            Inline::Math(_) | Inline::Image(_) | Inline::Break => true,
+            Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => true,
         }));
     }
 

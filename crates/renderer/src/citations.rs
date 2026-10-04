@@ -87,6 +87,152 @@ mod tests {
     }
 
     #[test]
+    fn bilingual_notes_and_citations_keep_distinct_shared_marker_identities() {
+        let source = Source(Book {
+            id: PublicationId::new("bilingual-markers").unwrap(),
+            metadata: Metadata::default(),
+            cover: None,
+            sections: vec![],
+            table_of_contents: vec![],
+        });
+        let anchor = SourceAnchor {
+            spine: SpineItemId::new("chapter").unwrap(),
+            node: "p".into(),
+            text_offset: 0,
+        };
+        let owner = SourceRange {
+            start: anchor.clone(),
+            end: SourceAnchor {
+                text_offset: 20,
+                ..anchor
+            },
+        };
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                Inline::Text(TextRun {
+                    text: "Body ".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: "note".into(),
+                    style: TextStyle {
+                        inline_role: InlineRole::Footnote,
+                        ..Default::default()
+                    },
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: " and ".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                }),
+                Inline::Text(TextRun {
+                    text: "Smith, 2020".into(),
+                    style: TextStyle {
+                        inline_citation: 1,
+                        ..Default::default()
+                    },
+                    link: None,
+                }),
+            ],
+            style: BlockStyle::default(),
+            source: Some(owner.clone()),
+        };
+        let mut companion = block.clone();
+        companion.source = None;
+        companion.style.reference_owner = Some(source_block_identity(&owner));
+        let style = ReaderStyle {
+            spread: SpreadMode::Single,
+            focus_footnote_icons: true,
+            typesetting: rebook_layout::ReaderTypesetting::unified(),
+            ..Default::default()
+        };
+        let layout = LayoutEngine::new()
+            .layout_blocks(
+                &source,
+                &[Block::Text(block), Block::Text(companion)],
+                LayoutViewport::new(800, 600).unwrap(),
+                &style,
+            )
+            .unwrap();
+        let display = DisplayListCompiler.compile(&layout.pages[0]);
+        // Focus-unit geometry may cover a subset of the source paragraph.
+        // Both the original and source-less translated markers must paint.
+        let mut partial = owner.clone();
+        partial.start.text_offset = 3;
+        partial.end.text_offset = 8;
+        let yellow = Color::from_rgba8(250, 204, 21, 255);
+        let normal = Color::from_rgba8(37, 99, 235, 255);
+        let mut actual = anyrender::Scene::new();
+        display.paint_focus_footnote_icons(
+            &mut actual,
+            std::slice::from_ref(&partial),
+            normal,
+            Some((&owner, 0x2000_0001, yellow)),
+            17.0,
+        );
+        display.paint_focus_footnote_activation_bars(
+            &mut actual,
+            std::slice::from_ref(&partial),
+            Some((&owner, 0x2000_0001, yellow)),
+            17.0,
+        );
+        let mut expected = anyrender::Scene::new();
+        assert_eq!(display.footnote_regions.len(), 4);
+        for region in &display.footnote_regions {
+            paint_footnote_region(
+                &mut expected,
+                region,
+                if region.reference_number == 0x2000_0001 {
+                    yellow
+                } else {
+                    normal
+                },
+                Affine::translate((17.0, 0.0)),
+            );
+        }
+        for region in &display.footnote_regions {
+            if region.reference_number == 0x2000_0001 {
+                let y = region.activation_bar_y;
+                assert!(
+                    y > region.bounds.y1,
+                    "bar belongs below the body line, not the superscript"
+                );
+                paint_footnote_activation_bar(
+                    &mut expected,
+                    region,
+                    yellow,
+                    Affine::translate((17.0, 0.0)),
+                );
+            }
+        }
+        assert!(!actual.commands.is_empty());
+        assert_eq!(
+            actual.commands, expected.commands,
+            "paint each marker once and add a bar only to the active original and translated references"
+        );
+        for number in [1, 0x2000_0001] {
+            let bounds = display.footnote_reference_bounds(&owner, number);
+            assert_eq!(
+                bounds.len(),
+                2,
+                "both language markers must retain their association"
+            );
+            for bound in bounds {
+                assert_eq!(
+                    display.footnote_reference_at(
+                        (bound[0] + bound[2]) * 0.5,
+                        (bound[1] + bound[3]) * 0.5
+                    ),
+                    Some((source_block_identity(&owner), number))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn generated_text_math_preserves_copy_and_source_offsets() {
         let source = Source(Book {
             id: PublicationId::new("text-math").unwrap(),

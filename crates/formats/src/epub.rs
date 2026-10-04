@@ -67,6 +67,7 @@ struct EpubOpenOptions {
 /// Parsed EPUB backed by an immutable in-memory archive and lazy resource reads.
 #[derive(Debug)]
 pub(super) struct EpubPublication {
+    cover_page: Option<PublicationUrl>,
     book: Book,
     media_types: HashMap<String, String>,
     archive: EpubArchive,
@@ -100,6 +101,7 @@ impl EpubPublication {
         let package_url = PublicationUrl::parse(&rootfile_path)?.resource_url();
         let package = archive.read_xml(&package_url)?;
         let package_model = parse_package(&package, &package_url)?;
+        let cover_page = discover_cover_page(&archive, &package_model, &package, &package_url);
 
         let mut media_types = HashMap::new();
         for item in package_model
@@ -126,6 +128,7 @@ impl EpubPublication {
         let id = PublicationId::new(format!("{digest:x}"))?;
 
         Ok(Self {
+            cover_page,
             book: Book {
                 id,
                 metadata: package_model.metadata,
@@ -194,6 +197,40 @@ fn is_note_navigation_label(label: &str) -> bool {
 impl BookSource for EpubPublication {
     fn book(&self) -> &Book {
         &self.book
+    }
+
+    fn cover_section(&self) -> Result<Option<Section>, PublicationError> {
+        let Some(href) = &self.cover_page else {
+            return Ok(None);
+        };
+        if let Some(index) = self
+            .book
+            .sections
+            .iter()
+            .position(|s| s.href.path() == href.path())
+        {
+            return self.parse_section(index).map(Some);
+        }
+        let descriptor = SpineItem {
+            id: SpineItemId::new("cover-page")?,
+            href: href.clone(),
+            media_type: "application/xhtml+xml".into(),
+            linear: false,
+            properties: Vec::new(),
+        };
+        let xml = self
+            .archive
+            .read_content_xml(href)
+            .map_err(EpubError::into_publication_error)?;
+        parse_section_with_hints_and_image_classifier(
+            &xml,
+            &descriptor,
+            |href| self.archive.read_stylesheet(href).ok(),
+            |_| false,
+            SectionParseHints::default(),
+        )
+        .map(Some)
+        .map_err(|error| PublicationError::InvalidPublication(error.to_string()))
     }
 
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
@@ -838,6 +875,68 @@ fn read_bounded(
         format!("resource expanded beyond size budget: {href}"),
     )?;
     Ok(bytes)
+}
+
+fn discover_cover_page(
+    archive: &EpubArchive,
+    package: &PackageModel,
+    xml: &str,
+    package_url: &PublicationUrl,
+) -> Option<PublicationUrl> {
+    let mut candidates = Vec::new();
+    if let Ok(document) = Document::parse(xml) {
+        for node in document.descendants().filter(Node::is_element) {
+            if node.tag_name().name() == "reference"
+                && token_attribute(node, "type")
+                    .iter()
+                    .any(|token| token == "cover")
+                && let Some(href) = attribute_local(node, "href")
+                && let Ok(href) = package_url.resolve(href)
+            {
+                candidates.push((href.resource_url(), true));
+            }
+        }
+    }
+    if let Some(nav) = package
+        .manifest
+        .values()
+        .find(|item| item.properties.iter().any(|p| p == "nav"))
+        && let Ok(xml) = archive.read_content_xml(&nav.href)
+        && let Ok(document) = Document::parse(&xml)
+    {
+        for node in document.descendants().filter(Node::is_element) {
+            if node.tag_name().name() == "a"
+                && token_attribute(node, "type")
+                    .iter()
+                    .any(|token| token == "cover")
+                && let Some(href) = attribute_local(node, "href")
+                && let Ok(href) = nav.href.resolve(href)
+            {
+                candidates.push((href.resource_url(), true));
+            }
+        }
+    }
+    // Bound discovery to the front matter; never scan all chapters for a thumbnail.
+    for spine in package.spine.iter().take(3) {
+        if let Some(item) = package.manifest.get(&spine.idref)
+            && matches!(
+                item.media_type.as_str(),
+                "application/xhtml+xml" | "text/html"
+            )
+        {
+            candidates.push((item.href.clone(), false));
+        }
+    }
+    candidates.into_iter().find_map(|(href, explicit)| {
+        let xml = archive.read_content_xml(&href).ok()?;
+        let document = Document::parse(&xml).ok()?;
+        let marked_cover = document.descendants().filter(Node::is_element).any(|node| {
+            token_attribute(node, "type")
+                .iter()
+                .any(|token| token == "cover")
+        });
+        (explicit || marked_cover).then_some(href)
+    })
 }
 
 #[derive(Debug)]
@@ -1532,6 +1631,62 @@ mod tests {
         EpubError, EpubLimits, EpubOpenOptions, EpubPublication, ZIP_CENTRAL_HEADER_SIGNATURE,
         ZIP_CENTRAL_HEADER_SIZE, ZIP_SIGNATURE_SIZE, collect_note_section_paths, read_u16,
     };
+
+    #[test]
+    fn detects_and_renders_composed_cover_page_without_image_metadata() {
+        let package = std::str::from_utf8(minimal_entries()[2].1)
+            .unwrap()
+            .replace("properties=\"cover-image\"", "");
+        let page = r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body><section epub:type="cover"><h1>草枕</h1><p>夏目漱石</p></section></body></html>"#;
+        let mut entries = minimal_entries();
+        entries[2].1 = package.as_bytes();
+        let chapter = entries
+            .iter_mut()
+            .find(|entry| entry.0 == "OPS/Text/chapter.xhtml")
+            .unwrap();
+        chapter.1 = page.as_bytes();
+        let source = EpubPublication::open_bytes(zip_entries(&entries)).unwrap();
+        assert!(source.book().cover.is_none());
+        assert_eq!(
+            source.cover_page.as_ref().unwrap().path(),
+            "OPS/Text/chapter.xhtml"
+        );
+        let cover = crate::cover::page_thumbnail(&source).unwrap();
+        let image = image::load_from_memory(&cover).unwrap();
+        assert_eq!((image.width(), image.height()), (420, 600));
+        assert!(
+            image
+                .to_rgba8()
+                .pixels()
+                .any(|p| p.0[..3] != [255, 255, 255])
+        );
+    }
+
+    #[test]
+    fn discovers_epub2_guide_cover_outside_the_spine_and_ignores_unmarked_prose() {
+        let mut entries = minimal_entries();
+        let package = std::str::from_utf8(entries[2].1)
+            .unwrap()
+            .replace("properties=\"cover-image\"", "")
+            .replace(
+                "</package>",
+                "<guide><reference type=\"cover\" href=\"title.xhtml\"/></guide></package>",
+            );
+        entries[2].1 = package.as_bytes();
+        entries.push((
+            "OPS/title.xhtml",
+            b"<html><body><h1>Cover title</h1></body></html>",
+            CompressionMethod::Deflated,
+        ));
+        let source = EpubPublication::open_bytes(zip_entries(&entries)).unwrap();
+        assert_eq!(
+            source.cover_page.as_ref().unwrap().path(),
+            "OPS/title.xhtml"
+        );
+        assert!(source.cover_section().unwrap().is_some());
+        let source = EpubPublication::open_bytes(minimal_epub()).unwrap();
+        assert!(source.cover_page.is_none());
+    }
 
     #[test]
     fn promotes_a_single_root_without_flattening_deeper_sections() {

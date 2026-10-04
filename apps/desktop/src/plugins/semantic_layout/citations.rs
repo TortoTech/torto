@@ -61,6 +61,7 @@ fn candidate_spans(block: &TextBlock) -> Vec<Citation> {
     let mut offset = 0;
     for inline in &block.content {
         let (len, protected) = match inline {
+            Inline::Ruby(run) => (run.source_char_len(), true),
             Inline::Text(r) => (
                 r.text.chars().count(),
                 r.style.inline_citation != 0
@@ -143,6 +144,7 @@ fn candidate_spans(block: &TextBlock) -> Vec<Citation> {
             }
         }
         match inline {
+            Inline::Ruby(run) => offset += run.source_char_len(),
             Inline::Text(run) => {
                 if is_authored {
                     authored
@@ -339,6 +341,10 @@ fn apply(text: &mut TextBlock, spans: &[Citation]) {
     let mut last_number = 0;
     for inline in &text.content {
         match inline {
+            Inline::Ruby(run) => {
+                offset += run.source_char_len();
+                last_number = 0;
+            }
             Inline::Text(run) => {
                 let end = offset + run.text.chars().count();
                 if run.style.inline_citation != 0 {
@@ -437,6 +443,10 @@ fn apply(text: &mut TextBlock, spans: &[Citation]) {
                     .unwrap_or_else(|| m.latex.clone())
                     .chars()
                     .count();
+                result.push(inline.clone());
+            }
+            Inline::Ruby(run) => {
+                offset += run.source_char_len();
                 result.push(inline.clone());
             }
             _ => result.push(inline.clone()),

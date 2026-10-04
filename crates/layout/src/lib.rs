@@ -1,4 +1,6 @@
 //! Renderer-independent pagination for normalized reading IR.
+#[cfg(test)]
+mod ruby_tests;
 
 pub mod linebreak;
 
@@ -869,6 +871,7 @@ pub struct QuotePlacement {
 /// Original text and ownership behind a collapsed inline reference marker.
 #[derive(Clone)]
 pub struct InlineCitationPlacement {
+    pub owner_id: Option<u64>,
     pub website: Option<String>,
     pub owner: Option<SourceRange>,
     pub range: Range<usize>,
@@ -879,6 +882,7 @@ pub struct InlineCitationPlacement {
 /// A line slice from a shaped paragraph, retaining collapsed reference text.
 #[derive(Clone)]
 pub struct TextPlacement {
+    pub ruby: Arc<[RubyPlacement]>,
     pub citations: Arc<[InlineCitationPlacement]>,
     pub layout: Arc<Layout<TextBrush>>,
     /// UTF-8 text shaped by Parley. Kept alongside the layout so retained
@@ -1924,7 +1928,7 @@ impl LayoutEngine {
         for inline in &block.content {
             rasters.push(match inline {
                 Inline::Image(run) => Some(load_raster_image(source, &run.image)?),
-                Inline::Text(_) | Inline::Math(_) | Inline::Break => None,
+                Inline::Text(_) | Inline::Ruby(_) | Inline::Math(_) | Inline::Break => None,
             });
         }
         Ok(self.shape_text_with_min_width_and_rasters(
@@ -2217,17 +2221,19 @@ impl LayoutEngine {
             None
         };
         let typography = &reader_style.typography;
-        let (text, spans, inline_images, source_text_start, citations) = prepare_inline_content(
-            block,
-            reader_style.foreground,
-            typography,
-            available_width,
-            &self.svg_options,
-            reader_style.focus_footnote_icons,
-            reader_style.typesetting.mode == TypesettingMode::Unified,
-            reader_style.typesetting.mode == TypesettingMode::Unified || reader_style.website_icons,
-            inline_rasters,
-        );
+        let (text, mut spans, inline_images, source_text_start, citations, ruby_specs) =
+            prepare_inline_content(
+                block,
+                reader_style.foreground,
+                typography,
+                available_width,
+                &self.svg_options,
+                reader_style.focus_footnote_icons,
+                reader_style.typesetting.mode == TypesettingMode::Unified,
+                reader_style.typesetting.mode == TypesettingMode::Unified
+                    || reader_style.website_icons,
+                inline_rasters,
+            );
         let sentence_reference = sentence_reference.filter(|reference| {
             let end = text.find('\n').unwrap_or(text.len());
             !reference.hyphens.iter().any(|hyphen| {
@@ -2242,6 +2248,59 @@ impl LayoutEngine {
         } else {
             typography.default_stack_for(reader_style.writing_system)
         };
+        let mut ruby = Vec::new();
+        for spec in &ruby_specs {
+            let make_block = |runs: &[TextRun]| TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: runs.iter().cloned().map(Inline::Text).collect(),
+                style: rebook_publication::BlockStyle {
+                    line_height: 1.0,
+                    align: TextAlignment::Start,
+                    ..Default::default()
+                },
+                source: None,
+            };
+            let mut annotation_style = reader_style.clone();
+            annotation_style.typography.minimum_font_size = 1.0;
+            let annotation = self.shape_text_with_min_width(
+                &make_block(&spec.run.annotation),
+                &annotation_style,
+                f32::MAX,
+                1.0,
+            );
+            let base = self.shape_text_with_min_width(
+                &make_block(&spec.run.base),
+                reader_style,
+                f32::MAX,
+                1.0,
+            );
+            let base_width = base.layout.width();
+            let annotation_width = annotation.layout.width();
+            let width = base_width.max(annotation_width);
+            let metrics = base.layout.get(0).map(|line| *line.metrics());
+            let gap = typography.font_size * 0.06;
+            let offset_y = if spec.run.below {
+                metrics.map_or(typography.font_size * 0.2, |m| m.descent) + gap
+            } else {
+                -metrics.map_or(typography.font_size, |m| m.ascent)
+                    - annotation.layout.height()
+                    - gap
+            };
+            let placement = RubyPlacement {
+                range: spec.range.clone(),
+                layout: annotation.layout,
+                offset_y,
+                spacing: (width - base_width)
+                    / text[spec.range.clone()].chars().count().max(1) as f32,
+            };
+            let shared = Arc::new(placement.clone());
+            for span in spans.iter_mut().filter(|span| {
+                span.range.start >= spec.range.start && span.range.end <= spec.range.end
+            }) {
+                span.ruby = Some(Arc::clone(&shared));
+            }
+            ruby.push(placement);
+        }
         let mut layout = self.build_text_layout(
             &text,
             &spans,
@@ -2251,6 +2310,7 @@ impl LayoutEngine {
             block.style.line_height,
             reader_style.foreground,
             &[],
+            block.style.direction,
         );
         self.apply_text_indents(
             &mut layout,
@@ -2262,6 +2322,7 @@ impl LayoutEngine {
         );
         let should_optimize = reader_style.typesetting.line_break_strategy
             == LineBreakStrategy::Optimized
+            && ruby.is_empty()
             && matches!(
                 block.style.align,
                 TextAlignment::Start | TextAlignment::Justify
@@ -2327,6 +2388,7 @@ impl LayoutEngine {
                         reader_style.foreground,
                         &[],
                         &shaping_breaks,
+                        block.style.direction,
                     );
                     self.apply_text_indents(
                         &mut layout,
@@ -2348,6 +2410,7 @@ impl LayoutEngine {
                     reader_style.foreground,
                     &plan.adjustments,
                     &shaping_breaks,
+                    block.style.direction,
                 );
                 self.apply_text_indents(
                     &mut adjusted,
@@ -2388,6 +2451,7 @@ impl LayoutEngine {
                 block.style.line_height,
                 reader_style.foreground,
                 &[],
+                block.style.direction,
             );
             self.apply_text_indents(
                 &mut layout,
@@ -2401,7 +2465,8 @@ impl LayoutEngine {
         if !optimized {
             layout.break_all_lines(Some(available_width));
             linebreak::parley::repair_trailing_footnote_line(&mut layout, &text, available_width);
-            if (block.style.align == TextAlignment::Justify || sentence_reference.is_some())
+            if ruby.is_empty()
+                && (block.style.align == TextAlignment::Justify || sentence_reference.is_some())
                 && let Some(plan) = linebreak::parley::plan_wrapped_with_sentence_prefix(
                     &mut layout,
                     &text,
@@ -2421,6 +2486,7 @@ impl LayoutEngine {
                     block.style.line_height,
                     reader_style.foreground,
                     &plan.adjustments,
+                    block.style.direction,
                 );
                 self.apply_text_indents(
                     &mut adjusted,
@@ -2441,9 +2507,19 @@ impl LayoutEngine {
         let alignment = if optimized {
             Alignment::Start
         } else {
-            text_alignment(block.style.align)
+            let alignment = text_alignment(block.style.align);
+            if layout.is_rtl() && !block.style.logical_alignment {
+                match alignment {
+                    Alignment::Start => Alignment::End,
+                    Alignment::End => Alignment::Start,
+                    other => other,
+                }
+            } else {
+                alignment
+            }
         };
-        layout.align(alignment, AlignmentOptions::default());
+        let translated_ranges = rtl_translation_ranges(block.style.direction, &spans);
+        layout.align_with_left_ranges(alignment, AlignmentOptions::default(), &translated_ranges);
         if !inline_images.is_empty() {
             layout.reserve_inline_box_paint_bounds(
                 &inline_images
@@ -2452,7 +2528,16 @@ impl LayoutEngine {
                     .collect::<Vec<_>>(),
             );
         }
+        if !ruby.is_empty() {
+            layout.reserve_text_paint_bounds(
+                &ruby
+                    .iter()
+                    .map(|r| (r.range.clone(), r.offset_y, r.layout.height()))
+                    .collect::<Vec<_>>(),
+            );
+        }
         PreparedText {
+            ruby: ruby.into(),
             citations: citations.into(),
             layout: Arc::new(layout),
             text: text.into(),
@@ -2530,6 +2615,7 @@ impl LayoutEngine {
                 continue;
             }
             let hyphen_span = StyledRange {
+                ruby: None,
                 range: 0..hyphen_text.len(),
                 style,
                 footnote_reference_group: 0,
@@ -2544,6 +2630,7 @@ impl LayoutEngine {
                 line_height,
                 foreground,
                 &[],
+                rebook_publication::TextDirection::Auto,
             );
             layout.break_all_lines(None);
             let Some(line) = layout.get(0) else {
@@ -2575,6 +2662,7 @@ impl LayoutEngine {
         line_height: f32,
         foreground: Rgba,
         spacing: &[linebreak::parley::SpacingAdjustment],
+        direction: rebook_publication::TextDirection,
     ) -> Layout<TextBrush> {
         self.build_text_layout_with_boundaries(
             text,
@@ -2586,6 +2674,7 @@ impl LayoutEngine {
             foreground,
             spacing,
             &[],
+            direction,
         )
     }
 
@@ -2601,6 +2690,7 @@ impl LayoutEngine {
         foreground: Rgba,
         spacing: &[linebreak::parley::SpacingAdjustment],
         shaping_breaks: &[usize],
+        direction: rebook_publication::TextDirection,
     ) -> Layout<TextBrush> {
         let mut layout = self.build_text_layout_raw(
             text,
@@ -2613,6 +2703,7 @@ impl LayoutEngine {
             spacing,
             shaping_breaks,
             &[],
+            direction,
         );
         if note_spacing::needs_measurement(text, spans) {
             layout.break_all_lines(None);
@@ -2629,6 +2720,7 @@ impl LayoutEngine {
                     spacing,
                     shaping_breaks,
                     &optical,
+                    direction,
                 );
             }
         }
@@ -2648,10 +2740,17 @@ impl LayoutEngine {
         spacing: &[linebreak::parley::SpacingAdjustment],
         shaping_breaks: &[usize],
         optical: &[linebreak::parley::SpacingAdjustment],
+        direction: rebook_publication::TextDirection,
     ) -> Layout<TextBrush> {
         let mut builder =
             self.layout_context
                 .ranged_builder(&mut self.font_context, text, 1.0, false);
+        builder.set_base_level(match direction {
+            rebook_publication::TextDirection::Auto => None,
+            rebook_publication::TextDirection::Ltr => Some(0),
+            rebook_publication::TextDirection::Rtl => Some(1),
+        });
+        builder.set_ltr_ranges(&rtl_translation_ranges(direction, spans));
         builder.push_default(StyleProperty::FontFamily(FontFamily::from(font_stack)));
         builder.push_default(StyleProperty::FontSize(typography.font_size));
         let default_variations = optical_size_variations(typography.font_size);
@@ -2668,6 +2767,18 @@ impl LayoutEngine {
         builder.push_default(StyleProperty::Brush(default_brush));
 
         for span in spans {
+            if let Some(ruby) = &span.ruby {
+                builder.push(
+                    StyleProperty::TextWrapMode(parley::TextWrapMode::NoWrap),
+                    span.range.clone(),
+                );
+                if ruby.spacing > 0.0 {
+                    builder.push(
+                        StyleProperty::LetterSpacing(ruby.spacing),
+                        span.range.clone(),
+                    );
+                }
+            }
             let size = if span.style.inline_citation != 0
                 || span.footnote_reference_group & 0x2000_0000 != 0
             {
@@ -3173,6 +3284,26 @@ fn resolve_text_block<'a>(
                     run.style.citation = false;
                 }
             }
+            Inline::Ruby(run) => {
+                let authored_base = run
+                    .base
+                    .first()
+                    .map_or(1.0, |r| r.style.size_scale)
+                    .max(0.1);
+                for base in &mut run.base {
+                    base.style.size_scale = scale;
+                    base.style.color = Rgba::BLACK;
+                    base.style.underline = false;
+                    if block.kind.is_heading() {
+                        base.style.bold = true;
+                    }
+                }
+                for annotation in &mut run.annotation {
+                    annotation.style.size_scale =
+                        scale * annotation.style.size_scale / authored_base;
+                    annotation.style.color = Rgba::BLACK;
+                }
+            }
             Inline::Math(run) => run.size_scale = scale,
             Inline::Image(run) => run.size_scale = scale,
             Inline::Break => {}
@@ -3202,6 +3333,17 @@ fn resolve_text_block<'a>(
                 run.style.italic = false;
             }
         }
+    }
+    if block.style.direction == rebook_publication::TextDirection::Ltr
+        && !block.style.logical_alignment
+        && block.style.authored_alignment == Some(TextAlignment::Start)
+        && block
+            .content
+            .iter()
+            .flat_map(Inline::text_runs)
+            .any(|run| run.style.display_writing_system.is_some())
+    {
+        resolved.style.align = TextAlignment::Start;
     }
     Cow::Owned(resolved)
 }
@@ -3358,6 +3500,7 @@ fn text_block_supports_space_justification(block: &TextBlock) -> bool {
             .text
             .chars()
             .all(|character| character != '\u{00a0}' && !linebreak::parley::is_cjk(character)),
+        Inline::Ruby(_) => false,
         Inline::Math(_) | Inline::Image(_) | Inline::Break => true,
     })
 }
@@ -3453,6 +3596,30 @@ fn apply_list_hanging_indent(
     );
 }
 
+/// Bilingual cells/notes retain one text block. Its translated paragraphs get
+/// independent LTR shaping/alignment while original paragraphs retain RTL.
+fn rtl_translation_ranges(
+    direction: rebook_publication::TextDirection,
+    spans: &[StyledRange],
+) -> Vec<std::ops::Range<usize>> {
+    if direction != rebook_publication::TextDirection::Rtl {
+        return Vec::new();
+    }
+    let Some(start) = spans
+        .iter()
+        .find(|span| span.style.display_writing_system.is_some())
+        .map(|span| span.range.start)
+    else {
+        return Vec::new();
+    };
+    let end = spans
+        .iter()
+        .map(|span| span.range.end)
+        .max()
+        .unwrap_or(start);
+    vec![start..end]
+}
+
 fn text_alignment(alignment: TextAlignment) -> Alignment {
     match alignment {
         TextAlignment::Start => Alignment::Start,
@@ -3544,6 +3711,7 @@ pub fn reading_content_width(page_width: f32, reader_style: &ReaderStyle) -> f32
 }
 
 struct StyledRange {
+    ruby: Option<Arc<RubyPlacement>>,
     range: Range<usize>,
     style: TextStyle,
     footnote_reference_group: u32,
@@ -3551,6 +3719,7 @@ struct StyledRange {
 }
 
 struct PreparedText {
+    ruby: Arc<[RubyPlacement]>,
     citations: Arc<[InlineCitationPlacement]>,
     layout: Arc<Layout<TextBrush>>,
     text: Arc<str>,
@@ -3559,6 +3728,20 @@ struct PreparedText {
     available_width: f32,
     inline_images: Arc<[InlineImage]>,
     hyphens: Arc<[PreparedHyphen]>,
+}
+
+/// A pronunciation layout anchored to its prose base's UTF-8 range.
+#[derive(Clone)]
+pub struct RubyPlacement {
+    pub range: Range<usize>,
+    pub layout: Arc<Layout<TextBrush>>,
+    pub offset_y: f32,
+    pub spacing: f32,
+}
+
+struct RubySpec {
+    range: Range<usize>,
+    run: rebook_publication::RubyRun,
 }
 
 #[derive(Clone)]
@@ -3791,7 +3974,9 @@ fn prepare_inline_content(
     Vec<PreparedInlineImage>,
     usize,
     Vec<InlineCitationPlacement>,
+    Vec<RubySpec>,
 ) {
+    let mut ruby_specs = Vec::new();
     let mut citations = Vec::new();
     let mut text = String::new();
     let mut spans = Vec::new();
@@ -3807,6 +3992,7 @@ fn prepare_inline_content(
         let start = text.len();
         text.push_str(&prefix);
         spans.push(StyledRange {
+            ruby: None,
             range: start..text.len(),
             style: TextStyle {
                 color: fallback_color,
@@ -3820,6 +4006,26 @@ fn prepare_inline_content(
 
     for (inline_index, inline) in block.content.iter().enumerate() {
         match inline {
+            Inline::Ruby(run) => {
+                let start = text.len();
+                for base in &run.base {
+                    let at = text.len();
+                    text.push_str(&base.text);
+                    spans.push(StyledRange {
+                        ruby: None,
+                        range: at..text.len(),
+                        style: base.style,
+                        footnote_reference_group: 0,
+                        hyphenation_suppressed: true,
+                    });
+                }
+                if start != text.len() && !run.annotation.is_empty() {
+                    ruby_specs.push(RubySpec {
+                        range: start..text.len(),
+                        run: (**run).clone(),
+                    });
+                }
+            }
             Inline::Text(run) => {
                 let numbered_note = numbered_notes
                     .iter()
@@ -3868,6 +4074,12 @@ fn prepare_inline_content(
                     let original: String = block.content[inline_index..].iter().take_while(|inline| matches!(inline,Inline::Text(r) if r.link==run.link && r.style.inline_citation==0 && r.style.inline_role==InlineRole::Normal && r.style.link_role==LinkRole::Normal)).filter_map(|inline|match inline {Inline::Text(r)=>Some(r.text.as_str()),_=>None}).collect();
                     text.push_str(&footnote_icon_placeholder(&original));
                     citations.push(InlineCitationPlacement {
+                        owner_id: block.style.reference_owner.or_else(|| {
+                            block
+                                .source
+                                .as_ref()
+                                .map(rebook_publication::source_block_identity)
+                        }),
                         website: run
                             .link
                             .as_ref()
@@ -3890,6 +4102,12 @@ fn prepare_inline_content(
                         text.push('\u{2060}');
                     }
                     citations.push(InlineCitationPlacement {
+                        owner_id: block.style.reference_owner.or_else(|| {
+                            block
+                                .source
+                                .as_ref()
+                                .map(rebook_publication::source_block_identity)
+                        }),
                         website: None,
                         owner: block.source.clone(),
                         range: start..text.len(),
@@ -3924,6 +4142,12 @@ fn prepare_inline_content(
                             original.chars().count().saturating_sub(label.len()),
                         ));
                         citations.push(InlineCitationPlacement {
+                            owner_id: block.style.reference_owner.or_else(|| {
+                                block
+                                    .source
+                                    .as_ref()
+                                    .map(rebook_publication::source_block_identity)
+                            }),
                             website: None,
                             owner: block.source.clone(),
                             range: start..text.len(),
@@ -3960,6 +4184,7 @@ fn prepare_inline_content(
                     0
                 };
                 spans.push(StyledRange {
+                    ruby: None,
                     range: start..text.len(),
                     style,
                     footnote_reference_group,
@@ -4033,6 +4258,12 @@ fn prepare_inline_content(
                         let start = text.len();
                         text.extend(std::iter::repeat_n('\u{2060}', original.chars().count()));
                         citations.push(InlineCitationPlacement {
+                            owner_id: block.style.reference_owner.or_else(|| {
+                                block
+                                    .source
+                                    .as_ref()
+                                    .map(rebook_publication::source_block_identity)
+                            }),
                             website: None,
                             owner: block.source.clone(),
                             range: start..text.len(),
@@ -4040,6 +4271,7 @@ fn prepare_inline_content(
                             number: 0,
                         });
                         spans.push(StyledRange {
+                            ruby: None,
                             range: start..text.len(),
                             style: TextStyle {
                                 color: fallback_color,
@@ -4054,6 +4286,7 @@ fn prepare_inline_content(
                         let start = text.len();
                         text.push_str(&run.text);
                         spans.push(StyledRange {
+                            ruby: None,
                             range: start..text.len(),
                             style: run.style,
                             footnote_reference_group: 0,
@@ -4066,6 +4299,7 @@ fn prepare_inline_content(
                     text.push_str(&run.latex);
                     text.push('$');
                     spans.push(StyledRange {
+                        ruby: None,
                         range: start..text.len(),
                         style: TextStyle {
                             size_scale: run.size_scale,
@@ -4115,7 +4349,14 @@ fn prepare_inline_content(
             }
         }
     }
-    (text, spans, inline_images, source_text_start, citations)
+    (
+        text,
+        spans,
+        inline_images,
+        source_text_start,
+        citations,
+        ruby_specs,
+    )
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -4540,6 +4781,7 @@ impl Paginator {
             let origin_x = self.column_left() + prepared.start_offset;
             let origin_y = self.cursor_y - first_top;
             self.items.push(PageItem::Text(TextPlacement {
+                ruby: Arc::clone(&prepared.ruby),
                 citations: Arc::clone(&prepared.citations),
                 layout: Arc::clone(&prepared.layout),
                 text: Arc::clone(&prepared.text),
@@ -4566,6 +4808,7 @@ impl Paginator {
                     .get(0)
                     .ok_or(LayoutError::InvalidLayout)?;
                 self.items.push(PageItem::Text(TextPlacement {
+                    ruby: Arc::from([]),
                     citations: Arc::from([]),
                     layout: Arc::clone(&hyphen.glyph.layout),
                     text: Arc::clone(&hyphen.glyph.text),
@@ -4704,6 +4947,7 @@ impl Paginator {
                         table.cell_padding
                     };
                     TextPlacement {
+                        ruby: Arc::clone(&cell.text.ruby),
                         citations: Arc::clone(&cell.text.citations),
                         layout: Arc::clone(&cell.text.layout),
                         text: Arc::clone(&cell.text.text),
@@ -4902,6 +5146,7 @@ impl Paginator {
         let segment = FixedPageTextReplacementSegmentPlacement {
             rect: request.rect,
             text: TextPlacement {
+                ruby: Arc::clone(&prepared.ruby),
                 citations: Arc::clone(&prepared.citations),
                 layout: Arc::clone(&prepared.layout),
                 text: Arc::clone(&prepared.text),
@@ -5123,6 +5368,103 @@ pub enum LayoutError {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn rtl_website_icons_keep_paragraph_direction_and_physical_alignment() {
+        use rebook_publication::{BlockStyle, TextDirection};
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "http://www.heliconbooks.com".into(),
+                link: Some(PublicationUrl::website("http://www.heliconbooks.com").unwrap()),
+                style: TextStyle::default(),
+            })],
+            style: BlockStyle {
+                direction: TextDirection::Rtl,
+                ..Default::default()
+            },
+            source: None,
+        };
+        let mut engine = LayoutEngine::new();
+        let reader_style = ReaderStyle {
+            website_icons: true,
+            ..Default::default()
+        };
+        for (logical, align, right) in [
+            (true, TextAlignment::Start, true),
+            (false, TextAlignment::End, true),
+            (false, TextAlignment::Start, false),
+            (true, TextAlignment::End, false),
+        ] {
+            block.style.logical_alignment = logical;
+            block.style.align = align;
+            let prepared = engine.shape_text(&block, &reader_style, 400.0);
+            assert!(prepared.layout.is_rtl());
+            assert_eq!(prepared.citations.len(), 1);
+            let x = prepared.layout.get(0).unwrap().metrics().offset;
+            assert!(
+                if right { x > 350.0 } else { x.abs() < 1.0 },
+                "{logical} {align:?}: {x}"
+            );
+        }
+        block.style.direction = TextDirection::Ltr;
+        block.style.align = TextAlignment::Start;
+        let prepared = engine.shape_text(&block, &reader_style, 400.0);
+        assert!(!prepared.layout.is_rtl());
+        assert!(prepared.layout.get(0).unwrap().metrics().offset.abs() < 1.0);
+    }
+
+    #[test]
+    fn bilingual_rtl_block_keeps_original_right_and_translation_left() {
+        use rebook_publication::{BlockStyle, TextDirection};
+        let run = |text: &str, translated: bool| {
+            Inline::Text(TextRun {
+                text: text.into(),
+                link: None,
+                style: TextStyle {
+                    display_writing_system: translated.then_some(WritingSystem::Latin),
+                    ..Default::default()
+                },
+            })
+        };
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                run("?????", false),
+                Inline::Break,
+                run("Translation (example).", true),
+            ],
+            style: BlockStyle {
+                direction: TextDirection::Rtl,
+                ..Default::default()
+            },
+            source: None,
+        };
+        let prepared = LayoutEngine::new().shape_text(&block, &ReaderStyle::default(), 400.0);
+        assert!(prepared.layout.get(0).unwrap().metrics().offset > 250.0);
+        assert!(prepared.layout.get(1).unwrap().metrics().offset.abs() < 1.0);
+        for item in prepared.layout.get(1).unwrap().items() {
+            if let PositionedLayoutItem::GlyphRun(run) = item {
+                assert!(!run.run().is_rtl());
+            }
+        }
+        let mut translated = block.clone();
+        translated.content.remove(0);
+        translated.content.remove(0);
+        translated.style.direction = TextDirection::Ltr;
+        translated.style.authored_alignment = Some(TextAlignment::Start);
+        translated.style.logical_alignment = false;
+        let reader_style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_text_block(&translated, &reader_style, TextContext::Flow)
+                .style
+                .align,
+            TextAlignment::Start
+        );
+    }
     use super::*;
 
     #[test]
@@ -5361,12 +5703,14 @@ mod tests {
             let end = text.len() - 1;
             let mut spans = vec![
                 StyledRange {
+                    ruby: None,
                     range: 0..end,
                     style: TextStyle::default(),
                     footnote_reference_group: 0,
                     hyphenation_suppressed: false,
                 },
                 StyledRange {
+                    ruby: None,
                     range: end..text.len(),
                     style: TextStyle {
                         inline_citation: 1,
@@ -5387,6 +5731,7 @@ mod tests {
                 1.5,
                 Rgba::BLACK,
                 &[],
+                rebook_publication::TextDirection::Auto,
             );
             normal.break_all_lines(None);
             spans[1].footnote_reference_group = 0x2000_0001;
@@ -5399,6 +5744,7 @@ mod tests {
                 1.5,
                 Rgba::BLACK,
                 &[],
+                rebook_publication::TextDirection::Auto,
             );
             padded.break_all_lines(None);
             let expected = if text.contains(' ') {
@@ -5442,7 +5788,7 @@ mod tests {
         };
         assert_eq!(paragraph_footnotes(&block).len(), 12);
         for _ in 0..2 {
-            let (text, spans, _, _, citations) = prepare_inline_content(
+            let (text, spans, _, _, citations, _) = prepare_inline_content(
                 &block,
                 Rgba::BLACK,
                 &ReaderTypography::default(),
@@ -5530,7 +5876,7 @@ mod tests {
         };
         let svg_options = resvg::usvg::Options::default();
 
-        let (focus_text, spans, _, _, _) = prepare_inline_content(
+        let (focus_text, spans, _, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &ReaderTypography::default(),
@@ -5557,7 +5903,7 @@ mod tests {
             )
         );
 
-        let (classic_text, disabled_spans, _, _, _) = prepare_inline_content(
+        let (classic_text, disabled_spans, _, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &ReaderTypography::default(),
@@ -5787,7 +6133,7 @@ mod tests {
         let typography = ReaderTypography::default();
         let svg_options = resvg::usvg::Options::default();
 
-        let (text, _, images, _, _) = prepare_inline_content(
+        let (text, _, images, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &typography,
@@ -5841,7 +6187,7 @@ mod tests {
         let typography = ReaderTypography::default();
         let svg_options = resvg::usvg::Options::default();
 
-        let (_, _, images, _, _) = prepare_inline_content(
+        let (_, _, images, _, _, _) = prepare_inline_content(
             &block,
             Rgba::BLACK,
             &typography,
@@ -7716,6 +8062,7 @@ mod tests {
             source: None,
         });
         let spans = vec![StyledRange {
+            ruby: None,
             range: 0..value.len(),
             style: text_style,
             footnote_reference_group: 0,
@@ -7740,6 +8087,7 @@ mod tests {
                 1.5,
                 Rgba::BLACK,
                 &[],
+                rebook_publication::TextDirection::Auto,
             );
             natural.break_all_lines(None);
             let mut interiors = Vec::new();

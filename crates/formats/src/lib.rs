@@ -6,6 +6,7 @@
 
 mod cbz;
 mod chm;
+mod cover;
 mod epub;
 mod fb2;
 mod kf8;
@@ -214,7 +215,13 @@ fn finish_open(
         .as_ref()
         .filter(|_| load_cover)
         .and_then(|href| source.resource(href).ok())
-        .map(|resource| resource.bytes.to_vec());
+        .filter(|resource| resource.media_type.starts_with("image/"))
+        .map(|resource| resource.bytes.to_vec())
+        .or_else(|| {
+            load_cover
+                .then(|| cover::page_thumbnail(source.as_ref()))
+                .flatten()
+        });
     OpenedPublication {
         format,
         source,

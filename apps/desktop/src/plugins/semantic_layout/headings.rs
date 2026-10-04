@@ -67,7 +67,7 @@ pub(super) fn style(block: &TextBlock) -> Value {
     let mut italic = 0.0;
     let mut size = 0.0;
     for inline in &block.content {
-        if let Inline::Text(run) = inline {
+        for run in inline.text_runs() {
             let count = run.text.chars().filter(|c| !c.is_whitespace()).count() as f64;
             total += count;
             if run.style.bold {

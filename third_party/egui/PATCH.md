@@ -14,3 +14,8 @@ Remove this patch after upstream egui preserves cross-label selections whose end
 Torto also exposes whether the vertical scroll bar is being interacted with so focus-mode scroll bar
 input follows the same paragraph-based navigation path as mouse-wheel input. The upstream 0.36.1
 `Sense::drag` hit-testing fix is included alongside these local changes.
+
+The default image texture loader also evicts least recently used, inactive textures when its
+retained pixel data exceeds 64 MiB. Textures touched in the current or previous pass are protected;
+visible content can exceed this soft budget. This bounds unused UI image retention without
+changing the texture format or the GPU device allocation strategy.

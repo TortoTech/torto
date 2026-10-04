@@ -177,12 +177,29 @@ impl DesktopApp {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     ) {
+        let started = std::time::Instant::now();
         self.shelf.spawn_pending_tasks(runtime, proxy);
+        let shelf_finished = started.elapsed();
         self.settings.spawn_pending_tasks(runtime, proxy);
         #[cfg(target_os = "windows")]
         self.updater.spawn_pending_tasks(runtime, proxy);
+        let settings_finished = started.elapsed();
         if let Some(reader) = self.reader.as_mut() {
             reader.spawn_pending_tasks(runtime, proxy);
+        }
+        let finished = started.elapsed();
+        if finished.as_millis() >= 100 {
+            use crate::diagnostics::{Field, log};
+            let ms = |duration: std::time::Duration| duration.as_secs_f32() * 1000.0;
+            log(
+                "app.background_dispatch_slow",
+                &[
+                    Field::F32("total_ms", ms(finished)),
+                    Field::F32("shelf_ms", ms(shelf_finished)),
+                    Field::F32("settings_ms", ms(settings_finished - shelf_finished)),
+                    Field::F32("reader_ms", ms(finished - settings_finished)),
+                ],
+            );
         }
     }
 

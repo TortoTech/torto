@@ -26,6 +26,8 @@ pub struct LayoutContext<B: Brush = [u8; 4]> {
     pub(crate) style_runs: Vec<StyleRun>,
     pub(crate) inline_boxes: Vec<InlineBox>,
     pub(crate) bidi: BidiResolver,
+    pub(crate) base_level_override: Option<u8>,
+    pub(crate) ltr_ranges: Vec<core::ops::Range<usize>>,
 
     // Reusable style builders (to amortise allocations)
     pub(crate) ranged_style_builder: RangedStyleBuilder<B>,
@@ -47,6 +49,8 @@ impl<B: Brush> LayoutContext<B> {
             style_runs: vec![],
             inline_boxes: vec![],
             bidi: BidiResolver::new(),
+            base_level_override: None,
+            ltr_ranges: Vec::new(),
             ranged_style_builder: RangedStyleBuilder::default(),
             tree_style_builder: TreeStyleBuilder::default(),
             info: vec![],
@@ -187,6 +191,8 @@ impl<B: Brush> LayoutContext<B> {
         self.inline_boxes.clear();
         self.info.clear();
         self.bidi.clear();
+        self.base_level_override = None;
+        self.ltr_ranges.clear();
     }
 }
 

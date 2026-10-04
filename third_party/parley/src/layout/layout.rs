@@ -1,19 +1,19 @@
 // Copyright 2025 the Parley Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use crate::InlineBox;
 use crate::layout::alignment::align;
 use crate::layout::alignment::unjustify;
 use crate::layout::data::LayoutData;
 use crate::style::Brush;
-use crate::InlineBox;
 use core::cmp::Ordering;
 use core::fmt;
 
-use crate::layout::{
-    alignment::Alignment, alignment::AlignmentOptions, line::Line, line_break::BreakLines,
-    ContentWidths, Style,
-};
 use crate::IndentOptions;
+use crate::layout::{
+    ContentWidths, Style, alignment::Alignment, alignment::AlignmentOptions, line::Line,
+    line_break::BreakLines,
+};
 
 /// Text layout.
 ///
@@ -172,6 +172,54 @@ impl<B: Brush> Layout<B> {
     }
 
     /// Returns an iterator over the lines in the layout.
+    /// Reserve application-painted annotations anchored to real text, rather than
+    /// zero-width boxes that can land on the preceding line at a wrap boundary.
+    /// Offsets are relative to the line's text baseline. Call after breaking.
+    pub fn reserve_text_paint_bounds(&mut self, bounds: &[(core::ops::Range<usize>, f32, f32)]) {
+        let extra: alloc::vec::Vec<_> = self
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                let m = line.metrics();
+                let bottom = self.get(index + 1).map_or(
+                    m.block_max_coord.max(m.block_min_coord + m.line_height),
+                    |next| {
+                        m.block_max_coord
+                            .max(m.block_min_coord + m.line_height)
+                            .min(next.metrics().block_min_coord)
+                    },
+                );
+                let mut above = 0.0_f32;
+                let mut below = 0.0_f32;
+                for (range, offset, height) in bounds {
+                    if range.start < line.text_range().end
+                        && range.end > line.text_range().start
+                        && offset.is_finite()
+                        && height.is_finite()
+                        && *height >= 0.0
+                    {
+                        above = above.max(m.block_min_coord - m.baseline - offset);
+                        below = below.max(m.baseline + offset + height - bottom);
+                    }
+                }
+                (above, below)
+            })
+            .collect();
+        let mut shift = 0.0;
+        for (line, (above, below)) in self.data.lines.iter_mut().zip(extra) {
+            let m = &mut line.metrics;
+            m.block_min_coord += shift;
+            m.block_max_coord += shift + above + below;
+            m.baseline += shift + above;
+            m.ascent += above;
+            m.descent += below;
+            m.line_height += above + below;
+            shift += above + below;
+        }
+        self.data.height += shift;
+    }
+
+    /// Returns an iterator over the lines in the layout.
     pub fn lines(
         &self,
     ) -> impl ExactSizeIterator<Item = Line<'_, B>> + DoubleEndedIterator + '_ + Clone {
@@ -224,6 +272,21 @@ impl<B: Brush> Layout<B> {
     /// struct then each line will be aligned individually within its line box.
     pub fn align(&mut self, alignment: Alignment, options: AlignmentOptions) {
         unjustify(&mut self.data);
+        self.data.left_aligned_ranges.clear();
+        align(&mut self.data, alignment, options);
+    }
+
+    /// Aligns translated paragraphs to the physical left while preserving the
+    /// enclosing layout's alignment for original paragraphs. Ranges use UTF-8.
+    pub fn align_with_left_ranges(
+        &mut self,
+        alignment: Alignment,
+        options: AlignmentOptions,
+        ranges: &[core::ops::Range<usize>],
+    ) {
+        unjustify(&mut self.data);
+        self.data.left_aligned_ranges.clear();
+        self.data.left_aligned_ranges.extend_from_slice(ranges);
         align(&mut self.data, alignment, options);
     }
 

@@ -345,6 +345,7 @@ fn normalized_text_block(block: &TextBlock) -> String {
     let mut text = String::new();
     for inline in &block.content {
         match inline {
+            Inline::Ruby(run) => run.base.iter().for_each(|r| text.push_str(&r.text)),
             Inline::Text(run) => text.push_str(&run.text),
             Inline::Math(run) => text.push_str(&run.latex),
             Inline::Image(_) => {}

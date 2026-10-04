@@ -24,6 +24,7 @@ fn text(node: &str, value: &str, y: f32) -> TextPlacement {
         },
     };
     TextPlacement {
+        ruby: Arc::from([]),
         citations: Arc::from([]),
         lines: 0..layout.len(),
         layout: Arc::new(layout),

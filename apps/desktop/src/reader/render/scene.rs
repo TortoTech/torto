@@ -40,6 +40,10 @@ fn focus_footnote_icon_color() -> Color {
     Color::from_rgba8(color.r(), color.g(), color.b(), color.a())
 }
 
+pub(in crate::reader) fn active_footnote_marker_color() -> egui::Color32 {
+    crate::ui::footnote_link_color()
+}
+
 pub(in crate::reader) fn text_selection_fill() -> egui::Color32 {
     let rgba = TEXT_SELECTION_COLOR.to_rgba8();
     egui::Color32::from_rgba_unmultiplied(rgba.r, rgba.g, rgba.b, rgba.a)
@@ -122,17 +126,9 @@ impl DesktopReader {
         match self.reader.current_spread() {
             Ok(spread) => {
                 let mut bridge = VelloScene::new(&mut scene);
-                self.paint_focus_table_border(
-                    &spread.primary,
-                    &mut bridge,
-                    spread.primary_offset_x,
-                );
+                self.paint_page_foreground(&spread.primary, &mut bridge, spread.primary_offset_x);
                 if let Some(secondary) = spread.secondary {
-                    self.paint_focus_table_border(
-                        &secondary,
-                        &mut bridge,
-                        spread.secondary_offset_x,
-                    );
+                    self.paint_page_foreground(&secondary, &mut bridge, spread.secondary_offset_x);
                 }
             }
             Err(error) => self.error = Some(format!("组合双页失败：{error}")),
@@ -230,11 +226,11 @@ impl DesktopReader {
             self.paint_page_overlays(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
             page_scene.append(&layers.content, None);
             page_scene.pop_layer();
-            // Outer activation strokes may extend past the first/last content
-            // row. Keep the content clip intact and allow only the border out.
-            let border_clip = Rect::new(clip.x0, clip.y0 - 2.0, clip.x1, clip.y1 + 2.0);
+            // Borders and reference bars can extend into inter-paragraph space.
+            // Keep the text clip intact while preserving foreground indicators.
+            let border_clip = Rect::new(clip.x0, clip.y0 - 4.0, clip.x1, clip.y1 + 4.0);
             page_scene.push_clip_layer(peniko::Fill::NonZero, Affine::IDENTITY, &border_clip);
-            self.paint_focus_table_border(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
+            self.paint_page_foreground(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
             page_scene.pop_layer();
             scene.append(
                 &page_scene,
@@ -392,18 +388,6 @@ impl DesktopReader {
                 offset_x,
             );
         }
-        if let Some(unit) = focus_unit {
-            page.paint_footnote_icons(
-                scene,
-                unit.list_group
-                    .as_ref()
-                    .map_or(&unit.paint_ranges, |group| &group.paint_ranges),
-                focus_footnote_icon_color(),
-                offset_x,
-            );
-        } else if !self.is_focus_mode() {
-            page.paint_all_footnote_icons(scene, focus_footnote_icon_color(), offset_x);
-        }
         for highlight in &self.highlights {
             page.paint_source_ranges(scene, &highlight.ranges, ANNOTATION_MARK_COLOR, offset_x);
         }
@@ -443,12 +427,45 @@ impl DesktopReader {
         }
     }
 
-    fn paint_focus_table_border(
+    fn paint_page_foreground(
         &self,
         page: &PageDisplayList,
         scene: &mut VelloScene<'_>,
         offset_x: f32,
     ) {
+        if self.is_focus_mode()
+            && let Some(unit) = self.focus_units.get(self.focus_unit_index)
+        {
+            let active = self
+                .ui
+                .focus_footnotes_visible
+                .then_some(())
+                .and(self.active_footnote_reference.as_ref())
+                .map(|(source, number)| {
+                    let color = active_footnote_marker_color();
+                    (
+                        source,
+                        *number,
+                        Color::from_rgba8(color.r(), color.g(), color.b(), 255),
+                    )
+                });
+            let ranges = unit
+                .list_group
+                .as_ref()
+                .map_or(&unit.paint_ranges, |group| &group.paint_ranges);
+            // Both indicators are foreground paint with one color, so green
+            // activation and annotation fills cannot tint either of them.
+            page.paint_focus_footnote_icons(
+                scene,
+                ranges,
+                focus_footnote_icon_color(),
+                active,
+                offset_x,
+            );
+            page.paint_focus_footnote_activation_bars(scene, ranges, active, offset_x);
+        } else if !self.is_focus_mode() {
+            page.paint_all_footnote_icons(scene, focus_footnote_icon_color(), offset_x);
+        }
         if self.is_focus_mode()
             && focus_unit_activation_visible(
                 self.selection.is_some(),

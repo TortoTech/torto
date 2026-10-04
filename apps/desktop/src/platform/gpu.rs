@@ -29,7 +29,7 @@ pub(super) struct GpuState {
     queue: wgpu::Queue,
     surface_config: wgpu::SurfaceConfiguration,
     egui_renderer: Renderer,
-    vello_renderer: VelloRenderer,
+    vello_renderer: Option<VelloRenderer>,
     page_target: Option<PageTarget>,
     retired_page_textures: Vec<TextureId>,
     clear_color: wgpu::Color,
@@ -85,21 +85,13 @@ impl GpuState {
         surface.configure(&device, &surface_config);
 
         let egui_renderer = Renderer::new(&device, format, RendererOptions::default());
-        let vello_renderer = VelloRenderer::new(
-            &device,
-            VelloOptions {
-                antialiasing_support: AaSupport::area_only(),
-                ..Default::default()
-            },
-        )
-        .map_err(|error| error.to_string())?;
         Ok(Self {
             surface,
             device,
             queue,
             surface_config,
             egui_renderer,
-            vello_renderer,
+            vello_renderer: None,
             page_target: None,
             retired_page_textures: Vec::new(),
             last_frame: None,
@@ -234,6 +226,7 @@ impl GpuState {
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
     ) -> Result<(), String> {
+        let frame_started = std::time::Instant::now();
         if !window_can_render(window) {
             return Ok(());
         }
@@ -251,11 +244,15 @@ impl GpuState {
         let mut output = egui_ctx.run_ui(raw_input, |ui| {
             plan = app.ui(ui, self.page_texture());
         });
+        let ui_finished = frame_started.elapsed();
+        crate::ui::resolve_interface_font_fallbacks(egui_ctx, &output.shapes);
+        let fonts_finished = frame_started.elapsed();
         // ScaleFactorChanged is applied by begin_pass, so read this only after
         // run_ui instead of using the previous frame's scale.
         let pixels_per_point = egui_ctx.pixels_per_point();
         egui_state.handle_platform_output(window, std::mem::take(&mut output.platform_output));
         process_root_viewport_commands(window, egui_ctx, &mut viewport_info, &mut output);
+        let platform_finished = frame_started.elapsed();
 
         let mut page_target_recreated = false;
         if let Some(plan) = plan {
@@ -269,6 +266,13 @@ impl GpuState {
             if needs_render && let Some(scene) = app.reader_scene() {
                 self.render_reader_scene(&scene, plan, pixels_per_point)?;
             }
+        } else {
+            // No reader is displayed. Retire its texture after this frame and
+            // release Vello's work-buffer pool; reopen lazily on the next book.
+            if let Some(target) = self.page_target.take() {
+                self.retired_page_textures.push(target.texture_id);
+            }
+            self.vello_renderer = None;
         }
         if page_target_recreated {
             // This frame intentionally retains the old texture at its old logical
@@ -277,7 +281,9 @@ impl GpuState {
             window.request_redraw();
         }
 
+        let reader_finished = frame_started.elapsed();
         let paint_jobs = egui_ctx.tessellate(output.shapes, pixels_per_point);
+        let tessellation_finished = frame_started.elapsed();
         let screen = ScreenDescriptor {
             size_in_pixels: [self.surface_config.width, self.surface_config.height],
             pixels_per_point,
@@ -289,10 +295,12 @@ impl GpuState {
             }
         }
 
+        let textures_finished = frame_started.elapsed();
         let Some(frame) = self.acquire_surface_frame(window)? else {
             self.free_egui_textures(&mut output.textures_delta);
             return Ok(());
         };
+        let acquisition_finished = frame_started.elapsed();
         // Retain the complete UI on the GPU, including panels and popups.
         let retain_frame = self.surface_config.usage.contains(TextureUsages::COPY_DST);
         if retain_frame {
@@ -359,10 +367,41 @@ impl GpuState {
                 frame.texture.size(),
             );
         }
+        let encoding_finished = frame_started.elapsed();
         self.queue
             .submit(callback_commands.into_iter().chain([encoder.finish()]));
+        let submission_finished = frame_started.elapsed();
         window.pre_present_notify();
         frame.present();
+        let presentation_finished = frame_started.elapsed();
+        if presentation_finished.as_millis() >= 100 {
+            use crate::diagnostics::{Field, log};
+            let ms = |duration: std::time::Duration| duration.as_secs_f32() * 1000.0;
+            log(
+                "render.frame_slow",
+                &[
+                    Field::F32("total_ms", ms(presentation_finished)),
+                    Field::F32("ui_ms", ms(ui_finished)),
+                    Field::F32("fonts_ms", ms(fonts_finished - ui_finished)),
+                    Field::F32("platform_ms", ms(platform_finished - fonts_finished)),
+                    Field::F32("reader_ms", ms(reader_finished - platform_finished)),
+                    Field::F32(
+                        "tessellation_ms",
+                        ms(tessellation_finished - reader_finished),
+                    ),
+                    Field::F32("textures_ms", ms(textures_finished - tessellation_finished)),
+                    Field::F32("acquire_ms", ms(acquisition_finished - textures_finished)),
+                    Field::F32("encode_ms", ms(encoding_finished - acquisition_finished)),
+                    Field::F32("submit_ms", ms(submission_finished - encoding_finished)),
+                    Field::F32(
+                        "present_ms",
+                        ms(presentation_finished - submission_finished),
+                    ),
+                    Field::Bool("reader", plan.is_some()),
+                    Field::Bool("recreated", page_target_recreated),
+                ],
+            );
+        }
         if crate::smoke::enabled() {
             self.device
                 .poll(wgpu::PollType::Wait {
@@ -501,6 +540,19 @@ impl GpuState {
         pixels_per_point: f32,
     ) -> Result<(), String> {
         let started = std::time::Instant::now();
+        if self.vello_renderer.is_none() {
+            self.vello_renderer = Some(
+                VelloRenderer::new(
+                    &self.device,
+                    VelloOptions {
+                        antialiasing_support: AaSupport::area_only(),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+        let renderer = self.vello_renderer.as_mut().unwrap();
         // Vello 0.10 can still omit a previously resolved ImageData on subsequent
         // render_to_texture calls (linebender/vello#1809). Explicitly marking
         // every image referenced by this scene dirty makes the persistent atlas
@@ -523,7 +575,7 @@ impl GpuState {
                 );
             }
             for image in scene.images.iter() {
-                self.vello_renderer.mark_override_image_dirty(image);
+                renderer.mark_override_image_dirty(image);
             }
         }
         let Some(target) = self.page_target.as_mut() else {
@@ -534,7 +586,7 @@ impl GpuState {
             &scene.scene,
             Some(Affine::scale(f64::from(pixels_per_point))),
         );
-        self.vello_renderer
+        renderer
             .render_to_texture(
                 &self.device,
                 &self.queue,

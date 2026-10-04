@@ -195,12 +195,14 @@ mod tests {
             let end = start + label.len() + '\u{2060}'.len_utf8();
             let spans = [
                 StyledRange {
+                    ruby: None,
                     range: 0..start,
                     style: TextStyle::default(),
                     footnote_reference_group: 0,
                     hyphenation_suppressed: false,
                 },
                 StyledRange {
+                    ruby: None,
                     range: start..end,
                     style: TextStyle {
                         size_scale: 0.78,
@@ -211,6 +213,7 @@ mod tests {
                     hyphenation_suppressed: true,
                 },
                 StyledRange {
+                    ruby: None,
                     range: end..text.len(),
                     style: TextStyle::default(),
                     footnote_reference_group: 0,
@@ -228,6 +231,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                rebook_publication::TextDirection::Auto,
             );
             raw.break_all_lines(None);
             let measured = measure(&raw, &text, &spans, typography.font_size);
@@ -251,6 +255,7 @@ mod tests {
                 1.5,
                 Rgba::BLACK,
                 &[],
+                rebook_publication::TextDirection::Auto,
             );
             adjusted.break_all_lines(None);
             let delta: f32 = measured.iter().map(|item| item.amount).sum();
@@ -272,6 +277,7 @@ mod tests {
         for text in ["Sentence.1Next", "Sentence.1 Next", "Sentence\u{201d}1Next"] {
             let start = text.find('1').unwrap();
             let spans = [StyledRange {
+                ruby: None,
                 range: start..start + 1,
                 style: TextStyle::default(),
                 footnote_reference_group: 0x2000_0001,

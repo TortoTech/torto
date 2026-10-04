@@ -159,6 +159,7 @@ fn numeric_reference(block: &TextBlock, citation: &Citation) -> bool {
     let mut offset = 0;
     let linked = block.content.iter().any(|inline| {
         let (len, evidence) = match inline {
+            Inline::Ruby(run) => (run.source_char_len(), false),
             Inline::Text(run) => (
                 run.text.chars().count(),
                 run.link

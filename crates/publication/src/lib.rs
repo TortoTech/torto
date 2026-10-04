@@ -721,12 +721,44 @@ pub struct TableCell {
 pub enum Inline {
     /// Styled Unicode text.
     Text(TextRun),
+    /// A base text segment with a separate, non-prose pronunciation annotation.
+    Ruby(Box<RubyRun>),
     /// LaTeX formula kept as semantic inline content for native layout.
     Math(MathRun),
     /// A small authored image that participates in the surrounding text line.
     Image(Box<InlineImageRun>),
     /// Forced line break.
     Break,
+}
+
+/// One paired ruby segment. Text extraction uses `base` only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RubyRun {
+    pub base: Vec<TextRun>,
+    pub annotation: Vec<TextRun>,
+    #[serde(default)]
+    pub below: bool,
+}
+
+impl RubyRun {
+    pub fn base_text(&self) -> String {
+        self.base.iter().map(|run| run.text.as_str()).collect()
+    }
+
+    pub fn source_char_len(&self) -> usize {
+        self.base.iter().map(|run| run.text.chars().count()).sum()
+    }
+}
+
+impl Inline {
+    /// Authored prose runs, excluding ruby annotations and generated media.
+    pub fn text_runs(&self) -> &[TextRun] {
+        match self {
+            Self::Text(run) => std::slice::from_ref(run),
+            Self::Ruby(run) => &run.base,
+            _ => &[],
+        }
+    }
 }
 
 /// Raster or vector image kept at its authored position inside a text block.
@@ -1159,9 +1191,27 @@ pub enum TextAlignment {
     Justify,
 }
 
+/// Paragraph base direction; Auto uses the first strong character.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextDirection {
+    #[default]
+    Auto,
+    Ltr,
+    Rtl,
+}
+
 /// Portable block style subset, expressed in CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BlockStyle {
+    /// Ephemeral marker association for a bilingual companion without a source range.
+    #[serde(skip)]
+    pub reference_owner: Option<u64>,
+    /// Inherited paragraph direction, independent of its displayed text.
+    #[serde(default)]
+    pub direction: TextDirection,
+    /// Whether start/end alignment follows direction rather than physical edges.
+    #[serde(default = "default_logical_alignment")]
+    pub logical_alignment: bool,
     /// Source-local identity of the outermost authored list container.
     /// Absent for inferred paragraph lists and older serialized content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1202,6 +1252,9 @@ pub struct BlockStyle {
 impl Default for BlockStyle {
     fn default() -> Self {
         Self {
+            reference_owner: None,
+            direction: TextDirection::Auto,
+            logical_alignment: true,
             list_group: None,
             align: TextAlignment::Start,
             authored_alignment: None,
@@ -1219,6 +1272,10 @@ impl Default for BlockStyle {
     }
 }
 
+fn default_logical_alignment() -> bool {
+    true
+}
+
 /// Lazy source boundary: parsers produce stable reading IR one section at a time.
 pub trait BookSource: Send + Sync {
     /// Lightweight descriptor available immediately after opening.
@@ -1231,6 +1288,10 @@ pub trait BookSource: Send + Sync {
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError>;
     /// Loads a referenced resource subject to format-specific budgets.
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError>;
+    /// An authored cover page used when no usable standalone cover image exists.
+    fn cover_section(&self) -> Result<Option<Section>, PublicationError> {
+        Ok(None)
+    }
     /// Returns an already decoded image when the format can provide one cheaply.
     fn raster_resource(
         &self,
@@ -1600,4 +1661,14 @@ mod website_tests {
         }
         assert!(PublicationUrl::parse("https://example.com").is_err());
     }
+}
+
+/// Display-session identity shared by a source block and its translated companion.
+/// Source offsets are excluded because sentence splitting changes those ranges.
+pub fn source_block_identity(source: &SourceRange) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut state = std::collections::hash_map::DefaultHasher::new();
+    source.start.spine.hash(&mut state);
+    source.start.node.hash(&mut state);
+    state.finish()
 }

@@ -266,16 +266,24 @@ pub fn parse_section_with_hints_and_image_classifier(
     mut is_decorative_separator_image: impl FnMut(&PublicationUrl) -> bool,
     hints: SectionParseHints,
 ) -> Result<Section, HtmlError> {
+    #[cfg(debug_assertions)]
+    let profile_started = std::time::Instant::now();
     let document = Document::parse(xml).map_err(|error| HtmlError::InvalidDocument {
         resource: descriptor.href.to_string(),
         message: error.to_string(),
     })?;
+    #[cfg(debug_assertions)]
+    let document_finished = profile_started.elapsed();
     let styles = StyleSheet::from_document(&document, &descriptor.href, &mut load_stylesheet);
+    #[cfg(debug_assertions)]
+    let styles_finished = profile_started.elapsed();
     let root = document
         .descendants()
         .find(|node| node.is_element() && node.tag_name().name() == "body")
         .unwrap_or_else(|| document.root_element());
     let footnote_links = classify_footnote_links(&document, &descriptor.href);
+    #[cfg(debug_assertions)]
+    let links_finished = profile_started.elapsed();
     let mut parser = ReadingIrParser::new(
         descriptor.id.clone(),
         descriptor.href.clone(),
@@ -295,6 +303,21 @@ pub fn parse_section_with_hints_and_image_classifier(
         parser.push_text_block(root, TextBlockKind::Paragraph, style)?;
     }
 
+    #[cfg(debug_assertions)]
+    if std::env::var_os("TORTO_PROFILE_HTML").is_some() {
+        eprintln!(
+            "HTML {} document={:.2}ms styles={:.2}ms links={:.2}ms body={:.2}ms quotes={:.2}ms quote_nodes={} indented_quote_nodes={} blocks={}",
+            descriptor.href,
+            document_finished.as_secs_f64() * 1000.0,
+            (styles_finished - document_finished).as_secs_f64() * 1000.0,
+            (links_finished - styles_finished).as_secs_f64() * 1000.0,
+            (profile_started.elapsed() - links_finished).as_secs_f64() * 1000.0,
+            parser.quote_elapsed.as_secs_f64() * 1000.0,
+            parser.quote_nodes,
+            parser.indented_quote_nodes,
+            parser.blocks.len()
+        );
+    }
     Ok(Section {
         id: descriptor.id.clone(),
         href: descriptor.href.clone(),
@@ -303,7 +326,22 @@ pub fn parse_section_with_hints_and_image_classifier(
     })
 }
 
+#[derive(Clone, Copy)]
+struct IndentedQuoteCandidate {
+    inset: f32,
+    attribution: bool,
+}
+
 struct ReadingIrParser<'a> {
+    // Nodes and styles are immutable for the lifetime of one section parse.
+    indented_quote_candidates: HashMap<roxmltree::NodeId, Option<IndentedQuoteCandidate>>,
+    failed_indented_quotes: HashSet<roxmltree::NodeId>,
+    #[cfg(debug_assertions)]
+    quote_elapsed: std::time::Duration,
+    #[cfg(debug_assertions)]
+    quote_nodes: usize,
+    #[cfg(debug_assertions)]
+    indented_quote_nodes: usize,
     section_id: SpineItemId,
     section_href: PublicationUrl,
     next_node: u64,
@@ -330,6 +368,14 @@ impl<'a> ReadingIrParser<'a> {
         is_decorative_separator_image: &'a mut dyn FnMut(&PublicationUrl) -> bool,
     ) -> Self {
         Self {
+            indented_quote_candidates: HashMap::new(),
+            failed_indented_quotes: HashSet::new(),
+            #[cfg(debug_assertions)]
+            quote_elapsed: std::time::Duration::ZERO,
+            #[cfg(debug_assertions)]
+            quote_nodes: 0,
+            #[cfg(debug_assertions)]
+            indented_quote_nodes: 0,
             section_id,
             section_href,
             next_node: 0,
@@ -372,7 +418,14 @@ impl<'a> ReadingIrParser<'a> {
                     self.parse_note_section_nodes(&children[index..])?;
                     break;
                 }
-                if let Some(consumed) = self.try_parse_sibling_quote(parent, &children[index..])? {
+                #[cfg(debug_assertions)]
+                let quote_started = std::time::Instant::now();
+                let quote = self.try_parse_sibling_quote(parent, &children[index..])?;
+                #[cfg(debug_assertions)]
+                {
+                    self.quote_elapsed += quote_started.elapsed();
+                }
+                if let Some(consumed) = quote {
                     index += consumed;
                     continue;
                 }
@@ -642,6 +695,10 @@ impl<'a> ReadingIrParser<'a> {
         let mut last_body_consumed = 0;
 
         for (index, node) in siblings.iter().copied().enumerate() {
+            #[cfg(debug_assertions)]
+            {
+                self.quote_nodes += 1;
+            }
             if node.is_text() {
                 if node.text().is_some_and(|text| text.trim().is_empty()) {
                     continue;
@@ -729,9 +786,19 @@ impl<'a> ReadingIrParser<'a> {
         container: Node<'_, '_>,
         siblings: &[Node<'_, '_>],
     ) -> Result<Option<usize>, HtmlError> {
+        if siblings
+            .first()
+            .is_some_and(|node| self.failed_indented_quotes.contains(&node.id()))
+        {
+            return Ok(None);
+        }
         let mut body = Vec::new();
         let mut body_inset = None::<f32>;
         for (index, node) in siblings.iter().copied().enumerate() {
+            #[cfg(debug_assertions)]
+            {
+                self.indented_quote_nodes += 1;
+            }
             if node.is_text() {
                 if node.text().is_some_and(|text| text.trim().is_empty()) {
                     continue;
@@ -741,27 +808,11 @@ impl<'a> ReadingIrParser<'a> {
             if !node.is_element() {
                 continue;
             }
-            if !(node.tag_name().name().eq_ignore_ascii_case("p")
-                || node.tag_name().name().eq_ignore_ascii_case("div"))
-                || !node_has_visible_text(node)
-                || is_numbered_media_paragraph(node)
-                || node.descendants().skip(1).any(|child| {
-                    if !child.is_element() {
-                        return false;
-                    }
-                    let name = child.tag_name().name().to_ascii_lowercase();
-                    if name == "img" {
-                        self.styles.image_establishes_block_layout(child)
-                    } else {
-                        is_block_boundary(&name)
-                            || matches!(name.as_str(), "svg" | "table" | "video" | "object")
-                    }
-                })
-            {
+            let Some(candidate) = self.indented_quote_candidate(node) else {
                 break;
-            }
-            let inset = self.styles.quote_layout_metrics(node).start;
-            if self.styles.block_style(node, BlockStyle::default()).align == TextAlignment::End {
+            };
+            let inset = candidate.inset;
+            if candidate.attribution {
                 if body_inset.is_some_and(|start| inset <= start + 0.5) {
                     self.parse_quote_nodes(container, &body, Some(node))?;
                     return Ok(Some(index + 1));
@@ -779,7 +830,48 @@ impl<'a> ReadingIrParser<'a> {
             body_inset.get_or_insert(inset);
             body.push(node);
         }
+        if let Some(start) = body_inset.filter(|start| start.is_finite()) {
+            // A failed scan is reusable only for the identical reference inset.
+            // "Compatible" insets are not transitive: restarting at a different
+            // inset can admit a later paragraph or attribution that failed here.
+            for node in body {
+                if self.indented_quote_candidates[&node.id()]
+                    .is_some_and(|candidate| candidate.inset.to_bits() == start.to_bits())
+                {
+                    self.failed_indented_quotes.insert(node.id());
+                }
+            }
+        }
         Ok(None)
+    }
+
+    fn indented_quote_candidate(&mut self, node: Node<'_, '_>) -> Option<IndentedQuoteCandidate> {
+        if let Some(candidate) = self.indented_quote_candidates.get(&node.id()) {
+            return *candidate;
+        }
+        let eligible = (node.tag_name().name().eq_ignore_ascii_case("p")
+            || node.tag_name().name().eq_ignore_ascii_case("div"))
+            && node_has_visible_text(node)
+            && !is_numbered_media_paragraph(node)
+            && !node.descendants().skip(1).any(|child| {
+                if !child.is_element() {
+                    return false;
+                }
+                let name = child.tag_name().name().to_ascii_lowercase();
+                if name == "img" {
+                    self.styles.image_establishes_block_layout(child)
+                } else {
+                    is_block_boundary(&name)
+                        || matches!(name.as_str(), "svg" | "table" | "video" | "object")
+                }
+            });
+        let candidate = eligible.then(|| IndentedQuoteCandidate {
+            inset: self.styles.quote_layout_metrics(node).start,
+            attribution: self.styles.block_style(node, BlockStyle::default()).align
+                == TextAlignment::End,
+        });
+        self.indented_quote_candidates.insert(node.id(), candidate);
+        candidate
     }
 
     fn parse_node(&mut self, node: Node<'_, '_>) -> Result<(), HtmlError> {
@@ -1513,6 +1605,9 @@ impl<'a> ReadingIrParser<'a> {
                     .iter()
                     .map(|inline| match inline {
                         Inline::Text(run) => run.text.chars().count() as u64,
+                        Inline::Ruby(run) => {
+                            run.base.iter().map(|r| r.text.chars().count() as u64).sum()
+                        }
                         Inline::Math(_) => 0,
                         Inline::Image(_) => 0,
                         Inline::Break => 1,
@@ -1709,6 +1804,7 @@ impl<'a> ReadingIrParser<'a> {
             .iter()
             .map(|inline| match inline {
                 Inline::Text(run) => run.text.chars().count() as u64,
+                Inline::Ruby(run) => run.base.iter().map(|r| r.text.chars().count() as u64).sum(),
                 Inline::Math(_) => 0,
                 Inline::Image(_) => 0,
                 Inline::Break => 1,
@@ -1765,6 +1861,7 @@ impl<'a> ReadingIrParser<'a> {
             .iter()
             .map(|inline| match inline {
                 Inline::Text(run) => run.text.chars().count() as u64,
+                Inline::Ruby(run) => run.base.iter().map(|r| r.text.chars().count() as u64).sum(),
                 Inline::Math(_) => 0,
                 Inline::Image(_) => 0,
                 Inline::Break => 1,
@@ -2638,6 +2735,13 @@ fn collect_inline_node_with_block_boundaries(
         return;
     }
     let name = node.tag_name().name().to_ascii_lowercase();
+    if name == "ruby" {
+        collect_ruby(node, inherited, link, context, collector);
+        return;
+    }
+    if matches!(name.as_str(), "rt" | "rp" | "rtc") {
+        return;
+    }
     if name == "br" {
         collector.push_break();
         return;
@@ -2742,6 +2846,100 @@ fn collect_inline_node_with_block_boundaries(
             collector,
             preserve_block_boundaries,
         );
+    }
+}
+
+fn collect_ruby(
+    node: Node<'_, '_>,
+    inherited: TextStyle,
+    link: Option<&PublicationUrl>,
+    context: &InlineParseContext<'_>,
+    collector: &mut InlineCollector,
+) {
+    let mut style = inherited;
+    context
+        .styles
+        .apply_text_node(node, &mut style, inherited.size_scale);
+    let below = context
+        .styles
+        .cascaded_properties(node)
+        .get("ruby-position")
+        .is_some_and(|value| value.trim() == "under");
+    let mut base = InlineCollector::new(collector.preserve_whitespace);
+    base.last_was_space = collector.last_was_space;
+    let mut explicit_bases = std::collections::VecDeque::new();
+    for child in node.children() {
+        let name = if child.is_element() {
+            child.tag_name().name()
+        } else {
+            ""
+        };
+        if name.eq_ignore_ascii_case("rp") || name.eq_ignore_ascii_case("rtc") {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("rb") {
+            let mut explicit = InlineCollector::new(collector.preserve_whitespace);
+            explicit.last_was_space = base.last_was_space;
+            collect_inline_node(child, style, link, context, &mut explicit);
+            base.last_was_space = explicit.last_was_space;
+            explicit_bases.push_back(explicit.content);
+            continue;
+        }
+        if !explicit_bases.is_empty()
+            && child.is_text()
+            && child.text().is_some_and(|s| s.trim().is_empty())
+        {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("rt") {
+            let mut annotation = InlineCollector::new(false);
+            let mut annotation_style = style;
+            annotation_style.size_scale *= 0.5;
+            // Explicit rt styles are relative to the base, not the UA 50% default.
+            context
+                .styles
+                .apply_text_node(child, &mut annotation_style, style.size_scale);
+            collect_inline(child, annotation_style, None, context, &mut annotation);
+            annotation.finish();
+            let take_runs = |items: Vec<Inline>| {
+                items
+                    .into_iter()
+                    .flat_map(|item| match item {
+                        Inline::Text(run) => vec![run],
+                        Inline::Ruby(run) => run.base,
+                        _ => Vec::new(),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let base_runs = take_runs(
+                explicit_bases
+                    .pop_front()
+                    .unwrap_or_else(|| std::mem::take(&mut base.content)),
+            );
+            let annotation_runs = take_runs(annotation.content);
+            if !base_runs.is_empty() {
+                collector
+                    .content
+                    .push(Inline::Ruby(Box::new(rebook_publication::RubyRun {
+                        base: base_runs,
+                        annotation: annotation_runs,
+                        below,
+                    })));
+                collector.last_was_space = base.last_was_space;
+            }
+        } else {
+            collect_inline_node(child, style, link, context, &mut base);
+        }
+    }
+    for content in explicit_bases {
+        base.content.extend(content);
+    }
+    // Unannotated trailing bases are ordinary text. No pronunciation is lost into prose.
+    for item in base.content {
+        match item {
+            Inline::Text(run) => collector.push_text(&run.text, run.style, run.link),
+            other => collector.content.push(other),
+        }
     }
 }
 
@@ -2948,7 +3146,7 @@ fn strip_authored_list_marker(content: &mut Vec<Inline>) {
             .chars()
             .next()
             .is_some_and(is_semantic_bullet_char),
-        Inline::Math(_) | Inline::Image(_) | Inline::Break => false,
+        Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => false,
     }) else {
         return;
     };
@@ -3157,12 +3355,17 @@ impl StyleSheet {
         for ancestor in ancestors {
             let inherited_only = ancestor != node;
             let properties = self.cascaded_properties(ancestor);
+            if let Some(direction) = attribute_local(ancestor, "dir").and_then(parse_text_direction)
+            {
+                style.direction = direction;
+            }
             apply_block_properties(&mut style, &properties, inherited_only);
             if let Some(alignment) =
                 attribute_local(ancestor, "align").and_then(parse_text_alignment)
             {
                 style.align = alignment;
                 style.authored_alignment = Some(alignment);
+                style.logical_alignment = false;
             }
         }
         style
@@ -3630,6 +3833,12 @@ fn apply_block_properties(
     properties: &HashMap<String, String>,
     inherited_only: bool,
 ) {
+    if let Some(direction) = properties
+        .get("direction")
+        .and_then(|value| parse_text_direction(value))
+    {
+        style.direction = direction;
+    }
     // Reading IR flattens nested HTML boxes into blocks. Preserve the start-side
     // offset contributed by every containing box so authored lists keep their
     // visual hierarchy after flattening.
@@ -3655,6 +3864,9 @@ fn apply_block_properties(
     {
         style.align = alignment;
         style.authored_alignment = Some(alignment);
+        style.logical_alignment = properties.get("text-align").is_some_and(|value| {
+            matches!(value.trim().to_ascii_lowercase().as_str(), "start" | "end")
+        });
     }
     if let Some(value) = properties
         .get("text-indent")
@@ -3691,6 +3903,16 @@ fn parse_text_alignment(value: &str) -> Option<TextAlignment> {
         "center" => Some(TextAlignment::Center),
         "right" | "end" => Some(TextAlignment::End),
         "justify" => Some(TextAlignment::Justify),
+        _ => None,
+    }
+}
+
+fn parse_text_direction(value: &str) -> Option<rebook_publication::TextDirection> {
+    use rebook_publication::TextDirection;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "rtl" => Some(TextDirection::Rtl),
+        "ltr" | "initial" => Some(TextDirection::Ltr),
+        "auto" => Some(TextDirection::Auto),
         _ => None,
     }
 }
@@ -3977,6 +4199,160 @@ fn attribute_local<'a>(node: Node<'a, '_>, name: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_quote_scan_does_not_skip_a_valid_suffix_with_a_different_inset() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        // 24px is compatible with 20px, and 29px with 24px, but not 20px.
+        // The failed 20px scan must not suppress the valid 24px quotation.
+        let xml = "<html><body><p style='margin-left:20px'>Prose A</p><p style='margin-left:20px'>Prose B</p><p style='margin-left:24px'>Quote A</p><p style='margin-left:29px'>Quote B</p><p style='text-align:right'>Author</p></body></html>";
+        let section = parse_section(xml, &descriptor, |_| None).unwrap();
+        assert_eq!(section.blocks.len(), 3);
+        assert!(matches!(&section.blocks[0], Block::Text(_)));
+        assert!(matches!(&section.blocks[1], Block::Text(_)));
+        let Block::Quote(quote) = &section.blocks[2] else {
+            panic!("valid suffix must remain a quote")
+        };
+        assert_eq!(quote.body.len(), 2);
+        assert!(quote.attribution.is_some());
+    }
+
+    #[test]
+    fn repeated_asymmetric_inset_prose_reuses_failed_quote_scans() {
+        let xml = format!(
+            "<html><body>{}</body></html>",
+            (0..825)
+                .map(|index| format!("<p style='margin-left:20px'>Reference {index}</p>\n"))
+                .collect::<String>()
+        );
+        let document = Document::parse(&xml).unwrap();
+        let href = PublicationUrl::parse("chapter.xhtml").unwrap();
+        let styles = StyleSheet::from_document(&document, &href, &mut |_| None);
+        let mut classify_image = |_: &PublicationUrl| false;
+        let mut parser = ReadingIrParser::new(
+            SpineItemId::new("chapter").unwrap(),
+            href,
+            styles,
+            HashMap::new(),
+            &mut classify_image,
+        );
+        parser
+            .parse_children(
+                document
+                    .descendants()
+                    .find(|node| node.has_tag_name("body"))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(parser.blocks.len(), 825);
+        assert!(
+            parser
+                .blocks
+                .iter()
+                .all(|block| matches!(block, Block::Text(_)))
+        );
+        assert_eq!(parser.failed_indented_quotes.len(), 825);
+        assert_eq!(parser.indented_quote_candidates.len(), 825);
+        #[cfg(debug_assertions)]
+        assert!(
+            parser.indented_quote_nodes <= 1650,
+            "must not rescan every remaining suffix"
+        );
+    }
+
+    #[test]
+    fn direction_and_logical_alignment_inherit_and_allow_local_overrides() {
+        use rebook_publication::TextDirection;
+        let descriptor = SpineItem {
+            id: SpineItemId::new("rtl").unwrap(),
+            href: PublicationUrl::parse("Text/rtl.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let section = parse_section(r#"<html><head><style>.override {direction:ltr;text-align:left}.logical {text-align:end}</style></head><body><div dir="rtl"><p><a href="http://www.heliconbooks.com">http://www.heliconbooks.com</a></p><p class="override" dir="rtl">English</p><p class="logical">עברית</p><p dir="auto">auto</p></div></body></html>"#, &descriptor, |_| None).unwrap();
+        let blocks: Vec<_> = section
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                if let Block::Text(text) = block {
+                    Some(text)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(blocks[0].style.direction, TextDirection::Rtl);
+        assert_eq!(blocks[0].style.align, TextAlignment::Start);
+        assert!(blocks[0].style.logical_alignment);
+        assert_eq!(blocks[1].style.direction, TextDirection::Ltr);
+        assert!(!blocks[1].style.logical_alignment);
+        assert_eq!(blocks[2].style.direction, TextDirection::Rtl);
+        assert_eq!(blocks[2].style.align, TextAlignment::End);
+        assert!(blocks[2].style.logical_alignment);
+        assert_eq!(blocks[3].style.direction, TextDirection::Auto);
+    }
+
+    #[test]
+    fn ruby_pairs_keep_annotations_out_of_prose_and_source_offsets() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("ruby").unwrap(),
+            href: PublicationUrl::parse("Text/ruby.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html><head><style>rt {font-size:50%}</style></head><body><p>前<ruby>山路<rp>（</rp><rt>やまみち</rt><rp>）</rp>智<rt>ち</rt></ruby>後</p></body></html>"#;
+        let section = parse_section(xml, &descriptor, |_| None).unwrap();
+        let Block::Text(block) = &section.blocks[0] else {
+            panic!()
+        };
+        let prose: String = block
+            .content
+            .iter()
+            .flat_map(Inline::text_runs)
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(prose, "前山路智後");
+        assert_eq!(block.source.as_ref().unwrap().end.text_offset, 5);
+        let ruby: Vec<_> = block
+            .content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Ruby(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ruby.len(), 2);
+        assert_eq!(ruby[0].base_text(), "山路");
+        assert_eq!(ruby[0].annotation[0].text, "やまみち");
+        assert!((ruby[0].annotation[0].style.size_scale - 0.5).abs() < 0.01);
+        assert_eq!(ruby[1].base_text(), "智");
+        let xml = r#"<html><body><p><ruby style="ruby-position:under"><rb>山</rb><rb>路</rb><rt>やま</rt><rt>みち</rt></ruby></p></body></html>"#;
+        let section = parse_section(xml, &descriptor, |_| None).unwrap();
+        let Block::Text(block) = &section.blocks[0] else {
+            panic!()
+        };
+        let ruby: Vec<_> = block
+            .content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Ruby(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ruby.len(), 2);
+        assert_eq!(ruby[0].base_text(), "山");
+        assert_eq!(ruby[1].base_text(), "路");
+        assert_eq!(ruby[1].annotation[0].text, "みち");
+        assert!(ruby.iter().all(|r| r.below));
+    }
+
     fn collect_text_blocks<'a>(blocks: &'a [Block], output: &mut Vec<&'a TextBlock>) {
         for block in blocks {
             match block {
@@ -4000,7 +4376,7 @@ mod tests {
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
                 Inline::Math(run) => Some(run.latex.as_str()),
-                Inline::Image(_) => None,
+                Inline::Ruby(_) | Inline::Image(_) => None,
                 Inline::Break => Some("\n"),
             })
             .collect()
@@ -4336,7 +4712,7 @@ mod tests {
             .map(|inline| match inline {
                 Inline::Text(run) => run.text.as_str(),
                 Inline::Break => "\n",
-                Inline::Math(_) | Inline::Image(_) => "",
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) => "",
             })
             .collect::<String>();
 
@@ -4368,7 +4744,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some((run.text.trim(), run.style)),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
 
@@ -4412,7 +4788,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<String>();
         assert_eq!(text, "2015年，Dark\u{00a0}Reading 报道");
@@ -4442,7 +4818,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some((run.text.trim(), run.style.inline_role)),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
 
@@ -4474,7 +4850,7 @@ mod tests {
             .flatten()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
 
@@ -4542,7 +4918,11 @@ mod tests {
                 Inline::Text(run) if run.style.link_role == LinkRole::FootnoteReference => {
                     Some(run)
                 }
-                Inline::Text(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Text(_)
+                | Inline::Ruby(_)
+                | Inline::Math(_)
+                | Inline::Image(_)
+                | Inline::Break => None,
             })
             .expect("image-backed footnote reference");
         assert_eq!(reference.text, "译");
@@ -4561,7 +4941,7 @@ mod tests {
             .flat_map(|block| &block.content)
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<String>();
         assert!(paragraph_text.contains("网站译以及"));
@@ -4590,7 +4970,7 @@ mod tests {
             .flatten()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
 
@@ -4627,7 +5007,7 @@ mod tests {
             .flatten()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
 
@@ -4659,7 +5039,7 @@ mod tests {
             .flat_map(|block| &block.content)
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
 
@@ -5009,7 +5389,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Image(image) => Some(image.as_ref()),
-                Inline::Text(_) | Inline::Math(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Text(_) | Inline::Math(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(inline_images.len(), 2);
@@ -5048,7 +5428,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<Vec<_>>();
         let run = |needle: &str| {
@@ -5117,7 +5497,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<String>();
         assert_eq!(caption_text, "Figure 1. New growth.");
@@ -5318,7 +5698,9 @@ mod tests {
                     .iter()
                     .filter_map(|inline| match inline {
                         Inline::Text(run) => Some(run.text.as_str()),
-                        Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                        Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => {
+                            None
+                        }
                     })
                     .collect::<String>(),
                 _ => panic!("expected only text blocks"),
@@ -5396,7 +5778,7 @@ mod tests {
             .iter()
             .filter_map(|inline| match inline {
                 Inline::Text(run) => Some(run.text.as_str()),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
             })
             .collect::<String>();
         assert_eq!(text, "A semantic item");
@@ -5558,7 +5940,9 @@ mod tests {
                     .iter()
                     .filter_map(|inline| match inline {
                         Inline::Text(run) => Some(run.text.as_str()),
-                        Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                        Inline::Ruby(_) | Inline::Math(_) | Inline::Image(_) | Inline::Break => {
+                            None
+                        }
                     })
                     .collect::<String>()
             })
@@ -5646,7 +6030,10 @@ mod tests {
                         .iter()
                         .filter_map(|inline| match inline {
                             Inline::Text(run) => Some(run.text.as_str()),
-                            Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                            Inline::Ruby(_)
+                            | Inline::Math(_)
+                            | Inline::Image(_)
+                            | Inline::Break => None,
                         })
                         .collect::<String>(),
                 ),
@@ -5759,7 +6146,10 @@ mod tests {
                         .iter()
                         .filter_map(|inline| match inline {
                             Inline::Text(run) => Some(run.text.as_str()),
-                            Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                            Inline::Ruby(_)
+                            | Inline::Math(_)
+                            | Inline::Image(_)
+                            | Inline::Break => None,
                         })
                         .collect::<String>(),
                 ),
@@ -5855,7 +6245,10 @@ mod tests {
                         .iter()
                         .filter_map(|inline| match inline {
                             Inline::Text(run) => Some(run.text.as_str()),
-                            Inline::Math(_) | Inline::Image(_) | Inline::Break => None,
+                            Inline::Ruby(_)
+                            | Inline::Math(_)
+                            | Inline::Image(_)
+                            | Inline::Break => None,
                         })
                         .collect::<String>(),
                 )),

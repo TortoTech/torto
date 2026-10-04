@@ -841,14 +841,17 @@ impl DesktopReader {
         if !self.content_interacting() && self.semantic_layout.reflow_worker.is_none() {
             let mut changed = false;
             let mut retained = Vec::new();
-            for group in std::mem::take(&mut self.semantic_layout.groups) {
+            for mut group in std::mem::take(&mut self.semantic_layout.groups) {
                 if !relevant(group.index, &group.sources, demand) {
                     retained.push(group);
                     continue;
                 }
-                let needed = self
-                    .missing_prepared(group.index, &group.sources)
-                    .unwrap_or_default();
+                let needed = if self.translation.enabled {
+                    self.missing_prepared(group.index, &group.sources)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 let ready = !self.translation.enabled
                     || self.plugin_settings.translation_endpoint().is_err()
                     || needed.iter().all(|input| {
@@ -863,33 +866,51 @@ impl DesktopReader {
                 if self.semantic_layout.hashes.get(&group.index) != Some(&group.hash) {
                     continue;
                 }
-                let translations = needed
-                    .iter()
-                    .filter_map(|input| {
-                        self.semantic_layout.translations.remove(&(
-                            group.index,
-                            input.block_index,
-                            input.segment_index,
-                        ))
-                    })
-                    .collect::<Vec<_>>();
-                self.semantic_source.commit_together(|| {
+                let has_translations = needed.iter().any(|input| {
+                    self.semantic_layout.translations.contains_key(&(
+                        group.index,
+                        input.block_index,
+                        input.segment_index,
+                    ))
+                });
+                let has_semantic = group
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.has_annotations());
+                if !has_translations && !has_semantic {
+                    continue;
+                }
+                let committed = self.semantic_source.try_commit_together(|| {
+                    // Do not consume staged content until the transaction is acquired.
+                    let translations = needed
+                        .iter()
+                        .filter_map(|input| {
+                            self.semantic_layout.translations.remove(&(
+                                group.index,
+                                input.block_index,
+                                input.segment_index,
+                            ))
+                        })
+                        .collect::<Vec<_>>();
                     if !translations.is_empty() {
                         let _ = self
                             .translation_source
                             .store_batch(group.index, &translations);
                         changed = true;
                     }
-                    if let Some(result) = group.result {
+                    if let Some(result) = group.result.take() {
                         changed |= self.semantic_source.install_prepared_scope(
                             group.index,
                             &self.semantic_layout.originals[&group.index],
                             &group.hash,
-                            group.range,
+                            group.range.clone(),
                             result,
                         );
                     }
                 });
+                if committed.is_none() {
+                    retained.push(group);
+                }
             }
             self.semantic_layout.groups = retained;
             // With AI disabled, each finished paragraph can publish immediately.

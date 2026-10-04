@@ -118,12 +118,34 @@ struct QuoteRegion {
 struct FootnoteRegion {
     website: Option<String>,
     bounds: Rect,
+    activation_bar_y: f64,
     source: Option<SourceRange>,
     citation_number: u32,
+    reference_number: u32,
+    reference_owner: Option<u64>,
     citation_glyphs: Vec<GlyphCommand>,
 }
 
 const FOOTNOTE_ICON_CENTER_ABOVE_BASELINE: f32 = 0.68;
+
+fn footnote_activation_bar_y(origin_y: f32, metrics: &parley::layout::LineMetrics) -> f64 {
+    // Center the short indicator on the body line's lower boundary rather than
+    // under the superscript glyph. This leaves layout and line spacing intact.
+    f64::from(origin_y + metrics.block_max_coord - 1.0)
+}
+
+fn paint_footnote_activation_bar(
+    scene: &mut impl PaintScene,
+    footnote: &FootnoteRegion,
+    color: Color,
+    transform: Affine,
+) {
+    let y = footnote.activation_bar_y;
+    let width = footnote.bounds.width().clamp(12.0, 16.0);
+    let x = footnote.bounds.center().x;
+    let bar = RoundedRect::from_rect(Rect::new(x - width * 0.5, y, x + width * 0.5, y + 2.0), 1.0);
+    scene.fill(Fill::NonZero, transform, color, None, &bar);
+}
 
 fn footnote_icon_bounds(center_x: f32, baseline: f32, font_size: f32) -> Rect {
     let size = (font_size * 0.78).clamp(8.0, 12.0);
@@ -259,6 +281,7 @@ impl PageDisplayList {
             }
             for region in &mut page.footnote_regions[group.footnotes.clone()] {
                 region.bounds = region.bounds + delta;
+                region.activation_bar_y += f64::from(dy);
                 for glyphs in &mut region.citation_glyphs {
                     glyphs.transform = transform * glyphs.transform;
                 }
@@ -842,16 +865,70 @@ impl PageDisplayList {
         color: Color,
         offset_x: f32,
     ) {
+        self.paint_focus_footnote_icons(scene, ranges, color, None, offset_x);
+    }
+
+    /// Paint visibility and active color use the same owner identity as hit testing.
+    pub fn paint_focus_footnote_icons(
+        &self,
+        scene: &mut impl PaintScene,
+        ranges: &[SourceRange],
+        color: Color,
+        active: Option<(&SourceRange, u32, Color)>,
+        offset_x: f32,
+    ) {
+        let active = active.map(|(source, number, color)| {
+            (
+                rebook_publication::source_block_identity(source),
+                number,
+                color,
+            )
+        });
         let transform = Affine::translate((f64::from(offset_x), 0.0));
         for footnote in &self.footnote_regions {
             if footnote.website.is_none()
-                && !ranges
-                    .iter()
-                    .any(|range| Some(range) == footnote.source.as_ref())
+                && !ranges.iter().any(|range| {
+                    footnote.reference_owner
+                        == Some(rebook_publication::source_block_identity(range))
+                })
             {
                 continue;
             }
-            paint_footnote_region(scene, footnote, color, transform);
+            let active_color = active
+                .filter(|(owner, number, _)| {
+                    footnote.website.is_none()
+                        && footnote.reference_owner == Some(*owner)
+                        && footnote.reference_number == *number
+                })
+                .map(|(_, _, color)| color);
+            paint_footnote_region(scene, footnote, active_color.unwrap_or(color), transform);
+        }
+    }
+
+    /// Paint active bars separately so chapter-fragment clips and highlights
+    /// cannot truncate or fade the indicator at the end of a paragraph.
+    pub fn paint_focus_footnote_activation_bars(
+        &self,
+        scene: &mut impl PaintScene,
+        ranges: &[SourceRange],
+        active: Option<(&SourceRange, u32, Color)>,
+        offset_x: f32,
+    ) {
+        let Some((source, number, color)) = active else {
+            return;
+        };
+        let owner = rebook_publication::source_block_identity(source);
+        let transform = Affine::translate((f64::from(offset_x), 0.0));
+        for footnote in &self.footnote_regions {
+            if footnote.website.is_none()
+                && footnote.reference_owner == Some(owner)
+                && footnote.reference_number == number
+                && ranges
+                    .iter()
+                    .any(|range| rebook_publication::source_block_identity(range) == owner)
+            {
+                paint_footnote_activation_bar(scene, footnote, color, transform);
+            }
         }
     }
 
@@ -901,6 +978,74 @@ impl PageDisplayList {
                     )
                 })
             })
+    }
+
+    /// Stable reference identity under a marker. Bit 29 distinguishes ordinary
+    /// notes from citations, whose ordinals are independent within a paragraph.
+    pub fn footnote_reference_at(&self, x: f32, y: f32) -> Option<(u64, u32)> {
+        self.footnote_regions
+            .iter()
+            .rev()
+            .find(|region| {
+                region.website.is_none()
+                    && region
+                        .bounds
+                        .contains(Point::new(f64::from(x), f64::from(y)))
+            })
+            .and_then(|region| {
+                region
+                    .reference_owner
+                    .map(|owner| (owner, region.reference_number))
+            })
+    }
+
+    pub fn footnote_reference_bounds(&self, source: &SourceRange, number: u32) -> Vec<[f32; 4]> {
+        let owner = rebook_publication::source_block_identity(source);
+        self.footnote_regions
+            .iter()
+            .filter(|region| {
+                region.website.is_none()
+                    && region.reference_number == number
+                    && region.reference_owner == Some(owner)
+            })
+            .map(|region| {
+                [
+                    region.bounds.x0 as f32,
+                    region.bounds.y0 as f32,
+                    region.bounds.x1 as f32,
+                    region.bounds.y1 as f32,
+                ]
+            })
+            .collect()
+    }
+
+    pub fn paint_active_footnote_reference(
+        &self,
+        scene: &mut impl PaintScene,
+        source: &SourceRange,
+        number: u32,
+        color: Color,
+        offset_x: f32,
+    ) {
+        let owner = rebook_publication::source_block_identity(source);
+        for region in self.footnote_regions.iter().filter(|region| {
+            region.website.is_none()
+                && region.reference_owner == Some(owner)
+                && region.reference_number == number
+        }) {
+            paint_footnote_region(
+                scene,
+                region,
+                color,
+                Affine::translate((f64::from(offset_x), 0.0)),
+            );
+            paint_footnote_activation_bar(
+                scene,
+                region,
+                color,
+                Affine::translate((f64::from(offset_x), 0.0)),
+            );
+        }
     }
 
     /// Returns the source-backed paragraph owning a semantic footnote icon.
@@ -2369,6 +2514,46 @@ fn compile_text_commands(
         .skip(text.lines.start)
         .take(text.lines.len())
     {
+        for ruby in text
+            .ruby
+            .iter()
+            .filter(|ruby| line.text_range().contains(&ruby.range.start))
+        {
+            let left = Cursor::from_byte_index(&text.layout, ruby.range.start, Affinity::Downstream)
+                .geometry(&text.layout, 0.0)
+                .x0 as f32;
+            let right = Cursor::from_byte_index(&text.layout, ruby.range.end, Affinity::Upstream)
+                .geometry(&text.layout, 0.0)
+                .x0 as f32;
+            let x = text.origin_x + (left + right - ruby.layout.width()) * 0.5;
+            let y = text.origin_y + line.metrics().baseline + ruby.offset_y;
+            let transform = Affine::translate((f64::from(x), f64::from(y)));
+            for annotation_line in ruby.layout.lines() {
+                for item in annotation_line.items() {
+                    if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
+                        let run = glyph_run.run();
+                        commands.push(DisplayCommand::Glyphs(GlyphCommand {
+                            font: run.font().clone(),
+                            font_size: run.font_size(),
+                            normalized_coords: run.normalized_coords().to_vec().into(),
+                            embolden: Vec2::ZERO,
+                            color: color(glyph_run.style().brush.color),
+                            transform,
+                            glyph_transform: None,
+                            glyphs: glyph_run
+                                .positioned_glyphs()
+                                .map(|g| Glyph {
+                                    id: g.id,
+                                    x: g.x,
+                                    y: g.y,
+                                })
+                                .collect::<Vec<_>>()
+                                .into(),
+                        }));
+                    }
+                }
+            }
+        }
         let body_font_size = line
             .runs()
             .filter(|run| {
@@ -2465,12 +2650,15 @@ fn compile_text_commands(
             };
             if brush.footnote_reference_group & 0xa000_0000 != 0 {
                 let number = brush.footnote_reference_group & 0x7fff_ffff;
-                if let Some(source) = text.source.as_ref().or_else(|| {
-                    text.citations
-                        .iter()
-                        .find(|c| c.number == number)
-                        .and_then(|c| c.owner.as_ref())
-                }) {
+                let citation = text.citations.iter().find(|c| c.number == number);
+                let source = text
+                    .source
+                    .as_ref()
+                    .or_else(|| citation.and_then(|c| c.owner.as_ref()));
+                let reference_owner = source
+                    .map(rebook_publication::source_block_identity)
+                    .or_else(|| citation.and_then(|c| c.owner_id));
+                if source.is_some() || reference_owner.is_some() {
                     let x = text.origin_x + glyph_run.offset();
                     let baseline = text.origin_y + glyph_run.baseline() + baseline_offset;
                     let bounds = Rect::new(
@@ -2507,9 +2695,19 @@ fn compile_text_commands(
                     } else {
                         compiled_citation_indices.push((number, footnote_regions.len()));
                         footnote_regions.push(FootnoteRegion {
+                            activation_bar_y: footnote_activation_bar_y(
+                                text.origin_y,
+                                line.metrics(),
+                            ),
+                            reference_number: if brush.footnote_reference_group & 0x2000_0000 != 0 {
+                                0x2000_0000 | number
+                            } else {
+                                number
+                            },
                             website: None,
                             bounds,
-                            source: Some(source.clone()),
+                            source: source.cloned(),
+                            reference_owner,
                             citation_number: if brush.footnote_reference_group & 0x2000_0000 != 0 {
                                 0
                             } else {
@@ -2551,6 +2749,12 @@ fn compile_text_commands(
                         )
                     };
                     footnote_regions.push(FootnoteRegion {
+                        activation_bar_y: footnote_activation_bar_y(text.origin_y, line.metrics()),
+                        reference_owner: source
+                            .as_ref()
+                            .map(rebook_publication::source_block_identity),
+                        reference_number: 0x2000_0000
+                            | (brush.footnote_reference_group & 0x1fff_ffff),
                         website: text
                             .citations
                             .iter()
@@ -2906,6 +3110,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text,
@@ -2937,6 +3142,13 @@ mod tests {
                 < 0.001
         );
         let shifted_icon = shifted.footnote_regions[0].bounds;
+        assert!(
+            (shifted.footnote_regions[0].activation_bar_y
+                - list.footnote_regions[0].activation_bar_y
+                - 1.85)
+                .abs()
+                < 0.001
+        );
         assert!((shifted_icon.y0 - icon_bounds.y0 - 1.85).abs() < 0.001);
         assert_eq!(
             shifted.footnote_source_at(
@@ -3016,6 +3228,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text,
@@ -3111,6 +3324,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
@@ -3184,6 +3398,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text,
@@ -3263,6 +3478,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text,
@@ -3354,6 +3570,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
@@ -3439,6 +3656,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
@@ -3724,6 +3942,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
                 text: Arc::clone(&text),
@@ -3907,6 +4126,7 @@ mod tests {
                             height: 30.0,
                         },
                         text: TextPlacement {
+                            ruby: Arc::from([]),
                             citations: Arc::from([]),
                             layout: Arc::new(layout),
                             text,
