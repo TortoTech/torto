@@ -243,6 +243,7 @@ impl ShelfFeature {
         let initial_error_dismiss_at = initial_error
             .as_ref()
             .map(|_| Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
+        let read_activity = load_read_activity(local_store.as_ref());
         let mut feature = Self {
             statistics: crate::statistics::Page::default(),
             shelf: ShelfState {
@@ -277,7 +278,7 @@ impl ShelfFeature {
                 .return_to_shelf,
             settings_requested: false,
             cover_textures: covers::CoverCache::default(),
-            read_activity: HashMap::new(),
+            read_activity,
             refresh_generation: 0,
             refresh_requested: false,
             refresh_job: BackgroundJob::default(),
@@ -1703,6 +1704,21 @@ fn selection_after_reader(last_opened: Option<&str>, books: &[LibraryBook]) -> O
         .map(ToOwned::to_owned)
 }
 
+/// Reading activity orders the shelf and therefore decides which card the first
+/// frame highlights. The asynchronous refresh that normally supplies it lands
+/// after that frame, and a first frame left to fall back on `added_at` would
+/// highlight the newest import and keep it selected from then on, so read the
+/// activity once up front as well.
+fn load_read_activity(store: Option<&SyncStore>) -> HashMap<String, u64> {
+    let Some(store) = store else {
+        return HashMap::new();
+    };
+    store.progress_activity_times().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load shelf reading activity");
+        HashMap::new()
+    })
+}
+
 fn sort_shelf_books(books: &mut [LibraryBook], read_activity: &HashMap<String, u64>) {
     books.sort_by(|left, right| {
         let left_activity = read_activity
@@ -1966,6 +1982,36 @@ mod tests {
         );
         assert_eq!(selection_after_reader(None, &books), None);
         assert_eq!(selection_after_reader(Some("missing"), &books), None);
+    }
+
+    #[test]
+    fn startup_reads_the_activity_that_decides_the_first_highlight() {
+        use rebook_publication::{LocatorV1, PublicationId, PublicationUrl};
+
+        let path = std::env::temp_dir().join(format!(
+            "torto-shelf-startup-activity-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SyncStore::open_at(path.clone(), "device-a").unwrap();
+        let mut locator = LocatorV1::at_start(
+            PublicationId::new("read").unwrap(),
+            PublicationUrl::parse("chapter.xhtml").unwrap(),
+        );
+        locator.total_progression = Some(0.4);
+        store.save_progress("read", &locator).unwrap();
+
+        // "imported" was added after "read" was last opened, so a first frame
+        // that has no activity yet would highlight the import instead.
+        let mut books = vec![book("read", 100), book("imported", 300)];
+        sort_shelf_books(&mut books, &load_read_activity(Some(&store)));
+        assert_eq!(books[0].id, "read");
+
+        sort_shelf_books(&mut books, &HashMap::new());
+        assert_eq!(books[0].id, "imported");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
     }
 
     #[test]
