@@ -15,7 +15,10 @@ fn batch_results_match_ids_and_isolate_bad_items() {
     ]}"#,
         &[0, 1, 2],
     );
-    assert_eq!(result.len(), 2);
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[&1].status, "unreadable");
+    assert!(result[&1].transient);
+    assert!(result[&1].latex.is_none());
     assert_eq!(result[&0].latex.as_deref(), Some("x=1"));
     assert_eq!(result[&2].status, "not_formula");
     let duplicate = parse(
@@ -66,10 +69,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
                     _ => json!([0, 1]),
                 }
             );
-            assert_eq!(
-                super::super::super::wire::decode(&header)["mode"],
-                if turn == 2 { "verify" } else { "transcribe" }
-            );
+            assert!(header.get("m").is_none());
             assert_eq!(
                 input.iter().filter(|v| v["type"] == "image_url").count(),
                 match turn {
@@ -81,6 +81,18 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
             assert_eq!(
                 body["response_format"]["json_schema"]["schema"]["required"],
                 json!(["r"])
+            );
+            let instructions = body["messages"][0]["content"].to_string();
+            assert!(!instructions.contains("Compact JSON transport"));
+            assert!(instructions.contains("ri=requested_ids") && !instructions.contains("m=mode"));
+            assert!(!instructions.contains("g=groups") && !instructions.contains("pr=proposal"));
+            let status = &body["response_format"]["json_schema"]["schema"]["properties"]["r"]["items"]
+                ["properties"]["ss"];
+            assert!(
+                status["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ok=recognized, no=not_formula, u=unreadable")
             );
             let item = |id, latex: Option<&str>| json!({"image_id":id,"status":if latex.is_some(){"recognized"}else{"not_formula"},"latex":latex,"equation_number":null});
             let results = match turn {
@@ -144,13 +156,13 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
     assert!(result.iter().all(|r| !r.as_ref().unwrap().transient));
 }
 
-fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Option<Response>> {
+fn run_batch_fixture(replies: Vec<(Value, Vec<usize>)>) -> Vec<Option<Response>> {
     use std::io::{BufRead, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        for (reply, mode, ids) in replies {
+        for (reply, ids) in replies {
             let started = std::time::Instant::now();
             let (mut socket, _) = loop {
                 match listener.accept() {
@@ -195,21 +207,17 @@ fn run_review_fixture(replies: Vec<(Value, &'static str, Vec<usize>)>) -> Vec<Op
             }
             assert_eq!(request["messages"][0]["role"], "system");
             let prompt = request["messages"][0]["content"].to_string();
-            assert!(!prompt.contains(if mode == "verify" {
-                "Transcription self-check"
-            } else {
-                "Conditional review"
-            }));
-
+            assert!(!prompt.contains("Conditional review"));
+            assert!(!prompt.contains("proposal") && !prompt.contains("local_validation_error"));
+            assert!(prompt.contains("Transcription self-check"));
             let content = request["messages"][1]["content"].as_array().unwrap();
             let header: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
-            assert_eq!(super::super::super::wire::decode(&header)["mode"], mode);
+            assert!(header.get("m").is_none());
             assert_eq!(header["ri"], json!(ids));
-            assert!(prompt.contains(if mode == "verify" {
-                "Conditional review"
-            } else {
-                "Transcription self-check"
-            }));
+            assert_eq!(
+                content.iter().filter(|v| v["type"] == "image_url").count(),
+                ids.len()
+            );
             let (status, body) = if reply.is_null() {
                 ("500 Internal Server Error", "{}".to_owned())
             } else {
@@ -273,9 +281,8 @@ fn recognized(id: usize, latex: &str) -> Value {
 
 #[test]
 fn valid_batch_finishes_after_one_request() {
-    let result = run_review_fixture(vec![(
+    let result = run_batch_fixture(vec![(
         json!({"results":[recognized(0,"x=1"),recognized(1,"y=2")]}),
-        "transcribe",
         vec![0, 1],
     )]);
     assert!(
@@ -286,54 +293,15 @@ fn valid_batch_finishes_after_one_request() {
 }
 
 #[test]
-fn only_local_validation_failures_are_reviewed_and_corrected() {
-    let result = run_review_fixture(vec![
-        (
-            json!({"results":[recognized(0,"x=1"),recognized(1,r"\frac{")]}),
-            "transcribe",
-            vec![0, 1],
-        ),
-        (
-            json!({"results":[recognized(1,r"\frac{a}{b}")]}),
-            "verify",
-            vec![1],
-        ),
-    ]);
+fn invalid_formula_keeps_original_without_a_review_request() {
+    let result = run_batch_fixture(vec![(
+        json!({"results":[recognized(0,"x=1"),recognized(1,r"\frac{")]}),
+        vec![0, 1],
+    )]);
     assert_eq!(result[0].as_ref().unwrap().latex.as_deref(), Some("x=1"));
-    assert_eq!(
-        result[1].as_ref().unwrap().latex.as_deref(),
-        Some(r"\frac{a}{b}")
-    );
-    assert!(!result[1].as_ref().unwrap().transient);
-}
-
-#[test]
-fn failed_review_keeps_original_only_for_the_bad_image() {
-    let result = run_review_fixture(vec![
-        (
-            json!({"results":[recognized(0,"x=1"),recognized(1,r"\frac{")]}),
-            "transcribe",
-            vec![0, 1],
-        ),
-        (Value::Null, "verify", vec![1]),
-    ]);
-    assert_eq!(result[0].as_ref().unwrap().status, "recognized");
-    assert_eq!(result[1].as_ref().unwrap().status, "unreadable");
-    assert!(result[1].as_ref().unwrap().transient);
-}
-
-#[test]
-fn review_rendering_respects_source_and_nesting_limits() {
-    let mut response = Response {
-        status: "recognized".into(),
-        latex: Some("{".repeat(33) + "x" + &"}".repeat(33)),
-        equation_number: None,
-        transient: false,
-    };
-    assert_eq!(
-        rendered_url(&response).unwrap_err(),
-        "Formula nesting limit"
-    );
-    response.latex = None;
-    assert_eq!(rendered_url(&response).unwrap_err(), "Missing LaTeX");
+    let invalid = result[1].as_ref().unwrap();
+    assert_eq!(invalid.status, "unreadable");
+    assert!(invalid.transient);
+    assert!(invalid.latex.is_none());
+    assert!(invalid.formula().unwrap().is_none());
 }

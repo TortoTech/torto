@@ -861,6 +861,71 @@ fn cached_negative_results_load_without_a_request_and_content_changes_miss() {
 }
 
 #[test]
+fn missing_recognition_cache_notices_a_new_file_and_configuration_reset() {
+    let section = section(vec![text("a", "Ordinary narrative")]);
+    let identity = json!(["missing-test", uuid::Uuid::new_v4().to_string()]);
+    let hash = fingerprint(&section);
+    let path = recognition_path(&identity, &hash).unwrap();
+    let original = Arc::new(crate::plugins::RewriteBookSource::new(original_source(
+        section.clone(),
+    )));
+    let overlay = SemanticLayoutSource::new(original.clone(), original);
+    *overlay.cache_identity.write().unwrap() = Some(identity.clone());
+    for _ in 0..2 {
+        assert_eq!(overlay.parse_section(0).unwrap(), section);
+    }
+    assert!(overlay.recognition_misses.read().unwrap().contains_key(&0));
+    crate::persistence::write_json_atomic(
+        &path,
+        &Recognition {
+            formulas_checked: true,
+            fingerprint: hash.clone(),
+            skipped_groups: 0,
+            annotations: vec![],
+        },
+    )
+    .unwrap();
+    assert_eq!(overlay.parse_section(0).unwrap(), section);
+    assert!(overlay.has_recognition(0, &hash));
+    assert!(overlay.recognition_misses.read().unwrap().is_empty());
+    overlay.configure("different-configuration", &PluginSettings::default());
+    assert!(!overlay.has_recognition(0, &hash));
+    assert!(overlay.recognition_misses.read().unwrap().is_empty());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn cached_fingerprint_tracks_rewrite_and_rollback_generations() {
+    let section = section(vec![text("a", "Claim (Smith, 2020).")]);
+    let original = Arc::new(crate::plugins::RewriteBookSource::new(original_source(
+        section.clone(),
+    )));
+    let overlay = SemanticLayoutSource::new(original.clone(), original.clone());
+    let (_, initial_hash) = overlay.original_snapshot(0).unwrap();
+    assert_eq!(overlay.original_snapshot(0).unwrap().1, initial_hash);
+    assert_eq!(
+        overlay.fingerprints.read().unwrap()[&0].0,
+        original.revision()
+    );
+    let transaction = original
+        .apply_rewrites(&[crate::plugins::rewrite::BlockRewrite {
+            section_index: 0,
+            block_id: "a".into(),
+            text: "Claim (Jones, 2021).".into(),
+        }])
+        .unwrap();
+    assert_ne!(overlay.original_snapshot(0).unwrap().1, initial_hash);
+    original.rollback(transaction).unwrap();
+    assert_eq!(overlay.original_snapshot(0).unwrap().1, initial_hash);
+    original.clear_parsed_cache();
+    assert_eq!(overlay.original_snapshot(0).unwrap().1, initial_hash);
+    assert_eq!(
+        overlay.fingerprints.read().unwrap()[&0].0,
+        original.revision()
+    );
+}
+
+#[test]
 fn window_ownership_prevents_duplicate_groups_and_protected_boundaries_cannot_be_crossed() {
     let mut protected = text("b", "Existing caption");
     if let Block::Text(text) = &mut protected {
@@ -1008,6 +1073,15 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
             assert_eq!(item["required"], json!(["a", "al", "d", "k"]));
             assert_eq!(item["properties"]["a"]["type"], json!("integer"));
             assert!(wire_text(&request["messages"][0]).starts_with("# AI layout"));
+            let instructions = wire_text(&request["messages"][0]);
+            assert!(!instructions.contains("Compact JSON transport"));
+            assert!(instructions.contains("bs=blocks") && !instructions.contains("r=results"));
+            assert!(
+                item["properties"]["k"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("q=quote")
+            );
             let input: Value = serde_json::from_str(&wire_text(&request["messages"][1])).unwrap();
             assert_eq!(input["bs"][0]["i"], 0);
             if attempt == 1 {
@@ -1338,6 +1412,12 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
         reader.read_exact(&mut bytes).unwrap();
         let request: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(request["reasoning_effort"], "high");
+        let schema = &request["response_format"]["json_schema"]["schema"];
+        assert!(
+            !schema["properties"]["g"]["items"]
+                .to_string()
+                .contains("section_heading")
+        );
         assert_eq!(
             request["response_format"]["json_schema"]["schema"]["required"],
             json!(["c", "f", "g"])
@@ -1349,10 +1429,7 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
         assert_eq!(input["captions_enabled"], true);
         let mut response = json!({"groups":[{"kind":"quote_inline","body":[1],"credit":"-- A poet","alignment":"start"},{"kind":"figure","images":[2],"captions":[3]}],"citations":["c0_0_0"],"formulas":[{"block":0,"paragraph":0,"original":"x = y","latex":"x=y","before":"","after":""}]});
         let duplicate = response["groups"][0].clone();
-        response["groups"]
-            .as_array_mut()
-            .unwrap()
-            .extend([duplicate, json!({"kind":"section_heading","block":4})]);
+        response["groups"].as_array_mut().unwrap().push(duplicate);
         response["citations"]
             .as_array_mut()
             .unwrap()
@@ -1432,4 +1509,86 @@ fn layout_reasoning_defaults_roundtrips_and_changes_cache_identity() {
     let restored: SemanticLayoutSettings =
         serde_json::from_value(serde_json::to_value(&settings.semantic_layout).unwrap()).unwrap();
     assert_eq!(restored.reasoning_effort, ReasoningEffort::High);
+}
+
+#[test]
+fn window_schema_only_allows_roles_with_eligible_blocks() {
+    let s = section(vec![image("img")]);
+    let roles = window_roles(&s, &RecognitionRoles::default(), 0..1, 0..1);
+    assert!(!roles.headings && !roles.quotes && roles.captions);
+    let schema = completion_options(&roles)["output_schema"].clone();
+    assert_eq!(
+        schema["properties"]["groups"]["items"]["properties"]["kind"]["enum"],
+        json!(["figure"])
+    );
+    let prompt = window_prompt(&s, &RecognitionRoles::default(), 0..1, 0..1);
+    assert!(!prompt.contains("## Headings") && !prompt.contains("## Quotations"));
+    assert!(prompt.contains("## Captions"));
+
+    let roles = window_roles(
+        &s,
+        &RecognitionRoles {
+            headings: true,
+            quotes: true,
+            captions: false,
+        },
+        0..1,
+        0..1,
+    );
+    let schema = completion_options(&roles)["output_schema"].clone();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&json!({"groups":[],"citations":[],"formulas":[]})));
+    assert!(!validator.is_valid(&json!({"groups":[{}],"citations":[],"formulas":[]})));
+    assert!(
+        schema["properties"]["groups"]["items"]
+            .get("anyOf")
+            .is_none()
+    );
+}
+
+#[test]
+fn empty_citation_candidates_require_empty_ids_without_extracting_bibliography() {
+    let mut note = text(
+        "references",
+        "For the classic account, see Marshall McLuhan, The Gutenberg Galaxy (Toronto: The University of Toronto Press, 1962).",
+    );
+    let Block::Text(block) = &mut note else {
+        unreachable!()
+    };
+    block.kind = TextBlockKind::FootnoteDefinition;
+    let s = section(vec![note]);
+    let candidates = citations::window_candidates(&s, 0..1);
+    assert!(candidates.is_empty());
+    let roles = RecognitionRoles::default();
+    let input = unified_window_input(&s, &roles, 0..1, 0..1, &candidates);
+    let compact = wire::encode(&input);
+    assert_eq!(compact["tg"]["ci"], json!([]));
+    assert_eq!(compact["bs"][0]["cc"], json!([]));
+    assert_eq!(compact["bs"][0]["ty"], json!("pb"));
+    let prompt = wire::instructions(&window_prompt(&s, &roles, 0..1, 0..1), [&input]);
+    assert!(!prompt.contains("## Inline citations"));
+    assert!(prompt.contains("Return only candidate IDs in `c`, never citation text."));
+    assert!(prompt.contains("Return `c: []` when `tg.ci` is empty."));
+    let schema = wire::options(&completion_options(&roles));
+    let citations = &schema["output_schema"]["properties"]["c"];
+    assert!(
+        citations["description"]
+            .as_str()
+            .unwrap()
+            .contains("`tg.ci`")
+    );
+    assert!(
+        citations["items"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("`cc`")
+    );
+    assert!(validate_citation_ids(&[], &candidates).is_ok());
+    assert!(
+        validate_citation_ids(
+            &["Marshall McLuhan, The Gutenberg Galaxy".into()],
+            &candidates
+        )
+        .is_err()
+    );
 }

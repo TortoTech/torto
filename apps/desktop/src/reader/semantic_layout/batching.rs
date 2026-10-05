@@ -1,7 +1,9 @@
 use super::*;
 use crate::plugins::semantic_layout::{fixed_batches, semantic_units};
 use std::ops::Range;
+use std::sync::Arc;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Batch {
     pub index: usize,
     pub target: Range<usize>,
@@ -10,6 +12,143 @@ pub(super) struct Batch {
     pub visible: bool,
 }
 
+struct SubsectionPlan {
+    range: Range<usize>,
+    batches: Vec<Batch>,
+}
+
+pub(super) struct SectionPlan {
+    original: Arc<Section>,
+    sources: Vec<Vec<SourceRange>>,
+    nodes: HashMap<(rebook_publication::SpineItemId, String), Vec<usize>>,
+    subsections: Vec<SubsectionPlan>,
+}
+
+pub(super) fn trim_plans(plans: &mut HashMap<usize, Arc<SectionPlan>>, retained: &HashSet<usize>) {
+    while plans.len() > 16 {
+        let Some(index) = plans
+            .keys()
+            .find(|index| !retained.contains(index))
+            .copied()
+        else {
+            break;
+        };
+        plans.remove(&index);
+    }
+}
+
+impl SectionPlan {
+    pub(super) fn new(
+        index: usize,
+        original: Arc<Section>,
+        toc: &[rebook_reader::TocViewItem],
+    ) -> Self {
+        let sources: Vec<_> = original.blocks.iter().map(block_ranges).collect();
+        let mut nodes: HashMap<_, Vec<usize>> = HashMap::new();
+        let mut starts = HashMap::new();
+        for (block, ranges) in sources.iter().enumerate() {
+            for source in ranges {
+                starts.entry(source.start.node.as_str()).or_insert(block);
+                for anchor in [&source.start, &source.end] {
+                    let entries = nodes
+                        .entry((anchor.spine.clone(), anchor.node.clone()))
+                        .or_default();
+                    if entries.last() != Some(&block) {
+                        entries.push(block);
+                    }
+                }
+            }
+        }
+        let mut anchors = HashMap::new();
+        for anchor in &original.anchors {
+            anchors
+                .entry(anchor.fragment.as_str())
+                .or_insert(&anchor.source);
+        }
+        let mut boundaries = vec![0, original.blocks.len()];
+        boundaries.extend(toc.iter().filter_map(|item| {
+            let target = item.target.as_ref()?;
+            if target.path() != original.href.path() {
+                return None;
+            }
+            let anchor = anchors.get(target.fragment()?)?;
+            starts.get(anchor.node.as_str()).copied()
+        }));
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let subsections = boundaries
+            .windows(2)
+            .map(|bounds| {
+                let range = bounds[0]..bounds[1];
+                let units = semantic_units(&original, range.clone());
+                let batches = fixed_batches(&original, range.clone())
+                    .into_iter()
+                    .map(|target| {
+                        let lo = units
+                            .iter()
+                            .rev()
+                            .find(|r| r.end == target.start)
+                            .map_or(target.start, |r| r.start);
+                        let hi = units
+                            .iter()
+                            .find(|r| r.start == target.end)
+                            .map_or(target.end, |r| r.end);
+                        Batch {
+                            index,
+                            target,
+                            context: lo..hi,
+                            subsection: range.clone(),
+                            visible: false,
+                        }
+                    })
+                    .collect();
+                SubsectionPlan { range, batches }
+            })
+            .collect();
+        Self {
+            original,
+            sources,
+            nodes,
+            subsections,
+        }
+    }
+
+    pub(super) fn matches(&self, original: &Arc<Section>) -> bool {
+        Arc::ptr_eq(&self.original, original)
+    }
+
+    fn select(&self, ranges: &[SourceRange]) -> Vec<Batch> {
+        let mut touched = std::collections::BTreeSet::new();
+        for range in ranges {
+            for anchor in [&range.start, &range.end] {
+                if let Some(blocks) = self.nodes.get(&(anchor.spine.clone(), anchor.node.clone())) {
+                    for &block in blocks {
+                        if self.sources[block]
+                            .iter()
+                            .any(|source| overlap(source, range))
+                        {
+                            touched.insert(block);
+                        }
+                    }
+                }
+            }
+        }
+        let touches = |range: &Range<usize>| touched.range(range.clone()).next().is_some();
+        let mut out = Vec::new();
+        for subsection in &self.subsections {
+            if touches(&subsection.range) {
+                out.extend(subsection.batches.iter().cloned().map(|mut batch| {
+                    batch.visible = touches(&batch.target);
+                    batch
+                }));
+            }
+        }
+        out.sort_by_key(|b| !b.visible);
+        out
+    }
+}
+
+#[cfg(test)]
 pub(super) fn plan(
     index: usize,
     section: &Section,
@@ -71,26 +210,24 @@ impl DesktopReader {
                 .filter(|(i, _)| i == index)
                 .flat_map(|(_, r)| r.iter().cloned())
                 .collect();
-            let boundaries = self
-                .reader
-                .toc_items()
-                .iter()
-                .filter_map(|item| {
-                    let target = item.target.as_ref()?;
-                    if target.path() != section.href.path() {
-                        return None;
-                    }
-                    let fragment = target.fragment()?;
-                    let anchor = section.anchors.iter().find(|a| a.fragment == fragment)?;
-                    section.blocks.iter().position(|b| {
-                        block_ranges(b)
-                            .iter()
-                            .any(|r| r.start.node == anchor.source.node)
-                    })
-                })
-                .collect();
-            out.extend(plan(*index, section, boundaries, &ranges));
+            let mut plans = self.semantic_layout.batch_plans.borrow_mut();
+            let cached = plans.entry(*index).or_insert_with(|| {
+                Arc::new(SectionPlan::new(
+                    *index,
+                    Arc::clone(section),
+                    self.reader.toc_items(),
+                ))
+            });
+            if !cached.matches(section) {
+                *cached = Arc::new(SectionPlan::new(
+                    *index,
+                    Arc::clone(section),
+                    self.reader.toc_items(),
+                ));
+            }
+            out.extend(cached.select(&ranges));
         }
+        trim_plans(&mut self.semantic_layout.batch_plans.borrow_mut(), &seen);
         out.sort_by_key(|b| !b.visible);
         out
     }
@@ -99,6 +236,71 @@ impl DesktopReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rebook_publication::Block;
+
+    #[test]
+    fn indexed_plan_preserves_boundaries_visibility_and_context() {
+        let (_, mut section, _) = super::super::tests::fixture();
+        let template = section.blocks[0].clone();
+        section.blocks = (0..12)
+            .map(|index| {
+                let mut block = template.clone();
+                let Block::Text(text) = &mut block else {
+                    unreachable!()
+                };
+                text.content = vec![rebook_publication::Inline::Text(
+                    rebook_publication::TextRun {
+                        text: "word ".repeat(500),
+                        style: Default::default(),
+                        link: None,
+                    },
+                )];
+                let range = text.source.as_mut().unwrap();
+                range.start.node = index.to_string();
+                range.end.node = index.to_string();
+                range.end.text_offset = 2500;
+                block
+            })
+            .collect();
+        let toc = [0, 4, 9]
+            .into_iter()
+            .map(|index| {
+                let source = block_ranges(&section.blocks[index])[0].start.clone();
+                section.anchors.push(rebook_publication::SectionAnchor {
+                    fragment: format!("a{index}"),
+                    source,
+                });
+                rebook_reader::TocViewItem {
+                    id: format!("toc{index}"),
+                    label: index.to_string(),
+                    target: Some(
+                        rebook_publication::PublicationUrl::parse(&format!(
+                            "{}#a{index}",
+                            section.href.path()
+                        ))
+                        .unwrap(),
+                    ),
+                    depth: 0,
+                    ancestors: Vec::new(),
+                    has_children: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        let section = Arc::new(section);
+        let indexed = SectionPlan::new(0, section.clone(), &toc);
+        for visible in [vec![0], vec![3], vec![4, 5], vec![2, 10], vec![11]] {
+            let ranges = visible
+                .into_iter()
+                .flat_map(|index| block_ranges(&section.blocks[index]))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                indexed.select(&ranges),
+                plan(0, &section, vec![0, 4, 9], &ranges)
+            );
+        }
+        assert!(indexed.matches(&section));
+        assert!(!indexed.matches(&Arc::new((*section).clone())));
+    }
 
     #[test]
     fn subsection_batches_are_stable_prioritized_and_do_not_prefetch_other_subsections() {

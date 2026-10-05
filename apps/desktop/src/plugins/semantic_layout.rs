@@ -222,6 +222,8 @@ struct WindowCache {
 pub(crate) struct SemanticLayoutSource {
     unified_citations: std::sync::atomic::AtomicBool,
     heuristic_cache: RwLock<HashMap<usize, (String, Vec<Annotation>)>>,
+    fingerprints: RwLock<HashMap<usize, (u64, String)>>,
+    recognition_misses: RwLock<HashMap<usize, RecognitionMiss>>,
     transaction: RwLock<()>,
     enabled: std::sync::atomic::AtomicBool,
     inner: Arc<dyn BookSource>,
@@ -231,11 +233,31 @@ pub(crate) struct SemanticLayoutSource {
     cache_identity: RwLock<Option<Value>>,
 }
 
+struct RecognitionMiss {
+    hash: String,
+    identity: Value,
+    path: PathBuf,
+}
+
+const DERIVED_SECTION_CACHE_CAPACITY: usize = 16;
+
+fn cache_section<T>(cache: &mut HashMap<usize, T>, index: usize, value: T) {
+    if cache.len() >= DERIVED_SECTION_CACHE_CAPACITY
+        && !cache.contains_key(&index)
+        && let Some(evicted) = cache.keys().next().copied()
+    {
+        cache.remove(&evicted);
+    }
+    cache.insert(index, value);
+}
+
 impl SemanticLayoutSource {
     pub(crate) fn new(inner: Arc<dyn BookSource>, original: Arc<dyn BookSource>) -> Self {
         Self {
             unified_citations: std::sync::atomic::AtomicBool::new(false),
             heuristic_cache: RwLock::new(HashMap::new()),
+            fingerprints: RwLock::new(HashMap::new()),
+            recognition_misses: RwLock::new(HashMap::new()),
             transaction: RwLock::new(()),
             enabled: std::sync::atomic::AtomicBool::new(true),
             inner,
@@ -281,19 +303,80 @@ impl SemanticLayoutSource {
             != enabled
     }
 
-    fn cached_heuristics(&self, index: usize, original: &Section) -> Vec<Annotation> {
-        let hash = fingerprint(original);
+    fn original_snapshot(&self, index: usize) -> Result<(Section, String), PublicationError> {
+        let before = self.original.content_revision();
+        let original = self.original.parse_section(index)?;
+        let revision = before.filter(|_| before == self.original.content_revision());
+        if let Some(revision) = revision
+            && let Ok(cache) = self.fingerprints.read()
+            && let Some((cached_revision, hash)) = cache.get(&index)
+            && *cached_revision == revision
+        {
+            return Ok((original, hash.clone()));
+        }
+        let hash = fingerprint(&original);
+        if let Some(revision) = revision
+            && let Ok(mut cache) = self.fingerprints.write()
+        {
+            cache_section(&mut cache, index, (revision, hash.clone()));
+        }
+        Ok((original, hash))
+    }
+
+    fn cached_heuristics(&self, index: usize, original: &Section, hash: &str) -> Vec<Annotation> {
         if let Ok(cache) = self.heuristic_cache.read()
             && let Some((cached_hash, annotations)) = cache.get(&index)
-            && cached_hash == &hash
+            && cached_hash == hash
         {
             return annotations.clone();
         }
         let annotations = citations::heuristic_annotations(original);
         if let Ok(mut cache) = self.heuristic_cache.write() {
-            cache.insert(index, (hash, annotations.clone()));
+            cache_section(&mut cache, index, (hash.to_owned(), annotations.clone()));
         }
         annotations
+    }
+
+    fn cached_recognition(
+        &self,
+        index: usize,
+        original: &Section,
+        hash: &str,
+        identity: &Value,
+    ) -> Option<Recognition> {
+        let missing_path = self.recognition_misses.read().ok().and_then(|cache| {
+            cache
+                .get(&index)
+                .filter(|miss| miss.hash == hash && &miss.identity == identity)
+                .map(|miss| miss.path.clone())
+        });
+        // A cloud sync or another worker can create a previously absent file.
+        // Check its existence cheaply without serializing the section again.
+        if missing_path.is_some_and(|path| !path.try_exists().unwrap_or(true)) {
+            return None;
+        }
+        let recognition = load_recognition_with_hash(original, identity, hash);
+        if let Ok(current) = self.cache_identity.read()
+            && current.as_ref() == Some(identity)
+            && let Ok(mut misses) = self.recognition_misses.write()
+        {
+            misses.remove(&index);
+            if recognition.is_none()
+                && let Some(path) = recognition_path(identity, hash)
+                && !path.try_exists().unwrap_or(true)
+            {
+                cache_section(
+                    &mut misses,
+                    index,
+                    RecognitionMiss {
+                        hash: hash.into(),
+                        identity: identity.clone(),
+                        path,
+                    },
+                );
+            }
+        }
+        recognition
     }
 
     pub(crate) fn clear(&self) {
@@ -302,6 +385,9 @@ impl SemanticLayoutSource {
         }
         if let Ok(mut partial) = self.partial.write() {
             partial.clear();
+        }
+        if let Ok(mut misses) = self.recognition_misses.write() {
+            misses.clear();
         }
     }
 
@@ -433,8 +519,8 @@ impl BookSource for SemanticLayoutSource {
             }
             text_formulas::restore_originals(&mut section.blocks);
             if unified_citations {
-                let original = self.original.parse_section(index)?;
-                for annotation in self.cached_heuristics(index, &original) {
+                let (original, hash) = self.original_snapshot(index)?;
+                for annotation in self.cached_heuristics(index, &original, &hash) {
                     compose(&mut section.blocks, &annotation);
                 }
                 citations::apply_heuristic_fallback(&mut section);
@@ -446,15 +532,23 @@ impl BookSource for SemanticLayoutSource {
             .read()
             .ok()
             .and_then(|state| state.get(&index).cloned());
+        let partial = self
+            .partial
+            .read()
+            .ok()
+            .and_then(|state| state.get(&index).cloned());
+        let identity = self
+            .cache_identity
+            .read()
+            .ok()
+            .and_then(|value| value.clone());
+        let snapshot =
+            (unified_citations || recognition.is_some() || partial.is_some() || identity.is_some())
+                .then(|| self.original_snapshot(index))
+                .transpose()?;
         if recognition.is_none() {
-            let identity = self
-                .cache_identity
-                .read()
-                .ok()
-                .and_then(|value| value.clone());
-            if let Some(identity) = identity {
-                let original = self.original.parse_section(index)?;
-                recognition = load_recognition(&original, &identity);
+            if let (Some(identity), Some((original, hash))) = (identity, snapshot.as_ref()) {
+                recognition = self.cached_recognition(index, original, hash, &identity);
                 if let Ok(current) = self.cache_identity.read() {
                     if current.as_ref() == Some(&identity) {
                         if let Some(result) = &recognition
@@ -468,22 +562,18 @@ impl BookSource for SemanticLayoutSource {
                 }
             }
         }
-        let partial = self
-            .partial
-            .read()
-            .ok()
-            .and_then(|state| state.get(&index).cloned());
-        if recognition.is_some() || partial.is_some() {
-            let original = self.original.parse_section(index)?;
-            let hash = fingerprint(&original);
-            if let Some(recognition) = recognition.filter(|result| result.fingerprint == hash) {
+        if let Some((original, hash)) = snapshot.as_ref() {
+            if let Some(recognition) = recognition.filter(|result| result.fingerprint == *hash) {
                 for annotation in &recognition.annotations {
                     if headings::annotation_eligible(&original, annotation) {
                         compose(&mut section.blocks, annotation);
                     }
                 }
             } else if let Some(results) = partial {
-                for recognition in results.values().filter(|result| result.fingerprint == hash) {
+                for recognition in results
+                    .values()
+                    .filter(|result| result.fingerprint == *hash)
+                {
                     for annotation in &recognition.annotations {
                         if headings::annotation_eligible(&original, annotation) {
                             compose(&mut section.blocks, annotation);
@@ -493,9 +583,8 @@ impl BookSource for SemanticLayoutSource {
             }
         }
         text_formulas::normalize_formula_quotes(&mut section.blocks);
-        if unified_citations {
-            let original = self.original.parse_section(index)?;
-            for annotation in self.cached_heuristics(index, &original) {
+        if unified_citations && let Some((original, hash)) = snapshot.as_ref() {
+            for annotation in self.cached_heuristics(index, original, hash) {
                 compose(&mut section.blocks, &annotation);
             }
             citations::apply_heuristic_fallback(&mut section);
@@ -671,27 +760,41 @@ fn section_input_block(section: &Section, index: usize) -> Value {
 
 const PROMPT: &str = include_str!("semantic_layout/prompt.md");
 
+fn window_roles(
+    section: &Section,
+    roles: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+) -> RecognitionRoles {
+    RecognitionRoles {
+        headings: roles.headings
+            && target
+                .clone()
+                .any(|i| headings::candidate(&section.blocks[i]).is_some()),
+        quotes: roles.quotes
+            && target.clone().any(|i| {
+                paragraph(&section.blocks[i]).is_some()
+                    || unattributed_quote_body(&section.blocks[i]).is_some()
+            }),
+        captions: roles.captions && context.clone().any(|i| image_needs_caption(section, i)),
+    }
+}
+
 fn window_prompt(
     section: &Section,
     roles: &RecognitionRoles,
     target: std::ops::Range<usize>,
     context: std::ops::Range<usize>,
 ) -> String {
+    let roles = window_roles(section, roles, target.clone(), context);
     let mut out = String::new();
     for part in PROMPT.split("\n## ") {
         let enabled = if part.starts_with("Headings") {
             roles.headings
-                && target
-                    .clone()
-                    .any(|i| headings::candidate(&section.blocks[i]).is_some())
         } else if part.starts_with("Quotations") {
             roles.quotes
-                && target.clone().any(|i| {
-                    paragraph(&section.blocks[i]).is_some()
-                        || unattributed_quote_body(&section.blocks[i]).is_some()
-                })
         } else if part.starts_with("Captions") {
-            roles.captions && context.clone().any(|i| image_needs_caption(section, i))
+            roles.captions
         } else if part.starts_with("Inline citations") {
             !citations::window_candidates(section, target.clone()).is_empty()
         } else {
@@ -716,7 +819,6 @@ fn request_contract_fingerprint() -> &'static str {
                 citations::PROMPT,
                 formulas::PROMPT,
                 formulas::TRANSCRIBE_PROMPT,
-                formulas::VERIFY_PROMPT,
                 formulas::options(),
                 completion_options(&RecognitionRoles {
                     quotes: true,
@@ -751,7 +853,7 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
             "kind":{"type":"string","enum":["quote"]},
             "body":ids,
             "attribution":{"type":"integer","description":"Immediately following paragraph containing an explicit author or work credit. Required for every new quote."},
-            "alignment":{"type":["string","null"],"enum":["start","center","end","justify",null],"description":"Recommended quote-body alignment for unified typesetting; null retains normal reader behavior."}
+            "alignment":{"type":["string","null"],"enum":["start","center","end","justify",null],"description":"Quote-body alignment; null keeps the default."}
         },
         "required":["kind","body","attribution","alignment"]
     });
@@ -777,7 +879,7 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
         "type":"object", "additionalProperties":false,
         "properties":{
             "kind":{"type":"string","enum":["section_heading"]},
-            "block":{"type":"integer","description":"An ID from targets.classify_headings: an ordinary paragraph starting with a numeric or chapter/part/section ordinal prefix, not an existing heading."}
+            "block":{"type":"integer","description":"An ID from targets.classify_headings."}
         },
         "required":["kind","block"]
     });
@@ -804,24 +906,31 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
     if roles.headings {
         items.push(heading);
     }
-    let item = if items.len() == 1 {
+    let no_groups = items.is_empty();
+    let item = if no_groups {
+        json!({"type":"object","properties":{},"required":[],"additionalProperties":false})
+    } else if items.len() == 1 {
         items.remove(0)
     } else {
         json!({"anyOf":items})
     };
-    json!({"temperature":0.0,"output_schema":{
+    let mut options = json!({"temperature":0.0,"output_schema":{
                 "type":"object", "additionalProperties":false,
-                "properties":{"groups":{"type":"array","items":item}, "citations":{"type":"array","items":{"type":"string"}},
+                "properties":{"groups":{"type":"array","items":item}, "citations":{"type":"array","description":"Select citation candidate IDs from `targets.classify_citations` only, in source order, without duplicates. Return [] when that list is empty. Never return citation text or block IDs.","items":{"type":"string","description":"An unchanged ID from `citation_candidates`, such as c0_0_0."}},
                     "formulas":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
                         "block":{"type":"integer"},"paragraph":{"type":"integer"},
-                        "original":{"type":"string","minLength":1,"description":"Nonempty exact contiguous substring of the designated math_texts paragraph, including markup and escaped entities. Select the complete expression or chained relation across style tags, including operands and attached superscripts/subscripts; never select an isolated exponent or subscript. Never rewrite it or supply offsets."},
+                        "original":{"type":"string","minLength":1,"description":"Exact contiguous substring of the designated math_texts paragraph, including markup and escaped entities. Copy the complete expression; do not rewrite it or supply offsets."},
                         "latex":{"type":"string","description":"Faithful supported LaTeX, without dollar signs or Markdown. JSON-escape each literal command backslash as two backslashes, and a two-backslash row separator as four. Never simplify, solve, correct, or invent symbols."},
                         "before":{"type":"string","description":"Exact immediately preceding text from math_texts to disambiguate repeated occurrences, or empty when unnecessary."},
                         "after":{"type":"string","description":"Exact immediately following text from math_texts to disambiguate repeated occurrences, or empty when unnecessary."}
                     },"required":["block","paragraph","original","latex","before","after"]}}},
                 "required":["groups","citations","formulas"]
             }
-    })
+    });
+    if no_groups {
+        options["output_schema"]["properties"]["groups"]["maxItems"] = json!(0);
+    }
+    options
 }
 
 fn cache_path(key: &str) -> Option<PathBuf> {
@@ -857,7 +966,15 @@ fn recognition_path(identity: &Value, hash: &str) -> Option<PathBuf> {
 
 fn load_recognition(section: &Section, identity: &Value) -> Option<Recognition> {
     let hash = fingerprint(section);
-    let bytes = std::fs::read(recognition_path(identity, &hash)?).ok()?;
+    load_recognition_with_hash(section, identity, &hash)
+}
+
+fn load_recognition_with_hash(
+    section: &Section,
+    identity: &Value,
+    hash: &str,
+) -> Option<Recognition> {
+    let bytes = std::fs::read(recognition_path(identity, hash)?).ok()?;
     let mut result: Recognition = serde_json::from_slice(&bytes).ok()?;
     result
         .annotations
@@ -1360,8 +1477,10 @@ async fn request_groups(
 ) -> Result<WindowResult, String> {
     crate::plugins::llm::budgeted(async {
     let (provider, model, reasoning_effort) = endpoint;
+    let roles = window_roles(section, config, target.clone(), context.clone());
+    let config = &roles;
     let mut messages = vec![
-        json!({"role":"system","content":wire::instructions(&window_prompt(section, config, target.clone(), context.clone()))}),
+        json!({"role":"system","content":wire::instructions(&window_prompt(section, config, target.clone(), context.clone()), std::iter::once(input))}),
         json!({"role":"user","content":wire::encode(input).to_string()}),
     ];
     let candidates = citations::window_candidates(section, target.clone());

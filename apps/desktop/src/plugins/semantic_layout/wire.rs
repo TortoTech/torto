@@ -1,5 +1,6 @@
 //! Compact transport only; domain values and persisted caches remain readable.
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 const KEYS: &[(&str, &str)] = &[
     ("groups", "g"),
@@ -49,13 +50,9 @@ const KEYS: &[(&str, &str)] = &[
     ("equation_number", "n"),
     ("requested_ids", "ri"),
     ("metadata", "md"),
-    ("next_image", "ni"),
-    ("mode", "m"),
     ("retry", "rt"),
     ("inline", "in"),
     ("context", "cx"),
-    ("proposal", "pr"),
-    ("local_validation_error", "ve"),
     ("bold_ratio", "br"),
     ("italic_ratio", "ir"),
     ("relative_font_size", "fs"),
@@ -83,9 +80,6 @@ const ENUMS: &[(&str, &str)] = &[
     ("recognized", "ok"),
     ("not_formula", "no"),
     ("unreadable", "u"),
-    ("original", "o"),
-    ("transcribe", "tr"),
-    ("verify", "v"),
 ];
 
 fn enum_key(name: &str, decode: bool) -> &str {
@@ -104,7 +98,7 @@ fn enum_key(name: &str, decode: bool) -> &str {
 }
 
 fn enum_field(name: &str) -> bool {
-    matches!(name, "kind" | "type" | "status" | "next_image" | "mode")
+    matches!(name, "kind" | "type" | "status")
 }
 
 fn key(name: &str, decode: bool) -> &str {
@@ -183,9 +177,35 @@ pub(super) fn options(value: &Value) -> Value {
                                                 .get("description")
                                                 .and_then(Value::as_str)
                                                 .unwrap_or("");
+                                            let meanings = if enum_field(name) {
+                                                object
+                                                    .get("enum")
+                                                    .and_then(Value::as_array)
+                                                    .map(|values| {
+                                                        values
+                                                            .iter()
+                                                            .filter_map(Value::as_str)
+                                                            .filter_map(|value| {
+                                                                let long = enum_key(value, true);
+                                                                (long != value).then(|| {
+                                                                    format!("{value}={long}")
+                                                                })
+                                                            })
+                                                            .collect::<Vec<_>>()
+                                                            .join(", ")
+                                                    })
+                                                    .unwrap_or_default()
+                                            } else {
+                                                String::new()
+                                            };
+                                            let mut description = format!("{name}. {description}");
+                                            if !meanings.is_empty() {
+                                                description
+                                                    .push_str(&format!(" Values: {meanings}."));
+                                            }
                                             object.insert(
                                                 "description".into(),
-                                                Value::String(format!("{name}. {description}")),
+                                                Value::String(description),
                                             );
                                         }
                                         (key(name, false).to_owned(), property)
@@ -248,27 +268,134 @@ pub(super) fn prompt(text: &str) -> String {
     result
 }
 
-pub(super) fn instructions(text: &str) -> String {
+pub(super) fn instructions<'a>(text: &str, inputs: impl IntoIterator<Item = &'a Value>) -> String {
+    // The output schema describes output keys and enums. Only explain compact
+    // names actually present in this request's input, never scan source strings.
+    fn visit(value: &Value, fields: &mut BTreeSet<String>, enums: &mut BTreeSet<String>) {
+        match value {
+            Value::Object(object) => {
+                for (name, value) in object {
+                    if key(name, false) != name {
+                        fields.insert(name.clone());
+                    }
+                    if enum_field(name)
+                        && let Some(value) = value.as_str()
+                        && enum_key(value, false) != value
+                    {
+                        enums.insert(format!(
+                            "{}: {}={value}",
+                            key(name, false),
+                            enum_key(value, false)
+                        ));
+                    }
+                    visit(value, fields, enums);
+                }
+            }
+            Value::Array(array) => {
+                for value in array {
+                    visit(value, fields, enums);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut used_fields = BTreeSet::new();
+    let mut used_enums = BTreeSet::new();
+    for input in inputs {
+        visit(input, &mut used_fields, &mut used_enums);
+    }
     let fields = KEYS
         .iter()
+        .filter(|(long, _)| used_fields.contains(*long))
         .map(|(long, short)| format!("{short}={long}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let enums = ENUMS
-        .iter()
-        .map(|(long, short)| format!("{short}={long}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "{}\n\nCompact JSON transport: use the supplied schema and compact keys exclusively. Field meanings: {fields}. Enum meanings (only in k/ty/ss/ni/m): {enums}. All source strings, IDs and LaTeX remain exact.\n",
-        prompt(text)
-    )
+    let mut result = prompt(text);
+    if !fields.is_empty() {
+        result.push_str(&format!("\n\nInput fields: {fields}."));
+    }
+    if !used_enums.is_empty() {
+        result.push_str(&format!(
+            "\nInput values: {}.",
+            used_enums.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    result.push_str("\nKeep source IDs unchanged. Copy source text exactly when the Schema requires an exact match.\n");
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn input_instructions_only_explain_present_fields_and_values() {
+        let input = json!({"blocks":[{"id":4,"type":"paragraph","text":"groups recognized latex < x"}],"targets":{"classify_headings":[4]}});
+        let text = instructions("Read `blocks`; follow the output schema.", [&input]);
+        assert!(text.contains("Read `bs`"));
+        assert!(
+            text.contains("i=id")
+                && text.contains("t=text")
+                && text.contains("ch=classify_headings")
+        );
+        assert!(text.contains("ty: p=paragraph"));
+        assert!(
+            !text.contains("g=groups")
+                && !text.contains("ss=status")
+                && !text.contains("ok=recognized")
+        );
+        assert!(!text.contains("Compact JSON transport"));
+        assert!(text.contains("Keep source IDs unchanged."));
+
+        let plain = instructions("Task.", [&json!({"unknown":"type groups recognized"})]);
+        assert!(!plain.contains("Input fields:") && !plain.contains("Input values:"));
+    }
+
+    #[test]
+    fn formula_inputs_only_describe_original_image_metadata() {
+        let header = json!({"requested_ids":[7],"retry":false});
+        let item = json!({"image_id":7,"metadata":{"inline":true,"context":"Original text"}});
+        let text = instructions("Transcribe the original image.", [&header, &item]);
+        for meaning in ["ri=requested_ids", "ii=image_id", "md=metadata"] {
+            assert!(text.contains(meaning), "missing input meaning: {meaning}");
+        }
+        for removed in [
+            "m=mode",
+            "pr=proposal",
+            "ve=local_validation_error",
+            "r=results",
+        ] {
+            assert!(!text.contains(removed));
+        }
+    }
+
+    #[test]
+    fn output_schema_describes_only_its_allowed_compact_enum_values() {
+        let result = options(&json!({"output_schema":{"type":"object","properties":{
+            "kind":{"type":"string","enum":["quote_inline"]},
+            "status":{"type":"string","enum":["recognized","unreadable"],"description":"recognized: faithful transcription; unreadable: uncertain."},
+            "latex":{"type":"string","description":"Keep LaTeX exact."}
+        },"required":["kind","status","latex"],"additionalProperties":false}}));
+        let schema = &result["output_schema"];
+        let properties = &schema["properties"];
+        assert_eq!(properties["k"]["enum"], json!(["qi"]));
+        assert_eq!(
+            properties["k"]["description"],
+            "kind.  Values: qi=quote_inline."
+        );
+        assert_eq!(properties["ss"]["enum"], json!(["ok", "u"]));
+        let description = properties["ss"]["description"].as_str().unwrap();
+        assert!(
+            description.contains("faithful transcription")
+                && description.contains("ok=recognized, u=unreadable")
+        );
+        assert!(!description.contains("not_formula"));
+        assert_eq!(properties["l"]["description"], "latex. Keep LaTeX exact.");
+        assert_eq!(schema["required"], json!(["k", "ss", "l"]));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
     #[test]
     fn transport_round_trip_preserves_text_and_schema_keywords() {
         let unique = KEYS

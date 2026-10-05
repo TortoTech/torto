@@ -491,7 +491,7 @@ fn prepare_output(
                 }
             }
             request.chat_history.push(Message::system(format!(
-                "Return only one complete JSON value matching this JSON Schema. Do not include Markdown fences or commentary. Preserve all field constraints and descriptions. JSON Schema:\n{wire_schema}")));
+                "Return one complete JSON value that follows this Schema and its field descriptions. Omit Markdown fences and commentary. JSON Schema:\n{wire_schema}")));
         }
         OutputMode::Auto => return Err("内部错误：未选择结构化输出模式".into()),
     }

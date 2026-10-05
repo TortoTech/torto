@@ -2569,18 +2569,56 @@ impl DesktopReader {
         ))
     }
 
+    fn popup_footnotes(&self) -> &[super::FocusFootnote] {
+        if self.is_focus_mode() {
+            self.focus_units
+                .get(self.focus_unit_index)
+                .map_or(&[], |unit| unit.footnotes.as_slice())
+        } else {
+            &self.classic_footnotes
+        }
+    }
+
+    fn active_popup_footnote_text(&self, ctx: &egui::Context) -> Option<&str> {
+        let notes = self.popup_footnotes();
+        let scroll_key = self.footnote_scroll_key();
+        let pending = self.citation_popup_target.as_ref().and_then(|target| {
+            notes
+                .iter()
+                .find(|note| note.reference().as_ref() == Some(target))
+        });
+        let active = if self.is_focus_mode()
+            && self
+                .ui
+                .focus_footnote_scroll_positions
+                .contains_key(&scroll_key)
+        {
+            ctx.data_mut(|data| {
+                data.get_temp::<super::footnote_navigation::Navigation>(
+                    scroll_key.with("block-navigation"),
+                )
+            })
+            .and_then(|navigation| navigation.active)
+            .and_then(|key| {
+                notes
+                    .iter()
+                    .find(|note| footnote_row_key(scroll_key, note) == key)
+            })
+        } else {
+            None
+        };
+        pending
+            .or(active)
+            .or_else(|| notes.iter().min_by_key(|note| note.citation.is_some()))
+            .map(|note| note.popup_text().trim())
+            .filter(|text| !text.is_empty())
+    }
+
     pub(super) fn focus_footnote_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
         if !self.ui.focus_footnotes_visible {
             return;
         }
-        let mut footnotes = if self.is_focus_mode() {
-            self.focus_units
-                .get(self.focus_unit_index)
-                .map(|unit| unit.footnotes.clone())
-                .unwrap_or_default()
-        } else {
-            self.classic_footnotes.clone()
-        };
+        let mut footnotes = self.popup_footnotes().to_vec();
         footnotes.sort_by_key(|note| note.citation.is_some());
         if footnotes.is_empty() {
             self.close_focus_footnotes();
@@ -2715,15 +2753,7 @@ impl DesktopReader {
         let focus_popup = self.is_focus_mode();
         let row_keys: Vec<_> = footnotes
             .iter()
-            .map(|note| {
-                let owner = note
-                    .reference()
-                    .map(|(source, _)| rebook_publication::source_block_identity(&source));
-                let slot = note
-                    .stable_id
-                    .unwrap_or_else(|| egui::Id::new((note.number, note.citation.is_some())));
-                scroll_key.with(("footnote-entry", owner, slot))
-            })
+            .map(|note| footnote_row_key(scroll_key, note))
             .collect();
         let navigation_key = scroll_key.with("block-navigation");
         let mut block_navigation = focus_popup.then(|| {
@@ -2788,7 +2818,13 @@ impl DesktopReader {
                 focus_assistant_frame(egui::Margin::same(12)).show(ui, |ui| {
                     ui.set_width((width - 24.0).max(1.0));
                     let wheel_scroll = ui.input_mut(|input| {
-                        let delta = input.smooth_scroll_delta.y;
+                        // Block navigation already animates its own motion. Egui's
+                        // smoothed tail must not become a second navigation action.
+                        let delta = if focus_popup {
+                            footnote_wheel_delta(input)
+                        } else {
+                            input.smooth_scroll_delta.y
+                        };
                         input.smooth_scroll_delta.y = 0.0;
                         delta
                     });
@@ -3554,12 +3590,7 @@ impl DesktopReader {
         let mut apply = false;
         let mut cancel = false;
         let mut remove = None;
-        let modal = egui::Modal::new(egui::Id::new("pdf-toc-review-modal"))
-            .area(crate::ui::modal_area(
-                ctx,
-                egui::Id::new("pdf-toc-review-modal"),
-            ))
-            .backdrop_color(Color32::BLACK.gamma_multiply(0.42))
+        let modal = crate::ui::modal(ctx, egui::Id::new("pdf-toc-review-modal"), 0.42)
             .frame(
                 egui::Frame::new()
                     .fill(palette().surface)
@@ -4863,6 +4894,15 @@ impl DesktopReader {
         if !preview && (text_edit_focused || interaction_blocked) {
             return;
         }
+        if !preview && self.ui.focus_footnotes_visible {
+            if ctx.input_mut(|input| consume_copy_shortcut(input, &self.shortcuts.copy))
+                && let Some(text) = self.active_popup_footnote_text(ctx)
+            {
+                ctx.copy_text(text.to_owned());
+                self.show_copy_notice(ctx, false);
+            }
+            return;
+        }
         let selected_image = self.selected_image.is_some();
         let selection_text = if !preview && !selected_image && self.selection_toolbar_visible {
             self.selection
@@ -5226,6 +5266,40 @@ fn footnote_popup_width(
         .map(|layout| layout.content_width)
         .fold(0.0_f32, f32::max);
     (content + 24.0 + 8.0).ceil().clamp(minimum, maximum)
+}
+
+fn footnote_row_key(scroll_key: egui::Id, note: &super::FocusFootnote) -> egui::Id {
+    let owner = note
+        .reference()
+        .map(|(source, _)| rebook_publication::source_block_identity(&source));
+    let slot = note
+        .stable_id
+        .unwrap_or_else(|| egui::Id::new((note.number, note.citation.is_some())));
+    scroll_key.with(("footnote-entry", owner, slot))
+}
+
+fn footnote_wheel_delta(input: &egui::InputState) -> f32 {
+    input
+        .raw
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+                ..
+            } if !modifiers.ctrl && !modifiers.command => Some(
+                delta.y
+                    * match unit {
+                        egui::MouseWheelUnit::Point => 1.0,
+                        egui::MouseWheelUnit::Line => 50.0,
+                        egui::MouseWheelUnit::Page => 240.0,
+                    },
+            ),
+            _ => None,
+        })
+        .sum()
 }
 
 fn footnote_scroll_area(maximum_body_height: f32) -> egui::ScrollArea {
@@ -8746,6 +8820,156 @@ mod reference_suggestion_label_tests {
             ),
             Vec2::new(200.0, -200.0)
         );
+    }
+
+    #[test]
+    fn focus_footnote_wheel_uses_one_raw_event_without_replaying_its_smooth_tail() {
+        let ctx = egui::Context::default();
+        let mut navigation = super::super::footnote_navigation::Navigation::default();
+        navigation.synchronize(
+            (0..4)
+                .map(|i| super::super::footnote_navigation::Row {
+                    key: egui::Id::new(i),
+                    top: i as f32 * 50.0,
+                    height: 40.0,
+                })
+                .collect(),
+            300.0,
+            190.0,
+        );
+        let mut saw_smooth_tail = false;
+        for frame in 0..60 {
+            let events = if frame == 0 || frame == 40 {
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: Vec2::new(0.0, -3.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                }]
+            } else {
+                vec![]
+            };
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    time: Some(frame as f64 / 60.0),
+                    ..Default::default()
+                },
+                |_| {
+                    let delta = ctx.input(|input| {
+                        if frame > 0 && frame < 40 && input.smooth_scroll_delta.y != 0.0 {
+                            saw_smooth_tail = true;
+                        }
+                        footnote_wheel_delta(input)
+                    });
+                    // No cooldown: the regression must be fixed by input ownership,
+                    // even when enough time has passed for another navigation action.
+                    navigation.wheel(delta, WHEEL_PAGE_THRESHOLD, Duration::ZERO);
+                },
+            );
+            output.textures_delta.clear();
+            assert_eq!(navigation.index(), if frame < 40 { 1 } else { 2 });
+        }
+        assert!(
+            saw_smooth_tail,
+            "the fixture must exercise egui's multi-frame smoothing"
+        );
+    }
+
+    #[test]
+    fn focus_footnote_copy_follows_active_entry_and_configured_shortcut() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        reader.focus_unit_index = 0;
+        let owner = reader.focus_units[0].range.clone();
+        // Intentionally unsorted: clipboard routing must match popup row identity.
+        reader.focus_units[0].footnotes = vec![
+            super::super::FocusFootnote {
+                stable_id: Some(egui::Id::new("citation")),
+                owner: None,
+                number: 2,
+                citation: Some((owner.clone(), 2)),
+                text: "(Citation text)".into(),
+            },
+            super::super::FocusFootnote {
+                stable_id: Some(egui::Id::new("note")),
+                owner: Some(owner.clone()),
+                number: 1,
+                citation: None,
+                text: "  Footnote text  ".into(),
+            },
+        ];
+        reader.ui.focus_footnotes_visible = true;
+        reader.citation_popup_target = Some((owner.clone(), 2));
+        let ctx = egui::Context::default();
+        let render = |reader: &mut DesktopReader, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0))),
+                    ..Default::default()
+                },
+                |_| {
+                    reader.copy_shortcut(&ctx, false);
+                    reader.keyboard_shortcuts(&ctx, false);
+                    reader.focus_footnote_overlay(
+                        &ctx,
+                        Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 900.0)),
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        render(&mut reader, vec![]);
+        let copied = |output: &egui::FullOutput| {
+            output
+                .platform_output
+                .commands
+                .iter()
+                .filter_map(|command| {
+                    if let egui::OutputCommand::CopyText(text) = command {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            copied(&render(&mut reader, vec![egui::Event::Copy])),
+            ["Citation text"]
+        );
+        render(
+            &mut reader,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(reader.active_footnote_reference, Some((owner, 0x2000_0001)));
+        reader.shortcuts.copy = egui::KeyboardShortcut::new(
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            egui::Key::C,
+        );
+        let custom_copy = egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: reader.shortcuts.copy.modifiers,
+        };
+        assert_eq!(
+            copied(&render(&mut reader, vec![custom_copy])),
+            ["Footnote text"]
+        );
+        assert!(copied(&render(&mut reader, vec![egui::Event::Copy])).is_empty());
+        let unit = reader.focus_unit_index;
+        assert_eq!(unit, 0, "popup navigation must not move the body");
     }
 
     #[test]

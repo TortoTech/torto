@@ -222,12 +222,7 @@ impl WindowsUpdater {
             return;
         };
         let mut action = None;
-        let modal = egui::Modal::new(egui::Id::new("windows-update-modal"))
-            .area(crate::ui::modal_area(
-                ctx,
-                egui::Id::new("windows-update-modal"),
-            ))
-            .backdrop_color(egui::Color32::BLACK.gamma_multiply(0.42))
+        let modal = crate::ui::modal(ctx, egui::Id::new("windows-update-modal"), 0.42)
             .frame(
                 egui::Frame::new()
                     .fill(palette().surface)
@@ -1206,6 +1201,51 @@ mod tests {
                 .url
                 .starts_with("https://gitee.com/TortoTech/torto/releases/download/")
         );
+    }
+
+    #[test]
+    fn update_dialog_dims_caption_controls_including_over_settings() {
+        use crate::app::window_chrome;
+
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let release = release_from_github(github_release("v0.2.12", Some(&digest)), "0.2.11")
+            .unwrap()
+            .unwrap();
+        let mut updater = WindowsUpdater::new();
+        updater.state = UpdateState::Available(release);
+        let ctx = egui::Context::default();
+        crate::ui::apply_interface_typography(
+            &ctx,
+            &crate::preferences::InterfaceTypography::default(),
+            AppLanguage::English,
+        );
+        for (visible, settings_opacity) in [(false, 0.0), (true, 0.0), (true, 0.46)] {
+            updater.dialog_visible = visible;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+                window_chrome::begin_frame(&ctx);
+                window_chrome::header(
+                    &ctx,
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 44.0)),
+                );
+                if settings_opacity > 0.0 {
+                    let _ =
+                        crate::ui::modal(&ctx, egui::Id::new("test-settings"), settings_opacity)
+                            .show(&ctx, |ui| {
+                                ui.label("Settings");
+                            });
+                }
+                updater.overlay(&ctx, AppLanguage::English);
+                let geometry = window_chrome::geometry(&ctx);
+                let expected = if visible {
+                    1.0 - (1.0 - settings_opacity) * (1.0 - 0.42)
+                } else {
+                    settings_opacity
+                };
+                assert!((geometry.overlay_dim - expected).abs() < 0.0001);
+                assert_eq!(geometry.drag_enabled, !visible);
+            });
+            output.textures_delta.clear();
+        }
     }
 
     #[test]

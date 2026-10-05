@@ -7,6 +7,7 @@ pub(super) struct Prepared {
     pub raw: Demand,
     pub demand: Demand,
     pub originals: HashMap<usize, Arc<Section>>,
+    pub batch_plans: HashMap<usize, Arc<batching::SectionPlan>>,
     pub hashes: HashMap<usize, String>,
     pub inputs: HashMap<usize, Vec<(crate::plugins::TranslationBlockInput, SourceRange)>>,
 }
@@ -35,12 +36,36 @@ impl BookSource for CachedSource {
     }
 }
 
+#[cfg(test)]
 pub(super) fn prepare(
     source: Arc<dyn BookSource>,
     raw: Demand,
     originals: HashMap<usize, Arc<Section>>,
     fixed_page: bool,
     with_translation: bool,
+) -> Prepared {
+    let mut prepared = prepare_with_plans(
+        source,
+        raw,
+        originals,
+        fixed_page,
+        with_translation,
+        &[],
+        HashMap::new(),
+    );
+    // Fixtures supply their own TOC when selecting batches.
+    prepared.batch_plans.clear();
+    prepared
+}
+
+pub(super) fn prepare_with_plans(
+    source: Arc<dyn BookSource>,
+    raw: Demand,
+    originals: HashMap<usize, Arc<Section>>,
+    fixed_page: bool,
+    with_translation: bool,
+    toc: &[rebook_reader::TocViewItem],
+    mut batch_plans: HashMap<usize, Arc<batching::SectionPlan>>,
 ) -> Prepared {
     let source = CachedSource {
         source,
@@ -57,6 +82,16 @@ pub(super) fn prepare(
             continue;
         }
         if let Ok(section) = source.parse_section(*index) {
+            let original = source.sections.lock().unwrap().get(index).unwrap().clone();
+            if !batch_plans
+                .get(index)
+                .is_some_and(|plan| plan.matches(&original))
+            {
+                batch_plans.insert(
+                    *index,
+                    Arc::new(batching::SectionPlan::new(*index, original, toc)),
+                );
+            }
             hashes.insert(*index, fingerprint(&section));
             inputs.insert(
                 *index,
@@ -64,11 +99,16 @@ pub(super) fn prepare(
             );
         }
     }
+    batching::trim_plans(
+        &mut batch_plans,
+        &demand.iter().map(|(index, _)| *index).collect(),
+    );
     Prepared {
         with_translation,
         raw,
         demand,
         originals: source.sections.into_inner().unwrap(),
+        batch_plans,
         hashes,
         inputs,
     }

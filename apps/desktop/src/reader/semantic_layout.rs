@@ -80,6 +80,7 @@ pub(super) struct SemanticLayoutState {
     translations: HashMap<Key, BlockTranslation>,
     failed: HashSet<Key>,
     originals: HashMap<usize, std::sync::Arc<Section>>,
+    batch_plans: std::cell::RefCell<HashMap<usize, std::sync::Arc<batching::SectionPlan>>>,
     hashes: HashMap<usize, String>,
     inputs: HashMap<usize, Vec<(crate::plugins::TranslationBlockInput, SourceRange)>>,
     prepared_raw: Option<Demand>,
@@ -253,6 +254,7 @@ impl DesktopReader {
         self.semantic_layout.reflow_version += 1;
         self.semantic_layout.done.clear();
         self.semantic_layout.originals.clear();
+        self.semantic_layout.batch_plans.get_mut().clear();
         self.semantic_layout.hashes.clear();
         self.semantic_layout.inputs.clear();
         self.semantic_layout.prepared_raw = None;
@@ -458,6 +460,7 @@ impl DesktopReader {
             self.semantic_layout.prepare_worker = None;
             self.semantic_layout.prepare_receiver = None;
             self.semantic_layout.originals = prepared.originals;
+            *self.semantic_layout.batch_plans.get_mut() = prepared.batch_plans;
             self.semantic_layout.hashes.extend(prepared.hashes);
             self.semantic_layout.inputs.extend(prepared.inputs);
             self.semantic_layout.expanded = prepared.demand;
@@ -472,6 +475,8 @@ impl DesktopReader {
                 let source = self.semantic_source.original();
                 let raw = self.semantic_layout.demand.clone();
                 let originals = self.semantic_layout.originals.clone();
+                let batch_plans = self.semantic_layout.batch_plans.borrow().clone();
+                let toc = self.reader.toc_items().to_vec();
                 let fixed = self.source.book().metadata.layout == RenditionLayout::PrePaginated;
                 let with_translation = self.translation.enabled;
                 let proxy = proxy.clone();
@@ -479,7 +484,15 @@ impl DesktopReader {
                 self.semantic_layout.prepare_receiver = Some(rx);
                 self.semantic_layout.prepare_worker = Some(runtime.spawn(async move {
                     if let Ok(prepared) = tokio::task::spawn_blocking(move || {
-                        preparation::prepare(source, raw, originals, fixed, with_translation)
+                        preparation::prepare_with_plans(
+                            source,
+                            raw,
+                            originals,
+                            fixed,
+                            with_translation,
+                            &toc,
+                            batch_plans,
+                        )
                     })
                     .await
                     {

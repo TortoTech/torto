@@ -1280,6 +1280,12 @@ fn default_logical_alignment() -> bool {
 pub trait BookSource: Send + Sync {
     /// Lightweight descriptor available immediately after opening.
     fn book(&self) -> &Book;
+    /// Optional generation for the parsed content. A source returning `Some`
+    /// must advance it whenever its section output changes; `None` requires
+    /// consumers to validate derived caches against the content itself.
+    fn content_revision(&self) -> Option<u64> {
+        None
+    }
     /// Reports whether navigation is authored, mechanical, or generated.
     fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
         TableOfContentsOrigin::Embedded

@@ -2744,14 +2744,17 @@ fn decode_html_entities_once(value: &str) -> String {
 fn sanitize_ocr_html(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0;
-    while let Some(open_offset) = value[cursor..].find('<') {
-        let open = cursor + open_offset;
-        output.push_str(&sanitize_ocr_html_text(&value[cursor..open]));
-        let Some(close_offset) = value[open..].find('>') else {
-            output.push_str(&sanitize_ocr_html_text(&value[open..]));
-            return output;
+    let mut search = 0;
+    while let Some(open_offset) = value[search..].find('<') {
+        let open = search + open_offset;
+        let Some(tag_len) = ocr_html_tag_len(&value[open..]) else {
+            // Keep literal comparisons in the text span, including inside math.
+            // They must not consume a subsequent cell's closing tag.
+            search = open + 1;
+            continue;
         };
-        let close = open + close_offset + 1;
+        output.push_str(&sanitize_ocr_html_text(&value[cursor..open]));
+        let close = open + tag_len;
         let tag = &value[open..close];
         if is_html_image_tag(tag) {
             if let Some(image) = sanitize_ocr_image_tag(tag) {
@@ -2763,9 +2766,53 @@ fn sanitize_ocr_html(value: &str) -> String {
             output.push(' ');
         }
         cursor = close;
+        search = close;
     }
     output.push_str(&sanitize_ocr_html_text(&value[cursor..]));
     output
+}
+
+/// Recognize tag boundaries without mistaking text's `<` for an opening tag.
+fn ocr_html_tag_len(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+    if value.starts_with("<!--") {
+        return value.find("-->").map(|end| end + 3);
+    }
+    let mut cursor = 1 + usize::from(bytes.get(1) == Some(&b'/'));
+    if !bytes.get(cursor)?.is_ascii_alphabetic() {
+        return None;
+    }
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':'))
+    {
+        cursor += 1;
+    }
+    if !bytes
+        .get(cursor)
+        .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+    {
+        return None;
+    }
+    let mut quote = None;
+    for (offset, &byte) in bytes[cursor..].iter().enumerate() {
+        if let Some(delimiter) = quote {
+            if byte == delimiter {
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'<' => return None,
+                b'>' => return Some(cursor + offset + 1),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 fn sanitize_ocr_html_text(value: &str) -> String {
@@ -3821,6 +3868,75 @@ mod tests {
             .content
             .iter()
             .any(|inline| matches!(inline, rebook_publication::Inline::Math(math) if math.latex == "E=mc^2")));
+    }
+
+    #[test]
+    fn ocr_table_comparisons_preserve_cells_text_and_math() {
+        let body = markdown_to_html(
+            "<table><tr><th>Label < Right half</th><th>Value</th></tr>\n\
+             <tr><td>-1.00 ≤ r < -0.95</td><td>x <= 30 &lt; 60</td></tr>\n\
+             <tr><td>$x < 2$</td><td>x<y</td></tr></table>",
+        );
+        let descriptor = SpineItem {
+            id: SpineItemId::new("ocr-comparisons").unwrap(),
+            href: PublicationUrl::parse("Text/ocr-comparisons.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let section = rebook_html::parse_section(
+            &format!("<html><body>{body}</body></html>"),
+            &descriptor,
+            |_| None,
+        )
+        .unwrap();
+        let table = section
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                rebook_publication::Block::Table(table) => Some(table),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(table.rows.len(), 3);
+        assert!(table.rows.iter().all(|row| row.cells.len() == 2));
+        let cell_text = |row: usize, cell: usize| {
+            table.rows[row].cells[cell]
+                .text
+                .content
+                .iter()
+                .filter_map(|inline| match inline {
+                    rebook_publication::Inline::Text(run) => Some(run.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+        assert_eq!(cell_text(0, 0), "Label < Right half");
+        assert_eq!(cell_text(1, 0), "-1.00 ≤ r < -0.95");
+        assert_eq!(cell_text(1, 1), "x <= 30 < 60");
+        assert_eq!(cell_text(2, 1), "x<y");
+        assert!(
+            table.rows[2].cells[0]
+                .text
+                .content
+                .iter()
+                .any(|inline| matches!(inline,
+                    rebook_publication::Inline::Math(math) if math.latex == "x < 2"
+                ))
+        );
+    }
+
+    #[test]
+    fn ocr_sanitizer_keeps_quoted_angles_and_filters_real_tags() {
+        let html = sanitize_ocr_html(
+            r#"<table><tr><td title="x < 2 > 1" onclick="bad()">x < 2</td><td><!-- <td>ignored</td> --><span>kept</span><img src="../OcrResources/a.png" alt="x < 2 > 1" onerror="bad()" /></td></tr></table>"#,
+        );
+        assert!(html.contains("<td>x &lt; 2</td>"));
+        assert!(html.contains(r#"alt="x &lt; 2 &gt; 1""#));
+        assert!(html.contains("kept"));
+        for removed in ["title=", "onclick", "onerror", "ignored", "<span>"] {
+            assert!(!html.contains(removed), "unexpected {removed} in {html}");
+        }
     }
 
     #[test]

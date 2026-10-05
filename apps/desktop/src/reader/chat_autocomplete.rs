@@ -204,10 +204,9 @@ pub(super) fn build_chat_prompt_with_references(
             }
             if reference.kind == ChatReferenceKind::Book {
                 lines.push(if english {
-                    "Use searchBook and getContent as needed, and copy the citations they return."
-                        .into()
+                    "Use searchBook and getContent to read the book.".into()
                 } else {
-                    "请按需使用 searchBook 和 getContent，并逐字复制工具返回的 citation。".into()
+                    "使用 searchBook 和 getContent 读取本书。".into()
                 });
             }
             lines.join("\n")
@@ -217,9 +216,9 @@ pub(super) fn build_chat_prompt_with_references(
     format!(
         "{base}\n\n{}\n\n{reference_text}",
         if english {
-            "The user referenced the following book content. Use it as the primary context. Every claim based on a chapter or paragraph reference must copy its supplied citation:"
+            "Use the following user-selected book content as the primary context. Use its supplied citations:"
         } else {
-            "用户在输入框中引用了以下书籍内容。请优先以这些内容为上下文；凡依据章节或段落引用作出的陈述，都必须逐字复制其提供的 citation："
+            "优先使用以下用户选择的书籍内容作为上下文，引用时使用其提供的 citation："
         }
     )
 }
@@ -345,7 +344,7 @@ mod tests {
 
         let prompt = build_chat_prompt_with_references("概括本章", &[chapter], false);
 
-        assert!(prompt.contains("都必须逐字复制其提供的 citation"));
+        assert!(prompt.contains("引用时使用其提供的 citation"));
         assert!(prompt.contains("citation: 【6†source】"));
     }
 

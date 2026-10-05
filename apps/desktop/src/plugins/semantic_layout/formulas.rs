@@ -6,33 +6,25 @@ use std::io::Cursor;
 
 pub(super) const PROMPT: &str = include_str!("formulas/prompt.md");
 pub(super) const TRANSCRIBE_PROMPT: &str = include_str!("formulas/transcribe.md");
-pub(super) const VERIFY_PROMPT: &str = include_str!("formulas/verify.md");
 mod batch;
 
 pub(super) fn options() -> Value {
     let item = json!({"type":"object","additionalProperties":false,"properties":{
-        "image_id":{"type":"integer","description":"An ID from requested_ids. Preserve its original value; IDs can be nonconsecutive. Never invent an ID."},
-        "status":{"type":"string","enum":["recognized","not_formula","unreadable"],"description":"recognized: the entire meaningful image is faithfully representable as math, a symbol or a formal production rule. not_formula: a diagram, plot, table, photo, decorative art or prose, even if it contains equations. unreadable: a formula with ambiguous essential details or unsupported notation. Both latex and equation_number must be null for either negative status."},
-        "latex":{"type":["string","null"],"description":"Faithful LaTeX source without dollar delimiters or Markdown; null for a negative status. Use supported standard math commands, text operators and matrix/aligned environments; no custom macros, packages, images, URLs or executable commands. JSON-escape every literal backslash: two in the JSON source for one LaTeX backslash, four for a two-backslash row separator. Decoding must preserve command backslashes and row separators, never produce backspace, form feed, newline, carriage return or tab from a command prefix. Do not remove backslashes to make JSON valid."},
-        "equation_number":{"type":["string","null"],"description":"Separate equation number visibly printed inside this image; exclude it from latex. Never copy or infer a number from adjacent HTML or context. Null when absent or for a negative status."}
+        "image_id":{"type":"integer","description":"Copy an ID from requested_ids. IDs need not be consecutive."},
+        "status":{"type":"string","enum":["recognized","not_formula","unreadable"],"description":"recognized: the whole meaningful image represents math, a symbol or a formal production rule. not_formula: a diagram, plot, table, photo, decoration or prose, even with equations. unreadable: essential formula details are unclear or unsupported. For either negative status, set latex and equation_number to null."},
+        "latex":{"type":["string","null"],"description":"Transcribe faithful supported LaTeX without dollar delimiters or Markdown. For a negative status, return null. Use standard math commands, text operators and matrix/aligned environments. Exclude custom macros, packages, images, URLs and executable commands. Encode each command backslash as two JSON backslashes; encode a row separator as four. Do not drop backslashes or turn command prefixes into control characters."},
+        "equation_number":{"type":["string","null"],"description":"Copy only a separate equation number visible in this image. Exclude it from latex. Do not infer it from context. If absent or the status is negative, return null."}
     },"required":["image_id","status","latex","equation_number"]});
     json!({"temperature":0.0,"output_schema":{
             "type":"object","additionalProperties":false,
-            "properties":{"results":{"type":"array","description":"Exactly one result per requested image ID, including negative results. Use this array even for a single image. No missing, duplicate or additional IDs; array order is irrelevant.","items":item}},
+            "properties":{"results":{"type":"array","description":"Return one result per requested ID, including negative results. Use an array for a single image too. IDs must match exactly; order is unrestricted.","items":item}},
             "required":["results"]
         }
     })
 }
 
-pub(super) fn request_prompt(mode: &str) -> String {
-    format!(
-        "{PROMPT}\n{}",
-        if mode == "verify" {
-            VERIFY_PROMPT
-        } else {
-            TRANSCRIBE_PROMPT
-        }
-    )
+pub(super) fn request_prompt() -> String {
+    format!("{PROMPT}\n{TRANSCRIBE_PROMPT}")
 }
 
 #[derive(Clone)]
@@ -354,7 +346,6 @@ pub(super) async fn recognize(
                 "compact-wire-v1",
                 PROMPT,
                 TRANSCRIBE_PROMPT,
-                VERIFY_PROMPT,
                 options(),
                 provider.id,
                 provider.base_url,

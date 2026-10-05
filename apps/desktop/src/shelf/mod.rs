@@ -1316,9 +1316,7 @@ impl ShelfFeature {
             let mut remove = false;
             let screen_width = crate::ui::overlay_rect(ctx).width();
             let modal_width = (screen_width - 48.0).clamp(280.0, 380.0).min(screen_width);
-            let modal = egui::Modal::new(egui::Id::new("shelf-remove-book-modal"))
-                .area(crate::ui::modal_area(ctx, egui::Id::new("shelf-remove-book-modal")))
-                .backdrop_color(Color32::BLACK.gamma_multiply(0.42))
+            let modal = crate::ui::modal(ctx, egui::Id::new("shelf-remove-book-modal"), 0.42)
                 .frame(
                     egui::Frame::new()
                         .fill(palette().surface)

@@ -911,16 +911,15 @@ fn focus_footnote_text(
         .sections
         .iter()
         .position(|section| section.href.path() == target.path())?;
-    let section = if section_index == current_section_index {
-        current_section
-    } else {
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            linked_sections.entry(section_index)
-        {
-            entry.insert(source.parse_section(section_index).ok()?);
-        }
-        linked_sections.get(&section_index)?
-    };
+    if section_index == current_section_index
+        && let Some(text) = focus_footnote_text_in_section(current_section, target, marker)
+    {
+        return Some(text);
+    }
+    if let std::collections::hash_map::Entry::Vacant(entry) = linked_sections.entry(section_index) {
+        entry.insert(source.parse_section(section_index).ok()?);
+    }
+    let section = linked_sections.get(&section_index)?;
     focus_footnote_text_in_section(section, target, marker)
 }
 
@@ -2284,30 +2283,47 @@ impl DesktopReader {
                     marker,
                     target,
                     number,
-                } => Some(FocusFootnote {
-                    owner: None,
-                    stable_id: Some(egui::Id::new((
-                        "linked-note-slot",
-                        target.path(),
-                        target.fragment(),
-                        slot,
-                    ))),
-                    number,
-                    citation: None,
-                    text: focus_footnote_text(
-                        self.source.as_ref(),
-                        &target,
-                        &marker,
-                        current_section_index,
-                        current_section,
-                        linked_sections,
-                    )
-                    .unwrap_or_else(|| {
-                        self.language
-                            .text("未能读取脚注内容", "Footnote content is unavailable")
-                            .to_owned()
-                    }),
-                }),
+                } => {
+                    if let Some(index) = self
+                        .source
+                        .book()
+                        .sections
+                        .iter()
+                        .position(|section| section.href.path() == target.path())
+                        && (index != current_section_index
+                            || focus_footnote_text_in_section(current_section, &target, &marker)
+                                .is_none())
+                        && let std::collections::hash_map::Entry::Vacant(entry) =
+                            linked_sections.entry(index)
+                        && let Some(section) = self.reader.cached_section_content(index)
+                    {
+                        entry.insert(section);
+                    }
+                    Some(FocusFootnote {
+                        owner: None,
+                        stable_id: Some(egui::Id::new((
+                            "linked-note-slot",
+                            target.path(),
+                            target.fragment(),
+                            slot,
+                        ))),
+                        number,
+                        citation: None,
+                        text: focus_footnote_text(
+                            self.source.as_ref(),
+                            &target,
+                            &marker,
+                            current_section_index,
+                            current_section,
+                            linked_sections,
+                        )
+                        .unwrap_or_else(|| {
+                            self.language
+                                .text("未能读取脚注内容", "Footnote content is unavailable")
+                                .to_owned()
+                        }),
+                    })
+                }
             })
             .collect();
         let numbered = rebook_layout::numbered_semantic_footnotes(block);
@@ -2367,15 +2383,7 @@ impl DesktopReader {
             self.selection = None;
             self.selection_toolbar_visible = false;
         }
-        let parsed = self
-            .reader
-            .current_reading_unit_sections()
-            .map(|index| {
-                self.source
-                    .parse_section(index)
-                    .map(|section| (index, section))
-            })
-            .collect::<Result<Vec<_>, _>>();
+        let parsed = self.reader.current_reading_unit_content();
         let Ok(sections) = parsed else {
             self.invalidate_focus_units();
             self.focus_unit_index = 0;
@@ -4642,6 +4650,30 @@ mod tests {
             );
         }
         assert_eq!(source.parse_count.load(Ordering::Relaxed), 1);
+        let mut current_unit = current.clone();
+        current_unit.blocks.clear();
+        current_unit.anchors.clear();
+        // A same-file target can live outside the active TOC unit. Prefer the
+        // prepared full-section snapshot, then parse only once if uncached.
+        linked_sections.insert(0, current.clone());
+        for expected_parses in [1, 2] {
+            for _ in 0..2 {
+                assert_eq!(
+                    focus_footnote_text(
+                        &source,
+                        &PublicationUrl::parse("current.xhtml#note").unwrap(),
+                        "1",
+                        0,
+                        &current_unit,
+                        &mut linked_sections,
+                    )
+                    .as_deref(),
+                    Some("Current note")
+                );
+            }
+            assert_eq!(source.parse_count.load(Ordering::Relaxed), expected_parses);
+            linked_sections.remove(&0);
+        }
     }
 
     #[test]

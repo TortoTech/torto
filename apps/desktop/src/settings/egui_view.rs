@@ -40,8 +40,6 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
         return;
     }
     ctx.request_repaint();
-    #[cfg(target_os = "windows")]
-    crate::app::window_chrome::dim_controls(ctx, 0.46 * visible);
 
     let screen = crate::ui::overlay_rect(ctx);
     let modal_size = Vec2::new(
@@ -58,9 +56,8 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
         Align2::CENTER_CENTER,
         screen.center() - ctx.content_rect().center() + offset,
     );
-    let response = egui::Modal::new(modal_id)
+    let response = crate::ui::modal(ctx, modal_id, 0.46 * visible)
         .area(modal_area)
-        .backdrop_color(Color32::BLACK.gamma_multiply(0.46 * visible))
         .frame(
             egui::Frame::new()
                 .fill(palette().surface)

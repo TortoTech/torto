@@ -918,6 +918,55 @@ fn attach_footnote_atoms(
     attached
 }
 
+fn mask_leading_list_number(chars: &mut [char]) {
+    let Some(start) = chars
+        .iter()
+        .position(|character| !character.is_whitespace())
+    else {
+        return;
+    };
+    let closer = match chars[start] {
+        '(' => Some(')'),
+        '（' => Some('）'),
+        '[' => Some(']'),
+        '【' => Some('】'),
+        _ => None,
+    };
+    let digits_start = start + usize::from(closer.is_some());
+    let mut end = digits_start;
+    while chars.get(end).is_some_and(char::is_ascii_digit) {
+        end += 1;
+    }
+    if end == digits_start {
+        return;
+    }
+    if let Some(closer) = closer {
+        if chars.get(end) != Some(&closer) {
+            return;
+        }
+        end += 1;
+    } else if chars
+        .get(end)
+        .is_some_and(|character| matches!(character, '.' | ')' | '）' | '、' | '．'))
+    {
+        end += 1;
+    } else {
+        return;
+    }
+    if chars
+        .get(end)
+        .is_some_and(|character| character.is_whitespace())
+        && chars[end..]
+            .iter()
+            .any(|character| !character.is_whitespace())
+    {
+        // SentenceX treats a numbered item as one unsplittable span. Explicit
+        // sentence structure needs its internal boundaries. Mask only the
+        // segmentation copy, preserving character offsets and the source label.
+        chars[start..end].fill('\u{fffc}');
+    }
+}
+
 fn paragraph_atoms_with_protected_ranges(
     text: &str,
     protected_ranges: &[std::ops::Range<usize>],
@@ -944,6 +993,7 @@ fn paragraph_atoms_with_protected_ranges(
             }
         }
     }
+    mask_leading_list_number(&mut segmentation_chars);
     let segmentation_text = segmentation_chars.iter().collect::<String>();
     let mut atoms: Vec<ParagraphAtom> = Vec::new();
     let mut start = 0;
@@ -1566,6 +1616,144 @@ mod tests {
         );
         assert_eq!(atoms.len(), 2);
         assert_eq!(atoms[1].text, "其次，比较反馈；Finally, decide.");
+    }
+
+    #[test]
+    fn numbered_paragraphs_split_sentences_without_rewriting_labels() {
+        for marker in [
+            "(8)", "（8）", "[8]", "【8】", "8.", "8)", "8）", "8、", "8．",
+        ] {
+            let text = format!("  {marker} First sentence. Second sentence. Third sentence.");
+            let atoms = paragraph_atoms_with_protected_ranges(&text, &[], &[], "en");
+            assert_eq!(atoms.len(), 3, "{marker}");
+            assert_eq!(atoms[0].text, format!("  {marker} First sentence. "));
+            assert_eq!(atoms[1].text, "Second sentence. ");
+            assert_eq!(atoms[2].text, "Third sentence.");
+            let chars: Vec<_> = text.chars().collect();
+            let mut cursor = 0;
+            for atom in &atoms {
+                assert_eq!(atom.start, cursor);
+                assert_eq!(
+                    atom.text,
+                    chars[atom.start..atom.end].iter().collect::<String>()
+                );
+                cursor = atom.end;
+            }
+            assert_eq!(cursor, chars.len());
+        }
+    }
+
+    #[test]
+    fn list_number_mask_leaves_decimals_formulas_and_asides_unchanged() {
+        for text in [
+            "3.14 is pi.",
+            "(8 + 2) is ten.",
+            "(2020 was unusual.) Next sentence.",
+            "(8)word",
+            "(8)",
+            "[8]. A reference.",
+            "Figure C.1 is referenced.",
+        ] {
+            let mut chars: Vec<_> = text.chars().collect();
+            mask_leading_list_number(&mut chars);
+            assert_eq!(chars.iter().collect::<String>(), text);
+        }
+    }
+
+    #[test]
+    fn numbered_network_training_paragraph_keeps_aside_links_and_citation_styles() {
+        let plain = |text: &str| {
+            Inline::Text(TextRun {
+                text: text.into(),
+                style: Default::default(),
+                link: None,
+            })
+        };
+        let reference = |text: &str, id| {
+            Inline::Text(TextRun {
+                text: text.into(),
+                style: rebook_publication::TextStyle {
+                    inline_citation: id,
+                    ..Default::default()
+                },
+                link: None,
+            })
+        };
+        let link = PublicationUrl::parse("chapter.xhtml#figure-C-1").unwrap();
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            source: None,
+            style: Default::default(),
+            content: vec![
+                plain(
+                    "(8) Steps 6 and 7 are repeated for each set of connection weights until all of the weights have been adjusted. (In the network shown in ",
+                ),
+                Inline::Text(TextRun {
+                    text: "Figure C.1".into(),
+                    style: Default::default(),
+                    link: Some(link.clone()),
+                }),
+                plain(
+                    ", there are only two layers of connections, but other networks might have three or more layers of connections.) As indicated, each application of the forward ",
+                ),
+                reference("(Steps 1–3)", 1),
+                plain(" and backward "),
+                reference("(Steps 4–7)", 2),
+                plain(
+                    " equations constitutes a single training epoch. Depending on the nature of the patterns that are being learned, the value of the learning rate parameter, and the architecture of the network, the network usually requires on the order of hundreds or thousands of training epochs to learn any type of problem of moderate complexity (e.g., the types of cognitive processes that are the focus of this book).",
+                ),
+            ],
+        };
+        let original = inline_text(&block.content);
+        let atoms = paragraph_atoms_for_content(&block.content, "en");
+        assert_eq!(atoms.len(), 3);
+        assert!(
+            atoms[0].text.starts_with("(8) Steps")
+                && atoms[0].text.trim_end().ends_with("connections.)")
+        );
+        assert!(
+            atoms[1].text.trim_start().starts_with("As indicated,")
+                && atoms[1].text.trim_end().ends_with("epoch.")
+        );
+        assert!(atoms[2].text.starts_with("Depending on") && atoms[2].text.ends_with("book)."));
+        assert_eq!(
+            atoms
+                .iter()
+                .map(|atom| atom.text.as_str())
+                .collect::<String>(),
+            original
+        );
+        apply_sentence_structure(&mut block, "en");
+        assert!(block.style.sentence_indents);
+        assert_eq!(
+            block
+                .content
+                .iter()
+                .filter(|inline| matches!(inline, Inline::Break))
+                .count(),
+            2
+        );
+        assert_eq!(inline_text(&block.content).replace('\n', ""), original);
+        let links: Vec<_> = block
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) => run.link.as_ref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links, vec![&link]);
+        let citations: Vec<_> = block
+            .content
+            .iter()
+            .filter_map(|inline| match inline {
+                Inline::Text(run) if run.style.inline_citation != 0 => {
+                    Some((run.style.inline_citation, run.text.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(citations, vec![(1, "(Steps 1–3)"), (2, "(Steps 4–7)")]);
     }
 
     #[test]

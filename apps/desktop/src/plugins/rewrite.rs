@@ -147,6 +147,10 @@ impl BookSource for RewriteBookSource {
         self.inner.book()
     }
 
+    fn content_revision(&self) -> Option<u64> {
+        Some(self.revision())
+    }
+
     fn table_of_contents_origin(&self) -> rebook_publication::TableOfContentsOrigin {
         self.inner.table_of_contents_origin()
     }

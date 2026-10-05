@@ -1209,6 +1209,68 @@ impl ReaderSession {
         self.chapter_prelude_sections(self.current_section)
     }
 
+    /// Content from the same prepared snapshot as the active unit's pages.
+    /// Copies only its fragments and never reparses the publication source.
+    pub fn current_reading_unit_content(&self) -> Result<Vec<(usize, Section)>, ReaderError> {
+        let fixed = self
+            .fixed_reading_units
+            .as_ref()
+            .and_then(|units| units.get(self.current_reading_unit));
+        let group = fixed.map_or_else(
+            || self.current_reading_unit_sections(),
+            |unit| unit.section_range.clone(),
+        );
+        let grouped = group.len() > 1;
+        group
+            .map(|index| {
+                let prepared = self.repository.load(index)?;
+                let unit_index = if grouped {
+                    0
+                } else {
+                    self.current_reading_unit
+                };
+                let range = if fixed.is_some() {
+                    0..prepared.fragments.len()
+                } else {
+                    prepared
+                        .reading_units
+                        .get(unit_index)
+                        .or_else(|| prepared.reading_units.first())
+                        .map_or(0..prepared.fragments.len(), |unit| {
+                            unit.fragment_range.clone()
+                        })
+                };
+                Ok((
+                    index,
+                    self.section_snapshot(index, &prepared.fragments[range]),
+                ))
+            })
+            .collect()
+    }
+
+    /// Reconstructs a cached section for linked notes without calling the source.
+    pub fn cached_section_content(&self, index: usize) -> Option<Section> {
+        let prepared = self.repository.get(index)?;
+        Some(self.section_snapshot(index, &prepared.fragments))
+    }
+
+    fn section_snapshot(&self, index: usize, fragments: &[ContentFragment]) -> Section {
+        let descriptor = &self.source.book().sections[index];
+        let mut blocks = Vec::new();
+        for block in fragments.iter().flat_map(|fragment| &fragment.blocks) {
+            append_snapshot_block(&mut blocks, block);
+        }
+        Section {
+            id: descriptor.id.clone(),
+            href: descriptor.href.clone(),
+            blocks,
+            anchors: fragments
+                .iter()
+                .flat_map(|fragment| fragment.anchors.iter().cloned())
+                .collect(),
+        }
+    }
+
     /// Returns the pages intersecting the active semantic table-of-contents unit.
     /// The first and last page carry semantic crop bounds so continuous views do
     /// not expose neighboring units that share those physical pages.
@@ -3598,6 +3660,27 @@ fn prepare_section(
         anchor_segments,
         reading_units,
     }
+}
+
+// Pagination can split a long authored text block into budgeted fragments.
+// Restore its identity, margins and full text before exposing focus content.
+fn append_snapshot_block(blocks: &mut Vec<Block>, block: &Block) {
+    if let Block::Text(next) = block
+        && let Some(Block::Text(previous)) = blocks.last_mut()
+        && let (Some(left), Some(right)) = (&mut previous.source, &next.source)
+        && left.start.spine == left.end.spine
+        && left.start.node == left.end.node
+        && right.start.spine == right.end.spine
+        && right.start.node == right.end.node
+        && left.end == right.start
+        && left.start.text_offset < left.end.text_offset
+    {
+        previous.content.extend(next.content.iter().cloned());
+        previous.style.margin_after = next.style.margin_after;
+        left.end = right.end.clone();
+        return;
+    }
+    blocks.push(block.clone());
 }
 
 fn build_reading_units(
@@ -6473,6 +6556,99 @@ mod tests {
         assert_eq!(source.parse_count(1), 1);
         assert_eq!(source.parse_count(2), 1);
         assert_eq!(source.parse_count(3), 1);
+    }
+
+    #[test]
+    fn prepared_content_restores_long_paragraphs_without_reparsing() {
+        let text = "Long authored paragraph. ".repeat(1000);
+        let mut source = CountingSource::new(std::slice::from_ref(&text));
+        let Block::Text(block) = &mut Arc::get_mut(&mut source).unwrap().sections[0].blocks[0]
+        else {
+            unreachable!()
+        };
+        block.style.margin_before = 17.0;
+        block.style.margin_after = 23.0;
+        block.style.indent = 11.0;
+        let expected = block.clone();
+        let reader =
+            ReaderSession::open(source.clone(), viewport(800, 600), ReaderStyle::default())
+                .unwrap();
+        for _ in 0..3 {
+            let content = reader.current_reading_unit_content().unwrap();
+            assert_eq!(content.len(), 1);
+            assert_eq!(content[0].1.blocks.len(), 1);
+            let Block::Text(restored) = &content[0].1.blocks[0] else {
+                unreachable!()
+            };
+            assert_eq!(restored.source, expected.source);
+            assert_eq!(restored.style, expected.style);
+            assert_eq!(restored.kind, expected.kind);
+            let restored_text = restored
+                .content
+                .iter()
+                .filter_map(|inline| match inline {
+                    Inline::Text(run) => Some(run.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(restored_text, text);
+        }
+        assert_eq!(source.parse_count(0), 1);
+    }
+
+    #[test]
+    fn prepared_content_is_scoped_to_current_toc_unit() {
+        let mut source = CountingSource::new(&["First unit".into()]);
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        let mut second = source_mut.sections[0].blocks[0].clone();
+        let Block::Text(block) = &mut second else {
+            unreachable!()
+        };
+        block.source.as_mut().unwrap().start.node = "second".into();
+        block.source.as_mut().unwrap().end.node = "second".into();
+        block.source.as_mut().unwrap().end.text_offset = 11;
+        block.content = vec![Inline::Text(TextRun {
+            text: "Second unit".into(),
+            style: Default::default(),
+            link: None,
+        })];
+        let anchor = block.source.as_ref().unwrap().start.clone();
+        source_mut.sections[0].blocks.push(second);
+        source_mut.sections[0].anchors.push(SectionAnchor {
+            fragment: "second".into(),
+            source: anchor,
+        });
+        source_mut.book.table_of_contents = vec![TocEntry {
+            label: "First unit".into(),
+            href: Some(PublicationUrl::parse("section-0.xhtml").unwrap()),
+            children: Vec::new(),
+        }];
+        source_mut.book.table_of_contents.push(TocEntry {
+            label: "Second unit".into(),
+            href: Some(PublicationUrl::parse("section-0.xhtml#second").unwrap()),
+            children: Vec::new(),
+        });
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(800, 600), ReaderStyle::default())
+                .unwrap();
+        assert_eq!(
+            reader.current_reading_unit_content().unwrap()[0]
+                .1
+                .blocks
+                .len(),
+            1
+        );
+        reader
+            .go_to_href(&PublicationUrl::parse("section-0.xhtml#second").unwrap())
+            .unwrap();
+        let content = reader.current_reading_unit_content().unwrap();
+        assert_eq!(content[0].1.blocks.len(), 1);
+        assert_eq!(
+            block_source(&content[0].1.blocks[0]).unwrap().start.node,
+            "second"
+        );
+        assert_eq!(reader.cached_section_content(0).unwrap().blocks.len(), 2);
+        assert_eq!(source.parse_count(0), 1);
     }
 
     #[test]

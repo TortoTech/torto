@@ -1,6 +1,120 @@
 use crate::reader::*;
 
 #[test]
+#[ignore = "requires TORTO_SCROLL_BOOK; profiles OCR scrolling locally without model calls"]
+fn local_ocr_scroll_performance() {
+    let path = PathBuf::from(std::env::var("TORTO_SCROLL_BOOK").unwrap());
+    let scratch = std::env::temp_dir().join(format!("torto-scroll-perf-{}", std::process::id()));
+    let store =
+        crate::sync::SyncStore::open_at(scratch.join("sync.sqlite3"), "diagnostic").unwrap();
+    let mut reader = open_reader(
+        &path,
+        crate::fonts::embedded_reader_fonts(),
+        None,
+        None,
+        store,
+    )
+    .unwrap();
+    reader.progress_store = None;
+    let label = std::env::var("TORTO_SCROLL_TOC").unwrap_or_else(|_| "8.4.1".into());
+    let target = reader
+        .reader
+        .toc_items()
+        .iter()
+        .find(|item| item.label.contains(&label))
+        .unwrap()
+        .clone();
+    let result = reader
+        .reader
+        .go_to_href(target.target.as_ref().unwrap())
+        .unwrap();
+    reader.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
+    reader.focus_anchor = reader
+        .reader
+        .source_anchor_for_href(target.target.as_ref().unwrap());
+    let index = reader.snapshot.location.section_index;
+    for run in 0..3 {
+        let now = Instant::now();
+        let section = reader.source.parse_section(index).unwrap();
+        println!(
+            "PERF parse run={run} ms={:.3} blocks={}",
+            now.elapsed().as_secs_f64() * 1000.0,
+            section.blocks.len()
+        );
+    }
+    let ctx = egui::Context::default();
+    let frame = |reader: &mut DesktopReader| {
+        let now = Instant::now();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(1200.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |root| {
+                reader.ui(root, None, false);
+            },
+        );
+        out.textures_delta.clear();
+        now.elapsed().as_secs_f64() * 1000.0
+    };
+    for run in 0..6 {
+        println!("PERF ui warm={run} ms={:.3}", frame(&mut reader));
+    }
+    let layout = reader.current_scroll_layout().unwrap();
+    for run in 0..3 {
+        let now = Instant::now();
+        reader.rebuild_focus_units(&layout);
+        println!(
+            "PERF focus_rebuild run={run} ms={:.3} units={}",
+            now.elapsed().as_secs_f64() * 1000.0,
+            reader.focus_units.len()
+        );
+    }
+    let now = Instant::now();
+    let prepared = super::preparation::prepare_with_plans(
+        reader.semantic_source.original(),
+        reader.current_content_request_ranges().unwrap(),
+        HashMap::new(),
+        false,
+        false,
+        reader.reader.toc_items(),
+        HashMap::new(),
+    );
+    println!(
+        "PERF background_prepare_ms={:.3}",
+        now.elapsed().as_secs_f64() * 1000.0
+    );
+    reader.semantic_layout.originals = prepared.originals;
+    reader.semantic_layout.hashes = prepared.hashes;
+    reader.semantic_layout.inputs = prepared.inputs;
+    *reader.semantic_layout.batch_plans.get_mut() = prepared.batch_plans;
+    for turn in 0..20 {
+        let demand = reader.current_content_request_ranges().unwrap();
+        let now = Instant::now();
+        let plan = reader.semantic_batch_plan(&demand);
+        println!(
+            "PERF plan turn={turn} ms={:.3} batches={}",
+            now.elapsed().as_secs_f64() * 1000.0,
+            plan.len()
+        );
+        reader.move_focus_unit(PageDirection::Next);
+        for run in 0..4 {
+            let ui_ms = frame(&mut reader);
+            let now = Instant::now();
+            let scene = reader.page_scene();
+            println!(
+                "PERF scroll turn={turn} frame={run} ui_ms={ui_ms:.3} scene_ms={:.3} images={}",
+                now.elapsed().as_secs_f64() * 1000.0,
+                scene.images.len()
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires TORTO_PERF_BOOK; profiles cached local content without model requests"]
 fn local_cached_semantic_source_performance() {
     let book = rebook_formats::open_file(std::path::PathBuf::from(

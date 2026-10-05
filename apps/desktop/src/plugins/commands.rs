@@ -103,9 +103,9 @@ pub fn resolve_chat_command(input: &str) -> ChatCommandResolution {
     }
 
     let prompt = match command.name {
-        "/summary" => "请总结当前章节内容。要求：用中文回答；先给出一句话概括，再列出关键要点；如果章节中有重要术语，请单独解释；每个主要结论都使用提供的 href 就近引用。".into(),
+        "/summary" => "请用中文总结当前章节。先用一句话概括，再列出关键要点。单独解释重要术语。每个主要结论使用提供的 citation 就近引用。".into(),
         "/search" => format!(
-            "请在本书中搜索与“{args}”相关的信息，优先使用 searchBook；需要阅读完整章节时使用 getContent。请用中文回答，列出最相关的章节或段落，并简要解释上下文。"
+            "用 searchBook 搜索本书中与“{args}”相关的信息。需要完整章节时调用 getContent。用中文列出最相关的章节或段落，并简要解释上下文。"
         ),
         "/rewrite" => {
             let extra = if args.is_empty() {
@@ -114,10 +114,10 @@ pub fn resolve_chat_command(input: &str) -> ChatCommandResolution {
                 format!("\n额外改写要求：{args}")
             };
             format!(
-                "请改写当前章节正文，默认改成更通俗易懂的中文。必须先调用 getContent 获取块 id，再调用 rewriteBlocks 修改实际渲染文本，不要只在回答中贴改写结果。保留原文核心信息、术语和逻辑；不要修改图片或表格；完成后只简要说明已改写完成。{extra}"
+                "将当前章节正文改写为通俗易懂的中文。先调用 getContent 获取块 id，再调用 rewriteBlocks 修改正文。保留核心信息、术语和逻辑。不要修改图片或表格。完成后简要说明结果。{extra}"
             )
         }
-        "/extract" => "请提取当前章节的关键概念。要求：用中文回答；先列出概念清单，再分别解释每个概念的含义、它在本章中的作用，以及概念之间的关系。涉及本章具体内容时说明对应段落依据。".into(),
+        "/extract" => "用中文提取当前章节的关键概念。先列出概念，再解释各自的含义、在本章中的作用和相互关系。具体内容使用对应段落的 citation 引用。".into(),
         _ => unreachable!("every registered command has a prompt"),
     };
     ChatCommandResolution::Resolved {
@@ -194,6 +194,7 @@ mod tests {
         };
         assert_eq!(kind, ChatRequestKind::ChapterSummary);
         assert!(!prompt.contains("getVisualContent"));
-        assert!(prompt.contains("href"));
+        assert!(prompt.contains("citation"));
+        assert!(!prompt.contains("href"));
     }
 }

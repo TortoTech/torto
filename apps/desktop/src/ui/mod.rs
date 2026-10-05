@@ -45,6 +45,16 @@ pub(crate) fn modal_area(ctx: &egui::Context, id: egui::Id) -> egui::Area {
         .constrain_to(ctx.content_rect())
 }
 
+/// Full-window modal with matching dimming for caption controls painted above it.
+pub(crate) fn modal(ctx: &egui::Context, id: egui::Id, opacity: f32) -> egui::Modal {
+    let opacity = opacity.clamp(0.0, 1.0);
+    #[cfg(target_os = "windows")]
+    crate::app::window_chrome::dim_controls(ctx, opacity);
+    egui::Modal::new(id)
+        .area(modal_area(ctx, id))
+        .backdrop_color(Color32::BLACK.gamma_multiply(opacity))
+}
+
 const EGUI_BASE_FONT_SIZE: f32 = 13.0;
 const EGUI_BASE_EXTRA_TEXT_LINE_SPACING: f32 = 1.0;
 const TOAST_MAX_WIDTH: f32 = 400.0;
@@ -726,6 +736,7 @@ mod tests {
                 (Vec2::new(1200.0, 800.0), 1.0),
                 (Vec2::new(1200.0, 800.0), 0.5),
                 (Vec2::new(1200.0, 800.0), 0.25),
+                (Vec2::new(1200.0, 800.0), 0.42 / 0.46),
             ] {
                 let screen = Rect::from_min_size(egui::Pos2::ZERO, size);
                 let mut output = None;
@@ -744,20 +755,18 @@ mod tests {
                                     Vec2::new(screen.width(), window_chrome::HEIGHT),
                                 ),
                             );
-                            let response = egui::Modal::new(egui::Id::new("caption-modal-test"))
-                                .area(modal_area(&ctx, egui::Id::new("caption-modal-test")))
-                                .backdrop_color(Color32::BLACK.gamma_multiply(0.46 * progress))
-                                .frame(egui::Frame::new().fill(Color32::WHITE))
-                                .show(&ctx, |ui| {
-                                    ui.set_width(400.0);
-                                    ui.set_height(300.0);
-                                    ui.label("Settings");
-                                });
+                            let response =
+                                modal(&ctx, egui::Id::new("caption-modal-test"), 0.46 * progress)
+                                    .frame(egui::Frame::new().fill(Color32::WHITE))
+                                    .show(&ctx, |ui| {
+                                        ui.set_width(400.0);
+                                        ui.set_height(300.0);
+                                        ui.label("Settings");
+                                    });
                             assert!(
                                 response.response.rect.top() >= window_chrome::HEIGHT,
                                 "modal content stays below the caption"
                             );
-                            window_chrome::dim_controls(&ctx, 0.46 * progress);
                             window_chrome::paint_controls(&ctx);
                         },
                     );

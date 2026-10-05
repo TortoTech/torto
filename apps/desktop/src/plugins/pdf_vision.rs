@@ -21,10 +21,11 @@ pub(super) async fn request_vision_json(
     provider: &AiProvider,
     model: &str,
     content: Vec<Value>,
+    schema: Value,
 ) -> Result<Value, String> {
     crate::plugins::llm::budgeted(async {
         let messages = vec![json!({ "role": "user", "content": content })];
-        let mut extra_body = super::llm::schema_options(json!({"type":"object"}));
+        let mut extra_body = super::llm::schema_options(schema);
         if model.to_ascii_lowercase().contains("qwen") {
             extra_body["enable_thinking"] = Value::Bool(false);
         }
