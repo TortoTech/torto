@@ -43,9 +43,11 @@ pub struct PageSelectionFragment {
     pub rects: Vec<Rect>,
 }
 
-/// Original raster content for the top-most image under a page coordinate.
+/// Raster content for the top-most image under a page coordinate.
+/// Downsampled display rasters retain their original resource in `origin`.
 #[derive(Clone)]
 pub struct PageImageHit {
+    pub origin: Option<rebook_layout::RasterOrigin>,
     pub formula: Option<String>,
     pub bounds: Rect,
     pub width: u32,
@@ -356,6 +358,65 @@ impl PageDisplayList {
         })
     }
 
+    /// Includes on-page rasters and original formula pixels retained for copy.
+    /// Pointer identities permit callers to count shared RGBA allocations once.
+    pub fn raster_allocations(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.commands
+            .iter()
+            .filter_map(|command| match command {
+                DisplayCommand::Image(command) => Some([
+                    (command.pixels.as_ptr() as usize, command.pixels.len()),
+                    (
+                        command.image.image.data.as_ref().as_ptr() as usize,
+                        command.image.image.data.len(),
+                    ),
+                ]),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    /// Approximate retained layout/command bytes, excluding shared font and
+    /// raster blobs. Shaping internals use a conservative per-byte estimate.
+    pub fn estimated_layout_bytes(&self) -> usize {
+        self.accumulate_layout_bytes(&mut std::collections::HashSet::new())
+    }
+
+    /// Accumulates several pages without counting shared shaped paragraphs twice.
+    pub fn accumulate_layout_bytes(&self, layouts: &mut std::collections::HashSet<usize>) -> usize {
+        fn allocation<T>(items: &Vec<T>) -> usize {
+            items.capacity() * std::mem::size_of::<T>()
+        }
+        let mut bytes = std::mem::size_of::<Self>()
+            + allocation(&self.commands)
+            + allocation(&self.text_regions)
+            + allocation(&self.inline_content_regions)
+            + allocation(&self.table_regions)
+            + allocation(&self.quote_regions)
+            + allocation(&self.footnote_regions)
+            + allocation(&self.text_groups);
+        for command in &self.commands {
+            if let DisplayCommand::Glyphs(command) = command {
+                bytes += command.glyphs.len() * std::mem::size_of::<Glyph>()
+                    + std::mem::size_of_val(command.normalized_coords.as_ref());
+            }
+        }
+        for region in &self.text_regions {
+            bytes += match region {
+                TextRegion::Shaped(region)
+                    if layouts.insert(Arc::as_ptr(&region.layout) as usize) =>
+                {
+                    region.text.len().saturating_mul(64)
+                }
+                TextRegion::Fixed(region) => {
+                    region.text.len() + std::mem::size_of_val(region.spans.as_ref())
+                }
+                _ => 0,
+            };
+        }
+        bytes
+    }
+
     /// Returns the top-most retained raster image under the given page coordinate.
     pub fn image_at(&self, x: f32, y: f32) -> Option<PageImageHit> {
         let point = kurbo::Point::new(f64::from(x), f64::from(y));
@@ -367,6 +428,7 @@ impl PageDisplayList {
                     if command.interactive && command.bounds.contains(point) =>
                 {
                     Some(PageImageHit {
+                        origin: command.origin.clone(),
                         formula: command.formula.clone(),
                         bounds: command.bounds,
                         width: command.width,
@@ -2027,6 +2089,7 @@ struct GlyphCommand {
 
 #[derive(Clone)]
 struct ImageCommand {
+    origin: Option<rebook_layout::RasterOrigin>,
     formula: Option<String>,
     image: ImageBrush,
     transform: Affine,
@@ -2173,7 +2236,11 @@ impl DisplayListCompiler {
                 }
                 PageItem::Image(image) => {
                     let data = ImageData {
-                        data: Blob::new(Arc::new(image.image.pixels.clone())),
+                        data: image
+                            .image
+                            .blob
+                            .clone()
+                            .unwrap_or_else(|| Blob::new(Arc::new(image.image.pixels.clone()))),
                         format: ImageFormat::Rgba8,
                         alpha_type: ImageAlphaType::Alpha,
                         width: image.image.width,
@@ -2185,6 +2252,7 @@ impl DisplayListCompiler {
                             f64::from(image.height) / f64::from(image.image.height.max(1)),
                         );
                     commands.push(DisplayCommand::Image(ImageCommand {
+                        origin: image.image.origin.clone(),
                         formula: image.formula_presentation.as_ref().map(|f| f.latex.clone()),
                         image: ImageBrush::new(data),
                         transform,
@@ -2584,13 +2652,18 @@ fn compile_text_commands(
                         f64::from(image.height) / f64::from(image.image.height.max(1)),
                     );
                 let data = ImageData {
-                    data: Blob::new(Arc::new(image.image.pixels.clone())),
+                    data: image
+                        .image
+                        .blob
+                        .clone()
+                        .unwrap_or_else(|| Blob::new(Arc::new(image.image.pixels.clone()))),
                     format: ImageFormat::Rgba8,
                     alpha_type: ImageAlphaType::Alpha,
                     width: image.image.width,
                     height: image.image.height,
                 };
                 commands.push(DisplayCommand::Image(ImageCommand {
+                    origin: image.image.origin.clone(),
                     formula: image.formula_presentation.as_ref().map(|f| f.latex.clone()),
                     image: ImageBrush::new(data),
                     transform: image_transform,
@@ -3010,6 +3083,8 @@ mod tests {
     #[test]
     fn rendered_formula_preview_keeps_original_pixels_and_latex() {
         let original = rebook_layout::RasterImage {
+            origin: None,
+            blob: None,
             width: 3,
             height: 2,
             pixels: vec![127; 24].into(),
@@ -3025,6 +3100,8 @@ mod tests {
                     latex: r"\sigma=\sqrt{k\theta^2}".into(),
                 }),
                 image: rebook_layout::RasterImage {
+                    origin: None,
+                    blob: None,
                     width: 40,
                     height: 20,
                     pixels: vec![255; 40 * 20 * 4].into(),
@@ -3412,6 +3489,8 @@ mod tests {
                     formula_presentation: None,
                     id: 1,
                     image: RasterImage {
+                        origin: None,
+                        blob: None,
                         width: 1,
                         height: 1,
                         pixels: Arc::from([0_u8, 0, 0, 255]),
@@ -3492,6 +3571,8 @@ mod tests {
                     formula_presentation: None,
                     id: 7,
                     image: RasterImage {
+                        origin: None,
+                        blob: None,
                         width: 1,
                         height: 1,
                         pixels: Arc::from([0_u8, 0, 0, 255]),
@@ -4018,6 +4099,8 @@ mod tests {
             items: vec![PageItem::Image(ImagePlacement {
                 formula_presentation: None,
                 image: RasterImage {
+                    origin: None,
+                    blob: None,
                     width: 100,
                     height: 100,
                     pixels: vec![255; 100 * 100 * 4].into(),
@@ -4107,6 +4190,8 @@ mod tests {
             items: vec![PageItem::Image(ImagePlacement {
                 formula_presentation: None,
                 image: RasterImage {
+                    origin: None,
+                    blob: None,
                     width: 100,
                     height: 100,
                     pixels: [200, 201, 202, 255].repeat(100 * 100).into(),

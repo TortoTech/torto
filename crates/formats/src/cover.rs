@@ -42,6 +42,7 @@ pub(super) fn page_thumbnail(source: &dyn BookSource) -> Option<Vec<u8>> {
     let viewport = LayoutViewport {
         width: 420,
         height: 1200,
+        raster_scale: 1.0,
     };
     let mut style = ReaderStyle {
         spread: SpreadMode::Single,
@@ -133,6 +134,7 @@ mod tests {
         let viewport = rebook_layout::LayoutViewport {
             width: 1000,
             height: 1000,
+            raster_scale: 1.0,
         };
         let style = rebook_layout::ReaderStyle {
             website_icons: true,
@@ -233,6 +235,7 @@ mod tests {
         let viewport = rebook_layout::LayoutViewport {
             width: 780,
             height: 1000,
+            raster_scale: 1.0,
         };
         let mut style = rebook_layout::ReaderStyle::default();
         style.writing_system = source.book().metadata.writing_system();

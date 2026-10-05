@@ -25,6 +25,8 @@ pub(crate) struct DesktopApp {
     pending_reader_notice: Option<String>,
     pending_reader_error: Option<String>,
     fullscreen_toggle_requested: bool,
+    memory_sample: Option<(std::time::Instant, bool)>,
+    memory_peak: usize,
     #[cfg(target_os = "windows")]
     updater: crate::updater::WindowsUpdater,
 }
@@ -46,6 +48,8 @@ impl DesktopApp {
             pending_reader_notice: None,
             pending_reader_error: None,
             fullscreen_toggle_requested: false,
+            memory_sample: None,
+            memory_peak: 0,
             #[cfg(target_os = "windows")]
             updater: crate::updater::WindowsUpdater::new(),
         }
@@ -54,6 +58,9 @@ impl DesktopApp {
     pub(crate) fn open_book(&mut self, path: &Path) {
         self.pending_reader_notice = None;
         self.pending_reader_error = None;
+        // Release reusable pixels from the previous book before decoding the
+        // replacement. Its visible layout still owns everything needed to paint.
+        rebook_layout::clear_raster_cache();
         self.shelf.open_book(path);
         if let Some(mut next_reader) = self.shelf.take_opened_reader() {
             if let Some(current_reader) = self.reader.as_ref() {
@@ -77,7 +84,7 @@ impl DesktopApp {
         #[cfg(target_os = "windows")]
         window_chrome::begin_frame(ui.ctx());
         self.reconcile_state(ui.ctx());
-        self.shelf.poll_sync(ui.ctx());
+        self.shelf.poll_background_tasks();
         let open_settings_shortcut = self.settings.applied().shortcuts.open_settings;
         if !self.settings.is_open()
             && ui
@@ -151,7 +158,65 @@ impl DesktopApp {
         }
         #[cfg(target_os = "windows")]
         window_chrome::paint_controls(ui.ctx());
+        self.sample_memory(ui.ctx());
         plan
+    }
+
+    fn sample_memory(&mut self, ctx: &egui::Context) {
+        use crate::diagnostics::{Field, log};
+        let reader_open = self.reader.is_some();
+        let changed = self
+            .memory_sample
+            .is_none_or(|(_, previous)| previous != reader_open);
+        if !changed
+            && self
+                .memory_sample
+                .is_some_and(|(at, _)| at.elapsed().as_secs() < 10)
+        {
+            return;
+        }
+        self.memory_sample = Some((std::time::Instant::now(), reader_open));
+        ctx.request_repaint_after(std::time::Duration::from_secs(10));
+        let (reader, scenes) = self
+            .reader
+            .as_ref()
+            .map(DesktopReader::memory_stats)
+            .unwrap_or_default();
+        let rasters = rebook_layout::raster_cache_stats();
+        let covers = self.shelf.cover_cache_bytes();
+        let (working_set, private_bytes) = crate::diagnostics::process_memory();
+        #[cfg(all(target_os = "windows", feature = "memory-profiling"))]
+        {
+            let (live, peak) = rebook_windows_window_background::rust_allocation_bytes();
+            log(
+                "memory.rust",
+                &[
+                    Field::Usize("live_bytes", live),
+                    Field::Usize("peak_bytes", peak),
+                ],
+            );
+        }
+        self.memory_peak = self.memory_peak.max(working_set);
+        log(
+            "memory.caches",
+            &[
+                Field::Bool("reader", reader_open),
+                Field::Usize("cover_bytes", covers),
+                Field::Usize("raster_cache_bytes", rasters.bytes),
+                Field::Usize("raster_images", rasters.images),
+                Field::U64("raster_hits", rasters.hits),
+                Field::U64("raster_misses", rasters.misses),
+                Field::Usize("layout_estimated_bytes", reader.layout_bytes),
+                Field::Usize("layout_raster_bytes", reader.raster_bytes),
+                Field::Usize("pinned_bytes", reader.pinned_bytes),
+                Field::Usize("segments", reader.segments),
+                Field::Usize("scene_cache_bytes", scenes),
+                Field::Usize("working_set_bytes", working_set),
+                Field::Usize("private_bytes", private_bytes),
+                Field::Bool("process_counters_available", working_set > 0),
+                Field::Usize("sampled_peak_working_set", self.memory_peak),
+            ],
+        );
     }
 
     pub(crate) fn take_fullscreen_toggle_request(&mut self) -> bool {
@@ -201,6 +266,13 @@ impl DesktopApp {
                 ],
             );
         }
+    }
+
+    pub(crate) fn complete_shelf_sync_check(
+        &mut self,
+        message: crate::shelf::SyncCheckMessage,
+    ) -> bool {
+        self.shelf.complete_sync_check(message)
     }
 
     pub(crate) fn complete_shelf_sync(&mut self, message: SyncTaskMessage) {
@@ -341,6 +413,7 @@ impl DesktopApp {
             self.pending_reader_notice = notice;
             self.pending_reader_error = error;
             self.reader = None;
+            rebook_layout::clear_raster_cache();
             self.shelf.open_book(&path);
         }
         if self
@@ -352,6 +425,7 @@ impl DesktopApp {
                 reader.prepare_for_shutdown();
             }
             self.reader = None;
+            rebook_layout::clear_raster_cache();
             self.shelf.resume();
         }
         self.promote_opened_reader();

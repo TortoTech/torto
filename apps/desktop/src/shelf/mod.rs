@@ -1,6 +1,10 @@
 mod background;
+mod covers;
 mod sync_button;
+mod sync_monitor;
 mod sync_schedule;
+
+pub(crate) use sync_monitor::SyncCheckMessage;
 
 use background::BackgroundJob;
 
@@ -27,8 +31,8 @@ use crate::sync::{
     append_sync_log, format_error_chain, run_sync,
 };
 use crate::ui::{
-    Icon, ToastKind, decode_color_image, dialog_action_button, dialog_danger_button, icon,
-    icon_button, paint_icon, palette, show_toast,
+    Icon, ToastKind, dialog_action_button, dialog_danger_button, icon, icon_button, paint_icon,
+    palette, show_toast,
 };
 
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
@@ -72,7 +76,7 @@ pub(crate) struct ShelfFeature {
     import_books_shortcut: egui::KeyboardShortcut,
     return_to_shelf_shortcut: egui::KeyboardShortcut,
     settings_requested: bool,
-    cover_textures: HashMap<String, TextureHandle>,
+    cover_textures: covers::CoverCache,
     read_activity: HashMap<String, u64>,
     refresh_generation: u64,
     refresh_requested: bool,
@@ -100,8 +104,7 @@ struct SyncUiState {
     button: SyncButtonState,
     schedule: SyncSchedule,
     import_error: Option<String>,
-    probe_requested: Option<(SyncStore, String)>,
-    probe_job: BackgroundJob<(String, Result<Option<u64>, String>)>,
+    monitor: sync_monitor::SyncMonitor,
 }
 
 struct ShelfSnapshot {
@@ -170,6 +173,9 @@ struct ShelfRemoveConfirmation {
 }
 
 impl ShelfFeature {
+    pub(crate) fn cover_cache_bytes(&self) -> usize {
+        self.cover_textures.bytes()
+    }
     pub(crate) fn startup_error(&self) -> Option<&str> {
         self.shelf
             .error
@@ -257,8 +263,7 @@ impl ShelfFeature {
                 button: SyncButtonState::default(),
                 schedule: SyncSchedule::default(),
                 import_error: None,
-                probe_requested: None,
-                probe_job: BackgroundJob::default(),
+                monitor: sync_monitor::SyncMonitor::default(),
             },
             language,
             search_shortcut: egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F),
@@ -266,7 +271,7 @@ impl ShelfFeature {
             return_to_shelf_shortcut: crate::preferences::ShortcutPreferences::default()
                 .return_to_shelf,
             settings_requested: false,
-            cover_textures: HashMap::new(),
+            cover_textures: covers::CoverCache::default(),
             read_activity: HashMap::new(),
             refresh_generation: 0,
             refresh_requested: false,
@@ -321,6 +326,7 @@ impl ShelfFeature {
             local_store,
         ) {
             Ok(reader) => {
+                self.cover_textures.suspend();
                 self.pending_reader = Some(reader);
                 self.shelf.error = None;
                 self.shelf.error_dismiss_at = None;
@@ -425,7 +431,8 @@ impl ShelfFeature {
         let changed = crate::sync::account_key(&self.sync.settings)
             != crate::sync::account_key(&settings.sync_settings)
             || self.sync.password != settings.sync_password
-            || self.sync.settings.enabled != settings.sync_settings.enabled;
+            || self.sync.settings.enabled != settings.sync_settings.enabled
+            || self.sync.settings.device_id != settings.sync_settings.device_id;
         self.language = settings.language;
         self.search_shortcut = settings.shortcuts.search;
         self.import_books_shortcut = settings.shortcuts.import_books;
@@ -433,6 +440,7 @@ impl ShelfFeature {
         self.sync.settings.clone_from(&settings.sync_settings);
         self.sync.password.clone_from(&settings.sync_password);
         if changed {
+            self.sync.monitor.invalidate();
             self.local_store = SyncStore::open_default(self.sync.settings.device_id.clone()).ok();
             self.start_sync(SyncMode::Full {
                 force_statistics: false,
@@ -495,52 +503,38 @@ impl ShelfFeature {
         }
     }
 
-    pub(crate) fn poll_sync(&mut self, ctx: &egui::Context) {
-        let now = Instant::now();
-        self.sync.button.expire(now);
+    pub(crate) fn poll_background_tasks(&mut self) {
+        self.sync.button.expire(Instant::now());
         self.poll_background();
-        if self.refresh_job.is_running() || self.refresh_requested {
-            ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    fn sync_monitor_key(&self) -> sync_monitor::MonitorKey {
+        sync_monitor::MonitorKey {
+            enabled: self.sync.settings.enabled,
+            account: crate::sync::account_key(&self.sync.settings),
+            device_id: self.sync.settings.device_id.clone(),
+            store_path: self
+                .local_store
+                .as_ref()
+                .map(|store| store.path().to_owned()),
+            running: self.sync.task.is_pending(),
+            schedule: self.sync.schedule.clone(),
         }
-        let probe = self.sync.probe_job.poll();
-        if !self.sync.settings.enabled {
-            return;
+    }
+
+    pub(crate) fn complete_sync_check(&mut self, message: SyncCheckMessage) -> bool {
+        let key = self.sync_monitor_key();
+        let Some(decision) = self.sync.monitor.complete(message, &key) else {
+            return false;
+        };
+        self.sync.schedule = decision.schedule;
+        if decision.refresh {
+            self.refresh_read_activity();
         }
-        ctx.request_repaint_after(Duration::from_secs(1));
-        if let Some((account, result)) = probe
-            && account == crate::sync::account_key(&self.sync.settings)
-            && !self.sync.task.is_pending()
-        {
-            match result {
-                Ok(latest) => {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    if let Some(mode) = self.sync.schedule.next(now, now_ms, latest) {
-                        self.start_sync(mode);
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "failed to inspect pending sync changes"),
-            }
+        if let Some(mode) = decision.mode {
+            self.start_sync(mode);
         }
-        if now < self.sync.schedule.next_poll {
-            return;
-        }
-        self.sync.schedule.next_poll = now + Duration::from_secs(1);
-        if let Ok(token) = crate::sync::derived_change_token() {
-            if token.is_some() && token != self.sync.schedule.derived_token {
-                self.request_file_sync();
-            }
-            self.sync.schedule.derived_token = token;
-        }
-        if self.sync.task.is_pending() || self.sync.probe_job.is_running() {
-            return;
-        }
-        if let Some(store) = &self.local_store {
-            self.sync.probe_requested =
-                Some((store.clone(), crate::sync::account_key(&self.sync.settings)));
-        }
+        true
     }
 
     fn start_sync(&mut self, mode: SyncMode) {
@@ -609,6 +603,10 @@ impl ShelfFeature {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<crate::platform::UserEvent>,
     ) {
+        let wake = proxy.clone();
+        self.cover_textures.spawn(runtime, move || {
+            let _ = wake.send_event(crate::platform::UserEvent::RepaintAfter(Duration::ZERO));
+        });
         if !self.cover_job.is_running() {
             let books = self
                 .shelf
@@ -680,25 +678,13 @@ impl ShelfFeature {
                 },
             );
         }
-        if !self.sync.probe_job.is_running()
-            && let Some((store, account)) = self.sync.probe_requested.take()
-        {
-            let wake = proxy.clone();
-            self.sync.probe_job.start(
-                runtime,
-                move || {
-                    let latest = store
-                        .pending_reading(&account)
-                        .map(|pending| pending.into_iter().map(|(_, _, changed)| changed).max())
-                        .map_err(|error| error.to_string());
-                    (account, latest)
-                },
-                move || {
-                    let _ =
-                        wake.send_event(crate::platform::UserEvent::RepaintAfter(Duration::ZERO));
-                },
-            );
-        }
+        let key = self.sync_monitor_key();
+        let wake = proxy.clone();
+        self.sync
+            .monitor
+            .update(runtime, self.local_store.clone(), key, move |message| {
+                let _ = wake.send_event(crate::platform::UserEvent::ShelfSyncCheck(message));
+            });
         if let Some(request) = self.import_task.take_pending() {
             let proxy = proxy.clone();
             runtime.spawn(async move {
@@ -886,13 +872,29 @@ impl ShelfFeature {
     }
 
     pub(crate) fn ui(&mut self, root_ui: &mut egui::Ui, interaction_blocked: bool) {
+        self.cover_textures.begin_frame(root_ui.ctx());
         if self.statistics.open {
             self.statistics.ui(
                 root_ui,
                 self.language,
                 interaction_blocked,
                 self.return_to_shelf_shortcut,
+                &mut |ui, id, size| {
+                    let book = self
+                        .shelf
+                        .library
+                        .books()
+                        .iter()
+                        .find(|book| book.id == id)?;
+                    self.cover_textures.texture_sized(
+                        ui.ctx(),
+                        id,
+                        book.cover_bytes.as_deref()?,
+                        size,
+                    )
+                },
             );
+            self.cover_textures.trim();
             return;
         }
         let ctx = root_ui.ctx().clone();
@@ -967,7 +969,17 @@ impl ShelfFeature {
                     .books()
                     .iter()
                     .filter(|book| book_matches_query(book, &query))
-                    .cloned()
+                    // Covers remain in the library; copying their encoded
+                    // bytes on every animation frame dominates shelf CPU work.
+                    .map(|book| LibraryBook {
+                        id: book.id.clone(),
+                        title: book.title.clone(),
+                        authors: book.authors.clone(),
+                        file_name: book.file_name.clone(),
+                        path: book.path.clone(),
+                        cover_bytes: None,
+                        added_at: book.added_at,
+                    })
                     .collect();
                 sort_shelf_books(&mut books, &self.read_activity);
                 if search_response.changed() {
@@ -1000,6 +1012,7 @@ impl ShelfFeature {
                     });
                 }
             });
+        self.cover_textures.trim();
         if !interaction_blocked {
             self.dialogs(&ctx);
         }
@@ -1142,28 +1155,40 @@ impl ShelfFeature {
             None => {}
         }
         let selected_id = self.shelf.selected_book_id.clone();
+        let selected_index = selected_id
+            .as_ref()
+            .and_then(|id| books.iter().position(|book| &book.id == id))
+            .unwrap_or(0);
         let request_selected_focus = std::mem::take(&mut self.shelf.focus_selected_book);
-        egui::Grid::new("shelf-grid")
-            .num_columns(columns)
-            .spacing(Vec2::new(20.0, 24.0))
-            .show(ui, |ui| {
-                for (index, book) in books.iter().enumerate() {
-                    let selected = selected_id.as_deref() == Some(book.id.as_str());
-                    if self.book_card(
-                        ui,
-                        book,
-                        selected,
-                        selected && request_selected_focus,
-                        interaction_blocked,
-                    ) {
-                        self.shelf.selected_book_id = Some(book.id.clone());
-                        open_path = Some(book.path.clone());
-                    }
-                    if (index + 1) % columns == 0 {
-                        ui.end_row();
-                    }
+        let target_visible = show_virtual_shelf_grid(
+            ui,
+            books.len(),
+            columns,
+            request_selected_focus.then_some(selected_index),
+            |ui, index| {
+                let book = &books[index];
+                let selected = selected_id.as_deref() == Some(book.id.as_str());
+                if ui
+                    .push_id(&book.id, |ui| {
+                        self.book_card(
+                            ui,
+                            book,
+                            selected,
+                            selected && request_selected_focus,
+                            interaction_blocked,
+                        )
+                    })
+                    .inner
+                {
+                    self.shelf.selected_book_id = Some(book.id.clone());
+                    open_path = Some(book.path.clone());
                 }
-            });
+            },
+        );
+        if request_selected_focus && !target_visible {
+            self.shelf.focus_selected_book = true;
+            ui.ctx().request_repaint();
+        }
         if let Some(path) = open_path {
             self.open_book(&path);
         }
@@ -1277,17 +1302,14 @@ impl ShelfFeature {
     }
 
     fn cover_texture(&mut self, ctx: &egui::Context, book: &LibraryBook) -> Option<TextureHandle> {
-        if let Some(texture) = self.cover_textures.get(&book.id) {
-            return Some(texture.clone());
-        }
-        let image = decode_color_image(book.cover_bytes.as_deref()?).ok()?;
-        let texture = ctx.load_texture(
-            format!("cover:{}", book.id),
-            image,
-            egui::TextureOptions::LINEAR,
-        );
-        self.cover_textures.insert(book.id.clone(), texture.clone());
-        Some(texture)
+        let original = self
+            .shelf
+            .library
+            .books()
+            .iter()
+            .find(|original| original.id == book.id)?;
+        self.cover_textures
+            .texture(ctx, &book.id, original.cover_bytes.as_deref()?)
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -1457,6 +1479,71 @@ const fn shelf_book_focus_filter() -> egui::EventFilter {
     }
 }
 
+/// Allocates the entire scroll extent but instantiates only visible rows and
+/// one row of overscan. Returns whether the requested keyboard target exists.
+fn show_virtual_shelf_grid(
+    ui: &mut egui::Ui,
+    count: usize,
+    columns: usize,
+    focus_index: Option<usize>,
+    mut card: impl FnMut(&mut egui::Ui, usize),
+) -> bool {
+    let row_height = CARD_HEIGHT + 24.0;
+    let rows = count.div_ceil(columns);
+    let (grid_rect, _) = ui.allocate_exact_size(
+        Vec2::new(
+            ui.available_width(),
+            (rows as f32 * row_height - 24.0).max(0.0),
+        ),
+        egui::Sense::hover(),
+    );
+    if let Some(index) = focus_index {
+        ui.scroll_to_rect(
+            egui::Rect::from_min_size(
+                grid_rect.min + Vec2::new(0.0, (index / columns) as f32 * row_height),
+                Vec2::new(CARD_WIDTH, CARD_HEIGHT),
+            ),
+            None,
+        );
+    }
+    let clip = ui.clip_rect();
+    let first_row = (((clip.top() - grid_rect.top()) / row_height)
+        .floor()
+        .max(0.0) as usize)
+        .saturating_sub(1)
+        .min(rows);
+    let last_row = (((clip.bottom() - grid_rect.top()) / row_height)
+        .ceil()
+        .max(0.0) as usize)
+        .saturating_add(1)
+        .min(rows);
+    let visible = first_row * columns..(last_row * columns).min(count);
+    let target_visible = focus_index.is_none_or(|index| visible.contains(&index));
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+            grid_rect.min + Vec2::new(0.0, first_row as f32 * row_height),
+            Vec2::new(
+                grid_rect.width(),
+                (last_row - first_row) as f32 * row_height,
+            ),
+        )),
+        |ui| {
+            egui::Grid::new("shelf-grid")
+                .num_columns(columns)
+                .spacing(Vec2::new(20.0, 24.0))
+                .show(ui, |ui| {
+                    for index in visible {
+                        card(ui, index);
+                        if (index + 1) % columns == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        },
+    );
+    target_visible
+}
+
 fn shelf_grid_columns(available_width: f32) -> usize {
     let mut columns = 1_usize;
     let mut occupied = CARD_WIDTH;
@@ -1621,6 +1708,56 @@ fn sort_shelf_books(books: &mut [LibraryBook], read_activity: &HashMap<String, u
 mod tests {
     use super::sync_button::sync_progress_text;
     use super::*;
+
+    #[test]
+    fn virtual_shelf_preserves_scroll_extent_and_keyboard_jump() {
+        let ctx = egui::Context::default();
+        let mut focus_pending = true;
+        let mut saw_target = false;
+        for frame in 0..5 {
+            let mut cards = Vec::new();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(650.0, 600.0),
+                    )),
+                    time: Some(frame as f64),
+                    ..Default::default()
+                },
+                |ui| {
+                    cards.clear();
+                    let output = egui::ScrollArea::vertical().show(ui, |ui| {
+                        show_virtual_shelf_grid(
+                            ui,
+                            70,
+                            3,
+                            focus_pending.then_some(69),
+                            |ui, index| {
+                                cards.push(index);
+                                ui.allocate_exact_size(
+                                    Vec2::new(CARD_WIDTH, CARD_HEIGHT),
+                                    egui::Sense::click(),
+                                );
+                            },
+                        )
+                    });
+                    assert!((output.content_size.y - (24.0 * 324.0 - 24.0)).abs() < 1.0);
+                    if output.inner {
+                        focus_pending = false;
+                        saw_target = true;
+                    }
+                },
+            );
+            output.textures_delta.clear();
+            assert!(cards.len() <= 15, "rendered {} cards", cards.len());
+            if saw_target {
+                assert!(cards.contains(&69));
+                break;
+            }
+        }
+        assert!(saw_target, "offscreen keyboard target must become visible");
+    }
 
     #[test]
     fn sync_percentage_only_reaches_100_when_complete() {

@@ -118,3 +118,17 @@ pub use windows::WindowBackground;
 mod frame;
 #[cfg(target_os = "windows")]
 pub use frame::{FrameLayout, WindowFrame, WindowPlacement};
+
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+mod memory;
+#[cfg(target_os = "windows")]
+pub use memory::process_memory;
+#[cfg(all(target_os = "windows", feature = "memory-profiling"))]
+pub use memory::{ProcessHeapStats, process_heap_stats};
+
+#[cfg(feature = "memory-profiling")]
+#[allow(unsafe_code)]
+mod allocation;
+#[cfg(feature = "memory-profiling")]
+pub use allocation::{CountingAllocator, rust_allocation_bytes};

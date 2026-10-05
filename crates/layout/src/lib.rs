@@ -7,8 +7,12 @@ pub mod linebreak;
 mod caption_labels;
 mod formula_images;
 mod note_spacing;
+mod raster_cache;
 mod semantic_lists;
 mod web_links;
+pub use raster_cache::{
+    RasterCacheStats, RasterOrigin, clear_raster_cache, load_original_raster, raster_cache_stats,
+};
 pub use semantic_lists::semantic_list_groups;
 
 /// Avoid copying blocks without footnotes, especially image-heavy chapters.
@@ -237,6 +241,8 @@ const DEFAULT_BOTTOM_MARGIN: f32 = 24.0;
 pub struct LayoutViewport {
     pub width: u32,
     pub height: u32,
+    /// Physical pixels per logical pixel, used only for raster quality.
+    pub raster_scale: f32,
 }
 
 impl LayoutViewport {
@@ -244,7 +250,20 @@ impl LayoutViewport {
         if width == 0 || height == 0 {
             return Err(LayoutError::InvalidViewport);
         }
-        Ok(Self { width, height })
+        Ok(Self {
+            width,
+            height,
+            raster_scale: 1.0,
+        })
+    }
+
+    pub fn with_raster_scale(mut self, scale: f32) -> Self {
+        self.raster_scale = if scale.is_finite() {
+            scale.clamp(1.0, 4.0)
+        } else {
+            1.0
+        };
+        self
     }
 }
 
@@ -937,6 +956,8 @@ pub struct InlineImage {
 /// Decoded RGBA image ready for upload by the renderer.
 #[derive(Clone)]
 pub struct RasterImage {
+    pub origin: Option<RasterOrigin>,
+    pub blob: Option<peniko::Blob<u8>>,
     pub width: u32,
     pub height: u32,
     pub pixels: Arc<[u8]>,
@@ -985,6 +1006,8 @@ pub struct LayoutEngine {
     layout_context: LayoutContext<TextBrush>,
     svg_options: resvg::usvg::Options<'static>,
     publication_languages: Vec<String>,
+    raster_target: [u32; 2],
+    raster_generation: u64,
 }
 
 fn should_layout_flow_block(block: &Block, reader_style: &ReaderStyle) -> bool {
@@ -1169,6 +1192,8 @@ impl LayoutEngine {
             layout_context: LayoutContext::new(),
             svg_options,
             publication_languages: Vec::new(),
+            raster_target: [2048, 2048],
+            raster_generation: raster_cache::generation(),
         }
     }
 
@@ -1178,6 +1203,16 @@ impl LayoutEngine {
             engine.font_context.collection.register_fonts(font, None);
         }
         engine
+    }
+
+    /// A book's foreground, prefetch and delayed refresh work share one cache
+    /// lease. Clearing the cache invalidates insertion by all older leases.
+    pub fn raster_cache_generation(&self) -> u64 {
+        self.raster_generation
+    }
+
+    pub fn set_raster_cache_generation(&mut self, generation: u64) {
+        self.raster_generation = generation;
     }
 
     pub fn available_font_families(&mut self) -> Vec<String> {
@@ -1306,6 +1341,8 @@ impl LayoutEngine {
         );
         paginator.push_image(
             RasterImage {
+                origin: None,
+                blob: None,
                 width: dimensions.width.max(1),
                 height: dimensions.height.max(1),
                 pixels: Arc::from([255_u8, 255, 255, 255]),
@@ -1319,6 +1356,8 @@ impl LayoutEngine {
             for item in &mut page.items {
                 if let PageItem::Image(image) = item {
                     image.image = RasterImage {
+                        origin: None,
+                        blob: None,
                         width: 1,
                         height: 1,
                         pixels: Arc::from([255_u8, 255, 255, 255]),
@@ -1347,6 +1386,12 @@ impl LayoutEngine {
         viewport: LayoutViewport,
         reader_style: &ReaderStyle,
     ) -> Result<SectionLayout, LayoutError> {
+        // Quantize variants so minor window resizing does not fill the cache.
+        let physical = |size: u32| {
+            (((size as f32 * viewport.raster_scale).ceil() as u32).clamp(256, 4096)).div_ceil(256)
+                * 256
+        };
+        self.raster_target = [physical(viewport.width), physical(viewport.height)];
         self.publication_languages
             .clone_from(&source.book().metadata.languages);
         let page_width = viewport.width as f32;
@@ -1685,7 +1730,12 @@ impl LayoutEngine {
                         block_index += 1;
                         continue;
                     }
-                    let raster = load_raster_image(source, image)?;
+                    let raster = raster_cache::load(
+                        source,
+                        image,
+                        self.raster_target,
+                        self.raster_generation,
+                    )?;
                     let formula_presentation = (!unified_reflow)
                         .then(|| image.formula.as_ref())
                         .flatten()
@@ -1750,7 +1800,12 @@ impl LayoutEngine {
                             SeparatorKind::Rule => paginator.push_separator(),
                             SeparatorKind::Ornament => {
                                 if let Some(image) = &separator.image {
-                                    let raster = load_raster_image(source, image)?;
+                                    let raster = raster_cache::load(
+                                        source,
+                                        image,
+                                        self.raster_target,
+                                        self.raster_generation,
+                                    )?;
                                     let replacements = paginator.push_image(
                                         raster,
                                         image.style,
@@ -1818,7 +1873,11 @@ impl LayoutEngine {
             // child would double the gap between an image and its caption.
             style.margin_before = 0.0;
             style.margin_after = 0.0;
-            images.push((load_raster_image(source, image)?, style, image));
+            images.push((
+                raster_cache::load(source, image, self.raster_target, self.raster_generation)?,
+                style,
+                image,
+            ));
         }
         let captions = self.shape_figure_captions(
             source,
@@ -1927,7 +1986,12 @@ impl LayoutEngine {
         let mut rasters = Vec::with_capacity(block.content.len());
         for inline in &block.content {
             rasters.push(match inline {
-                Inline::Image(run) => Some(load_raster_image(source, &run.image)?),
+                Inline::Image(run) => Some(raster_cache::load(
+                    source,
+                    &run.image,
+                    self.raster_target,
+                    self.raster_generation,
+                )?),
                 Inline::Text(_) | Inline::Ruby(_) | Inline::Math(_) | Inline::Break => None,
             });
         }
@@ -3530,26 +3594,6 @@ fn unified_heading_scale(h1_scale: f32, level: u8) -> f32 {
         }
 }
 
-fn load_raster_image(
-    source: &dyn BookSource,
-    image: &ImageBlock,
-) -> Result<RasterImage, LayoutError> {
-    if let Some(raster) = source.raster_resource(&image.href)? {
-        return Ok(RasterImage {
-            width: raster.width,
-            height: raster.height,
-            pixels: raster.pixels,
-        });
-    }
-    let resource = source.resource(&image.href)?;
-    let decoded = image::load_from_memory(&resource.bytes)?.to_rgba8();
-    Ok(RasterImage {
-        width: decoded.width(),
-        height: decoded.height(),
-        pixels: decoded.into_raw().into(),
-    })
-}
-
 fn dominant_paragraph_start_offset(fragments: &[&[Block]], content_width: f32) -> f32 {
     let mut offsets = fragments
         .iter()
@@ -4368,8 +4412,16 @@ fn prepare_inline_raster(
     id: u64,
     index: usize,
 ) -> PreparedInlineImage {
-    let intrinsic_width = image.width.max(1) as f32;
-    let intrinsic_height = image.height.max(1) as f32;
+    let intrinsic_width = image
+        .origin
+        .as_ref()
+        .map_or(image.width, |o| o.width)
+        .max(1) as f32;
+    let intrinsic_height = image
+        .origin
+        .as_ref()
+        .map_or(image.height, |o| o.height)
+        .max(1) as f32;
     let aspect_ratio = intrinsic_width / intrinsic_height;
     let surrounding_scale = run.size_scale.max(0.1);
     let authored_height = run.image.style.height.map(|height| match height {
@@ -4552,6 +4604,8 @@ fn rasterize_formula(
     );
     Ok((
         RasterImage {
+            origin: None,
+            blob: None,
             width: pixel_width,
             height: pixel_height,
             pixels: pixmap.data().to_vec().into(),
@@ -4989,8 +5043,16 @@ impl Paginator {
         reason = "decoded image dimensions are bounded by publication resource limits"
     )]
     fn image_display_size(&self, image: &RasterImage, style: ImageStyle) -> (f32, f32) {
-        let intrinsic_width = image.width.max(1) as f32;
-        let intrinsic_height = image.height.max(1) as f32;
+        let intrinsic_width = image
+            .origin
+            .as_ref()
+            .map_or(image.width, |o| o.width)
+            .max(1) as f32;
+        let intrinsic_height = image
+            .origin
+            .as_ref()
+            .map_or(image.height, |o| o.height)
+            .max(1) as f32;
         let aspect_ratio = intrinsic_width / intrinsic_height;
         let content_height = self.bottom - self.top;
         let media_width = (self.width - self.media_start_offset).max(1.0);
@@ -6033,6 +6095,8 @@ mod tests {
                         source: None,
                     };
                     let raster = RasterImage {
+                        origin: None,
+                        blob: None,
                         width: 40,
                         height: 80,
                         pixels: vec![255; 40 * 80 * 4].into(),
@@ -6126,6 +6190,8 @@ mod tests {
             source: None,
         };
         let raster = RasterImage {
+            origin: None,
+            blob: None,
             width: 200,
             height: 100,
             pixels: vec![0; 200 * 100 * 4].into(),
@@ -6180,6 +6246,8 @@ mod tests {
             source: None,
         };
         let raster = RasterImage {
+            origin: None,
+            blob: None,
             width: 12,
             height: 12,
             pixels: vec![0; 12 * 12 * 4].into(),
@@ -9220,6 +9288,8 @@ mod tests {
         );
         paginator.push_image(
             RasterImage {
+                origin: None,
+                blob: None,
                 width: 800,
                 height: 600,
                 pixels: Vec::new().into(),
@@ -9638,6 +9708,8 @@ mod tests {
         paginator.push_separator();
         paginator.push_image(
             RasterImage {
+                origin: None,
+                blob: None,
                 width: 200,
                 height: 100,
                 pixels: Vec::new().into(),
@@ -9860,6 +9932,8 @@ mod tests {
         paginator.prepare_group(300.0, outer_gap);
         paginator.push_image_with_gaps(
             RasterImage {
+                origin: None,
+                blob: None,
                 width: 200,
                 height: 100,
                 pixels: Vec::new().into(),
@@ -9895,6 +9969,8 @@ mod tests {
         );
         paginator.push_image_with_gaps(
             RasterImage {
+                origin: None,
+                blob: None,
                 width: 200,
                 height: 210,
                 pixels: Vec::new().into(),
@@ -9934,6 +10010,8 @@ mod tests {
         );
         paginator.push_image_with_gaps(
             RasterImage {
+                origin: None,
+                blob: None,
                 width: 200,
                 height: 210,
                 pixels: Vec::new().into(),
@@ -9949,6 +10027,8 @@ mod tests {
         paginator.add_preserved_spacing(5.0);
         paginator.push_image_with_gaps(
             RasterImage {
+                origin: None,
+                blob: None,
                 width: 100,
                 height: 50,
                 pixels: Vec::new().into(),
@@ -9984,6 +10064,8 @@ mod tests {
         );
         paginator.push_image_with_gaps(
             RasterImage {
+                origin: None,
+                blob: None,
                 width: 200,
                 height: 210,
                 pixels: Vec::new().into(),
@@ -9996,6 +10078,8 @@ mod tests {
         );
         paginator.push_image_with_gaps(
             RasterImage {
+                origin: None,
+                blob: None,
                 width: 100,
                 height: 100,
                 pixels: Vec::new().into(),
@@ -10031,6 +10115,8 @@ mod tests {
         );
         paginator.push_image(
             RasterImage {
+                origin: None,
+                blob: None,
                 width: 200,
                 height: 100,
                 pixels: Vec::new().into(),

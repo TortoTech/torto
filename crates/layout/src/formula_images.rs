@@ -785,6 +785,8 @@ pub(super) fn padded_display_row(
     }
     Some((
         RasterImage {
+            origin: None,
+            blob: None,
             width: canvas.width(),
             height: canvas.height(),
             pixels: canvas.take().into(),
@@ -810,7 +812,16 @@ impl LayoutEngine {
         if formula.is_none() && (number.is_none() || original_run.is_none()) {
             return Ok(false);
         }
-        let original = load_raster_image(source, image)?;
+        // An inferred equation may lack formula metadata on its source image.
+        // Always retain exact original pixels for the formula preview.
+        let mut original_image = image.clone();
+        original_image.formula_image = true;
+        let original = raster_cache::load(
+            source,
+            &original_image,
+            self.raster_target,
+            self.raster_generation,
+        )?;
         if let (Some(authored), Some(recognized)) =
             (number, formula.and_then(|f| f.equation_number.as_deref()))
         {

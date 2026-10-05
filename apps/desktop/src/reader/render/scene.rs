@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use kurbo::{Affine, Rect, RoundedRect};
@@ -14,6 +14,7 @@ use super::vello::VelloScene;
 
 const PAGE_SCENE_CACHE_CAPACITY: usize = 32;
 const PDF_PAGE_SCENE_CACHE_CAPACITY: usize = 4;
+const PAGE_SCENE_CACHE_BUDGET: usize = 32 * 1024 * 1024;
 const ANNOTATION_MARK_COLOR: Color = Color::from_rgba8(96, 165, 250, 72);
 const TEXT_SELECTION_COLOR: Color = Color::from_rgba8(68, 137, 103, 72);
 
@@ -66,6 +67,26 @@ pub(crate) struct ReaderScene {
     pub(crate) scene: Arc<Scene>,
     pub(crate) images: Arc<[ImageData]>,
     pub(crate) refresh_image_atlas: bool,
+}
+
+/// Retained scene streams excluding font files and image blobs shared with
+/// the layout cache. Counts allocations, rather than just drawing commands.
+pub(crate) fn scene_encoding_bytes(scene: &Scene) -> usize {
+    fn bytes<T>(v: &Vec<T>) -> usize {
+        v.capacity() * std::mem::size_of::<T>()
+    }
+    let e = scene.encoding();
+    bytes(&e.path_tags)
+        + bytes(&e.path_data)
+        + bytes(&e.draw_tags)
+        + bytes(&e.draw_data)
+        + bytes(&e.transforms)
+        + bytes(&e.styles)
+        + bytes(&e.resources.patches)
+        + bytes(&e.resources.color_stops)
+        + bytes(&e.resources.glyphs)
+        + bytes(&e.resources.glyph_runs)
+        + bytes(&e.resources.normalized_coords)
 }
 
 const fn focus_unit_activation_visible(
@@ -287,14 +308,7 @@ impl DesktopReader {
         });
         self.page_scenes.insert(key, Arc::clone(&layers));
         self.touch_page_scene(key);
-        while self.page_scenes.len() > PAGE_SCENE_CACHE_CAPACITY {
-            let Some(oldest) = self.page_scene_lru.pop_front() else {
-                break;
-            };
-            if oldest != key {
-                self.page_scenes.remove(&oldest);
-            }
-        }
+        self.trim_page_scenes(key, PAGE_SCENE_CACHE_CAPACITY);
         layers
     }
 
@@ -353,15 +367,44 @@ impl DesktopReader {
             BookFormat::Pdf => PDF_PAGE_SCENE_CACHE_CAPACITY,
             _ => PAGE_SCENE_CACHE_CAPACITY,
         };
-        while self.page_scenes.len() > cache_capacity {
+        self.trim_page_scenes(key, cache_capacity);
+        layers
+    }
+
+    pub(crate) fn page_scene_cache_bytes(&self) -> usize {
+        let mut images = HashSet::new();
+        self.page_scenes
+            .values()
+            .map(|layers| {
+                scene_encoding_bytes(&layers.underlay)
+                    + scene_encoding_bytes(&layers.content)
+                    + layers
+                        .images
+                        .iter()
+                        .filter(|image| images.insert(image.data.id()))
+                        .map(|image| image.data.len())
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    fn trim_page_scenes(&mut self, active: PageSceneKey, capacity: usize) {
+        // Bounded scan permits a single active scene to exceed the soft limit.
+        for _ in 0..self.page_scene_lru.len() {
+            if self.page_scenes.len() <= capacity
+                && self.page_scene_cache_bytes() <= PAGE_SCENE_CACHE_BUDGET
+            {
+                break;
+            }
             let Some(oldest) = self.page_scene_lru.pop_front() else {
                 break;
             };
-            if oldest != key {
+            if oldest == active {
+                self.page_scene_lru.push_back(oldest);
+            } else {
                 self.page_scenes.remove(&oldest);
             }
         }
-        layers
     }
 
     fn paint_page_overlays(

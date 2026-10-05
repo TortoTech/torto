@@ -132,6 +132,8 @@ pub(super) fn open_reader(
     let publication_started = Instant::now();
     let known_publication_id = shelf_metadata.as_ref().map(|metadata| metadata.id.as_str());
     let publication = open_publication_file_for_reading(path, known_publication_id)?;
+    #[cfg(all(target_os = "windows", feature = "memory-profiling"))]
+    crate::diagnostics::memory_checkpoint("publication_opened");
     let publication_ms = publication_started.elapsed().as_secs_f32() * 1_000.0;
     let format = publication.format();
     let cover = shelf_cover.or_else(|| publication.cover_bytes().map(<[u8]>::to_vec));
@@ -208,6 +210,8 @@ pub(super) fn open_reader(
             (canonical_source, None, false, PdfOcrViewMode::Original)
         };
     let source_wrappers_ms = source_wrappers_started.elapsed().as_secs_f32() * 1_000.0;
+    #[cfg(all(target_os = "windows", feature = "memory-profiling"))]
+    crate::diagnostics::memory_checkpoint("pdf_ocr_loaded");
     let fixed_page = canonical_source.book().metadata.layout == RenditionLayout::PrePaginated;
     let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
     let translation_source = Arc::new(if fixed_page {
@@ -300,6 +304,8 @@ pub(super) fn open_reader(
         ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?
     };
     let initial_layout_ms = initial_layout_started.elapsed().as_secs_f32() * 1_000.0;
+    #[cfg(all(target_os = "windows", feature = "memory-profiling"))]
+    crate::diagnostics::memory_checkpoint("initial_layout_complete");
     let initial_location = reader.location();
     crate::diagnostics::log(
         "reader.open",
@@ -355,6 +361,58 @@ pub(super) fn open_reader(
             source_path: path.to_path_buf(),
         },
     ))
+}
+
+/// Opt-in headless reproduction. Reads local progress/settings but does not
+/// dispatch plugin/network tasks, save progress, or create any GPU/window.
+/// Build with `--features memory-profiling`, then set `TORTO_MEMORY_PROBE_BOOK`
+/// to an existing library book's absolute path and run the executable.
+#[cfg(all(target_os = "windows", feature = "memory-profiling"))]
+pub(crate) fn probe_memory(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::diagnostics::memory_checkpoint;
+    memory_checkpoint("headless_baseline");
+    let library = crate::library::LocalLibrary::load_default()?;
+    let book = library.books().iter().find(|book| book.path == path);
+    let settings = SyncSettings::load_default()?;
+    let store = SyncStore::open_default(settings.device_id)?;
+    let fonts = crate::fonts::embedded_reader_fonts();
+    memory_checkpoint("library_loaded");
+    for cycle in 0..3 {
+        println!("cycle={cycle}");
+        let mut reader = open_reader(
+            path,
+            fonts.clone(),
+            book.map(BookDisplayMetadata::from),
+            book.and_then(|book| book.cover_bytes.clone()),
+            store.clone(),
+        )?;
+        memory_checkpoint("desktop_reader_created");
+        reader.snapshot = reader
+            .reader
+            .resize(LayoutViewport::new(1440, 780)?.with_raster_scale(2.0))?;
+        memory_checkpoint("viewport_resized");
+        drop(reader.page_scene());
+        memory_checkpoint("scene_encoded_without_gpu");
+        let weak = Arc::downgrade(&reader.source);
+        drop(reader);
+        rebook_layout::clear_raster_cache();
+        memory_checkpoint("reader_dropped");
+        // The detached prefetch worker needs time to observe cancellation.
+        for _ in 0..100 {
+            if weak.strong_count() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        println!("source_strong_count_after_close={}", weak.strong_count());
+        // A zero strong count can be observed before recursive destructors on
+        // the worker finish. Sample once more after they have run.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        memory_checkpoint("prefetch_shutdown");
+    }
+    drop((library, store, fonts));
+    memory_checkpoint("headless_finished");
+    Ok(())
 }
 
 fn repair_legacy_translated_paragraph_highlights(
@@ -610,6 +668,7 @@ enum ImagePointerState {
 }
 
 struct SelectedImage {
+    origin: Option<rebook_layout::RasterOrigin>,
     formula: Option<String>,
     pixels: Arc<[u8]>,
     size: [usize; 2],
@@ -657,7 +716,7 @@ struct FocusUnit {
     footnotes: Vec<FocusFootnote>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct FocusFootnote {
     stable_id: Option<egui::Id>,
     owner: Option<SourceRange>,
@@ -2006,6 +2065,9 @@ fn reflow_anchor_offset(
 }
 
 impl DesktopReader {
+    pub(crate) fn memory_stats(&self) -> (rebook_reader::ReaderCacheStats, usize) {
+        (self.reader.cache_stats(), self.page_scene_cache_bytes())
+    }
     pub(crate) fn startup_error(&self) -> Option<&str> {
         self.error.as_deref().or(self.reopen_error.as_deref())
     }
@@ -3141,7 +3203,7 @@ impl DesktopReader {
             self.invalidate_page_scenes();
         }
         if materialization_pending {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            crate::ui::request_repaint_in(ctx, Duration::from_millis(50));
         }
         let current = ReaderPosition {
             section_index: self.snapshot.location.section_index,
@@ -5021,6 +5083,8 @@ mod tests {
             items: vec![PageItem::Image(ImagePlacement {
                 formula_presentation: None,
                 image: RasterImage {
+                    origin: None,
+                    blob: None,
                     width: 2,
                     height: 2,
                     pixels: vec![255; 16].into(),
@@ -5068,6 +5132,8 @@ mod tests {
                 items: vec![PageItem::Image(ImagePlacement {
                     formula_presentation: None,
                     image: RasterImage {
+                        origin: None,
+                        blob: None,
                         width: 2,
                         height: 2,
                         pixels: vec![255; 16].into(),

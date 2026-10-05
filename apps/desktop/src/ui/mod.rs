@@ -1,6 +1,7 @@
 mod http_loader;
 mod icons;
 mod interface_fonts;
+mod loading_spinner;
 mod svg_loader;
 
 use std::collections::BTreeSet;
@@ -15,6 +16,7 @@ use egui::{
 pub(crate) use interface_fonts::resolve as resolve_interface_font_fallbacks;
 
 pub(crate) use icons::{Icon, IconWidget, paint_icon};
+pub(crate) use loading_spinner::{LoadingSpinner, request_repaint_in};
 
 use crate::preferences::{
     AppLanguage, AppTheme, DEFAULT_INTERFACE_FONT_SIZE, InterfaceTypography, SYSTEM_INTERFACE_FONT,

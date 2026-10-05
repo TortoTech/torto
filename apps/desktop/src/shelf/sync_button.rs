@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::preferences::AppLanguage;
 use crate::sync::SyncStage;
-use crate::ui::{Icon, icon_button, palette};
+use crate::ui::{Icon, LoadingSpinner, icon_button, palette};
 
 #[derive(Default)]
 pub(super) enum SyncButtonState {
@@ -64,7 +64,7 @@ impl SyncButtonState {
                 if pending {
                     let (rect, response) =
                         ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
-                    egui::Spinner::new()
+                    LoadingSpinner::new()
                         .color(palette().accent)
                         .paint_at(ui, rect.shrink(7.0));
                     response.widget_info(|| {
@@ -115,6 +115,36 @@ pub(super) fn sync_progress_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_sync_schedules_a_timer_after_layout_settles() {
+        let ctx = egui::Context::default();
+        let state = SyncButtonState::Running {
+            stage: SyncStage::Checking,
+            completed: 0,
+            total: 70,
+        };
+        let mut repaint_delay = Duration::ZERO;
+        for pass in 0..5 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(640.0, 480.0),
+                    )),
+                    time: Some(f64::from(pass) * 0.1),
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = state.show(ui, false, AppLanguage::English);
+                },
+            );
+            repaint_delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            output.textures_delta.clear();
+        }
+        assert!(repaint_delay > Duration::ZERO);
+        assert!(repaint_delay <= Duration::from_millis(100));
+    }
 
     #[test]
     fn sync_completion_expires_without_resetting_a_new_sync_or_error() {

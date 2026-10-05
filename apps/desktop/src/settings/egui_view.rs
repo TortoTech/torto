@@ -39,7 +39,8 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
     if visible <= f32::EPSILON {
         return;
     }
-    ctx.request_repaint();
+    // animate_bool_with_time requests frames only while opening/closing.
+    // A settled, visible settings dialog must be allowed to sleep.
 
     let screen = crate::ui::overlay_rect(ctx);
     let modal_size = Vec2::new(
@@ -1266,7 +1267,7 @@ fn provider_models_selector(
             ui.set_min_width(SETTINGS_MODEL_SELECT_WIDTH);
             if loading {
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    ui.add(crate::ui::LoadingSpinner::new());
                     ui.weak(language.text("正在获取模型…", "Loading models…"));
                 });
             } else if let Some(error) = error {
@@ -1299,7 +1300,7 @@ fn provider_models_selector(
         });
     let refresh_requested = secondary_button(ui, language.text("刷新", "Refresh")).clicked();
     if loading {
-        ui.spinner();
+        ui.add(crate::ui::LoadingSpinner::new());
     } else if let Some(error) = error {
         ui.add(icon(Icon::AlertCircle).size(16.0).color(palette().error))
             .on_hover_text(error);
@@ -2689,6 +2690,65 @@ fn secondary_button_with_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_tabs_stop_requesting_frames_when_idle() {
+        let preferences = crate::preferences::ReaderPreferences::default();
+        let applied = crate::settings::AppliedSettings {
+            spread: preferences.spread,
+            reading_mode: preferences.reading_mode,
+            hide_cursor_in_focus_mode: preferences.hide_cursor_in_focus_mode,
+            interface_typography: preferences.interface_typography,
+            typography: preferences.typography,
+            typesetting: preferences.typesetting,
+            plugin_settings: crate::plugins::PluginSettings::default(),
+            language: AppLanguage::English,
+            theme: crate::preferences::AppTheme::Light,
+            selection_granularity: preferences.selection_granularity,
+            shortcuts: preferences.shortcuts,
+            sync_settings: crate::sync::SyncSettings::new_device(),
+            sync_password: String::new(),
+        };
+        let mut state = SettingsFeature::from_applied(
+            applied,
+            rebook_layout::LayoutEngine::with_fonts(std::iter::empty())
+                .available_reader_font_families(),
+            Vec::new(),
+        );
+        state.open = true;
+        for tab in [
+            SettingsTab::System,
+            SettingsTab::Typography,
+            SettingsTab::Shortcuts,
+            SettingsTab::Ai,
+            SettingsTab::AiChat,
+            SettingsTab::Translation,
+            SettingsTab::Ocr,
+            SettingsTab::Cloud,
+            SettingsTab::About,
+        ] {
+            state.settings_tab = tab;
+            let ctx = egui::Context::default();
+            for pass in 0..12 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(1000.0, 800.0),
+                        )),
+                        time: Some(f64::from(pass) * 0.2),
+                        ..Default::default()
+                    },
+                    |_| settings_overlay(&ctx, &mut state),
+                );
+                let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+                output.textures_delta.clear();
+                if pass == 11 {
+                    assert_eq!(delay, std::time::Duration::MAX, "tab={tab:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn focus_mode_hides_content_style_without_overwriting_the_classic_preference() {

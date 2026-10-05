@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui::TextureId;
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
@@ -23,6 +25,59 @@ struct PageTarget {
     rendered_scene: Option<(u64, u64)>,
 }
 
+#[derive(Default)]
+struct ReaderGpuResidency {
+    images: HashMap<u64, usize>,
+    uploaded_bytes: usize,
+    current_image_bytes: usize,
+    peak_scene_bytes: usize,
+    current_scene_bytes: usize,
+    rendered_at: Option<Instant>,
+    trimmed_at: Option<Instant>,
+}
+
+impl ReaderGpuResidency {
+    fn observe(&mut self, scene: &ReaderScene, now: Instant) {
+        let mut current = std::collections::HashSet::new();
+        self.current_image_bytes = 0;
+        for image in scene.images.iter() {
+            let id = image.data.id();
+            if current.insert(id) {
+                self.current_image_bytes += image.data.len();
+            }
+            if self.images.insert(id, image.data.len()).is_none() {
+                self.uploaded_bytes += image.data.len();
+            }
+        }
+        self.current_scene_bytes = crate::reader::render::scene_encoding_bytes(&scene.scene);
+        self.peak_scene_bytes = self.peak_scene_bytes.max(self.current_scene_bytes);
+        self.rendered_at = Some(now);
+    }
+
+    fn has_unused_capacity(&self) -> bool {
+        self.uploaded_bytes > (32 * 1024 * 1024).max(self.current_image_bytes.saturating_mul(4))
+            || self.peak_scene_bytes
+                > (2 * 1024 * 1024).max(self.current_scene_bytes.saturating_mul(4))
+    }
+
+    fn trim_delay(&self, now: Instant) -> Option<Duration> {
+        if !self.has_unused_capacity() {
+            return None;
+        }
+        let idle = self
+            .rendered_at
+            .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+        let cooldown = self.trimmed_at.map_or(Duration::from_secs(20), |at| {
+            now.saturating_duration_since(at)
+        });
+        Some(
+            Duration::from_secs(2)
+                .saturating_sub(idle)
+                .max(Duration::from_secs(20).saturating_sub(cooldown)),
+        )
+    }
+}
+
 pub(super) struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -35,6 +90,11 @@ pub(super) struct GpuState {
     clear_color: wgpu::Color,
     last_frame: Option<wgpu::Texture>,
     resize_pending: bool,
+    reader_residency: ReaderGpuResidency,
+    memory_sample_at: Option<Instant>,
+    sampled_frames: usize,
+    sampled_ui_ms: f32,
+    sampled_frame_ms: f32,
 }
 
 impl GpuState {
@@ -55,11 +115,24 @@ impl GpuState {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("rebook-device"),
+                // Large default GPU heaps consume system RAM on integrated
+                // GPUs even when the reader only needs a few small textures.
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
                 ..Default::default()
             })
             .await
             .map_err(|error| error.to_string())?;
         let capabilities = surface.get_capabilities(&adapter);
+        let info = adapter.get_info();
+        crate::diagnostics::log(
+            "memory.gpu_device",
+            &[
+                crate::diagnostics::Field::Detail("adapter", &info.name),
+                crate::diagnostics::Field::Detail("driver", &info.driver),
+                crate::diagnostics::Field::Detail("backend", &format!("{:?}", info.backend)),
+                crate::diagnostics::Field::Text("memory_hints", "MemoryUsage"),
+            ],
+        );
         if crate::smoke::enabled() {
             crate::smoke::stage(&format!("gpu: {:?}", adapter.get_info()));
             device.on_uncaptured_error(Arc::new(|error| {
@@ -96,6 +169,11 @@ impl GpuState {
             retired_page_textures: Vec::new(),
             last_frame: None,
             resize_pending: false,
+            reader_residency: ReaderGpuResidency::default(),
+            memory_sample_at: None,
+            sampled_frames: 0,
+            sampled_ui_ms: 0.0,
+            sampled_frame_ms: 0.0,
             clear_color: wgpu::Color {
                 r: 0.965,
                 g: 0.957,
@@ -256,15 +334,56 @@ impl GpuState {
 
         let mut page_target_recreated = false;
         if let Some(plan) = plan {
+            if self
+                .page_target
+                .as_ref()
+                .and_then(|target| target.rendered_scene)
+                .is_some_and(|(id, _)| id != plan.scene_id)
+            {
+                self.vello_renderer = None;
+                self.reader_residency = ReaderGpuResidency::default();
+            }
             let recreated = self.ensure_page_target(plan, pixels_per_point);
             page_target_recreated = recreated;
+            let trim = self
+                .reader_residency
+                .trim_delay(Instant::now())
+                .is_some_and(|delay| delay.is_zero());
+            if trim {
+                // wgpu retains submitted resources until the GPU is done with
+                // them. The page target remains intact while Vello recreates its
+                // atlas and work-buffer pool, then replays this same scene.
+                self.vello_renderer = None;
+                crate::diagnostics::log(
+                    "memory.gpu_trim",
+                    &[
+                        crate::diagnostics::Field::Usize(
+                            "uploaded_image_bytes",
+                            self.reader_residency.uploaded_bytes,
+                        ),
+                        crate::diagnostics::Field::Usize(
+                            "active_image_bytes",
+                            self.reader_residency.current_image_bytes,
+                        ),
+                    ],
+                );
+                self.reader_residency = ReaderGpuResidency {
+                    trimmed_at: Some(Instant::now()),
+                    ..Default::default()
+                };
+            }
             let needs_render = recreated
+                || trim
                 || self
                     .page_target
                     .as_ref()
                     .is_some_and(|target| reader_scene_needs_render(target.rendered_scene, plan));
             if needs_render && let Some(scene) = app.reader_scene() {
                 self.render_reader_scene(&scene, plan, pixels_per_point)?;
+                self.reader_residency.observe(&scene, Instant::now());
+            }
+            if let Some(delay) = self.reader_residency.trim_delay(Instant::now()) {
+                egui_ctx.request_repaint_after(delay.max(Duration::from_millis(1)));
             }
         } else {
             // No reader is displayed. Retire its texture after this frame and
@@ -273,6 +392,7 @@ impl GpuState {
                 self.retired_page_textures.push(target.texture_id);
             }
             self.vello_renderer = None;
+            self.reader_residency = ReaderGpuResidency::default();
         }
         if page_target_recreated {
             // This frame intentionally retains the old texture at its old logical
@@ -421,7 +541,101 @@ impl GpuState {
             self.egui_renderer.free_texture(&id);
         }
         self.free_egui_textures(&mut output.textures_delta);
+        // Process completed submissions and dropped resource handles without
+        // blocking the UI. Shelf frames may otherwise become idle immediately.
+        self.device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| error.to_string())?;
+        self.sampled_frames += 1;
+        self.sampled_ui_ms += ui_finished.as_secs_f32() * 1000.0;
+        self.sampled_frame_ms += presentation_finished.as_secs_f32() * 1000.0;
+        self.sample_gpu_memory(egui_ctx);
         Ok(())
+    }
+
+    fn sample_gpu_memory(&mut self, egui_ctx: &egui::Context) {
+        if self
+            .memory_sample_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(10))
+        {
+            return;
+        }
+        let elapsed = self
+            .memory_sample_at
+            .map_or(0.0, |at| at.elapsed().as_secs_f32());
+        self.memory_sample_at = Some(Instant::now());
+        let frames = std::mem::take(&mut self.sampled_frames);
+        let ui_ms = std::mem::take(&mut self.sampled_ui_ms);
+        let frame_ms = std::mem::take(&mut self.sampled_frame_ms);
+        let causes = format!("{:?}", egui_ctx.repaint_causes());
+        crate::diagnostics::log(
+            "render.activity",
+            &[
+                crate::diagnostics::Field::Usize("frames", frames),
+                crate::diagnostics::Field::F32("sample_seconds", elapsed),
+                crate::diagnostics::Field::F32("ui_ms", ui_ms),
+                crate::diagnostics::Field::F32("frame_ms", frame_ms),
+                crate::diagnostics::Field::Detail("repaint_causes", &causes),
+            ],
+        );
+        let page_bytes = self.page_target.as_ref().map_or(0, |target| {
+            target.size[0] as usize * target.size[1] as usize * 4
+        });
+        let retained_bytes = self.last_frame.as_ref().map_or(0, |texture| {
+            texture.width() as usize * texture.height() as usize * 4
+        });
+        let allocator = self.device.generate_allocator_report();
+        let vello_buffers = allocator.as_ref().map_or(0, |report| {
+            report
+                .allocations
+                .iter()
+                .filter(|allocation| allocation.name.starts_with("vello."))
+                .map(|allocation| allocation.size)
+                .sum::<u64>()
+        });
+        crate::diagnostics::log(
+            "memory.gpu",
+            &[
+                crate::diagnostics::Field::Usize("page_target_bytes", page_bytes),
+                crate::diagnostics::Field::Usize("retained_frame_bytes", retained_bytes),
+                crate::diagnostics::Field::U64("vello_buffer_bytes", vello_buffers),
+                crate::diagnostics::Field::Usize(
+                    "surface_width",
+                    self.surface_config.width as usize,
+                ),
+                crate::diagnostics::Field::Usize(
+                    "surface_height",
+                    self.surface_config.height as usize,
+                ),
+                crate::diagnostics::Field::Bool("allocator_report_available", allocator.is_some()),
+                crate::diagnostics::Field::U64(
+                    "allocator_allocated_bytes",
+                    allocator
+                        .as_ref()
+                        .map_or(0, |report| report.total_allocated_bytes),
+                ),
+                crate::diagnostics::Field::U64(
+                    "allocator_reserved_bytes",
+                    allocator
+                        .as_ref()
+                        .map_or(0, |report| report.total_reserved_bytes),
+                ),
+                // Vello does not expose its atlas capacity. Upload history is an
+                // indicator for reclamation, not a measurement of driver memory.
+                crate::diagnostics::Field::Usize(
+                    "uploaded_image_bytes",
+                    self.reader_residency.uploaded_bytes,
+                ),
+                crate::diagnostics::Field::Usize(
+                    "active_image_bytes",
+                    self.reader_residency.current_image_bytes,
+                ),
+                crate::diagnostics::Field::Usize(
+                    "peak_scene_encoding_bytes",
+                    self.reader_residency.peak_scene_bytes,
+                ),
+            ],
+        );
     }
 
     /// Present old pixels without scaling before expensive UI layout starts.
@@ -687,6 +901,29 @@ fn physical_dimension(points: f32, pixels_per_point: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_trim_waits_for_idle_and_observes_cooldown() {
+        let now = Instant::now();
+        let mut residency = ReaderGpuResidency {
+            uploaded_bytes: 64 * 1024 * 1024,
+            current_image_bytes: 1024,
+            rendered_at: Some(now),
+            ..Default::default()
+        };
+        assert_eq!(residency.trim_delay(now), Some(Duration::from_secs(2)));
+        assert_eq!(
+            residency.trim_delay(now + Duration::from_secs(2)),
+            Some(Duration::ZERO)
+        );
+        residency.trimmed_at = Some(now);
+        assert_eq!(
+            residency.trim_delay(now + Duration::from_secs(2)),
+            Some(Duration::from_secs(18))
+        );
+        residency.current_image_bytes = residency.uploaded_bytes;
+        assert_eq!(residency.trim_delay(now + Duration::from_secs(30)), None);
+    }
 
     fn plan(scene_id: u64, scene_revision: u64) -> ReaderFramePlan {
         ReaderFramePlan {

@@ -22,6 +22,10 @@ use unicode_segmentation::UnicodeSegmentation;
 
 const PREFETCH_DISTANCE: usize = 2;
 const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = PREFETCH_DISTANCE * 2 + 3;
+// Together with the desktop's 32 MiB scene budget, layout metadata has a
+// 96 MiB soft budget. Raster allocations are shared and accounted separately.
+const LAYOUT_CACHE_BUDGET: usize = 64 * 1024 * 1024;
+const RASTER_CACHE_BUDGET: usize = 128 * 1024 * 1024;
 const FRAGMENT_TEXT_BUDGET: usize = 4_096;
 const LARGE_SECTION_TEXT_BUDGET: usize = FRAGMENT_TEXT_BUDGET * 8;
 const FRAGMENT_BLOCK_BUDGET: usize = 64;
@@ -224,9 +228,11 @@ pub struct ReaderSelection {
     pub rects: Vec<ReaderSelectionRect>,
 }
 
-/// Original image pixels resolved from a point in the visible reader spread.
+/// Display raster resolved from a point in the visible reader spread.
+/// `origin` permits loading full resolution pixels for preview/copy on demand.
 #[derive(Clone)]
 pub struct ReaderImage {
+    pub origin: Option<rebook_layout::RasterOrigin>,
     pub formula: Option<String>,
     pub position: ReaderPosition,
     /// Left edge in the coordinate space used for the image query.
@@ -337,6 +343,7 @@ struct CachedSegment {
 }
 
 struct PreparedSection {
+    estimated_bytes: usize,
     fragments: Vec<ContentFragment>,
     segments: Vec<LayoutSegment>,
     anchor_segments: HashMap<String, usize>,
@@ -499,6 +506,7 @@ impl PrefetchWorker {
         source: Arc<dyn BookSource>,
         repository: Arc<SectionRepository>,
         fonts: Arc<[ReaderFontBlob]>,
+        raster_generation: u64,
     ) -> Result<Self, ReaderError> {
         let (request_sender, request_receiver) = mpsc::channel::<PrefetchRequest>();
         let (result_sender, result_receiver) = mpsc::channel::<PrefetchResult>();
@@ -512,6 +520,7 @@ impl PrefetchWorker {
             .name("rebook-prefetch".into())
             .spawn(move || {
                 let mut layout_engine = LayoutEngine::with_fonts(fonts.iter().cloned());
+                layout_engine.set_raster_cache_generation(raster_generation);
                 let display_compiler = DisplayListCompiler;
                 while let Ok(request) = request_receiver.recv() {
                     if worker_cancelled.load(Ordering::Acquire) {
@@ -695,23 +704,33 @@ pub struct ReaderSession {
     fixed_reading_units: Option<Vec<FixedReadingUnit>>,
 }
 
+#[derive(Default, Clone, Copy)]
+pub struct ReaderCacheStats {
+    pub layout_bytes: usize,
+    pub raster_bytes: usize,
+    pub pinned_bytes: usize,
+    pub segments: usize,
+}
+
 pub struct ReaderRefreshRequest {
     source: Arc<dyn BookSource>,
     fonts: Arc<[ReaderFontBlob]>,
     viewport: LayoutViewport,
     style: ReaderStyle,
     locator: LocatorV1,
+    raster_generation: u64,
 }
 
 impl ReaderRefreshRequest {
     pub fn prepare(self) -> Result<ReaderSession, ReaderError> {
-        let mut reader = ReaderSession::open_with_fonts_at_locator(
+        let mut reader = ReaderSession::new_unpositioned(
             self.source,
             self.viewport,
             self.style,
             self.fonts,
-            &self.locator,
+            Some(self.raster_generation),
         )?;
+        reader.restore_locator(&self.locator)?;
         reader.cache_capacity = usize::MAX;
         // Scroll/focus mode must not compile additional pages on the UI thread
         // immediately after the refreshed current page is adopted.
@@ -725,6 +744,15 @@ impl ReaderRefreshRequest {
 }
 
 impl ReaderSession {
+    pub fn original_image(
+        &self,
+        origin: &rebook_layout::RasterOrigin,
+    ) -> Result<rebook_layout::RasterImage, ReaderError> {
+        Ok(rebook_layout::load_original_raster(
+            self.source.as_ref(),
+            &origin.href,
+        )?)
+    }
     pub fn prepare_refresh_request(&self, source: Option<SourceRange>) -> ReaderRefreshRequest {
         let mut locator = self.current_locator();
         if let Some(source) = source {
@@ -745,6 +773,7 @@ impl ReaderSession {
             viewport: self.viewport,
             style: self.style.clone(),
             locator,
+            raster_generation: self.layout_engine.raster_cache_generation(),
         }
     }
 
@@ -812,7 +841,7 @@ impl ReaderSession {
         style: ReaderStyle,
         fonts: Arc<[ReaderFontBlob]>,
     ) -> Result<Self, ReaderError> {
-        let mut session = Self::new_unpositioned(source, viewport, style, fonts)?;
+        let mut session = Self::new_unpositioned(source, viewport, style, fonts, None)?;
         session.ensure_segment(session.current_key())?;
         Ok(session)
     }
@@ -827,7 +856,7 @@ impl ReaderSession {
         fonts: Arc<[ReaderFontBlob]>,
         locator: &LocatorV1,
     ) -> Result<Self, ReaderError> {
-        let mut session = Self::new_unpositioned(source, viewport, style, fonts)?;
+        let mut session = Self::new_unpositioned(source, viewport, style, fonts, None)?;
         session.restore_locator(locator)?;
         Ok(session)
     }
@@ -837,6 +866,7 @@ impl ReaderSession {
         viewport: LayoutViewport,
         mut style: ReaderStyle,
         fonts: Arc<[ReaderFontBlob]>,
+        raster_generation: Option<u64>,
     ) -> Result<Self, ReaderError> {
         if source.book().sections.is_empty() {
             return Err(ReaderError::EmptyBook);
@@ -864,12 +894,16 @@ impl ReaderSession {
             build_fixed_reading_units(source.as_ref(), &toc_items, &section_indices_by_path);
         let repository = Arc::new(SectionRepository::new(Arc::clone(&source)));
         let mut layout_engine = LayoutEngine::with_fonts(fonts.iter().cloned());
+        if let Some(generation) = raster_generation {
+            layout_engine.set_raster_cache_generation(generation);
+        }
         let available_fonts = layout_engine.available_reader_font_families();
         available_fonts.repair_typography(&mut style.typography);
         let prefetch_worker = PrefetchWorker::spawn(
             Arc::clone(&source),
             Arc::clone(&repository),
             Arc::clone(&fonts),
+            layout_engine.raster_cache_generation(),
         )?;
         let current_section =
             first_visible_section(source.book().sections.len(), &hidden_sections).unwrap_or(0);
@@ -2376,6 +2410,13 @@ impl ReaderSession {
     /// This method never performs layout on the caller thread.
     pub fn prefetch_adjacent(&mut self) -> Result<(), ReaderError> {
         self.poll_prefetch()?;
+        self.evict();
+        let memory = self.cache_stats();
+        if memory.layout_bytes >= LAYOUT_CACHE_BUDGET * 4 / 5
+            || memory.raster_bytes >= RASTER_CACHE_BUDGET * 4 / 5
+        {
+            return Ok(());
+        }
         let section_count = self.source.book().sections.len();
         let segment_count = self.current_section_data().segments.len();
         // A double spread advances by two logical pages. Queue the whole next
@@ -2591,6 +2632,7 @@ impl ReaderSession {
             Arc::clone(&self.source),
             Arc::clone(&repository),
             Arc::clone(&self.fonts),
+            self.layout_engine.raster_cache_generation(),
         )?;
         let target_page = target
             .and_then(PublicationUrl::fragment)
@@ -3502,16 +3544,74 @@ impl ReaderSession {
     }
 
     fn evict(&mut self) {
-        while self.cache.len() > self.cache_capacity {
+        // Newly requested navigation/layout must remain available to its caller,
+        // even when that one segment exceeds a budget. Pages retained by a
+        // scroll/focus reading unit are pinned until the desktop releases them.
+        let newest = self.lru.back().copied();
+        for _ in 0..self.lru.len() {
+            let memory = self.cache_stats();
+            if self.cache.len() <= self.cache_capacity
+                && memory.layout_bytes <= LAYOUT_CACHE_BUDGET
+                && memory.raster_bytes <= RASTER_CACHE_BUDGET
+            {
+                break;
+            }
             let Some(candidate) = self.lru.pop_front() else {
                 break;
             };
-            if candidate == self.current_key() {
+            let pinned = self.cache.get(&candidate).is_some_and(|segment| {
+                segment.pages.iter().any(|page| Arc::strong_count(page) > 1)
+            });
+            if candidate == self.current_key() || Some(candidate) == newest || pinned {
                 self.lru.push_back(candidate);
                 continue;
             }
             self.cache.remove(&candidate);
         }
+    }
+
+    pub fn cache_stats(&self) -> ReaderCacheStats {
+        let mut stats = ReaderCacheStats {
+            segments: self.cache.len(),
+            ..Default::default()
+        };
+        let mut sections = HashSet::new();
+        let mut images = HashSet::new();
+        let mut pages = HashSet::new();
+        let mut layouts = HashSet::new();
+        let mut pinned_sections = HashSet::new();
+        let mut pinned_images = HashSet::new();
+        for (key, segment) in &self.cache {
+            if sections.insert(Arc::as_ptr(&segment.section) as usize) {
+                stats.layout_bytes += segment.section.estimated_bytes;
+            }
+            if (*key == self.current_key()
+                || segment.pages.iter().any(|page| Arc::strong_count(page) > 1))
+                && pinned_sections.insert(Arc::as_ptr(&segment.section) as usize)
+            {
+                stats.pinned_bytes += segment.section.estimated_bytes;
+            }
+            for page in &segment.pages {
+                if !pages.insert(Arc::as_ptr(page) as usize) {
+                    continue;
+                }
+                let bytes = page.accumulate_layout_bytes(&mut layouts);
+                stats.layout_bytes += bytes;
+                let pinned = *key == self.current_key() || Arc::strong_count(page) > 1;
+                if pinned {
+                    stats.pinned_bytes += bytes;
+                }
+                for (id, len) in page.raster_allocations() {
+                    if images.insert(id) {
+                        stats.raster_bytes += len;
+                    }
+                    if pinned && pinned_images.insert(id) {
+                        stats.pinned_bytes += len;
+                    }
+                }
+            }
+        }
+        stats
     }
 
     fn moved(&self) -> NavigationResult {
@@ -3655,6 +3755,13 @@ fn prepare_section(
     );
 
     PreparedSection {
+        estimated_bytes: section_text.saturating_mul(4)
+            + fragments
+                .iter()
+                .map(|fragment| fragment.blocks.len() * std::mem::size_of::<Block>())
+                .sum::<usize>()
+            + fragments.len() * std::mem::size_of::<ContentFragment>()
+            + segments.len() * std::mem::size_of::<LayoutSegment>(),
         fragments,
         segments,
         anchor_segments,
@@ -4580,6 +4687,7 @@ fn build_reader_selection(
 )]
 fn reader_image(position: ReaderPosition, hit: PageImageHit, offset_x: f32) -> ReaderImage {
     ReaderImage {
+        origin: hit.origin,
         formula: hit.formula,
         position,
         x: hit.bounds.x0 as f32 + offset_x,
@@ -5200,6 +5308,8 @@ mod tests {
                 rebook_layout::ImagePlacement {
                     formula_presentation: None,
                     image: rebook_layout::RasterImage {
+                        origin: None,
+                        blob: None,
                         width: 400,
                         height: 600,
                         pixels: vec![255; 400 * 600 * 4].into(),
@@ -8084,6 +8194,52 @@ mod tests {
     }
 
     #[test]
+    fn byte_pressure_evicts_old_segments_and_keeps_pinned_pages() {
+        let source = CountingSource::new(&["one".into(), "two".into(), "three".into()]);
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        let current = reader.current_key();
+        let pinned_page = Arc::clone(&reader.cache[&current].pages[0]);
+        let expensive = Arc::new(PreparedSection {
+            estimated_bytes: LAYOUT_CACHE_BUDGET + 1,
+            fragments: Vec::new(),
+            segments: Vec::new(),
+            anchor_segments: HashMap::new(),
+            reading_units: Vec::new(),
+        });
+        let old = SegmentKey {
+            section_index: 1,
+            segment_index: 0,
+        };
+        let newest = SegmentKey {
+            section_index: 2,
+            segment_index: 0,
+        };
+        for key in [old, newest] {
+            reader.cache.insert(
+                key,
+                Arc::new(CachedSegment {
+                    section: Arc::clone(&expensive),
+                    pages: Vec::new(),
+                    anchor_pages: HashMap::new(),
+                    visible_pages: 1,
+                    continuation_offset_x: 0.0,
+                }),
+            );
+            reader.touch(key);
+        }
+        reader.evict();
+        assert!(!reader.cache.contains_key(&old));
+        assert!(reader.cache.contains_key(&current));
+        assert!(reader.cache.contains_key(&newest));
+        assert!(Arc::ptr_eq(&pinned_page, &reader.cache[&current].pages[0]));
+        // Pinned overage is reported and speculative work stops; it must not
+        // cause an endless eviction loop or block direct navigation.
+        reader.prefetch_adjacent().unwrap();
+        assert!(reader.prefetch_inflight.is_empty());
+    }
+
+    #[test]
     fn dropping_reader_eventually_releases_worker_source() {
         let source = CountingSource::new(&["正文".into()]);
         let weak = Arc::downgrade(&source);
@@ -8132,6 +8288,7 @@ mod tests {
             source.clone(),
             Arc::new(SectionRepository::new(source)),
             Arc::default(),
+            LayoutEngine::new().raster_cache_generation(),
         )
         .unwrap();
         worker

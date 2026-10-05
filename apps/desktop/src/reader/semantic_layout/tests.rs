@@ -397,6 +397,7 @@ fn formula_copy_uses_latex_and_ordinary_images_still_copy_pixels() {
     let (mut reader, _, _) = fixture();
     let ctx = egui::Context::default();
     let mut image = rebook_reader::ReaderImage {
+        origin: None,
         formula: Some(r"\frac{a}{b}".into()),
         position: rebook_reader::ReaderPosition {
             section_index: 0,

@@ -9,6 +9,9 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
+[features]
+memory-profiling = ["rebook-windows-window-background/memory-profiling"]
+
 [[bin]]
 name = "torto"
 path = "src/main.rs"

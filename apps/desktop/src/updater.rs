@@ -272,7 +272,7 @@ impl WindowsUpdater {
                             }
                         }
                         UpdateDialogView::Downloading(_) => {
-                            ui.add(egui::Spinner::new().size(18.0));
+                            ui.add(crate::ui::LoadingSpinner::new().size(18.0));
                             ui.label(language.text("正在下载…", "Downloading…"));
                         }
                         UpdateDialogView::Ready(_) | UpdateDialogView::InstallFailed(_, _) => {

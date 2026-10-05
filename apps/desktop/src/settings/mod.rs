@@ -125,6 +125,18 @@ impl SettingsFeature {
             sync_settings,
             sync_password,
         };
+        Self::from_applied(
+            applied,
+            available_reader_font_families,
+            available_interface_font_families,
+        )
+    }
+
+    fn from_applied(
+        applied: AppliedSettings,
+        available_reader_font_families: ReaderFontFamilies,
+        available_interface_font_families: Vec<String>,
+    ) -> Self {
         Self {
             settings_tab: SettingsTab::System,
             draft_spread: applied.spread,

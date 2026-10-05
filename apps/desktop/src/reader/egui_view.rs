@@ -661,7 +661,11 @@ impl DesktopReader {
                         self.wheel_interaction(&response, interaction_blocked);
                     }
                 }
-                self.resize_canvas(f64::from(page_rect.width()), f64::from(page_rect.height()));
+                self.resize_canvas(
+                    f64::from(page_rect.width()),
+                    f64::from(page_rect.height()),
+                    ui.ctx().pixels_per_point(),
+                );
 
                 let progress = unit_f32(self.progress());
                 let (track, _) = ui.allocate_exact_size(
@@ -4607,12 +4611,13 @@ impl DesktopReader {
             let y = position.y - response.rect.min.y;
             match self.classic_footnotes_at_canvas(x, y) {
                 Ok(Some(footnotes)) => {
-                    self.citation_popup_target = self.citation_at_canvas(x, y);
-                    self.classic_footnotes = footnotes;
-                    self.classic_footnote_anchor_y = Some(position.y);
-                    self.ui.focus_footnotes_visible = true;
-                    self.ui.focus_footnote_scroll_delta = 0.0;
-                    response.ctx.request_repaint();
+                    let citation = self.citation_at_canvas(x, y);
+                    self.show_classic_hover_footnotes(
+                        &response.ctx,
+                        footnotes,
+                        citation,
+                        position.y,
+                    );
                     return;
                 }
                 Ok(None) => {}
@@ -4620,8 +4625,34 @@ impl DesktopReader {
             }
         }
         if !over_overlay {
+            let was_visible = self.ui.focus_footnotes_visible;
             self.close_focus_footnotes();
+            if was_visible {
+                response.ctx.request_repaint();
+            }
         }
+    }
+
+    fn show_classic_hover_footnotes(
+        &mut self,
+        ctx: &egui::Context,
+        footnotes: Vec<super::FocusFootnote>,
+        citation: Option<(rebook_publication::SourceRange, u32)>,
+        anchor_y: f32,
+    ) {
+        if self.ui.focus_footnotes_visible
+            && self.classic_footnotes == footnotes
+            && self.citation_popup_target == citation
+            && self.classic_footnote_anchor_y == Some(anchor_y)
+        {
+            return;
+        }
+        self.citation_popup_target = citation;
+        self.classic_footnotes = footnotes;
+        self.classic_footnote_anchor_y = Some(anchor_y);
+        self.ui.focus_footnotes_visible = true;
+        self.ui.focus_footnote_scroll_delta = 0.0;
+        ctx.request_repaint();
     }
 
     fn pointer_interaction(&mut self, response: &egui::Response) {
@@ -4821,7 +4852,7 @@ impl DesktopReader {
         self.open_reader_image_preview(ctx, image)
     }
 
-    fn open_reader_image_preview(&mut self, ctx: &egui::Context, image: ReaderImage) -> bool {
+    fn open_reader_image_preview(&mut self, ctx: &egui::Context, mut image: ReaderImage) -> bool {
         if let Some(latex) = image.formula.as_deref() {
             match formula_preview_image(latex) {
                 Ok(image) => {
@@ -4833,6 +4864,19 @@ impl DesktopReader {
                 Err(error) => self.error = Some(format!("Formula preview failed: {error}")),
             }
             return true;
+        }
+        if let Some(origin) = &image.origin {
+            match self.reader.original_image(origin) {
+                Ok(original) => {
+                    image.width = original.width;
+                    image.height = original.height;
+                    image.pixels = original.pixels;
+                }
+                Err(error) => {
+                    self.error = Some(format!("预览原图失败：{error}"));
+                    return false;
+                }
+            }
         }
         let (Ok(width), Ok(height)) = (usize::try_from(image.width), usize::try_from(image.height))
         else {
@@ -4953,7 +4997,21 @@ impl DesktopReader {
                 ctx.copy_text(latex.to_owned());
                 false
             } else {
-                ctx.copy_image(selected.color_image());
+                let image = if let Some(origin) = &selected.origin {
+                    match self.reader.original_image(origin) {
+                        Ok(image) => egui::ColorImage::from_rgba_unmultiplied(
+                            [image.width as usize, image.height as usize],
+                            &image.pixels,
+                        ),
+                        Err(error) => {
+                            self.error = Some(format!("复制原图失败：{error}"));
+                            return;
+                        }
+                    }
+                } else {
+                    selected.color_image()
+                };
+                ctx.copy_image(image);
                 true
             }
         } else {
@@ -6152,6 +6210,7 @@ impl SelectedImage {
 
         Ok(Self {
             formula: image.formula.clone(),
+            origin: image.origin.clone(),
             pixels: image.pixels.clone(),
             size: [width, height],
             position: image.position,
@@ -6382,7 +6441,7 @@ fn show_chat_progress(
                     ui.add_space(4.0);
                 }
                 if busy && !answering {
-                    ui.spinner();
+                    ui.add(crate::ui::LoadingSpinner::new());
                 }
             });
     }
@@ -6508,6 +6567,41 @@ fn page_wheel_input_allowed(pointer_over_page: bool, blocked: bool) -> bool {
 #[cfg(test)]
 mod reference_suggestion_label_tests {
     use super::*;
+
+    #[test]
+    fn idle_classic_footnote_hover_keeps_scroll_and_stops_repainting() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let ctx = egui::Context::default();
+        let footnotes = vec![super::super::FocusFootnote {
+            stable_id: None,
+            owner: None,
+            number: 1,
+            citation: None,
+            text: "A footnote".into(),
+        }];
+        for pass in 0..8 {
+            if pass == 1 {
+                reader.ui.focus_footnote_scroll_delta = 77.0;
+            }
+            let anchor_y = if pass < 7 { 120.0 } else { 140.0 };
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(f64::from(pass) * 0.1),
+                    ..Default::default()
+                },
+                |_| reader.show_classic_hover_footnotes(&ctx, footnotes.clone(), None, anchor_y),
+            );
+            let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            output.textures_delta.clear();
+            if pass == 6 {
+                assert_eq!(delay, Duration::MAX);
+                assert_eq!(reader.ui.focus_footnote_scroll_delta, 77.0);
+            } else if pass == 7 {
+                assert_eq!(delay, Duration::ZERO);
+                assert_eq!(reader.ui.focus_footnote_scroll_delta, 0.0);
+            }
+        }
+    }
 
     #[test]
     fn chat_keyboard_scroll_reaches_conversation_with_expanded_tools() {
@@ -9019,6 +9113,7 @@ mod reference_suggestion_label_tests {
     #[test]
     fn selected_reader_image_keeps_original_pixels_and_display_bounds() {
         let image = ReaderImage {
+            origin: None,
             formula: None,
             position: rebook_reader::ReaderPosition {
                 section_index: 2,

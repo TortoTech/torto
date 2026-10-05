@@ -6,8 +6,8 @@ const FULL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const MAX_READING_DELAY: Duration = Duration::from_secs(15);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SyncSchedule {
-    pub next_poll: Instant,
     pub derived_token: Option<String>,
     last_full: Instant,
     pending_since: Option<Instant>,
@@ -19,7 +19,6 @@ impl Default for SyncSchedule {
     fn default() -> Self {
         let now = Instant::now();
         Self {
-            next_poll: now,
             derived_token: None,
             last_full: now,
             pending_since: None,
@@ -102,7 +101,7 @@ mod tests {
     #[test]
     fn reading_sync_debounces_but_continuous_turns_cannot_starve_it() {
         let mut schedule = SyncSchedule::default();
-        let now = schedule.next_poll;
+        let now = schedule.last_full;
         assert_eq!(schedule.next(now, 1_000, Some(1_000)), None);
         assert_eq!(
             schedule.next(now + Duration::from_secs(1), 2_000, Some(1_800)),
@@ -125,7 +124,7 @@ mod tests {
     #[test]
     fn returning_to_library_flushes_immediately_and_failed_work_retries() {
         let mut schedule = SyncSchedule::default();
-        let now = schedule.next_poll;
+        let now = schedule.last_full;
         schedule.request(SyncMode::Reading);
         assert_eq!(
             schedule.next(now, 1_000, Some(1_000)),

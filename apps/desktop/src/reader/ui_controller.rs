@@ -13,12 +13,17 @@ impl DesktopReader {
             // 16 ms timer produces uneven frame intervals on displays whose
             // refresh period is not exactly 60 Hz.
             ctx.request_repaint();
-        } else if self.ui.needs_motion_tick()
-            || self.pending_page_turn.is_some()
+        } else if self.ui.is_animating() {
+            crate::ui::request_repaint_in(ctx, Duration::from_millis(16));
+        } else if self.pending_page_turn.is_some()
             || self.pending_reading_unit_turn.is_some()
             || self.pending_toc_navigation.is_some()
         {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            // Waiting for background layout does not need animation-rate frames.
+            crate::ui::request_repaint_in(ctx, Duration::from_millis(50));
+        }
+        if let Some(deadline) = self.ui.toolbar_hide_at {
+            crate::ui::request_repaint_in(ctx, deadline.saturating_duration_since(Instant::now()));
         }
     }
 
@@ -90,6 +95,7 @@ impl DesktopReader {
             .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
         let sidebar_was_animating = self.ui.sidebar_motion.is_animating();
         let assistant_was_animating = self.ui.assistant_motion.is_animating();
+        let mut toolbar_delta = delta;
         if self
             .ui
             .toolbar_hide_at
@@ -98,9 +104,12 @@ impl DesktopReader {
             self.ui.toolbar_hide_at = None;
             if !self.ui.toolbar_hovered && self.ui.overlay != ReaderOverlay::Menu {
                 self.ui.toolbar_motion.animate_to(0.0);
+                // The elapsed wait belongs to the hide timer, not the new
+                // animation. Preserve its fade when waking from an idle frame.
+                toolbar_delta = Duration::ZERO;
             }
         }
-        self.ui.toolbar_motion.advance(delta);
+        self.ui.toolbar_motion.advance(toolbar_delta);
         self.ui.sidebar_motion.advance(delta);
         self.ui.assistant_motion.advance(delta);
         self.ui.menu_motion.advance(delta);
@@ -168,5 +177,59 @@ impl DesktopReader {
         .into_iter()
         .flatten()
         .min()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_reader_waits_for_toolbar_deadline_and_paces_layout_polling() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        reader.ui.toolbar_motion = crate::reader::Motion::settled(0.0);
+        reader.ui.sidebar_motion = crate::reader::Motion::settled(0.0);
+        reader.ui.assistant_motion = crate::reader::Motion::settled(0.0);
+        reader.ui.menu_motion = crate::reader::Motion::settled(0.0);
+        reader.ui.focus_scroll_motion = None;
+        reader.ui.toolbar_hide_at = None;
+        let ctx = egui::Context::default();
+        for pass in 0..8 {
+            if pass == 5 {
+                reader.ui.toolbar_hide_at = Some(Instant::now() + Duration::from_secs(2));
+            } else if pass == 6 {
+                reader.ui.toolbar_hide_at = None;
+                reader.pending_page_turn = Some(rebook_reader::PageDirection::Next);
+            } else if pass == 7 {
+                reader.pending_page_turn = None;
+            }
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(f64::from(pass) * 0.1),
+                    ..Default::default()
+                },
+                |_| reader.request_frame_repaint(&ctx),
+            );
+            let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            output.textures_delta.clear();
+            if pass == 4 || pass == 7 {
+                assert_eq!(delay, Duration::MAX);
+            } else if pass == 5 {
+                assert!(delay > Duration::from_secs(1));
+            } else if pass == 6 {
+                assert_eq!(delay, Duration::from_millis(50));
+            }
+        }
+        let now = Instant::now();
+        reader.ui.toolbar_motion = crate::reader::Motion::settled(1.0);
+        reader.ui.toolbar_hovered = false;
+        reader.ui.overlay = ReaderOverlay::None;
+        reader.ui.last_motion_tick = Some(now);
+        reader.ui.toolbar_hide_at = Some(now + Duration::from_secs(1));
+        reader.advance_motion(now + Duration::from_secs(2));
+        assert!(reader.ui.toolbar_motion.is_animating());
+        assert_eq!(reader.ui.toolbar_motion.value, 1.0);
+        reader.advance_motion(now + Duration::from_secs(2) + Duration::from_millis(30));
+        assert!(reader.ui.toolbar_motion.value < 1.0);
     }
 }

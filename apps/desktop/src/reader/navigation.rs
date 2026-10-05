@@ -147,16 +147,20 @@ impl DesktopReader {
         }
     }
 
-    pub(in crate::reader) fn resize_canvas(&mut self, width: f64, height: f64) {
+    pub(in crate::reader) fn resize_canvas(&mut self, width: f64, height: f64, raster_scale: f32) {
         let width = logical_dimension(width);
         let height = logical_dimension(height);
-        if width == 0 || height == 0 || self.canvas_size == Some((width, height)) {
+        if width == 0
+            || height == 0
+            || (self.canvas_size == Some((width, height))
+                && self.reader.viewport().raster_scale == raster_scale.clamp(1.0, 4.0))
+        {
             return;
         }
         let Ok(viewport) = LayoutViewport::new(width, height) else {
             return;
         };
-        let result = self.reader.resize(viewport);
+        let result = self.reader.resize(viewport.with_raster_scale(raster_scale));
         match result {
             Ok(snapshot) => {
                 self.canvas_size = Some((width, height));

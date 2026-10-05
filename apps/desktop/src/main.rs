@@ -34,6 +34,11 @@ use std::sync::Arc;
 use app::DesktopApp;
 use library::LocalLibrary;
 
+#[cfg(all(target_os = "windows", feature = "memory-profiling"))]
+#[global_allocator]
+static ALLOCATOR: rebook_windows_window_background::CountingAllocator =
+    rebook_windows_window_background::CountingAllocator;
+
 fn main() -> ExitCode {
     let result = run();
     let error = result.as_ref().err().map(ToString::to_string);
@@ -55,6 +60,11 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(all(target_os = "windows", feature = "memory-profiling"))]
+    if let Some(path) = env::var_os("TORTO_MEMORY_PROBE_BOOK") {
+        return reader::probe_memory(PathBuf::from(path).as_path())
+            .map_err(|error| io::Error::other(error.to_string()).into());
+    }
     let launch = parse_arguments()?;
     diagnostics::install_panic_hook();
     rebook_formats::set_pdf_timing_sink(|book, stage, page, hit, elapsed_ms| {

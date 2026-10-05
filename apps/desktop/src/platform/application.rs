@@ -252,7 +252,7 @@ struct Application {
     app: DesktopApp,
     egui_ctx: egui::Context,
     window: Option<WindowState>,
-    repaint_at: Option<Instant>,
+    repaint: super::repaint::RepaintSchedule,
     fatal_error: Option<String>,
     proxy: EventLoopProxy<UserEvent>,
     runtime: tokio::runtime::Runtime,
@@ -279,13 +279,19 @@ impl Application {
         crate::ui::apply_visuals(&egui_ctx, &crate::ui::palette());
         let repaint_proxy = proxy.clone();
         egui_ctx.set_request_repaint_callback(move |request| {
-            let _ = repaint_proxy.send_event(UserEvent::RepaintAfter(request.delay));
+            if let Some(when) = Instant::now().checked_add(request.delay) {
+                let _ = repaint_proxy.send_event(UserEvent::EguiRepaint {
+                    when,
+                    cumulative_pass_nr: request.current_cumulative_pass_nr,
+                    viewport_id: request.viewport_id,
+                });
+            }
         });
         Self {
             app,
             egui_ctx,
             window: None,
-            repaint_at: None,
+            repaint: super::repaint::RepaintSchedule::default(),
             fatal_error: None,
             proxy,
             runtime,
@@ -296,19 +302,17 @@ impl Application {
         }
     }
 
-    fn schedule_repaint(&mut self, event_loop: &ActiveEventLoop, delay: Duration) {
-        let Some(window) = &self.window else {
-            return;
-        };
-        if delay.is_zero() {
+    fn update_repaint_schedule(&mut self, event_loop: &ActiveEventLoop) {
+        let current = self.egui_ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT);
+        if self.repaint.take_due(Instant::now(), current)
+            && let Some(window) = &self.window
+        {
             window.window.request_redraw();
-            return;
         }
-        let deadline = Instant::now() + delay;
-        if self.repaint_at.is_none_or(|current| deadline < current) {
-            self.repaint_at = Some(deadline);
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-        }
+        event_loop.set_control_flow(match self.repaint.next_deadline(current) {
+            Some(deadline) => ControlFlow::WaitUntil(deadline),
+            None => ControlFlow::Wait,
+        });
     }
 
     fn render_window_state(
@@ -452,21 +456,14 @@ impl ApplicationHandler<UserEvent> for Application {
         self.window = Some(state);
     }
 
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         if crate::smoke::enabled() && matches!(cause, StartCause::ResumeTimeReached { .. }) {
             if let Some(window) = &self.window {
                 window.window.request_redraw();
             }
         }
-        if matches!(cause, StartCause::ResumeTimeReached { .. })
-            && self
-                .repaint_at
-                .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            self.repaint_at = None;
-            if let Some(window) = &self.window {
-                window.window.request_redraw();
-            }
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            self.update_repaint_schedule(event_loop);
         }
     }
 
@@ -478,7 +475,30 @@ impl ApplicationHandler<UserEvent> for Application {
         };
         let callback_started = Instant::now();
         match event {
-            UserEvent::RepaintAfter(delay) => self.schedule_repaint(event_loop, delay),
+            UserEvent::RepaintAfter(delay) => {
+                if let Some(when) = Instant::now().checked_add(delay) {
+                    self.repaint.external(when);
+                    self.update_repaint_schedule(event_loop);
+                }
+                return;
+            }
+            UserEvent::EguiRepaint {
+                when,
+                cumulative_pass_nr,
+                viewport_id,
+            } => {
+                if viewport_id == egui::ViewportId::ROOT {
+                    let current = self.egui_ctx.cumulative_pass_nr_for(viewport_id);
+                    self.repaint.egui(when, cumulative_pass_nr, current);
+                    self.update_repaint_schedule(event_loop);
+                }
+                return;
+            }
+            UserEvent::ShelfSyncCheck(message) => {
+                if !self.app.complete_shelf_sync_check(message) {
+                    return;
+                }
+            }
             #[cfg(target_os = "macos")]
             UserEvent::OpenBook(path) => self.app.open_book(&path),
             #[cfg(target_os = "windows")]
@@ -571,7 +591,10 @@ impl ApplicationHandler<UserEvent> for Application {
             }
         }
         let response = state.egui_state.on_window_event(&state.window, &event);
-        if response.repaint {
+        // RedrawRequested is already being serviced below. egui-winit marks
+        // it as needing paint, but requesting another frame here creates a
+        // perpetual render loop even when egui has no pending repaint.
+        if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             state.window.request_redraw();
         }
         match event {
@@ -622,6 +645,10 @@ impl ApplicationHandler<UserEvent> for Application {
                 Self::render_window_state(state, &mut self.app, &self.egui_ctx);
             }
             WindowEvent::RedrawRequested => {
+                self.repaint.on_redraw(
+                    Instant::now(),
+                    self.egui_ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT),
+                );
                 if !super::gpu::window_can_render(&state.window) {
                     return;
                 }
@@ -709,18 +736,7 @@ impl ApplicationHandler<UserEvent> for Application {
             ));
             return;
         }
-        if let Some(deadline) = self.repaint_at {
-            if Instant::now() >= deadline {
-                self.repaint_at = None;
-                if let Some(window) = &self.window {
-                    window.window.request_redraw();
-                }
-            } else {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            }
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
-        }
+        self.update_repaint_schedule(event_loop);
     }
 }
 

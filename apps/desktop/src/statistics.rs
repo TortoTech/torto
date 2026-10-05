@@ -488,8 +488,6 @@ fn detail_reading_time_text(ms: u64, language: AppLanguage, size: f32) -> egui::
 pub(crate) struct Page {
     progress: HashMap<String, f64>,
     annotations: HashMap<String, (usize, usize)>,
-    covers: HashMap<String, Vec<u8>>,
-    textures: HashMap<String, egui::TextureHandle>,
     history: Vec<Event>,
     pub(crate) open: bool,
     selected: Option<String>,
@@ -549,9 +547,6 @@ impl Page {
         self.period_offset = 0;
         self.open = true;
         for book in library {
-            if let Some(bytes) = &book.cover_bytes {
-                self.covers.insert(book.id.clone(), bytes.clone());
-            }
             if let Some(progress) = store.and_then(|s| s.load_progress(&book.id).ok().flatten()) {
                 self.progress.insert(
                     book.id.clone(),
@@ -634,6 +629,7 @@ impl Page {
         language: AppLanguage,
         blocked: bool,
         return_to_shelf: egui::KeyboardShortcut,
+        cover_texture: &mut CoverTexture<'_>,
     ) {
         use crate::ui::{Icon, icon_button, palette};
         if !blocked
@@ -750,9 +746,9 @@ impl Page {
                                 ui.set_max_width(800.0);
                                 ui.spacing_mut().item_spacing.y = 12.0;
                                 if let Some(id) = self.selected.clone() {
-                                    self.detail(ui, language, &id);
+                                    self.detail(ui, language, &id, cover_texture);
                                 } else {
-                                    self.overview(ui, language);
+                                    self.overview(ui, language, cover_texture);
                                 }
                             });
                     });
@@ -760,7 +756,12 @@ impl Page {
             });
     }
 
-    fn overview(&mut self, ui: &mut egui::Ui, language: AppLanguage) {
+    fn overview(
+        &mut self,
+        ui: &mut egui::Ui,
+        language: AppLanguage,
+        cover_texture: &mut CoverTexture<'_>,
+    ) {
         use period::Period;
 
         let today = Local::now().date_naive();
@@ -920,23 +921,25 @@ impl Page {
                 );
             }
             for (id, book, time) in books {
-                if book_row(
-                    ui,
-                    id,
-                    book,
-                    time,
-                    language,
-                    self.covers.get(id).map(Vec::as_slice),
-                    &mut self.textures,
-                )
-                .clicked()
+                if ui
+                    .push_id(id, |ui| {
+                        book_row(ui, id, book, time, language, cover_texture)
+                    })
+                    .inner
+                    .clicked()
                 {
                     self.selected = Some(id.clone());
                 }
             }
         });
     }
-    fn detail(&mut self, ui: &mut egui::Ui, language: AppLanguage, id: &str) {
+    fn detail(
+        &mut self,
+        ui: &mut egui::Ui,
+        language: AppLanguage,
+        id: &str,
+        cover_texture: &mut CoverTexture<'_>,
+    ) {
         use crate::ui::palette;
         let Some(book) = self.books.get(id) else {
             empty_hint(
@@ -945,34 +948,21 @@ impl Page {
             );
             return;
         };
-        if !self.textures.contains_key(id) {
-            if let Some(bytes) = self.covers.get(id) {
-                if let Ok(image) = image::load_from_memory(bytes) {
-                    let image = image.thumbnail(100, 150).to_rgba8();
-                    self.textures.insert(
-                        id.into(),
-                        ui.ctx().load_texture(
-                            format!("stats-{id}"),
-                            egui::ColorImage::from_rgba_unmultiplied(
-                                [image.width() as usize, image.height() as usize],
-                                image.as_raw(),
-                            ),
-                            egui::TextureOptions::LINEAR,
-                        ),
-                    );
-                }
-            }
-        }
         card().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal_top(|ui| {
-                let cover_bottom = if let Some(texture) = self.textures.get(id) {
-                    let bottom = ui.image(texture).rect.bottom();
-                    ui.add_space(14.0);
-                    Some(bottom)
-                } else {
-                    None
-                };
+                let (cover_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(100.0, 150.0), egui::Sense::hover());
+                if ui.is_rect_visible(cover_rect) {
+                    if let Some(texture) = cover_texture(ui, id, [100, 150]) {
+                        paint_statistics_cover(ui, &texture, cover_rect, 0);
+                    } else {
+                        ui.painter()
+                            .rect_filled(cover_rect, 3.0, palette().surface_muted);
+                    }
+                }
+                let cover_bottom = Some(cover_rect.bottom());
+                ui.add_space(14.0);
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new(&book.title).size(22.0).strong());
                     ui.label(egui::RichText::new(&book.authors).color(palette().muted));
@@ -1551,18 +1541,38 @@ fn reading_row_text_positions(
     )
 }
 
+// The owning shelf supplies borrowed library data and the shared async cache.
+// Statistics keeps neither encoded covers nor its own GPU texture collection.
+type CoverTexture<'a> = dyn FnMut(&egui::Ui, &str, [u32; 2]) -> Option<egui::TextureHandle> + 'a;
+
+fn paint_statistics_cover(
+    ui: &egui::Ui,
+    texture: &egui::TextureHandle,
+    rect: egui::Rect,
+    radius: u8,
+) {
+    let original = texture.size_vec2();
+    let scale = (rect.width() / original.x).min(rect.height() / original.y);
+    let image_rect = egui::Rect::from_center_size(rect.center(), original * scale);
+    egui::Image::new(texture)
+        .corner_radius(radius)
+        .paint_at(ui, image_rect);
+}
+
 fn book_row(
     ui: &mut egui::Ui,
     id: &str,
     book: &BookStats,
     time: u64,
     language: AppLanguage,
-    cover: Option<&[u8]>,
-    textures: &mut HashMap<String, egui::TextureHandle>,
+    cover_texture: &mut CoverTexture<'_>,
 ) -> egui::Response {
     let colors = crate::ui::palette();
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 88.0), egui::Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
     if response.hovered() || response.has_focus() {
         ui.painter()
             .rect_filled(rect, 6.0, colors.hovered_weak_fill);
@@ -1570,30 +1580,8 @@ fn book_row(
     let cover_rect =
         egui::Rect::from_min_size(rect.min + egui::vec2(10.0, 8.0), egui::vec2(48.0, 72.0));
     if ui.is_rect_visible(rect) {
-        if !textures.contains_key(id)
-            && let Some(bytes) = cover
-            && let Ok(image) = image::load_from_memory(bytes)
-        {
-            let image = image.thumbnail(100, 150).to_rgba8();
-            textures.insert(
-                id.into(),
-                ui.ctx().load_texture(
-                    format!("stats-{id}"),
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        [image.width() as usize, image.height() as usize],
-                        image.as_raw(),
-                    ),
-                    egui::TextureOptions::LINEAR,
-                ),
-            );
-        }
-        if let Some(texture) = textures.get(id) {
-            let original = texture.size_vec2();
-            let scale = (cover_rect.width() / original.x).min(cover_rect.height() / original.y);
-            let image_rect = egui::Rect::from_center_size(cover_rect.center(), original * scale);
-            egui::Image::new(texture)
-                .corner_radius(3)
-                .paint_at(ui, image_rect);
+        if let Some(texture) = cover_texture(ui, id, [48, 72]) {
+            paint_statistics_cover(ui, &texture, cover_rect, 3);
         } else {
             ui.painter()
                 .rect_filled(cover_rect, 3.0, colors.surface_muted);
@@ -1886,6 +1874,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn offscreen_statistics_rows_do_not_request_covers() {
+        let ctx = egui::Context::default();
+        let book = BookStats {
+            title: "A book".into(),
+            ..Default::default()
+        };
+        let mut requested = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 240.0),
+                )),
+                ..Default::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    for row in 0..100 {
+                        let id = format!("book-{row}");
+                        book_row(
+                            ui,
+                            &id,
+                            &book,
+                            120_000,
+                            AppLanguage::English,
+                            &mut |_, id, size| {
+                                requested.push((id.to_owned(), size));
+                                None
+                            },
+                        );
+                    }
+                });
+            },
+        );
+        output.textures_delta.clear();
+        assert!(!requested.is_empty());
+        assert!(
+            requested.len() < 10,
+            "offscreen rows requested covers: {}",
+            requested.len()
+        );
+        assert!(requested.iter().all(|(_, size)| *size == [48, 72]));
+    }
+
+    #[test]
+    fn overview_and_details_stop_requesting_frames_when_idle() {
+        for detail in [false, true] {
+            let ctx = egui::Context::default();
+            let mut page = Page::default();
+            let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+            page.books.insert(
+                "idle-book".into(),
+                BookStats {
+                    title: "Idle statistics".into(),
+                    authors: "Author".into(),
+                    status: Status::Reading,
+                    intervals: vec![(1_700_000_000_000, 1_700_000_120_000, 0)],
+                    valid_intervals: vec![(1_700_000_000_000, 1_700_000_120_000, 0)],
+                    days: BTreeMap::from([(today, 120_000)]),
+                    ..Default::default()
+                },
+            );
+            page.selected = detail.then(|| "idle-book".into());
+            for pass in 0..10 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1000.0, 800.0),
+                        )),
+                        time: Some(f64::from(pass) * 0.2),
+                        ..Default::default()
+                    },
+                    |root| {
+                        page.ui(
+                            root,
+                            AppLanguage::English,
+                            false,
+                            crate::preferences::ShortcutPreferences::default().return_to_shelf,
+                            &mut |_, _, _| None,
+                        );
+                    },
+                );
+                let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+                output.textures_delta.clear();
+                if pass == 9 {
+                    assert_eq!(delay, Duration::MAX, "detail={detail}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn history_aligns_hour_and_minute_columns_for_different_digit_counts() {
         let ctx = egui::Context::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |root| {
@@ -1946,7 +2027,6 @@ mod tests {
             egui::TextureOptions::LINEAR,
         );
         let cover_id = cover.id();
-        page.textures.insert("book".into(), cover);
         page.books.insert(
             "book".into(),
             BookStats {
@@ -1971,8 +2051,11 @@ mod tests {
                 ..Default::default()
             },
             |root| {
-                egui::CentralPanel::default()
-                    .show(root, |ui| page.detail(ui, AppLanguage::English, "book"));
+                egui::CentralPanel::default().show(root, |ui| {
+                    page.detail(ui, AppLanguage::English, "book", &mut |_, _, _| {
+                        Some(cover.clone())
+                    })
+                });
             },
         );
         output.textures_delta.clear();
@@ -2323,7 +2406,6 @@ mod tests {
             period_offset: -2,
             ..Default::default()
         };
-        page.covers.insert("book".into(), vec![1, 2, 3]);
         let mut snapshot = Page::default();
         snapshot.books.insert(
             "book".into(),
@@ -2337,7 +2419,6 @@ mod tests {
         assert_eq!(page.selected.as_deref(), Some("book"));
         assert_eq!(page.period, period::Period::Month);
         assert_eq!(page.period_offset, -2);
-        assert_eq!(page.covers["book"], [1, 2, 3]);
         assert_eq!(page.books["book"].title, "Updated title");
     }
 
@@ -2493,7 +2574,7 @@ mod tests {
                 },
                 |root| {
                     egui::CentralPanel::default().show(root, |ui| {
-                        page.overview(ui, AppLanguage::default());
+                        page.overview(ui, AppLanguage::default(), &mut |_, _, _| None);
                         assert!(
                             ui.min_rect().right() <= width + 1.0,
                             "overview overflows at {width}: {:?}",

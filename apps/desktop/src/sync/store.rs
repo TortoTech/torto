@@ -48,7 +48,6 @@ impl SyncStore {
         Ok(store)
     }
 
-    #[cfg(test)]
     pub(crate) fn path(&self) -> &std::path::Path {
         &self.path
     }

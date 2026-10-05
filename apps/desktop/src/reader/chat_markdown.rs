@@ -753,7 +753,7 @@ fn paint_asset(
             preview_error(ui, error);
         }
         Some(AssetStatus::Pending { .. }) | None => {
-            ui.ctx().request_repaint_after(ASSET_REPAINT_INTERVAL);
+            crate::ui::request_repaint_in(ui.ctx(), ASSET_REPAINT_INTERVAL);
             if inline {
                 ui.label(
                     RichText::new("…")
@@ -762,7 +762,7 @@ fn paint_asset(
                 );
             } else {
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    ui.add(crate::ui::LoadingSpinner::new());
                     ui.label(
                         RichText::new("Rendering…")
                             .size(crate::ui::scaled_font_size(11.5))
@@ -870,7 +870,7 @@ fn paint_visual_preview_image(
             image: (*image).clone(),
         }),
         Ok(ImagePoll::Pending { .. }) => {
-            ui.ctx().request_repaint();
+            crate::ui::request_repaint_in(ui.ctx(), ASSET_REPAINT_INTERVAL);
             None
         }
         Err(_) => {
