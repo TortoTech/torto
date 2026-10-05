@@ -1,5 +1,5 @@
 use crate::highlights::StoredHighlight;
-use rebook_publication::SourceRange;
+use rebook_publication::{SourceAnchor, SourceRange};
 use rebook_reader::{
     NavigationAttempt, NavigationOutcome, PageDirection, ReaderPosition, SelectionGranularity,
 };
@@ -467,17 +467,47 @@ impl DesktopReader {
         };
         match self.reader.go_to_source(&anchor) {
             Ok(result) => {
+                let focus = self.is_focus_mode();
+                if focus {
+                    self.reanchor_focus_view(anchor.clone());
+                }
                 self.apply_snapshot(
                     result.snapshot,
                     SnapshotEffects {
                         marks: MarkRetention::Keep,
+                        // Focus mode saves the position below, once the highlight's
+                        // own anchor has replaced the page the snapshot names.
+                        progress: if focus {
+                            ProgressChange::Keep
+                        } else {
+                            ProgressChange::Persist
+                        },
                         ..SnapshotEffects::navigation()
                     },
                 );
+                if focus {
+                    self.focus_anchor = Some(anchor);
+                    self.persist_progress();
+                }
                 self.selected_highlight_id = Some(id.to_owned());
             }
             Err(error) => self.error = Some(format!("高亮跳转失败：{error}")),
         }
+    }
+
+    /// Points the focus-mode view at `anchor` and drops the focus units and
+    /// scroll targets that still describe the previous reading unit.
+    ///
+    /// Focus units belong to one reading unit, and the scroll viewport keeps the
+    /// session position on them. A highlight in another chapter therefore
+    /// leaves the reader on the paragraph it came from, so the jump has to
+    /// re-anchor before the next frame rebuilds the units.
+    fn reanchor_focus_view(&mut self, anchor: SourceAnchor) {
+        self.focus_anchor = Some(anchor);
+        self.scroll_section = None;
+        self.invalidate_focus_units();
+        self.focus_target_offset = None;
+        self.ui.focus_scroll_motion = None;
     }
 
     pub(in crate::reader) fn set_sidebar_tab(&mut self, tab: SidebarTab) {
