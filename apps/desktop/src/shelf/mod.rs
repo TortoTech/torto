@@ -68,6 +68,10 @@ pub(crate) struct ShelfFeature {
     shelf: ShelfState,
     import_task: TaskSlot<()>,
     pending_reader: Option<DesktopReader>,
+    /// Book most recently handed to the reader. Reading activity is refreshed
+    /// asynchronously, so on return the shelf cannot yet re-derive the
+    /// highlight from the order without lagging one book behind.
+    last_opened_book_id: Option<String>,
     reader_fonts: Arc<[Blob<u8>]>,
     local_store: Option<SyncStore>,
     sync: SyncUiState,
@@ -254,6 +258,7 @@ impl ShelfFeature {
             },
             import_task: TaskSlot::default(),
             pending_reader: None,
+            last_opened_book_id: None,
             reader_fonts,
             local_store,
             sync: SyncUiState {
@@ -328,6 +333,7 @@ impl ShelfFeature {
             Ok(reader) => {
                 self.cover_textures.suspend();
                 self.pending_reader = Some(reader);
+                self.last_opened_book_id = Some(book.id.clone());
                 self.shelf.error = None;
                 self.shelf.error_dismiss_at = None;
             }
@@ -453,7 +459,10 @@ impl ShelfFeature {
             self.language = language;
         }
         self.refresh_read_activity();
-        self.shelf.selected_book_id = None;
+        self.shelf.selected_book_id = selection_after_reader(
+            self.last_opened_book_id.as_deref(),
+            self.shelf.library.books(),
+        );
         self.shelf.focus_selected_book = true;
         self.start_sync(SyncMode::Reading);
     }
@@ -1685,6 +1694,15 @@ fn shelf_search_hint(language: AppLanguage, book_count: usize) -> String {
     }
 }
 
+/// The card to highlight when the reader returns to the shelf. The book that
+/// was open wins, because the activity refresh that reorders the shelf may not
+/// have landed yet; otherwise the caller leaves the choice to the sorted list.
+fn selection_after_reader(last_opened: Option<&str>, books: &[LibraryBook]) -> Option<String> {
+    last_opened
+        .filter(|id| books.iter().any(|book| book.id == *id))
+        .map(ToOwned::to_owned)
+}
+
 fn sort_shelf_books(books: &mut [LibraryBook], read_activity: &HashMap<String, u64>) {
     books.sort_by(|left, right| {
         let left_activity = read_activity
@@ -1932,6 +1950,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["new", "middle", "old"]
         );
+    }
+
+    #[test]
+    fn returning_from_the_reader_keeps_the_book_that_was_read_selected() {
+        // Book "a" is still ranked first because its activity refresh is in
+        // flight when the shelf paints its first frame back from the reader.
+        let mut books = vec![book("a", 300), book("b", 100)];
+        sort_shelf_books(&mut books, &HashMap::from([("a".into(), 400)]));
+        assert_eq!(books[0].id, "a");
+
+        assert_eq!(
+            selection_after_reader(Some("b"), &books).as_deref(),
+            Some("b")
+        );
+        assert_eq!(selection_after_reader(None, &books), None);
+        assert_eq!(selection_after_reader(Some("missing"), &books), None);
     }
 
     #[test]
