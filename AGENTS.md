@@ -97,3 +97,15 @@
 
 - Keep all English-only content before `<details>`. Put all Chinese-only content inside the matching `<details>` block.
 - If a Full Changelog link should appear in both languages, include it in both sections rather than placing it after `</details>`.
+
+### Contributor Attribution
+
+- Before publishing, inspect the commits and associated pull requests between the previous release tag and the new tag. Include only contributions shipped in that release; check GitHub's commit-to-PR associations so squash/rebase merges are also covered.
+- Credit externally contributed changes directly in their `Feature`, `Improvement`, or `Fix` entry, with links to the author's GitHub profile and the contributing PR. The maintainer's account is `L-Chris`; omit attribution for the maintainer's own changes.
+- Use the PR author and verified co-authors as the contribution source. Do not substitute the person who merged the PR or the merge commit's committer. Confirm the contribution against the included code before assigning credit.
+- Preserve identical authors and PR links in the English and Chinese versions of an entry. Use absolute GitHub URLs so the links also work when release notes are mirrored to Gitee.
+- If an entry combines work from multiple authors, identify their respective contributions or split independently meaningful changes into separate entries. Do not attribute the maintainer's additional work to an external contributor merely because the entry also includes their PR.
+- For a verified external contribution without a PR, link its commit. Do not guess authorship from a display name or an unverified email address.
+- Follow the entry-level attribution used by [egui](https://github.com/emilk/egui/releases/tag/0.36.2) and [bat](https://github.com/sharkdp/bat/releases/tag/v0.26.1). Keep the existing release categories and concise user-facing descriptions.
+- Example English entry: `Keep the table of contents highlight on the section currently being read. — by [@Catapult291](https://github.com/Catapult291), [#3](https://github.com/TortoTech/torto/pull/3)`.
+- 对应中文条目：`目录高亮正确跟随当前阅读的章节。——感谢 [@Catapult291](https://github.com/Catapult291)，[PR #3](https://github.com/TortoTech/torto/pull/3)`。
