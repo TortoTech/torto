@@ -208,8 +208,8 @@ impl SyncStore {
         self.write_progress(book_id, locator, false)
     }
 
-    /// Refreshes the reading-activity time even when the locator is unchanged, so
-    /// opening a book without turning a page still counts as reading it.
+    /// Refreshes activity without replacing an existing precise locator. The
+    /// supplied locator is only used for a book with no progress yet.
     pub(crate) fn record_reading_activity(
         &self,
         book_id: &str,
@@ -226,7 +226,11 @@ impl SyncStore {
     ) -> SyncResult<()> {
         locator.validate()?;
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = if refresh_activity {
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+        } else {
+            connection.transaction()?
+        };
         let locator_json = serde_json::to_string(locator)?;
         if !refresh_activity {
             let current: Option<String> = transaction
@@ -241,10 +245,16 @@ impl SyncStore {
             }
         }
         let updated_at = tick(&transaction, &self.device_id, None)?;
-        transaction.execute(
+        let sql = if refresh_activity {
+            "INSERT INTO progress(book_id, locator_json, updated_hlc) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(book_id) DO UPDATE SET updated_hlc = excluded.updated_hlc"
+        } else {
             "INSERT INTO progress(book_id, locator_json, updated_hlc) VALUES (?1, ?2, ?3) \
              ON CONFLICT(book_id) DO UPDATE SET locator_json = excluded.locator_json, \
-             updated_hlc = excluded.updated_hlc",
+             updated_hlc = excluded.updated_hlc"
+        };
+        transaction.execute(
+            sql,
             params![book_id, locator_json, serde_json::to_string(&updated_at)?],
         )?;
         mark_reading_changed(&transaction, &self.device_id, book_id)?;
@@ -974,6 +984,31 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         store.record_reading_activity("book", &locator).unwrap();
         assert!(store.progress_activity_times().unwrap()["book"] > first);
+        cleanup(&store);
+    }
+
+    #[test]
+    fn delayed_reading_activity_preserves_the_complete_latest_locator() {
+        let store = test_store("activity-precise-position");
+        let initial = locator("book", 0.2);
+        store.record_reading_activity("book", &initial).unwrap();
+        assert_eq!(
+            store.load_progress("book").unwrap().unwrap().locator,
+            initial
+        );
+
+        let mut precise = locator("book", 0.6);
+        let mut range = source_range();
+        range.start.text_offset = 17;
+        range.end.text_offset = 31;
+        precise.source = Some(range);
+        store.save_progress("book", &precise).unwrap();
+        let previous_time = store.load_progress("book").unwrap().unwrap().updated_at;
+        // An earlier opening finishes after the reader has already moved.
+        store.record_reading_activity("book", &initial).unwrap();
+        let saved = store.load_progress("book").unwrap().unwrap();
+        assert_eq!(saved.locator, precise);
+        assert!(saved.updated_at > previous_time);
         cleanup(&store);
     }
 

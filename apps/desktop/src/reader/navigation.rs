@@ -293,13 +293,18 @@ impl DesktopReader {
         let Some(store) = &self.progress_store else {
             return;
         };
+        let locator = self.progress_locator();
+        if let Err(error) = store.save_progress(&self.book_id, &locator) {
+            tracing::warn!(%error, book_id = %self.book_id, "failed to persist reading progress");
+        }
+    }
+
+    pub(crate) fn progress_locator(&self) -> rebook_publication::LocatorV1 {
         let mut locator = self.reader.current_locator();
         if let Some(source) = self.progress_source_range() {
             locator.source = Some(source);
         }
-        if let Err(error) = store.save_progress(&self.book_id, &locator) {
-            tracing::warn!(%error, book_id = %self.book_id, "failed to persist reading progress");
-        }
+        locator
     }
 
     pub(super) fn progress_source_range(&self) -> Option<SourceRange> {

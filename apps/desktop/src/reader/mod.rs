@@ -4044,11 +4044,6 @@ impl DesktopReader {
                 settings: plugin_settings.clone(),
             });
         }
-        if let Some(store) = progress_store.as_ref()
-            && let Err(error) = store.record_reading_activity(&book_id, &reader.current_locator())
-        {
-            tracing::warn!(%error, book_id = %book_id, "failed to record reading activity");
-        }
         let search = SearchUiState::default();
         Self {
             reader,

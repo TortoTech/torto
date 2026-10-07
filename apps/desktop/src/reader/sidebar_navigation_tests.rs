@@ -96,11 +96,19 @@ fn paragraph(spine: &SpineItemId, index: usize) -> Block {
 
 /// One spine file holding `CHAPTERS` chapters, each pointed at by a TOC
 /// fragment, exactly like a book whose chapters live in a shared resource.
+fn chapter_book(reading_mode: ReadingMode) -> (DesktopReader, Section) {
+    chapter_book_with_progress(reading_mode, None, None)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the fixture keeps the book, its section, and the reader wiring in one readable place"
 )]
-fn chapter_book(reading_mode: ReadingMode) -> (DesktopReader, Section) {
+fn chapter_book_with_progress(
+    reading_mode: ReadingMode,
+    progress_store: Option<crate::sync::SyncStore>,
+    restored_source_range: Option<SourceRange>,
+) -> (DesktopReader, Section) {
     let spine = SpineItemId::new(CHAPTER).unwrap();
     let href = PublicationUrl::parse("chapter.xhtml").unwrap();
     let blocks = (0..CHAPTERS * PARAGRAPHS_PER_CHAPTER)
@@ -163,7 +171,7 @@ fn chapter_book(reading_mode: ReadingMode) -> (DesktopReader, Section) {
         rewrite_source.clone(),
     ));
     let structure_source = Arc::new(ParagraphStructureSource::new(semantic_source.clone()));
-    let session = rebook_reader::ReaderSession::open_with_fonts(
+    let mut session = rebook_reader::ReaderSession::open_with_fonts(
         structure_source.clone(),
         rebook_layout::LayoutViewport::new(800, 600).unwrap(),
         rebook_layout::ReaderStyle {
@@ -174,6 +182,11 @@ fn chapter_book(reading_mode: ReadingMode) -> (DesktopReader, Section) {
         crate::fonts::embedded_reader_fonts(),
     )
     .unwrap();
+    if let Some(store) = &progress_store
+        && let Some(progress) = store.load_progress("sidebar-scroll-regression").unwrap()
+    {
+        session.restore_locator(&progress.locator).unwrap();
+    }
     let mut reader = DesktopReader::new(
         session,
         DesktopReaderResources {
@@ -199,8 +212,8 @@ fn chapter_book(reading_mode: ReadingMode) -> (DesktopReader, Section) {
             },
             highlight_store: HighlightStore::from_repository(EmptyHighlights),
             highlights: vec![],
-            progress_store: None,
-            restored_source_range: None,
+            progress_store,
+            restored_source_range,
             plugin_settings: settings,
             language: AppLanguage::English,
             reading_mode,
@@ -396,6 +409,38 @@ fn focus_highlight_jump_lands_on_the_highlight_and_stays_there() {
         Some("p205"),
         "the saved position still points at the paragraph left behind"
     );
+}
+
+#[test]
+fn opening_book_keeps_its_precise_resume_anchor() {
+    let (reader, section) = chapter_book(ReadingMode::Focus);
+    let target = range_at(&section, "p1");
+    let mut locator = reader.reader.current_locator();
+    locator.source = Some(target.clone());
+    let path = std::env::temp_dir().join(format!("torto-resume-{}.sqlite3", uuid::Uuid::new_v4()));
+    let store = crate::sync::SyncStore::open_at(path.clone(), "resume-test").unwrap();
+    store
+        .save_progress("sidebar-scroll-regression", &locator)
+        .unwrap();
+    drop(reader);
+    let (resumed, _) =
+        chapter_book_with_progress(ReadingMode::Focus, Some(store.clone()), Some(target));
+    assert_eq!(
+        resumed.reader.current_locator().source.unwrap().start.node,
+        "p0"
+    );
+    assert_eq!(resumed.progress_locator().source.unwrap().start.node, "p1");
+    assert_eq!(
+        store
+            .load_progress("sidebar-scroll-regression")
+            .unwrap()
+            .unwrap()
+            .locator,
+        locator
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
 }
 
 #[test]

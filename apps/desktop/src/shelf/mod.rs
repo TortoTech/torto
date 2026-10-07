@@ -1,5 +1,6 @@
 mod background;
 mod covers;
+mod reading_activity;
 mod sync_button;
 mod sync_monitor;
 mod sync_schedule;
@@ -7,6 +8,7 @@ mod sync_schedule;
 pub(crate) use sync_monitor::SyncCheckMessage;
 
 use background::BackgroundJob;
+use reading_activity::ReadingActivity;
 
 use sync_schedule::SyncSchedule;
 
@@ -81,7 +83,7 @@ pub(crate) struct ShelfFeature {
     return_to_shelf_shortcut: egui::KeyboardShortcut,
     settings_requested: bool,
     cover_textures: covers::CoverCache,
-    read_activity: HashMap<String, u64>,
+    read_activity: ReadingActivity,
     refresh_generation: u64,
     refresh_requested: bool,
     refresh_job: BackgroundJob<(u64, Result<ShelfSnapshot, String>)>,
@@ -243,7 +245,6 @@ impl ShelfFeature {
         let initial_error_dismiss_at = initial_error
             .as_ref()
             .map(|_| Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
-        let read_activity = load_read_activity(local_store.as_ref());
         let mut feature = Self {
             statistics: crate::statistics::Page::default(),
             shelf: ShelfState {
@@ -278,7 +279,7 @@ impl ShelfFeature {
                 .return_to_shelf,
             settings_requested: false,
             cover_textures: covers::CoverCache::default(),
-            read_activity,
+            read_activity: ReadingActivity::default(),
             refresh_generation: 0,
             refresh_requested: false,
             refresh_job: BackgroundJob::default(),
@@ -329,9 +330,22 @@ impl ShelfFeature {
             Arc::clone(&self.reader_fonts),
             metadata,
             book.cover_bytes.clone(),
-            local_store,
+            local_store.clone(),
         ) {
             Ok(reader) => {
+                let opened_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                self.read_activity.record(
+                    local_store,
+                    book.id.clone(),
+                    reader.progress_locator(),
+                    opened_ms,
+                );
+                self.refresh_read_activity();
                 self.cover_textures.suspend();
                 self.pending_reader = Some(reader);
                 self.last_opened_book_id = Some(book.id.clone());
@@ -400,6 +414,7 @@ impl ShelfFeature {
                     tracing::warn!(%error, "failed to persist local book removal tombstone");
                 }
                 self.cover_textures.remove(id);
+                self.read_activity.remove(id);
                 self.show_notice(
                     self.language
                         .text("已从本地书架移除", "Removed from the local shelf")
@@ -448,7 +463,9 @@ impl ShelfFeature {
         self.sync.password.clone_from(&settings.sync_password);
         if changed {
             self.sync.monitor.invalidate();
+            self.read_activity.invalidate();
             self.local_store = SyncStore::open_default(self.sync.settings.device_id.clone()).ok();
+            self.refresh_read_activity();
             self.start_sync(SyncMode::Full {
                 force_statistics: false,
             });
@@ -474,6 +491,9 @@ impl ShelfFeature {
     }
 
     fn poll_background(&mut self) {
+        if self.read_activity.poll() {
+            self.refresh_read_activity();
+        }
         if let Some(covers) = self.cover_job.poll()
             && let Err(error) = self.shelf.library.update_missing_covers(&covers)
         {
@@ -485,13 +505,16 @@ impl ShelfFeature {
             match result {
                 Ok(snapshot) => {
                     self.statistics.apply_shelf_snapshot(snapshot.statistics);
-                    self.read_activity = snapshot.activity;
+                    self.read_activity.apply_snapshot(snapshot.activity);
                     if let Err(error) = self.shelf.library.update_metadata_batch(&snapshot.metadata)
                     {
                         self.sync_failed(error.to_string());
                     }
                 }
-                Err(error) => tracing::warn!(%error, "failed to refresh shelf data"),
+                Err(error) => {
+                    self.read_activity.load_failed();
+                    tracing::warn!(%error, "failed to refresh shelf data");
+                }
             }
         }
     }
@@ -614,6 +637,10 @@ impl ShelfFeature {
         proxy: &winit::event_loop::EventLoopProxy<crate::platform::UserEvent>,
     ) {
         let wake = proxy.clone();
+        self.read_activity.spawn(runtime, move || {
+            let _ = wake.send_event(crate::platform::UserEvent::RepaintAfter(Duration::ZERO));
+        });
+        let wake = proxy.clone();
         self.cover_textures.spawn(runtime, move || {
             let _ = wake.send_event(crate::platform::UserEvent::RepaintAfter(Duration::ZERO));
         });
@@ -651,7 +678,10 @@ impl ShelfFeature {
                 );
             }
         }
-        if self.refresh_requested && !self.refresh_job.is_running() {
+        if self.refresh_requested
+            && !self.refresh_job.is_running()
+            && !self.read_activity.is_pending()
+        {
             self.refresh_requested = false;
             let generation = self.refresh_generation;
             let books = self
@@ -991,19 +1021,17 @@ impl ShelfFeature {
                         added_at: book.added_at,
                     })
                     .collect();
-                sort_shelf_books(&mut books, &self.read_activity);
+                sort_shelf_books(&mut books, self.read_activity.times());
                 if search_response.changed() {
                     self.shelf.selected_book_id = books.first().map(|book| book.id.clone());
                     // Keep the editor active while the user continues typing. The first result
                     // remains the logical keyboard selection and Enter opens it.
                     self.shelf.focus_selected_book = false;
-                } else if self
-                    .shelf
-                    .selected_book_id
-                    .as_ref()
-                    .is_none_or(|selected| !books.iter().any(|book| &book.id == selected))
-                {
-                    self.shelf.selected_book_id = books.first().map(|book| book.id.clone());
+                } else if update_shelf_selection(
+                    &mut self.shelf.selected_book_id,
+                    &books,
+                    self.read_activity.is_ready(),
+                ) {
                     self.shelf.focus_selected_book = !search_response.has_focus();
                 }
                 if books.is_empty() {
@@ -1704,19 +1732,24 @@ fn selection_after_reader(last_opened: Option<&str>, books: &[LibraryBook]) -> O
         .map(ToOwned::to_owned)
 }
 
-/// Reading activity orders the shelf and therefore decides which card the first
-/// frame highlights. The asynchronous refresh that normally supplies it lands
-/// after that frame, and a first frame left to fall back on `added_at` would
-/// highlight the newest import and keep it selected from then on, so read the
-/// activity once up front as well.
-fn load_read_activity(store: Option<&SyncStore>) -> HashMap<String, u64> {
-    let Some(store) = store else {
-        return HashMap::new();
-    };
-    store.progress_activity_times().unwrap_or_else(|error| {
-        tracing::warn!(%error, "failed to load shelf reading activity");
-        HashMap::new()
-    })
+/// Defer automatic selection until reading activity arrives. An explicit
+/// choice made during startup, including search or keyboard navigation, wins.
+fn update_shelf_selection(
+    selected: &mut Option<String>,
+    books: &[LibraryBook],
+    activity_ready: bool,
+) -> bool {
+    if !activity_ready
+        || selected
+            .as_ref()
+            .is_some_and(|id| books.iter().any(|book| &book.id == id))
+    {
+        return false;
+    }
+    let next = books.first().map(|book| book.id.clone());
+    let changed = *selected != next;
+    *selected = next;
+    changed
 }
 
 fn sort_shelf_books(books: &mut [LibraryBook], read_activity: &HashMap<String, u64>) {
@@ -2003,15 +2036,41 @@ mod tests {
         // "imported" was added after "read" was last opened, so a first frame
         // that has no activity yet would highlight the import instead.
         let mut books = vec![book("read", 100), book("imported", 300)];
-        sort_shelf_books(&mut books, &load_read_activity(Some(&store)));
-        assert_eq!(books[0].id, "read");
-
-        sort_shelf_books(&mut books, &HashMap::new());
+        let mut activity = ReadingActivity::default();
+        let mut selected = None;
+        sort_shelf_books(&mut books, activity.times());
         assert_eq!(books[0].id, "imported");
+        assert!(!update_shelf_selection(
+            &mut selected,
+            &books,
+            activity.is_ready()
+        ));
+        assert_eq!(selected, None, "loading must not select the newest import");
+
+        // The same result that the background refresh publishes.
+        activity.apply_snapshot(store.progress_activity_times().unwrap());
+        sort_shelf_books(&mut books, activity.times());
+        assert_eq!(books[0].id, "read");
+        assert!(update_shelf_selection(
+            &mut selected,
+            &books,
+            activity.is_ready()
+        ));
+        assert_eq!(selected.as_deref(), Some("read"));
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn startup_activity_does_not_replace_an_explicit_selection() {
+        let mut books = vec![book("read", 100), book("imported", 300)];
+        let mut selected = Some("imported".to_owned());
+        assert!(!update_shelf_selection(&mut selected, &books, false));
+        sort_shelf_books(&mut books, &HashMap::from([("read".into(), 400)]));
+        assert!(!update_shelf_selection(&mut selected, &books, true));
+        assert_eq!(selected.as_deref(), Some("imported"));
     }
 
     #[test]
