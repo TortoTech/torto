@@ -81,6 +81,8 @@ mod navigation;
 pub(super) mod render;
 mod semantic_layout;
 mod settings_controller;
+#[cfg(test)]
+mod sidebar_navigation_tests;
 mod ui_controller;
 
 use chat_autocomplete::ChatReference;
