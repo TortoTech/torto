@@ -277,6 +277,10 @@ pub struct ReaderStyle {
     /// Publication-wide writing system used by automatic typography defaults.
     pub writing_system: WritingSystem,
     pub horizontal_margin: f32,
+    /// Shrink preferred margins to retain this text width when space permits.
+    pub minimum_content_width: f32,
+    /// Smallest side margin used with `minimum_content_width`.
+    pub minimum_horizontal_margin: f32,
     pub top_margin: f32,
     pub bottom_margin: f32,
     pub column_gap: f32,
@@ -651,6 +655,8 @@ impl Default for ReaderStyle {
             typesetting: ReaderTypesetting::default(),
             writing_system: WritingSystem::Unknown,
             horizontal_margin: 44.0,
+            minimum_content_width: 0.0,
+            minimum_horizontal_margin: 0.0,
             top_margin: DEFAULT_TOP_MARGIN,
             bottom_margin: DEFAULT_BOTTOM_MARGIN,
             column_gap: DEFAULT_COLUMN_GAP,
@@ -3909,9 +3915,15 @@ fn resolve_horizontal_page_geometry(
     page_width: f32,
     reader_style: &ReaderStyle,
 ) -> (f32, f32, usize, f32) {
-    let horizontal_margin = reader_style
+    let mut horizontal_margin = reader_style
         .horizontal_margin
         .min(page_width.mul_add(0.2, -8.0).max(20.0));
+    if reader_style.minimum_content_width > 0.0 {
+        let minimum_margin = reader_style.minimum_horizontal_margin.max(0.0);
+        let margin_limit =
+            ((page_width - reader_style.minimum_content_width) * 0.5).max(minimum_margin);
+        horizontal_margin = horizontal_margin.max(minimum_margin).min(margin_limit);
+    }
     let configured_column_gap = reader_style.column_gap.max(0.0);
     let double_available = page_width - horizontal_margin * 2.0 - configured_column_gap;
     let column_count = if reader_style.spread == SpreadMode::Double

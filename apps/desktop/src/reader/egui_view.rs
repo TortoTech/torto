@@ -35,8 +35,15 @@ const ASSISTANT_MAX_WIDTH: f32 = 560.0;
 const ASSISTANT_SIDE_PADDING: i8 = 14;
 const ASSISTANT_SCROLLBAR_GUTTER: f32 = 14.0;
 const MIN_READER_CONTENT_WIDTH: f32 = 200.0;
+const FOCUS_MIN_TEXT_WIDTH: f32 = 400.0;
+const FOCUS_MIN_SIDE_SPACE: f32 = 24.0;
+const FOCUS_MIN_READER_WIDTH: f32 = FOCUS_MIN_TEXT_WIDTH + FOCUS_MIN_SIDE_SPACE * 2.0;
 const PANEL_RESIZE_HANDLE_WIDTH: f32 = 8.0;
 const ASSISTANT_EMPTY_TOP_PADDING: f32 = 12.0;
+
+#[cfg(test)]
+#[path = "focus_chat_sidebar_tests.rs"]
+mod focus_chat_sidebar_tests;
 const ASSISTANT_BOTTOM_PADDING: f32 = 12.0;
 const ASSISTANT_COMPOSER_RESERVED_HEIGHT: f32 = 52.0;
 const ASSISTANT_INPUT_HEIGHT: f32 = 32.0;
@@ -401,6 +408,15 @@ fn constrained_panel_widths(
     (sidebar_width, assistant_width)
 }
 
+fn focus_assistant_sidebar_width(viewport_width: f32, preferred: f32) -> Option<f32> {
+    let maximum = (viewport_width - FOCUS_MIN_READER_WIDTH).min(ASSISTANT_MAX_WIDTH);
+    (maximum >= ASSISTANT_MIN_WIDTH).then(|| {
+        preferred
+            .clamp(ASSISTANT_MIN_WIDTH, ASSISTANT_MAX_WIDTH)
+            .min(maximum)
+    })
+}
+
 fn panel_resize_pointer(ctx: &egui::Context, id: &'static str, edge_x: f32) -> Option<f32> {
     #[cfg(not(target_os = "windows"))]
     let viewport = ctx.content_rect();
@@ -628,13 +644,26 @@ impl DesktopReader {
                 }
                 let size = Vec2::new(ui.available_width(), (ui.available_height() - 3.0).max(1.0));
                 if self.is_scroll_mode() {
-                    page_rect = self.scroll_content(
-                        ui,
-                        size,
-                        page_texture,
-                        background_ui,
-                        interaction_blocked,
-                    );
+                    page_rect = ui
+                        .scope(|ui| {
+                            if self.assistant_is_docked()
+                                && self.ui.assistant_panel.is_some()
+                                && assistant_progress > 0.001
+                            {
+                                // Inset the floating bar beyond the divider's drag
+                                // strip without taking width away from the text.
+                                ui.spacing_mut().scroll.bar_outer_margin =
+                                    PANEL_RESIZE_HANDLE_WIDTH / 2.0 + 4.0;
+                            }
+                            self.scroll_content(
+                                ui,
+                                size,
+                                page_texture,
+                                background_ui,
+                                interaction_blocked,
+                            )
+                        })
+                        .inner;
                 } else {
                     let response = if let Some(texture) = page_texture {
                         let (rect, response) =
@@ -723,7 +752,12 @@ impl DesktopReader {
                 ),
                 interaction_blocked,
                 floating_sidebar_visible,
-                self.ui.assistant_panel.is_some(),
+                self.focus_assistant_popup_visible()
+                    || self.ui.assistant_panel.is_some()
+                        && (self.ui.assistant_keyboard_focus
+                            || ctx
+                                .pointer_hover_pos()
+                                .is_some_and(|point| point.x >= page_rect.right())),
             )
         {
             ctx.set_cursor_icon(egui::CursorIcon::None);
@@ -984,21 +1018,34 @@ impl DesktopReader {
     }
 
     fn show_side_panels(&mut self, root_ui: &mut egui::Ui) -> (f32, f32) {
+        let viewport_width = root_ui.ctx().content_rect().width();
+        if self.is_focus_mode()
+            && self.assistant_is_docked()
+            && self.ui.assistant_panel.is_some()
+            && focus_assistant_sidebar_width(viewport_width, self.ui.assistant_width).is_none()
+        {
+            self.close_assistant_panel();
+        }
         let sidebar_progress = self.ui.sidebar_motion.value.clamp(0.0, 1.0);
         let assistant_progress = self.ui.assistant_motion.value.clamp(0.0, 1.0);
-        let viewport_width = root_ui.ctx().content_rect().width();
         let sidebar_consumes_width =
             !self.is_focus_mode() && self.ui.sidebar_pinned && sidebar_progress > 0.001;
-        let assistant_consumes_width = !self.is_focus_mode()
+        let assistant_consumes_width = self.assistant_is_docked()
             && self.ui.assistant_panel.is_some()
             && assistant_progress > 0.001;
-        (self.ui.sidebar_width, self.ui.assistant_width) = constrained_panel_widths(
+        let (sidebar_width, mut assistant_width) = constrained_panel_widths(
             viewport_width,
             self.ui.sidebar_width,
             self.ui.assistant_width,
             sidebar_consumes_width,
             assistant_consumes_width,
         );
+        self.ui.sidebar_width = sidebar_width;
+        if self.is_focus_mode() {
+            assistant_width =
+                focus_assistant_sidebar_width(viewport_width, self.ui.assistant_width)
+                    .unwrap_or(0.0);
+        }
         if sidebar_consumes_width {
             #[cfg(target_os = "windows")]
             let sidebar_margin = egui::Margin {
@@ -1020,7 +1067,7 @@ impl DesktopReader {
         }
         if assistant_consumes_width {
             egui::Panel::right("reader-assistant")
-                .exact_size(self.ui.assistant_width * assistant_progress)
+                .exact_size(assistant_width * assistant_progress)
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(
@@ -1028,7 +1075,14 @@ impl DesktopReader {
                         .fill(palette().background)
                         .inner_margin(egui::Margin::symmetric(ASSISTANT_SIDE_PADDING, 0)),
                 )
-                .show(root_ui, |ui| self.assistant(ui));
+                .show(root_ui, |ui| {
+                    if ui.rect_contains_pointer(ui.max_rect())
+                        && ui.input(|input| input.pointer.any_pressed())
+                    {
+                        self.ui.assistant_keyboard_focus = true;
+                    }
+                    ui.push_id(self.chat.session_id, |ui| self.assistant(ui));
+                });
         }
         (sidebar_progress, assistant_progress)
     }
@@ -1044,7 +1098,7 @@ impl DesktopReader {
             return;
         }
         let viewport = ctx.content_rect();
-        let assistant_visible = !self.is_focus_mode()
+        let assistant_visible = self.assistant_is_docked()
             && self.ui.assistant_panel.is_some()
             && assistant_progress > 0.001;
         if sidebar_progress >= 0.999 {
@@ -1066,17 +1120,27 @@ impl DesktopReader {
             }
         }
         if assistant_visible && assistant_progress >= 0.999 {
-            let sidebar_reservation = if self.ui.sidebar_pinned && sidebar_progress > 0.001 {
-                self.ui.sidebar_width
+            let sidebar_reservation =
+                if !self.is_focus_mode() && self.ui.sidebar_pinned && sidebar_progress > 0.001 {
+                    self.ui.sidebar_width
+                } else {
+                    0.0
+                };
+            let minimum_reader_width = if self.is_focus_mode() {
+                FOCUS_MIN_READER_WIDTH
             } else {
-                0.0
+                MIN_READER_CONTENT_WIDTH
             };
-            let assistant_max = (viewport.width() - MIN_READER_CONTENT_WIDTH - sidebar_reservation)
+            let assistant_max = (viewport.width() - minimum_reader_width - sidebar_reservation)
                 .clamp(ASSISTANT_MIN_WIDTH, ASSISTANT_MAX_WIDTH);
+            let assistant_width = self
+                .ui
+                .assistant_width
+                .clamp(ASSISTANT_MIN_WIDTH, assistant_max);
             if let Some(pointer_x) = panel_resize_pointer(
                 ctx,
                 "reader-assistant-resize",
-                viewport.right() - self.ui.assistant_width,
+                viewport.right() - assistant_width,
             ) {
                 self.ui.assistant_width =
                     (viewport.right() - pointer_x).clamp(ASSISTANT_MIN_WIDTH, assistant_max);
@@ -1129,6 +1193,9 @@ impl DesktopReader {
             return;
         }
         if self.focus_chat_shortcut(ctx, interaction_blocked) {
+            return;
+        }
+        if self.layout_shortcut(ctx, interaction_blocked) {
             return;
         }
         let focus_footnote_requested =
@@ -1209,9 +1276,18 @@ impl DesktopReader {
         }
         if self.is_focus_mode()
             && !interaction_blocked
-            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
             && self.ui.assistant_panel.is_some()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
+            if ctx.text_edit_focused() || self.ui.assistant_keyboard_focus {
+                let (references, commands) =
+                    self.assistant_suggestions(self.chat.task.is_pending());
+                if active_suggestion_count(&references, &commands) > 0 {
+                    self.chat.suggestions_dismissed = true;
+                    ctx.request_repaint();
+                    return;
+                }
+            }
             self.close_assistant_panel();
             ctx.memory_mut(egui::Memory::stop_text_input);
             return;
@@ -1220,6 +1296,8 @@ impl DesktopReader {
             && !interaction_blocked
             && self.ui.assistant_panel.is_some()
             && self.current_chat_has_data()
+            && (self.focus_assistant_popup_visible()
+                || self.ui.assistant_keyboard_focus && !ctx.text_edit_focused())
             && !assistant_suggestions_active(
                 &self.chat.input,
                 self.chat.cursor_char_index,
@@ -1242,9 +1320,6 @@ impl DesktopReader {
             }
         }
         if self.toc_keyboard_shortcut(ctx, interaction_blocked) {
-            return;
-        }
-        if self.layout_shortcut(ctx, interaction_blocked) {
             return;
         }
         if self.focus_edge_shortcut(ctx, interaction_blocked) {
@@ -1431,7 +1506,7 @@ impl DesktopReader {
             && !self.ui.overlay_visible()
             && !self.ui.sidebar_open
             && self.image_preview.is_none()
-            && self.ui.assistant_panel.is_none()
+            && !self.focus_assistant_popup_visible()
             && self.annotation_note_draft.is_none()
             && !ctx.text_edit_focused();
         if !context_active {
@@ -1535,12 +1610,12 @@ impl DesktopReader {
             || self.ui.overlay_visible()
             || self.image_preview.is_some()
             || self.annotation_note_draft.is_some()
-            || ctx.text_edit_focused()
         {
             return false;
         }
+        let typing = ctx.text_edit_focused();
         let action = ctx.input_mut(|input| {
-            if input.consume_shortcut(&self.shortcuts.toggle_left_sidebar) {
+            if !typing && input.consume_shortcut(&self.shortcuts.toggle_left_sidebar) {
                 Some(0)
             } else if input.consume_shortcut(&self.shortcuts.toggle_right_sidebar) {
                 Some(1)
@@ -1551,10 +1626,8 @@ impl DesktopReader {
         match action {
             Some(0) => self.set_sidebar_open(!self.ui.sidebar_open),
             Some(1) => {
-                if self.is_focus_mode() && self.ui.assistant_motion.target <= 0.5 {
-                    self.attach_current_focus_reference();
-                }
                 self.toggle_assistant_panel(AssistantPanel::Chat);
+                ctx.memory_mut(egui::Memory::stop_text_input);
             }
             Some(_) => unreachable!(),
             None => return false,
@@ -1606,29 +1679,52 @@ impl DesktopReader {
         {
             return false;
         }
-        let open = self.ui.assistant_panel == Some(AssistantPanel::Chat)
-            && self.ui.assistant_motion.target > 0.5;
-        let suggestions_active = if open && ctx.text_edit_focused() {
+        let open = self.focus_assistant_popup_visible() && self.ui.assistant_motion.target > 0.5;
+        let input_focused = ctx.text_edit_focused();
+        let suggestions_active = if self.ui.assistant_panel.is_some() && input_focused {
             let (references, commands) = self.assistant_suggestions(self.chat.task.is_pending());
             active_suggestion_count(&references, &commands) > 0
         } else {
             false
         };
+        if suggestions_active && ctx.input(|input| input.key_pressed(egui::Key::Tab)) {
+            // The composer owns completion Tab; cancel egui's pending native
+            // focus traversal while leaving the key event for completion.
+            ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+        }
         let Some(action) = ctx.input_mut(|input| {
-            focus_chat_shortcut_action(input, &self.shortcuts.focus_chat, open, suggestions_active)
+            focus_chat_shortcut_action(
+                input,
+                &self.shortcuts.focus_chat,
+                self.ui.assistant_panel.is_some(),
+                suggestions_active,
+            )
         }) else {
             return false;
         };
+        // Consuming the key doesn't cancel the focus direction that egui
+        // scheduled at the start of this pass, including on key repeats.
+        ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
         if action != FocusChatShortcutAction::IgnoreRepeat {
             self.ui.focus_navigation_repeat.held = None;
             self.ui.focus_actions_visible = false;
-            if action == FocusChatShortcutAction::Close {
+            if self.assistant_is_docked() && self.ui.assistant_panel.is_some() {
+                if input_focused {
+                    self.ui.assistant_keyboard_focus = false;
+                    self.chat.move_cursor_to_end = false;
+                    ctx.memory_mut(egui::Memory::stop_text_input);
+                } else {
+                    self.close_focus_footnotes();
+                    self.open_assistant_panel(AssistantPanel::Chat);
+                }
+            } else if action == FocusChatShortcutAction::Close && open {
                 self.close_assistant_panel();
                 ctx.memory_mut(egui::Memory::stop_text_input);
             } else {
                 self.close_focus_footnotes();
+                self.ui.assistant_presentation = super::AssistantPresentation::Popup;
                 self.attach_current_focus_reference();
-                self.open_assistant_panel(AssistantPanel::Chat);
+                self.open_focus_assistant();
             }
             ctx.request_repaint();
         }
@@ -1849,14 +1945,16 @@ impl DesktopReader {
             && !self.ui.overlay_visible()
             && !self.ui.sidebar_open
             && self.image_preview.is_none()
-            && self.ui.assistant_panel.is_none()
+            && !self.focus_assistant_popup_visible()
+            && !(self.ui.assistant_panel.is_some() && self.ui.assistant_keyboard_focus)
             && self.annotation_note_draft.is_none()
     }
 
     fn focus_wheel_interaction(&mut self, response: &egui::Response) {
         if self.ui.focus_footnotes_visible
             || self.ui.sidebar_open
-            || self.ui.assistant_panel.is_some() && self.current_chat_has_data()
+            || self.focus_assistant_popup_visible() && self.current_chat_has_data()
+            || !response.hovered()
         {
             self.ui.focus_wheel.reset();
             return;
@@ -2106,7 +2204,7 @@ impl DesktopReader {
                     }
                 });
         }
-        if !self.is_focus_mode() && (hovered || self.ui.assistant_panel.is_some()) {
+        if hovered || self.ui.assistant_panel.is_some() {
             egui::Area::new(egui::Id::new("reader-right-sidebar-toggle"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(Pos2::new(right - TOOLBAR_CONTROL_SIZE - 12.0, y))
@@ -2114,11 +2212,13 @@ impl DesktopReader {
                 .default_size(Vec2::splat(TOOLBAR_CONTROL_SIZE))
                 .show(ctx, |ui| {
                     if icon_button(ui, Icon::PanelRight)
-                        .on_hover_text(if self.ui.assistant_motion.target > 0.5 {
-                            self.language.text("收起右侧栏", "Close right sidebar")
-                        } else {
-                            self.language.text("展开右侧栏", "Open right sidebar")
-                        })
+                        .on_hover_text(
+                            if self.assistant_is_docked() && self.ui.assistant_motion.target > 0.5 {
+                                self.language.text("收起右侧栏", "Close right sidebar")
+                            } else {
+                                self.language.text("展开右侧栏", "Open right sidebar")
+                            },
+                        )
                         .clicked()
                     {
                         self.toggle_assistant_panel(AssistantPanel::Chat);
@@ -2453,7 +2553,7 @@ impl DesktopReader {
             + reading_content_left(page_rect.width(), &style)
             + reading_content_width(page_rect.width(), &style);
         self.focus_data_indicator_overlays(ctx, page_rect, viewport, content_right);
-        if self.ui.assistant_panel.is_none() {
+        if !self.focus_assistant_popup_visible() {
             return;
         }
 
@@ -2504,6 +2604,15 @@ impl DesktopReader {
             self.close_assistant_panel();
             ctx.memory_mut(egui::Memory::stop_text_input);
         }
+    }
+
+    fn pointer_over_footnote_popup(&self, ctx: &egui::Context) -> bool {
+        let pointer = ctx.pointer_hover_pos();
+        self.ui.focus_footnotes_visible
+            && ctx.data(|data| {
+                data.get_temp::<Rect>(egui::Id::new("reader-footnote-popup-rect"))
+                    .is_none_or(|rect| pointer.is_some_and(|point| rect.contains(point)))
+            })
     }
 
     fn footnote_scroll_key(&self) -> egui::Id {
@@ -2610,9 +2719,14 @@ impl DesktopReader {
         let content_right = page_rect.left()
             + reading_content_left(page_rect.width(), &style)
             + reading_content_width(page_rect.width(), &style);
-        let Some((x, minimum_width, width_cap)) =
+        let Some((x, minimum_width, width_cap)) = (if self.is_focus_mode()
+            && self.assistant_is_docked()
+            && self.ui.assistant_panel.is_some()
+        {
+            footnote_popup_sidebar_bounds(content_right, viewport)
+        } else {
             footnote_popup_side_bounds(content_right, viewport.right())
-        else {
+        }) else {
             // Keep the popup state, but never cover the reader when the window
             // has no room for even the frame. Resizing can reveal it again.
             return;
@@ -2789,6 +2903,12 @@ impl DesktopReader {
                     let wheel_scroll = ui.input_mut(|input| {
                         // Block navigation already animates its own motion. Egui's
                         // smoothed tail must not become a second navigation action.
+                        let over_popup = input.pointer.hover_pos().is_some_and(|position| {
+                            Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, panel_height)).contains(position)
+                        });
+                        if self.assistant_is_docked() && self.ui.assistant_panel.is_some() && !over_popup {
+                            return 0.0;
+                        }
                         let delta = if focus_popup {
                             footnote_wheel_delta(input)
                         } else {
@@ -2908,6 +3028,12 @@ impl DesktopReader {
                     });
                 });
             });
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("reader-footnote-popup-rect"),
+                overlay.response.rect,
+            )
+        });
         if let Some(navigation) = block_navigation {
             let active = footnotes
                 .get(navigation.index())
@@ -2976,7 +3102,7 @@ impl DesktopReader {
             let current_replacement_visible = index == self.focus_unit_index
                 && (self.ui.focus_actions_visible
                     || self.ui.focus_footnotes_visible
-                    || self.ui.assistant_panel.is_some());
+                    || self.focus_assistant_popup_visible());
             if current_replacement_visible {
                 continue;
             }
@@ -3032,7 +3158,7 @@ impl DesktopReader {
             self.ui.focus_actions_visible = false;
             self.annotation_note_draft = None;
             self.select_focus_unit(index);
-            self.open_assistant_panel(AssistantPanel::Chat);
+            self.open_focus_assistant();
         } else if let Some((index, note)) = clicked_note {
             self.close_assistant_panel();
             self.select_focus_unit(index);
@@ -3152,8 +3278,9 @@ impl DesktopReader {
             });
         if chat {
             self.ui.focus_actions_visible = false;
+            self.ui.assistant_presentation = super::AssistantPresentation::Popup;
             self.attach_current_focus_reference();
-            self.open_assistant_panel(AssistantPanel::Chat);
+            self.open_focus_assistant();
         } else if highlight {
             self.ui.focus_actions_visible = false;
             self.create_focus_highlight(None);
@@ -3789,14 +3916,6 @@ impl DesktopReader {
             Vec2::new(width, TOOLBAR_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                if ui.available_width() >= 100.0 {
-                    ui.label(
-                        RichText::new(self.language.text("对话", "Chat"))
-                            .size(crate::ui::scaled_font_size(14.0))
-                            .strong()
-                            .color(palette().text),
-                    );
-                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_enabled_ui(!self.chat.messages.is_empty(), |ui| {
                         if icon_button(ui, Icon::Trash2)
@@ -3833,16 +3952,22 @@ impl DesktopReader {
         let routed_scroll = self.assistant_conversation_scroll_delta(ui);
         let mut clicked_citation = None;
         let mut clicked_attachment = None;
-        let scroll_output = egui::ScrollArea::vertical()
+        let mut conversation_scroll = egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .max_height(height)
             .min_scrolled_height(height)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .auto_shrink([false, false]);
+        if self.is_focus_mode() {
+            // Wheel events are routed explicitly so a foreground footnote can
+            // consume them without also scrolling the sidebar underneath it.
+            conversation_scroll =
+                conversation_scroll.scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR);
+        }
+        let scroll_output = conversation_scroll.show(ui, |ui| {
                 let content_width =
                     (ui.available_width() - ASSISTANT_SCROLLBAR_GUTTER).max(1.0);
                 ui.set_width(content_width);
-                if messages.is_empty() && !busy {
+                if messages.is_empty() && !busy && !self.assistant_is_docked() {
                     ui.allocate_ui_with_layout(
                         Vec2::new(ui.available_width(), height),
                         egui::Layout::top_down(egui::Align::Center),
@@ -3946,11 +4071,18 @@ impl DesktopReader {
     fn assistant_conversation_scroll_delta(&mut self, ui: &mut egui::Ui) -> f32 {
         if self.is_focus_mode() && self.ui.assistant_panel.is_some() {
             let keyboard = std::mem::take(&mut self.chat.pending_keyboard_scroll_delta);
-            let wheel = ui.input_mut(|input| {
-                let delta = input.smooth_scroll_delta.y;
-                input.smooth_scroll_delta.y = 0.0;
-                delta
-            });
+            let accepts_wheel = self.focus_assistant_popup_visible()
+                || ui.rect_contains_pointer(ui.max_rect())
+                    && !self.pointer_over_footnote_popup(ui.ctx());
+            let wheel = if accepts_wheel {
+                ui.input_mut(|input| {
+                    let delta = input.smooth_scroll_delta.y;
+                    input.smooth_scroll_delta.y = 0.0;
+                    delta
+                })
+            } else {
+                0.0
+            };
             return wheel - keyboard;
         }
         -assistant_keyboard_scroll_input(
@@ -4114,6 +4246,9 @@ impl DesktopReader {
     }
 
     fn assistant_suggestions(&mut self, busy: bool) -> (Vec<ChatReference>, Vec<ChatCommand>) {
+        if self.chat.suggestions_dismissed {
+            return (Vec::new(), Vec::new());
+        }
         let reference_token_active = chat_reference_token(
             &self.chat.input,
             self.chat.cursor_char_index,
@@ -4169,6 +4304,7 @@ impl DesktopReader {
                 );
                 if output.response.changed() {
                     self.chat.suggestion_index = 0;
+                    self.chat.suggestions_dismissed = false;
                 }
                 self.chat.cursor_char_index = output.cursor_range.map_or_else(
                     || self.chat.input.chars().count(),
@@ -4621,6 +4757,12 @@ impl DesktopReader {
     }
 
     fn pointer_interaction(&mut self, response: &egui::Response) {
+        if response.hovered() && response.ctx.input(|input| input.pointer.any_pressed()) {
+            self.ui.assistant_keyboard_focus = false;
+            if self.assistant_is_docked() {
+                response.ctx.memory_mut(egui::Memory::stop_text_input);
+            }
+        }
         if let Some(position) = response.hover_pos() {
             if let Some((url, bounds)) = self.website_at_canvas(
                 position.x - response.rect.min.x,
@@ -5274,6 +5416,19 @@ fn footnote_popup_side_bounds(content_right: f32, viewport_right: f32) -> Option
     let x = content_right + 12.0;
     let maximum = (viewport_right - x - 16.0).min(480.0);
     (maximum > 32.0).then_some((x, 240.0_f32.min(maximum), maximum))
+}
+
+fn footnote_popup_sidebar_bounds(content_right: f32, viewport: Rect) -> Option<(f32, f32, f32)> {
+    let available = viewport.width() - 32.0;
+    if available <= 32.0 {
+        return None;
+    }
+    let minimum = 240.0_f32.min(available);
+    let x = (content_right + 12.0)
+        .min(viewport.right() - minimum - 16.0)
+        .max(viewport.left() + 16.0);
+    let maximum = (viewport.right() - x - 16.0).min(480.0);
+    Some((x, minimum, maximum))
 }
 
 fn footnote_popup_width(
@@ -6825,11 +6980,17 @@ mod reference_suggestion_label_tests {
                         "right toggle stays inside content header"
                     );
                     if assistant {
+                        let assistant_left = egui::containers::panel::PanelState::load(
+                            &ctx,
+                            egui::Id::new("reader-assistant"),
+                        )
+                        .unwrap()
+                        .outer_rect
+                        .left();
                         assert!(
-                            right_toggle.right() <= width - reader.ui.assistant_width,
+                            right_toggle.right() <= assistant_left,
                             "right toggle stays outside the assistant column"
                         );
-                        let assistant_left = width - reader.ui.assistant_width;
                         assert!(
                             geometry
                                 .excluded

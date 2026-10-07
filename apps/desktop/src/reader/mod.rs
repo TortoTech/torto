@@ -256,6 +256,16 @@ pub(super) fn open_reader(
             reader_preferences.spread
         },
         focus_footnote_icons: !fixed_page,
+        minimum_content_width: if reading_mode == ReadingMode::Focus {
+            400.0
+        } else {
+            0.0
+        },
+        minimum_horizontal_margin: if reading_mode == ReadingMode::Focus {
+            24.0
+        } else {
+            0.0
+        },
         typography: reader_preferences.typography.clone(),
         typesetting: effective_typesetting(reading_mode, &reader_preferences.typesetting),
         ..ReaderStyle::default()
@@ -3463,6 +3473,7 @@ struct ChatUiState {
     input: String,
     cursor_char_index: usize,
     suggestion_index: usize,
+    suggestions_dismissed: bool,
     move_cursor_to_end: bool,
     references: Vec<ChatReference>,
     reference_options_location: Option<(usize, usize, usize)>,
@@ -3484,6 +3495,7 @@ impl Default for ChatUiState {
             input: String::new(),
             cursor_char_index: 0,
             suggestion_index: 0,
+            suggestions_dismissed: false,
             move_cursor_to_end: false,
             references: Vec::new(),
             reference_options_location: None,
@@ -3745,6 +3757,13 @@ enum AssistantPanel {
     Chat,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AssistantPresentation {
+    #[default]
+    Popup,
+    Sidebar,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Motion {
     value: f32,
@@ -3835,6 +3854,8 @@ struct ReaderUiState {
     toolbar_hide_at: Option<Instant>,
     overlay: ReaderOverlay,
     assistant_panel: Option<AssistantPanel>,
+    assistant_presentation: AssistantPresentation,
+    assistant_keyboard_focus: bool,
     assistant_width: f32,
     toolbar_motion: Motion,
     sidebar_motion: Motion,
@@ -4095,6 +4116,8 @@ impl DesktopReader {
                 toolbar_hide_at: None,
                 overlay: ReaderOverlay::None,
                 assistant_panel: None,
+                assistant_presentation: crate::reader::AssistantPresentation::Popup,
+                assistant_keyboard_focus: false,
                 assistant_width: egui_view::ASSISTANT_WIDTH,
                 toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
                 sidebar_motion: Motion::settled(if reading_mode == ReadingMode::Classic {
@@ -6343,6 +6366,8 @@ mod tests {
             toolbar_hide_at: None,
             overlay: ReaderOverlay::None,
             assistant_panel: None,
+            assistant_presentation: crate::reader::AssistantPresentation::Popup,
+            assistant_keyboard_focus: false,
             assistant_width: super::egui_view::ASSISTANT_WIDTH,
             toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
             sidebar_motion: Motion::settled(0.0),
@@ -6387,6 +6412,8 @@ mod tests {
             toolbar_hide_at: None,
             overlay: ReaderOverlay::None,
             assistant_panel: None,
+            assistant_presentation: crate::reader::AssistantPresentation::Popup,
+            assistant_keyboard_focus: false,
             assistant_width: super::egui_view::ASSISTANT_WIDTH,
             toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
             sidebar_motion: Motion::settled(0.0),

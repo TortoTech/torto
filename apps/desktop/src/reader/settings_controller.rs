@@ -145,6 +145,8 @@ impl DesktopReader {
         style.focus_footnote_icons =
             self.source.book().metadata.layout != RenditionLayout::PrePaginated;
         style.minimum_paragraph_gap = 0.0;
+        style.minimum_content_width = if self.is_focus_mode() { 400.0 } else { 0.0 };
+        style.minimum_horizontal_margin = if self.is_focus_mode() { 24.0 } else { 0.0 };
         style.typography.clone_from(&settings.typography);
         style.typesetting = super::effective_typesetting(self.reading_mode, &settings.typesetting);
         self.selection_granularity = settings.selection_granularity;

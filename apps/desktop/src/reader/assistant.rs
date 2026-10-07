@@ -851,12 +851,30 @@ impl DesktopReader {
     pub(super) fn toggle_assistant_panel(&mut self, panel: AssistantPanel) {
         self.log_diagnostic_snapshot("assistant.toggle.before", None);
         self.cancel_text_selection();
-        if self.ui.assistant_panel == Some(panel) && self.ui.assistant_motion.target > 0.5 {
+        if self.ui.assistant_panel == Some(panel)
+            && self.ui.assistant_motion.target > 0.5
+            && self.assistant_is_docked()
+        {
             self.close_assistant_panel();
         } else {
+            self.ui.assistant_presentation = super::AssistantPresentation::Sidebar;
             self.open_assistant_panel(panel);
         }
         self.log_diagnostic_snapshot("assistant.toggle.after", None);
+    }
+
+    pub(super) fn assistant_is_docked(&self) -> bool {
+        !self.is_focus_mode()
+            || self.ui.assistant_presentation == super::AssistantPresentation::Sidebar
+    }
+
+    pub(super) fn focus_assistant_popup_visible(&self) -> bool {
+        self.is_focus_mode() && !self.assistant_is_docked() && self.ui.assistant_panel.is_some()
+    }
+
+    pub(super) fn open_focus_assistant(&mut self) {
+        self.ui.assistant_presentation = super::AssistantPresentation::Popup;
+        self.open_assistant_panel(AssistantPanel::Chat);
     }
 
     fn focus_chat_key_at(&self, index: usize) -> Option<String> {
@@ -874,7 +892,7 @@ impl DesktopReader {
     }
 
     pub(super) fn sync_focus_chat_session(&mut self) {
-        if !self.is_focus_mode() {
+        if self.assistant_is_docked() {
             self.restore_book_chat_session();
             return;
         }
@@ -899,8 +917,9 @@ impl DesktopReader {
         self.chat.move_cursor_to_end = true;
         self.chat_markdown = super::chat_markdown::ChatMarkdownState::default();
 
-        if self.ui.assistant_panel.is_some() {
+        if self.focus_assistant_popup_visible() {
             self.ui.assistant_panel = None;
+            self.ui.assistant_keyboard_focus = false;
             self.ui.assistant_motion = super::Motion::settled(0.0);
         }
     }
@@ -951,19 +970,26 @@ impl DesktopReader {
     pub(super) fn open_assistant_panel(&mut self, panel: AssistantPanel) {
         self.ui.focus_footnotes_visible = false;
         self.ui.focus_footnote_scroll_delta = 0.0;
-        if self.is_focus_mode() {
-            self.sync_focus_chat_session();
-        }
+        self.sync_focus_chat_session();
         self.ui.assistant_panel = Some(panel);
+        self.ui.assistant_keyboard_focus = true;
         self.chat.move_cursor_to_end = true;
-        if self.ui.assistant_motion.animate_to(1.0) {
+        if self.is_focus_mode() && self.assistant_is_docked() {
+            // A single resize preserves the reading anchor and avoids laying
+            // out the entire reading unit at every intermediate animation width.
+            self.ui.assistant_motion = super::Motion::settled(1.0);
+        } else if self.ui.assistant_motion.animate_to(1.0) {
             self.ui.last_motion_tick = Some(std::time::Instant::now());
         }
     }
 
     pub(super) fn close_assistant_panel(&mut self) {
         self.log_diagnostic_snapshot("assistant.close.before", None);
-        if self.ui.assistant_motion.animate_to(0.0) {
+        self.ui.assistant_keyboard_focus = false;
+        if self.is_focus_mode() && self.assistant_is_docked() {
+            self.ui.assistant_motion = super::Motion::settled(0.0);
+            self.ui.assistant_panel = None;
+        } else if self.ui.assistant_motion.animate_to(0.0) {
             self.ui.last_motion_tick = Some(std::time::Instant::now());
         }
         self.log_diagnostic_snapshot("assistant.close.after", None);
@@ -1215,7 +1241,11 @@ impl DesktopReader {
         });
         self.focused_mark = Some(FocusedMark::assistant(selection.ranges.clone()));
         self.cancel_text_selection();
-        self.open_assistant_panel(AssistantPanel::Chat);
+        if self.is_focus_mode() {
+            self.open_focus_assistant();
+        } else {
+            self.open_assistant_panel(AssistantPanel::Chat);
+        }
         self.queue_chat(prompt, display_content);
     }
 
@@ -1319,6 +1349,7 @@ impl DesktopReader {
             ranges: selection.ranges.clone(),
         });
         if self.is_focus_mode()
+            && !self.assistant_is_docked()
             && (selection.is_none() || self.focus_selection_anchor.is_none())
             && let Some(unit) = self.focus_units.get(self.focus_unit_index)
         {
@@ -1360,7 +1391,10 @@ impl DesktopReader {
             .as_ref()
             .map(|s| s.images.clone())
             .unwrap_or_default();
-        let footnotes = if self.is_focus_mode() && kind == ChatRequestKind::Normal {
+        let footnotes = if self.is_focus_mode()
+            && !self.assistant_is_docked()
+            && kind == ChatRequestKind::Normal
+        {
             selection.as_ref().and_then(|selection| {
                 match super::chat_footnotes::capture(
                     self.rewrite_source.as_ref(),
