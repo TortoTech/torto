@@ -7,6 +7,8 @@
 //! buffers without Vello. `-novalidation` emulates production instance flags;
 //! `-serial` compiles Vello's shaders on a single thread for comparison.
 //! `-reuse` keeps one Vello renderer across the three cycles.
+//! `pdf-raster <path> [page indices...]` measures actual PDF raster allocations
+//! and prints pixel digests for comparison between builds (indices are zero-based).
 
 use std::sync::Arc;
 
@@ -50,6 +52,44 @@ fn sample(stage: &str) {
 fn main() {
     sample("baseline");
     match std::env::args().nth(1).as_deref() {
+        Some("pdf-raster") => {
+            use sha2::{Digest, Sha256};
+            let mut args = std::env::args().skip(2);
+            let path = args.next().expect("pdf-raster requires a PDF path");
+            let pages: Vec<usize> = args
+                .map(|page| page.parse().expect("page index must be an integer"))
+                .collect();
+            let publication = rebook_formats::open_file_for_reading(path, None).unwrap();
+            let source = publication.source();
+            println!("PDF pages={}", source.book().sections.len());
+            sample("PDF opened");
+            let pages = if pages.is_empty() {
+                (0..source.book().sections.len().min(10)).collect()
+            } else {
+                pages
+            };
+            for index in pages {
+                let href = rebook_publication::PublicationUrl::parse(&format!(
+                    "Pages/page-{:05}.png",
+                    index + 1
+                ))
+                .unwrap();
+                let started = std::time::Instant::now();
+                let raster = source.raster_resource(&href).unwrap().unwrap();
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                sample("PDF raster completed");
+                println!(
+                    "page={} dimensions={}x{} bytes={} ms={elapsed:.2} sha256={:x}",
+                    index + 1,
+                    raster.width,
+                    raster.height,
+                    raster.pixels.len(),
+                    Sha256::digest(&raster.pixels)
+                );
+            }
+            drop((source, publication));
+            sample("PDF dropped");
+        }
         Some(mode) if mode.starts_with("gpu") => {
             pollster::block_on(async {
                 let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -255,7 +295,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: memory_probe svg|layout|gpu[-vulkan][-render|-buffers][-memory][-novalidation][-serial][-reuse]"
+                "usage: memory_probe pdf-raster <path> [page indices...]|svg|layout|gpu[-vulkan][-render|-buffers][-memory][-novalidation][-serial][-reuse]"
             )
         }
     }

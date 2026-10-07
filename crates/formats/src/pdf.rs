@@ -350,8 +350,11 @@ impl PdfPublication {
         let raster = RasterResource {
             width: u32::from(pixmap.width()),
             height: u32::from(pixmap.height()),
-            pixels: pixmap.data_as_u8_slice().to_vec().into(),
+            // Copy directly into the shared allocation, avoiding a temporary
+            // Vec and its second full-size copy when converted into an Arc.
+            pixels: Arc::from(pixmap.data_as_u8_slice()),
         };
+        drop(pixmap);
         let mut cache = self.lock_cache()?;
         if let Some(cached) = cache.rasters.get(&page_index).cloned() {
             touch_page(&mut cache.raster_lru, page_index);
