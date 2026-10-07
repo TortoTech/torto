@@ -83,6 +83,113 @@ fn runtime() -> tokio::runtime::Runtime {
         .build()
         .unwrap()
 }
+
+fn connection_error(status: u16, kind: &str) -> Value {
+    json!({"status_code":status,"error":{"type":kind,"message":"failed to execute HTTP request to provider API"}})
+}
+
+#[test]
+fn connection_retry_classification_excludes_auth_schema_and_generic_server_errors() {
+    for status in [502, 503, 504] {
+        assert!(transient_connection_failure(&format!(
+            "ProviderResponseError: status {status}: {}\n (request id: test)",
+            connection_error(status, "provider_connection_failed")
+        )));
+    }
+    for (status, kind) in [
+        (401, "provider_connection_failed"),
+        (429, "provider_connection_failed"),
+        (500, "provider_connection_failed"),
+        (502, "invalid_request_error"),
+        (502, "provider_response_unmarshal"),
+    ] {
+        assert!(!transient_connection_failure(
+            &connection_error(status, kind).to_string()
+        ));
+    }
+    assert!(!transient_connection_failure(
+        "JsonError: missing field data"
+    ));
+    assert!(!transient_connection_failure("AI 请求超时"));
+}
+
+#[test]
+fn connection_retry_resends_same_round_before_tool_execution() {
+    let reply = json!({"id":"reply","object":"chat.completion","created":0,"model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+    let (url, handle) = crate::plugins::llm::tests::server(vec![
+        (502, connection_error(502, "provider_connection_failed")),
+        (200, reply),
+    ]);
+    let provider = AiProvider {
+        base_url: url,
+        ..Default::default()
+    };
+    let mut progress = Vec::new();
+    let result = runtime()
+        .block_on(complete_round(
+            &provider,
+            "test",
+            &[json!({"role":"user","content":"inspect"})],
+            &tools(),
+            &mut |p| progress.push(p),
+        ))
+        .unwrap();
+    assert_eq!(result["content"], "done");
+    assert_eq!(progress.len(), 1);
+    let requests = handle.join().unwrap();
+    assert_eq!(requests[0], requests[1]);
+}
+
+#[test]
+fn connection_retry_is_bounded_and_preserves_final_error() {
+    let (url, handle) = crate::plugins::llm::tests::server(vec![
+        (
+            502,
+            connection_error(502, "provider_connection_failed")
+        );
+        3
+    ]);
+    let provider = AiProvider {
+        base_url: url,
+        ..Default::default()
+    };
+    let mut progress = Vec::new();
+    let error = runtime()
+        .block_on(complete_round(
+            &provider,
+            "test",
+            &[json!({"role":"user","content":"inspect"})],
+            &tools(),
+            &mut |p| progress.push(p),
+        ))
+        .unwrap_err();
+    assert!(error.contains("provider_connection_failed"));
+    assert_eq!(progress.len(), 2);
+    assert_eq!(handle.join().unwrap().len(), 3);
+}
+
+#[test]
+fn connection_retry_does_not_retry_authentication_errors() {
+    let (url, handle) = crate::plugins::llm::tests::server(vec![(
+        401,
+        connection_error(401, "provider_connection_failed"),
+    )]);
+    let provider = AiProvider {
+        base_url: url,
+        ..Default::default()
+    };
+    let error = runtime()
+        .block_on(complete_round(
+            &provider,
+            "test",
+            &[json!({"role":"user","content":"inspect"})],
+            &tools(),
+            &mut |_| panic!("must not retry"),
+        ))
+        .unwrap_err();
+    assert!(error.contains("401"));
+    assert_eq!(handle.join().unwrap().len(), 1);
+}
 fn goals() -> Goals {
     Goals {
         toc: true,

@@ -291,6 +291,78 @@ fn messages_from_legacy(messages: &[Value]) -> Result<Vec<Message>, String> {
     Ok(output)
 }
 
+// Opaque gateway fields belong to this endpoint, credential and model only.
+// Store a digest, never credentials, in the private history envelope.
+fn compatible_scope(provider: &AiProvider, model: &str) -> String {
+    let mut hash = Sha256::new();
+    for value in [
+        format!("{:?}", provider.kind),
+        provider.id.clone(),
+        provider.base_url.trim().trim_end_matches('/').to_owned(),
+        provider.api_key.trim().to_owned(),
+        model.to_owned(),
+    ] {
+        hash.update(value.len().to_le_bytes());
+        hash.update(value);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn compatible_replay(
+    provider: &AiProvider,
+    model: &str,
+    messages: &[Value],
+) -> Vec<transport::ReplayMessage> {
+    let scope = compatible_scope(provider, model);
+    messages
+        .iter()
+        .filter_map(|message| {
+            let saved = message.get("_compatible_message")?;
+            if saved["scope"] != scope || saved["core"] != message["_rig_message"] {
+                return None;
+            }
+            let core: Message = serde_json::from_value(saved["core"].clone()).ok()?;
+            if !matches!(core, Message::Assistant { .. }) {
+                return None;
+            }
+            let wire: Vec<providers::openai::completion::Message> = core.try_into().ok()?;
+            if wire.len() != 1 || !saved["original"].is_object() {
+                return None;
+            }
+            Some(transport::ReplayMessage {
+                expected: serde_json::to_value(&wire[0]).ok()?,
+                original: saved["original"].clone(),
+            })
+        })
+        .collect()
+}
+
+fn scoped_messages(
+    provider: &AiProvider,
+    model: &str,
+    messages: &[Value],
+) -> Result<Vec<Message>, String> {
+    let mut history = messages_from_legacy(messages)?;
+    let scope = compatible_scope(provider, model);
+    // Preserve ordinary text/calls, but don't let the SDK replay its typed copy
+    // of a gateway's opaque reasoning to a different endpoint or model either.
+    for (saved, current) in messages.iter().zip(&mut history) {
+        if saved
+            .get("_compatible_message")
+            .is_some_and(|m| m["scope"] != scope || m["core"] != saved["_rig_message"])
+            && let Message::Assistant { content, .. } = current
+        {
+            content.retain(|part| !matches!(part, AssistantContent::Reasoning(_)));
+            for part in content {
+                if let AssistantContent::ToolCall(call) = part {
+                    call.signature = None;
+                }
+            }
+        }
+    }
+    Ok(history)
+}
+
 fn reasoning_params(kind: AiProviderKind, model: &str, effort: ReasoningEffort) -> Value {
     let Some(value) = effort.api_value() else {
         return json!({});
@@ -400,6 +472,10 @@ fn build_request(
         .transpose()?
         .unwrap_or_default();
     let thinking = effort != ReasoningEffort::Default && effort != ReasoningEffort::None;
+    let replay = compatible_replay(provider, model, messages);
+    if !replay.is_empty() {
+        params["_torto_compatible_replay"] = json!(replay);
+    }
     let temperature = params
         .as_object_mut()
         .and_then(|p| p.remove("temperature"))
@@ -413,7 +489,7 @@ fn build_request(
         CompletionRequest {
             model: None,
             preamble: None,
-            chat_history: messages_from_legacy(messages)?,
+            chat_history: scoped_messages(provider, model, messages)?,
             documents: vec![],
             tool_choice: (!tools.is_empty()).then_some(ToolChoice::Auto),
             tools,
@@ -577,6 +653,10 @@ fn response_message(response: &CompletionResponse) -> Value {
         content: response.choice.clone(),
     })
     .unwrap_or_default();
+    if let Some(saved) = response.raw.get("_torto_compatible_message") {
+        message["_compatible_message"] = saved.clone();
+        message["_compatible_message"]["core"] = message["_rig_message"].clone();
+    }
     let mut sources = Vec::new();
     super::web_search::collect_sources(&response.raw, &mut sources);
     super::web_search::collect_sources(&message["_rig_message"], &mut sources);
@@ -893,7 +973,21 @@ async fn dispatch(
             .additional_params
             .as_ref()
             .is_some_and(|p| p.get("tools").is_some());
-    let http = transport::CompatHttp(http, hosted, capture.then(|| source_capture.clone()));
+    let replay = request
+        .additional_params
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .and_then(|params| params.remove("_torto_compatible_replay"))
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    let assistant_capture: transport::AssistantCapture = Default::default();
+    let http = transport::CompatHttp(
+        http,
+        hosted,
+        capture.then(|| source_capture.clone()),
+        replay,
+        assistant_capture.clone(),
+    );
     let responses = request
         .additional_params
         .as_mut()
@@ -983,6 +1077,19 @@ async fn dispatch(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         );
+    }
+    if let Some(original) = assistant_capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        if !response.raw.is_object() {
+            response.raw = json!({});
+        }
+        response.raw["_torto_compatible_message"] = json!({
+            "scope": compatible_scope(provider, model),
+            "original": original,
+        });
     }
     Ok(response)
 }

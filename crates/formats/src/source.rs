@@ -5,7 +5,8 @@ use rebook_html::parse_section;
 use rebook_publication::{
     Block, Book, BookSource, ImageBlock, ImageStyle, Inline, Metadata, PublicationError,
     PublicationId, PublicationUrl, RenditionLayout, Resource, Section, SpineItem, SpineItemId,
-    TableOfContentsOrigin, TextBlock, TextBlockKind, TocEntry, promote_single_toc_root,
+    TableOfContentsOrigin, TextBlock, TextBlockKind, TocEntry, heading_ordinal_key,
+    promote_single_toc_root,
 };
 
 use crate::{BookFormat, FormatError, conversion_error};
@@ -107,10 +108,20 @@ pub(crate) fn promote_toc_headings(section: &mut Section, hints: &[TocHeadingHin
         });
 
         let search_range = heading_search_range(section.blocks.len(), anchored_index);
-        let matches = search_range
+        let mut matches = search_range
             .clone()
             .filter_map(|index| heading_candidate(&section.blocks, index, hint))
             .collect::<Vec<_>>();
+        // A title-only TOC label can identify the second half of a split
+        // heading. Prefer its validated pair over that same title on its own.
+        let paired_titles = matches
+            .iter()
+            .filter_map(|candidate| match candidate {
+                HeadingCandidate::Split { title, .. } => Some(*title),
+                HeadingCandidate::Single(_) => None,
+            })
+            .collect::<Vec<_>>();
+        matches.retain(|candidate| !matches!(candidate, HeadingCandidate::Single(index) if paired_titles.contains(index)));
         let [candidate] = matches.as_slice() else {
             continue;
         };
@@ -165,12 +176,17 @@ fn heading_candidate(
     let title_index = index.checked_add(1)?;
     let title = heading_text_block(blocks.get(title_index)?)?;
     let ordinal = normalized_text_block(block);
-    let title = normalized_text_block(title);
-    (is_heading_ordinal(&ordinal) && split_heading_matches(&ordinal, &title, &hint.label))
-        .then_some(HeadingCandidate::Split {
-            ordinal: index,
-            title: title_index,
-        })
+    let title_text = normalized_text_block(title);
+    (heading_ordinal_key(&ordinal).is_some()
+        && title_text.chars().any(char::is_alphabetic)
+        && (split_heading_matches(&ordinal, &title_text, &hint.label)
+            || block.kind.is_heading()
+                && title.kind.is_heading()
+                && heading_labels_match(&title_text, &hint.label)))
+    .then_some(HeadingCandidate::Split {
+        ordinal: index,
+        title: title_index,
+    })
 }
 
 fn heading_text_block(block: &Block) -> Option<&TextBlock> {
@@ -193,11 +209,6 @@ fn split_heading_matches(ordinal: &str, title: &str, hint: &str) -> bool {
     if title.is_empty() {
         return false;
     }
-    let combined = format!("{ordinal} {title}");
-    if heading_labels_match(&combined, hint) {
-        return true;
-    }
-
     let Some(ordinal_key) = heading_ordinal_key(ordinal) else {
         return false;
     };
@@ -232,113 +243,21 @@ fn heading_match_key(text: &str) -> String {
 
 fn split_heading_label(label: &str) -> Option<(String, &str)> {
     let trimmed = label.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    for prefix in ["chapter", "part", "book"] {
-        if lower == prefix || !lower.starts_with(prefix) {
-            continue;
-        }
-        let rest = trimmed.get(prefix.len()..)?.trim_start();
-        let ordinal_end = rest
-            .char_indices()
-            .find_map(|(index, character)| {
-                (character.is_whitespace()
-                    || matches!(character, ':' | '.' | '-' | '\u{2013}' | '\u{2014}'))
-                .then_some(index)
-            })
-            .unwrap_or(rest.len());
-        let ordinal = rest.get(..ordinal_end)?.trim();
-        let title = rest
-            .get(ordinal_end..)?
-            .trim_start_matches(|character: char| {
-                character.is_whitespace()
-                    || matches!(character, ':' | '.' | '-' | '\u{2013}' | '\u{2014}')
+    // Prefer the longest valid prefix: dotted ordinals and number words can
+    // contain punctuation/spaces themselves. Require a textual title after it.
+    trimmed
+        .char_indices()
+        .skip(1)
+        .take(96)
+        .filter_map(|(index, _)| {
+            let ordinal = heading_ordinal_key(&trimmed[..index])?;
+            let title = trimmed[index..].trim_start_matches(|ch: char| {
+                ch.is_whitespace() || matches!(ch, ':' | '.' | '-' | '–' | '—')
             });
-        if !ordinal.is_empty() && !title.is_empty() {
-            return Some((heading_match_key(ordinal), title));
-        }
-    }
-
-    let ordinal_end = trimmed.char_indices().find_map(|(index, character)| {
-        (character.is_whitespace()
-            || matches!(character, ':' | '.' | '-' | '\u{2013}' | '\u{2014}'))
-        .then_some(index)
-    })?;
-    let ordinal = trimmed.get(..ordinal_end)?.trim();
-    let title = trimmed
-        .get(ordinal_end..)?
-        .trim_start_matches(|character: char| {
-            character.is_whitespace()
-                || matches!(character, ':' | '.' | '-' | '\u{2013}' | '\u{2014}')
-        });
-    (!ordinal.is_empty() && !title.is_empty()).then(|| (heading_match_key(ordinal), title))
-}
-
-fn heading_ordinal_key(text: &str) -> Option<String> {
-    let mut normalized = text.trim().to_ascii_lowercase();
-    for prefix in ["chapter", "part", "book"] {
-        if normalized.starts_with(prefix) {
-            normalized = normalized.get(prefix.len()..)?.trim_start().to_owned();
-            break;
-        }
-    }
-    let normalized = normalized.trim_matches(|character: char| {
-        character.is_whitespace() || matches!(character, ':' | '.' | '-' | '\u{2013}' | '\u{2014}')
-    });
-    is_bare_heading_ordinal(normalized).then(|| heading_match_key(normalized))
-}
-
-fn is_heading_ordinal(text: &str) -> bool {
-    heading_ordinal_key(text).is_some()
-}
-
-fn is_bare_heading_ordinal(text: &str) -> bool {
-    !text.is_empty()
-        && (text.chars().all(|character| character.is_ascii_digit())
-            || is_roman_numeral(text)
-            || is_english_number_word(text))
-}
-
-fn is_roman_numeral(text: &str) -> bool {
-    text.len() <= 12
-        && text
-            .chars()
-            .all(|character| matches!(character, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'))
-}
-
-fn is_english_number_word(text: &str) -> bool {
-    text.split([' ', '-']).all(|word| {
-        matches!(
-            word,
-            "one"
-                | "two"
-                | "three"
-                | "four"
-                | "five"
-                | "six"
-                | "seven"
-                | "eight"
-                | "nine"
-                | "ten"
-                | "eleven"
-                | "twelve"
-                | "thirteen"
-                | "fourteen"
-                | "fifteen"
-                | "sixteen"
-                | "seventeen"
-                | "eighteen"
-                | "nineteen"
-                | "twenty"
-                | "thirty"
-                | "forty"
-                | "fifty"
-                | "sixty"
-                | "seventy"
-                | "eighty"
-                | "ninety"
-                | "hundred"
-        )
-    })
+            (!title.is_empty() && title.chars().any(char::is_alphabetic))
+                .then_some((ordinal, title))
+        })
+        .last()
 }
 
 fn normalized_text_block(block: &TextBlock) -> String {
@@ -548,6 +467,93 @@ mod tests {
     use rebook_publication::{BookSource, RenditionLayout, TextBlockKind};
 
     use super::*;
+
+    fn heading_fixture(xml: &str, label: &str) -> Section {
+        DirectBookSource::open(
+            SourceBook {
+                id: "heading-recovery-test".into(),
+                metadata: Metadata::default(),
+                sections: vec![SourceSection {
+                    title: "Chapter".into(),
+                    content: SectionContent::Html(xml.into()),
+                    linear: true,
+                }],
+                table_of_contents: vec![SourceTocEntry {
+                    label: label.into(),
+                    href: "Text/section-1.xhtml#chapter".into(),
+                    children: vec![],
+                }],
+                resources: vec![],
+                cover_path: None,
+            },
+            BookFormat::Epub,
+        )
+        .unwrap()
+        .parse_section(0)
+        .unwrap()
+    }
+
+    #[test]
+    fn split_heading_recovery_handles_appendices_dotted_ordinals_and_title_only_toc_labels() {
+        for (xml, label) in [
+            (
+                "<p id='chapter'>Appendix C</p><p>CONNECTIONIST MODELS</p>",
+                "Appendix C—Connectionist Models",
+            ),
+            (
+                "<h1 id='chapter'>1</h1><h1>Thinking with Sensations</h1>",
+                "Thinking with Sensations",
+            ),
+            ("<h2>1.1</h2><h2 id='chapter'>Models</h2>", "1.1 Models"),
+            (
+                "<h1 id='chapter'>第1章</h1><h1>社会工程初探</h1>",
+                "第1章 社会工程初探",
+            ),
+        ] {
+            let section = heading_fixture(xml, label);
+            assert!(
+                matches!(&section.blocks[0], Block::Text(t) if t.kind == TextBlockKind::HeadingOrdinal(1)),
+                "{label}"
+            );
+            assert!(
+                matches!(&section.blocks[1], Block::Text(t) if t.kind == TextBlockKind::Heading(1)),
+                "{label}"
+            );
+            let ranges: Vec<_> = section
+                .blocks
+                .iter()
+                .filter_map(|b| {
+                    if let Block::Text(t) = b {
+                        t.source.as_ref()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(ranges.len(), 2);
+            assert_ne!(ranges[0].start.node, ranges[1].start.node);
+            assert_eq!(section.anchors.len(), 1);
+        }
+    }
+
+    #[test]
+    fn split_heading_recovery_rejects_page_numbers_formulas_and_ordinal_collisions() {
+        for (xml, label) in [
+            (
+                "<h2 id='chapter'>CHAPTER 6</h2><h3>81</h3><p>Through the Looking Glass</p>",
+                "CHAPTER 6, 81",
+            ),
+            (
+                "<p id='chapter'>0.9206</p><h2>Gaps between Primes</h2>",
+                "Gaps between Primes",
+            ),
+            ("<h2 id='chapter'>1.1</h2><h2>Models</h2>", "11 Models"),
+            ("<h2 id='chapter'>A</h2><p>Abrahamson, Dor</p>", "A"),
+        ] {
+            let section = heading_fixture(xml, label);
+            assert!(!section.blocks.iter().any(|b| matches!(b, Block::Text(t) if matches!(t.kind, TextBlockKind::HeadingOrdinal(_)))), "{label}");
+        }
+    }
 
     #[test]
     fn direct_source_promotes_a_single_toc_root() {

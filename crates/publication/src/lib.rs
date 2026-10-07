@@ -1,5 +1,8 @@
 //! Format-neutral publication, resource, and locator contracts.
 
+mod headings;
+pub use headings::heading_ordinal_key;
+
 use std::fmt;
 use std::sync::Arc;
 

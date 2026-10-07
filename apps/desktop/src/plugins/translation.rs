@@ -1432,6 +1432,24 @@ fn translation_text(block: &TextBlock) -> String {
 }
 
 fn translatable_text(block: &TextBlock) -> Option<String> {
+    if matches!(block.kind, TextBlockKind::HeadingOrdinal(_)) {
+        let plain = block
+            .content
+            .iter()
+            .flat_map(Inline::text_runs)
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+        let plain = plain.trim().to_ascii_lowercase();
+        if rebook_publication::heading_ordinal_key(&plain).is_some()
+            && plain
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ch == '.' || "ivxlcdm".contains(ch))
+        {
+            // Numeric/roman labels are language-independent. Keep their block
+            // IDs and cached translations, but do not request a new translation.
+            return None;
+        }
+    }
     block
         .content
         .iter()
@@ -3458,6 +3476,138 @@ mod tests {
     }
 
     #[test]
+    fn split_heading_translation_keeps_block_ids_and_composes_replace_and_bilingual_views() {
+        use rebook_layout::{
+            LayoutEngine, LayoutViewport, PageItem, ReaderStyle, ReaderTypesetting, SpreadMode,
+        };
+        let inner = source();
+        let mut section = inner.parse_section(0).unwrap();
+        let Block::Text(mut ordinal) = section.blocks.remove(0) else {
+            unreachable!()
+        };
+        ordinal.kind = TextBlockKind::HeadingOrdinal(1);
+        ordinal.content = vec![Inline::Text(TextRun {
+            text: "2".into(),
+            style: TextStyle::default(),
+            link: None,
+        })];
+        ordinal.source.as_mut().unwrap().end.text_offset = 1;
+        let mut title = ordinal.clone();
+        title.kind = TextBlockKind::Heading(1);
+        title.content = vec![Inline::Text(TextRun {
+            text: "Formal Models".into(),
+            style: TextStyle::default(),
+            link: None,
+        })];
+        title.source.as_mut().unwrap().start.node = "title".into();
+        title.source.as_mut().unwrap().end.node = "title".into();
+        title.source.as_mut().unwrap().end.text_offset = 13;
+        let title_source = title.source.clone();
+        section.blocks = vec![Block::Text(ordinal), Block::Text(title)];
+        let source = TranslationBookSource::new(
+            Arc::new(TestSource {
+                book: inner.book().clone(),
+                section,
+            }),
+            TranslationMode::Bilingual,
+        );
+        let inputs = source.translatable_blocks(0).unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].block_index, 1);
+        source.set_target_language("简体中文").unwrap();
+        source
+            .store_section(
+                0,
+                &[BlockTranslation {
+                    block_index: 1,
+                    segment_index: None,
+                    text: "形式模型".into(),
+                }],
+            )
+            .unwrap();
+        source.set_enabled(true).unwrap();
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            spread: SpreadMode::Single,
+            ..Default::default()
+        };
+        for mode in [TranslationMode::Bilingual, TranslationMode::Replace] {
+            source.set_mode(mode).unwrap();
+            let section = source.parse_section(0).unwrap();
+            assert!(matches!(&section.blocks[1], Block::Text(t) if t.source == title_source));
+            let result = LayoutEngine::new()
+                .layout_section(
+                    &source,
+                    &section,
+                    LayoutViewport::new(800, 600).unwrap(),
+                    &style,
+                )
+                .unwrap();
+            let texts: Vec<_> = result
+                .pages
+                .iter()
+                .flat_map(|p| &p.items)
+                .filter_map(|item| {
+                    if let PageItem::Text(text) = item {
+                        Some(text.text.as_ref())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                texts,
+                if mode == TranslationMode::Bilingual {
+                    vec!["2 Formal Models", "2 形式模型"]
+                } else {
+                    vec!["2 形式模型"]
+                }
+            );
+        }
+        // Old cached numeric translations remain usable without new requests.
+        source
+            .store_section(
+                0,
+                &[
+                    BlockTranslation {
+                        block_index: 0,
+                        segment_index: None,
+                        text: "2".into(),
+                    },
+                    BlockTranslation {
+                        block_index: 1,
+                        segment_index: None,
+                        text: "形式模型".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        source.set_mode(TranslationMode::Bilingual).unwrap();
+        let section = source.parse_section(0).unwrap();
+        assert_eq!(section.blocks.len(), 4);
+        let result = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(800, 600).unwrap(),
+                &style,
+            )
+            .unwrap();
+        let texts: Vec<_> = result.pages[0]
+            .items
+            .iter()
+            .filter_map(|item| {
+                if let PageItem::Text(t) = item {
+                    Some(t.text.as_ref())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(texts, ["2 Formal Models", "2 形式模型"]);
+    }
+
+    #[test]
     fn toggles_between_original_replace_and_bilingual_views() {
         let source = TranslationBookSource::new(source(), TranslationMode::Replace);
         source.set_target_language("简体中文").unwrap();
@@ -3734,6 +3884,65 @@ mod tests {
             );
             assert!(text_block_text(&translated.before[0]).contains("数据"));
             assert!(text_block_text(&translated.rows[0].cells[0].text).contains("数值"));
+        }
+    }
+
+    #[test]
+    fn marked_table_title_translation_keeps_original_segment_ids_and_source_ranges() {
+        let base = source();
+        let section = rebook_html::parse_section(
+            "<html><body><div class='table'><p>TABLE 3.1</p><table><thead><tr><td colspan='2'><p class='table'>Benchmark phenomena</p></td></tr><tr><td>Category</td><td>Description</td></tr></thead><tr><td>Learning</td><td>Measured effects</td></tr></table><p>NOTE: Rounded.</p></div></body></html>",
+            &base.book().sections[0], |_| None,
+        ).unwrap();
+        let inputs = translatable_blocks(&section, false);
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| input.segment_index)
+                .collect::<Vec<_>>(),
+            (0..7).map(Some).collect::<Vec<_>>()
+        );
+        let Block::Table(table) = &section.blocks[0] else {
+            panic!()
+        };
+        let ranges = table
+            .text_blocks()
+            .map(|text| text.source.clone())
+            .collect::<Vec<_>>();
+        let translations = HashMap::from([(0, "表 3.1".into()), (1, "基准现象".into())]);
+        for mode in [TranslationMode::Replace, TranslationMode::Bilingual] {
+            let translated = super::translated_table(table.clone(), &translations, mode);
+            assert_eq!(translated.rows.len(), table.rows.len());
+            assert_eq!(
+                translated.rows[0].cells[0].text.kind,
+                TextBlockKind::Caption
+            );
+            assert_eq!(
+                translated
+                    .text_blocks()
+                    .map(|text| text.source.clone())
+                    .collect::<Vec<_>>(),
+                ranges
+            );
+            assert!(text_block_text(&translated.rows[0].cells[0].text).contains("基准现象"));
+            assert_eq!(
+                text_block_text(&translated.rows[1].cells[0].text),
+                "Category"
+            );
+            let translated_section = rebook_publication::Section {
+                blocks: vec![Block::Table(translated)],
+                ..section.clone()
+            };
+            assert_eq!(
+                translatable_blocks(&translated_section, false)
+                    .iter()
+                    .map(|input| input.segment_index)
+                    .collect::<Vec<_>>(),
+                inputs
+                    .iter()
+                    .map(|input| input.segment_index)
+                    .collect::<Vec<_>>()
+            );
         }
     }
 

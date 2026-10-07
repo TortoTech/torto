@@ -1,9 +1,9 @@
 //! Associate authored table captions with either grids or image carriers.
 use super::{
     Block, BlockStyle, CaptionPosition, FigureBlock, HtmlError, InlineCollector,
-    InlineParseContext, Node, ReadingIrParser, TextBlock, TextBlockKind, attribute_local,
-    collect_table_cell_inline, has_descendant_image, node_has_visible_text, node_text,
-    starts_with_caption_identifier,
+    InlineParseContext, Node, ReadingIrParser, TableRow, TextAlignment, TextBlock, TextBlockKind,
+    attribute_local, collect_table_cell_inline, has_descendant_image, node_has_visible_text,
+    node_text, starts_with_caption_identifier,
 };
 
 #[cfg(test)]
@@ -166,6 +166,129 @@ fn ignorable(node: Node<'_, '_>) -> bool {
 }
 
 impl ReadingIrParser<'_> {
+    /// Mark the authored title without moving it: book-mode rendering and
+    /// translation segment identities still use the complete original grid.
+    pub(super) fn mark_table_title_row(&self, table: Node<'_, '_>, rows: &mut [TableRow]) {
+        let Some(first) = rows.first().filter(|row| row.cells.len() == 1) else {
+            return;
+        };
+        let title = &first.cells[0];
+        let Some(columns) = rows.get(1).filter(|row| row.cells.len() > 1) else {
+            return;
+        };
+        let width = grid_width(&rows[1..]);
+        if title.row_span != 1 || width < 2 || usize::from(title.column_span) < width {
+            return;
+        }
+        let text: String = title
+            .text
+            .content
+            .iter()
+            .flat_map(|inline| inline.text_runs())
+            .map(|run| run.text.as_str())
+            .collect();
+        if !text.chars().any(char::is_alphabetic) || text.chars().count() > 1024 {
+            return;
+        }
+        let lower = text.trim().to_lowercase();
+        if [
+            "note:",
+            "notes:",
+            "source:",
+            "sources:",
+            "注：",
+            "注:",
+            "来源：",
+            "来源:",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        {
+            return;
+        }
+        let mut source_rows = table.descendants().filter(|node| {
+            node.has_tag_name("tr")
+                && node
+                    .children()
+                    .any(|cell| cell.has_tag_name("td") || cell.has_tag_name("th"))
+                && node
+                    .ancestors()
+                    .skip(1)
+                    .find(|parent| parent.has_tag_name("table"))
+                    == Some(table)
+        });
+        let Some(row) = source_rows.next() else {
+            return;
+        };
+        let scoped = table.parent().is_some_and(semantic_table_container);
+        let named = row.descendants().filter(Node::is_element).any(|node| {
+            has_table_caption_semantics(node)
+                || scoped
+                    && attribute_local(node, "class").is_some_and(|classes| {
+                        classes
+                            .split_ascii_whitespace()
+                            .any(|class| class.eq_ignore_ascii_case("table"))
+                    })
+        });
+        let labels = columns.cells.iter().all(|cell| {
+            let text: String = cell
+                .text
+                .content
+                .iter()
+                .flat_map(|inline| inline.text_runs())
+                .map(|run| run.text.as_str())
+                .collect();
+            !text.trim().is_empty()
+                && text.chars().count() <= 120
+                && text.chars().any(char::is_alphabetic)
+        });
+        let header = row
+            .parent()
+            .is_some_and(|parent| parent.has_tag_name("thead"));
+        // The cell can inherit justification while its actual title paragraph
+        // is centered. Ignore empty wrappers and use a paragraph covering all
+        // visible cell text, without changing the authored grid presentation.
+        let content_alignment = |cell: Node<'_, '_>, fallback| {
+            let visible = node_text(cell);
+            cell.descendants()
+                .skip(1)
+                .filter(|node| node.has_tag_name("p") || node.has_tag_name("div"))
+                .find_map(|node| {
+                    let content = node_text(node);
+                    content
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .eq(visible.chars().filter(|c| !c.is_whitespace()))
+                        .then(|| self.styles.declared_text_alignment(node))
+                        .flatten()
+                })
+                .or(fallback)
+        };
+        let source_cell = row
+            .children()
+            .find(|node| node.has_tag_name("td") || node.has_tag_name("th"));
+        let title_alignment =
+            source_cell.and_then(|cell| content_alignment(cell, title.authored_alignment));
+        let distinct_centered = title_alignment == Some(TextAlignment::Center)
+            && source_rows.next().is_some_and(|row| {
+                row.children()
+                    .filter(|node| node.has_tag_name("td") || node.has_tag_name("th"))
+                    .zip(&columns.cells)
+                    .all(|(node, cell)| {
+                        content_alignment(node, cell.authored_alignment)
+                            != Some(TextAlignment::Center)
+                    })
+            });
+        // Repeated spanning rows usually denote data groups, not one table title.
+        let repeated_groups = rows
+            .iter()
+            .skip(2)
+            .any(|row| row.cells.len() == 1 && usize::from(row.cells[0].column_span) >= width);
+        if named || labels && (header || distinct_centered) && !repeated_groups {
+            rows[0].cells[0].text.kind = TextBlockKind::Caption;
+        }
+    }
+
     pub(super) fn parse_table_annotation(
         &mut self,
         node: Node<'_, '_>,
@@ -401,4 +524,29 @@ impl ReadingIrParser<'_> {
             self.blocks.extend(after.into_iter().map(Block::Text));
         }
     }
+}
+
+// Compute the remaining grid's width with row spans. Publishers sometimes
+// overstate the title's colspan (e.g. 3 over a two-column table); it must not
+// manufacture an extra data column when deciding whether it covers the grid.
+fn grid_width(rows: &[TableRow]) -> usize {
+    let mut occupied = Vec::<u16>::new();
+    let mut width = 0;
+    for row in rows {
+        let mut column = 0;
+        for cell in &row.cells {
+            while occupied.get(column).copied().unwrap_or(0) > 0 {
+                column += 1;
+            }
+            let end = column + usize::from(cell.column_span.max(1));
+            occupied.resize(occupied.len().max(end), 0);
+            occupied[column..end].fill(cell.row_span.max(1));
+            column = end;
+            width = width.max(end);
+        }
+        for span in &mut occupied {
+            *span = span.saturating_sub(1);
+        }
+    }
+    width
 }

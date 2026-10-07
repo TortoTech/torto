@@ -31,6 +31,7 @@ mod imp {
                 | "app.exit"
                 | "panic"
                 | "render.fatal"
+                | "pdf.agent.finished"
                 | "window.minimize"
                 | "memory.caches"
                 | "memory.gpu"

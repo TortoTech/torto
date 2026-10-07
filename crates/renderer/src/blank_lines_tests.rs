@@ -68,6 +68,7 @@ fn blank_lines_have_no_highlight_but_remain_in_copied_text() {
                 background: Rgba::BLACK,
                 leading_gap: 0.0,
                 items: vec![PageItem::Text(TextPlacement {
+                    source_spans: Arc::from([]),
                     ruby: Arc::from([]),
                     citations: Arc::from([]),
                     layout: layout.clone(),

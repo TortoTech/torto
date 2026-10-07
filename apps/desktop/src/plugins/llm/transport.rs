@@ -7,16 +7,32 @@ use rig_core::http_client::{
 };
 use serde_json::{Value, json};
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct ReplayMessage {
+    pub expected: Value,
+    pub original: Value,
+}
+
+pub(super) type AssistantCapture = std::sync::Arc<std::sync::Mutex<Option<Value>>>;
+
 #[derive(Clone, Debug)]
 pub(super) struct CompatHttp(
     pub reqwest::Client,
     pub Vec<Value>,
     pub Option<std::sync::Arc<std::sync::Mutex<Vec<crate::plugins::web_search::WebSource>>>>,
+    pub Vec<ReplayMessage>,
+    pub AssistantCapture,
 );
 
 impl Default for CompatHttp {
     fn default() -> Self {
-        Self(crate::http::client(), Vec::new(), None)
+        Self(
+            crate::http::client(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            Default::default(),
+        )
     }
 }
 
@@ -24,16 +40,31 @@ impl CompatHttp {
     fn prepare<T: Into<Bytes>>(&self, request: Request<T>) -> Request<Bytes> {
         let (parts, body) = request.into_parts();
         let mut bytes = body.into();
-        if !self.1.is_empty()
+        if (!self.1.is_empty() || !self.3.is_empty())
+            && parts.uri.path().ends_with("/chat/completions")
             && let Ok(mut payload) = serde_json::from_slice::<Value>(&bytes)
         {
-            if !payload["tools"].is_array() {
-                payload["tools"] = json!([]);
+            if !self.1.is_empty() {
+                if !payload["tools"].is_array() {
+                    payload["tools"] = json!([]);
+                }
+                payload["tools"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(self.1.iter().cloned());
             }
-            payload["tools"]
-                .as_array_mut()
-                .unwrap()
-                .extend(self.1.iter().cloned());
+            if let Some(messages) = payload["messages"].as_array_mut() {
+                // Match the SDK's current serialization, not just a call ID.
+                // Edited turns must never receive an old opaque signature.
+                let mut replay: Vec<_> = self.3.iter().collect();
+                for message in messages {
+                    if let Some(index) = replay.iter().position(|saved| *message == saved.expected)
+                    {
+                        let saved = replay.remove(index);
+                        *message = saved.original.clone();
+                    }
+                }
+            }
             bytes = Bytes::from(payload.to_string());
         }
         #[cfg(debug_assertions)]
@@ -108,6 +139,21 @@ fn normalize(mut payload: Value) -> Value {
         if choice["message"].is_object() && choice["message"].get("role").is_none() {
             choice["message"]["role"] = json!("assistant");
         }
+        // The transport retains these entries verbatim for the next turn.
+        // Hide only unsupported entries from Rig's typed view; never invent
+        // `data` from `signature`, which are different gateway fields.
+        if let Some(details) = choice
+            .get_mut("message")
+            .and_then(|message| message.get_mut("reasoning_details"))
+            .and_then(Value::as_array_mut)
+        {
+            details.retain(|detail| {
+                serde_json::from_value::<rig_core::providers::openai::completion::ReasoningDetails>(
+                    detail.clone(),
+                )
+                .is_ok()
+            });
+        }
         // Rig parses tool arguments while decoding the response. Repair our
         // output-only tool before that boundary; actual agent tools stay strict.
         if let Some(calls) = choice["message"]["tool_calls"].as_array_mut() {
@@ -134,6 +180,32 @@ fn normalize(mut payload: Value) -> Value {
         }
     }
     payload
+}
+
+fn capture_assistant(payload: &Value, capture: &AssistantCapture) {
+    let Some(message) = payload.pointer("/choices/0/message") else {
+        return;
+    };
+    let has_extensions = message
+        .get("reasoning_details")
+        .is_some_and(|v| v.as_array().is_some_and(|details| !details.is_empty()))
+        || ["extra_content", "signature", "thought_signature"]
+            .iter()
+            .any(|key| message.get(*key).is_some())
+        || message["tool_calls"].as_array().is_some_and(|calls| {
+            calls.iter().any(|call| {
+                call.as_object().is_some_and(|fields| {
+                    fields
+                        .keys()
+                        .any(|key| !matches!(key.as_str(), "id" | "index" | "type" | "function"))
+                })
+            })
+        });
+    if has_extensions {
+        *capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.clone());
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +249,7 @@ impl HttpClientExt for CompatHttp {
         let compatible = request.uri().path().ends_with("/chat/completions");
         let pending = self.0.send::<Bytes, Bytes>(request);
         let sources = self.2.clone();
+        let capture = self.4.clone();
         async move {
             let response = pending.await?;
             let success = response.status().is_success();
@@ -188,6 +261,7 @@ impl HttpClientExt for CompatHttp {
                     && success
                     && let Ok(payload) = serde_json::from_slice::<Value>(&bytes)
                 {
+                    capture_assistant(&payload, &capture);
                     if let Some(sources) = sources {
                         crate::plugins::web_search::collect_sources(
                             &payload,
@@ -224,6 +298,7 @@ impl HttpClientExt for CompatHttp {
         let request = self.prepare(request);
         let compatible = request.uri().path().ends_with("/chat/completions");
         let sources = self.2.clone();
+        let capture = self.4.clone();
         async move {
             let response = self.0.send_streaming(request).await?;
             let is_json = response
@@ -271,6 +346,7 @@ impl HttpClientExt for CompatHttp {
             }
             let payload: Value =
                 serde_json::from_slice(&bytes).map_err(|e| http::Error::Instance(Box::new(e)))?;
+            capture_assistant(&payload, &capture);
             if let Some(sources) = sources {
                 crate::plugins::web_search::collect_sources(
                     &payload,

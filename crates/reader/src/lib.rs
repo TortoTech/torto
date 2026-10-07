@@ -3682,9 +3682,8 @@ fn compile_segment(
                 .position(|page| {
                     page.items.iter().any(|item| match item {
                         PageItem::Text(placement) => placement
-                            .source
-                            .as_ref()
-                            .is_some_and(|range| source_range_contains(range, &anchor.source)),
+                            .sources()
+                            .any(|range| source_range_contains(range, &anchor.source)),
                         PageItem::Quote(placement) => placement
                             .sources
                             .iter()
@@ -4626,6 +4625,7 @@ fn build_reader_selection(
     let mut ranges = Vec::new();
     let mut quote = String::new();
     let mut rects = Vec::new();
+    let mut previous_region: Option<(usize, usize)> = None;
     for (page_index, (position, page, offset_x)) in
         pages.iter().enumerate().take(end.page + 1).skip(start.page)
     {
@@ -4661,7 +4661,18 @@ fn build_reader_selection(
                     && previous.end.node == fragment.range.start.node
                     && previous.end.text_offset == fragment.range.start.text_offset
             });
-            append_selection_quote(&mut quote, &fragment.quote, source_continues);
+            let joiner = previous_region.and_then(|(previous_page, previous_index)| {
+                page.text_region_joiner(&pages[previous_page].1, previous_index, region_index)
+            });
+            if !source_continues && let Some(joiner) = joiner {
+                quote.push_str(joiner);
+            }
+            append_selection_quote(
+                &mut quote,
+                &fragment.quote,
+                source_continues || joiner.is_some(),
+            );
+            previous_region = Some((page_index, region_index));
             push_source_range(&mut ranges, fragment.range);
             rects.extend(fragment.rects.into_iter().map(|rect| ReaderSelectionRect {
                 position: *position,
@@ -5510,6 +5521,110 @@ mod tests {
         assert_eq!(snapshot.location.section_index, last.section_index);
         assert_eq!(snapshot.location.segment_index, last.segment_index);
         assert_eq!(snapshot.location.page_index, last.page_index);
+    }
+
+    #[test]
+    fn joined_table_caption_selection_and_number_anchor_keep_both_sources() {
+        use rebook_publication::{TableBlock, TableCell, TableRow};
+        let mut source = CountingSource::new(&["placeholder".into()]);
+        let section = &mut Arc::get_mut(&mut source).unwrap().sections[0];
+        let block = |node: &str, value: &str, kind| TextBlock {
+            kind,
+            style: BlockStyle::default(),
+            content: vec![Inline::Text(TextRun {
+                text: value.into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            source: Some(SourceRange {
+                start: SourceAnchor {
+                    spine: section.id.clone(),
+                    node: node.into(),
+                    text_offset: 0,
+                },
+                end: SourceAnchor {
+                    spine: section.id.clone(),
+                    node: node.into(),
+                    text_offset: value.chars().count() as u64,
+                },
+            }),
+        };
+        let label = block("label", "TABLE 3.1:", TextBlockKind::Caption);
+        let title = block("title", "Benchmark phenomena", TextBlockKind::Caption);
+        let ranges = [label.source.clone().unwrap(), title.source.clone().unwrap()];
+        let cell = |text, span| TableCell {
+            text,
+            authored_alignment: None,
+            column_span: span,
+            row_span: 1,
+            header: false,
+        };
+        let table = TableBlock {
+            source: None,
+            before: vec![label],
+            after: vec![],
+            rows: vec![
+                TableRow {
+                    cells: vec![cell(title, 2)],
+                },
+                TableRow {
+                    cells: vec![
+                        cell(block("a", "Category", TextBlockKind::Paragraph), 1),
+                        cell(block("b", "Description", TextBlockKind::Paragraph), 1),
+                    ],
+                },
+            ],
+        };
+        section.blocks = vec![Block::Table(table)];
+        section.anchors = vec![SectionAnchor {
+            fragment: "table-label".into(),
+            source: ranges[0].start.clone(),
+        }];
+        let reader = ReaderSession::open(
+            source,
+            viewport(800, 600),
+            ReaderStyle {
+                spread: SpreadMode::Single,
+                typesetting: ReaderTypesetting::unified(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            reader
+                .cache
+                .values()
+                .any(|segment| segment.anchor_pages.contains_key("table-label"))
+        );
+        let page = reader.current_page();
+        let boundaries = ranges
+            .iter()
+            .map(|range| {
+                (0..page.text_region_count())
+                    .find_map(|index| {
+                        page.text_region_byte_range_for_source(index, range)
+                            .map(|bytes| (index, bytes))
+                    })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let pages = vec![(
+            ReaderPosition {
+                section_index: 0,
+                segment_index: 0,
+                page_index: 0,
+            },
+            Arc::new(page.clone()),
+            0.0,
+        )];
+        let selected = build_reader_selection(
+            &pages,
+            SelectionBoundary::new(0, boundaries[0].0, boundaries[0].1.start),
+            SelectionBoundary::new(0, boundaries[1].0, boundaries[1].1.end),
+        )
+        .unwrap();
+        assert_eq!(selected.text, "TABLE 3.1: Benchmark phenomena");
+        assert_eq!(selected.ranges, ranges);
     }
 
     #[test]

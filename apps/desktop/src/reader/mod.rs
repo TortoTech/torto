@@ -73,6 +73,7 @@ mod citation_tests;
 mod completion;
 mod egui_view;
 mod focus_lists;
+mod focus_wheel;
 mod footnote_layout;
 mod footnote_navigation;
 mod interaction;
@@ -3842,6 +3843,7 @@ struct ReaderUiState {
     last_motion_tick: Option<Instant>,
     wheel_accumulator: f32,
     last_wheel_turn: Option<Instant>,
+    focus_wheel: focus_wheel::Navigation,
     expanded_toc: HashSet<String>,
     last_auto_scrolled_toc: Option<String>,
     toc_keyboard_row: Option<usize>,
@@ -4105,6 +4107,7 @@ impl DesktopReader {
                 last_motion_tick: None,
                 wheel_accumulator: 0.0,
                 last_wheel_turn: None,
+                focus_wheel: focus_wheel::Navigation::default(),
                 expanded_toc,
                 last_auto_scrolled_toc: None,
                 toc_keyboard_row: None,
@@ -4485,6 +4488,7 @@ mod tests {
             }
         }
     }
+    use super::focus_wheel;
     use super::navigation::snapshot_reanchors_focus;
     use super::{
         BookDisplayMetadata, Duration, FOCUS_SCROLL_MAX_DURATION, FOCUS_SCROLL_MIN_DURATION,
@@ -6347,6 +6351,7 @@ mod tests {
             last_motion_tick: None,
             wheel_accumulator: 0.0,
             last_wheel_turn: None,
+            focus_wheel: focus_wheel::Navigation::default(),
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
             toc_keyboard_row: None,
@@ -6390,6 +6395,7 @@ mod tests {
             last_motion_tick: None,
             wheel_accumulator: 0.0,
             last_wheel_turn: None,
+            focus_wheel: focus_wheel::Navigation::default(),
             expanded_toc: HashSet::new(),
             last_auto_scrolled_toc: None,
             toc_keyboard_row: None,

@@ -269,3 +269,99 @@ fn prose_and_cell_headers_remain_untouched() {
     assert_eq!(table.rows.len(), 2);
     assert_eq!(table.rows[0].cells[0].column_span, 3);
 }
+
+#[test]
+fn spanning_title_is_marked_without_moving_cells_or_sources() {
+    let section = parse(
+        "<div class='table'><p>TABLE 3.1</p><table><thead><tr><td colspan='3' id='title'><p class='table'>Benchmark <em>phenomena</em><a href='notes.xhtml#n1' role='doc-noteref'>1</a></p></td></tr><tr><td>Category</td><td>Description</td></tr></thead><tbody><tr><td>Learning</td><td>Effects</td></tr></tbody></table></div>",
+    );
+    let [Block::Table(table)] = &section.blocks[..] else {
+        panic!()
+    };
+    assert_eq!(table.rows.len(), 3);
+    assert_eq!(table.before.len(), 1);
+    let title = &table.rows[0].cells[0];
+    assert_eq!(title.column_span, 3);
+    assert_eq!(title.text.kind, TextBlockKind::Caption);
+    assert_eq!(
+        section.anchors[0].source,
+        title.text.source.as_ref().unwrap().start
+    );
+    assert!(
+        title
+            .text
+            .content
+            .iter()
+            .any(|inline| matches!(inline, Inline::Text(run) if run.style.italic))
+    );
+    assert!(
+        title
+            .text
+            .content
+            .iter()
+            .any(|inline| matches!(inline, Inline::Text(run) if run.link.is_some()))
+    );
+    assert_eq!(table.text_blocks().count(), 6);
+}
+
+#[test]
+fn distinct_centered_title_over_column_labels_needs_no_publisher_classes() {
+    let section = parse(
+        "<style>.title {text-align:center} .label {text-align:justify}</style><table><tr><td colspan='5'><p class='title'>九型人格</p></td></tr><tr><td><p class='label'>类型</p></td><td><p class='label'>理想</p></td><td><p class='label'>恐惧</p></td><td><p class='label'>愿望</p></td><td><p class='label'>缺陷</p></td></tr></table>",
+    );
+    let [Block::Table(table)] = &section.blocks[..] else {
+        panic!()
+    };
+    assert!(table.before.is_empty());
+    assert_eq!(table.rows[0].cells[0].text.kind, TextBlockKind::Caption);
+    assert_eq!(
+        table.rows[0].cells[0].authored_alignment,
+        Some(TextAlignment::Center)
+    );
+}
+
+#[test]
+fn title_paragraph_alignment_overrides_inherited_cell_alignment_for_identification_only() {
+    let section = parse(
+        "<style>body {text-align:justify} td {text-align:inherit} .title {text-align:center} .label {text-align:justify}</style><table><tr><td colspan='2'><span>&#160; </span><p class='title'>&#160; 九型人格</p></td></tr><tr><td><span>&#160;</span><p class='label'>类型</p></td><td><p class='label'>理想</p></td></tr></table>",
+    );
+    let [Block::Table(table)] = &section.blocks[..] else {
+        panic!()
+    };
+    assert_eq!(table.rows[0].cells[0].text.kind, TextBlockKind::Caption);
+    // Keep the existing cell style for original-book rendering.
+    assert_eq!(
+        table.rows[0].cells[0].authored_alignment,
+        Some(TextAlignment::Justify)
+    );
+}
+
+#[test]
+fn data_groups_notes_partial_spans_and_numeric_rows_are_not_titles() {
+    for first in [
+        "<td colspan='2'>Group A</td>",
+        "<td colspan='2' style='text-align:center'>Note: Rounded results</td>",
+        "<td colspan='2' style='text-align:center'>1234</td>",
+        "<td colspan='1' style='text-align:center'>Title</td>",
+        "<td colspan='2' rowspan='2' style='text-align:center'>Title</td>",
+    ] {
+        let section = parse(&format!(
+            "<table><tr>{first}</tr><tr><td>Category</td><td>Description</td></tr></table>"
+        ));
+        let Block::Table(table) = &section.blocks[0] else {
+            panic!()
+        };
+        assert_eq!(
+            table.rows[0].cells[0].text.kind,
+            TextBlockKind::Paragraph,
+            "{first}"
+        );
+    }
+    let section = parse(
+        "<table><thead><tr><th colspan='2'>Group A</th></tr><tr><th>Category</th><th>Description</th></tr></thead><tr><td colspan='2'>Group B</td></tr></table>",
+    );
+    let Block::Table(table) = &section.blocks[0] else {
+        panic!()
+    };
+    assert_eq!(table.rows[0].cells[0].text.kind, TextBlockKind::Paragraph);
+}

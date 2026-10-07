@@ -638,3 +638,178 @@ fn tool_history_keeps_names_ids_and_reasoning_signatures() {
         matches!(&history[1],Message::User{content} if matches!(&content[0],UserContent::ToolResult(result) if result.name=="read_book"))
     );
 }
+
+fn signed_gateway_message(id: &str) -> Value {
+    json!({"role":"assistant","content":null,"reasoning_content":"checking","reasoning":"checking",
+        "reasoning_details":[
+            {"type":"reasoning.encrypted","id":id,"index":0,"signature":"opaque-signed-value"},
+            {"type":"future.gateway.trace","payload":{"keep":true}},
+            {"type":"reasoning.encrypted","id":"cipher","index":1,"data":"opaque-ciphertext"}
+        ],
+        "tool_calls":[{"id":id,"type":"function","function":{"name":"read_draft","arguments":"{\"offset\":0}"},
+            "extra_content":{"google":{"thought_signature":"call-signature"}},"gateway_extension":{"keep":true}}]})
+}
+
+fn gateway_tools() -> Value {
+    json!([{"type":"function","function":{"name":"read_draft","description":"Read draft","parameters":{"type":"object","properties":{"offset":{"type":"integer"}}}}}])
+}
+
+#[test]
+fn compatible_gateway_signed_history_replays_verbatim_across_tool_rounds() {
+    let first = signed_gateway_message("call-1");
+    let second = signed_gateway_message("call-2");
+    let (url, handle) = server(vec![
+        (200, wire_message(first.clone())),
+        (200, wire_message(second.clone())),
+        (200, text_response("done")),
+    ]);
+    let provider = AiProvider {
+        kind: AiProviderKind::Custom,
+        base_url: url,
+        ..Default::default()
+    };
+    let tools = gateway_tools();
+    let mut history = vec![json!({"role":"user","content":"Inspect draft"})];
+    for id in ["call-1", "call-2"] {
+        let message = run(complete(
+            &provider,
+            "gemini/lite",
+            &history,
+            Some(&tools),
+            None,
+            ReasoningEffort::Default,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(message["tool_calls"][0]["id"], id);
+        // Persist/reload the private envelope exactly as callers persist history.
+        history.push(serde_json::from_str(&message.to_string()).unwrap());
+        history.push(json!({"role":"tool","tool_call_id":id,"content":"draft"}));
+    }
+    run(complete(
+        &provider,
+        "gemini/lite",
+        &history,
+        Some(&tools),
+        None,
+        ReasoningEffort::Default,
+        None,
+    ))
+    .unwrap();
+    let requests = handle.join().unwrap();
+    assert_eq!(requests[1]["messages"][1], first);
+    assert_eq!(requests[2]["messages"][1], first);
+    assert_eq!(requests[2]["messages"][3], second);
+    assert_eq!(requests[2]["messages"][2]["tool_call_id"], "call-1");
+    assert_eq!(requests[2]["messages"][4]["tool_call_id"], "call-2");
+    for request in requests {
+        assert!(!request.to_string().contains("_torto_"));
+        assert!(!request.to_string().contains("_compatible_message"));
+    }
+}
+
+#[test]
+fn compatible_gateway_history_is_scoped_and_invalidated_by_core_edits() {
+    let original = signed_gateway_message("call-1");
+    let (url, handle) = server(vec![(200, wire_message(original))]);
+    let provider = AiProvider {
+        kind: AiProviderKind::Custom,
+        base_url: url,
+        api_key: "first-key".into(),
+        ..Default::default()
+    };
+    let tools = gateway_tools();
+    let message = run(complete(
+        &provider,
+        "gemini/lite",
+        &[json!({"role":"user","content":"inspect"})],
+        Some(&tools),
+        None,
+        ReasoningEffort::Default,
+        None,
+    ))
+    .unwrap();
+    handle.join().unwrap();
+    assert_eq!(
+        compatible_replay(&provider, "gemini/lite", &[message.clone()]).len(),
+        1
+    );
+    assert!(compatible_replay(&provider, "other-model", &[message.clone()]).is_empty());
+    for changed in [
+        AiProvider {
+            base_url: "http://other/v1".into(),
+            ..provider.clone()
+        },
+        AiProvider {
+            api_key: "second-key".into(),
+            ..provider.clone()
+        },
+        AiProvider {
+            kind: AiProviderKind::Gemini,
+            ..provider.clone()
+        },
+    ] {
+        assert!(compatible_replay(&changed, "gemini/lite", &[message.clone()]).is_empty());
+    }
+    assert!(!message.to_string().contains("first-key"));
+    let mut edited = message;
+    let mut core: Message = serde_json::from_value(edited["_rig_message"].clone()).unwrap();
+    if let Message::Assistant { content, .. } = &mut core {
+        for part in content {
+            if let AssistantContent::ToolCall(call) = part {
+                call.function.arguments = json!({"offset":9});
+            }
+        }
+    }
+    edited["_rig_message"] = serde_json::to_value(core).unwrap();
+    assert!(compatible_replay(&provider, "gemini/lite", &[edited.clone()]).is_empty());
+    let projected = scoped_messages(&provider, "gemini/lite", &[edited.clone()]).unwrap();
+    assert!(matches!(&projected[0], Message::Assistant { content, .. }
+        if !content.iter().any(|part| matches!(part, AssistantContent::Reasoning(_)))));
+    edited["_rig_message"]["content"] = json!([]);
+    assert!(compatible_replay(&provider, "gemini/lite", &[edited]).is_empty());
+}
+
+#[test]
+fn incompatible_signed_history_is_not_sent_to_a_different_model() {
+    let (url, handle) = server(vec![
+        (200, wire_message(signed_gateway_message("call-1"))),
+        (200, text_response("done")),
+    ]);
+    let provider = AiProvider {
+        kind: AiProviderKind::Custom,
+        base_url: url,
+        ..Default::default()
+    };
+    let tools = gateway_tools();
+    let mut history = vec![json!({"role":"user","content":"inspect"})];
+    history.push(
+        run(complete(
+            &provider,
+            "gemini/lite",
+            &history,
+            Some(&tools),
+            None,
+            ReasoningEffort::Default,
+            None,
+        ))
+        .unwrap(),
+    );
+    history.push(json!({"role":"tool","tool_call_id":"call-1","content":"draft"}));
+    run(complete(
+        &provider,
+        "another-model",
+        &history,
+        Some(&tools),
+        None,
+        ReasoningEffort::Default,
+        None,
+    ))
+    .unwrap();
+    let requests = handle.join().unwrap();
+    let echoed = requests[1]["messages"][1].to_string();
+    assert!(!echoed.contains("opaque-signed-value"));
+    assert!(!echoed.contains("opaque-ciphertext"));
+    assert!(!echoed.contains("call-signature"));
+    assert!(!echoed.contains("future.gateway.trace"));
+}

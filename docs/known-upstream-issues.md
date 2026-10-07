@@ -1,9 +1,56 @@
 # 核心依赖已知问题
 
-- 最近更新：2026-09-10
+- 最近更新：2026-10-07
 - 记录范围：已经在 Torto 中复现、确认与上游依赖、Windows 图形栈或渲染帧时序有关，并需要本地兼容代码或长期回归检查的问题
 
 依赖升级时应逐项检查本文。只有在上游修复已经进入当前版本，并且移除本地兼容代码后相关回归测试仍能通过，才删除对应兼容代码和本文条目。
+
+## Rig：OpenAI 兼容网关的签名扩展导致响应解析失败或回传丢失
+
+- 影响版本：项目当前 `rig-core 0.42.0`；核对 `0.43.0` 标签源码，相同字段限制仍存在。
+- 核查日期：2026-10-07。最新发布版为 [0.43.0](https://github.com/0xPlaygrounds/rig/releases/tag/v0.43.0)（2026-09-30）。
+- 本地位置：`apps/desktop/src/plugins/llm/transport.rs` 的 `capture_assistant`、`normalize`、`CompatHttp::prepare`；`apps/desktop/src/plugins/llm.rs` 的 `compatible_scope`、`compatible_replay`、`scoped_messages`、`response_message`。
+- 官方跟踪：[Rig #2591](https://github.com/0xPlaygrounds/rig/issues/2591)（兼容响应解析过严，同类问题，非完全相同复现）、[PR #2713](https://github.com/0xPlaygrounds/rig/pull/2713)（2026-10-04 合并到主分支，宽容 JSON 解析和原始条目回传，尚未进入 0.43.0）。未找到专门报告 Bifrost 此签名结构的官方 issue；本次没有向上游创建 issue。
+
+### 复现证据
+
+目录识别使用自定义 OpenAI 兼容端点的 `/chat/completions`，模型 ID 为 `gemini/lite`。Bifrost 负责转换 Gemini 原生协议，客户端并未直接调用 Gemini API。
+
+网关真实工具调用响应包含如下扩展：
+
+```json
+{"reasoning_details":[{"type":"reasoning.encrypted","id":"call-example","index":0,"signature":"<opaque signature>"}]}
+```
+
+Rig 的 `ReasoningDetails::Encrypted` 强制要求 `data: String`，因此整个响应报 `missing field data`。实验中人为补 `data` 可通过解析，但 `signature` 不属于该类型的字段，经过 SDK 序列化会消失；这不能作为修复。Bifrost 的 `reasoning_details` 是标准之外的扩展，`signature` 与 `data` 是不同字段，不能互相假定等价。
+
+2026-10-07 使用相同网关、凭据和模型，完整目录工具声明的首轮请求及原样回传后的第二轮请求均返回 HTTP 200；真实首轮响应交给项目锁定版本的 SDK，仍复现上述错误。签名值没有写入诊断日志或本文。
+
+补丁后用本地《The psychology of reading》（554 页）实测：首轮再次遇到上述连接失败，一次重试后恢复，随后运行到第 19 轮模型请求，可正常处理页面概览与阅读调用，没有 SDK 解码或签名回传错误。但模型也出现一次 `read_pages` 请求 6 页、超过声明的 5 页上限的无效调用；约 96 秒后因重复查看页面、没有形成有效目录/元数据草稿而触发停滞保护，返回“连续调用未取得新进展，已保留草稿”。这是尚待调查的模型识别/工具决策问题，本轮实测不能记为整本目录识别通过；报告位于本地 `target/pdf-agent-live/report.json`，不随代码提交。
+
+### 当前本地兼容方案
+
+1. 兼容 HTTP 层在 SDK 解码前保存带扩展的原始 assistant 消息，仅从 SDK 的解析视图移除其无法识别的 `reasoning_details` 条目；原始字段和值保持不变。标准密文 `data` 和 SDK 支持的其他条目继续正常解析。
+2. 私有历史同时记录原始消息、SDK 核心消息及端点/凭据/模型的摘要。发送前只有上下文相同、核心消息未修改、SDK 最终序列化仍匹配时，才恢复原始消息。内部标记和摘要不发送到 API，凭据不存入历史。
+3. 切换端点、凭据或模型后不恢复原始扩展，也去除 SDK 核心消息中该网关的 reasoning/signature 副本，保留普通文字、调用和结果。
+4. 捕获仅随当前请求及调用方历史存活，没有新增全局消息缓存。覆盖非流式 Chat Completions 和返回完整 JSON 的伪流式兼容路径；真实 SSE 仍交给 Rig，未知 SSE 扩展的完整回传尚需另行验证。
+
+回归测试：`compatible_gateway_signed_history_replays_verbatim_across_tool_rounds`（含持久化、未来扩展、调用附加签名、两轮完整回传）、`compatible_gateway_history_is_scoped_and_invalidated_by_core_edits`、`incompatible_signed_history_is_not_sent_to_a_different_model`，以及已有双 reasoning 字段和原生签名历史测试。
+
+### 另一个独立故障：网关连接上游时提前断开
+
+2026-10-07 客户端日志记录：目录识别第一轮约 1045 ms 返回 HTTP 502，错误类型 `provider_connection_failed`，网关底层错误为 `fasthttp: the server closed connection before returning the first response byte`。当时尚未发送 PDF 页面图片，request ID 为 `aedb1e0a-cc8e-4c6e-9542-f43a0320d958`。
+
+该错误与 SDK 解码无关，具体断连根因仍需网关的上游连接日志。`pdf_toc/agent.rs::complete_round` 对明确的 502/503/504 `provider_connection_failed` 最多重试两次，等待 1 秒和 2 秒；重发相同轮次，成功前不执行工具，等待计入原有总截止时间。认证、限流、请求格式、响应解析错误和普通 5xx 不按此策略重试；最终失败保留原始错误和已有草稿。
+
+回归测试：`connection_retry_classification_excludes_auth_schema_and_generic_server_errors`、`connection_retry_resends_same_round_before_tool_execution`、`connection_retry_is_bounded_and_preserves_final_error`、`connection_retry_does_not_retry_authentication_errors`。
+
+### 升级检查与后续事项
+
+1. 跟踪 #2713 进入发布版的时间。该 PR 大幅改变 assistant 历史、工具调用和提供商 API，不能只改版本号；需要单独迁移统一 LLM 层并检查已有历史是否可读。
+2. 升级候选版本后，用本次网关的真实响应和本地多轮回归核对未知字段、签名、密文、调用 ID 的原样回传；仅有“Gemini 原生签名支持”不等于网关扩展问题已解决。
+3. 临时关闭本地兼容层，验证目录识别、AI 对话、翻译和排版，以及跨模型/端点切换、错误响应和 SSE。全部通过后才移除本地兼容逻辑；在此之前保留本文。
+4. 网关上游连接故障独立跟踪。SDK 升级不能替代上游根因排查，也不能据此删除有限重试。
 
 ## 2026-09-10 上游版本核查
 

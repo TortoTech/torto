@@ -1,6 +1,30 @@
 //! Presentation-only normalization of numbered figure and table captions.
 use rebook_publication::{Inline, TextRun};
 
+/// A table caption containing its identifier and optional punctuation only.
+pub(super) fn table_label_only(text: &str) -> bool {
+    let text = text.trim();
+    let number = ["table", "tab.", "表格", "表"]
+        .into_iter()
+        .find_map(|name| {
+            text.get(..name.len())
+                .filter(|prefix| prefix.eq_ignore_ascii_case(name))
+                .map(|_| {
+                    text[name.len()..]
+                        .trim_start()
+                        .trim_start_matches(['.', ':', '：', '．'])
+                        .trim_start()
+                })
+        })
+        .unwrap_or(text);
+    let canonical = format!("Table {number}");
+    label(&canonical).is_some_and(|(_, end)| {
+        canonical[end..]
+            .chars()
+            .all(|c| c.is_whitespace() || ".:：．。–—-".contains(c))
+    })
+}
+
 pub(super) fn normalize(content: &mut Vec<Inline>) {
     // Stop at media: only an authored textual prefix can be a caption label.
     let leading = content

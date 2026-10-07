@@ -6,9 +6,11 @@ pub mod linebreak;
 
 mod caption_labels;
 mod formula_images;
+mod headings;
 mod note_spacing;
 mod raster_cache;
 mod semantic_lists;
+mod table_captions;
 mod web_links;
 pub use raster_cache::{
     RasterCacheStats, RasterOrigin, clear_raster_cache, load_original_raster, raster_cache_stats,
@@ -901,6 +903,9 @@ pub struct InlineCitationPlacement {
 /// A line slice from a shaped paragraph, retaining collapsed reference text.
 #[derive(Clone)]
 pub struct TextPlacement {
+    /// Independent authored fragments sharing this paragraph's shaped text.
+    /// Empty for the usual single-source paragraph.
+    pub source_spans: Arc<[TextSourceSpan]>,
     pub ruby: Arc<[RubyPlacement]>,
     pub citations: Arc<[InlineCitationPlacement]>,
     pub layout: Arc<Layout<TextBrush>>,
@@ -918,6 +923,39 @@ pub struct TextPlacement {
     pub source: Option<SourceRange>,
     /// Formula rasters positioned by Parley inline boxes in this text layout.
     pub inline_images: Arc<[InlineImage]>,
+}
+
+#[derive(Clone)]
+pub struct TextSourceSpan {
+    /// UTF-8 byte range in the complete shaped display text.
+    pub range: Range<usize>,
+    pub source: SourceRange,
+}
+
+impl TextPlacement {
+    pub fn sources(&self) -> impl Iterator<Item = &SourceRange> {
+        self.source_spans.iter().map(|span| &span.source).chain(
+            self.source
+                .as_ref()
+                .filter(|_| self.source_spans.is_empty()),
+        )
+    }
+
+    pub fn source_at_byte(&self, byte: usize) -> Option<&SourceRange> {
+        if self.source_spans.is_empty() {
+            self.source.as_ref()
+        } else {
+            self.source_spans
+                .iter()
+                .find(|span| span.range.contains(&byte))
+                .map(|span| &span.source)
+        }
+    }
+}
+
+fn empty_text_source_spans() -> Arc<[TextSourceSpan]> {
+    static EMPTY: std::sync::OnceLock<Arc<[TextSourceSpan]>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::from([])))
 }
 
 /// One positioned table chunk. Large tables can produce one chunk per page.
@@ -1481,24 +1519,31 @@ impl LayoutEngine {
                 continue;
             }
 
-            if unified_reflow
-                && let Some(Block::Text(ordinal)) = layout_blocks.get(block_index).copied()
-                && let TextBlockKind::HeadingOrdinal(level) = ordinal.kind
-                && let Some(Block::Text(title)) = layout_blocks.get(block_index + 1).copied()
-                && title.kind.heading_level() == Some(level)
-            {
-                let ordinal = resolve_text_block(ordinal, reader_style, TextContext::Flow);
-                let title = resolve_text_block(title, reader_style, TextContext::Flow);
-                let ordinal_text = self.shape_text(&ordinal, reader_style, content_width);
-                let title_text = self.shape_text(&title, reader_style, content_width);
-                paginator.keep_together_if_fits(
-                    prepared_flow_height(&ordinal_text)
-                        + ordinal.style.margin_before.max(0.0)
-                        + ordinal.style.margin_after.max(0.0)
-                        + prepared_flow_height(&title_text)
-                        + title.style.margin_before.max(0.0)
-                        + title.style.margin_after.max(0.0),
-                );
+            if unified_reflow && let Some(group) = headings::group(&layout_blocks[block_index..]) {
+                let (combined, spans) = headings::joined(group.ordinal, group.title, false);
+                let resolved = resolve_text_block(&combined, reader_style, TextContext::Flow);
+                let prepared = self.shape_text_from_source_with_spans(
+                    source,
+                    &resolved,
+                    reader_style,
+                    content_width,
+                    spans,
+                )?;
+                paginator.push_text(&prepared, &resolved)?;
+                if let Some(title) = group.translated_title {
+                    let ordinal = group.translated_ordinal.unwrap_or(group.ordinal);
+                    let (combined, _) = headings::joined(ordinal, title, true);
+                    let resolved = resolve_text_block(&combined, reader_style, TextContext::Flow);
+                    let prepared = self.shape_text_from_source(
+                        source,
+                        &resolved,
+                        reader_style,
+                        content_width,
+                    )?;
+                    paginator.push_text(&prepared, &resolved)?;
+                }
+                block_index += group.consumed;
+                continue;
             }
 
             let block = layout_blocks[block_index];
@@ -1650,28 +1695,41 @@ impl LayoutEngine {
                     }
                 }
                 Block::Table(table) => {
+                    let captions = table_captions::presentation(table, unified_reflow);
                     let width = (content_width - media_start_offset).max(1.0);
-                    let mut prepared = self.shape_table(table, reader_style, width);
-                    if table.before.is_empty() && table.after.is_empty()
+                    let mut prepared = if captions.skip_title {
+                        self.shape_table_rows(&table.rows[1..], reader_style, width)
+                    } else {
+                        self.shape_table(table, reader_style, width)
+                    };
+                    if captions.before.is_empty() && captions.after.is_empty()
                         || prepared.row_heights.is_empty()
                     {
                         paginator.push_table(&prepared, 0.0);
                         block_index += 1;
                         continue;
                     }
-                    let before = self.shape_figure_captions(
+                    let before = self.shape_captions_with_join(
                         source,
-                        &table.before,
+                        &captions.before,
                         reader_style,
                         width,
                         unified_reflow,
+                        captions
+                            .join
+                            .filter(|(after, _)| !after)
+                            .map(|(_, index)| index),
                     )?;
-                    let after = self.shape_figure_captions(
+                    let after = self.shape_captions_with_join(
                         source,
-                        &table.after,
+                        &captions.after,
                         reader_style,
                         width,
                         unified_reflow,
+                        captions
+                            .join
+                            .filter(|(after, _)| *after)
+                            .map(|(_, index)| index),
                     )?;
                     let gap =
                         reader_style.typography.font_size * reader_style.typesetting.caption_gap_em;
@@ -1967,6 +2025,7 @@ impl LayoutEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn shape_text(
         &mut self,
         block: &TextBlock,
@@ -1983,6 +2042,23 @@ impl LayoutEngine {
         reader_style: &ReaderStyle,
         content_width: f32,
     ) -> Result<PreparedText, LayoutError> {
+        self.shape_text_from_source_with_spans(
+            source,
+            block,
+            reader_style,
+            content_width,
+            Vec::new(),
+        )
+    }
+
+    fn shape_text_from_source_with_spans(
+        &mut self,
+        source: &dyn BookSource,
+        block: &TextBlock,
+        reader_style: &ReaderStyle,
+        content_width: f32,
+        source_spans: Vec<TextSourceSpan>,
+    ) -> Result<PreparedText, LayoutError> {
         let mut rasters = Vec::with_capacity(block.content.len());
         for inline in &block.content {
             rasters.push(match inline {
@@ -1995,12 +2071,13 @@ impl LayoutEngine {
                 Inline::Text(_) | Inline::Ruby(_) | Inline::Math(_) | Inline::Break => None,
             });
         }
-        Ok(self.shape_text_with_min_width_and_rasters(
+        Ok(self.shape_text_with_sources(
             block,
             reader_style,
             content_width,
             40.0,
             &rasters,
+            source_spans,
         ))
     }
 
@@ -2025,10 +2102,13 @@ impl LayoutEngine {
         };
         let mut prepared =
             self.shape_text_from_source(source, &resolved, reader_style, content_width)?;
-        if unified_reflow && prepared.layout.len() > 1 {
+        if unified_reflow && caption_visible_line_count(&prepared) > 1 {
             resolved.to_mut().style.align = TextAlignment::Start;
             prepared =
                 self.shape_text_from_source(source, &resolved, reader_style, content_width)?;
+        }
+        if unified_reflow {
+            prepared.lines = edge_content_lines(&prepared);
         }
         Ok((prepared, resolved))
     }
@@ -2041,35 +2121,103 @@ impl LayoutEngine {
         content_width: f32,
         unified_reflow: bool,
     ) -> Result<Vec<(PreparedText, Cow<'a, TextBlock>)>, LayoutError> {
-        let mut shaped = captions
-            .iter()
-            .map(|caption| {
-                self.shape_figure_caption(
+        self.shape_captions_with_join(
+            source,
+            captions,
+            reader_style,
+            content_width,
+            unified_reflow,
+            None,
+        )
+    }
+
+    fn shape_captions_with_join<'a>(
+        &mut self,
+        source: &dyn BookSource,
+        captions: &'a [TextBlock],
+        reader_style: &ReaderStyle,
+        content_width: f32,
+        unified_reflow: bool,
+        join: Option<usize>,
+    ) -> Result<Vec<(PreparedText, Cow<'a, TextBlock>)>, LayoutError> {
+        let mut shaped = Vec::with_capacity(captions.len());
+        let mut caption_flags = Vec::with_capacity(captions.len());
+        let mut index = 0;
+        while index < captions.len() {
+            let caption = &captions[index];
+            caption_flags.push(caption.kind == TextBlockKind::Caption);
+            if join == Some(index) && unified_reflow {
+                let label = resolve_text_block(caption, reader_style, TextContext::Flow);
+                let title =
+                    resolve_text_block(&captions[index + 1], reader_style, TextContext::Flow);
+                let mut combined = title.into_owned();
+                let title_content = std::mem::take(&mut combined.content);
+                combined.content = table_captions::join_content(&label.content, &title_content);
+                let title_start = label.content.len() + 1;
+                let mut spans = Vec::with_capacity(2);
+                for (range, source) in [
+                    (0..label.content.len(), &label.source),
+                    (title_start..combined.content.len(), &combined.source),
+                ] {
+                    if let Some(source) = source {
+                        spans.push(TextSourceSpan {
+                            range,
+                            source: source.clone(),
+                        });
+                    }
+                }
+                let mut prepared = self.shape_text_from_source_with_spans(
+                    source,
+                    &combined,
+                    reader_style,
+                    content_width,
+                    spans,
+                )?;
+                if caption_visible_line_count(&prepared) > 1 {
+                    combined.style.align = TextAlignment::Start;
+                    let sources = Arc::clone(&prepared.source_spans);
+                    prepared = self.shape_text_from_source(
+                        source,
+                        &combined,
+                        reader_style,
+                        content_width,
+                    )?;
+                    prepared.source_spans = sources;
+                }
+                prepared.lines = edge_content_lines(&prepared);
+                shaped.push((prepared, Cow::Owned(combined)));
+                index += 2;
+            } else {
+                shaped.push(self.shape_figure_caption(
                     source,
                     caption,
                     reader_style,
                     content_width,
                     unified_reflow,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                )?);
+                index += 1;
+            }
+        }
         // The semantic caption can consist of several authored paragraphs (or
         // bilingual companions). Apply the single-line/multi-line rule to the
         // entire caption, not independently to each fragment.
         if unified_reflow
             && shaped
                 .iter()
-                .zip(captions)
-                .filter(|(_, caption)| caption.kind == TextBlockKind::Caption)
-                .map(|((text, _), _)| text.layout.len())
+                .zip(caption_flags)
+                .filter(|(_, caption)| *caption)
+                .map(|((text, _), _)| caption_visible_line_count(text))
                 .sum::<usize>()
                 > 1
         {
             for (prepared, resolved) in &mut shaped {
                 if resolved.style.align != TextAlignment::Start {
                     resolved.to_mut().style.align = TextAlignment::Start;
+                    let sources = Arc::clone(&prepared.source_spans);
                     *prepared =
                         self.shape_text_from_source(source, resolved, reader_style, content_width)?;
+                    prepared.source_spans = sources;
+                    prepared.lines = edge_content_lines(prepared);
                 }
             }
         }
@@ -2086,11 +2234,24 @@ impl LayoutEngine {
         reader_style: &ReaderStyle,
         content_width: f32,
     ) -> PreparedTable {
-        let row_count = table.rows.len();
+        self.shape_table_rows(&table.rows, reader_style, content_width)
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "table spans are clamped by the parser"
+    )]
+    fn shape_table_rows(
+        &mut self,
+        rows: &[rebook_publication::TableRow],
+        reader_style: &ReaderStyle,
+        content_width: f32,
+    ) -> PreparedTable {
+        let row_count = rows.len();
         let mut occupied = vec![Vec::<bool>::new(); row_count];
         let mut grid_cells = Vec::new();
         let mut column_count = 0;
-        for (row_index, row) in table.rows.iter().enumerate() {
+        for (row_index, row) in rows.iter().enumerate() {
             let mut column = 0;
             for cell in &row.cells {
                 while occupied[row_index].get(column).copied().unwrap_or(false) {
@@ -2136,7 +2297,12 @@ impl LayoutEngine {
                 .iter()
                 .sum::<f32>();
             let text_width = (cell_width - table_metrics.cell_padding * 2.0).max(20.0);
-            let text = self.shape_text_with_min_width(&block, reader_style, text_width, 8.0);
+            let mut text = self.shape_text_with_min_width(&block, reader_style, text_width, 8.0);
+            if unified {
+                // Ignore empty publisher wrappers at cell edges while retaining
+                // the complete source text and deliberate internal line breaks.
+                text.lines = edge_content_lines(&text);
+            }
             let required_height = prepared_text_height(&text) + table_metrics.cell_padding * 2.0;
             if row_span == 1 {
                 row_heights[row] = row_heights[row].max(required_height);
@@ -2260,6 +2426,26 @@ impl LayoutEngine {
         minimum_width: f32,
         inline_rasters: &[Option<RasterImage>],
     ) -> PreparedText {
+        self.shape_text_with_sources(
+            block,
+            reader_style,
+            content_width,
+            minimum_width,
+            inline_rasters,
+            Vec::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn shape_text_with_sources(
+        &mut self,
+        block: &TextBlock,
+        reader_style: &ReaderStyle,
+        content_width: f32,
+        minimum_width: f32,
+        inline_rasters: &[Option<RasterImage>],
+        mut source_spans: Vec<TextSourceSpan>,
+    ) -> PreparedText {
         let (start_offset, available_width, first_line_indent) =
             resolve_text_measure(block, content_width, minimum_width);
         let sentence_reference = if block.style.sentence_indents
@@ -2297,6 +2483,7 @@ impl LayoutEngine {
                 reader_style.typesetting.mode == TypesettingMode::Unified
                     || reader_style.website_icons,
                 inline_rasters,
+                &mut source_spans,
             );
         let sentence_reference = sentence_reference.filter(|reference| {
             let end = text.find('\n').unwrap_or(text.len());
@@ -2601,8 +2788,14 @@ impl LayoutEngine {
             );
         }
         PreparedText {
+            source_spans: if source_spans.is_empty() {
+                empty_text_source_spans()
+            } else {
+                source_spans.into()
+            },
             ruby: ruby.into(),
             citations: citations.into(),
+            lines: 0..layout.len(),
             layout: Arc::new(layout),
             text: text.into(),
             source_text_start,
@@ -3103,6 +3296,10 @@ fn resolve_table_metrics(reader_style: &ReaderStyle) -> ResolvedTableMetrics {
 
 fn table_cell_text_block(cell: &TableCell) -> TextBlock {
     let mut block = cell.text.clone();
+    // Caption is a title-row role, not a decoration while it stays in the grid.
+    if block.kind == TextBlockKind::Caption {
+        block.kind = TextBlockKind::Paragraph;
+    }
     block.style.align = cell.authored_alignment.unwrap_or(TextAlignment::Center);
     if cell.header {
         for inline in &mut block.content {
@@ -3168,6 +3365,7 @@ fn resolve_text_block<'a>(
     }
 
     let mut resolved = block.clone();
+    headings::normalize_internal(&mut resolved);
     let generated_display = matches!(block.content.as_slice(),[Inline::Math(run)] if run.original.is_some() && run.display);
     let typography = &reader_style.typography;
     let profile = &reader_style.typesetting;
@@ -3190,7 +3388,7 @@ fn resolve_text_block<'a>(
                 base_size * profile.heading_body_gap_em,
             ),
             TextBlockKind::HeadingOrdinal(level) => (
-                unified_heading_scale(profile.heading_scale, level) * 0.72,
+                unified_heading_scale(profile.heading_scale, level),
                 1.15,
                 base_size * 0.25,
             ),
@@ -3763,9 +3961,12 @@ struct StyledRange {
 }
 
 struct PreparedText {
+    source_spans: Arc<[TextSourceSpan]>,
     ruby: Arc<[RubyPlacement]>,
     citations: Arc<[InlineCitationPlacement]>,
     layout: Arc<Layout<TextBrush>>,
+    // Display a slice of the complete layout without changing source offsets.
+    lines: Range<usize>,
     text: Arc<str>,
     source_text_start: usize,
     start_offset: f32,
@@ -3953,21 +4154,56 @@ fn fixed_page_replacement_block(text: &str, source: Option<SourceRange>) -> Text
     }
 }
 
+fn content_visible_lines(prepared: &PreparedText) -> impl Iterator<Item = usize> + '_ {
+    prepared
+        .layout
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            // Empty publisher wrappers can produce a whitespace-only first line.
+            // Keep source offsets intact and count rendered media as visible content.
+            prepared.text.get(line.text_range()).is_some_and(|text| !text.trim().is_empty())
+                || line
+                    .items()
+                    .any(|item| matches!(item, PositionedLayoutItem::InlineBox(item) if item.width > 0.0 || item.height > 0.0))
+        })
+        .map(|(index, _)| index)
+}
+
+fn caption_visible_line_count(prepared: &PreparedText) -> usize {
+    content_visible_lines(prepared).count()
+}
+
+fn edge_content_lines(prepared: &PreparedText) -> Range<usize> {
+    let mut visible = content_visible_lines(prepared);
+    let Some(start) = visible.next() else {
+        return 0..0;
+    };
+    // Only omit edge whitespace; internal blank lines remain in the slice.
+    start..visible.last().map_or(start + 1, |last| last + 1)
+}
+
 fn prepared_text_height(prepared: &PreparedText) -> f32 {
-    let Some(first) = prepared.layout.get(0) else {
+    if prepared.lines.is_empty() {
+        return 0.0;
+    }
+    let Some(first) = prepared.layout.get(prepared.lines.start) else {
         return 0.0;
     };
-    let Some(last) = prepared.layout.get(prepared.layout.len().saturating_sub(1)) else {
+    let Some(last) = prepared.layout.get(prepared.lines.end - 1) else {
         return 0.0;
     };
     (last.metrics().block_max_coord - first.metrics().block_min_coord).max(0.0)
 }
 
 fn prepared_flow_height(prepared: &PreparedText) -> f32 {
-    let Some(first) = prepared.layout.get(0) else {
+    if prepared.lines.is_empty() {
+        return 0.0;
+    }
+    let Some(first) = prepared.layout.get(prepared.lines.start) else {
         return 0.0;
     };
-    let Some(last) = prepared.layout.get(prepared.layout.len().saturating_sub(1)) else {
+    let Some(last) = prepared.layout.get(prepared.lines.end - 1) else {
         return 0.0;
     };
     let metrics = last.metrics();
@@ -4012,6 +4248,7 @@ fn prepare_inline_content(
     unified_math: bool,
     website_icons: bool,
     inline_rasters: &[Option<RasterImage>],
+    source_spans: &mut [TextSourceSpan],
 ) -> (
     String,
     Vec<StyledRange>,
@@ -4047,8 +4284,22 @@ fn prepare_inline_content(
         });
     }
     let source_text_start = text.len();
+    // The caller supplies inline-index boundaries; convert them while the
+    // actual display text is built, including collapsed links and formulas.
+    let boundaries = source_spans
+        .iter()
+        .map(|span| span.range.clone())
+        .collect::<Vec<_>>();
 
     for (inline_index, inline) in block.content.iter().enumerate() {
+        for (span, boundary) in source_spans.iter_mut().zip(&boundaries) {
+            if boundary.start == inline_index {
+                span.range.start = text.len();
+            }
+            if boundary.end == inline_index {
+                span.range.end = text.len();
+            }
+        }
         match inline {
             Inline::Ruby(run) => {
                 let start = text.len();
@@ -4391,6 +4642,11 @@ fn prepare_inline_content(
             Inline::Break => {
                 text.push('\n');
             }
+        }
+    }
+    for (span, boundary) in source_spans.iter_mut().zip(&boundaries) {
+        if boundary.end == block.content.len() {
+            span.range.end = text.len();
         }
     }
     (
@@ -4799,8 +5055,8 @@ impl Paginator {
         if !display_formula {
             self.add_preserved_spacing(block.style.margin_before);
         }
-        let mut line_start = 0;
-        while line_start < prepared.layout.len() {
+        let mut line_start = prepared.lines.start;
+        while line_start < prepared.lines.end {
             let first = prepared
                 .layout
                 .get(line_start)
@@ -4808,7 +5064,7 @@ impl Paginator {
             let first_top = first.metrics().block_min_coord;
             let mut line_end = line_start;
             let mut slice_height = 0.0;
-            while line_end < prepared.layout.len() {
+            while line_end < prepared.lines.end {
                 let line = prepared
                     .layout
                     .get(line_end)
@@ -4835,6 +5091,7 @@ impl Paginator {
             let origin_x = self.column_left() + prepared.start_offset;
             let origin_y = self.cursor_y - first_top;
             self.items.push(PageItem::Text(TextPlacement {
+                source_spans: Arc::clone(&prepared.source_spans),
                 ruby: Arc::clone(&prepared.ruby),
                 citations: Arc::clone(&prepared.citations),
                 layout: Arc::clone(&prepared.layout),
@@ -4862,6 +5119,7 @@ impl Paginator {
                     .get(0)
                     .ok_or(LayoutError::InvalidLayout)?;
                 self.items.push(PageItem::Text(TextPlacement {
+                    source_spans: empty_text_source_spans(),
                     ruby: Arc::from([]),
                     citations: Arc::from([]),
                     layout: Arc::clone(&hyphen.glyph.layout),
@@ -4880,7 +5138,7 @@ impl Paginator {
             self.cursor_y += slice_height;
             self.update_quote_decoration();
             line_start = line_end;
-            if line_start < prepared.layout.len() {
+            if line_start < prepared.lines.end {
                 self.advance_column();
             }
         }
@@ -4994,26 +5252,32 @@ impl Paginator {
                     .iter()
                     .sum::<f32>();
                 let cell_height = row_offsets[local_row + cell.row_span] - row_offsets[local_row];
-                let text = cell.text.layout.get(0).map(|first| {
-                    let top_padding = if table.center_content {
-                        ((cell_height - prepared_text_height(&cell.text)) / 2.0).max(0.0)
-                    } else {
-                        table.cell_padding
-                    };
-                    TextPlacement {
-                        ruby: Arc::clone(&cell.text.ruby),
-                        citations: Arc::clone(&cell.text.citations),
-                        layout: Arc::clone(&cell.text.layout),
-                        text: Arc::clone(&cell.text.text),
-                        source_text_start: cell.text.source_text_start,
-                        lines: 0..cell.text.layout.len(),
-                        origin_x: cell_x + table.cell_padding + cell.text.start_offset,
-                        origin_y: cell_y + top_padding - first.metrics().block_min_coord,
-                        available_width: cell.text.available_width,
-                        source: cell.source.clone(),
-                        inline_images: Arc::clone(&cell.text.inline_images),
-                    }
-                });
+                let text = cell
+                    .text
+                    .layout
+                    .get(cell.text.lines.start)
+                    .filter(|_| !cell.text.lines.is_empty())
+                    .map(|first| {
+                        let top_padding = if table.center_content {
+                            ((cell_height - prepared_text_height(&cell.text)) / 2.0).max(0.0)
+                        } else {
+                            table.cell_padding
+                        };
+                        TextPlacement {
+                            source_spans: empty_text_source_spans(),
+                            ruby: Arc::clone(&cell.text.ruby),
+                            citations: Arc::clone(&cell.text.citations),
+                            layout: Arc::clone(&cell.text.layout),
+                            text: Arc::clone(&cell.text.text),
+                            source_text_start: cell.text.source_text_start,
+                            lines: cell.text.lines.clone(),
+                            origin_x: cell_x + table.cell_padding + cell.text.start_offset,
+                            origin_y: cell_y + top_padding - first.metrics().block_min_coord,
+                            available_width: cell.text.available_width,
+                            source: cell.source.clone(),
+                            inline_images: Arc::clone(&cell.text.inline_images),
+                        }
+                    });
                 TableCellPlacement {
                     x: cell_x,
                     y: cell_y,
@@ -5208,6 +5472,7 @@ impl Paginator {
         let segment = FixedPageTextReplacementSegmentPlacement {
             rect: request.rect,
             text: TextPlacement {
+                source_spans: empty_text_source_spans(),
                 ruby: Arc::clone(&prepared.ruby),
                 citations: Arc::clone(&prepared.citations),
                 layout: Arc::clone(&prepared.layout),
@@ -5860,6 +6125,7 @@ mod tests {
                 true,
                 true,
                 &[],
+                &mut [],
             );
             assert_eq!(citations.len(), 12);
             for (index, citation) in citations.iter().enumerate() {
@@ -5948,6 +6214,7 @@ mod tests {
             false,
             false,
             &[],
+            &mut [],
         );
         assert_eq!(
             spans
@@ -5975,6 +6242,7 @@ mod tests {
             false,
             false,
             &[],
+            &mut [],
         );
         assert!(
             disabled_spans
@@ -6209,6 +6477,7 @@ mod tests {
             false,
             false,
             &[Some(raster), None],
+            &mut [],
         );
 
         assert_eq!(text, "Chapter title");
@@ -6265,6 +6534,7 @@ mod tests {
             false,
             false,
             &[Some(raster)],
+            &mut [],
         );
 
         let [image] = images.as_slice() else {
@@ -6572,7 +6842,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_split_heading_uses_a_compact_ordinal_before_the_title() {
+    fn unified_heading_ordinal_and_title_use_the_same_size() {
         let text_block = |kind| TextBlock {
             kind,
             content: vec![Inline::Text(TextRun {
@@ -6598,7 +6868,7 @@ mod tests {
         let Inline::Text(title_run) = &title.content[0] else {
             panic!("expected title text run");
         };
-        assert!(ordinal_run.style.size_scale < title_run.style.size_scale);
+        assert_eq!(ordinal_run.style.size_scale, title_run.style.size_scale);
         assert!(ordinal.style.margin_after < title.style.margin_after);
         assert!(ordinal_run.style.bold);
         assert!(!ordinal_run.style.italic);

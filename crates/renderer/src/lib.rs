@@ -4,6 +4,8 @@
 mod blank_lines_tests;
 mod citations;
 #[cfg(test)]
+mod heading_tests;
+#[cfg(test)]
 mod table_focus_tests;
 
 use std::ops::Range;
@@ -84,6 +86,7 @@ pub struct PageDisplayList {
 
 #[derive(Clone)]
 struct SourceTextGroup {
+    additional_sources: Vec<SourceRange>,
     source: SourceRange,
     commands: Range<usize>,
     regions: Range<usize>,
@@ -251,8 +254,11 @@ impl PageDisplayList {
         let delta = Vec2::new(0.0, f64::from(dy));
         let transform = Affine::translate(delta);
         for group in &self.text_groups {
-            if group.source.start.spine != range.start.spine
-                || group.source.start.node != range.start.node
+            if !std::iter::once(&group.source)
+                .chain(&group.additional_sources)
+                .any(|source| {
+                    source.start.spine == range.start.spine && source.start.node == range.start.node
+                })
             {
                 continue;
             }
@@ -395,6 +401,11 @@ impl PageDisplayList {
             + allocation(&self.quote_regions)
             + allocation(&self.footnote_regions)
             + allocation(&self.text_groups);
+        bytes += self
+            .text_groups
+            .iter()
+            .map(|group| allocation(&group.additional_sources))
+            .sum::<usize>();
         for command in &self.commands {
             if let DisplayCommand::Glyphs(command) = command {
                 bytes += command.glyphs.len() * std::mem::size_of::<Glyph>()
@@ -540,6 +551,27 @@ impl PageDisplayList {
             .map(TextRegion::selectable_byte_range)
     }
 
+    /// Display-only separator between fragments of the same shaped paragraph.
+    pub fn text_region_joiner(
+        &self,
+        previous: &Self,
+        previous_index: usize,
+        index: usize,
+    ) -> Option<&str> {
+        let TextRegion::Shaped(left) = previous.text_regions.get(previous_index)? else {
+            return None;
+        };
+        let TextRegion::Shaped(right) = self.text_regions.get(index)? else {
+            return None;
+        };
+        if !Arc::ptr_eq(&left.layout, &right.layout) {
+            return None;
+        }
+        let end = left.visible_byte_range()?.end;
+        let start = right.visible_byte_range()?.start;
+        right.text.get(end..start)
+    }
+
     /// Maps a byte range in retained text to its durable authored source range.
     pub fn text_region_source_range(
         &self,
@@ -609,19 +641,23 @@ impl PageDisplayList {
     /// Hit-tests source-backed text. Exact mode is used when a drag starts;
     /// nearest mode lets a drag extend naturally through line/column whitespace.
     pub fn hit_test_text(&self, x: f32, y: f32, exact: bool) -> Option<PageTextHit> {
-        if exact {
-            return self
-                .text_regions
-                .iter()
-                .enumerate()
-                .find_map(|(index, region)| {
-                    region.hit_test(x, y, true).map(|hit| PageTextHit {
-                        region_index: index,
-                        byte_index: hit.byte_index,
-                        cluster_start: hit.cluster_start,
-                        cluster_end: hit.cluster_end,
-                    })
-                });
+        let direct = self
+            .text_regions
+            .iter()
+            .enumerate()
+            .filter(|(_, region)| {
+                exact || matches!(region, TextRegion::Shaped(region) if region.fragmented)
+            })
+            .find_map(|(index, region)| {
+                region.hit_test(x, y, true).map(|hit| PageTextHit {
+                    region_index: index,
+                    byte_index: hit.byte_index,
+                    cluster_start: hit.cluster_start,
+                    cluster_end: hit.cluster_end,
+                })
+            });
+        if direct.is_some() || exact {
+            return direct;
         }
 
         self.text_regions
@@ -630,6 +666,14 @@ impl PageDisplayList {
             .min_by(|(_, left), (_, right)| {
                 left.vertical_distance(y)
                     .total_cmp(&right.vertical_distance(y))
+                    .then_with(|| match (left, right) {
+                        (TextRegion::Shaped(left), TextRegion::Shaped(right))
+                            if left.fragmented && Arc::ptr_eq(&left.layout, &right.layout) =>
+                        {
+                            left.cursor_distance(x, y).cmp(&right.cursor_distance(x, y))
+                        }
+                        _ => std::cmp::Ordering::Equal,
+                    })
             })
             .and_then(|(index, region)| {
                 region.hit_test(x, y, false).map(|hit| PageTextHit {
@@ -676,6 +720,47 @@ impl PageDisplayList {
                 .total_cmp(&right.y0)
                 .then_with(|| left.x0.total_cmp(&right.x0))
         });
+        rects
+    }
+
+    /// Presentation-only spaces between joined source fragments have no durable
+    /// source anchor. Paint them only when both adjacent boundaries are selected;
+    /// keep source geometry for copying, hit testing, and single-fragment marks.
+    fn selected_separator_rects(&self, ranges: &[SourceRange]) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        for pair in self.text_regions.windows(2) {
+            let [TextRegion::Shaped(left), TextRegion::Shaped(right)] = pair else {
+                continue;
+            };
+            if !left.fragmented
+                || !right.fragmented
+                || !Arc::ptr_eq(&left.layout, &right.layout)
+                || left.origin_x != right.origin_x
+                || left.origin_y != right.origin_y
+                || left.lines != right.lines
+                || left.source_text_end >= right.source_text_start
+            {
+                continue;
+            }
+            let gap = left.source_text_end..right.source_text_start;
+            if !left.text.get(gap.clone()).is_some_and(|text| {
+                text.chars()
+                    .all(|ch| ch.is_whitespace() && !matches!(ch, '\n' | '\r'))
+            }) || !ranges.iter().any(|range| {
+                range.end.text_offset >= left.source.end.text_offset
+                    && left
+                        .byte_range_for_source(range)
+                        .is_some_and(|bytes| bytes.end == gap.start)
+            }) || !ranges.iter().any(|range| {
+                range.start.text_offset <= right.source.start.text_offset
+                    && right
+                        .byte_range_for_source(range)
+                        .is_some_and(|bytes| bytes.start == gap.end)
+            }) {
+                continue;
+            }
+            rects.extend(left.selection_rects(gap));
+        }
         rects
     }
 
@@ -886,7 +971,11 @@ impl PageDisplayList {
         offset_x: f32,
     ) {
         let transform = Affine::translate((f64::from(offset_x), 0.0));
-        let path = source_range_highlight_path(self.source_rects(ranges));
+        let path = source_range_highlight_path(
+            self.source_rects(ranges)
+                .into_iter()
+                .chain(self.selected_separator_rects(ranges)),
+        );
         if !path.is_empty() {
             // Separate translucent AA rectangles can expose one-pixel conflation
             // seams at shared line edges in Vello. Paint one slightly-overlapped
@@ -1214,7 +1303,7 @@ impl TextRegion {
 
     fn selectable_byte_range(&self) -> Range<usize> {
         match self {
-            Self::Shaped(region) => region.source_text_start..region.text.len(),
+            Self::Shaped(region) => region.source_text_start..region.source_text_end,
             Self::Fixed(region) => 0..region.text.len(),
         }
     }
@@ -1301,6 +1390,8 @@ struct ShapedTextRegion {
     layout: Arc<Layout<TextBrush>>,
     text: Arc<str>,
     source_text_start: usize,
+    source_text_end: usize,
+    fragmented: bool,
     lines: Range<usize>,
     origin_x: f32,
     origin_y: f32,
@@ -1317,6 +1408,14 @@ struct DiscretionaryHyphen {
 }
 
 impl ShapedTextRegion {
+    fn cursor_distance(&self, x: f32, y: f32) -> usize {
+        let Some(visible) = self.visible_byte_range() else {
+            return usize::MAX;
+        };
+        let index = Cursor::from_point(&self.layout, x - self.origin_x, y - self.origin_y).index();
+        index.abs_diff(index.clamp(visible.start, visible.end))
+    }
+
     fn attach_discretionary_hyphen(&mut self, text: &TextPlacement) {
         let Some(glyph_line) = text.layout.get(0) else {
             return;
@@ -1342,7 +1441,7 @@ impl ShapedTextRegion {
             let line = self.layout.get(line_index)?;
             let range = line.text_range();
             let start = range.start.max(self.source_text_start).min(self.text.len());
-            let end = range.end.max(self.source_text_start).min(self.text.len());
+            let end = range.end.min(self.source_text_end);
             (end > start).then_some(start..end)
         });
         let first = visible.next()?;
@@ -1351,8 +1450,22 @@ impl ShapedTextRegion {
     }
 
     fn vertical_bounds(&self) -> Option<(f32, f32)> {
-        let first = self.layout.get(self.lines.start)?;
-        let last = self.layout.get(self.lines.end.checked_sub(1)?)?;
+        if !self.fragmented {
+            let first = self.layout.get(self.lines.start)?;
+            let last = self.layout.get(self.lines.end.checked_sub(1)?)?;
+            return Some((
+                first.metrics().block_min_coord + self.origin_y,
+                last.metrics().block_max_coord + self.origin_y,
+            ));
+        }
+        let mut lines = self.lines.clone().filter_map(|index| {
+            let line = self.layout.get(index)?;
+            let range = line.text_range();
+            (range.start < self.source_text_end && range.end > self.source_text_start)
+                .then_some(line)
+        });
+        let first = lines.next()?;
+        let last = lines.last().unwrap_or(first);
         Some((
             first.metrics().block_min_coord + self.origin_y,
             last.metrics().block_max_coord + self.origin_y,
@@ -1436,6 +1549,14 @@ impl ShapedTextRegion {
             (byte_index, byte_index, byte_index)
         };
         let visible = self.visible_byte_range()?;
+        // Shared caption layouts have several source regions on one line.
+        // A glyph outside this fragment must be considered by its own region.
+        if exact
+            && self.fragmented
+            && (cluster_end <= visible.start || cluster_start >= visible.end)
+        {
+            return None;
+        }
         if let Some(c) = self
             .citations
             .iter()
@@ -1552,7 +1673,8 @@ impl ShapedTextRegion {
                             x0 = x0.min(inset);
                         }
                     }
-                    if selected_text.start <= selectable_line_start
+                    if self.source_text_end >= line_text.end
+                        && selected_text.start <= selectable_line_start
                         && selected_text.end >= line_text.end
                     {
                         let visual_start =
@@ -1639,7 +1761,15 @@ impl ShapedTextRegion {
         }
         let source_start = self.source.start.text_offset;
         let source_length = self.source.end.text_offset.checked_sub(source_start)?;
-        let original = self.citation_original(self.source_text_start..self.text.len());
+        let byte_range = byte_range
+            .start
+            .max(self.source_text_start)
+            .min(self.source_text_end)
+            ..byte_range
+                .end
+                .max(self.source_text_start)
+                .min(self.source_text_end);
+        let original = self.citation_original(self.source_text_start..self.source_text_end);
         let text_length = original.chars().count();
         let start_chars = self
             .citation_original(self.source_text_start..byte_range.start)
@@ -1690,7 +1820,7 @@ impl ShapedTextRegion {
         if end_offset <= start_offset {
             return None;
         }
-        let original = self.citation_original(self.source_text_start..self.text.len());
+        let original = self.citation_original(self.source_text_start..self.source_text_end);
         let text_length = original.chars().count();
         let source_length = self
             .source
@@ -2153,9 +2283,10 @@ impl DisplayListCompiler {
                         inline_content_regions.len(),
                         footnote_regions.len(),
                     );
-                    if let Some(region) = text_region(text) {
-                        parent_text_region = Some(text_regions.len());
-                        text_regions.push(region);
+                    let region_start = text_regions.len();
+                    text_regions.extend(shaped_text_regions(text));
+                    if text_regions.len() > region_start {
+                        parent_text_region = Some(text_regions.len() - 1);
                     } else if text.text.as_ref() == "\u{2010}" {
                         if let Some(index) = parent_text_region
                             && let Some(TextRegion::Shaped(parent)) = text_regions.get_mut(index)
@@ -2175,9 +2306,15 @@ impl DisplayListCompiler {
                     let source = text
                         .source
                         .clone()
+                        .or_else(|| text.source_spans.first().map(|span| span.source.clone()))
                         .or_else(|| text_groups.last().map(|g| g.source.clone()));
                     if let Some(source) = source {
                         text_groups.push(SourceTextGroup {
+                            additional_sources: text
+                                .source_spans
+                                .iter()
+                                .map(|span| span.source.clone())
+                                .collect(),
                             source,
                             commands: starts.0..commands.len(),
                             regions: starts.1..text_regions.len(),
@@ -2288,9 +2425,7 @@ impl DisplayListCompiler {
                                 ),
                                 color: fixed_page_mask_color(image, segment.rect),
                             }));
-                            if let Some(region) = text_region(&segment.text) {
-                                text_regions.push(region);
-                            }
+                            text_regions.extend(shaped_text_regions(&segment.text));
                             compile_text_commands(
                                 &mut commands,
                                 &mut inline_content_regions,
@@ -2391,9 +2526,7 @@ fn compile_table_commands(
     }
     for cell in &table.cells {
         if let Some(text) = &cell.text {
-            if let Some(region) = text_region(text) {
-                text_regions.push(region);
-            }
+            text_regions.extend(shaped_text_regions(text));
             compile_text_commands(commands, inline_content_regions, footnote_regions, text);
         }
     }
@@ -2511,19 +2644,35 @@ fn fixed_page_mask_color(
     Color::from_rgba8(median(0), median(1), median(2), median(3))
 }
 
-fn text_region(text: &TextPlacement) -> Option<TextRegion> {
-    Some(TextRegion::Shaped(ShapedTextRegion {
-        citations: Arc::clone(&text.citations),
-        layout: Arc::clone(&text.layout),
-        text: Arc::clone(&text.text),
-        source_text_start: text.source_text_start,
-        lines: text.lines.clone(),
-        origin_x: text.origin_x,
-        origin_y: text.origin_y,
-        available_width: text.available_width,
-        source: text.source.clone()?,
-        discretionary_hyphens: Vec::new(),
-    }))
+fn shaped_text_regions(text: &TextPlacement) -> impl Iterator<Item = TextRegion> + '_ {
+    text.source_spans
+        .iter()
+        .map(|span| (span.range.clone(), &span.source))
+        .chain(
+            text.source
+                .as_ref()
+                .filter(|_| text.source_spans.is_empty())
+                .map(|source| (text.source_text_start..text.text.len(), source)),
+        )
+        .filter_map(|(range, source)| {
+            let region = ShapedTextRegion {
+                citations: Arc::clone(&text.citations),
+                layout: Arc::clone(&text.layout),
+                text: Arc::clone(&text.text),
+                source_text_start: range.start,
+                source_text_end: range.end,
+                fragmented: !text.source_spans.is_empty(),
+                lines: text.lines.clone(),
+                origin_x: text.origin_x,
+                origin_y: text.origin_y,
+                available_width: text.available_width,
+                source: source.clone(),
+                discretionary_hyphens: Vec::new(),
+            };
+            region
+                .visible_byte_range()
+                .map(|_| TextRegion::Shaped(region))
+        })
 }
 
 fn fixed_text_region(image: &ImagePlacement) -> Option<TextRegion> {
@@ -2713,6 +2862,7 @@ fn compile_text_commands(
             };
             let run = glyph_run.run();
             let brush = glyph_run.style().brush;
+            let run_source = text.source_at_byte(run.text_range().start);
             let baseline_offset = match brush.baseline {
                 TextBaseline::Normal => 0.0,
                 TextBaseline::Superscript if brush.footnote_reference_group & 0x2000_0000 != 0 => {
@@ -2724,10 +2874,7 @@ fn compile_text_commands(
             if brush.footnote_reference_group & 0xa000_0000 != 0 {
                 let number = brush.footnote_reference_group & 0x7fff_ffff;
                 let citation = text.citations.iter().find(|c| c.number == number);
-                let source = text
-                    .source
-                    .as_ref()
-                    .or_else(|| citation.and_then(|c| c.owner.as_ref()));
+                let source = run_source.or_else(|| citation.and_then(|c| c.owner.as_ref()));
                 let reference_owner = source
                     .map(rebook_publication::source_block_identity)
                     .or_else(|| citation.and_then(|c| c.owner_id));
@@ -2801,8 +2948,8 @@ fn compile_text_commands(
                     .iter()
                     .find(|c| c.number == brush.footnote_reference_group)
                     .and_then(|c| c.website.clone());
-                if text.source.is_some() || website.is_some() {
-                    let source = text.source.clone();
+                if run_source.is_some() || website.is_some() {
+                    let source = run_source.cloned();
                     let center_x = text.origin_x + glyph_run.offset() + glyph_run.advance() / 2.0;
                     let bounds = if website.is_some() {
                         let size = (run.font_size() * 0.78).clamp(8.0, 12.0);
@@ -3187,6 +3334,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                source_spans: Arc::from([]),
                 ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
@@ -3305,6 +3453,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                source_spans: Arc::from([]),
                 ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
@@ -3401,6 +3550,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                source_spans: Arc::from([]),
                 ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
@@ -3475,6 +3625,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                source_spans: Arc::from([]),
                 ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
@@ -3557,6 +3708,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                source_spans: Arc::from([]),
                 ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
@@ -3651,6 +3803,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                source_spans: Arc::from([]),
                 ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
@@ -3737,6 +3890,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                source_spans: Arc::from([]),
                 ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
@@ -4023,6 +4177,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Text(TextPlacement {
+                source_spans: Arc::from([]),
                 ruby: Arc::from([]),
                 citations: Arc::from([]),
                 layout: Arc::new(layout),
@@ -4211,6 +4366,7 @@ mod tests {
                             height: 30.0,
                         },
                         text: TextPlacement {
+                            source_spans: Arc::from([]),
                             ruby: Arc::from([]),
                             citations: Arc::from([]),
                             layout: Arc::new(layout),

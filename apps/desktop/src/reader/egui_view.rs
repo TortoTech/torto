@@ -1858,57 +1858,20 @@ impl DesktopReader {
             || self.ui.sidebar_open
             || self.ui.assistant_panel.is_some() && self.current_chat_has_data()
         {
-            self.ui.wheel_accumulator = 0.0;
+            self.ui.focus_wheel.reset();
             return;
         }
-        let delta = response.ctx.input(|input| {
-            input
-                .raw
-                .events
-                .iter()
-                .filter_map(|event| match event {
-                    egui::Event::MouseWheel {
-                        unit,
-                        delta,
-                        modifiers,
-                        ..
-                    } if !modifiers.ctrl && !modifiers.command => Some(
-                        delta.y
-                            * match unit {
-                                egui::MouseWheelUnit::Point => 1.0,
-                                egui::MouseWheelUnit::Line => 50.0,
-                                egui::MouseWheelUnit::Page => 240.0,
-                            },
-                    ),
-                    _ => None,
-                })
-                .sum::<f32>()
+        let direction = response.ctx.input(|input| {
+            self.ui.focus_wheel.turn(
+                &input.raw.events,
+                Instant::now(),
+                WHEEL_PAGE_THRESHOLD,
+                WHEEL_TURN_COOLDOWN,
+            )
         });
-        if delta.abs() <= f32::EPSILON {
+        let Some(direction) = direction else {
             return;
-        }
-        if self.ui.wheel_accumulator.signum() != delta.signum() {
-            self.ui.wheel_accumulator = 0.0;
-        }
-        self.ui.wheel_accumulator += delta;
-        if self.ui.wheel_accumulator.abs() < WHEEL_PAGE_THRESHOLD {
-            return;
-        }
-        let now = Instant::now();
-        if self
-            .ui
-            .last_wheel_turn
-            .is_some_and(|last| now.saturating_duration_since(last) < WHEEL_TURN_COOLDOWN)
-        {
-            return;
-        }
-        let direction = if self.ui.wheel_accumulator < 0.0 {
-            PageDirection::Next
-        } else {
-            PageDirection::Previous
         };
-        self.ui.wheel_accumulator = 0.0;
-        self.ui.last_wheel_turn = Some(now);
         // This callback runs after scroll_content has already chosen the current
         // layout and painted its texture. Applying a cross-unit navigation here
         // lets the GPU observe the new reading unit before its focus units and
@@ -2122,7 +2085,9 @@ impl DesktopReader {
         #[cfg(not(target_os = "windows"))]
         let right = page_rect.right() - TOOLBAR_CONTROL_SIZE - 12.0;
         let y = screen.top() + (TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) * 0.5;
-        if hovered || self.ui.sidebar_open || floating {
+        if (hovered || self.ui.sidebar_open || floating)
+            && !(self.is_focus_mode() && (self.ui.sidebar_open || floating))
+        {
             egui::Area::new(egui::Id::new("reader-left-sidebar-toggle"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(Pos2::new(left + f32::from(SIDEBAR_PADDING), y))
@@ -6943,16 +6908,12 @@ mod reference_suggestion_label_tests {
                 assert_eq!(scrim.top(), screen.top());
                 assert_eq!(scrim.bottom(), screen.bottom());
                 assert_eq!(scrim.width(), screen.width());
-                let toggle = ctx
-                    .memory(|memory| memory.area_rect(egui::Id::new("reader-left-sidebar-toggle")))
-                    .unwrap();
                 assert!(
-                    toggle.left() >= drawer.right(),
-                    "drawer cannot cover the header toggle"
-                );
-                assert!(
-                    toggle.bottom() <= TOOLBAR_HEIGHT,
-                    "toggle remains on the caption row"
+                    ctx.memory(
+                        |memory| memory.area_rect(egui::Id::new("reader-left-sidebar-toggle"))
+                    )
+                    .is_none(),
+                    "open focus drawer hides the external expansion button"
                 );
                 assert!(!window_chrome::geometry(&ctx).drag_enabled);
                 assert!(
@@ -6965,8 +6926,8 @@ mod reference_suggestion_label_tests {
                         .iter()
                         .filter(|rect| (rect.width() - TOOLBAR_CONTROL_SIZE).abs() < 0.01
                             && rect.left() < drawer.right())
-                        .all(|rect| (rect.center().y - toggle.center().y).abs() < 0.01),
-                    "drawer header buttons align with the external toggle"
+                        .all(|rect| (rect.center().y - TOOLBAR_HEIGHT * 0.5).abs() < 0.01),
+                    "drawer header buttons remain on the caption row"
                 );
                 assert_eq!(
                     window_chrome::geometry(&ctx)

@@ -7,6 +7,9 @@ use rebook_publication::{
 };
 use rebook_reader::sentence_char_ranges;
 
+#[path = "structure/colon.rs"]
+mod colon;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ParagraphStructureKey {
     pub(crate) section_index: usize,
@@ -246,7 +249,7 @@ fn paragraph_atoms_for_content_mode(
             .take(atoms.len().saturating_sub(1))
             .map(|atom| atom.end)
             .chain(semicolon_boundaries(&chars, &protected))
-            .chain(colon_boundaries(&chars, &protected));
+            .chain(colon_boundaries(&chars, &protected, &atoms, language_hint));
         atoms_from_boundaries(boundaries, &chars, atoms.len())
     } else {
         atoms
@@ -504,6 +507,7 @@ fn attach_paired_punctuation_atoms(atoms: Vec<ParagraphAtom>, text: &str) -> Vec
     for atom in normalized {
         if is_parenthetical_annotation(&atom, &chars, &pairs)
             && let Some(previous) = attached.last_mut()
+            && !previous.text.trim_end().ends_with([':', '：'])
         {
             previous.text.push_str(&atom.text);
             previous.end = atom.end;
@@ -609,7 +613,12 @@ fn semicolon_boundaries(chars: &[char], protected: &[std::ops::Range<usize>]) ->
     unquoted_punctuation_boundaries(chars, protected, &['；', ';'])
 }
 
-fn colon_boundaries(chars: &[char], protected: &[std::ops::Range<usize>]) -> Vec<usize> {
+fn colon_boundaries(
+    chars: &[char],
+    protected: &[std::ops::Range<usize>],
+    atoms: &[ParagraphAtom],
+    language_hint: &str,
+) -> Vec<usize> {
     let mut protected = protected.to_vec();
     for (index, ch) in chars.iter().enumerate() {
         if !matches!(ch, ':' | '：') {
@@ -636,14 +645,15 @@ fn colon_boundaries(chars: &[char], protected: &[std::ops::Range<usize>]) -> Vec
             protected.push(index..index + 1);
         }
     }
-    unquoted_punctuation_boundaries(chars, &protected, &[':', '：'])
+    let boundaries = unquoted_punctuation_boundaries(chars, &protected, &[':', '：']);
+    colon::filter_boundaries(chars, &protected, atoms, language_hint, boundaries)
 }
 
 #[cfg(test)]
 mod colon_tests {
     use super::*;
     #[test]
-    fn sentence_structure_inserts_break_after_colon() {
+    fn sentence_structure_keeps_single_sentence_after_colon() {
         for text in ["说明：接下来进行测试。", "Note: Next step."] {
             let mut block = TextBlock {
                 kind: TextBlockKind::Paragraph,
@@ -662,7 +672,7 @@ mod colon_tests {
                     .iter()
                     .filter(|i| matches!(i, Inline::Break))
                     .count(),
-                1
+                0
             );
             assert_eq!(inline_text(&block.content).replace('\n', ""), text);
         }
@@ -670,8 +680,9 @@ mod colon_tests {
     #[test]
     fn colons_split_prose_but_preserve_technical_and_quoted_text() {
         for (text, expected) in [
-            ("说明：接下来进行测试。", vec!["说明：", "接下来进行测试。"]),
-            ("Note: Next step.", vec!["Note: ", "Next step."]),
+            ("说明：接下来进行测试。", vec!["说明：接下来进行测试。"]),
+            ("Note: Next step.", vec!["Note: Next step."]),
+            ("说明：先测试，再继续。", vec!["说明：", "先测试，再继续。"]),
             (
                 "时间12:30，比例1：2，网址https://example.com:8080/a，继续。",
                 vec!["时间12:30，比例1：2，网址https://example.com:8080/a，继续。"],
@@ -682,7 +693,9 @@ mod colon_tests {
             ),
         ] {
             let chars = text.chars().collect::<Vec<_>>();
-            let atoms = atoms_from_boundaries(colon_boundaries(&chars, &[]), &chars, 1);
+            let sentences = paragraph_atoms_with_protected_ranges(text, &[], &[], "en");
+            let atoms =
+                atoms_from_boundaries(colon_boundaries(&chars, &[], &sentences, "en"), &chars, 1);
             assert_eq!(
                 atoms.iter().map(|a| a.text.as_str()).collect::<Vec<_>>(),
                 expected
@@ -1548,9 +1561,9 @@ mod tests {
             link: None,
         })];
         let atoms = paragraph_atoms_for_content(&content, "zh");
-        assert_eq!(atoms.len(), 3);
-        assert_eq!(atoms[0].text, "他说：");
-        assert_eq!(atoms[1].text, "“她喊‘快走！’”，随后大家离开。");
+        assert_eq!(atoms.len(), 2);
+        assert_eq!(atoms[0].text, "他说：“她喊‘快走！’”，随后大家离开。");
+        assert_eq!(atoms[1].text, "第二天又回来了。");
         let text = "他说：“她念‘第一句。第二句。’”（出处）后面的解释另起一句。";
         let content = vec![Inline::Text(TextRun {
             text: text.into(),
@@ -1561,6 +1574,90 @@ mod tests {
         assert_eq!(atoms.len(), 3);
         assert_eq!(atoms[1].text, "“她念‘第一句。第二句。’”（出处）");
         assert_eq!(atoms[2].text, "后面的解释另起一句。");
+    }
+
+    #[test]
+    fn colon_continuations_apply_to_original_and_translation_companions() {
+        let spine = rebook_publication::SpineItemId::new("chapter").unwrap();
+        let href = PublicationUrl::parse("chapter.xhtml").unwrap();
+        for with_next_sentence in [false, true] {
+            let original = if with_next_sentence {
+                "Note: First step. Second step."
+            } else {
+                "Note: First step."
+            };
+            let translated = if with_next_sentence {
+                "说明：第一步。第二步。"
+            } else {
+                "说明：第一步。"
+            };
+            let range = source_range(&spine, "primary", original);
+            let make_block = |value: &str, source| {
+                Block::Text(TextBlock {
+                    kind: TextBlockKind::Paragraph,
+                    content: vec![Inline::Text(TextRun {
+                        text: value.into(),
+                        style: Default::default(),
+                        link: None,
+                    })],
+                    style: Default::default(),
+                    source,
+                })
+            };
+            let source = ParagraphStructureSource::new(Arc::new(StaticSource {
+                book: Book {
+                    id: rebook_publication::PublicationId::new("colon-bilingual").unwrap(),
+                    metadata: rebook_publication::Metadata {
+                        languages: vec!["en".into()],
+                        ..Default::default()
+                    },
+                    cover: None,
+                    sections: vec![],
+                    table_of_contents: vec![],
+                },
+                section: Section {
+                    id: spine.clone(),
+                    href: href.clone(),
+                    anchors: vec![],
+                    blocks: vec![
+                        make_block(original, Some(range.clone())),
+                        make_block(translated, None),
+                    ],
+                },
+            }));
+            let key = ParagraphStructureKey {
+                section_index: 0,
+                node: "primary".into(),
+            };
+            assert_eq!(source.can_structure(&key).unwrap(), with_next_sentence);
+            source.set_active(key, true).unwrap();
+            let section = source.parse_section(0).unwrap();
+            for (index, expected) in [original, translated].iter().enumerate() {
+                let Block::Text(block) = &section.blocks[index] else {
+                    panic!()
+                };
+                assert_eq!(inline_text(&block.content).replace('\n', ""), *expected);
+                assert_eq!(
+                    block
+                        .content
+                        .iter()
+                        .filter(|i| matches!(i, Inline::Break))
+                        .count(),
+                    usize::from(with_next_sentence)
+                );
+                assert_eq!(block.source, (index == 0).then(|| range.clone()));
+                if with_next_sentence {
+                    assert_eq!(
+                        inline_text(&block.content),
+                        if index == 0 {
+                            "Note: First step. \nSecond step."
+                        } else {
+                            "说明：第一步。\n第二步。"
+                        }
+                    );
+                }
+            }
+        }
     }
 
     struct StaticSource {

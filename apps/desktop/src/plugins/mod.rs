@@ -431,6 +431,20 @@ impl PluginSettings {
         settings.normalize();
         settings.load_api_keys()?;
         settings.load_pdf_ocr_tokens()?;
+        crate::diagnostics::log(
+            "plugins.settings.loaded",
+            &[
+                crate::diagnostics::Field::Detail("ocr_model", &settings.ocr_model),
+                crate::diagnostics::Field::Bool(
+                    "base_url_override",
+                    env::var_os("REBOOK_AI_BASE_URL").is_some(),
+                ),
+                crate::diagnostics::Field::Bool(
+                    "model_override",
+                    env::var_os("REBOOK_AI_MODEL").is_some(),
+                ),
+            ],
+        );
         if let Ok(value) = env::var("REBOOK_AI_BASE_URL")
             && !value.trim().is_empty()
             && let Some(provider) = settings.providers.first_mut()

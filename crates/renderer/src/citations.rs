@@ -31,7 +31,7 @@ impl ShapedTextRegion {
         let mut remaining = offset;
         let mut at = self.source_text_start;
         for c in self.citations.iter() {
-            if c.range.end <= at {
+            if c.range.end <= at || c.range.start >= self.source_text_end {
                 continue;
             }
             let plain = self.text[at..c.range.start].chars().count();
@@ -50,7 +50,7 @@ impl ShapedTextRegion {
             remaining -= length;
             at = c.range.end;
         }
-        at + byte_index_for_char_offset(&self.text[at..], remaining)
+        at + byte_index_for_char_offset(&self.text[at..self.source_text_end], remaining)
     }
 }
 
