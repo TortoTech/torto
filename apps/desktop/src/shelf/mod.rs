@@ -68,6 +68,10 @@ pub(crate) struct ShelfFeature {
     shelf: ShelfState,
     import_task: TaskSlot<()>,
     pending_reader: Option<DesktopReader>,
+    /// Book most recently handed to the reader. Reading activity is refreshed
+    /// asynchronously, so on return the shelf cannot yet re-derive the
+    /// highlight from the order without lagging one book behind.
+    last_opened_book_id: Option<String>,
     reader_fonts: Arc<[Blob<u8>]>,
     local_store: Option<SyncStore>,
     sync: SyncUiState,
@@ -239,6 +243,7 @@ impl ShelfFeature {
         let initial_error_dismiss_at = initial_error
             .as_ref()
             .map(|_| Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
+        let read_activity = load_read_activity(local_store.as_ref());
         let mut feature = Self {
             statistics: crate::statistics::Page::default(),
             shelf: ShelfState {
@@ -254,6 +259,7 @@ impl ShelfFeature {
             },
             import_task: TaskSlot::default(),
             pending_reader: None,
+            last_opened_book_id: None,
             reader_fonts,
             local_store,
             sync: SyncUiState {
@@ -272,7 +278,7 @@ impl ShelfFeature {
                 .return_to_shelf,
             settings_requested: false,
             cover_textures: covers::CoverCache::default(),
-            read_activity: HashMap::new(),
+            read_activity,
             refresh_generation: 0,
             refresh_requested: false,
             refresh_job: BackgroundJob::default(),
@@ -328,6 +334,7 @@ impl ShelfFeature {
             Ok(reader) => {
                 self.cover_textures.suspend();
                 self.pending_reader = Some(reader);
+                self.last_opened_book_id = Some(book.id.clone());
                 self.shelf.error = None;
                 self.shelf.error_dismiss_at = None;
             }
@@ -453,7 +460,10 @@ impl ShelfFeature {
             self.language = language;
         }
         self.refresh_read_activity();
-        self.shelf.selected_book_id = None;
+        self.shelf.selected_book_id = selection_after_reader(
+            self.last_opened_book_id.as_deref(),
+            self.shelf.library.books(),
+        );
         self.shelf.focus_selected_book = true;
         self.start_sync(SyncMode::Reading);
     }
@@ -1685,6 +1695,30 @@ fn shelf_search_hint(language: AppLanguage, book_count: usize) -> String {
     }
 }
 
+/// The card to highlight when the reader returns to the shelf. The book that
+/// was open wins, because the activity refresh that reorders the shelf may not
+/// have landed yet; otherwise the caller leaves the choice to the sorted list.
+fn selection_after_reader(last_opened: Option<&str>, books: &[LibraryBook]) -> Option<String> {
+    last_opened
+        .filter(|id| books.iter().any(|book| book.id == *id))
+        .map(ToOwned::to_owned)
+}
+
+/// Reading activity orders the shelf and therefore decides which card the first
+/// frame highlights. The asynchronous refresh that normally supplies it lands
+/// after that frame, and a first frame left to fall back on `added_at` would
+/// highlight the newest import and keep it selected from then on, so read the
+/// activity once up front as well.
+fn load_read_activity(store: Option<&SyncStore>) -> HashMap<String, u64> {
+    let Some(store) = store else {
+        return HashMap::new();
+    };
+    store.progress_activity_times().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load shelf reading activity");
+        HashMap::new()
+    })
+}
+
 fn sort_shelf_books(books: &mut [LibraryBook], read_activity: &HashMap<String, u64>) {
     books.sort_by(|left, right| {
         let left_activity = read_activity
@@ -1932,6 +1966,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["new", "middle", "old"]
         );
+    }
+
+    #[test]
+    fn returning_from_the_reader_keeps_the_book_that_was_read_selected() {
+        // Book "a" is still ranked first because its activity refresh is in
+        // flight when the shelf paints its first frame back from the reader.
+        let mut books = vec![book("a", 300), book("b", 100)];
+        sort_shelf_books(&mut books, &HashMap::from([("a".into(), 400)]));
+        assert_eq!(books[0].id, "a");
+
+        assert_eq!(
+            selection_after_reader(Some("b"), &books).as_deref(),
+            Some("b")
+        );
+        assert_eq!(selection_after_reader(None, &books), None);
+        assert_eq!(selection_after_reader(Some("missing"), &books), None);
+    }
+
+    #[test]
+    fn startup_reads_the_activity_that_decides_the_first_highlight() {
+        use rebook_publication::{LocatorV1, PublicationId, PublicationUrl};
+
+        let path = std::env::temp_dir().join(format!(
+            "torto-shelf-startup-activity-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SyncStore::open_at(path.clone(), "device-a").unwrap();
+        let mut locator = LocatorV1::at_start(
+            PublicationId::new("read").unwrap(),
+            PublicationUrl::parse("chapter.xhtml").unwrap(),
+        );
+        locator.total_progression = Some(0.4);
+        store.save_progress("read", &locator).unwrap();
+
+        // "imported" was added after "read" was last opened, so a first frame
+        // that has no activity yet would highlight the import instead.
+        let mut books = vec![book("read", 100), book("imported", 300)];
+        sort_shelf_books(&mut books, &load_read_activity(Some(&store)));
+        assert_eq!(books[0].id, "read");
+
+        sort_shelf_books(&mut books, &HashMap::new());
+        assert_eq!(books[0].id, "imported");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
     }
 
     #[test]

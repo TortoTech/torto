@@ -205,19 +205,40 @@ impl SyncStore {
     }
 
     pub(crate) fn save_progress(&self, book_id: &str, locator: &LocatorV1) -> SyncResult<()> {
+        self.write_progress(book_id, locator, false)
+    }
+
+    /// Refreshes the reading-activity time even when the locator is unchanged, so
+    /// opening a book without turning a page still counts as reading it.
+    pub(crate) fn record_reading_activity(
+        &self,
+        book_id: &str,
+        locator: &LocatorV1,
+    ) -> SyncResult<()> {
+        self.write_progress(book_id, locator, true)
+    }
+
+    fn write_progress(
+        &self,
+        book_id: &str,
+        locator: &LocatorV1,
+        refresh_activity: bool,
+    ) -> SyncResult<()> {
         locator.validate()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let locator_json = serde_json::to_string(locator)?;
-        let current: Option<String> = transaction
-            .query_row(
-                "SELECT locator_json FROM progress WHERE book_id = ?1",
-                [book_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if current.as_deref() == Some(locator_json.as_str()) {
-            return Ok(());
+        if !refresh_activity {
+            let current: Option<String> = transaction
+                .query_row(
+                    "SELECT locator_json FROM progress WHERE book_id = ?1",
+                    [book_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current.as_deref() == Some(locator_json.as_str()) {
+                return Ok(());
+            }
         }
         let updated_at = tick(&transaction, &self.device_id, None)?;
         transaction.execute(
@@ -937,6 +958,22 @@ mod tests {
         assert_eq!(activity_times.len(), 2);
         assert!(activity_times.contains_key("first"));
         assert!(activity_times.contains_key("second"));
+        cleanup(&store);
+    }
+
+    #[test]
+    fn recording_reading_activity_advances_the_time_without_a_locator_change() {
+        let store = test_store("reading-activity-refresh");
+        let locator = locator("book", 0.2);
+        store.save_progress("book", &locator).unwrap();
+        let first = store.progress_activity_times().unwrap()["book"];
+
+        store.save_progress("book", &locator).unwrap();
+        assert_eq!(store.progress_activity_times().unwrap()["book"], first);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store.record_reading_activity("book", &locator).unwrap();
+        assert!(store.progress_activity_times().unwrap()["book"] > first);
         cleanup(&store);
     }
 
