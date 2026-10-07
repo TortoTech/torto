@@ -31,6 +31,12 @@ fn geometry_id() -> egui::Id {
     egui::Id::new("native-window-geometry")
 }
 
+fn controls_layer() -> egui::LayerId {
+    // Native caption controls must stay above app overlays, including Tooltip
+    // image previews. Sharing their order lets a newly opened preview dim them twice.
+    egui::LayerId::new(egui::Order::Debug, egui::Id::new("window-caption-buttons"))
+}
+
 pub(crate) fn set_state(ctx: &egui::Context, state: WindowState) {
     ctx.data_mut(|data| data.insert_temp(state_id(), state));
 }
@@ -127,23 +133,12 @@ fn paint_header_masks(ctx: &egui::Context) {
     let Some(header) = geometry.header else {
         return;
     };
-    egui::Area::new(egui::Id::new("caption-backdrop"))
-        .fade_in(false)
-        .order(egui::Order::Tooltip)
-        .fixed_pos(header.min)
-        .constrain(false)
-        .interactable(false)
-        .default_size(header.size())
-        .show(ctx, |ui| {
-            ui.allocate_exact_size(header.size(), Sense::hover());
-            for (rect, opacity) in geometry.header_masks {
-                ui.painter().with_clip_rect(header).rect_filled(
-                    rect,
-                    0.0,
-                    Color32::BLACK.gamma_multiply(opacity),
-                );
-            }
-        });
+    // Append header scrims to the controls' paint layer so they cannot reorder
+    // independently when a caption button is hovered or pressed.
+    let painter = ctx.layer_painter(controls_layer()).with_clip_rect(header);
+    for (rect, opacity) in geometry.header_masks {
+        painter.rect_filled(rect, 0.0, Color32::BLACK.gamma_multiply(opacity));
+    }
 }
 
 pub(crate) fn block_drag(ctx: &egui::Context) {
@@ -182,9 +177,10 @@ pub(crate) fn paint_controls(ctx: &egui::Context) {
         )
     });
     let origin = Pos2::new(rect.right() - BUTTON_WIDTH * 3.0, rect.top());
-    egui::Area::new(egui::Id::new("window-caption-buttons"))
+    let layer = controls_layer();
+    egui::Area::new(layer.id)
         .fade_in(false)
-        .order(egui::Order::Tooltip)
+        .order(layer.order)
         .fixed_pos(origin)
         .constrain(false)
         .default_size(Vec2::new(BUTTON_WIDTH * 3.0, rect.height()))
@@ -471,6 +467,12 @@ mod tests {
             if !fullscreen {
                 let controls = Rect::from_min_size(Pos2::new(582.0, 0.0), Vec2::new(138.0, HEIGHT));
                 assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == controls && rect.fill == Color32::BLACK.gamma_multiply(0.46))), "settings backdrop also covers the three caption buttons");
+                let caption_index = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == controls && rect.fill == crate::ui::palette().background)).expect("opaque caption background");
+                let mask_index = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == header_mask && rect.fill == Color32::BLACK.gamma_multiply(0.31))).unwrap();
+                assert!(
+                    caption_index < mask_index,
+                    "drawer header tint must stay above the caption background"
+                );
             }
         }
     }

@@ -787,7 +787,13 @@ mod tests {
                         egui::pos2(screen.right() - 138.0, 0.0),
                         egui::vec2(138.0, window_chrome::HEIGHT),
                     );
-                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == controls && rect.fill == Color32::BLACK.gamma_multiply(0.46 * progress))), "caption and modal backdrop share opacity while opening and closing");
+                    let backdrop_index = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == screen && rect.fill == Color32::BLACK.gamma_multiply(0.46 * progress))).unwrap();
+                    let caption_index = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == controls && rect.fill == palette().background)).expect("opaque caption background");
+                    let dim_index = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == controls && rect.fill == Color32::BLACK.gamma_multiply(0.46 * progress))).expect("caption and modal backdrop share opacity while opening and closing");
+                    assert!(
+                        backdrop_index < caption_index && caption_index < dim_index,
+                        "modal dimming cannot be painted over already dimmed caption controls"
+                    );
                 }
             }
         }

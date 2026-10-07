@@ -7112,7 +7112,10 @@ mod reference_suggestion_label_tests {
                     ..Default::default()
                 },
             );
-            for frame in 0..2 {
+            // The caption already exists when a real reader opens a preview.
+            // Starting both Areas together hides their relative ordering bug.
+            for frame in 0..7 {
+                let preview_open = (2..5).contains(&frame);
                 let mut output = ctx.run_ui(
                     egui::RawInput {
                         screen_rect: Some(screen),
@@ -7127,36 +7130,66 @@ mod reference_suggestion_label_tests {
                                 Vec2::new(800.0, window_chrome::HEIGHT),
                             ),
                         );
-                        show_image_preview_area(
-                            &ctx,
-                            crate::ui::overlay_rect(&ctx),
-                            Rect::from_min_size(Pos2::new(200.0, 150.0), Vec2::new(400.0, 300.0)),
-                            TextureId::default(),
-                            100.0,
-                        );
+                        if preview_open {
+                            show_image_preview_area(
+                                &ctx,
+                                crate::ui::overlay_rect(&ctx),
+                                Rect::from_min_size(
+                                    Pos2::new(200.0, 150.0),
+                                    Vec2::new(400.0, 300.0),
+                                ),
+                                TextureId::default(),
+                                100.0,
+                            );
+                        }
                         window_chrome::paint_controls(&ctx);
                     },
                 );
                 output.textures_delta.clear();
-                if frame == 0 {
+                if !preview_open {
+                    assert_eq!(window_chrome::geometry(&ctx).overlay_dim, 0.0);
+                    continue;
+                }
+                if frame == 2 {
                     continue; // egui's first Area pass measures its size without painting.
                 }
-                assert!(output.shapes.iter().any(|shape| {
-                    matches!(&shape.shape, egui::Shape::Rect(rect)
+                let backdrop_index = output
+                    .shapes
+                    .iter()
+                    .position(|shape| {
+                        matches!(&shape.shape, egui::Shape::Rect(rect)
                         if rect.rect == screen
                         && rect.fill == Color32::from_black_alpha(190)
                         && shape.clip_rect.contains_rect(screen))
-                }));
+                    })
+                    .expect("preview covers the full window");
                 if !fullscreen {
                     let controls = Rect::from_min_size(
                         Pos2::new(screen.right() - 138.0, 0.0),
                         Vec2::new(138.0, window_chrome::HEIGHT),
                     );
-                    assert!(output.shapes.iter().any(|shape| {
-                        matches!(&shape.shape, egui::Shape::Rect(rect)
+                    let caption_index = output
+                        .shapes
+                        .iter()
+                        .position(|shape| {
+                            matches!(&shape.shape, egui::Shape::Rect(rect)
+                            if rect.rect == controls
+                            && rect.fill == crate::ui::palette().background)
+                        })
+                        .expect("opaque caption background");
+                    let dim_index = output
+                        .shapes
+                        .iter()
+                        .position(|shape| {
+                            matches!(&shape.shape, egui::Shape::Rect(rect)
                             if rect.rect == controls
                             && rect.fill == Color32::BLACK.gamma_multiply(190.0 / 255.0))
-                    }));
+                        })
+                        .expect("caption matches the preview dimming");
+                    assert!(
+                        backdrop_index < caption_index && caption_index < dim_index,
+                        "caption background must cover the preview scrim before receiving one dim layer"
+                    );
                 }
             }
         }
