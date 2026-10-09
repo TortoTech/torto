@@ -2797,6 +2797,20 @@ mod tests {
         )
     }
 
+    fn wire_text(message: &Value) -> String {
+        message["content"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                message["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|p| p["text"].as_str())
+                    .collect()
+            })
+    }
+
     fn read_http_request(stream: &mut TcpStream) -> String {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -3293,8 +3307,7 @@ mod tests {
                     .is_some_and(|text| text.contains("【1†source】"))
             }));
 
-            let response =
-                r#"{"choices":[{"message":{"role":"assistant","content":"总结【1†source】"}}]}"#;
+            let response = r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"总结【1†source】"}}]}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
@@ -3611,8 +3624,7 @@ mod tests {
             assert!(request.contains("authorization: Bearer secret-key"));
             assert!(request.contains(r#""reasoning_effort":"minimal""#));
 
-            let body =
-                r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"你好\"}"}}]}"#;
+            let body = r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"{\"0\":\"你好\"}"}}]}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -3667,7 +3679,7 @@ mod tests {
                 } else {
                     (
                         "200 OK",
-                        r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"你好\"}"}}]}"#,
+                        r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"{\"0\":\"你好\"}"}}]}"#,
                     )
                 };
                 write!(
@@ -3721,16 +3733,14 @@ mod tests {
                 let wire: Value =
                     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
                 if attempt == 1 {
-                    let feedback = wire["messages"].as_array().unwrap().last().unwrap()["content"]
-                        .as_str()
-                        .unwrap();
+                    let feedback = wire_text(wire["messages"].as_array().unwrap().last().unwrap());
                     assert!(feedback.contains("math placeholder"));
                     assert!(!feedback.contains("citation IDs"));
                 }
                 let body = if attempt == 0 {
-                    r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"能量为 $E=mc^2$\"}"}}]}"#
+                    r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"{\"0\":\"能量为 $E=mc^2$\"}"}}]}"#
                 } else {
-                    r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"能量为 <t-math-0/>\"}"}}]}"#
+                    r#"{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"{\"0\":\"能量为 <t-math-0/>\"}"}}]}"#
                 };
                 write!(
                     stream,
@@ -3802,9 +3812,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                let user = messages.iter().find(|m| m["role"] == "user").unwrap()["content"]
-                    .as_str()
-                    .unwrap();
+                let user = wire_text(messages.iter().find(|m| m["role"] == "user").unwrap());
                 let input: Value =
                     serde_json::from_str(user.split("\n\n").next().unwrap()).unwrap();
                 assert!(!user.contains("Expected paragraph keys"));
@@ -3845,7 +3853,7 @@ mod tests {
                 if step == 1 {
                     content["1"] = content["0"].clone();
                 }
-                let body = json!({"choices":[{"message":{"role":"assistant","content":content.to_string()}}]}).to_string();
+                let body = json!({"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":content.to_string()}}]}).to_string();
                 write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
             }
         });

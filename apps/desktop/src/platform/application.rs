@@ -518,6 +518,8 @@ impl ApplicationHandler<UserEvent> for Application {
             }
             UserEvent::ReaderPdfToc(message) => self.app.complete_reader_pdf_toc(message),
             UserEvent::ReaderPdfOcr(message) => self.app.complete_reader_pdf_ocr(message),
+            UserEvent::ReaderPdfOriginal(message) => self.app.complete_reader_pdf_original(message),
+            UserEvent::ReaderPdfNative(message) => self.app.complete_reader_pdf_native(message),
         }
         if let Some(callback) = sync_callback
             && callback_started.elapsed() >= Duration::from_millis(100)

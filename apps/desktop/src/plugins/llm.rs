@@ -1,5 +1,6 @@
 //! Provider protocols live in Rig. Output negotiation and validation live here,
 //! so book operations never depend on a provider's JSON dialect.
+mod history;
 #[cfg(test)]
 pub(super) mod tests;
 mod transport;
@@ -8,14 +9,14 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use rig_core::client::CompletionClient;
-use rig_core::completion::{
-    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, FinishReason,
-    ToolDefinition,
-};
+use rig_core::completion::{CompletionRequest, CompletionResponse, FinishReason, ToolDefinition};
+use rig_core::driver::Model;
+use rig_core::error::ProviderError as CompletionError;
 use rig_core::message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent};
+use rig_core::operation::Completion;
 use rig_core::providers;
-use rig_core::streaming::StreamedAssistantContent;
+use rig_core::streaming::{Item, StreamEvent};
+use rig_core::wire::{Encoded, Wire, WireFrame};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -50,7 +51,7 @@ fn consume_attempt() -> Result<(), CompletionError> {
     ATTEMPTS
         .try_with(|remaining| {
             if remaining.get() == 0 {
-                return Err(CompletionError::ProviderError(
+                return Err(CompletionError::Provider(
                     "AI 任务已达到总请求次数上限".into(),
                 ));
             }
@@ -236,133 +237,6 @@ pub(super) fn schema_options(schema: Value) -> Value {
     json!({"output_schema":schema})
 }
 
-fn messages_from_legacy(messages: &[Value]) -> Result<Vec<Message>, String> {
-    let mut output = Vec::new();
-    for message in messages {
-        if let Some(saved) = message.get("_rig_message") {
-            output.push(
-                serde_json::from_value(saved.clone())
-                    .map_err(|e| format!("AI 历史消息无效：{e}"))?,
-            );
-            continue;
-        }
-        if message["role"] == "tool" {
-            let id = message["tool_call_id"].as_str().unwrap_or_default();
-            let call = output.iter().rev().find_map(|m| match m {
-                Message::Assistant { content, .. } => content.iter().find_map(|c| match c {
-                    AssistantContent::ToolCall(call) if call.id.as_str() == id => Some(call),
-                    _ => None,
-                }),
-                _ => None,
-            });
-            if let Some(call) = call {
-                output.push(Message::User {
-                    content: vec![UserContent::tool_result_for(
-                        call.id.clone(),
-                        call.provider.clone(),
-                        call.function.name.clone(),
-                        vec![ToolResultContent::text(
-                            message["content"].as_str().unwrap_or_default(),
-                        )],
-                    )],
-                });
-                continue;
-            }
-        }
-        let wire: providers::openai::completion::Message =
-            serde_json::from_value(message.clone()).map_err(|e| format!("AI 请求消息无效：{e}"))?;
-        // Rig's generic OpenAI-to-core conversion demotes system messages to
-        // user messages. Preserve instructions explicitly, including text parts.
-        if let providers::openai::completion::Message::System { content, .. } = wire {
-            output.push(Message::system(
-                content
-                    .into_iter()
-                    .map(|part| part.text)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ));
-            continue;
-        }
-        output.push(
-            wire.try_into()
-                .map_err(|e| format!("AI 消息转换失败：{e}"))?,
-        );
-    }
-    Ok(output)
-}
-
-// Opaque gateway fields belong to this endpoint, credential and model only.
-// Store a digest, never credentials, in the private history envelope.
-fn compatible_scope(provider: &AiProvider, model: &str) -> String {
-    let mut hash = Sha256::new();
-    for value in [
-        format!("{:?}", provider.kind),
-        provider.id.clone(),
-        provider.base_url.trim().trim_end_matches('/').to_owned(),
-        provider.api_key.trim().to_owned(),
-        model.to_owned(),
-    ] {
-        hash.update(value.len().to_le_bytes());
-        hash.update(value);
-    }
-    format!("{:x}", hash.finalize())
-}
-
-fn compatible_replay(
-    provider: &AiProvider,
-    model: &str,
-    messages: &[Value],
-) -> Vec<transport::ReplayMessage> {
-    let scope = compatible_scope(provider, model);
-    messages
-        .iter()
-        .filter_map(|message| {
-            let saved = message.get("_compatible_message")?;
-            if saved["scope"] != scope || saved["core"] != message["_rig_message"] {
-                return None;
-            }
-            let core: Message = serde_json::from_value(saved["core"].clone()).ok()?;
-            if !matches!(core, Message::Assistant { .. }) {
-                return None;
-            }
-            let wire: Vec<providers::openai::completion::Message> = core.try_into().ok()?;
-            if wire.len() != 1 || !saved["original"].is_object() {
-                return None;
-            }
-            Some(transport::ReplayMessage {
-                expected: serde_json::to_value(&wire[0]).ok()?,
-                original: saved["original"].clone(),
-            })
-        })
-        .collect()
-}
-
-fn scoped_messages(
-    provider: &AiProvider,
-    model: &str,
-    messages: &[Value],
-) -> Result<Vec<Message>, String> {
-    let mut history = messages_from_legacy(messages)?;
-    let scope = compatible_scope(provider, model);
-    // Preserve ordinary text/calls, but don't let the SDK replay its typed copy
-    // of a gateway's opaque reasoning to a different endpoint or model either.
-    for (saved, current) in messages.iter().zip(&mut history) {
-        if saved
-            .get("_compatible_message")
-            .is_some_and(|m| m["scope"] != scope || m["core"] != saved["_rig_message"])
-            && let Message::Assistant { content, .. } = current
-        {
-            content.retain(|part| !matches!(part, AssistantContent::Reasoning(_)));
-            for part in content {
-                if let AssistantContent::ToolCall(call) = part {
-                    call.signature = None;
-                }
-            }
-        }
-    }
-    Ok(history)
-}
-
 fn reasoning_params(kind: AiProviderKind, model: &str, effort: ReasoningEffort) -> Value {
     let Some(value) = effort.api_value() else {
         return json!({});
@@ -472,40 +346,42 @@ fn build_request(
         .transpose()?
         .unwrap_or_default();
     let thinking = effort != ReasoningEffort::Default && effort != ReasoningEffort::None;
-    let replay = compatible_replay(provider, model, messages);
-    if !replay.is_empty() {
-        params["_torto_compatible_replay"] = json!(replay);
-    }
     let temperature = params
         .as_object_mut()
         .and_then(|p| p.remove("temperature"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.2);
+        .and_then(|v| v.as_f64());
+    // Do not add our sampling default to models that reason by default and
+    // reject it. Explicit caller options still go through SDK validation.
+    let sampling = rig_core::providers::registry::ProviderId::catalog("openai")
+        .and_then(|id| rig_core::catalog::Catalog::builtin().find(id, model));
+    let default_temperature = sampling.is_none_or(|spec| match spec.sampling {
+        Some(rig_core::catalog::Sampling::Never) => false,
+        Some(rig_core::catalog::Sampling::ReasoningOff) => {
+            effort == ReasoningEffort::None || spec.reasoning.default.is_none()
+        }
+        _ => true,
+    });
     let thinking_budget = params
         .pointer("/thinking/budget_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    Ok((
-        CompletionRequest {
-            model: None,
-            preamble: None,
-            chat_history: scoped_messages(provider, model, messages)?,
-            documents: vec![],
-            tool_choice: (!tools.is_empty()).then_some(ToolChoice::Auto),
-            tools,
-            temperature: (!thinking).then_some(temperature),
-            max_tokens: Some(
-                max_tokens
-                    .map(u64::from)
-                    .unwrap_or(16384)
-                    .saturating_add(thinking_budget),
-            ),
-            additional_params: Some(params),
-            output_schema: None,
-            record_telemetry_content: false,
-        },
-        schema,
-    ))
+    let mut request = CompletionRequest::new("");
+    request.chat_history = history::messages(provider, model, messages)?;
+    request.tool_choice = (!tools.is_empty()).then_some(ToolChoice::Auto);
+    request.tools = tools;
+    request.temperature = if thinking {
+        None
+    } else {
+        temperature.or(default_temperature.then_some(0.2))
+    };
+    request.max_tokens = Some(
+        max_tokens
+            .map(u64::from)
+            .unwrap_or(16384)
+            .saturating_add(thinking_budget),
+    );
+    request.additional_params = Some(params);
+    Ok((request, schema))
 }
 
 fn prepare_output(
@@ -523,29 +399,26 @@ fn prepare_output(
     };
     match mode {
         OutputMode::Native => {
-            if kind == AiProviderKind::Xai {
-                // Rig 0.42's xAI Responses adapter does not map output_schema.
-                request.additional_params.get_or_insert_with(|| json!({}))["text"] = json!({"format":{"type":"json_schema","name":"result","strict":true,"schema":wire_schema}});
-            } else {
-                request.output_schema = Some(
-                    wire_schema
-                        .try_into()
-                        .map_err(|e| format!("Schema 无效：{e}"))?,
-                );
-            }
+            request.output_schema = Some(
+                wire_schema
+                    .try_into()
+                    .map_err(|e| format!("Schema 无效：{e}"))?,
+            );
         }
         OutputMode::Tool => {
             if !request.tools.is_empty() {
                 return Err("结构化结果工具不能覆盖已有业务工具".into());
             }
             request.tools = vec![ToolDefinition {
-                name: OUTPUT_TOOL.into(),
+                name: rig_core::message::ToolName::new(OUTPUT_TOOL).expect("nonempty tool name"),
                 description: "Return the final structured result; this does not execute an action."
                     .into(),
                 parameters: wire_schema,
             }];
             request.tool_choice = Some(ToolChoice::Specific {
-                function_names: vec![OUTPUT_TOOL.into()],
+                function_names: vec![
+                    rig_core::message::ToolName::new(OUTPUT_TOOL).expect("nonempty tool name"),
+                ],
             });
         }
         OutputMode::JsonObject | OutputMode::Prompt => {
@@ -571,7 +444,7 @@ fn prepare_output(
         }
         OutputMode::Auto => return Err("内部错误：未选择结构化输出模式".into()),
     }
-    let mut instructions = request.preamble.take().into_iter().collect::<Vec<_>>();
+    let mut instructions = Vec::new();
     request.chat_history.retain(|message| {
         if let Message::System { content } = message {
             instructions.push(content.clone());
@@ -625,6 +498,17 @@ fn can_fallback(error: &CompletionError) -> bool {
 }
 
 fn check_finish(response: &CompletionResponse) -> Result<(), String> {
+    if response
+        .tool_calls()
+        .any(|c| c.function.name != OUTPUT_TOOL && c.function.invalid_arguments.is_some())
+    {
+        return Err("AI 工具参数不是有效 JSON，未执行工具".into());
+    }
+    if let rig_core::message::StopReason::Error(reason)
+    | rig_core::message::StopReason::Aborted(reason) = response.stop()
+    {
+        return Err(format!("AI 响应未正常完成，未应用结果：{reason}"));
+    }
     match response.finish_reason() {
         Some(FinishReason::Length) => Err("AI 输出被长度上限截断，未应用结果".into()),
         Some(FinishReason::ContentFilter) => Err("AI 拒绝或过滤了本次请求，未应用结果".into()),
@@ -639,8 +523,8 @@ fn response_message(response: &CompletionResponse) -> Value {
     for part in &response.choice {
         match part {
             AssistantContent::Text(t) => text.push_str(&t.text),
-            AssistantContent::Reasoning(r) => reasoning.push_str(&r.display_text()),
-            AssistantContent::ToolCall(t) => tools.push(json!({"id":t.id.as_str(),"type":"function","function":{"name":t.function.name,"arguments":t.function.arguments.to_string()}})),
+            AssistantContent::Reasoning(r) => reasoning.push_str(&r.text),
+            AssistantContent::ToolCall(t) => tools.push(json!({"id":t.id.wire(),"type":"function","function":{"name":t.function.name,"arguments":t.function.invalid_arguments.clone().unwrap_or_else(|| t.function.arguments_value().to_string())}})),
             _ => {},
         }
     }
@@ -648,14 +532,12 @@ fn response_message(response: &CompletionResponse) -> Value {
     if !tools.is_empty() {
         message["tool_calls"] = json!(tools);
     }
-    message["_rig_message"] = serde_json::to_value(Message::Assistant {
-        id: response.message_id.clone(),
-        content: response.choice.clone(),
-    })
-    .unwrap_or_default();
-    if let Some(saved) = response.raw.get("_torto_compatible_message") {
-        message["_compatible_message"] = saved.clone();
-        message["_compatible_message"]["core"] = message["_rig_message"].clone();
+    message["_rig_message"] = serde_json::to_value(response.message()).unwrap_or_default();
+    message["_rig_fingerprint"] =
+        serde_json::to_value(rig_core::message::Fingerprint::of(&response.message()))
+            .unwrap_or_default();
+    if let Some(scope) = response.raw.get("_torto_llm_scope") {
+        message["_llm_scope"] = scope.clone();
     }
     let mut sources = Vec::new();
     super::web_search::collect_sources(&response.raw, &mut sources);
@@ -684,7 +566,11 @@ fn structured_value(
         if calls.len() != 1 || calls[0].function.name != OUTPUT_TOOL {
             return Err("AI 未返回唯一的结构化结果工具调用".into());
         }
-        let mut result = calls[0].function.arguments.clone();
+        let mut result = if let Some(raw) = &calls[0].function.invalid_arguments {
+            llm_json::parse(raw)?
+        } else {
+            calls[0].function.arguments_value()
+        };
         if let Some(text) = result.as_str() {
             result = llm_json::parse(text)?;
         }
@@ -889,42 +775,62 @@ pub(super) async fn stream_with_search(
     Ok(response_message(&response))
 }
 
-async fn execute<M: CompletionModel>(
-    model: M,
+async fn execute<W>(
+    model: Model<W>,
     request: CompletionRequest,
     callback: &mut impl FnMut(ChatStreamEvent),
     streaming: bool,
-) -> Result<CompletionResponse, CompletionError> {
+) -> Result<CompletionResponse, CompletionError>
+where
+    W: Wire<Op = Completion, Payload = Encoded, Frame = WireFrame>,
+{
     if !streaming {
-        return model.completion(request).await;
+        return model.call(request).await;
     }
-    let mut stream = model.stream(request).await?;
+    let mut stream = model.stream(request)?;
     let mut text = String::new();
+    let mut text_seen = HashSet::new();
     let mut reasoning_seen = HashSet::new();
     let mut sources = Vec::new();
     while let Some(part) = stream.next().await {
         match part? {
-            StreamedAssistantContent::Text(delta) => {
-                text.push_str(&delta.text);
+            Item::Event(StreamEvent::Text { part, text: delta }) => {
+                text_seen.insert(part);
+                text.push_str(&delta);
                 callback(ChatStreamEvent::Content(text.clone()));
             }
-            StreamedAssistantContent::ReasoningDelta { id, reasoning, .. } => {
-                reasoning_seen.insert(id);
-                callback(ChatStreamEvent::Reasoning(reasoning));
+            Item::Event(StreamEvent::Reasoning { part, text }) => {
+                reasoning_seen.insert(part);
+                callback(ChatStreamEvent::Reasoning(text));
             }
-            StreamedAssistantContent::Reasoning { id, reasoning }
-                if !reasoning_seen.contains(&id) =>
-            {
-                callback(ChatStreamEvent::Reasoning(reasoning.display_text()))
+            Item::Event(StreamEvent::End {
+                part,
+                content: AssistantContent::Text(block),
+            }) if !text_seen.contains(&part) => {
+                text.push_str(&block.text);
+                callback(ChatStreamEvent::Content(text.clone()));
             }
-            StreamedAssistantContent::Unknown(payload) => {
+            Item::Event(StreamEvent::End {
+                part,
+                content: AssistantContent::Reasoning(block),
+            }) if !reasoning_seen.contains(&part) => {
+                callback(ChatStreamEvent::Reasoning(block.text));
+            }
+            Item::Event(StreamEvent::End {
+                content: AssistantContent::Opaque(block),
+                ..
+            }) => {
+                super::web_search::native_event(&block.item, callback);
+                super::web_search::collect_sources(&block.item, &mut sources);
+            }
+            Item::Unknown(payload) => {
                 super::web_search::native_event(payload.value(), callback);
                 super::web_search::collect_sources(payload.value(), &mut sources);
             }
             _ => {}
         }
     }
-    let mut response: CompletionResponse = stream.into();
+    let mut response = stream.finish().await?;
     if let Some(raw) = response.raw.as_object_mut() {
         raw.insert("_torto_web_sources".into(), json!(sources));
     }
@@ -948,148 +854,112 @@ async fn dispatch(
                 .expect("HTTP client initialization")
         })
         .clone();
-    // Compatible completion builders replace, rather than merge, raw tool arrays.
-    // Append hosted tools only after Rig has serialized the ordinary functions.
-    let hosted = if matches!(
-        provider.kind,
-        AiProviderKind::Custom
-            | AiProviderKind::OpenRouter
-            | AiProviderKind::Moonshot
-            | AiProviderKind::Zai
-    ) {
-        request
-            .additional_params
-            .as_mut()
-            .and_then(Value::as_object_mut)
-            .and_then(|params| params.remove("tools"))
-            .and_then(|value| value.as_array().cloned())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
     let source_capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let capture = !hosted.is_empty()
-        || request
-            .additional_params
-            .as_ref()
-            .is_some_and(|p| p.get("tools").is_some());
-    let replay = request
+    let capture = request
         .additional_params
-        .as_mut()
-        .and_then(Value::as_object_mut)
-        .and_then(|params| params.remove("_torto_compatible_replay"))
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
-    let assistant_capture: transport::AssistantCapture = Default::default();
-    let http = transport::CompatHttp(
-        http,
-        hosted,
-        capture.then(|| source_capture.clone()),
-        replay,
-        assistant_capture.clone(),
-    );
+        .as_ref()
+        .is_some_and(|p| p.get("tools").is_some());
+    let http = transport::CompatHttp {
+        inner: rig_reqwest::ReqwestClient::from(http),
+        sources: capture.then(|| source_capture.clone()),
+    };
     let responses = request
         .additional_params
         .as_mut()
         .and_then(Value::as_object_mut)
-        .and_then(|params| params.remove("_torto_responses"))
-        .and_then(|value| value.as_bool())
+        .and_then(|p| p.remove("_torto_responses"))
+        .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let base = provider
         .base_url
         .trim()
         .trim_end_matches('/')
         .trim_end_matches("/chat/completions");
-    let key = provider.api_key.trim().to_owned();
+    // xAI's SDK dialect includes /v1 in its paths; settings include it in the base.
     let base = if provider.kind == AiProviderKind::Xai {
-        base.strip_suffix("/v1").unwrap_or(base)
+        base.trim_end_matches("/v1")
     } else {
         base
     };
-    macro_rules! send {
-        ($name:ident) => {{
-            let client = providers::$name::Client::builder()
-                .api_key(key)
-                .base_url(base)
-                .http_client(http)
-                .build()?;
-            execute(client.completion_model(model), request, callback, streaming).await
-        }};
-    }
+    let key = provider.api_key.trim().to_owned();
+    let strict = request.tools.len() == 1
+        && request.tools[0].name == OUTPUT_TOOL
+        && native_schema_compatible(&request.tools[0].parameters, provider.kind);
     let mut response = match provider.kind {
-        AiProviderKind::OpenAi if responses => {
-            let client = providers::openai::Client::builder()
-                .api_key(key)
-                .base_url(base)
-                .http_client(http)
-                .build()?;
-            execute(client.completion_model(model), request, callback, streaming).await
-        }
         AiProviderKind::Anthropic => {
-            let client = providers::anthropic::Client::builder()
-                .api_key(key)
-                .base_url(base)
-                .http_client(http)
-                .build()?;
-            let mut engine = client.completion_model(model);
-            if request.tools.len() == 1
-                && request.tools[0].name == OUTPUT_TOOL
-                && native_schema_compatible(&request.tools[0].parameters, provider.kind)
-            {
-                engine = engine.with_strict_tools();
+            let client = providers::anthropic::AnthropicConfig::new(key)
+                .with_base_url(base)
+                .connect(http);
+            let mut engine = client.completion(model);
+            if strict {
+                engine.wire = engine.wire.with_strict_tools();
             }
             execute(engine, request, callback, streaming).await
         }
-        AiProviderKind::Gemini => send!(gemini),
-        AiProviderKind::DeepSeek => send!(deepseek),
-        AiProviderKind::OpenRouter => send!(openrouter),
-        AiProviderKind::Xai => send!(xai),
-        AiProviderKind::Groq => send!(groq),
-        AiProviderKind::Mistral => send!(mistral),
-        AiProviderKind::Moonshot => send!(moonshot),
-        AiProviderKind::MiniMax => send!(minimax),
-        AiProviderKind::Zai => send!(zai),
-        AiProviderKind::Ollama => send!(ollama),
+        AiProviderKind::Gemini => {
+            let client = providers::gemini::GeminiConfig::new(key)
+                .with_base_url(base)
+                .connect(http);
+            execute(client.completion(model), request, callback, streaming).await
+        }
+        AiProviderKind::Ollama => {
+            let client = providers::ollama::OllamaConfig::new()
+                .with_base_url(base)
+                .with_api_key(key)
+                .connect(http);
+            execute(
+                client.native_completion(model),
+                request,
+                callback,
+                streaming,
+            )
+            .await
+        }
         _ => {
-            let client = providers::openai::Client::builder()
-                .api_key(key)
-                .base_url(base)
-                .http_client(http)
-                .build()?
-                .completions_api();
-            let mut engine = client.completion_model(model);
-            if provider.kind == AiProviderKind::OpenAi
-                && request.tools.len() == 1
-                && request.tools[0].name == OUTPUT_TOOL
-                && native_schema_compatible(&request.tools[0].parameters, provider.kind)
-            {
-                engine = engine.with_strict_tools();
+            use providers::openai::wire::{OpenAIConfig, Route};
+            let dialect = match provider.kind {
+                AiProviderKind::DeepSeek => &providers::openai::wire::DEEPSEEK,
+                AiProviderKind::OpenRouter => &providers::openai::wire::OPENROUTER,
+                AiProviderKind::Xai => &providers::xai::DIALECT,
+                AiProviderKind::Groq => &providers::openai::wire::GROQ,
+                AiProviderKind::Mistral => &providers::openai::wire::MISTRAL,
+                AiProviderKind::Moonshot => &providers::openai::wire::MOONSHOT,
+                AiProviderKind::MiniMax => &providers::openai::wire::MINIMAX,
+                AiProviderKind::Zai => &providers::openai::wire::ZAI,
+                _ => &providers::openai::wire::OPENAI,
+            };
+            let config = OpenAIConfig::with_key(dialect, key).with_base_url(base);
+            // A gateway's model name never changes its configured API protocol.
+            let config = if matches!(
+                provider.kind,
+                AiProviderKind::OpenAi | AiProviderKind::Custom
+            ) {
+                config.with_route(if responses && provider.kind == AiProviderKind::OpenAi {
+                    Route::Responses
+                } else {
+                    Route::Chat
+                })
+            } else {
+                config
+            };
+            let client = config.connect(http);
+            let mut engine = client.completion(model);
+            if strict && provider.kind == AiProviderKind::OpenAi {
+                engine.wire = engine.wire.with_strict_tools();
             }
             execute(engine, request, callback, streaming).await
         }
     }?;
+    if !response.raw.is_object() {
+        response.raw = json!({});
+    }
+    response.raw["_torto_llm_scope"] = json!(history::scope(provider, model));
     if capture {
-        if !response.raw.is_object() {
-            response.raw = json!({});
-        }
         response.raw["_torto_captured_sources"] = json!(
             *source_capture
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         );
-    }
-    if let Some(original) = assistant_capture
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
-    {
-        if !response.raw.is_object() {
-            response.raw = json!({});
-        }
-        response.raw["_torto_compatible_message"] = json!({
-            "scope": compatible_scope(provider, model),
-            "original": original,
-        });
     }
     Ok(response)
 }

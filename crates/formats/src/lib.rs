@@ -13,6 +13,7 @@ mod kf8;
 mod markup;
 mod mobi;
 mod pdf;
+pub mod reflow;
 mod source;
 mod xml;
 
@@ -27,6 +28,7 @@ use thiserror::Error;
 use self::epub::{EpubError, EpubPublication};
 
 pub use self::pdf::cjk_fallback_font_bytes;
+pub use self::pdf::reflow as pdf_reflow;
 pub use self::pdf::{PdfTimingSink, set_pdf_timing_sink};
 
 /// E-book formats supported by the desktop application.

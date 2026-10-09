@@ -12,9 +12,10 @@ use super::chat_autocomplete::{
 use super::{
     AssistantPanel, ChatStreamMessage, ChatStreamingState, ChatTask, ChatTaskMessage,
     DesktopReader, FocusFootnoteSource, FocusedMark, MarkRetention, PdfMetadataUpdate, PdfOcrTask,
-    PdfOcrTaskMessage, PdfTocTask, PdfTocTaskMessage, SearchTask, SearchTaskMessage, SidebarTab,
-    SnapshotEffects, TocTranslationTask, TocTranslationTaskMessage, TranslationTaskMessage,
-    block_focus_footnotes, focus_footnote_translation_ranges_in_section,
+    PdfOcrTaskMessage, PdfOriginalTask, PdfOriginalTaskMessage, PdfTocTask, PdfTocTaskMessage,
+    SearchTask, SearchTaskMessage, SidebarTab, SnapshotEffects, TocTranslationTask,
+    TocTranslationTaskMessage, TranslationTaskMessage, block_focus_footnotes,
+    focus_footnote_translation_ranges_in_section,
 };
 use crate::platform::UserEvent;
 use crate::plugins::{
@@ -26,6 +27,127 @@ use crate::plugins::{
 };
 
 impl DesktopReader {
+    pub(super) fn start_pdf_native(&mut self, action: super::PdfNativeAction) {
+        if self.format != rebook_formats::BookFormat::Pdf
+            || self.pdf_ocr.original_task.is_pending()
+            || self.pdf_ocr.task.is_pending()
+        {
+            return;
+        }
+        if self.pdf_ocr.native_task.is_pending() {
+            if let Some(task) = self.pdf_ocr.native_task.active() {
+                task.cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            self.pdf_ocr.native_task.cancel();
+            self.pdf_ocr.native_progress.clear();
+            return;
+        }
+        let original = self
+            .pdf_ocr_controller
+            .as_ref()
+            .map_or_else(|| self.source.clone(), |c| c.original_source());
+        self.pdf_ocr.native_progress = self
+            .language
+            .text("正在准备 PDF 文字…", "Preparing PDF text…")
+            .into();
+        self.pdf_ocr.native_task.begin(super::PdfNativeTask {
+            path: self.source_path.clone(),
+            book_id: self.book_id.clone(),
+            original: original.book().clone(),
+            origin: original.table_of_contents_origin(),
+            job: uuid::Uuid::new_v4().to_string(),
+            action,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+    }
+
+    pub(crate) fn complete_pdf_native(&mut self, message: super::PdfNativeTaskMessage) {
+        match message {
+            super::PdfNativeTaskMessage::Progress {
+                book_id,
+                job,
+                id,
+                page,
+                total,
+                phase,
+            } => {
+                if book_id != self.book_id
+                    || self
+                        .pdf_ocr
+                        .native_task
+                        .in_flight(id)
+                        .is_none_or(|task| task.job != job)
+                {
+                    return;
+                }
+                self.pdf_ocr.native_progress = format!(
+                    "{} {page}/{total}",
+                    if phase == "extract" {
+                        self.language.text("提取 PDF 文字", "Extracting PDF text")
+                    } else {
+                        self.language.text("分析 PDF 版面", "Analyzing PDF layout")
+                    }
+                );
+            }
+            super::PdfNativeTaskMessage::Complete {
+                book_id,
+                job,
+                message,
+            } => {
+                if book_id != self.book_id
+                    || self
+                        .pdf_ocr
+                        .native_task
+                        .in_flight(message.id)
+                        .is_none_or(|task| task.job != job)
+                    || self.pdf_ocr.native_task.complete(message.id).is_none()
+                {
+                    return;
+                }
+                self.pdf_ocr.native_progress.clear();
+                match message.result {
+                    Ok(super::PdfTextResult::NeedsOcr) => {
+                        if self.plugin_settings.pdf_ocr_enabled {
+                            self.start_pdf_ocr();
+                        } else {
+                            self.error_timer.show(
+                                &mut self.error,
+                                self.language
+                                    .text(
+                                        "请在“设置 → OCR”中启用正文识别",
+                                        "Enable PDF text recognition in Settings → OCR",
+                                    )
+                                    .into(),
+                                Instant::now(),
+                            );
+                        }
+                    }
+                    Ok(super::PdfTextResult::Ready(stats)) => {
+                        if let Some(stats) = &stats {
+                            tracing::info!(?stats, "native PDF reflow completed");
+                        }
+                        self.persist_progress();
+                        self.reopen_notice = Some(
+                            self.language
+                                .text("PDF 文字版式已就绪", "PDF text view is ready")
+                                .into(),
+                        );
+                        self.reopen_requested = Some(self.source_path.clone());
+                    }
+                    Err(error) => self.error_timer.show(
+                        &mut self.error,
+                        format!(
+                            "{}: {error}",
+                            self.language
+                                .text("PDF 文字处理失败", "PDF text processing failed")
+                        ),
+                        Instant::now(),
+                    ),
+                }
+            }
+        }
+    }
     pub(super) fn attach_current_focus_reference(&mut self) {
         self.sync_focus_chat_session();
         self.chat.references.retain(|reference| {
@@ -247,6 +369,153 @@ impl DesktopReader {
         }
         self.spawn_pending_pdf_toc(runtime, proxy);
         self.spawn_pending_pdf_ocr(runtime, proxy);
+        if let Some(request) = self.pdf_ocr.native_task.take_pending() {
+            let proxy = proxy.clone();
+            let progress_proxy = proxy.clone();
+            let book_id = request.payload.book_id.clone();
+            let job = request.payload.job.clone();
+            let progress_id = book_id.clone();
+            let worker = runtime.spawn(async move {
+                let id = request.id;
+                let result = tokio::task::spawn_blocking(move || {
+                    use crate::plugins::pdf_native::{self, TextSource};
+                    let task = request.payload;
+                    if task.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err("PDF reflow cancelled".into());
+                    }
+                    let automatic = matches!(task.action,
+                        super::PdfNativeAction::Auto | super::PdfNativeAction::AutoRegenerate);
+                    let regenerate = matches!(task.action,
+                        super::PdfNativeAction::Regenerate | super::PdfNativeAction::AutoRegenerate);
+                    let use_ocr = if automatic {
+                        let assessment = rebook_formats::pdf_reflow::assess(
+                            &task.path, &task.book_id, &task.cancelled,
+                        )?;
+                        tracing::info!(?assessment, book_id = %task.book_id, "PDF text route selected");
+                        assessment.route == rebook_formats::pdf_reflow::TextRoute::Ocr
+                    } else {
+                        matches!(task.action, super::PdfNativeAction::Ocr)
+                    };
+                    if task.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err("PDF reflow cancelled".into());
+                    }
+                    if use_ocr {
+                        if automatic && (regenerate || !crate::plugins::pdf_ocr_result_available(&task.book_id)
+                            .map_err(|e| e.to_string())?) {
+                            return Ok(super::PdfTextResult::NeedsOcr);
+                        }
+                        if !crate::plugins::pdf_ocr_result_available(&task.book_id)
+                            .map_err(|e| e.to_string())?
+                        {
+                            return Err("No cached OCR result. Run PDF OCR first.".into());
+                        }
+                        pdf_native::select(&task.book_id, TextSource::Ocr)
+                            .map_err(|e| e.to_string())?;
+                        crate::plugins::set_pdf_ocr_view_mode(
+                            &task.book_id,
+                            PdfOcrViewMode::Reflow,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        return Ok(super::PdfTextResult::Ready(None));
+                    }
+                    if !regenerate
+                        && pdf_native::open(&task.book_id)
+                            .map_err(|e| e.to_string())?
+                            .is_some()
+                    {
+                        pdf_native::select(&task.book_id, TextSource::Native)
+                            .map_err(|e| e.to_string())?;
+                        pdf_native::set_mode(&task.book_id, PdfOcrViewMode::Reflow)
+                            .map_err(|e| e.to_string())?;
+                        return Ok(super::PdfTextResult::Ready(None));
+                    }
+                    let mut last = None;
+                    pdf_native::generate(
+                        &task.path,
+                        &task.original,
+                        task.origin,
+                        &task.cancelled,
+                        move |page, total, phase| {
+                            let percent = page * 100 / total.max(1);
+                            if last != Some((percent, phase)) {
+                                last = Some((percent, phase));
+                                let _ = progress_proxy.send_event(UserEvent::ReaderPdfNative(
+                                    super::PdfNativeTaskMessage::Progress {
+                                        book_id: progress_id.clone(),
+                                        job: task.job.clone(),
+                                        id,
+                                        page,
+                                        total,
+                                        phase,
+                                    },
+                                ));
+                            }
+                        },
+                    )
+                    .map(|stats| super::PdfTextResult::Ready(Some(stats)))
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+                let _ = proxy.send_event(UserEvent::ReaderPdfNative(
+                    super::PdfNativeTaskMessage::Complete {
+                        book_id,
+                        job,
+                        message: crate::async_task::TaskResult { id, result },
+                    },
+                ));
+            });
+            self.pdf_ocr.native_task.attach_worker(worker);
+        }
+        if !self.pdf_ocr.retired_sources.is_empty() || self.pdf_ocr.retired_rasters.is_some() {
+            let retired = std::mem::take(&mut self.pdf_ocr.retired_sources);
+            let rasters = self.pdf_ocr.retired_rasters.take();
+            runtime.spawn_blocking(move || {
+                drop(retired);
+                if let Some((id, fixed)) = rasters {
+                    rebook_layout::retire_publication_rasters(&id, fixed);
+                }
+            });
+        }
+        if let Some(request) = self.pdf_ocr.original_task.take_pending() {
+            let proxy = proxy.clone();
+            let book_id = self.book_id.clone();
+            let worker = runtime.spawn(async move {
+                let id = request.id;
+                let controller = Arc::clone(&request.payload.controller);
+                let result = tokio::task::spawn_blocking(move || {
+                    let source = request
+                        .payload
+                        .controller
+                        .prepare_mode(request.payload.mode)?;
+                    let index = request
+                        .payload
+                        .target
+                        .as_ref()
+                        .and_then(|target| {
+                            source
+                                .book()
+                                .sections
+                                .iter()
+                                .position(|section| section.href.path() == target.path())
+                        })
+                        .unwrap_or(0);
+                    source
+                        .parse_section(index)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                let _ = proxy.send_event(UserEvent::ReaderPdfOriginal(PdfOriginalTaskMessage {
+                    book_id,
+                    controller,
+                    message: crate::async_task::TaskResult { id, result },
+                }));
+            });
+            self.pdf_ocr.original_task.attach_worker(worker);
+        }
     }
 
     fn spawn_pending_pdf_ocr(
@@ -260,6 +529,8 @@ impl DesktopReader {
             runtime.spawn(async move {
                 let id = request.id;
                 let payload = request.payload;
+                let book_id = payload.book_id.clone();
+                let progress_book_id = book_id.clone();
                 let result = recognize_pdf(
                     payload.path,
                     payload.book_id,
@@ -267,14 +538,19 @@ impl DesktopReader {
                     payload.settings,
                     move |message| {
                         let _ = progress_proxy.send_event(UserEvent::ReaderPdfOcr(
-                            PdfOcrTaskMessage::Progress { id, message },
+                            PdfOcrTaskMessage::Progress {
+                                book_id: progress_book_id.clone(),
+                                id,
+                                message,
+                            },
                         ));
                     },
                 )
                 .await;
-                let _ = proxy.send_event(UserEvent::ReaderPdfOcr(PdfOcrTaskMessage::Complete(
-                    crate::async_task::TaskResult { id, result },
-                )));
+                let _ = proxy.send_event(UserEvent::ReaderPdfOcr(PdfOcrTaskMessage::Complete {
+                    book_id,
+                    message: crate::async_task::TaskResult { id, result },
+                }));
             });
         }
     }
@@ -290,8 +566,30 @@ impl DesktopReader {
             runtime.spawn(async move {
                 let id = request.id;
                 let payload = request.payload;
+                let prepared = if let Some(controller) = payload.controller.clone() {
+                    tokio::task::spawn_blocking(move || controller.original_lease())
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result)
+                } else {
+                    Ok(payload.source.clone())
+                };
+                let original = match prepared {
+                    Ok(source) => source,
+                    Err(error) => {
+                        let _ = proxy.send_event(UserEvent::ReaderPdfToc(
+                            PdfTocTaskMessage::Complete(Box::new(crate::async_task::TaskResult {
+                                id,
+                                result: Err(error),
+                            })),
+                        ));
+                        return;
+                    }
+                };
+                let book_id = payload.book_id.clone();
+                let save_roles = payload.need_page_roles;
                 let result = extract_pdf_metadata(
-                    payload.source,
+                    original.clone(),
                     payload.settings,
                     payload.need_toc,
                     payload.need_page_roles,
@@ -303,6 +601,30 @@ impl DesktopReader {
                     },
                 )
                 .await;
+                let result = match result {
+                    Ok(mut extraction) if save_roles => {
+                        let roles = extraction.page_roles.clone();
+                        let saved = tokio::task::spawn_blocking(move || {
+                            crate::plugins::save_pdf_ocr_page_roles(
+                                &book_id,
+                                &roles,
+                                original.as_ref(),
+                            )
+                        })
+                        .await;
+                        match saved {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => extraction
+                                .warnings
+                                .push(format!("Failed to save PDF page images: {error}")),
+                            Err(error) => extraction
+                                .warnings
+                                .push(format!("Failed to save PDF page images: {error}")),
+                        }
+                        Ok(extraction)
+                    }
+                    result => result,
+                };
                 let _ = proxy.send_event(UserEvent::ReaderPdfToc(PdfTocTaskMessage::Complete(
                     Box::new(crate::async_task::TaskResult { id, result }),
                 )));
@@ -321,6 +643,7 @@ impl DesktopReader {
         self.pdf_toc.editing = false;
         self.pdf_toc.progress = "正在准备页面…".into();
         self.pdf_toc.task.begin(PdfTocTask {
+            controller: self.pdf_ocr_controller.clone(),
             source: self.pdf_ocr_controller.as_ref().map_or_else(
                 || Arc::clone(&self.source),
                 |controller| controller.original_source(),
@@ -348,6 +671,7 @@ impl DesktopReader {
             .text("正在准备元数据提取…", "Preparing metadata extraction…")
             .into();
         self.pdf_toc.task.begin(PdfTocTask {
+            controller: self.pdf_ocr_controller.clone(),
             source: self.pdf_ocr_controller.as_ref().map_or_else(
                 || Arc::clone(&self.source),
                 |controller| controller.original_source(),
@@ -367,12 +691,22 @@ impl DesktopReader {
         {
             return;
         }
+        if let Some(task) = self.pdf_ocr.native_task.active() {
+            task.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.pdf_ocr.native_task.cancel();
+        self.pdf_ocr.native_progress.clear();
         self.pdf_ocr.progress = self.language.text("正在准备 PDF…", "Preparing PDF…").into();
         self.pdf_ocr.task.begin(PdfOcrTask {
             path: self.source_path.clone(),
             book_id: self.book_id.clone(),
-            page_count: self.source.book().sections.len(),
+            page_count: self.pdf_ocr_controller.as_ref().map_or_else(
+                || self.source.book().sections.len(),
+                |controller| controller.original_source().book().sections.len(),
+            ),
             settings: self.plugin_settings.clone(),
+            select_on_complete: true,
         });
         if !self.pdf_toc.task.is_pending()
             && self.plugin_settings.ocr_enabled
@@ -384,6 +718,7 @@ impl DesktopReader {
                 .text("正在准备 PDF 信息识别…", "Preparing PDF recognition…")
                 .into();
             self.pdf_toc.task.begin(PdfTocTask {
+                controller: self.pdf_ocr_controller.clone(),
                 source: self.pdf_ocr_controller.as_ref().map_or_else(
                     || Arc::clone(&self.source),
                     |controller| controller.original_source(),
@@ -399,18 +734,40 @@ impl DesktopReader {
 
     pub(crate) fn complete_pdf_ocr(&mut self, message: PdfOcrTaskMessage) {
         match message {
-            PdfOcrTaskMessage::Progress { id, message } => {
-                if self.pdf_ocr.task.in_flight(id).is_some() {
+            PdfOcrTaskMessage::Progress {
+                book_id,
+                id,
+                message,
+            } => {
+                if book_id == self.book_id && self.pdf_ocr.task.in_flight(id).is_some() {
                     self.pdf_ocr.progress = message;
                 }
             }
-            PdfOcrTaskMessage::Complete(message) => {
-                let Some(_request) = self.pdf_ocr.task.complete(message.id) else {
+            PdfOcrTaskMessage::Complete { book_id, message } => {
+                if book_id != self.book_id {
+                    return;
+                }
+                let Some(request) = self.pdf_ocr.task.complete(message.id) else {
                     return;
                 };
                 self.pdf_ocr.progress.clear();
                 match message.result {
                     Ok(()) => {
+                        if !request.select_on_complete
+                            && self
+                                .source
+                                .book()
+                                .sections
+                                .first()
+                                .is_some_and(|s| s.id.as_str().starts_with("pdf-native-v"))
+                        {
+                            return;
+                        }
+                        // Explicit OCR completion selects its own derived source.
+                        let _ = crate::plugins::pdf_native::select(
+                            &self.book_id,
+                            crate::plugins::pdf_native::TextSource::Ocr,
+                        );
                         self.pdf_ocr.available = true;
                         self.pdf_ocr.mode = PdfOcrViewMode::Reflow;
                         self.persist_progress();
@@ -444,11 +801,8 @@ impl DesktopReader {
         {
             return;
         }
-        match crate::plugins::load_pdf_ocr_source(
-            Arc::clone(&self.source),
-            self.plugin_settings.pdf_ocr_reflow_enabled,
-        ) {
-            Ok(loaded) if loaded.available => {
+        match crate::plugins::pdf_ocr_result_available(&self.book_id) {
+            Ok(true) => {
                 self.persist_progress();
                 self.reopen_requested = Some(self.source_path.clone());
             }
@@ -458,13 +812,15 @@ impl DesktopReader {
     }
 
     pub(super) fn toggle_pdf_ocr_view(&mut self) -> bool {
+        if self.pdf_ocr.original_task.is_pending() {
+            return false;
+        }
         if !self.pdf_ocr.available {
             return false;
         }
         let Some(controller) = self.pdf_ocr_controller.clone() else {
             return false;
         };
-        let previous_mode = self.pdf_ocr.mode;
         let mode = match self.pdf_ocr.mode {
             PdfOcrViewMode::Original => PdfOcrViewMode::Reflow,
             PdfOcrViewMode::Reflow => PdfOcrViewMode::Original,
@@ -478,6 +834,64 @@ impl DesktopReader {
                 .current_preceding_anchor(PDF_PAGE_ANCHOR_PREFIX)
                 .and_then(|fragment| controller.original_target_for_reflow_anchor(&fragment)),
         };
+        self.pdf_ocr.original_task.begin(PdfOriginalTask {
+            controller,
+            target: navigation_target,
+            mode,
+        });
+        true
+    }
+
+    pub(crate) fn complete_pdf_original(&mut self, message: PdfOriginalTaskMessage) {
+        if message.book_id != self.book_id
+            || self
+                .pdf_ocr_controller
+                .as_ref()
+                .is_none_or(|controller| !Arc::ptr_eq(controller, &message.controller))
+        {
+            return;
+        }
+        let Some(request) = self.pdf_ocr.original_task.complete(message.message.id) else {
+            return;
+        };
+        if self
+            .pdf_ocr_controller
+            .as_ref()
+            .is_none_or(|controller| !Arc::ptr_eq(controller, &request.controller))
+            || self.pdf_ocr.mode == request.mode
+        {
+            return;
+        }
+        match message.message.result {
+            Ok(()) => {
+                if !self.apply_pdf_ocr_view(request.mode, request.target) {
+                    self.pdf_ocr
+                        .retired_sources
+                        .extend(request.controller.retire_inactive());
+                }
+            }
+            Err(error) => {
+                self.pdf_ocr
+                    .retired_sources
+                    .extend(request.controller.retire_inactive());
+                self.show_error(format!(
+                    "{}: {error}",
+                    self.language
+                        .text("加载阅读模式失败", "Failed to load reading view")
+                ));
+            }
+        }
+    }
+
+    fn apply_pdf_ocr_view(
+        &mut self,
+        mode: PdfOcrViewMode,
+        navigation_target: Option<rebook_publication::PublicationUrl>,
+    ) -> bool {
+        let Some(controller) = self.pdf_ocr_controller.clone() else {
+            return false;
+        };
+        let previous_mode = self.pdf_ocr.mode;
         match set_pdf_ocr_view_mode(&self.book_id, mode) {
             Ok(()) => {
                 self.persist_progress();
@@ -521,6 +935,13 @@ impl DesktopReader {
                             self.leave_focus_mode_for_pdf();
                         }
                         self.apply_snapshot(snapshot, SnapshotEffects::static_content_change());
+                        self.pdf_ocr
+                            .retired_sources
+                            .extend(controller.retire_inactive());
+                        self.pdf_ocr.retired_rasters = Some((
+                            self.book_id.clone(),
+                            previous_mode == PdfOcrViewMode::Original,
+                        ));
                         true
                     }
                     Err(error) => {
@@ -611,12 +1032,8 @@ impl DesktopReader {
         let mut failures = std::mem::take(&mut extraction.warnings);
         let mut update = None;
         let mut page_roles_updated = false;
-        if request.need_page_roles
-            && let Err(error) =
-                crate::plugins::save_pdf_ocr_page_roles(&request.book_id, &extraction.page_roles)
-        {
-            failures.push(format!("保存 PDF 特殊页面识别结果失败：{error}"));
-        } else if request.need_page_roles {
+        // Page images and their document references were persisted by the worker.
+        if request.need_page_roles {
             page_roles_updated = true;
         }
         if request.missing.any() {

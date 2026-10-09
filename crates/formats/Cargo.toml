@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyrender.workspace = true
+arc-swap = "1.9.2"
 anyrender_vello_cpu = { version = "0.17.0", default-features = false }
 base64.workspace = true
 crc32fast.workspace = true
@@ -23,6 +24,8 @@ rebook-renderer = { path = "../renderer" }
 rebook-publication = { path = "../publication" }
 roxmltree.workspace = true
 scraper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 zip.workspace = true

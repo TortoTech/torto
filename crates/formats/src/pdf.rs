@@ -1,4 +1,5 @@
 mod catalog;
+pub mod reflow;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -141,7 +142,7 @@ fn open_data(
             metadata: Metadata {
                 title,
                 authors,
-                languages: Vec::new(),
+                languages: catalog.language.into_iter().collect(),
                 layout: RenditionLayout::PrePaginated,
             },
             sections,
@@ -762,6 +763,7 @@ mod tests {
         let publication = open(bytes, "fallback.pdf").unwrap();
         assert_eq!(publication.book().metadata.title, "Test PDF");
         assert_eq!(publication.book().metadata.authors, ["Rebook"]);
+        assert_eq!(publication.book().metadata.languages, ["en-GB"]);
         assert_eq!(
             publication.book().metadata.layout,
             RenditionLayout::PrePaginated
@@ -825,7 +827,7 @@ mod tests {
     fn minimal_pdf() -> Vec<u8> {
         let content = b"BT /F1 12 Tf 20 80 Td (Hello PDF) Tj ET";
         let objects = [
-            b"<< /Type /Catalog /Pages 2 0 R /Outlines 7 0 R >>".to_vec(),
+            b"<< /Type /Catalog /Pages 2 0 R /Outlines 7 0 R /Lang (en-GB) >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 160] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
             format!("<< /Length {} >>\nstream\n", content.len())

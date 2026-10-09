@@ -101,7 +101,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
                 _ => vec![item(1, Some("y=2")), item(0, Some("x=1"))],
             };
             let response =
-                json!({"choices":[{"message":{"content":super::super::super::wire::encode(&json!({"results":results})).to_string()}}]})
+                json!({"choices":[{"index":0,"finish_reason":"stop","message":{"content":super::super::super::wire::encode(&json!({"results":results})).to_string()}}]})
                     .to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
         }
@@ -223,7 +223,7 @@ fn run_batch_fixture(replies: Vec<(Value, Vec<usize>)>) -> Vec<Option<Response>>
             } else {
                 (
                     "200 OK",
-                    json!({"choices":[{"message":{"content":super::super::super::wire::encode(&reply).to_string()}}]}).to_string(),
+                    json!({"choices":[{"index":0,"finish_reason":"stop","message":{"content":super::super::super::wire::encode(&reply).to_string()}}]}).to_string(),
                 )
             };
             write!(socket,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();

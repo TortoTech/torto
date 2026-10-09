@@ -11,8 +11,9 @@ pub(crate) fn builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
 }
 
+#[cfg(test)]
 pub(crate) fn client() -> reqwest::Client {
-    builder().build().expect("HTTP client initialization")
+    builder().build().expect("HTTP client")
 }
 
 #[cfg(test)]

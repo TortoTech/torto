@@ -45,6 +45,7 @@ fn schema() -> Value {
 fn native_search_wire_keeps_functions_and_internal_flags_private() {
     for (kind, model) in [
         (AiProviderKind::OpenAi, "gpt-5"),
+        (AiProviderKind::OpenAi, "gpt-5-2025-08-07"),
         (AiProviderKind::Anthropic, "claude-sonnet-4-6"),
         (AiProviderKind::Gemini, "gemini-3-pro"),
         (AiProviderKind::Xai, "grok-4"),
@@ -93,6 +94,9 @@ fn native_search_wire_keeps_functions_and_internal_flags_private() {
             "{kind:?}: {body}"
         );
         assert!(body.get("_torto_responses").is_none());
+        if kind == AiProviderKind::OpenAi {
+            assert!(body.get("temperature").is_none());
+        }
         if kind == AiProviderKind::Custom {
             assert_eq!(body["_fixture_path"], "/v1/chat/completions");
             assert!(
@@ -216,12 +220,23 @@ fn tool_response(value: Value) -> Value {
 }
 
 pub(crate) fn server(responses: Vec<(u16, Value)>) -> (String, thread::JoinHandle<Vec<Value>>) {
+    server_payloads(
+        responses
+            .into_iter()
+            .map(|(status, value)| (status, "application/json", value.to_string()))
+            .collect(),
+    )
+}
+
+fn server_payloads(
+    responses: Vec<(u16, &'static str, String)>,
+) -> (String, thread::JoinHandle<Vec<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
-        for (status, response) in responses {
+        for (status, content_type, body) in responses {
             let deadline = Instant::now() + Duration::from_secs(15);
             let mut stream = loop {
                 match listener.accept() {
@@ -240,7 +255,7 @@ pub(crate) fn server(responses: Vec<(u16, Value)>) -> (String, thread::JoinHandl
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let mut bytes = Vec::new();
-            let body = loop {
+            let request = loop {
                 let mut buffer = [0; 4096];
                 let count = stream.read(&mut buffer).unwrap();
                 assert_ne!(count, 0);
@@ -271,9 +286,8 @@ pub(crate) fn server(responses: Vec<(u16, Value)>) -> (String, thread::JoinHandl
                     }
                 }
             };
-            requests.push(body);
-            let body = response.to_string();
-            write!(stream,"HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            requests.push(request);
+            write!(stream,"HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         }
         requests
     });
@@ -428,7 +442,7 @@ fn custom_output_defaults_to_prompt_and_deepseek_effort_is_preserved() {
 }
 
 #[test]
-fn malformed_structured_tool_arguments_are_repaired_before_rig_deserialization() {
+fn malformed_structured_tool_arguments_are_repaired_before_validation() {
     let mut response = tool_response(json!({"ok":true}));
     response["choices"][0]["message"]["content"] = json!("");
     response["choices"][0]["finish_reason"] = json!("tool_calls");
@@ -566,9 +580,12 @@ fn xai_responses_output_and_reasoning_use_native_parameter_names() {
     )
     .unwrap();
     let params = native.additional_params.unwrap();
-    assert_eq!(params["text"]["format"]["schema"], schema());
+    assert!(params.get("text").is_none());
     assert_eq!(params["reasoning"]["effort"], "high");
-    assert!(native.output_schema.is_none());
+    assert_eq!(
+        serde_json::to_value(native.output_schema).unwrap(),
+        schema()
+    );
     let (object, _) =
         prepare_output(request, &schema(), OutputMode::JsonObject, provider.kind).unwrap();
     assert_eq!(
@@ -609,31 +626,35 @@ fn task_budget_is_shared_across_corrections_and_fallbacks() {
 
 #[test]
 fn tool_history_keeps_names_ids_and_reasoning_signatures() {
-    use rig_core::message::{Reasoning, ToolCall, ToolFunction};
+    use rig_core::message::{Origin, ToolCall, ToolFunction, ToolName};
+    let provider = AiProvider {
+        kind: AiProviderKind::Anthropic,
+        ..Default::default()
+    };
     let call = ToolCall::from_wire(
         "call-7",
-        ToolFunction {
-            name: "read_book".into(),
-            arguments: json!({"page":1}),
-        },
+        ToolFunction::new(ToolName::new("read_book").unwrap(), json!({"page":1})),
     );
     let response = CompletionResponse::new(
         vec![
-            AssistantContent::Reasoning(Reasoning::new_with_signature(
-                "thinking",
-                Some("signed".into()),
-            )),
+            AssistantContent::reasoning("thinking")
+                .with_native(json!({"type":"thinking","thinking":"thinking","signature":"signed"})),
             AssistantContent::ToolCall(call),
         ],
         Default::default(),
-        "anthropic",
+        Origin::new("anthropic.messages", "anthropic", "test"),
+        json!({"_torto_llm_scope":history::scope(&provider, "test")}),
     );
-    let history = messages_from_legacy(&[
-        response_message(&response),
-        json!({"role":"tool","tool_call_id":"call-7","content":"book text"}),
-    ])
+    let history = history::messages(
+        &provider,
+        "test",
+        &[
+            response_message(&response),
+            json!({"role":"tool","tool_call_id":"call-7","content":"book text"}),
+        ],
+    )
     .unwrap();
-    assert!(matches!(&history[0],Message::Assistant{content,..} if content==&response.choice));
+    assert!(matches!(&history[0],Message::Assistant(turn) if turn.content==response.choice));
     assert!(
         matches!(&history[1],Message::User{content} if matches!(&content[0],UserContent::ToolResult(result) if result.name=="read_book"))
     );
@@ -655,7 +676,7 @@ fn gateway_tools() -> Value {
 }
 
 #[test]
-fn compatible_gateway_signed_history_replays_verbatim_across_tool_rounds() {
+fn compatible_gateway_signed_history_preserves_opaque_fields_across_tool_rounds() {
     let first = signed_gateway_message("call-1");
     let second = signed_gateway_message("call-2");
     let (url, handle) = server(vec![
@@ -682,8 +703,7 @@ fn compatible_gateway_signed_history_replays_verbatim_across_tool_rounds() {
         ))
         .unwrap();
         assert_eq!(message["tool_calls"][0]["id"], id);
-        // Persist/reload the private envelope exactly as callers persist history.
-        history.push(serde_json::from_str(&message.to_string()).unwrap());
+        history.push(message);
         history.push(json!({"role":"tool","tool_call_id":id,"content":"draft"}));
     }
     run(complete(
@@ -697,9 +717,17 @@ fn compatible_gateway_signed_history_replays_verbatim_across_tool_rounds() {
     ))
     .unwrap();
     let requests = handle.join().unwrap();
-    assert_eq!(requests[1]["messages"][1], first);
-    assert_eq!(requests[2]["messages"][1], first);
-    assert_eq!(requests[2]["messages"][3], second);
+    for (replayed, original) in [
+        (&requests[1]["messages"][1], &first),
+        (&requests[2]["messages"][1], &first),
+        (&requests[2]["messages"][3], &second),
+    ] {
+        let mut expected = original.clone();
+        // Rig consolidates duplicate reasoning aliases and omits null content.
+        expected.as_object_mut().unwrap().remove("reasoning");
+        expected.as_object_mut().unwrap().remove("content");
+        assert_eq!(replayed, &expected);
+    }
     assert_eq!(requests[2]["messages"][2]["tool_call_id"], "call-1");
     assert_eq!(requests[2]["messages"][4]["tool_call_id"], "call-2");
     for request in requests {
@@ -730,44 +758,57 @@ fn compatible_gateway_history_is_scoped_and_invalidated_by_core_edits() {
     ))
     .unwrap();
     handle.join().unwrap();
-    assert_eq!(
-        compatible_replay(&provider, "gemini/lite", &[message.clone()]).len(),
-        1
+    let intact = history::messages(&provider, "gemini/lite", &[message.clone()]).unwrap();
+    assert!(
+        matches!(&intact[0], Message::Assistant(turn) if turn.content.iter().any(|p| p.native_item().is_some()))
     );
-    assert!(compatible_replay(&provider, "other-model", &[message.clone()]).is_empty());
-    for changed in [
-        AiProvider {
-            base_url: "http://other/v1".into(),
-            ..provider.clone()
-        },
-        AiProvider {
-            api_key: "second-key".into(),
-            ..provider.clone()
-        },
-        AiProvider {
-            kind: AiProviderKind::Gemini,
-            ..provider.clone()
-        },
+    for (changed, model) in [
+        (provider.clone(), "other-model"),
+        (
+            AiProvider {
+                base_url: "http://other/v1".into(),
+                ..provider.clone()
+            },
+            "gemini/lite",
+        ),
+        (
+            AiProvider {
+                api_key: "second-key".into(),
+                ..provider.clone()
+            },
+            "gemini/lite",
+        ),
+        (
+            AiProvider {
+                kind: AiProviderKind::Gemini,
+                ..provider.clone()
+            },
+            "gemini/lite",
+        ),
     ] {
-        assert!(compatible_replay(&changed, "gemini/lite", &[message.clone()]).is_empty());
+        let projected = history::messages(&changed, model, &[message.clone()]).unwrap();
+        assert!(
+            matches!(&projected[0], Message::Assistant(turn) if turn.content.iter().all(|p| p.native_item().is_none()) && turn.origin.is_none())
+        );
     }
     assert!(!message.to_string().contains("first-key"));
     let mut edited = message;
     let mut core: Message = serde_json::from_value(edited["_rig_message"].clone()).unwrap();
-    if let Message::Assistant { content, .. } = &mut core {
-        for part in content {
+    if let Message::Assistant(turn) = &mut core {
+        for part in &mut turn.content {
             if let AssistantContent::ToolCall(call) = part {
-                call.function.arguments = json!({"offset":9});
+                call.function.arguments = json!({"offset":9}).as_object().unwrap().clone();
             }
         }
     }
     edited["_rig_message"] = serde_json::to_value(core).unwrap();
-    assert!(compatible_replay(&provider, "gemini/lite", &[edited.clone()]).is_empty());
-    let projected = scoped_messages(&provider, "gemini/lite", &[edited.clone()]).unwrap();
-    assert!(matches!(&projected[0], Message::Assistant { content, .. }
-        if !content.iter().any(|part| matches!(part, AssistantContent::Reasoning(_)))));
+    let projected = history::messages(&provider, "gemini/lite", &[edited.clone()]).unwrap();
+    assert!(matches!(&projected[0], Message::Assistant(turn)
+        if !turn.content.iter().any(|part| matches!(part, AssistantContent::Reasoning(_)))));
     edited["_rig_message"]["content"] = json!([]);
-    assert!(compatible_replay(&provider, "gemini/lite", &[edited]).is_empty());
+    assert!(
+        matches!(&history::messages(&provider, "gemini/lite", &[edited]).unwrap()[0], Message::Assistant(turn) if turn.content.is_empty())
+    );
 }
 
 #[test]
@@ -812,4 +853,152 @@ fn incompatible_signed_history_is_not_sent_to_a_different_model() {
     assert!(!echoed.contains("opaque-ciphertext"));
     assert!(!echoed.contains("call-signature"));
     assert!(!echoed.contains("future.gateway.trace"));
+}
+
+#[test]
+fn malformed_business_calls_and_unfinished_responses_are_rejected() {
+    let mut malformed = wire_message(signed_gateway_message("call-1"));
+    malformed["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = json!("{broken");
+    let mut unfinished = text_response("partial answer");
+    unfinished["choices"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("finish_reason");
+    for (response, expected) in [
+        (malformed, "工具参数不是有效 JSON"),
+        (unfinished, "未正常完成"),
+    ] {
+        let (url, handle) = server(vec![(200, response)]);
+        let provider = AiProvider {
+            base_url: url,
+            ..Default::default()
+        };
+        let result = run(complete(
+            &provider,
+            "test",
+            &[json!({"role":"user","content":"inspect"})],
+            Some(&gateway_tools()),
+            None,
+            ReasoningEffort::Default,
+            None,
+        ));
+        assert!(result.unwrap_err().contains(expected));
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn genuine_sse_preserves_signed_calls_and_emits_text_once() {
+    let mut delta = signed_gateway_message("call-sse");
+    delta["tool_calls"][0]["index"] = json!(0);
+    let frames = [
+        json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"Hello "},"finish_reason":null}]}),
+        json!({"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":null}]}),
+        json!({"choices":[{"index":0,"delta":delta,"finish_reason":"tool_calls"}]}),
+    ];
+    let mut sse = frames
+        .iter()
+        .map(|f| format!("data: {f}\n\n"))
+        .collect::<String>();
+    sse.push_str("data: [DONE]\n\n");
+    let (url, handle) = server_payloads(vec![
+        (200, "text/event-stream", sse),
+        (200, "application/json", text_response("done").to_string()),
+    ]);
+    let provider = AiProvider {
+        base_url: url,
+        ..Default::default()
+    };
+    let mut content = Vec::new();
+    let tools = gateway_tools();
+    let mut history = vec![json!({"role":"user","content":"inspect"})];
+    let message = run(stream_with_search(
+        &provider,
+        "gemini/lite",
+        &history,
+        Some(&tools),
+        ReasoningEffort::Default,
+        None,
+        &mut |event| {
+            if let ChatStreamEvent::Content(text) = event {
+                content.push(text);
+            }
+        },
+    ))
+    .unwrap();
+    assert_eq!(content, ["Hello ", "Hello world"]);
+    assert_eq!(message["content"], "Hello world");
+    assert_eq!(message["tool_calls"][0]["id"], "call-sse");
+    history.push(message);
+    history.push(json!({"role":"tool","tool_call_id":"call-sse","content":"draft"}));
+    run(complete(
+        &provider,
+        "gemini/lite",
+        &history,
+        Some(&tools),
+        None,
+        ReasoningEffort::Default,
+        None,
+    ))
+    .unwrap();
+    let requests = handle.join().unwrap();
+    let replay = &requests[1]["messages"][1];
+    assert_eq!(replay["reasoning_details"], delta["reasoning_details"]);
+    assert_eq!(
+        replay["tool_calls"][0]["extra_content"],
+        delta["tool_calls"][0]["extra_content"]
+    );
+    assert_eq!(
+        replay["tool_calls"][0]["gateway_extension"],
+        delta["tool_calls"][0]["gateway_extension"]
+    );
+    assert_eq!(requests[1]["messages"][2]["tool_call_id"], "call-sse");
+}
+
+#[test]
+fn xai_native_schema_and_image_are_encoded_at_the_configured_version_once() {
+    let (url, handle) = server(vec![(400, json!({"error":{"message":"fixture"}}))]);
+    let provider = AiProvider {
+        kind: AiProviderKind::Xai,
+        base_url: url,
+        structured_output: OutputMode::Native,
+        ..Default::default()
+    };
+    let _ = run(complete(
+        &provider,
+        "grok-test",
+        &[
+            json!({"role":"user","content":[{"type":"text","text":"inspect"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8=","detail":"high"}}]}),
+        ],
+        None,
+        None,
+        ReasoningEffort::Default,
+        Some(&schema_options(schema())),
+    ));
+    let requests = handle.join().unwrap();
+    assert_eq!(requests[0]["_fixture_path"], "/v1/responses");
+    assert_eq!(requests[0]["text"]["format"]["type"], "json_schema");
+    assert_eq!(requests[0]["text"]["format"]["schema"], schema());
+    assert!(
+        requests[0]
+            .to_string()
+            .contains("data:image/png;base64,aGVsbG8=")
+    );
+}
+
+#[test]
+fn ollama_retains_native_chat_and_schema_output() {
+    let reply = json!({"model":"test","message":{"role":"assistant","content":"{\"ok\":true}"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":2});
+    let (url, handle) = server(vec![(200, reply)]);
+    let provider = AiProvider {
+        kind: AiProviderKind::Ollama,
+        base_url: url.trim_end_matches("/v1").into(),
+        structured_output: OutputMode::Native,
+        ..Default::default()
+    };
+    let result = run(ask(&provider, schema())).unwrap();
+    assert_eq!(result["_structured_value"], json!({"ok":true}));
+    let requests = handle.join().unwrap();
+    assert_eq!(requests[0]["_fixture_path"], "/api/chat");
+    assert_eq!(requests[0]["format"], schema());
 }

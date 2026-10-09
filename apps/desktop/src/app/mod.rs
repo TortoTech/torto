@@ -378,6 +378,24 @@ impl DesktopApp {
         }
     }
 
+    pub(crate) fn complete_reader_pdf_original(
+        &mut self,
+        message: crate::reader::PdfOriginalTaskMessage,
+    ) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.complete_pdf_original(message);
+        }
+    }
+
+    pub(crate) fn complete_reader_pdf_native(
+        &mut self,
+        message: crate::reader::PdfNativeTaskMessage,
+    ) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.complete_pdf_native(message);
+        }
+    }
+
     pub(crate) fn log_reader_diagnostics(&self, event: &'static str, focused: Option<bool>) {
         if let Some(reader) = self.reader.as_ref() {
             reader.log_diagnostic_snapshot(event, focused);

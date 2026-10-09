@@ -14,6 +14,7 @@ mod table_captions;
 mod web_links;
 pub use raster_cache::{
     RasterCacheStats, RasterOrigin, clear_raster_cache, load_original_raster, raster_cache_stats,
+    retire_publication_rasters,
 };
 pub use semantic_lists::semantic_list_groups;
 
@@ -8304,6 +8305,75 @@ mod tests {
                 prepared.available_width
             );
         }
+    }
+
+    #[test]
+    #[ignore = "Set TORTO_LAYOUT_TEST_TEXT to paragraphs extracted from a local PDF"]
+    fn diagnose_local_pdf_english_hyphenation() {
+        let input = std::fs::read_to_string(
+            std::env::var_os("TORTO_LAYOUT_TEST_TEXT").expect("local paragraph fixture"),
+        )
+        .unwrap();
+        let reader_style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let mut totals = [0; 3];
+        for (index, text) in input.split("\n\n").enumerate() {
+            let mut counts = [0; 3];
+            for (case, explicit_english, languages) in [
+                (0, false, vec![]),
+                (1, false, vec!["en-US".into()]),
+                (2, true, vec![]),
+            ] {
+                let block = TextBlock {
+                    kind: TextBlockKind::Paragraph,
+                    content: vec![Inline::Text(TextRun {
+                        text: text.into(),
+                        style: TextStyle {
+                            language: if explicit_english {
+                                rebook_publication::TextLanguage::English
+                            } else {
+                                rebook_publication::TextLanguage::Unspecified
+                            },
+                            ..TextStyle::default()
+                        },
+                        link: None,
+                    })],
+                    style: BlockStyle::default(),
+                    source: None,
+                };
+                let mut engine = LayoutEngine::new();
+                engine.publication_languages = languages;
+                for width in (360_u16..=840).step_by(40) {
+                    let prepared = engine.shape_text_with_min_width(
+                        &block,
+                        &reader_style,
+                        f32::from(width),
+                        40.0,
+                    );
+                    counts[case] += prepared.hyphens.len();
+                    assert_eq!(
+                        prepared.text.as_ref(),
+                        text,
+                        "display hyphens must not rewrite source text"
+                    );
+                }
+            }
+            assert_eq!(counts[0], 0);
+            for case in 0..3 {
+                totals[case] += counts[case];
+            }
+            eprintln!(
+                "Paragraph {} selected hyphens across 13 widths: unspecified={}, book_en={}, inline_en={}",
+                index + 1,
+                counts[0],
+                counts[1],
+                counts[2]
+            );
+        }
+        assert!(totals[1] > 0 && totals[2] > 0);
+        eprintln!("Totals: {totals:?}");
     }
 
     #[test]

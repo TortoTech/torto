@@ -1,239 +1,20 @@
-//! Tolerate legacy OpenAI-compatible gateways without implementing an SSE
+//! Adapt OpenAI-compatible gateways without implementing an SSE
 //! parser. Real event streams are passed untouched to Rig.
+use crate::plugins::web_search;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use rig_core::http_client::{
     self as http, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
 };
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub(super) struct ReplayMessage {
-    pub expected: Value,
-    pub original: Value,
-}
-
-pub(super) type AssistantCapture = std::sync::Arc<std::sync::Mutex<Option<Value>>>;
-
-#[derive(Clone, Debug)]
-pub(super) struct CompatHttp(
-    pub reqwest::Client,
-    pub Vec<Value>,
-    pub Option<std::sync::Arc<std::sync::Mutex<Vec<crate::plugins::web_search::WebSource>>>>,
-    pub Vec<ReplayMessage>,
-    pub AssistantCapture,
-);
-
-impl Default for CompatHttp {
-    fn default() -> Self {
-        Self(
-            crate::http::client(),
-            Vec::new(),
-            None,
-            Vec::new(),
-            Default::default(),
-        )
-    }
-}
-
-impl CompatHttp {
-    fn prepare<T: Into<Bytes>>(&self, request: Request<T>) -> Request<Bytes> {
-        let (parts, body) = request.into_parts();
-        let mut bytes = body.into();
-        if (!self.1.is_empty() || !self.3.is_empty())
-            && parts.uri.path().ends_with("/chat/completions")
-            && let Ok(mut payload) = serde_json::from_slice::<Value>(&bytes)
-        {
-            if !self.1.is_empty() {
-                if !payload["tools"].is_array() {
-                    payload["tools"] = json!([]);
-                }
-                payload["tools"]
-                    .as_array_mut()
-                    .unwrap()
-                    .extend(self.1.iter().cloned());
-            }
-            if let Some(messages) = payload["messages"].as_array_mut() {
-                // Match the SDK's current serialization, not just a call ID.
-                // Edited turns must never receive an old opaque signature.
-                let mut replay: Vec<_> = self.3.iter().collect();
-                for message in messages {
-                    if let Some(index) = replay.iter().position(|saved| *message == saved.expected)
-                    {
-                        let saved = replay.remove(index);
-                        *message = saved.original.clone();
-                    }
-                }
-            }
-            bytes = Bytes::from(payload.to_string());
-        }
-        #[cfg(debug_assertions)]
-        if let Ok(payload) = serde_json::from_slice::<Value>(&bytes) {
-            // Capture the final wire declarations after Rig serialization and merging.
-            // Never include headers, credentials, messages or function arguments.
-            let declarations = payload
-                .get("tools")
-                .and_then(Value::as_array)
-                .map(|tools| {
-                    tools
-                        .iter()
-                        .map(|tool| {
-                            if tool["type"] == "function" {
-                                json!({"type":"function", "name":tool["function"]["name"]})
-                            } else {
-                                tool.clone()
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let declarations = serde_json::to_string(&declarations).unwrap_or_default();
-            crate::diagnostics::log(
-                "llm.wire.tools",
-                &[
-                    crate::diagnostics::Field::Detail("path", parts.uri.path()),
-                    crate::diagnostics::Field::Detail(
-                        "model",
-                        payload["model"].as_str().unwrap_or_default(),
-                    ),
-                    crate::diagnostics::Field::Detail("tools", &declarations),
-                ],
-            );
-        }
-        let mut request = Request::from_parts(parts, bytes);
-        request.headers_mut().remove("content-length");
-        request
-    }
-}
-
-fn normalize(mut payload: Value) -> Value {
-    if !payload["choices"].is_array() {
-        return payload;
-    }
-    for (key, value) in [
-        ("id", json!("")),
-        ("model", json!("")),
-        ("object", json!("chat.completion")),
-        ("created", json!(0)),
-    ] {
-        if payload.get(key).is_none() {
-            payload[key] = value;
-        }
-    }
-    for (index, choice) in payload["choices"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .enumerate()
-    {
-        if choice.get("index").is_none() {
-            choice["index"] = json!(index);
-        }
-        if choice.get("finish_reason").is_none() {
-            choice["finish_reason"] = json!(if choice["message"]["tool_calls"].is_array() {
-                "tool_calls"
-            } else {
-                "stop"
-            });
-        }
-        if choice["message"].is_object() && choice["message"].get("role").is_none() {
-            choice["message"]["role"] = json!("assistant");
-        }
-        // The transport retains these entries verbatim for the next turn.
-        // Hide only unsupported entries from Rig's typed view; never invent
-        // `data` from `signature`, which are different gateway fields.
-        if let Some(details) = choice
-            .get_mut("message")
-            .and_then(|message| message.get_mut("reasoning_details"))
-            .and_then(Value::as_array_mut)
-        {
-            details.retain(|detail| {
-                serde_json::from_value::<rig_core::providers::openai::completion::ReasoningDetails>(
-                    detail.clone(),
-                )
-                .is_ok()
-            });
-        }
-        // Rig parses tool arguments while decoding the response. Repair our
-        // output-only tool before that boundary; actual agent tools stay strict.
-        if let Some(calls) = choice["message"]["tool_calls"].as_array_mut() {
-            for call in calls {
-                if call["function"]["name"] == super::OUTPUT_TOOL
-                    && let Some(raw) = call["function"]["arguments"].as_str()
-                    && serde_json::from_str::<Value>(raw).is_err()
-                    && let Ok(value) = crate::plugins::llm_json::parse::<Value>(raw)
-                {
-                    call["function"]["arguments"] = Value::String(value.to_string());
-                }
-            }
-        }
-        // Some gateways emit both aliases. Serde treats them as the same field
-        // and rejects the whole response, including otherwise valid tool calls.
-        if let Some(message) = choice["message"].as_object_mut()
-            && message.contains_key("reasoning_content")
-            && let Some(alias) = message.remove("reasoning")
-            && message["reasoning_content"]
-                .as_str()
-                .is_none_or(str::is_empty)
-        {
-            message.insert("reasoning_content".into(), alias);
-        }
-    }
-    payload
-}
-
-fn capture_assistant(payload: &Value, capture: &AssistantCapture) {
-    let Some(message) = payload.pointer("/choices/0/message") else {
-        return;
-    };
-    let has_extensions = message
-        .get("reasoning_details")
-        .is_some_and(|v| v.as_array().is_some_and(|details| !details.is_empty()))
-        || ["extra_content", "signature", "thought_signature"]
-            .iter()
-            .any(|key| message.get(*key).is_some())
-        || message["tool_calls"].as_array().is_some_and(|calls| {
-            calls.iter().any(|call| {
-                call.as_object().is_some_and(|fields| {
-                    fields
-                        .keys()
-                        .any(|key| !matches!(key.as_str(), "id" | "index" | "type" | "function"))
-                })
-            })
-        });
-    if has_extensions {
-        *capture
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.clone());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn duplicate_reasoning_aliases_preserve_tools_and_signed_details() {
-        let payload = json!({"choices":[{"message":{"role":"assistant","content":"Looking at pages",
-            "reasoning":"think","reasoning_content":"think",
-            "reasoning_details":[{"type":"reasoning.text","text":"think","signature":"signed","index":0}],
-            "tool_calls":[{"id":"c1","index":0,"type":"function","function":{"name":"overview_pages","arguments":"{\"pages\":[1]}"}}]}}]});
-        let normalized = normalize(payload);
-        let parsed: rig_core::providers::openai::completion::CompletionResponse =
-            serde_json::from_value(normalized.clone()).unwrap();
-        assert_eq!(
-            normalized["choices"][0]["message"]["reasoning_content"],
-            "think"
-        );
-        assert_eq!(
-            normalized["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
-            "overview_pages"
-        );
-        assert_eq!(
-            normalized["choices"][0]["message"]["reasoning_details"][0]["signature"],
-            "signed"
-        );
-        drop(parsed);
-    }
+/// Preserve JSON replies from gateways that ignore the streaming flag, and
+/// capture hosted-search sources. Rig handles message decoding and tool merging.
+#[derive(Clone)]
+pub(super) struct CompatHttp {
+    pub inner: rig_reqwest::ReqwestClient,
+    pub sources: Option<Arc<Mutex<Vec<web_search::WebSource>>>>,
 }
 
 impl HttpClientExt for CompatHttp {
@@ -245,11 +26,9 @@ impl HttpClientExt for CompatHttp {
         T: Into<Bytes> + Send,
         U: From<Bytes> + Send + 'static,
     {
-        let request = self.prepare(request);
         let compatible = request.uri().path().ends_with("/chat/completions");
-        let pending = self.0.send::<Bytes, Bytes>(request);
-        let sources = self.2.clone();
-        let capture = self.4.clone();
+        let pending = self.inner.send::<T, Bytes>(request);
+        let sources = self.sources.clone();
         async move {
             let response = pending.await?;
             let success = response.status().is_success();
@@ -259,18 +38,15 @@ impl HttpClientExt for CompatHttp {
                 let bytes = body.await?;
                 if compatible
                     && success
+                    && let Some(sources) = sources
                     && let Ok(payload) = serde_json::from_slice::<Value>(&bytes)
                 {
-                    capture_assistant(&payload, &capture);
-                    if let Some(sources) = sources {
-                        crate::plugins::web_search::collect_sources(
-                            &payload,
-                            &mut sources
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        );
-                    }
-                    return Ok(U::from(Bytes::from(normalize(payload).to_string())));
+                    crate::plugins::web_search::collect_sources(
+                        &payload,
+                        &mut sources
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
                 }
                 Ok(U::from(bytes))
             });
@@ -285,7 +61,7 @@ impl HttpClientExt for CompatHttp {
     where
         U: From<Bytes> + Send + 'static,
     {
-        self.0.send_multipart(request)
+        self.inner.send_multipart(request)
     }
 
     fn send_streaming<T>(
@@ -295,12 +71,10 @@ impl HttpClientExt for CompatHttp {
     where
         T: Into<Bytes> + Send,
     {
-        let request = self.prepare(request);
         let compatible = request.uri().path().ends_with("/chat/completions");
-        let sources = self.2.clone();
-        let capture = self.4.clone();
+        let sources = self.sources.clone();
         async move {
-            let response = self.0.send_streaming(request).await?;
+            let response = self.inner.send_streaming(request).await?;
             let is_json = response
                 .headers()
                 .get("content-type")
@@ -312,7 +86,7 @@ impl HttpClientExt for CompatHttp {
                 {
                     let (parts, stream) = response.into_parts();
                     let mut pending = Vec::new();
-                    let stream: http::sse::BoxedStream = Box::pin(stream.map(move |chunk| {
+                    let stream: http::BoxedStream = Box::pin(stream.map(move |chunk| {
                         if let Ok(bytes) = &chunk {
                             if pending.len() + bytes.len() <= 2 * 1024 * 1024 {
                                 pending.extend_from_slice(bytes);
@@ -346,7 +120,6 @@ impl HttpClientExt for CompatHttp {
             }
             let payload: Value =
                 serde_json::from_slice(&bytes).map_err(|e| http::Error::Instance(Box::new(e)))?;
-            capture_assistant(&payload, &capture);
             if let Some(sources) = sources {
                 crate::plugins::web_search::collect_sources(
                     &payload,
@@ -355,10 +128,11 @@ impl HttpClientExt for CompatHttp {
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
                 );
             }
-            let mut payload = normalize(payload);
+            let mut payload = payload;
+            payload["object"] = json!("chat.completion.chunk");
             let choices = payload["choices"]
                 .as_array_mut()
-                .ok_or_else(|| http::Error::Instance("AI 鍝嶅簲缂哄皯 choices".into()))?;
+                .ok_or_else(|| http::Error::Instance("AI 响应缺少 choices".into()))?;
             for choice in choices {
                 let mut delta = choice
                     .as_object_mut()
@@ -377,7 +151,7 @@ impl HttpClientExt for CompatHttp {
             );
             parts.headers.remove("content-length");
             let event = Bytes::from(format!("data: {payload}\n\ndata: [DONE]\n\n"));
-            let stream: http::sse::BoxedStream =
+            let stream: http::BoxedStream =
                 Box::pin(futures_util::stream::once(async move { Ok(event) }));
             Ok(Response::from_parts(parts, stream))
         }

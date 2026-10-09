@@ -241,7 +241,7 @@ fn heading_match_key(text: &str) -> String {
         .collect()
 }
 
-fn split_heading_label(label: &str) -> Option<(String, &str)> {
+pub(crate) fn split_heading_label(label: &str) -> Option<(String, &str)> {
     let trimmed = label.trim();
     // Prefer the longest valid prefix: dotted ordinals and number words can
     // contain punctuation/spaces themselves. Require a textual title after it.

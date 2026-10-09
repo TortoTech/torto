@@ -30,6 +30,13 @@ use crate::generated_toc::GeneratedTocEntry;
 use crate::persistence::write_bytes_atomic;
 use crate::persistence::write_json_atomic;
 
+mod cache;
+mod original;
+mod structure;
+pub(crate) use cache::{PdfModeSource, RetiredPdfSource};
+use original::{cache_original_resources, store_special_page_images};
+pub(crate) use original::{cache_pdf_original_source, open_cached_pdf_ocr_original};
+
 const PDF_OCR_VERSION: u8 = 1;
 const PDF_OCR_DIRECTORY: &str = "pdf-ocr";
 const DOCUMENT_FILE: &str = "document.json";
@@ -90,6 +97,8 @@ pub(crate) struct PdfOcrSourceController {
     original_page_targets: Vec<PublicationUrl>,
     reflow_page_targets: Vec<PublicationUrl>,
     reflow_enabled: AtomicBool,
+    original_cache: Option<Arc<PdfModeSource>>,
+    reflow_cache: Option<Arc<PdfModeSource>>,
 }
 
 impl PdfOcrSourceController {
@@ -111,6 +120,8 @@ impl PdfOcrSourceController {
             original_page_targets,
             reflow_page_targets,
             reflow_enabled: AtomicBool::new(mode == PdfOcrViewMode::Reflow),
+            original_cache: None,
+            reflow_cache: None,
         }
     }
 
@@ -125,6 +136,38 @@ impl PdfOcrSourceController {
 
     pub(crate) fn original_source(&self) -> Arc<dyn BookSource> {
         Arc::clone(&self.original)
+    }
+
+    pub(crate) fn prepare_mode(&self, mode: PdfOcrViewMode) -> Result<Arc<dyn BookSource>, String> {
+        match mode {
+            PdfOcrViewMode::Original => {
+                if let Some(cache) = &self.original_cache {
+                    cache.prepare()?;
+                }
+                Ok(self.original.clone())
+            }
+            PdfOcrViewMode::Reflow => {
+                if let Some(cache) = &self.reflow_cache {
+                    cache.prepare()?;
+                }
+                Ok(self.reflow.clone())
+            }
+        }
+    }
+
+    pub(crate) fn original_lease(&self) -> Result<Arc<dyn BookSource>, String> {
+        self.original_cache
+            .as_ref()
+            .map_or_else(|| Ok(self.original.clone()), |cache| cache.lease())
+    }
+
+    pub(crate) fn retire_inactive(&self) -> Vec<RetiredPdfSource> {
+        let cache = if self.is_reflow_enabled() {
+            &self.original_cache
+        } else {
+            &self.reflow_cache
+        };
+        cache.iter().map(|cache| cache.retire()).collect()
     }
 
     pub(crate) fn reflow_target_for_page(&self, page_index: usize) -> Option<PublicationUrl> {
@@ -144,6 +187,55 @@ impl PdfOcrSourceController {
             .parse::<usize>()
             .ok()?;
         self.original_target_for_page(page_number.checked_sub(1)?)
+    }
+
+    pub(crate) fn remap_locator(&self, locator: &mut rebook_publication::LocatorV1) {
+        if self
+            .book()
+            .sections
+            .iter()
+            .any(|s| s.href.path() == locator.href.path())
+        {
+            return;
+        }
+        let page = locator
+            .href
+            .fragment()
+            .and_then(|f| f.strip_prefix(PDF_PAGE_ANCHOR_PREFIX))
+            .and_then(|p| p.parse::<usize>().ok())
+            .and_then(|p| p.checked_sub(1))
+            .or_else(|| {
+                self.original.book().sections.iter().position(|s| {
+                    s.href.path() == locator.href.path()
+                        || locator
+                            .source
+                            .as_ref()
+                            .is_some_and(|range| range.start.spine == s.id)
+                })
+            })
+            .or_else(|| {
+                locator
+                    .source
+                    .as_ref()
+                    .and_then(|s| s.start.node.strip_prefix('p'))
+                    .and_then(|s| s.split('-').next())
+                    .and_then(|p| p.parse::<usize>().ok())
+                    .and_then(|p| p.checked_sub(1))
+            });
+        if let Some(page) = page
+            && let Some(target) = if self.is_reflow_enabled() {
+                self.reflow_target_for_page(page)
+            } else {
+                self.original_target_for_page(page)
+            }
+        {
+            locator.href = target;
+            locator.source = None;
+            locator.partial_cfi = None;
+            locator.text = None;
+            locator.progression = None;
+            locator.position = None;
+        }
     }
 
     fn active(&self) -> &Arc<dyn BookSource> {
@@ -198,11 +290,18 @@ struct StoredPdfOcrDocument {
     resources: Vec<StoredOcrResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     page_roles: Vec<PdfOcrPageRoleAssignment>,
+    /// Original navigation and metadata, without retaining the PDF bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_book: Option<Book>,
+    #[serde(default)]
+    original_toc_origin: TableOfContentsOrigin,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct StoredOcrPage {
     markdown: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    blocks: Vec<structure::StoredBlock>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -292,6 +391,8 @@ struct OcrReflowBookSource {
     toc_anchors: Vec<Vec<OcrTocAnchor>>,
     page_roles: HashMap<usize, PdfOcrPageRole>,
     resources: HashMap<String, StoredResourceLocation>,
+    heading_hints: rebook_formats::reflow::HeadingHints,
+    normalize: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -314,7 +415,11 @@ struct StoredResourceLocation {
 pub(crate) fn load_pdf_ocr_source(
     source: Arc<dyn BookSource>,
     reflow_content: bool,
+    original_cache: Option<Arc<PdfModeSource>>,
 ) -> io::Result<PdfOcrLoadedSource> {
+    if let Some(loaded) = super::pdf_native::load(source.clone(), original_cache.clone())? {
+        return Ok(loaded);
+    }
     let book_id = source.book().id.to_string();
     let Some(document) = load_document(&book_id)? else {
         return Ok(PdfOcrLoadedSource {
@@ -324,6 +429,7 @@ pub(crate) fn load_pdf_ocr_source(
             mode: PdfOcrViewMode::Original,
         });
     };
+    let document = cache_original_resources(&book_id, source.as_ref(), document)?;
     let mode = load_pdf_ocr_view_mode(&book_id, document.view_mode)?;
     let reflow = Arc::new(OcrReflowBookSource::new(
         Arc::clone(&source),
@@ -331,13 +437,30 @@ pub(crate) fn load_pdf_ocr_source(
         reflow_content,
     )?);
     let reflow_page_targets = reflow.page_targets.clone();
-    let reflow_source: Arc<dyn BookSource> = reflow;
-    let controller = Arc::new(PdfOcrSourceController::new(
-        source,
-        reflow_source,
-        reflow_page_targets,
-        mode,
+    let reload_original = source.clone();
+    let reload_id = book_id.clone();
+    let reflow_cache = Arc::new(PdfModeSource::new(
+        reflow.book().clone(),
+        reflow.table_of_contents_origin(),
+        Some(reflow),
+        move || {
+            let document = load_document(&reload_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Cached OCR document is missing".to_owned())?;
+            OcrReflowBookSource::new(reload_original.clone(), document, reflow_content)
+                .map(|source| Arc::new(source) as Arc<dyn BookSource>)
+                .map_err(|error| error.to_string())
+        },
     ));
+    let reflow_source: Arc<dyn BookSource> = reflow_cache.clone();
+    let mut controller =
+        PdfOcrSourceController::new(source, reflow_source, reflow_page_targets, mode);
+    controller.original_cache = original_cache;
+    controller.reflow_cache = Some(reflow_cache);
+    // Reader construction runs on a worker, so the initial inactive payload
+    // can be destroyed here without retaining it for the reader's lifetime.
+    drop(controller.retire_inactive());
+    let controller = Arc::new(controller);
     Ok(PdfOcrLoadedSource {
         source: controller.clone(),
         controller: Some(controller),
@@ -347,6 +470,9 @@ pub(crate) fn load_pdf_ocr_source(
 }
 
 pub(crate) fn set_pdf_ocr_view_mode(book_id: &str, mode: PdfOcrViewMode) -> io::Result<()> {
+    if super::pdf_native::selected(book_id) == super::pdf_native::TextSource::Native {
+        return super::pdf_native::set_mode(book_id, mode);
+    }
     if !document_path(book_id)?.try_exists()? {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -354,6 +480,30 @@ pub(crate) fn set_pdf_ocr_view_mode(book_id: &str, mode: PdfOcrViewMode) -> io::
         ));
     }
     write_json_atomic(&view_mode_path(book_id)?, &mode)
+}
+
+pub(super) fn loaded_reflow(
+    original: Arc<dyn BookSource>,
+    reflow_cache: Arc<PdfModeSource>,
+    original_cache: Option<Arc<PdfModeSource>>,
+    targets: Vec<PublicationUrl>,
+    mode: PdfOcrViewMode,
+) -> PdfOcrLoadedSource {
+    let mut controller = PdfOcrSourceController::new(original, reflow_cache.clone(), targets, mode);
+    controller.original_cache = original_cache;
+    controller.reflow_cache = Some(reflow_cache);
+    drop(controller.retire_inactive());
+    let controller = Arc::new(controller);
+    PdfOcrLoadedSource {
+        source: controller.clone(),
+        controller: Some(controller),
+        available: true,
+        mode,
+    }
+}
+
+pub(crate) fn pdf_ocr_result_available(book_id: &str) -> io::Result<bool> {
+    Ok(load_document(book_id)?.is_some())
 }
 
 pub(crate) fn has_pending_pdf_ocr_task(
@@ -488,7 +638,16 @@ where
         .await?;
     normalize_page_count(&mut parsed.pages, page_count);
     progress("正在生成可重排正文…".into());
-    save_document(book_id, parsed).map_err(|error| format!("保存 PDF OCR 结果失败：{error}"))?;
+    let save_path = path.clone();
+    let save_id = book_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let original = rebook_formats::open_file_for_reading(&save_path, Some(&save_id))
+            .map_err(io::Error::other)?;
+        save_document_with_source(&save_id, parsed, Some(original.source()))
+    })
+    .await
+    .map_err(|error| format!("保存 PDF OCR 结果失败：{error}"))?
+    .map_err(|error| format!("保存 PDF OCR 结果失败：{error}"))?;
     if settings.pdf_ocr_provider == PdfOcrProviderKind::PaddleOcr
         && let Err(error) = clear_paddle_job(book_id)
     {
@@ -602,6 +761,7 @@ where
         {
             chunk_pages.push(StoredOcrPage {
                 markdown: download_text(client, url, "PaddleOCR Markdown").await?,
+                ..Default::default()
             });
         }
         if chunk_pages.is_empty() {
@@ -915,15 +1075,20 @@ async fn parse_paddle_jsonl(
                 if markdown.trim().is_empty() {
                     pages.push(StoredOcrPage {
                         markdown: format!("## 第 {} 页\n\n本页未识别到正文。", page_index + 1),
+                        ..Default::default()
                     });
                 } else {
-                    pages.push(StoredOcrPage { markdown });
+                    pages.push(StoredOcrPage {
+                        markdown,
+                        blocks: structure::paddle_blocks(entry),
+                    });
                 }
             }
         } else if let Some(entries) = result.get("ocrResults").and_then(Value::as_array) {
             for entry in entries {
                 pages.push(StoredOcrPage {
                     markdown: plain_paddle_text(entry),
+                    ..Default::default()
                 });
             }
         }
@@ -1138,6 +1303,7 @@ fn parse_mineru_zip(bytes: Vec<u8>) -> Result<(Vec<StoredOcrPage>, Vec<OcrResour
     {
         pages.push(StoredOcrPage {
             markdown: String::from_utf8_lossy(content).into_owned(),
+            ..Default::default()
         });
     }
     for page in &mut pages {
@@ -1156,35 +1322,20 @@ fn mineru_pages_from_value(value: &Value) -> Vec<StoredOcrPage> {
     if items.first().is_some_and(Value::is_array) {
         return items
             .iter()
-            .map(|page| StoredOcrPage {
-                markdown: page
-                    .as_array()
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(mineru_item_markdown)
-                            .collect::<Vec<_>>()
-                            .join("\n\n")
-                    })
-                    .unwrap_or_default(),
-            })
+            .map(|page| structure::mineru_page(page.as_array().map_or(&[][..], Vec::as_slice)))
             .collect();
     }
-    let mut pages = BTreeMap::<usize, Vec<String>>::new();
+    let mut pages = BTreeMap::<usize, Vec<&Value>>::new();
     for item in items {
         let page = item
             .get("page_idx")
             .and_then(value_as_usize)
             .unwrap_or_default();
-        if let Some(markdown) = mineru_item_markdown(item) {
-            pages.entry(page).or_default().push(markdown);
-        }
+        pages.entry(page).or_default().push(item);
     }
     let page_count = pages.keys().next_back().map_or(0, |page| page + 1);
     (0..page_count)
-        .map(|page| StoredOcrPage {
-            markdown: pages.remove(&page).unwrap_or_default().join("\n\n"),
-        })
+        .map(|page| structure::mineru_page(pages.remove(&page).unwrap_or_default()))
         .collect()
 }
 
@@ -1212,9 +1363,20 @@ fn mineru_item_markdown(item: &Value) -> Option<String> {
                 let caption = item
                     .get("image_caption")
                     .or_else(|| item.get("chart_caption"))
+                    .or_else(|| item.pointer("/content/image_caption"))
+                    .or_else(|| item.pointer("/content/chart_caption"))
+                    .or_else(|| item.pointer("/content/caption"))
                     .map(preferred_text)
                     .unwrap_or_default();
-                format!("![{}]({path})", caption.trim())
+                if caption.trim().is_empty() {
+                    format!("![]({path})")
+                } else {
+                    format!(
+                        "<figure><img src=\"{}\" alt=\"\" /><figcaption>{}</figcaption></figure>",
+                        quick_xml::escape::escape(path),
+                        quick_xml::escape::escape(caption.trim())
+                    )
+                }
             })
             .or_else(|| (!content.is_empty()).then_some(content))
         }
@@ -1455,7 +1617,16 @@ fn normalize_page_range(pages: &mut Vec<StoredOcrPage>, start_page: usize, end_p
     }
 }
 
+#[cfg(test)]
 fn save_document(book_id: &str, parsed: ParsedOcrDocument) -> io::Result<()> {
+    save_document_with_source(book_id, parsed, None)
+}
+
+fn save_document_with_source(
+    book_id: &str,
+    parsed: ParsedOcrDocument,
+    original: Option<Arc<dyn BookSource>>,
+) -> io::Result<()> {
     // Serialize final local writes with cloud imports so a finishing provider
     // cannot replace the result which just superseded its task.
     let tasks = PDF_OCR_TASKS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1480,7 +1651,7 @@ fn save_document(book_id: &str, parsed: ParsedOcrDocument) -> io::Result<()> {
             })
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let document = StoredPdfOcrDocument {
+    let mut document = StoredPdfOcrDocument {
         version: PDF_OCR_VERSION,
         book_id: book_id.to_owned(),
         provider: parsed.provider,
@@ -1489,7 +1660,16 @@ fn save_document(book_id: &str, parsed: ParsedOcrDocument) -> io::Result<()> {
         pages: parsed.pages,
         resources,
         page_roles: load_pdf_ocr_page_roles(book_id)?,
+        original_book: original.as_ref().map(|source| source.book().clone()),
+        original_toc_origin: original
+            .as_ref()
+            .map_or_else(TableOfContentsOrigin::default, |source| {
+                source.table_of_contents_origin()
+            }),
     };
+    if let Some(original) = original {
+        store_special_page_images(&resource_directory, original.as_ref(), &mut document)?;
+    }
     write_json_atomic(&directory.join(DOCUMENT_FILE), &document)?;
     write_json_atomic(&directory.join(VIEW_MODE_FILE), &PdfOcrViewMode::Reflow)?;
     crate::sync::mark_derived_dirty(book_id, crate::sync::DerivedDataKind::Ocr)
@@ -1498,7 +1678,12 @@ fn save_document(book_id: &str, parsed: ParsedOcrDocument) -> io::Result<()> {
 pub(crate) fn save_pdf_ocr_page_roles(
     book_id: &str,
     roles: &[PdfOcrPageRoleAssignment],
+    original: &dyn BookSource,
 ) -> io::Result<()> {
+    let tasks = PDF_OCR_TASKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let _tasks = tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let directory = book_directory(book_id)?;
     fs::create_dir_all(&directory)?;
     let mut roles = roles.to_vec();
@@ -1515,6 +1700,11 @@ pub(crate) fn save_pdf_ocr_page_roles(
     )?;
     if let Some(mut document) = load_document(book_id)? {
         document.page_roles = roles;
+        if document.original_book.is_none() {
+            document.original_book = Some(original.book().clone());
+            document.original_toc_origin = original.table_of_contents_origin();
+        }
+        store_special_page_images(&directory.join("resources"), original, &mut document)?;
         write_json_atomic(&directory.join(DOCUMENT_FILE), &document)?;
         crate::sync::mark_derived_dirty(book_id, crate::sync::DerivedDataKind::Ocr)?;
     }
@@ -1716,32 +1906,6 @@ fn book_directory(book_id: &str) -> io::Result<PathBuf> {
         .join(safe_id))
 }
 
-fn reflow_ocr_page_boundaries(
-    pages: &mut [StoredOcrPage],
-    page_roles: &HashMap<usize, PdfOcrPageRole>,
-) {
-    for index in 0..pages.len().saturating_sub(1) {
-        if page_roles.contains_key(&index) || page_roles.contains_key(&(index + 1)) {
-            continue;
-        }
-        let mut current = markdown_blocks(&pages[index].markdown);
-        let mut next = markdown_blocks(&pages[index + 1].markdown);
-        let Some((tail, head)) = current.last().zip(next.first()) else {
-            continue;
-        };
-        if !should_join_page_paragraphs(tail, head) {
-            continue;
-        }
-        let merged = join_page_paragraphs(tail, head);
-        if let Some(tail) = current.last_mut() {
-            *tail = merged;
-        }
-        next.remove(0);
-        pages[index].markdown = current.join("\n\n");
-        pages[index + 1].markdown = next.join("\n\n");
-    }
-}
-
 fn remove_missing_ocr_page_placeholders(pages: &mut [StoredOcrPage]) {
     static PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
     let regex = PLACEHOLDER.get_or_init(|| {
@@ -1755,77 +1919,6 @@ fn remove_missing_ocr_page_placeholders(pages: &mut [StoredOcrPage]) {
             page.markdown.clear();
         }
     }
-}
-
-fn markdown_blocks(markdown: &str) -> Vec<String> {
-    markdown
-        .replace("\r\n", "\n")
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|block| !block.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn should_join_page_paragraphs(tail: &str, head: &str) -> bool {
-    if !is_plain_ocr_paragraph(tail) || !is_plain_ocr_paragraph(head) {
-        return false;
-    }
-    let tail = tail.trim_end();
-    let head = head.trim_start();
-    if tail.is_empty() || head.is_empty() {
-        return false;
-    }
-    if tail.ends_with(['-', '‐', '‑', '\u{ad}']) {
-        return true;
-    }
-    let terminal = tail
-        .trim_end_matches(['”', '’', '"', '\'', ')', '）', ']', '】'])
-        .chars()
-        .next_back();
-    match terminal {
-        Some('.') => head.chars().next().is_some_and(char::is_lowercase),
-        Some(character) if rebook_reader::is_sentence_terminal(character) => false,
-        Some(_) => true,
-        None => false,
-    }
-}
-
-fn is_plain_ocr_paragraph(block: &str) -> bool {
-    let options = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH;
-    let mut events = Parser::new_ext(block.trim(), options);
-    if !matches!(events.next(), Some(Event::Start(Tag::Paragraph))) {
-        return false;
-    }
-    !events.any(|event| {
-        matches!(
-            event,
-            Event::Start(Tag::Image { .. })
-                | Event::Html(_)
-                | Event::InlineHtml(_)
-                | Event::DisplayMath(_)
-        )
-    })
-}
-
-fn join_page_paragraphs(tail: &str, head: &str) -> String {
-    let mut tail = tail.trim_end().to_owned();
-    let head = head.trim_start();
-    if tail.ends_with(['-', '‐', '‑', '\u{ad}']) {
-        tail.pop();
-        tail.push_str(head);
-        return tail;
-    }
-    let insert_space = tail
-        .chars()
-        .next_back()
-        .zip(head.chars().next())
-        .is_some_and(|(left, right)| left.is_ascii_alphanumeric() && right.is_ascii_alphanumeric());
-    if insert_space {
-        tail.push(' ');
-    }
-    tail.push_str(head);
-    tail
 }
 
 impl OcrReflowBookSource {
@@ -1862,9 +1955,6 @@ impl OcrReflowBookSource {
             .collect::<HashMap<_, _>>();
         let mut pages = document.pages;
         remove_missing_ocr_page_placeholders(&mut pages);
-        if reflow_content {
-            reflow_ocr_page_boundaries(&mut pages, &page_roles);
-        }
         let reflow_sections = if reflow_content {
             build_continuous_reflow_sections(&mut book, &pages, inner.table_of_contents_origin())?
         } else {
@@ -1882,6 +1972,7 @@ impl OcrReflowBookSource {
                 toc_anchors: vec![Vec::new(); pages.len()],
             }
         };
+        let heading_hints = rebook_formats::reflow::HeadingHints::new(&book.table_of_contents);
         Ok(Self {
             inner,
             book,
@@ -1891,6 +1982,8 @@ impl OcrReflowBookSource {
             toc_anchors: reflow_sections.toc_anchors,
             page_roles,
             resources,
+            heading_hints,
+            normalize: reflow_content,
         })
     }
 }
@@ -1939,8 +2032,12 @@ fn build_continuous_reflow_sections(
         let href = PublicationUrl::parse(&format!("Text/ocr-reflow-{}.xhtml", index + 1))
             .map_err(publication_io_error)?;
         sections.push(SpineItem {
-            id: SpineItemId::new(format!("pdf-ocr-reflow-{}", index + 1))
-                .map_err(publication_io_error)?,
+            id: SpineItemId::new(format!(
+                "pdf-ocr-reflow-v{}-{}",
+                rebook_formats::reflow::VERSION,
+                index + 1
+            ))
+            .map_err(publication_io_error)?,
             href: href.clone(),
             media_type: "application/xhtml+xml".into(),
             linear: true,
@@ -2138,28 +2235,19 @@ impl BookSource for OcrReflowBookSource {
                 page_index + 1
             );
             if self.page_roles.contains_key(&page_index) {
-                if let Ok(page) = self.inner.parse_section(page_index)
-                    && let Some(image) = page.blocks.iter().find_map(|block| match block {
-                        rebook_publication::Block::Image(image) => Some(image),
-                        rebook_publication::Block::Figure(figure) => figure.images.first(),
-                        rebook_publication::Block::Text(_)
-                        | rebook_publication::Block::Quote(_)
-                        | rebook_publication::Block::Table(_)
-                        | rebook_publication::Block::Note(_)
-                        | rebook_publication::Block::Separator(_)
-                        | rebook_publication::Block::LineBreak
-                        | rebook_publication::Block::PageBreak => None,
-                    })
-                {
+                let href = format!("OcrResources/pdf-original-page-{:05}.png", page_index + 1);
+                if self.resources.contains_key(&href) {
                     let _ = write!(
                         body,
                         r#"<img src="{}" alt="PDF page {}" style="display:block;max-width:100%;max-height:100%;margin:0 auto" />"#,
-                        format_args!("../{}", image.href.path()),
+                        format_args!("../{href}"),
                         page_index + 1
                     );
+                    body.push_str("<br />");
+                    continue;
                 }
-                body.push_str("<br />");
-                continue;
+                // A missing derived image must not synchronously open the PDF.
+                // Keep the cached OCR text visible until resources are repaired.
             }
             let markdown = self
                 .pages
@@ -2175,8 +2263,18 @@ impl BookSource for OcrReflowBookSource {
         let document = format!(
             "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title></title><style>h1 {{ font-size: 1.75em; margin-top: 32px; margin-bottom: 12px; }} h2 {{ font-size: 1.5em; margin-top: 28px; margin-bottom: 10px; }} h3 {{ font-size: 1.28em; margin-top: 22px; margin-bottom: 8px; }} h4, h5, h6 {{ font-size: 1.12em; margin-top: 18px; margin-bottom: 6px; }}</style></head><body>{body}</body></html>"
         );
-        rebook_html::parse_section(&document, descriptor, |_| None)
-            .map_err(|error| PublicationError::InvalidPublication(error.to_string()))
+        let mut section = rebook_html::parse_section(&document, descriptor, |_| None)
+            .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
+        if self.normalize {
+            let continuations = structure::apply(&mut section, &self.pages[range.clone()]);
+            rebook_formats::reflow::normalize_ocr_with_continuations(
+                &mut section,
+                &self.heading_hints,
+                PDF_PAGE_ANCHOR_PREFIX,
+                &continuations,
+            );
+        }
+        Ok(section)
     }
 
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
@@ -2196,17 +2294,14 @@ impl BookSource for OcrReflowBookSource {
                 bytes: bytes.into(),
             });
         }
-        self.inner.resource(href)
+        Err(PublicationError::ResourceNotFound(href.to_string()))
     }
 
     fn raster_resource(
         &self,
-        href: &PublicationUrl,
+        _href: &PublicationUrl,
     ) -> Result<Option<RasterResource>, PublicationError> {
-        if self.resources.contains_key(href.resource_url().path()) {
-            return Ok(None);
-        }
-        self.inner.raster_resource(href)
+        Ok(None)
     }
 }
 
@@ -2900,7 +2995,18 @@ fn sanitize_ocr_structure_tag(tag: &str) -> Option<String> {
     let name = inner[..name_end].to_ascii_lowercase();
     if !matches!(
         name.as_str(),
-        "div" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "br"
+        "div"
+            | "figure"
+            | "figcaption"
+            | "table"
+            | "thead"
+            | "tbody"
+            | "tfoot"
+            | "tr"
+            | "td"
+            | "th"
+            | "caption"
+            | "br"
     ) {
         return None;
     }
@@ -3084,6 +3190,52 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "reads an explicitly selected local OCR cache without changing it"]
+    fn local_shared_ocr_reflow() {
+        use rebook_publication::{Block, TextBlockKind};
+        let book_id = std::env::var("TORTO_DIAG_BOOK_ID").unwrap();
+        let document = load_document(&book_id).unwrap().unwrap();
+        let book = document
+            .original_book
+            .clone()
+            .expect("cached original descriptor");
+        let original: Arc<dyn BookSource> = Arc::new(StubBookSource { book });
+        let source = OcrReflowBookSource::new(original, document, true).unwrap();
+        let mut matched = 0;
+        let started = std::time::Instant::now();
+        for index in 0..source.book.sections.len() {
+            let section = source.parse_section(index).unwrap();
+            let plain = rebook_formats::reflow::text;
+            for expected in [
+                ("The user interface", "for the TX-2", "Figure 2.8"),
+                (
+                    "was first demonstrated",
+                    "by Ivan Sutherland",
+                    "Figure 2.24",
+                ),
+            ] {
+                if let Some(figure_index) = section.blocks.iter().position(|b| matches!(b, Block::Figure(f) if f.captions.iter().any(|t| plain(t).starts_with(expected.2)))) {
+                    let Some(Block::Text(body)) = figure_index.checked_sub(1).and_then(|i| section.blocks.get(i)) else { panic!("missing body before {}", expected.2) };
+                    assert!(plain(body).contains(expected.0) && plain(body).contains(expected.1), "unjoined {}: {}", expected.2, plain(body));
+                    matched += 1;
+                }
+            }
+            if source.page_ranges[index].contains(&89) {
+                assert!(section.blocks.windows(2).any(|b| matches!(b,
+                    [Block::Text(a), Block::Text(b)] if matches!(a.kind, TextBlockKind::HeadingOrdinal(_))
+                        && plain(a) == "2.1" && b.kind.is_heading() && plain(b) == "Introduction"
+                )), "missing verified split-heading pair");
+            }
+        }
+        assert_eq!(matched, 2);
+        println!(
+            "Validated {} OCR sections, both floating figures and 2.1 heading in {:?}",
+            source.book.sections.len(),
+            started.elapsed()
+        );
+    }
+
+    #[test]
     #[ignore = "validates every OCR section of an explicitly selected local PDF"]
     fn diagnose_cached_ocr_section_markup() {
         let book_id = std::env::var("TORTO_DIAG_BOOK_ID").unwrap();
@@ -3191,6 +3343,7 @@ mod tests {
                 model: "local".into(),
                 pages: vec![StoredOcrPage {
                     markdown: "stale A result".into(),
+                    ..Default::default()
                 }],
                 resources: Vec::new(),
             },
@@ -3408,7 +3561,7 @@ mod tests {
     }
 
     #[test]
-    fn special_pdf_pages_render_the_original_page_image_instead_of_ocr_text() {
+    fn special_pdf_pages_render_the_stored_page_image_instead_of_ocr_text() {
         struct SpecialPageSource {
             book: Book,
         }
@@ -3467,6 +3620,8 @@ mod tests {
         let reflow = OcrReflowBookSource::new(
             source,
             StoredPdfOcrDocument {
+                original_book: None,
+                original_toc_origin: TableOfContentsOrigin::Embedded,
                 version: PDF_OCR_VERSION,
                 book_id: "special-page-test".into(),
                 provider: PdfOcrProviderKind::PaddleOcr,
@@ -3474,8 +3629,13 @@ mod tests {
                 view_mode: PdfOcrViewMode::Reflow,
                 pages: vec![StoredOcrPage {
                     markdown: "OCR text must remain cached but hidden in reflow.".into(),
+                    ..Default::default()
                 }],
-                resources: Vec::new(),
+                resources: vec![StoredOcrResource {
+                    href: "OcrResources/pdf-original-page-00001.png".into(),
+                    file_name: "pdf-original-page-00001.png".into(),
+                    media_type: "image/png".into(),
+                }],
                 page_roles: vec![PdfOcrPageRoleAssignment {
                     physical_page: 1,
                     role: PdfOcrPageRole::Cover,
@@ -3491,7 +3651,7 @@ mod tests {
         );
         let parsed = reflow.parse_section(0).unwrap();
         assert!(parsed.blocks.iter().any(|block| {
-            matches!(block, rebook_publication::Block::Image(image) if image.href.path() == "Pages/page-00001.png" && image.text_layer.is_none())
+            matches!(block, rebook_publication::Block::Image(image) if image.href.path() == "OcrResources/pdf-original-page-00001.png" && image.text_layer.is_none())
         }));
         assert!(!parsed.blocks.iter().any(|block| {
             matches!(block, rebook_publication::Block::Text(text) if crate::plugins::text_block_text(text).contains("OCR text must remain cached"))
@@ -3499,39 +3659,19 @@ mod tests {
     }
 
     #[test]
-    fn content_reflow_joins_only_safe_cross_page_paragraphs() {
-        let mut pages = vec![
-            StoredOcrPage {
-                markdown: "作为一个物理学研究生，我担任".into(),
-            },
-            StoredOcrPage {
-                markdown: "课程助教。\n\n下一段。".into(),
-            },
-            StoredOcrPage {
-                markdown: "完整句子。".into(),
-            },
-            StoredOcrPage {
-                markdown: "# 新标题".into(),
-            },
-        ];
-        reflow_ocr_page_boundaries(&mut pages, &HashMap::new());
-        assert_eq!(pages[0].markdown, "作为一个物理学研究生，我担任课程助教。");
-        assert_eq!(pages[1].markdown, "下一段。");
-        assert_eq!(pages[2].markdown, "完整句子。");
-        assert_eq!(pages[3].markdown, "# 新标题");
-    }
-
-    #[test]
     fn missing_ocr_page_placeholders_are_hidden_but_real_content_is_preserved() {
         let mut pages = vec![
             StoredOcrPage {
                 markdown: "## 第 7 页\n\n本页未识别到正文。".into(),
+                ..Default::default()
             },
             StoredOcrPage {
                 markdown: "## 第 9 页\n\n本页尚未生成 OCR 正文。".into(),
+                ..Default::default()
             },
             StoredOcrPage {
                 markdown: "正文中提到本页未识别到正文。".into(),
+                ..Default::default()
             },
         ];
 
@@ -3578,21 +3718,6 @@ mod tests {
     }
 
     #[test]
-    fn content_reflow_restores_english_page_break_hyphenation() {
-        let mut pages = vec![
-            StoredOcrPage {
-                markdown: "An inter-".into(),
-            },
-            StoredOcrPage {
-                markdown: "national example.\n\nAnother paragraph.".into(),
-            },
-        ];
-        reflow_ocr_page_boundaries(&mut pages, &HashMap::new());
-        assert_eq!(pages[0].markdown, "An international example.");
-        assert_eq!(pages[1].markdown, "Another paragraph.");
-    }
-
-    #[test]
     #[allow(clippy::too_many_lines)]
     fn content_reflow_groups_physical_pages_by_top_level_toc() {
         let id = rebook_publication::PublicationId::new("continuous-ocr-test").unwrap();
@@ -3633,6 +3758,8 @@ mod tests {
         let reflow = OcrReflowBookSource::new(
             source,
             StoredPdfOcrDocument {
+                original_book: None,
+                original_toc_origin: TableOfContentsOrigin::Embedded,
                 version: PDF_OCR_VERSION,
                 book_id: "continuous-ocr-test".into(),
                 provider: PdfOcrProviderKind::PaddleOcr,
@@ -3646,6 +3773,7 @@ mod tests {
                 .into_iter()
                 .map(|markdown| StoredOcrPage {
                     markdown: markdown.into(),
+                    ..Default::default()
                 })
                 .collect(),
                 resources: Vec::new(),
@@ -3740,6 +3868,8 @@ mod tests {
         let reflow = OcrReflowBookSource::new(
             source,
             StoredPdfOcrDocument {
+                original_book: None,
+                original_toc_origin: TableOfContentsOrigin::Embedded,
                 version: PDF_OCR_VERSION,
                 book_id: "continuous-ocr-anchor-test".into(),
                 provider: PdfOcrProviderKind::PaddleOcr,
@@ -3749,6 +3879,7 @@ mod tests {
                     .into_iter()
                     .map(|markdown| StoredOcrPage {
                         markdown: markdown.into(),
+                        ..Default::default()
                     })
                     .collect(),
                 resources: Vec::new(),
@@ -4030,6 +4161,7 @@ mod tests {
     fn paddle_chunk_padding_keeps_physical_page_numbers() {
         let mut pages = vec![StoredOcrPage {
             markdown: "page 101".into(),
+            ..Default::default()
         }];
         normalize_page_range(&mut pages, 101, 103);
         assert_eq!(pages.len(), 3);
@@ -4089,6 +4221,8 @@ mod tests {
         let reflow = OcrReflowBookSource::new(
             source,
             StoredPdfOcrDocument {
+                original_book: None,
+                original_toc_origin: TableOfContentsOrigin::Embedded,
                 version: PDF_OCR_VERSION,
                 book_id: "ocr-test".into(),
                 provider: PdfOcrProviderKind::PaddleOcr,
@@ -4096,6 +4230,7 @@ mod tests {
                 view_mode: PdfOcrViewMode::Reflow,
                 pages: vec![StoredOcrPage {
                     markdown: "# 科学与工程中的洞察力\n\nReadable body with $ x_{1}=2x_{2} $.\n\n$$\\frac{a}{b}$$\n\n<div style=\"text-align:center\"><img src=\"../OcrResources/figure.jpg\" alt=\"Figure\" width=\"42%\" /></div>".into(),
+                    ..Default::default()
                 }],
                 resources: vec![StoredOcrResource {
                     href: "OcrResources/figure.jpg".into(),

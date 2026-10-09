@@ -2333,52 +2333,118 @@ impl DesktopReader {
         if self.format != rebook_formats::BookFormat::Pdf {
             return 0.0;
         }
-        let recognize = if self.plugin_settings.pdf_ocr_enabled {
-            1.0
-        } else {
-            0.0
-        };
-        let switch = if self.pdf_ocr.available { 1.0 } else { 0.0 };
-        recognize + switch
+        1.0 + if self.pdf_ocr.available { 1.0 } else { 0.0 }
     }
 
     fn pdf_ocr_toolbar_controls(&mut self, ui: &mut egui::Ui) {
         if self.format != rebook_formats::BookFormat::Pdf {
             return;
         }
-        if self.plugin_settings.pdf_ocr_enabled {
-            let pending = self.pdf_ocr.task.is_pending();
-            let label = if self.pdf_ocr.available {
-                self.language
-                    .text("重新识别 PDF 正文", "Recognize PDF text again")
-            } else {
-                self.language.text("识别 PDF 正文", "Recognize PDF text")
-            };
-            let recognize = ui.add_enabled_ui(!pending, |ui| icon_button(ui, Icon::ScanText));
-            let recognize = if pending {
-                recognize
-                    .inner
-                    .on_disabled_hover_text(self.pdf_ocr.progress.as_str())
-            } else {
-                recognize.inner.on_hover_text(label)
-            };
-            if recognize.clicked() {
-                self.start_pdf_ocr();
-            }
+        let native_pending = self.pdf_ocr.native_task.is_pending();
+        let ocr_pending = self.pdf_ocr.task.is_pending();
+        let pending = native_pending || ocr_pending;
+        let prepare = ui
+            .add_enabled_ui(
+                !ocr_pending && !self.pdf_ocr.original_task.is_pending(),
+                |ui| {
+                    if pending {
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::Vec2::splat(32.0), egui::Sense::click());
+                        #[cfg(target_os = "windows")]
+                        crate::app::window_chrome::exclude(ui.ctx(), rect);
+                        crate::ui::LoadingSpinner::new()
+                            .color(palette().accent)
+                            .paint_at(ui, rect.shrink(7.0));
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::ProgressIndicator,
+                                ui.is_enabled(),
+                                self.language.text("PDF 文字", "PDF text"),
+                            )
+                        });
+                        response
+                    } else {
+                        icon_button(ui, Icon::BookOpen)
+                    }
+                },
+            )
+            .inner;
+        let prepare = if ocr_pending {
+            prepare.on_disabled_hover_text(self.pdf_ocr.progress.as_str())
+        } else if native_pending {
+            prepare.on_hover_text(format!(
+                "{}\n{}",
+                self.pdf_ocr.native_progress,
+                self.language.text("点击取消", "Click to cancel"),
+            ))
+        } else {
+            prepare.on_hover_text(self.language.text("生成 PDF 文字", "Generate PDF text"))
+        };
+        if prepare.clicked() {
+            self.start_pdf_native(super::PdfNativeAction::Auto);
         }
-        if self.pdf_ocr.available
-            && selectable_icon_button(ui, Icon::Type, self.pdf_ocr.mode == PdfOcrViewMode::Reflow)
+        prepare.context_menu(|ui| {
+            ui.add_enabled_ui(!pending && !self.pdf_ocr.original_task.is_pending(), |ui| {
+                if ui
+                    .button(self.language.text("重新生成文字", "Regenerate text"))
+                    .clicked()
+                {
+                    self.start_pdf_native(super::PdfNativeAction::AutoRegenerate);
+                    ui.close();
+                }
+                // Preserve explicit access to existing independent derived sources.
+                if ui
+                    .button(self.language.text("使用本地重排", "Use local reflow"))
+                    .clicked()
+                {
+                    self.start_pdf_native(super::PdfNativeAction::Open);
+                    ui.close();
+                }
+                if ui
+                    .button(
+                        self.language
+                            .text("重新生成本地重排", "Regenerate local reflow"),
+                    )
+                    .clicked()
+                {
+                    self.start_pdf_native(super::PdfNativeAction::Regenerate);
+                    ui.close();
+                }
+                if ui
+                    .button(
+                        self.language
+                            .text("使用已有 OCR 文字", "Use existing OCR text"),
+                    )
+                    .clicked()
+                {
+                    self.start_pdf_native(super::PdfNativeAction::Ocr);
+                    ui.close();
+                }
+            });
+        });
+        if self.pdf_ocr.available {
+            let pending = self.pdf_ocr.original_task.is_pending();
+            let switch = ui
+                .add_enabled_ui(!pending, |ui| {
+                    selectable_icon_button(
+                        ui,
+                        Icon::Type,
+                        self.pdf_ocr.mode == PdfOcrViewMode::Reflow,
+                    )
+                })
+                .inner
+                .on_disabled_hover_text(
+                    self.language
+                        .text("正在切换阅读模式…", "Switching reading view…"),
+                )
                 .on_hover_text(if self.pdf_ocr.mode == PdfOcrViewMode::Reflow {
                     self.language.text("切换到原始 PDF", "Show original PDF")
                 } else {
-                    self.language.text("切换到 OCR 版式", "Show OCR reflow")
-                })
-                .clicked()
-            && self.toggle_pdf_ocr_view()
-        {
-            // The reopen request is consumed at the beginning of the next UI frame.
-            // Explicitly wake it so switching does not wait for another input event.
-            ui.ctx().request_repaint();
+                    self.language.text("切换到文字版式", "Show text reflow")
+                });
+            if switch.clicked() && self.toggle_pdf_ocr_view() {
+                ui.ctx().request_repaint();
+            }
         }
     }
 

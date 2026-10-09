@@ -13,8 +13,8 @@ use rebook_layout::{
 };
 use rebook_publication::{
     Block, Book, BookSource, Inline, LocatorV1, PublicationError, PublicationUrl, RenditionLayout,
-    Section, SectionAnchor, SourceAnchor, SourceRange, TableOfContentsOrigin, TextBlock, TextRun,
-    TocEntry,
+    Section, SectionAnchor, SourceAnchor, SourceRange, TableOfContentsOrigin, TextBlock,
+    TextBlockKind, TextRun, TocEntry,
 };
 use rebook_renderer::{DisplayListCompiler, PageDisplayList, PageImageHit, PageTextHit};
 use thiserror::Error;
@@ -335,11 +335,35 @@ enum PositionAttempt {
 }
 
 struct CachedSegment {
+    layout: Arc<SegmentLayout>,
+    continuous_unit: Option<Arc<ContinuousReadingUnit>>,
+}
+
+impl std::ops::Deref for CachedSegment {
+    type Target = SegmentLayout;
+
+    fn deref(&self) -> &Self::Target {
+        &self.layout
+    }
+}
+
+struct SegmentLayout {
     section: Arc<PreparedSection>,
     pages: Vec<Arc<PageDisplayList>>,
     anchor_pages: HashMap<String, usize>,
     visible_pages: usize,
     continuation_offset_x: f32,
+}
+
+struct ReadingUnitPart {
+    section_index: usize,
+    unit_index: usize,
+    section: Arc<PreparedSection>,
+}
+
+struct ContinuousReadingUnit {
+    parts: Vec<ReadingUnitPart>,
+    layouts: Vec<(SegmentKey, Arc<SegmentLayout>)>,
 }
 
 struct PreparedSection {
@@ -545,6 +569,7 @@ impl PrefetchWorker {
                                 return Err(ReaderError::PrefetchWorkerStopped);
                             }
                             compile_segment(
+                                repository.as_ref(),
                                 source.as_ref(),
                                 section,
                                 request.key,
@@ -1240,12 +1265,38 @@ impl ReaderSession {
     /// Physical sections contributing to the current reflowable TOC unit.
     /// Source anchors remain in their original spine, even when the view joins files.
     pub fn current_reading_unit_sections(&self) -> Range<usize> {
+        if let Some(unit) = self.current_continuous_unit() {
+            return unit.parts.first().unwrap().section_index
+                ..unit.parts.last().unwrap().section_index + 1;
+        }
         self.chapter_prelude_sections(self.current_section)
+    }
+
+    fn current_continuous_unit(&self) -> Option<&Arc<ContinuousReadingUnit>> {
+        self.cache
+            .get(&self.current_key())?
+            .continuous_unit
+            .as_ref()
     }
 
     /// Content from the same prepared snapshot as the active unit's pages.
     /// Copies only its fragments and never reparses the publication source.
     pub fn current_reading_unit_content(&self) -> Result<Vec<(usize, Section)>, ReaderError> {
+        if let Some(unit) = self.current_continuous_unit() {
+            return Ok(unit
+                .parts
+                .iter()
+                .map(|part| {
+                    let range = part.section.reading_units[part.unit_index]
+                        .fragment_range
+                        .clone();
+                    (
+                        part.section_index,
+                        self.section_snapshot(part.section_index, &part.section.fragments[range]),
+                    )
+                })
+                .collect());
+        }
         let fixed = self
             .fixed_reading_units
             .as_ref()
@@ -1313,6 +1364,43 @@ impl ReaderSession {
         reason = "renderer page coordinates are viewport-bounded f32 values stored in kurbo f64"
     )]
     pub fn current_reading_unit_pages(&mut self) -> Result<Vec<ReaderSectionPage>, ReaderError> {
+        if let Some(unit) = self.current_continuous_unit() {
+            let mut pages = Vec::new();
+            for part in &unit.parts {
+                let range = part.section.reading_units[part.unit_index]
+                    .fragment_range
+                    .clone();
+                let mut sources = Vec::new();
+                for block in part.section.fragments[range]
+                    .iter()
+                    .flat_map(|fragment| &fragment.blocks)
+                {
+                    append_block_geometry_sources(block, &mut sources);
+                }
+                let entries = unit
+                    .layouts
+                    .iter()
+                    .filter(|(key, _)| key.section_index == part.section_index)
+                    .flat_map(|(key, layout)| {
+                        layout.pages.iter().enumerate().map(|(page_index, page)| {
+                            ReaderSectionPage {
+                                position: ReaderPosition {
+                                    section_index: key.section_index,
+                                    segment_index: key.segment_index,
+                                    page_index,
+                                },
+                                page: page.clone(),
+                                placeholder: false,
+                                visible_top: None,
+                                visible_bottom: None,
+                            }
+                        })
+                    })
+                    .collect();
+                pages.extend(crop_reading_unit_pages(entries, &sources));
+            }
+            return Ok(pages);
+        }
         if let Some(unit) = self
             .fixed_reading_units
             .as_ref()
@@ -1397,34 +1485,28 @@ impl ReaderSession {
                     && unit.fragment_range.start < segment.fragment_range.end)
                     .then_some(index)
             });
-        let mut pages = self.segment_pages(section_index, segments)?;
-        let visible = pages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                entry
-                    .page
-                    .source_content_bounds(&ranges)
-                    .map(|bounds| (index, bounds.y0 as f32, bounds.y1 as f32))
-            })
-            .collect::<Vec<_>>();
-        let (Some((first, first_top, _)), Some((last, _, last_bottom))) =
-            (visible.first().copied(), visible.last().copied())
-        else {
-            return Ok(pages);
-        };
-        pages = pages.drain(first..=last).collect();
-        if let Some(page) = pages.first_mut() {
-            page.visible_top = Some(first_top);
-        }
-        if let Some(page) = pages.last_mut() {
-            page.visible_bottom = Some(last_bottom);
-        }
-        Ok(pages)
+        let pages = self.segment_pages(section_index, segments)?;
+        Ok(crop_reading_unit_pages(pages, &ranges))
     }
 
     /// Durable block ranges belonging to the active semantic TOC unit.
     pub fn current_reading_unit_source_ranges(&mut self) -> Result<Vec<SourceRange>, ReaderError> {
+        if let Some(unit) = self.current_continuous_unit() {
+            return Ok(unit
+                .parts
+                .iter()
+                .flat_map(|part| {
+                    let range = part.section.reading_units[part.unit_index]
+                        .fragment_range
+                        .clone();
+                    part.section.fragments[range]
+                        .iter()
+                        .flat_map(|fragment| &fragment.blocks)
+                        .filter_map(block_source)
+                        .cloned()
+                })
+                .collect());
+        }
         if let Some(unit) = self
             .fixed_reading_units
             .as_ref()
@@ -1478,6 +1560,13 @@ impl ReaderSession {
     }
 
     pub fn reading_unit_location(&mut self) -> ReadingUnitLocation {
+        if let Some(unit) = self.current_continuous_unit() {
+            let owner = &unit.parts[0];
+            return ReadingUnitLocation {
+                index: owner.unit_index,
+                count: owner.section.reading_units.len().max(1),
+            };
+        }
         if let Some(units) = &self.fixed_reading_units {
             let count = units.len().max(1);
             return ReadingUnitLocation {
@@ -1496,6 +1585,10 @@ impl ReaderSession {
     }
 
     pub fn current_reading_unit_anchor(&self) -> Option<SourceAnchor> {
+        if let Some(unit) = self.current_continuous_unit() {
+            let owner = &unit.parts[0];
+            return owner.section.reading_units[owner.unit_index].start.clone();
+        }
         if self.fixed_reading_units.is_some() {
             return None;
         }
@@ -1528,17 +1621,21 @@ impl ReaderSession {
             return Ok(result);
         }
         let group = self.current_reading_unit_sections();
-        let count = self
-            .repository
-            .load(self.current_section)?
-            .reading_units
-            .len();
+        let (active_section, active_unit) = self.current_continuous_unit().map_or(
+            (self.current_section, self.current_reading_unit),
+            |unit| {
+                let part = match direction {
+                    PageDirection::Previous => unit.parts.first().unwrap(),
+                    PageDirection::Next => unit.parts.last().unwrap(),
+                };
+                (part.section_index, part.unit_index)
+            },
+        );
+        let count = self.repository.load(active_section)?.reading_units.len();
         let target = match direction {
-            PageDirection::Previous if self.current_reading_unit > 0 => {
-                Some((self.current_section, self.current_reading_unit - 1))
-            }
-            PageDirection::Next if self.current_reading_unit + 1 < count => {
-                Some((self.current_section, self.current_reading_unit + 1))
+            PageDirection::Previous if active_unit > 0 => Some((active_section, active_unit - 1)),
+            PageDirection::Next if active_unit + 1 < count => {
+                Some((active_section, active_unit + 1))
             }
             PageDirection::Previous => {
                 if let Some(section) = self.previous_visible_section(group.start) {
@@ -1590,17 +1687,21 @@ impl ReaderSession {
         }
 
         let group = self.current_reading_unit_sections();
-        let count = self
-            .repository
-            .load(self.current_section)?
-            .reading_units
-            .len();
+        let (active_section, active_unit) = self.current_continuous_unit().map_or(
+            (self.current_section, self.current_reading_unit),
+            |unit| {
+                let part = match direction {
+                    PageDirection::Previous => unit.parts.first().unwrap(),
+                    PageDirection::Next => unit.parts.last().unwrap(),
+                };
+                (part.section_index, part.unit_index)
+            },
+        );
+        let count = self.repository.load(active_section)?.reading_units.len();
         let target = match direction {
-            PageDirection::Previous if self.current_reading_unit > 0 => {
-                Some((self.current_section, self.current_reading_unit - 1))
-            }
-            PageDirection::Next if self.current_reading_unit + 1 < count => {
-                Some((self.current_section, self.current_reading_unit + 1))
+            PageDirection::Previous if active_unit > 0 => Some((active_section, active_unit - 1)),
+            PageDirection::Next if active_unit + 1 < count => {
+                Some((active_section, active_unit + 1))
             }
             PageDirection::Previous => {
                 if let Some(section) = self.previous_visible_section(group.start) {
@@ -2277,8 +2378,7 @@ impl ReaderSession {
         let page_index = href
             .fragment()
             .and_then(|fragment| {
-                self.cache
-                    .get(&key)
+                self.cached_layout(key)
                     .and_then(|cached| cached.anchor_pages.get(fragment))
             })
             .copied()
@@ -2620,6 +2720,7 @@ impl ReaderSession {
             segment_index,
         };
         let segment = compile_segment(
+            repository.as_ref(),
             self.source.as_ref(),
             section,
             key,
@@ -3140,14 +3241,30 @@ impl ReaderSession {
     }
 
     fn page_at(&self, position: ReaderPosition) -> Result<Arc<PageDisplayList>, ReaderError> {
+        self.cached_layout(SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        })
+        .and_then(|segment| segment.pages.get(position.page_index))
+        .cloned()
+        .ok_or(ReaderError::PageOutOfBounds(position))
+    }
+
+    fn cached_layout(&self, key: SegmentKey) -> Option<&SegmentLayout> {
         self.cache
-            .get(&SegmentKey {
-                section_index: position.section_index,
-                segment_index: position.segment_index,
+            .get(&key)
+            .map(|segment| segment.layout.as_ref())
+            .or_else(|| {
+                self.cache.values().find_map(|segment| {
+                    segment
+                        .continuous_unit
+                        .as_ref()?
+                        .layouts
+                        .iter()
+                        .find(|(candidate, _)| *candidate == key)
+                        .map(|(_, layout)| layout.as_ref())
+                })
             })
-            .and_then(|segment| segment.pages.get(position.page_index))
-            .cloned()
-            .ok_or(ReaderError::PageOutOfBounds(position))
     }
 
     fn current_position(&self) -> ReaderPosition {
@@ -3272,6 +3389,16 @@ impl ReaderSession {
         unit_index: usize,
     ) -> Result<NavigationResult, ReaderError> {
         let section_index = self.chapter_prelude_sections(section_index).start;
+        let key = self.reading_unit_segment_key(section_index, unit_index)?;
+        self.ensure_segment(key)?;
+        let (section_index, unit_index) = self
+            .cache
+            .get(&key)
+            .and_then(|segment| segment.continuous_unit.as_ref())
+            .map_or((section_index, unit_index), |unit| {
+                let owner = &unit.parts[0];
+                (owner.section_index, owner.unit_index)
+            });
         let section = self.repository.load(section_index)?;
         let unit = section
             .reading_units
@@ -3336,7 +3463,30 @@ impl ReaderSession {
         self.touch(self.current_key());
     }
 
+    fn reuse_continuous_segment(&mut self, key: SegmentKey) {
+        if self.cache.contains_key(&key) {
+            return;
+        }
+        let cached = self.cache.values().find_map(|segment| {
+            let unit = segment.continuous_unit.as_ref()?;
+            let (_, layout) = unit
+                .layouts
+                .iter()
+                .find(|(candidate, _)| *candidate == key)?;
+            Some(Arc::new(CachedSegment {
+                layout: layout.clone(),
+                continuous_unit: Some(unit.clone()),
+            }))
+        });
+        if let Some(segment) = cached {
+            self.cache.insert(key, segment);
+            self.touch(key);
+            self.evict();
+        }
+    }
+
     fn ensure_segment(&mut self, key: SegmentKey) -> Result<(), ReaderError> {
+        self.reuse_continuous_segment(key);
         if self.cache.contains_key(&key) {
             self.touch(key);
             return Ok(());
@@ -3357,6 +3507,7 @@ impl ReaderSession {
         }
         let section = self.repository.load(key.section_index)?;
         let segment = compile_segment(
+            self.repository.as_ref(),
             self.source.as_ref(),
             section,
             key,
@@ -3372,6 +3523,7 @@ impl ReaderSession {
     }
 
     fn try_ensure_segment(&mut self, key: SegmentKey) -> Result<bool, ReaderError> {
+        self.reuse_continuous_segment(key);
         if self.cache.contains_key(&key) {
             self.touch(key);
             return Ok(true);
@@ -3390,6 +3542,7 @@ impl ReaderSession {
     }
 
     fn try_ensure_navigation_segment(&mut self, key: SegmentKey) -> Result<bool, ReaderError> {
+        self.reuse_continuous_segment(key);
         if self.cache.contains_key(&key) {
             self.touch(key);
             return Ok(true);
@@ -3431,6 +3584,7 @@ impl ReaderSession {
         self.lru.clear();
         let key = self.current_key();
         let segment = compile_segment(
+            self.repository.as_ref(),
             self.source.as_ref(),
             current_section,
             key,
@@ -3447,6 +3601,7 @@ impl ReaderSession {
     }
 
     fn queue_prefetch(&mut self, segment: SegmentKey) -> Result<(), ReaderError> {
+        self.reuse_continuous_segment(segment);
         let key = PrefetchKey {
             generation: self.prefetch_worker.generation(),
             segment,
@@ -3561,6 +3716,11 @@ impl ReaderSession {
             };
             let pinned = self.cache.get(&candidate).is_some_and(|segment| {
                 segment.pages.iter().any(|page| Arc::strong_count(page) > 1)
+                    || segment.continuous_unit.as_ref().is_some_and(|unit| {
+                        unit.layouts.iter().any(|(_, layout)| {
+                            layout.pages.iter().any(|page| Arc::strong_count(page) > 1)
+                        })
+                    })
             });
             if candidate == self.current_key() || Some(candidate) == newest || pinned {
                 self.lru.push_back(candidate);
@@ -3581,12 +3741,29 @@ impl ReaderSession {
         let mut layouts = HashSet::new();
         let mut pinned_sections = HashSet::new();
         let mut pinned_images = HashSet::new();
-        for (key, segment) in &self.cache {
+        let current_unit = self.current_continuous_unit();
+        let mut segment_ids = HashSet::new();
+        let cached_layouts = self.cache.iter().flat_map(|(key, segment)| {
+            std::iter::once((*key, segment.layout.as_ref())).chain(
+                segment.continuous_unit.iter().flat_map(|unit| {
+                    unit.layouts
+                        .iter()
+                        .map(|(key, layout)| (*key, layout.as_ref()))
+                }),
+            )
+        });
+        for (key, segment) in cached_layouts {
+            if !segment_ids.insert(segment as *const SegmentLayout as usize) {
+                continue;
+            }
+            let active = key == self.current_key()
+                || current_unit.is_some_and(|unit| {
+                    unit.layouts.iter().any(|(candidate, _)| *candidate == key)
+                });
             if sections.insert(Arc::as_ptr(&segment.section) as usize) {
                 stats.layout_bytes += segment.section.estimated_bytes;
             }
-            if (*key == self.current_key()
-                || segment.pages.iter().any(|page| Arc::strong_count(page) > 1))
+            if (active || segment.pages.iter().any(|page| Arc::strong_count(page) > 1))
                 && pinned_sections.insert(Arc::as_ptr(&segment.section) as usize)
             {
                 stats.pinned_bytes += segment.section.estimated_bytes;
@@ -3597,7 +3774,7 @@ impl ReaderSession {
                 }
                 let bytes = page.accumulate_layout_bytes(&mut layouts);
                 stats.layout_bytes += bytes;
-                let pinned = *key == self.current_key() || Arc::strong_count(page) > 1;
+                let pinned = active || Arc::strong_count(page) > 1;
                 if pinned {
                     stats.pinned_bytes += bytes;
                 }
@@ -3611,6 +3788,7 @@ impl ReaderSession {
                 }
             }
         }
+        stats.segments = segment_ids.len();
         stats
     }
 
@@ -3648,7 +3826,41 @@ impl ReaderSession {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "viewport-bounded renderer coordinates"
+)]
+fn crop_reading_unit_pages(
+    mut pages: Vec<ReaderSectionPage>,
+    ranges: &[SourceRange],
+) -> Vec<ReaderSectionPage> {
+    let visible = pages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            entry
+                .page
+                .source_content_bounds(ranges)
+                .map(|bounds| (index, bounds.y0 as f32, bounds.y1 as f32))
+        })
+        .collect::<Vec<_>>();
+    let (Some((first, first_top, _)), Some((last, _, last_bottom))) =
+        (visible.first().copied(), visible.last().copied())
+    else {
+        return pages;
+    };
+    pages = pages.drain(first..=last).collect();
+    if let Some(page) = pages.first_mut() {
+        page.visible_top = Some(first_top);
+    }
+    if let Some(page) = pages.last_mut() {
+        page.visible_bottom = Some(last_bottom);
+    }
+    pages
+}
+
 fn compile_segment(
+    repository: &SectionRepository,
     source: &dyn BookSource,
     section: Arc<PreparedSection>,
     key: SegmentKey,
@@ -3657,6 +3869,145 @@ fn compile_segment(
     layout_engine: &mut LayoutEngine,
     display_compiler: &DisplayListCompiler,
 ) -> Result<CachedSegment, ReaderError> {
+    let fragment = section
+        .segments
+        .get(key.segment_index)
+        .ok_or(ReaderError::SegmentOutOfBounds {
+            section: key.section_index,
+            segment: key.segment_index,
+        })?
+        .fragment_range
+        .start;
+    let unit_index = section
+        .reading_units
+        .iter()
+        .position(|unit| unit.fragment_range.contains(&fragment))
+        .unwrap_or(0);
+    let layout = Arc::new(compile_segment_layout(
+        source,
+        section.clone(),
+        key,
+        viewport,
+        style,
+        layout_engine,
+        display_compiler,
+    )?);
+    let parts =
+        continuous_reading_unit_parts(repository, source.book(), key.section_index, unit_index)?;
+    if parts.len() <= 1 {
+        return Ok(CachedSegment {
+            layout,
+            continuous_unit: None,
+        });
+    }
+    let mut layouts = Vec::new();
+    for part in &parts {
+        let unit = &part.section.reading_units[part.unit_index];
+        for (segment_index, segment) in part.section.segments.iter().enumerate() {
+            if segment.fragment_range.start >= unit.fragment_range.end
+                || unit.fragment_range.start >= segment.fragment_range.end
+            {
+                continue;
+            }
+            let part_key = SegmentKey {
+                section_index: part.section_index,
+                segment_index,
+            };
+            let part_layout = if part_key == key {
+                layout.clone()
+            } else {
+                Arc::new(compile_segment_layout(
+                    source,
+                    part.section.clone(),
+                    part_key,
+                    viewport,
+                    style,
+                    layout_engine,
+                    display_compiler,
+                )?)
+            };
+            layouts.push((part_key, part_layout));
+        }
+    }
+    Ok(CachedSegment {
+        layout,
+        continuous_unit: Some(Arc::new(ContinuousReadingUnit { parts, layouts })),
+    })
+}
+
+fn continuous_reading_unit_parts(
+    repository: &SectionRepository,
+    book: &Book,
+    section_index: usize,
+    unit_index: usize,
+) -> Result<Vec<ReadingUnitPart>, ReaderError> {
+    let continuation = |index: usize| {
+        book.sections.get(index).is_some_and(|section| {
+            section.linear
+                && !section.is_note_section()
+                && section
+                    .properties
+                    .iter()
+                    .any(|property| property == rebook_publication::CONTINUATION_SECTION_PROPERTY)
+        })
+    };
+    if !continuation(section_index) && !continuation(section_index + 1) {
+        return Ok(Vec::new());
+    }
+    let mut owner = section_index;
+    let mut section = repository.load(owner)?;
+    let mut unit = unit_index;
+    while owner > 0
+        && continuation(owner)
+        && unit == 0
+        && section
+            .reading_units
+            .first()
+            .is_some_and(|unit| unit.start.is_none())
+        && book.sections[owner - 1].linear
+        && !book.sections[owner - 1].is_note_section()
+    {
+        owner -= 1;
+        section = repository.load(owner)?;
+        unit = section.reading_units.len().saturating_sub(1);
+    }
+    let mut parts = vec![ReadingUnitPart {
+        section_index: owner,
+        unit_index: unit,
+        section,
+    }];
+    loop {
+        let last = parts.last().expect("continuous unit has an owner");
+        let next = last.section_index + 1;
+        if last.unit_index + 1 < last.section.reading_units.len() || !continuation(next) {
+            break;
+        }
+        let section = repository.load(next)?;
+        if !section
+            .reading_units
+            .first()
+            .is_some_and(|unit| unit.start.is_none())
+        {
+            break;
+        }
+        parts.push(ReadingUnitPart {
+            section_index: next,
+            unit_index: 0,
+            section,
+        });
+    }
+    Ok(parts)
+}
+
+fn compile_segment_layout(
+    source: &dyn BookSource,
+    section: Arc<PreparedSection>,
+    key: SegmentKey,
+    viewport: LayoutViewport,
+    style: &ReaderStyle,
+    layout_engine: &mut LayoutEngine,
+    display_compiler: &DisplayListCompiler,
+) -> Result<SegmentLayout, ReaderError> {
     let segment =
         section
             .segments
@@ -3709,7 +4060,7 @@ fn compile_segment(
         .iter()
         .map(|page| Arc::new(display_compiler.compile(page)))
         .collect();
-    Ok(CachedSegment {
+    Ok(SegmentLayout {
         section,
         pages,
         anchor_pages,
@@ -3815,7 +4166,9 @@ fn build_reading_units(
             Some((index, Some(source)))
         })
         .collect::<Vec<_>>();
-    starts.sort_by_key(|(index, _)| *index);
+    // An actual heading at offset zero wins over a synthetic continuation
+    // boundary at the same offset; there is no preceding prose to attach.
+    starts.sort_by_key(|(index, source)| (*index, source.is_none()));
     starts.dedup_by(|left, right| left.0 == right.0 || left.1 == right.1);
 
     if starts.is_empty() {
@@ -3881,35 +4234,51 @@ fn fragment_section_blocks(
             }
         };
 
-    for block in blocks {
-        let pieces = match block {
-            Block::Text(block) => split_text_block(block)
-                .into_iter()
-                .map(Block::Text)
-                .collect::<Vec<_>>(),
-            block => vec![block],
-        };
-        for piece in pieces {
-            let starts_layout_segment = !current.is_empty()
-                && block_source(&piece).is_some_and(|range| {
+    let mut append = |pieces: Vec<Block>| {
+        // A TOC anchor commonly targets the title, after its separate ordinal.
+        // Keep the semantic pair atomic for both TOC and budget boundaries so
+        // layout can compose it and focus reading cannot leave the ordinal behind.
+        let starts_layout_segment = !current.is_empty()
+            && pieces.iter().any(|piece| {
+                block_source(piece).is_some_and(|range| {
                     boundary_sources
                         .iter()
                         .any(|anchor| source_range_contains(range, anchor))
-                });
-            if starts_layout_segment {
-                flush(&mut current, &mut current_text, &mut block_groups);
-            }
-            let text_len = block_text_len(&piece);
-            if !current.is_empty()
-                && (current.len() >= FRAGMENT_BLOCK_BUDGET
-                    || current_text.saturating_add(text_len) > FRAGMENT_TEXT_BUDGET)
-            {
-                flush(&mut current, &mut current_text, &mut block_groups);
-            }
-            current_text = current_text.saturating_add(text_len);
-            current.push(piece);
-            if current.len() >= FRAGMENT_BLOCK_BUDGET || current_text >= FRAGMENT_TEXT_BUDGET {
-                flush(&mut current, &mut current_text, &mut block_groups);
+                })
+            });
+        let text_len = pieces.iter().map(block_text_len).sum::<usize>();
+        if starts_layout_segment
+            || (!current.is_empty()
+                && (current.len().saturating_add(pieces.len()) > FRAGMENT_BLOCK_BUDGET
+                    || current_text.saturating_add(text_len) > FRAGMENT_TEXT_BUDGET))
+        {
+            flush(&mut current, &mut current_text, &mut block_groups);
+        }
+        current_text = current_text.saturating_add(text_len);
+        current.extend(pieces);
+        if current.len() >= FRAGMENT_BLOCK_BUDGET || current_text >= FRAGMENT_TEXT_BUDGET {
+            flush(&mut current, &mut current_text, &mut block_groups);
+        }
+    };
+
+    let mut blocks = blocks.into_iter().peekable();
+    while let Some(block) = blocks.next() {
+        let heading_pair = matches!(
+            (&block, blocks.peek()),
+            (Block::Text(ordinal), Some(Block::Text(title)))
+                if matches!(ordinal.kind, TextBlockKind::HeadingOrdinal(level)
+                    if title.kind == TextBlockKind::Heading(level))
+        );
+        if heading_pair {
+            append(vec![block, blocks.next().expect("peeked heading title")]);
+        } else {
+            match block {
+                Block::Text(text) => {
+                    for piece in split_text_block(text) {
+                        append(vec![Block::Text(piece)]);
+                    }
+                }
+                block => append(vec![block]),
             }
         }
     }
@@ -4022,6 +4391,16 @@ fn semantic_toc_boundaries_for_section(book: &Book, section_index: usize) -> Vec
         return Vec::new();
     };
     let mut fragments = Vec::new();
+    if section
+        .properties
+        .iter()
+        .any(|property| property == rebook_publication::CONTINUATION_SECTION_PROPERTY)
+    {
+        // A storage cut is not a semantic heading. Keep its leading continuation
+        // separate from the first TOC target, so navigation and TOC highlighting
+        // continue using the preceding subsection until that target is reached.
+        fragments.push(None);
+    }
     append(&book.table_of_contents, section.href.path(), &mut fragments);
     fragments
 }
@@ -6571,6 +6950,125 @@ mod tests {
     }
 
     #[test]
+    fn title_toc_boundary_keeps_its_ordinal_in_the_new_reading_unit() {
+        let source = CountingSource::new(&["Previous subsection".into()]);
+        let mut section = source.sections[0].clone();
+        let template = section.blocks[0].clone();
+        let block = |node: &str, text: &str, kind| {
+            let Block::Text(mut block) = template.clone() else {
+                unreachable!();
+            };
+            block.kind = kind;
+            block.content = vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: Default::default(),
+                link: None,
+            })];
+            block.source = Some(SourceRange {
+                start: SourceAnchor {
+                    spine: section.id.clone(),
+                    node: node.into(),
+                    text_offset: 0,
+                },
+                end: SourceAnchor {
+                    spine: section.id.clone(),
+                    node: node.into(),
+                    text_offset: u64::try_from(text.len()).unwrap(),
+                },
+            });
+            Block::Text(block)
+        };
+        section.blocks = vec![
+            block("previous", "Previous subsection", TextBlockKind::Paragraph),
+            block("ordinal", "2.5", TextBlockKind::HeadingOrdinal(3)),
+            block("title", "Brief Overview", TextBlockKind::Heading(3)),
+            block("body", "New subsection", TextBlockKind::Paragraph),
+        ];
+        let title_source = block_source(&section.blocks[2]).unwrap().start.clone();
+        section.anchors = vec![SectionAnchor {
+            fragment: "section-2-5".into(),
+            source: title_source.clone(),
+        }];
+        let prepared = prepare_section(
+            section.clone(),
+            &HashSet::new(),
+            &[None, Some("section-2-5".into())],
+        );
+        assert_eq!(prepared.reading_units.len(), 2);
+        let previous = &prepared.reading_units[0];
+        let next = &prepared.reading_units[1];
+        assert_eq!(
+            prepared.fragments[previous.fragment_range.start]
+                .blocks
+                .len(),
+            1
+        );
+        let heading = &prepared.fragments[next.fragment_range.start];
+        assert_eq!(
+            block_source(&heading.blocks[0]).unwrap().start.node,
+            "ordinal"
+        );
+        assert_eq!(
+            block_source(&heading.blocks[1]).unwrap().start.node,
+            "title"
+        );
+        assert_eq!(next.start.as_ref(), Some(&title_source));
+        assert_eq!(prepared.anchor_segments["section-2-5"], 1);
+
+        // Ordinary numeric paragraphs and headings of another level remain
+        // separate; only the semantic ordinal/title pair moves together.
+        for kind in [TextBlockKind::Paragraph, TextBlockKind::HeadingOrdinal(2)] {
+            let Block::Text(ordinal) = &mut section.blocks[1] else {
+                unreachable!();
+            };
+            ordinal.kind = kind;
+            let prepared = prepare_section(
+                section.clone(),
+                &HashSet::new(),
+                &[None, Some("section-2-5".into())],
+            );
+            let heading = &prepared.fragments[prepared.reading_units[1].fragment_range.start];
+            assert_eq!(
+                block_source(&heading.blocks[0]).unwrap().start.node,
+                "title"
+            );
+        }
+    }
+
+    #[test]
+    fn fragment_budgets_keep_heading_ordinal_and_title_together() {
+        for (preceding_blocks, preceding_text) in [
+            (1, "a".repeat(FRAGMENT_TEXT_BUDGET - 4)),
+            (FRAGMENT_BLOCK_BUDGET - 1, "a".into()),
+        ] {
+            let source = CountingSource::new(&[preceding_text]);
+            let mut section = source.sections[0].clone();
+            let mut ordinal = section.blocks[0].clone();
+            let mut title = ordinal.clone();
+            for (block, text, kind) in [
+                (&mut ordinal, "2.5", TextBlockKind::HeadingOrdinal(3)),
+                (&mut title, "Brief Overview", TextBlockKind::Heading(3)),
+            ] {
+                let Block::Text(block) = block else {
+                    unreachable!()
+                };
+                block.kind = kind;
+                block.content = vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: Default::default(),
+                    link: None,
+                })];
+                block.source = None;
+            }
+            section.blocks = vec![section.blocks[0].clone(); preceding_blocks];
+            section.blocks.extend([ordinal, title]);
+            let prepared = prepare_section(section, &HashSet::new(), &[]);
+            assert_eq!(prepared.fragments.len(), 2);
+            assert_eq!(prepared.fragments[1].blocks.len(), 2);
+        }
+    }
+
+    #[test]
     fn continued_list_item_does_not_repeat_its_marker() {
         let parts = split_text_block(TextBlock {
             kind: TextBlockKind::ListItem {
@@ -8077,6 +8575,287 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture covers both source chunks, TOC navigation and locator restoration"
+    )]
+    fn storage_chunk_prefix_joins_the_previous_reading_unit_until_the_real_heading() {
+        let mut source =
+            CountingSource::new(&["Direct manipulation".into(), "Continuation".into()]);
+        let data = Arc::get_mut(&mut source).unwrap();
+        let block = |section: usize, node: &str, text: &str, kind| {
+            let Block::Text(mut block) = data.sections[section].blocks[0].clone() else {
+                unreachable!();
+            };
+            block.kind = kind;
+            block.content = vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: Default::default(),
+                link: None,
+            })];
+            block.source = Some(SourceRange {
+                start: SourceAnchor {
+                    spine: data.sections[section].id.clone(),
+                    node: node.into(),
+                    text_offset: 0,
+                },
+                end: SourceAnchor {
+                    spine: data.sections[section].id.clone(),
+                    node: node.into(),
+                    text_offset: u64::try_from(text.len()).unwrap(),
+                },
+            });
+            Block::Text(block)
+        };
+        let previous = vec![
+            block(
+                0,
+                "direct",
+                "2.5.1.3 Direct Manipulation",
+                TextBlockKind::Heading(5),
+            ),
+            block(
+                0,
+                "direct-body",
+                "First part of the subsection.",
+                TextBlockKind::Paragraph,
+            ),
+        ];
+        let continuation = vec![
+            block(
+                1,
+                "caption",
+                "Figure 2.24 A command line interface.",
+                TextBlockKind::Paragraph,
+            ),
+            block(
+                1,
+                "continued-body",
+                "by Ivan Sutherland in Sketchpad.",
+                TextBlockKind::Paragraph,
+            ),
+            block(
+                1,
+                "windows",
+                "2.5.1.4 Window Managers",
+                TextBlockKind::Heading(5),
+            ),
+            block(
+                1,
+                "windows-body",
+                "A window manager is a software package.",
+                TextBlockKind::Paragraph,
+            ),
+            block(
+                1,
+                "drawing",
+                "2.5.1.5 Drawing Programs",
+                TextBlockKind::Heading(5),
+            ),
+            block(
+                1,
+                "drawing-body",
+                "For creating graphics.",
+                TextBlockKind::Paragraph,
+            ),
+        ];
+        data.sections[0].blocks = previous;
+        data.sections[1].blocks = continuation;
+        data.sections[0].anchors = vec![SectionAnchor {
+            fragment: "direct".into(),
+            source: block_source(&data.sections[0].blocks[0])
+                .unwrap()
+                .start
+                .clone(),
+        }];
+        data.sections[1].anchors = [2, 4]
+            .into_iter()
+            .map(|index| {
+                let source = block_source(&data.sections[1].blocks[index])
+                    .unwrap()
+                    .start
+                    .clone();
+                SectionAnchor {
+                    fragment: source.node.clone(),
+                    source,
+                }
+            })
+            .collect();
+        data.book.sections[1]
+            .properties
+            .push(rebook_publication::CONTINUATION_SECTION_PROPERTY.into());
+        data.book.table_of_contents = [(0, "direct"), (1, "windows"), (1, "drawing")]
+            .into_iter()
+            .map(|(section, fragment)| TocEntry {
+                label: fragment.into(),
+                href: Some(
+                    data.book.sections[section]
+                        .href
+                        .resolve(&format!("#{fragment}"))
+                        .unwrap(),
+                ),
+                children: Vec::new(),
+            })
+            .collect();
+        let windows = data.book.table_of_contents[1].href.clone().unwrap();
+        let prefix_nodes = |reader: &mut ReaderSession| {
+            reader
+                .current_reading_unit_source_ranges()
+                .unwrap()
+                .into_iter()
+                .map(|range| range.start.node)
+                .collect::<Vec<_>>()
+        };
+        for typesetting in [TypesettingMode::Book, TypesettingMode::Unified] {
+            let mut style = ReaderStyle::default();
+            style.typesetting.mode = typesetting;
+            let mut reader =
+                ReaderSession::open(source.clone(), viewport(800, 600), style).unwrap();
+            let expected = ["direct", "direct-body", "caption", "continued-body"];
+            assert_eq!(reader.snapshot().active_toc_id.as_deref(), Some("0"));
+            assert_eq!(prefix_nodes(&mut reader), expected);
+            assert_eq!(reader.current_reading_unit_sections(), 0..2);
+            assert_eq!(reader.reading_unit_location().index, 0);
+            let group = Arc::downgrade(reader.current_continuous_unit().unwrap());
+            let memory = reader.cache_stats();
+            assert_eq!(memory.segments, 2);
+            assert!(
+                reader
+                    .current_continuous_unit()
+                    .unwrap()
+                    .layouts
+                    .iter()
+                    .all(|(_, layout)| {
+                        layout.pages.iter().all(|page| Arc::strong_count(page) == 1)
+                    })
+            );
+            let pages = reader.current_reading_unit_pages().unwrap();
+            assert!(pages.iter().any(|page| page.position.section_index == 0));
+            let continuation = pages
+                .iter()
+                .find(|page| page.position.section_index == 1)
+                .unwrap();
+            assert!(continuation.visible_top.is_some());
+            assert!(continuation.visible_bottom.is_some());
+            let position = continuation.position;
+            assert!(
+                !reader
+                    .cached_visible_text_fragments_for_pages(&[position])
+                    .is_empty()
+            );
+            drop(pages);
+            reader.set_visible_position(position).unwrap();
+            assert_eq!(reader.cache_stats().layout_bytes, memory.layout_bytes);
+            assert_eq!(reader.current_reading_unit_sections(), 0..2);
+            assert_eq!(reader.reading_unit_location().index, 0);
+            assert_eq!(prefix_nodes(&mut reader), expected);
+            let locator = reader.current_locator();
+            reader
+                .go_to_adjacent_reading_unit(PageDirection::Next)
+                .unwrap();
+            assert_eq!(reader.snapshot().active_toc_id.as_deref(), Some("1"));
+            assert_eq!(reader.current_reading_unit_sections(), 1..2);
+            assert_eq!(prefix_nodes(&mut reader), ["windows", "windows-body"]);
+            reader.cache_capacity = 1;
+            reader.evict();
+            assert!(
+                group.upgrade().is_none(),
+                "obsolete joined views must be evictable"
+            );
+            reader
+                .go_to_adjacent_reading_unit(PageDirection::Previous)
+                .unwrap();
+            assert_eq!(reader.current_position().section_index, 0);
+            assert_eq!(prefix_nodes(&mut reader), expected);
+            assert_eq!(reader.snapshot().active_toc_id.as_deref(), Some("0"));
+            reader.go_to_href(&windows).unwrap();
+            assert_eq!(prefix_nodes(&mut reader), ["windows", "windows-body"]);
+            let mut restored = ReaderSession::open_with_fonts_at_locator(
+                source.clone(),
+                viewport(760, 580),
+                reader.style().clone(),
+                Arc::default(),
+                &locator,
+            )
+            .unwrap();
+            restored.resize(viewport(650, 480)).unwrap();
+            assert_eq!(prefix_nodes(&mut restored), expected);
+            assert_eq!(restored.reading_unit_location().index, 0);
+            assert_eq!(restored.snapshot().active_toc_id.as_deref(), Some("0"));
+            for (direction, expected_toc) in
+                [(PageDirection::Next, "1"), (PageDirection::Previous, "0")]
+            {
+                loop {
+                    match restored.try_go_to_adjacent_reading_unit(direction).unwrap() {
+                        NavigationAttempt::Pending => restored.wait_for_prefetch().unwrap(),
+                        NavigationAttempt::Ready(_) => break,
+                    }
+                }
+                assert_eq!(
+                    restored.snapshot().active_toc_id.as_deref(),
+                    Some(expected_toc)
+                );
+            }
+            assert_eq!(prefix_nodes(&mut restored), expected);
+        }
+    }
+
+    #[test]
+    fn continuation_units_cross_multiple_chunks_and_stop_at_a_leading_toc_target() {
+        let mut source = CountingSource::new(&[
+            "First part.".into(),
+            "Middle part.".into(),
+            "Last part.".into(),
+            "Next subsection.".into(),
+            "Unrelated chapter.".into(),
+        ]);
+        let data = Arc::get_mut(&mut source).unwrap();
+        for index in 1..=3 {
+            data.book.sections[index]
+                .properties
+                .push(rebook_publication::CONTINUATION_SECTION_PROPERTY.into());
+        }
+        for index in [0, 3] {
+            let anchor = block_source(&data.sections[index].blocks[0])
+                .unwrap()
+                .start
+                .clone();
+            data.sections[index].anchors.push(SectionAnchor {
+                fragment: "heading".into(),
+                source: anchor,
+            });
+            data.book.table_of_contents.push(TocEntry {
+                label: format!("Subsection {index}"),
+                href: Some(data.book.sections[index].href.resolve("#heading").unwrap()),
+                children: Vec::new(),
+            });
+        }
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(800, 600), ReaderStyle::default())
+                .unwrap();
+        assert_eq!(reader.current_reading_unit_sections(), 0..3);
+        assert_eq!(reader.current_reading_unit_content().unwrap().len(), 3);
+        let pages = reader.current_reading_unit_pages().unwrap();
+        let last = pages.last().unwrap().position;
+        assert_eq!(last.section_index, 2);
+        drop(pages);
+        reader.set_visible_position(last).unwrap();
+        assert_eq!(reader.current_reading_unit_sections(), 0..3);
+        assert_eq!(reader.reading_unit_location().index, 0);
+        reader
+            .go_to_adjacent_reading_unit(PageDirection::Next)
+            .unwrap();
+        assert_eq!(reader.current_position().section_index, 3);
+        assert_eq!(reader.current_reading_unit_sections(), 3..4);
+        reader
+            .go_to_adjacent_reading_unit(PageDirection::Previous)
+            .unwrap();
+        assert_eq!(reader.current_position().section_index, 0);
+        assert_eq!(reader.current_reading_unit_content().unwrap().len(), 3);
+        assert_eq!(source.parse_count(4), 0);
+    }
+
+    #[test]
     fn active_toc_follows_the_nearest_preceding_segment_page() {
         let items = vec![
             TocViewItem {
@@ -8297,11 +9076,14 @@ mod tests {
             key: segment,
             generation: stale_generation,
             segment: Ok(Arc::new(CachedSegment {
-                section,
-                pages: Vec::new(),
-                anchor_pages: HashMap::new(),
-                visible_pages: 1,
-                continuation_offset_x: 0.0,
+                layout: Arc::new(SegmentLayout {
+                    section,
+                    pages: Vec::new(),
+                    anchor_pages: HashMap::new(),
+                    visible_pages: 1,
+                    continuation_offset_x: 0.0,
+                }),
+                continuous_unit: None,
             })),
         });
 
@@ -8334,11 +9116,14 @@ mod tests {
             reader.cache.insert(
                 key,
                 Arc::new(CachedSegment {
-                    section: Arc::clone(&expensive),
-                    pages: Vec::new(),
-                    anchor_pages: HashMap::new(),
-                    visible_pages: 1,
-                    continuation_offset_x: 0.0,
+                    layout: Arc::new(SegmentLayout {
+                        section: Arc::clone(&expensive),
+                        pages: Vec::new(),
+                        anchor_pages: HashMap::new(),
+                        visible_pages: 1,
+                        continuation_offset_x: 0.0,
+                    }),
+                    continuous_unit: None,
                 }),
             );
             reader.touch(key);

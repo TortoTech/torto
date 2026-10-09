@@ -24,6 +24,8 @@ pub struct RasterCacheStats {
 #[derive(Default)]
 struct Cache {
     entries: HashMap<u64, (RasterImage, u64)>,
+    owners: HashMap<u64, (String, bool)>,
+    mode_generations: HashMap<(String, bool), u64>,
     clock: u64,
     generation: u64,
     stats: RasterCacheStats,
@@ -45,6 +47,13 @@ pub fn clear_raster_cache() {
         generation,
         ..Cache::default()
     };
+}
+
+/// Removes pixels belonging to one inactive publication view. Runs on a
+/// retirement worker; in-flight decodes cannot insert into the retired view.
+pub fn retire_publication_rasters(publication_id: &str, fixed_page: bool) {
+    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    cache.retire_view(publication_id, fixed_page);
 }
 
 fn raster(width: u32, height: u32, pixels: Arc<[u8]>, origin: Option<RasterOrigin>) -> RasterImage {
@@ -100,6 +109,25 @@ fn display_raster(
 }
 
 impl Cache {
+    fn retire_view(&mut self, publication_id: &str, fixed_page: bool) {
+        let owner = (publication_id.to_owned(), fixed_page);
+        let epoch = self.mode_generations.entry(owner.clone()).or_default();
+        *epoch = epoch.wrapping_add(1);
+        let retired = self
+            .owners
+            .iter()
+            .filter(|(_, value)| **value == owner)
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        for key in retired {
+            self.owners.remove(&key);
+            if let Some((image, _)) = self.entries.remove(&key) {
+                self.stats.bytes -= image.pixels.len();
+            }
+        }
+        self.stats.images = self.entries.len();
+    }
+
     fn insert(&mut self, key: u64, raster: RasterImage, budget: usize) -> RasterImage {
         // Foreground layout and prefetch share the same Blob ID even if both
         // finished decoding at once.
@@ -117,6 +145,7 @@ impl Cache {
                     break;
                 };
                 if let Some((image, _)) = self.entries.remove(&oldest) {
+                    self.owners.remove(&oldest);
                     self.stats.bytes -= image.pixels.len();
                 }
             }
@@ -134,6 +163,18 @@ pub(super) fn load(
     target: [u32; 2],
     generation: u64,
 ) -> Result<RasterImage, LayoutError> {
+    let owner = (
+        source.book().id.to_string(),
+        source.book().metadata.layout == RenditionLayout::PrePaginated,
+    );
+    let mode_generation = {
+        let cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+        cache
+            .mode_generations
+            .get(&owner)
+            .copied()
+            .unwrap_or_default()
+    };
     // PDF text coordinates and formulas require exact pixels; they still reuse
     // decoded data and its upload identity.
     let exact = block.text_layer.is_some() || block.formula_image || block.formula.is_some();
@@ -184,16 +225,43 @@ pub(super) fn load(
     };
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     // Closing/replacing a book invalidates an in-progress decode's insertion.
-    if cache.generation != generation {
+    if cache.generation != generation
+        || cache
+            .mode_generations
+            .get(&owner)
+            .copied()
+            .unwrap_or_default()
+            != mode_generation
+    {
         return Ok(image);
     }
-    Ok(cache.insert(key, image, BUDGET))
+    let image = cache.insert(key, image, BUDGET);
+    if cache.entries.contains_key(&key) {
+        cache.owners.insert(key, owner);
+    }
+    Ok(image)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rebook_publication::{Book, Metadata, PublicationId};
+
+    #[test]
+    fn retiring_one_view_keeps_other_views_and_books() {
+        let mut cache = Cache::default();
+        for (key, book, fixed) in [(1, "book", true), (2, "book", false), (3, "other", true)] {
+            cache.insert(key, raster(2, 2, vec![255; 16].into(), None), 128);
+            cache.owners.insert(key, (book.into(), fixed));
+        }
+        cache.retire_view("book", true);
+        assert!(!cache.entries.contains_key(&1));
+        assert!(cache.entries.contains_key(&2));
+        assert!(cache.entries.contains_key(&3));
+        assert_eq!(cache.stats.bytes, 32);
+        assert_eq!(cache.stats.images, 2);
+        assert_eq!(cache.mode_generations.get(&("book".into(), true)), Some(&1));
+    }
 
     #[test]
     fn dpi_variants_reuse_pixels_keep_layout_and_reload_full_original() {

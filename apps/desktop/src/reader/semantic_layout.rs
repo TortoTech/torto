@@ -336,8 +336,13 @@ impl DesktopReader {
             self.semantic_layout.groups.clear();
             self.semantic_layout.semantic_config = Some(semantic);
             if had_config {
-                self.semantic_source
-                    .configure(&self.book_id, &self.plugin_settings);
+                self.semantic_source.configure(
+                    &crate::plugins::pdf_native::cache_identity(
+                        &self.book_id,
+                        self.rewrite_source.as_ref(),
+                    ),
+                    &self.plugin_settings,
+                );
                 self.refresh_semantic_layout();
                 refreshed = true;
             }
@@ -621,7 +626,10 @@ impl DesktopReader {
                 );
                 let active = job.clone();
                 let settings = self.plugin_settings.clone();
-                let book = self.book_id.clone();
+                let book = crate::plugins::pdf_native::cache_identity(
+                    &self.book_id,
+                    self.rewrite_source.as_ref(),
+                );
                 let source = original.clone();
                 let proxy = proxy.clone();
                 let (tx, rx) = mpsc::channel();

@@ -13,6 +13,7 @@ members = [
     "crates/windows-window-background",
 ]
 exclude = [
+    "third_party/hayro",
     "third_party/epaint",
     "third_party/egui",
     "third_party/egui-wgpu",
@@ -129,3 +130,5 @@ epaint = { path = "third_party/epaint" }
 egui-wgpu = { path = "third_party/egui-wgpu" }
 egui_commonmark = { path = "third_party/egui_commonmark" }
 egui_commonmark_backend = { path = "third_party/egui_commonmark_backend" }
+
+hayro = { path = "third_party/hayro" }

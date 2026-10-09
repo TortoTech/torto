@@ -2,7 +2,7 @@ use crate::plugins::semantic_layout::SemanticLayoutSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use peniko::{Blob, Color};
@@ -134,13 +134,39 @@ pub(super) fn open_reader(
     let started = Instant::now();
     let publication_started = Instant::now();
     let known_publication_id = shelf_metadata.as_ref().map(|metadata| metadata.id.as_str());
-    let publication = open_publication_file_for_reading(path, known_publication_id)?;
+    let cached_original = if BookFormat::from_file_name(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+    ) == Some(BookFormat::Pdf)
+        && let Some(book_id) = known_publication_id
+    {
+        crate::plugins::open_cached_pdf_ocr_original(path, book_id).unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to open cached OCR descriptor; opening original PDF");
+            None
+        })
+    } else {
+        None
+    };
+    let mut original_cache = cached_original.clone();
+    let (format, canonical_source, cover) = if let Some(source) = cached_original {
+        let source: Arc<dyn BookSource> = source;
+        (BookFormat::Pdf, source, shelf_cover)
+    } else {
+        let publication = open_publication_file_for_reading(path, known_publication_id)?;
+        let cover = shelf_cover.or_else(|| publication.cover_bytes().map(<[u8]>::to_vec));
+        (publication.format(), publication.source(), cover)
+    };
+    let canonical_source = if format == BookFormat::Pdf && original_cache.is_none() {
+        let cache = crate::plugins::cache_pdf_original_source(path, canonical_source);
+        original_cache = Some(cache.clone());
+        cache as Arc<dyn BookSource>
+    } else {
+        canonical_source
+    };
     #[cfg(all(target_os = "windows", feature = "memory-profiling"))]
     crate::diagnostics::memory_checkpoint("publication_opened");
     let publication_ms = publication_started.elapsed().as_secs_f32() * 1_000.0;
-    let format = publication.format();
-    let cover = shelf_cover.or_else(|| publication.cover_bytes().map(<[u8]>::to_vec));
-    let canonical_source = publication.source();
     let book_id = canonical_source.book().id.to_string();
     let source_title_missing = canonical_source.book().metadata.title.trim().is_empty();
     let source_authors_missing = canonical_source
@@ -197,6 +223,7 @@ pub(super) fn open_reader(
             match load_pdf_ocr_source(
                 Arc::clone(&canonical_source),
                 plugin_settings.pdf_ocr_reflow_enabled,
+                original_cache,
             ) {
                 Ok(loaded) => (
                     loaded.source,
@@ -230,7 +257,10 @@ pub(super) fn open_reader(
         rewrite_source.clone(),
     ));
     if !fixed_page {
-        semantic_source.configure(&book_id, &plugin_settings);
+        semantic_source.configure(
+            &crate::plugins::pdf_native::cache_identity(&book_id, rewrite_source.as_ref()),
+            &plugin_settings,
+        );
     }
     let structure_source = Arc::new(ParagraphStructureSource::new(semantic_source.clone()));
     let source: Arc<dyn BookSource> = structure_source.clone();
@@ -287,11 +317,16 @@ pub(super) fn open_reader(
     });
     let progress_store = Some(local_store);
     let progress_started = Instant::now();
-    let stored_progress = progress_store
+    let mut stored_progress = progress_store
         .as_ref()
         .map(|store| store.load_progress(&book_id))
         .transpose()?
         .flatten();
+    if let Some(progress) = stored_progress.as_mut()
+        && let Some(controller) = &pdf_ocr_controller
+    {
+        controller.remap_locator(&mut progress.locator);
+    }
     let mut restored_source_range = stored_progress
         .as_ref()
         .and_then(|progress| progress.locator.source.clone());
@@ -3547,6 +3582,7 @@ pub(crate) type TocTranslationTaskMessage = TaskResult<Vec<BlockTranslation>>;
 #[derive(Clone)]
 struct PdfTocTask {
     source: Arc<dyn BookSource>,
+    controller: Option<Arc<PdfOcrSourceController>>,
     book_id: String,
     need_toc: bool,
     need_page_roles: bool,
@@ -3591,11 +3627,74 @@ struct PdfOcrTask {
     book_id: String,
     page_count: usize,
     settings: PluginSettings,
+    select_on_complete: bool,
 }
 
 pub(crate) enum PdfOcrTaskMessage {
-    Progress { id: u64, message: String },
-    Complete(TaskResult<()>),
+    Progress {
+        book_id: String,
+        id: u64,
+        message: String,
+    },
+    Complete {
+        book_id: String,
+        message: TaskResult<()>,
+    },
+}
+
+#[derive(Clone)]
+struct PdfOriginalTask {
+    controller: Arc<PdfOcrSourceController>,
+    target: Option<PublicationUrl>,
+    mode: PdfOcrViewMode,
+}
+
+#[derive(Clone, Copy)]
+enum PdfNativeAction {
+    Auto,
+    AutoRegenerate,
+    Open,
+    Regenerate,
+    Ocr,
+}
+
+#[derive(Debug)]
+pub(crate) enum PdfTextResult {
+    Ready(Option<rebook_formats::pdf_reflow::Statistics>),
+    NeedsOcr,
+}
+
+#[derive(Clone)]
+struct PdfNativeTask {
+    path: PathBuf,
+    book_id: String,
+    original: rebook_publication::Book,
+    origin: TableOfContentsOrigin,
+    job: String,
+    action: PdfNativeAction,
+    cancelled: Arc<AtomicBool>,
+}
+
+pub(crate) enum PdfNativeTaskMessage {
+    Progress {
+        book_id: String,
+        job: String,
+        id: u64,
+        page: usize,
+        total: usize,
+        phase: &'static str,
+    },
+    Complete {
+        book_id: String,
+        job: String,
+        message: TaskResult<PdfTextResult>,
+    },
+}
+
+pub(crate) struct PdfOriginalTaskMessage {
+    pub(crate) book_id: String,
+    pub(crate) controller: Arc<PdfOcrSourceController>,
+    pub(crate) message: TaskResult<()>,
 }
 
 struct PdfOcrUiState {
@@ -3603,6 +3702,11 @@ struct PdfOcrUiState {
     mode: PdfOcrViewMode,
     progress: String,
     task: TaskSlot<PdfOcrTask>,
+    original_task: TaskSlot<PdfOriginalTask>,
+    native_task: TaskSlot<PdfNativeTask>,
+    native_progress: String,
+    retired_sources: Vec<crate::plugins::RetiredPdfSource>,
+    retired_rasters: Option<(String, bool)>,
 }
 
 impl PdfOcrUiState {
@@ -3612,6 +3716,33 @@ impl PdfOcrUiState {
             mode,
             progress: String::new(),
             task: TaskSlot::default(),
+            original_task: TaskSlot::default(),
+            native_task: TaskSlot::default(),
+            native_progress: String::new(),
+            retired_sources: Vec::new(),
+            retired_rasters: None,
+        }
+    }
+}
+
+impl Drop for PdfOcrUiState {
+    fn drop(&mut self) {
+        if let Some(task) = self.native_task.active() {
+            task.cancelled.store(true, Ordering::Release);
+        }
+        // Closing before the next frame must not destroy a large retired PDF
+        // or OCR document on the window thread.
+        if !self.retired_sources.is_empty() || self.retired_rasters.is_some() {
+            let retired = std::mem::take(&mut self.retired_sources);
+            let rasters = self.retired_rasters.take();
+            let _ = std::thread::Builder::new()
+                .name("pdf-view-retire".into())
+                .spawn(move || {
+                    drop(retired);
+                    if let Some((id, fixed)) = rasters {
+                        rebook_layout::retire_publication_rasters(&id, fixed);
+                    }
+                });
         }
     }
 }
@@ -4038,8 +4169,12 @@ impl DesktopReader {
             pdf_ocr.task.begin(PdfOcrTask {
                 path: source_path.clone(),
                 book_id: book_id.clone(),
-                page_count: source.book().sections.len(),
+                page_count: pdf_ocr_controller.as_ref().map_or_else(
+                    || source.book().sections.len(),
+                    |c| c.original_source().book().sections.len(),
+                ),
                 settings: plugin_settings.clone(),
+                select_on_complete: false,
             });
         }
         let pdf_visual_source = pdf_ocr_controller.as_ref().map_or_else(
@@ -4051,6 +4186,7 @@ impl DesktopReader {
         if format == BookFormat::Pdf
             && plugin_settings.ocr_enabled
             && plugin_settings.ocr_endpoint().is_ok()
+            && !(pdf_ocr.available && pdf_ocr.mode == PdfOcrViewMode::Reflow)
             && (need_toc || pdf_metadata_missing.any())
         {
             pdf_toc.progress = language
@@ -4058,6 +4194,7 @@ impl DesktopReader {
                 .into();
             pdf_toc.task.begin(PdfTocTask {
                 source: pdf_visual_source,
+                controller: pdf_ocr_controller.clone(),
                 book_id: book_id.clone(),
                 need_toc,
                 need_page_roles: true,
@@ -5195,6 +5332,21 @@ mod tests {
         assert!((second_top - first_bottom - 20.0).abs() < f32::EPSILON);
         assert!((layout.page_origins[1] - 40.0).abs() < f32::EPSILON);
         assert!((layout.page_heights[0] - 160.0).abs() < f32::EPSILON);
+
+        // A logical subsection crossing storage chunks is cropped at each
+        // chunk edge, so neither a blank page tail nor a new page head remains.
+        let mut owner = page(0, 0.0);
+        owner.position.section_index = 19;
+        owner.visible_top = Some(40.0);
+        owner.visible_bottom = Some(140.0);
+        let mut continuation = page(0, 20.0);
+        continuation.position.section_index = 20;
+        continuation.visible_top = Some(40.0);
+        continuation.visible_bottom = Some(140.0);
+        let layout = ScrollSectionLayout::new(19, 0, vec![owner, continuation], false);
+        assert!((layout.page_tops[1] - 100.0).abs() < f32::EPSILON);
+        assert!((layout.content_height - 200.0).abs() < f32::EPSILON);
+        assert_eq!(layout.page_at_content_y(100.0), Some((1, 40.0)));
     }
 
     #[test]

@@ -28,6 +28,7 @@ const MAX_ARCHIVE_TOTAL_BYTES: u64 = 768 * 1024 * 1024;
 pub(crate) enum DerivedDataKind {
     Ocr,
     Metadata,
+    NativePdf,
 }
 
 impl DerivedDataKind {
@@ -35,12 +36,13 @@ impl DerivedDataKind {
         match self {
             Self::Ocr => "ocr",
             Self::Metadata => "metadata",
+            Self::NativePdf => "native-pdf",
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct OcrManifest {
+struct DerivedArchiveManifest {
     version: u8,
     book_id: String,
     content_sha256: String,
@@ -68,26 +70,27 @@ enum DerivedOperation {
         dirty_revision: Option<Vec<u8>>,
         bytes: Vec<u8>,
     },
-    UploadOcr {
+    UploadArchive {
+        kind: DerivedDataKind,
         book_id: String,
         dirty_revision: Option<Vec<u8>>,
-        bytes: Vec<u8>,
-        manifest: OcrManifest,
+        path: PathBuf,
+        manifest: DerivedArchiveManifest,
     },
-    DownloadOcr {
+    DownloadArchive {
+        kind: DerivedDataKind,
         book_id: String,
         dirty_revision: Option<Vec<u8>>,
-        manifest: OcrManifest,
+        manifest: DerivedArchiveManifest,
     },
 }
 
 impl DerivedOperation {
     fn length(&self) -> u64 {
         match self {
-            Self::UploadMetadata { bytes, .. } | Self::UploadOcr { bytes, .. } => {
-                u64::try_from(bytes.len()).unwrap_or(u64::MAX)
-            }
-            Self::DownloadOcr { manifest, .. } => manifest.content_length,
+            Self::UploadMetadata { bytes, .. } => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            Self::UploadArchive { manifest, .. } => manifest.content_length,
+            Self::DownloadArchive { manifest, .. } => manifest.content_length,
             // Metadata is fetched while planning; applying it is not another download.
             Self::DownloadMetadata { .. } => 0,
         }
@@ -147,6 +150,14 @@ where
             &mut operations,
         )
         .await?;
+        collect_native_operation(
+            webdav,
+            &book_id,
+            archive_dir,
+            remote_files.contains("native-pdf.json"),
+            &mut operations,
+        )
+        .await?;
         progress(
             SyncStage::CheckingDerivedData,
             (index + 1) as u64,
@@ -158,7 +169,7 @@ where
         operations.into_iter().partition(|operation| {
             matches!(
                 operation,
-                DerivedOperation::UploadMetadata { .. } | DerivedOperation::UploadOcr { .. }
+                DerivedOperation::UploadMetadata { .. } | DerivedOperation::UploadArchive { .. }
             )
         });
     downloads
@@ -283,19 +294,24 @@ where
             acknowledge_derived(webdav, &book_id, DerivedDataKind::Metadata, &dirty_revision)?;
             Ok(completed)
         }
-        DerivedOperation::UploadOcr {
+        DerivedOperation::UploadArchive {
+            kind,
             book_id,
             dirty_revision,
-            bytes,
+            path,
             manifest,
         } => {
-            let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let bytes = fs::read(path)?;
+            let length = manifest.content_length;
+            if bytes.len() as u64 != length {
+                return Err(io::Error::other("Derived archive changed before upload").into());
+            }
             webdav
                 .ensure_collection(&format!("derived/{book_id}/"))
                 .await?;
             webdav
                 .put_mutable_bytes_with_progress(
-                    &format!("derived/{book_id}/ocr.zip"),
+                    &format!("derived/{book_id}/{}.zip", kind.marker_name()),
                     bytes,
                     "application/zip",
                     |sent| {
@@ -307,17 +323,22 @@ where
                 )
                 .await?;
             webdav
-                .put_mutable_json(&format!("derived/{book_id}/ocr.json"), &manifest)
+                .put_mutable_json(
+                    &format!("derived/{book_id}/{}.json", kind.marker_name()),
+                    &manifest,
+                )
                 .await?;
-            acknowledge_derived(webdav, &book_id, DerivedDataKind::Ocr, &dirty_revision)?;
+            acknowledge_derived(webdav, &book_id, kind, &dirty_revision)?;
             Ok(completed.saturating_add(length))
         }
-        DerivedOperation::DownloadOcr {
+        DerivedOperation::DownloadArchive {
+            kind,
             book_id,
             manifest,
             dirty_revision,
         } => {
-            download_ocr(
+            download_archive(
+                kind,
                 webdav,
                 &book_id,
                 &manifest,
@@ -332,10 +353,11 @@ where
     }
 }
 
-async fn download_ocr<F>(
+async fn download_archive<F>(
+    kind: DerivedDataKind,
     webdav: &WebDavClient,
     book_id: &str,
-    manifest: &OcrManifest,
+    manifest: &DerivedArchiveManifest,
     cache_dir: &Path,
     completed: u64,
     total: u64,
@@ -345,10 +367,14 @@ async fn download_ocr<F>(
 where
     F: FnMut(u64, u64),
 {
-    let cache_path = cache_dir.join(format!("{book_id}-{}.part", manifest.content_sha256));
+    let cache_path = cache_dir.join(format!(
+        "{book_id}-{}-{}.part",
+        kind.marker_name(),
+        manifest.content_sha256
+    ));
     let found = webdav
         .download_to_file(
-            &format!("derived/{book_id}/ocr.zip"),
+            &format!("derived/{book_id}/{}.zip", kind.marker_name()),
             &cache_path,
             manifest.content_length,
             |downloaded| {
@@ -374,10 +400,14 @@ where
         )
         .into());
     }
-    require_unchanged(book_id, DerivedDataKind::Ocr, dirty_revision)?;
-    import_pdf_ocr_sync_data(book_id, unpack_ocr_archive(bytes)?)?;
+    require_unchanged(book_id, kind, dirty_revision)?;
+    if kind == DerivedDataKind::NativePdf {
+        crate::plugins::pdf_native::import(book_id, unpack_native_archive(bytes)?)?;
+    } else {
+        import_pdf_ocr_sync_data(book_id, unpack_ocr_archive(bytes)?)?;
+    }
     fs::remove_file(cache_path).ok();
-    acknowledge_derived(webdav, book_id, DerivedDataKind::Ocr, dirty_revision)?;
+    acknowledge_derived(webdav, book_id, kind, dirty_revision)?;
     Ok(completed.saturating_add(manifest.content_length))
 }
 
@@ -504,7 +534,7 @@ async fn collect_ocr_operation(
         webdav
             .get_optional(&manifest_path)
             .await?
-            .map(|object| serde_json::from_slice::<OcrManifest>(&object.bytes))
+            .map(|object| serde_json::from_slice::<DerivedArchiveManifest>(&object.bytes))
             .transpose()?
     } else {
         None
@@ -519,26 +549,27 @@ async fn collect_ocr_operation(
             acknowledge_derived(webdav, book_id, DerivedDataKind::Ocr, &dirty_revision)?;
         }
         (Some(local), None) => {
-            let bytes = fs::read(&local.path)?;
             let manifest = local.manifest;
-            operations.push(DerivedOperation::UploadOcr {
+            operations.push(DerivedOperation::UploadArchive {
+                kind: DerivedDataKind::Ocr,
                 book_id: book_id.to_owned(),
                 dirty_revision,
-                bytes,
+                path: local.path,
                 manifest,
             });
         }
         (Some(local), Some(_)) if is_dirty(webdav, book_id, DerivedDataKind::Ocr)? => {
-            let bytes = fs::read(&local.path)?;
             let manifest = local.manifest;
-            operations.push(DerivedOperation::UploadOcr {
+            operations.push(DerivedOperation::UploadArchive {
+                kind: DerivedDataKind::Ocr,
                 book_id: book_id.to_owned(),
                 dirty_revision,
-                bytes,
+                path: local.path,
                 manifest,
             });
         }
-        (_, Some(manifest)) => operations.push(DerivedOperation::DownloadOcr {
+        (_, Some(manifest)) => operations.push(DerivedOperation::DownloadArchive {
+            kind: DerivedDataKind::Ocr,
             book_id: book_id.to_owned(),
             dirty_revision,
             manifest,
@@ -550,10 +581,138 @@ async fn collect_ocr_operation(
     Ok(())
 }
 
+async fn collect_native_operation(
+    webdav: &WebDavClient,
+    book_id: &str,
+    archive_dir: &Path,
+    remote_present: bool,
+    operations: &mut Vec<DerivedOperation>,
+) -> SyncResult<()> {
+    let kind = DerivedDataKind::NativePdf;
+    let revision = read_dirty_revision(book_id, kind)?;
+    let root = crate::plugins::pdf_native::directory(book_id)?;
+    let fingerprint = fs::read(root.join("current.json")).ok().map(|b| sha256(&b));
+    let key = format!("native-archive:{book_id}");
+    let mut cached = webdav
+        .cache_get(&key)?
+        .and_then(|b| serde_json::from_slice::<CachedOcrArchive>(&b).ok());
+    if let Some(fingerprint) = fingerprint {
+        if cached.as_ref().is_none_or(|c| {
+            c.fingerprint != fingerprint
+                || !fs::metadata(&c.path).is_ok_and(|m| m.len() == c.manifest.content_length)
+        }) {
+            let files = crate::plugins::pdf_native::export(book_id)?
+                .ok_or_else(|| io::Error::other("Native PDF cache disappeared"))?;
+            let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            for (name, contents) in files {
+                writer.start_file(name, options)?;
+                writer.write_all(&contents)?;
+            }
+            let bytes = writer.finish()?.into_inner();
+            if sha256(&fs::read(root.join("current.json"))?) != fingerprint {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Native PDF changed during sync; retry required",
+                )
+                .into());
+            }
+            fs::create_dir_all(archive_dir)?;
+            let path = archive_dir.join(format!("{book_id}-native-{fingerprint}.zip"));
+            crate::persistence::write_bytes_atomic(&path, &bytes)?;
+            let next = CachedOcrArchive {
+                fingerprint,
+                manifest: ocr_manifest(book_id, &bytes),
+                path,
+            };
+            webdav.cache_set(&key, &serde_json::to_vec(&next)?)?;
+            if let Some(old) = cached.take()
+                && old.path.parent() == Some(archive_dir)
+                && old.path != next.path
+            {
+                let _ = fs::remove_file(old.path);
+            }
+            cached = Some(next);
+        }
+    } else {
+        cached = None;
+    }
+    let remote = if remote_present {
+        webdav
+            .get_optional(&format!("derived/{book_id}/native-pdf.json"))
+            .await?
+            .map(|o| serde_json::from_slice::<DerivedArchiveManifest>(&o.bytes))
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(remote) = &remote {
+        validate_ocr_manifest(book_id, remote)?;
+    }
+    match (cached, remote) {
+        (Some(local), Some(remote)) if local.manifest.content_sha256 == remote.content_sha256 => {
+            acknowledge_derived(webdav, book_id, kind, &revision)?
+        }
+        (Some(local), None) => operations.push(DerivedOperation::UploadArchive {
+            kind,
+            book_id: book_id.to_owned(),
+            dirty_revision: revision,
+            path: local.path,
+            manifest: local.manifest,
+        }),
+        (Some(local), Some(_)) if is_dirty(webdav, book_id, kind)? => {
+            operations.push(DerivedOperation::UploadArchive {
+                kind,
+                book_id: book_id.to_owned(),
+                dirty_revision: revision,
+                path: local.path,
+                manifest: local.manifest,
+            })
+        }
+        (_, Some(manifest)) => operations.push(DerivedOperation::DownloadArchive {
+            kind,
+            book_id: book_id.to_owned(),
+            dirty_revision: revision,
+            manifest,
+        }),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn unpack_native_archive(bytes: Vec<u8>) -> io::Result<Vec<(String, Vec<u8>)>> {
+    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    let mut seen = BTreeSet::new();
+    let mut total = 0;
+    let mut files = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        total += entry.size();
+        if entry.size() > MAX_ARCHIVE_ENTRY_BYTES || total > MAX_ARCHIVE_TOTAL_BYTES {
+            return Err(io::Error::other("Native PDF archive is too large"));
+        }
+        let name = entry.name().to_owned();
+        let url = rebook_publication::PublicationUrl::parse(&name).map_err(io::Error::other)?;
+        if url.path() != name
+            || !seen.insert(name.clone())
+            || !(name == "manifest.json"
+                || name.starts_with("sections/")
+                || name.starts_with("resources/"))
+        {
+            return Err(io::Error::other("Invalid native PDF archive entry"));
+        }
+        let mut contents = Vec::new();
+        entry.read_to_end(&mut contents)?;
+        files.push((name, contents));
+    }
+    Ok(files)
+}
+
 #[derive(Serialize, Deserialize)]
 struct CachedOcrArchive {
     fingerprint: String,
-    manifest: OcrManifest,
+    manifest: DerivedArchiveManifest,
     path: PathBuf,
 }
 
@@ -669,8 +828,8 @@ fn unpack_ocr_archive(bytes: Vec<u8>) -> io::Result<PdfOcrSyncData> {
     })
 }
 
-fn ocr_manifest(book_id: &str, bytes: &[u8]) -> OcrManifest {
-    OcrManifest {
+fn ocr_manifest(book_id: &str, bytes: &[u8]) -> DerivedArchiveManifest {
+    DerivedArchiveManifest {
         version: DERIVED_SYNC_VERSION,
         book_id: book_id.to_owned(),
         content_sha256: sha256(bytes),
@@ -678,8 +837,9 @@ fn ocr_manifest(book_id: &str, bytes: &[u8]) -> OcrManifest {
     }
 }
 
-fn validate_ocr_manifest(book_id: &str, manifest: &OcrManifest) -> SyncResult<()> {
+fn validate_ocr_manifest(book_id: &str, manifest: &DerivedArchiveManifest) -> SyncResult<()> {
     if manifest.version != DERIVED_SYNC_VERSION
+        || manifest.content_length > MAX_ARCHIVE_TOTAL_BYTES
         || manifest.book_id != book_id
         || manifest.content_sha256.len() != 64
         || manifest
@@ -773,6 +933,36 @@ fn require_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_archive_rejects_paths_outside_the_generation_and_unknown_entries() {
+        fn zip(names: &[&str]) -> Vec<u8> {
+            let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+            for name in names {
+                writer
+                    .start_file(*name, SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(b"test").unwrap();
+            }
+            writer.finish().unwrap().into_inner()
+        }
+        assert!(unpack_native_archive(zip(&["../manifest.json"])).is_err());
+        assert!(unpack_native_archive(zip(&["unrecognized.json"])).is_err());
+        assert_eq!(
+            unpack_native_archive(zip(&[
+                "manifest.json",
+                "sections/0.json",
+                "resources/page.png"
+            ]))
+            .unwrap()
+            .len(),
+            3
+        );
+        assert_ne!(
+            DerivedDataKind::Ocr.marker_name(),
+            DerivedDataKind::NativePdf.marker_name()
+        );
+    }
 
     #[test]
     fn ocr_sync_cache_reuses_archive_until_local_files_change() {

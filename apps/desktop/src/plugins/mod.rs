@@ -10,6 +10,7 @@ mod commands;
 pub(crate) mod glossary;
 pub(crate) mod llm;
 mod llm_json;
+pub(crate) mod pdf_native;
 mod pdf_ocr;
 mod pdf_toc;
 mod pdf_vision;
@@ -43,9 +44,11 @@ pub use commands::{
 };
 pub(crate) use pdf_ocr::{
     PDF_PAGE_ANCHOR_PREFIX, PdfOcrPageRole, PdfOcrPageRoleAssignment, PdfOcrSourceController,
-    PdfOcrSyncData, PdfOcrViewMode, correct_generated_toc_pages_from_ocr, export_pdf_ocr_sync_data,
-    has_pending_pdf_ocr_task, import_pdf_ocr_sync_data, load_pdf_ocr_source,
-    pdf_ocr_sync_fingerprint, recognize_pdf, save_pdf_ocr_page_roles, set_pdf_ocr_view_mode,
+    PdfOcrSyncData, PdfOcrViewMode, RetiredPdfSource, cache_pdf_original_source,
+    correct_generated_toc_pages_from_ocr, export_pdf_ocr_sync_data, has_pending_pdf_ocr_task,
+    import_pdf_ocr_sync_data, load_pdf_ocr_source, open_cached_pdf_ocr_original,
+    pdf_ocr_result_available, pdf_ocr_sync_fingerprint, recognize_pdf, save_pdf_ocr_page_roles,
+    set_pdf_ocr_view_mode,
 };
 pub(crate) use pdf_toc::{PdfMetadataExtraction, extract_pdf_metadata};
 pub use rewrite::RewriteBookSource;

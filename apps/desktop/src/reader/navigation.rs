@@ -304,6 +304,15 @@ impl DesktopReader {
         if let Some(source) = self.progress_source_range() {
             locator.source = Some(source);
         }
+        if self.format == rebook_formats::BookFormat::Pdf
+            && self.pdf_ocr.mode == crate::plugins::PdfOcrViewMode::Reflow
+            && let Some(fragment) = self
+                .reader
+                .current_preceding_anchor(crate::plugins::PDF_PAGE_ANCHOR_PREFIX)
+            && let Ok(href) = locator.href.resolve(&format!("#{fragment}"))
+        {
+            locator.href = href;
+        }
         locator
     }
 

@@ -328,6 +328,12 @@ pub struct SpineItem {
 /// hint automatically.
 pub const NOTE_SECTION_PROPERTY: &str = "rebook-note-section";
 
+/// Internal spine property for storage chunks in one continuous content flow.
+/// Content before the first TOC anchor continues the preceding reading unit;
+/// it is not a prelude belonging to the next heading. Authored chapter files
+/// should not carry this hint merely because they have introductory content.
+pub const CONTINUATION_SECTION_PROPERTY: &str = "rebook-continuation-section";
+
 impl SpineItem {
     /// Returns whether this complete reading-order resource is an authored
     /// Notes/Endnotes section rather than ordinary prose containing local notes.

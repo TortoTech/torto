@@ -55,7 +55,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 image.workspace = true
 jsonrepair-rs.workspace = true
 jsonschema = { version = "0.46", default-features = false }
-rig-core = { version = "=0.42.0", default-features = false, features = ["reqwest"] }
+rig-core = { version = "=0.44.0", default-features = false }
+rig-reqwest = { version = "=0.44.0", default-features = false }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 keyring.workspace = true
 kurbo.workspace = true
@@ -89,6 +90,7 @@ vello.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 zip.workspace = true
+arc-swap = "1.9.2"
 
 [lints]
 workspace = true

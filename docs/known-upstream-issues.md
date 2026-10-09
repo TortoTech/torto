@@ -1,16 +1,16 @@
 # 核心依赖已知问题
 
-- 最近更新：2026-10-07
+- 最近更新：2026-10-09
 - 记录范围：已经在 Torto 中复现、确认与上游依赖、Windows 图形栈或渲染帧时序有关，并需要本地兼容代码或长期回归检查的问题
 
 依赖升级时应逐项检查本文。只有在上游修复已经进入当前版本，并且移除本地兼容代码后相关回归测试仍能通过，才删除对应兼容代码和本文条目。
 
 ## Rig：OpenAI 兼容网关的签名扩展导致响应解析失败或回传丢失
 
-- 影响版本：项目当前 `rig-core 0.42.0`；核对 `0.43.0` 标签源码，相同字段限制仍存在。
-- 核查日期：2026-10-07。最新发布版为 [0.43.0](https://github.com/0xPlaygrounds/rig/releases/tag/v0.43.0)（2026-09-30）。
-- 本地位置：`apps/desktop/src/plugins/llm/transport.rs` 的 `capture_assistant`、`normalize`、`CompatHttp::prepare`；`apps/desktop/src/plugins/llm.rs` 的 `compatible_scope`、`compatible_replay`、`scoped_messages`、`response_message`。
-- 官方跟踪：[Rig #2591](https://github.com/0xPlaygrounds/rig/issues/2591)（兼容响应解析过严，同类问题，非完全相同复现）、[PR #2713](https://github.com/0xPlaygrounds/rig/pull/2713)（2026-10-04 合并到主分支，宽容 JSON 解析和原始条目回传，尚未进入 0.43.0）。未找到专门报告 Bifrost 此签名结构的官方 issue；本次没有向上游创建 issue。
+- 影响版本：`rig-core 0.42.0`、`0.43.0`；项目已升级到 `rig-core 0.44.0` 和 `rig-reqwest 0.44.0`。
+- 核查日期：2026-10-09。[0.44.0](https://github.com/0xPlaygrounds/rig/releases/tag/v0.44.0)（2026-10-07）已包含 PR #2713 的 JSON-first 协议层和原始条目回传。
+- 本地位置：`apps/desktop/src/plugins/llm.rs` 的 `dispatch`、`execute`、`response_message`；`apps/desktop/src/plugins/llm/history.rs` 的当前内存消息适配与作用域校验；`apps/desktop/src/plugins/llm/transport.rs` 的 JSON 回复转流式桥接和搜索来源收集。
+- 官方跟踪：[Rig #2591](https://github.com/0xPlaygrounds/rig/issues/2591)（兼容响应解析过严，同类问题，非完全相同复现）、[PR #2713](https://github.com/0xPlaygrounds/rig/pull/2713)（2026-10-04 合并到主分支，宽容 JSON 解析和原始条目回传，已进入 0.44.0，未进入 0.43.0）。未找到专门报告 Bifrost 此签名结构的官方 issue；本次没有向上游创建 issue。
 
 ### 复现证据
 
@@ -22,20 +22,24 @@
 {"reasoning_details":[{"type":"reasoning.encrypted","id":"call-example","index":0,"signature":"<opaque signature>"}]}
 ```
 
-Rig 的 `ReasoningDetails::Encrypted` 强制要求 `data: String`，因此整个响应报 `missing field data`。实验中人为补 `data` 可通过解析，但 `signature` 不属于该类型的字段，经过 SDK 序列化会消失；这不能作为修复。Bifrost 的 `reasoning_details` 是标准之外的扩展，`signature` 与 `data` 是不同字段，不能互相假定等价。
+旧版 Rig 的 `ReasoningDetails::Encrypted` 强制要求 `data: String`，因此整个响应报 `missing field data`。实验中人为补 `data` 可通过解析，但 `signature` 不属于该类型的字段，经过 SDK 序列化会消失；这不能作为修复。Bifrost 的 `reasoning_details` 是标准之外的扩展，`signature` 与 `data` 是不同字段，不能互相假定等价。
 
 2026-10-07 使用相同网关、凭据和模型，完整目录工具声明的首轮请求及原样回传后的第二轮请求均返回 HTTP 200；真实首轮响应交给项目锁定版本的 SDK，仍复现上述错误。签名值没有写入诊断日志或本文。
 
-补丁后用本地《The psychology of reading》（554 页）实测：首轮再次遇到上述连接失败，一次重试后恢复，随后运行到第 19 轮模型请求，可正常处理页面概览与阅读调用，没有 SDK 解码或签名回传错误。但模型也出现一次 `read_pages` 请求 6 页、超过声明的 5 页上限的无效调用；约 96 秒后因重复查看页面、没有形成有效目录/元数据草稿而触发停滞保护，返回“连续调用未取得新进展，已保留草稿”。这是尚待调查的模型识别/工具决策问题，本轮实测不能记为整本目录识别通过；报告位于本地 `target/pdf-agent-live/report.json`，不随代码提交。
+2026-10-07 旧版兼容补丁后用本地《The psychology of reading》（554 页）实测：首轮再次遇到上述连接失败，一次重试后恢复，随后运行到第 19 轮模型请求，可正常处理页面概览与阅读调用，没有 SDK 解码或签名回传错误。但模型也出现一次 `read_pages` 请求 6 页、超过声明的 5 页上限的无效调用；约 96 秒后因重复查看页面、没有形成有效目录/元数据草稿而触发停滞保护，返回“连续调用未取得新进展，已保留草稿”。这是尚待调查的模型识别/工具决策问题，本轮实测不能记为整本目录识别通过；报告位于本地 `target/pdf-agent-live/report.json`，不随代码提交。
 
-### 当前本地兼容方案
+### 0.44.0 的实现与保留的适配
 
-1. 兼容 HTTP 层在 SDK 解码前保存带扩展的原始 assistant 消息，仅从 SDK 的解析视图移除其无法识别的 `reasoning_details` 条目；原始字段和值保持不变。标准密文 `data` 和 SDK 支持的其他条目继续正常解析。
-2. 私有历史同时记录原始消息、SDK 核心消息及端点/凭据/模型的摘要。发送前只有上下文相同、核心消息未修改、SDK 最终序列化仍匹配时，才恢复原始消息。内部标记和摘要不发送到 API，凭据不存入历史。
-3. 切换端点、凭据或模型后不恢复原始扩展，也去除 SDK 核心消息中该网关的 reasoning/signature 副本，保留普通文字、调用和结果。
-4. 捕获仅随当前请求及调用方历史存活，没有新增全局消息缓存。覆盖非流式 Chat Completions 和返回完整 JSON 的伪流式兼容路径；真实 SSE 仍交给 Rig，未知 SSE 扩展的完整回传尚需另行验证。
+1. SDK 负责宽容解码、原始条目及签名回传、联网工具与业务工具合并。已删除本地原始 assistant 副本、`reasoning_details` 清洗和发送前逐消息恢复代码，不再假造密文字段或丢弃未知扩展。
+2. 现有调用方仍用 JSON 组织当前请求，`history.rs` 将其适配为新版消息。私有消息只保留一份 SDK 消息、内容指纹和提供商/端点/凭据/模型摘要；内部标记不发送到 API，凭据不存入消息。
+3. SDK 的来源校验不覆盖端点和凭据，因此 Torto 继续校验这些摘要。换端点、凭据、模型或修改 SDK 消息后，去除推理/不透明条目及原始签名，保留普通文本、调用和结果。
+4. 对话及请求内工具历史不持久化，没有旧版对话数据迁移或兼容流程。SDK 消息和指纹仅服务于当前请求的多轮工具调用。
+5. HTTP 层保留网关忽略 `stream`、返回完整 JSON 时的流式桥接，以及搜索来源收集。真正 SSE 直接由 SDK 解码。非联网普通请求不额外解析一份完整 HTTP 响应。
+6. 新版宽容解码允许无效工具参数进入响应；普通业务工具仍在执行前拒绝，结构化结果工具沿用应用层 JSON 修复与 Schema 校验。未正常完成的响应不应用到书籍或继续执行工具。
 
-回归测试：`compatible_gateway_signed_history_replays_verbatim_across_tool_rounds`（含持久化、未来扩展、调用附加签名、两轮完整回传）、`compatible_gateway_history_is_scoped_and_invalidated_by_core_edits`、`incompatible_signed_history_is_not_sent_to_a_different_model`，以及已有双 reasoning 字段和原生签名历史测试。
+回归覆盖：多轮网关签名、未知扩展和密文回传，真正 SSE 的签名调用及文字增量，作用域/内容变更失效，xAI 的版本路径、图片和原生 Schema 映射，以及异常参数和未完成响应拒绝。此次升级验证使用本地 HTTP 夹具，不代表《The psychology of reading》整本目录识别已通过。
+
+2026-10-09 验证：桌面客户端构建通过；插件回归 308 项通过，25 项需要真实服务或本地书库的测试保持忽略。
 
 ### 另一个独立故障：网关连接上游时提前断开
 
@@ -45,12 +49,11 @@ Rig 的 `ReasoningDetails::Encrypted` 强制要求 `data: String`，因此整个
 
 回归测试：`connection_retry_classification_excludes_auth_schema_and_generic_server_errors`、`connection_retry_resends_same_round_before_tool_execution`、`connection_retry_is_bounded_and_preserves_final_error`、`connection_retry_does_not_retry_authentication_errors`。
 
-### 升级检查与后续事项
+### 后续跟踪
 
-1. 跟踪 #2713 进入发布版的时间。该 PR 大幅改变 assistant 历史、工具调用和提供商 API，不能只改版本号；需要单独迁移统一 LLM 层并检查已有历史是否可读。
-2. 升级候选版本后，用本次网关的真实响应和本地多轮回归核对未知字段、签名、密文、调用 ID 的原样回传；仅有“Gemini 原生签名支持”不等于网关扩展问题已解决。
-3. 临时关闭本地兼容层，验证目录识别、AI 对话、翻译和排版，以及跨模型/端点切换、错误响应和 SSE。全部通过后才移除本地兼容逻辑；在此之前保留本文。
-4. 网关上游连接故障独立跟踪。SDK 升级不能替代上游根因排查，也不能据此删除有限重试。
+1. 在实际 Bifrost 端点核对目录识别的完整工作流，重点观察模型选页、工具参数和停滞保护。不得把局部解码通过记为整本识别完成。
+2. 后续 SDK 升级继续回归多轮不透明字段回传、真正 SSE、跨端点/凭据/模型切换、翻译和排版的结构化输出。若上游增加端点和凭据保护，再评估移除本地作用域校验。
+3. 网关上游连接故障独立跟踪。SDK 升级不能替代上游根因排查，也不能据此删除有限重试。
 
 ## 2026-09-10 上游版本核查
 

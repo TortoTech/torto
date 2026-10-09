@@ -14,6 +14,7 @@ const MAX_NAME_TREE_DEPTH: usize = 64;
 pub(super) struct CatalogInfo {
     pub(super) title: Option<String>,
     pub(super) author: Option<String>,
+    pub(super) language: Option<String>,
     pub(super) table_of_contents: Vec<SourceTocEntry>,
 }
 
@@ -22,6 +23,11 @@ pub(super) fn read(pdf: &Pdf) -> CatalogInfo {
     CatalogInfo {
         title: metadata.title.as_deref().and_then(decode_pdf_text),
         author: metadata.author.as_deref().and_then(decode_pdf_text),
+        language: pdf
+            .xref()
+            .get::<Dict<'_>>(pdf.xref().root_id())
+            .and_then(|catalog| catalog.get::<PdfString<'_>>(b"Lang"))
+            .and_then(|language| decode_pdf_text(language.as_bytes())),
         table_of_contents: OutlineReader::new(pdf).read(),
     }
 }
@@ -31,6 +37,20 @@ struct OutlineReader<'a> {
     page_indices: HashMap<ObjectIdentifier, usize>,
     named_destinations: HashMap<String, Object<'a>>,
     seen_outline_nodes: HashSet<NodeKey>,
+    locations: Vec<OutlineLocation>,
+}
+
+pub(super) struct OutlineLocation {
+    pub(super) label: String,
+    pub(super) page: usize,
+    pub(super) left: Option<f64>,
+    pub(super) top: Option<f64>,
+}
+
+pub(super) fn locations(pdf: &Pdf) -> Vec<OutlineLocation> {
+    let mut reader = OutlineReader::new(pdf);
+    reader.read();
+    reader.locations
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -53,10 +73,11 @@ impl<'a> OutlineReader<'a> {
             page_indices,
             named_destinations: HashMap::new(),
             seen_outline_nodes: HashSet::new(),
+            locations: Vec::new(),
         }
     }
 
-    fn read(mut self) -> Vec<SourceTocEntry> {
+    fn read(&mut self) -> Vec<SourceTocEntry> {
         let Some(catalog) = self.pdf.xref().get::<Dict<'_>>(self.pdf.xref().root_id()) else {
             return Vec::new();
         };
@@ -130,6 +151,19 @@ impl<'a> OutlineReader<'a> {
             let page_index = self.outline_destination(&item);
             match (label, page_index) {
                 (Some(label), Some(page_index)) if !label.trim().is_empty() => {
+                    let destination = item.get::<Object<'a>>(b"Dest").or_else(|| {
+                        item.get::<Dict<'a>>(b"A")
+                            .and_then(|a| a.get::<Object<'a>>(b"D"))
+                    });
+                    let (left, top) = destination
+                        .and_then(|d| self.destination_position(d, &mut HashSet::new()))
+                        .unwrap_or((None, None));
+                    self.locations.push(OutlineLocation {
+                        label: label.trim().to_owned(),
+                        page: page_index,
+                        left,
+                        top,
+                    });
                     entries.push(SourceTocEntry {
                         label: label.trim().to_owned(),
                         href: format!("Text/section-{}.xhtml", page_index + 1),
@@ -206,6 +240,60 @@ impl<'a> OutlineReader<'a> {
         match value {
             MaybeRef::Ref(reference) => self.pdf.xref().get(reference.into()),
             MaybeRef::NotRef(value) => Some(value),
+        }
+    }
+
+    fn destination_position(
+        &self,
+        destination: Object<'a>,
+        seen: &mut HashSet<String>,
+    ) -> Option<(Option<f64>, Option<f64>)> {
+        match destination {
+            Object::Array(array) => {
+                let values = array.iter::<Object<'a>>().collect::<Vec<_>>();
+                let number = |index: usize| {
+                    values.get(index).and_then(|v| {
+                        if let Object::Number(n) = v {
+                            Some(n.as_f64())
+                        } else {
+                            None
+                        }
+                    })
+                };
+                let Some(Object::Name(kind)) = values.get(1) else {
+                    return None;
+                };
+                match kind.as_ref() {
+                    b"XYZ" => Some((number(2), number(3))),
+                    b"FitH" | b"FitBH" => Some((None, number(2))),
+                    b"FitR" => Some((number(2), number(5))),
+                    _ => None,
+                }
+            }
+            Object::Dict(dict) => dict
+                .get::<Object<'a>>(b"D")
+                .and_then(|d| self.destination_position(d, seen)),
+            Object::Name(name) => {
+                let name = String::from_utf8_lossy(name.as_ref()).into_owned();
+                if !seen.insert(name.clone()) {
+                    return None;
+                }
+                self.named_destinations
+                    .get(&name)
+                    .cloned()
+                    .and_then(|d| self.destination_position(d, seen))
+            }
+            Object::String(name) => {
+                let name = decode_pdf_text(name.as_bytes())?;
+                if !seen.insert(name.clone()) {
+                    return None;
+                }
+                self.named_destinations
+                    .get(&name)
+                    .cloned()
+                    .and_then(|d| self.destination_position(d, seen))
+            }
+            _ => None,
         }
     }
 }
@@ -373,10 +461,32 @@ mod tests {
         assert_eq!(toc[1].children[0].href, "Text/section-2.xhtml");
     }
 
+    #[test]
+    fn reads_document_language_without_guessing_missing_or_non_english_tags() {
+        for (entry, expected) in [
+            ("/Lang (en)", Some("en")),
+            ("/Lang ( en-GB )", Some("en-GB")),
+            ("/Lang <FEFF00660072>", Some("fr")),
+            ("/Lang (zh-Hans)", Some("zh-Hans")),
+            ("/Lang ()", None),
+            ("/Lang 42", None),
+            ("", None),
+        ] {
+            let pdf = Pdf::new(outline_pdf_with_catalog_entry(entry)).unwrap();
+            assert_eq!(read(&pdf).language.as_deref(), expected, "{entry}");
+        }
+    }
+
     fn outline_pdf() -> Vec<u8> {
+        outline_pdf_with_catalog_entry("")
+    }
+
+    fn outline_pdf_with_catalog_entry(entry: &str) -> Vec<u8> {
+        let catalog = format!(
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R /Names << /Dests 9 0 R >> {entry} >>"
+        );
         let objects = [
-            b"<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R /Names << /Dests 9 0 R >> >>"
-                .as_slice(),
+            catalog.as_bytes(),
             b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",

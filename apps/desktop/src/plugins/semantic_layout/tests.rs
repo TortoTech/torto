@@ -653,7 +653,7 @@ fn visible_request_sends_context_without_targeting_the_next_paragraph() {
         assert_eq!(input["target_end_exclusive"], 2);
         assert_eq!(input["blocks"].as_array().unwrap().len(), 3);
         let body =
-            json!({"choices":[{"message":{"content":"{\"g\":[],\"c\":[],\"f\":[]}"}}]}).to_string();
+            json!({"choices":[{"index":0,"finish_reason":"stop","message":{"content":"{\"g\":[],\"c\":[],\"f\":[]}"}}]}).to_string();
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
     });
     let original = section(vec![
@@ -1070,7 +1070,15 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
                     .any(|item| item["properties"]["k"]["enum"] == json!(["qa"]))
             );
             assert_eq!(item["properties"]["k"]["enum"], json!(["q"]));
-            assert_eq!(item["required"], json!(["a", "al", "d", "k"]));
+            assert_eq!(
+                item["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                std::collections::BTreeSet::from(["a", "al", "d", "k"]),
+            );
             assert_eq!(item["properties"]["a"]["type"], json!("integer"));
             assert!(wire_text(&request["messages"][0]).starts_with("# AI layout"));
             let instructions = wire_text(&request["messages"][0]);
@@ -1092,7 +1100,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
             }
             let result = json!({"groups":[{"kind":"quote_inline","body":[if attempt == 0 {99} else {0}],"credit":"-- A poet","alignment":"center"}],"citations":[],"formulas":[]});
             let body =
-                json!({"choices":[{"message":{"content":wire::encode(&result).to_string()}}]})
+                json!({"choices":[{"index":0,"finish_reason":"stop","message":{"content":wire::encode(&result).to_string()}}]})
                     .to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         }
@@ -1419,8 +1427,13 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
                 .contains("section_heading")
         );
         assert_eq!(
-            request["response_format"]["json_schema"]["schema"]["required"],
-            json!(["c", "f", "g"])
+            request["response_format"]["json_schema"]["schema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["c", "f", "g"])
         );
         let input: Value = serde_json::from_str(&wire_text(&request["messages"][1])).unwrap();
         let input = wire::decode(&input);
@@ -1436,7 +1449,7 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
             .push(json!("c0_0_0"));
         let duplicate = response["formulas"][0].clone();
         response["formulas"].as_array_mut().unwrap().push(duplicate);
-        let body = json!({"choices":[{"message":{"content":wire::encode(&response).to_string()}}]})
+        let body = json!({"choices":[{"index":0,"finish_reason":"stop","message":{"content":wire::encode(&response).to_string()}}]})
             .to_string();
         write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         // Listener drops after this one response. A second pass would fail.

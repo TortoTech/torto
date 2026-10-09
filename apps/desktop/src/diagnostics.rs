@@ -32,6 +32,7 @@ mod imp {
                 | "panic"
                 | "render.fatal"
                 | "pdf.agent.finished"
+                | "pdf.native.converted"
                 | "window.minimize"
                 | "memory.caches"
                 | "memory.gpu"
