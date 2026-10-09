@@ -5333,10 +5333,14 @@ impl Paginator {
         let aspect_ratio = intrinsic_width / intrinsic_height;
         let content_height = self.bottom - self.top;
         let media_width = (self.width - self.media_start_offset).max(1.0);
+        let containing_width = style
+            .container_width
+            .map_or(media_width, |width| width.resolve(media_width))
+            .clamp(1.0, media_width);
         let requested_height = style.height.map(|height| height.resolve(content_height));
         let requested_width = style
             .width
-            .map(|width| width.resolve(media_width))
+            .map(|width| width.resolve(containing_width))
             .or_else(|| requested_height.map(|height| height * aspect_ratio))
             .unwrap_or(intrinsic_width)
             .max(1.0);
@@ -5345,8 +5349,8 @@ impl Paginator {
             .max(1.0);
         let max_width = style
             .max_width
-            .map_or(media_width, |width| width.resolve(media_width))
-            .clamp(1.0, media_width);
+            .map_or(containing_width, |width| width.resolve(containing_width))
+            .clamp(1.0, containing_width);
         let max_height = style
             .max_height
             .map_or(content_height, |height| height.resolve(content_height))
@@ -9662,6 +9666,54 @@ mod tests {
         assert!((image.width - 250.0).abs() < 0.001);
         assert!((image.height - 187.5).abs() < 0.001);
         assert!((image.x - 75.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn image_percentages_resolve_inside_flattened_container_constraints() {
+        let viewport = LayoutViewport::new(1000, 700).unwrap();
+        let paginator = Paginator::new(
+            viewport,
+            Rgba::BLACK,
+            PageGeometry {
+                left: 0.0,
+                top: 0.0,
+                width: 1000.0,
+                bottom: 700.0,
+                visible_pages: 1,
+                continuation_offset_x: 0.0,
+            },
+            false,
+            0.0,
+        );
+        let image = RasterImage {
+            origin: None,
+            blob: None,
+            width: 800,
+            height: 600,
+            pixels: Vec::new().into(),
+        };
+        let style = ImageStyle {
+            width: Some(ImageLength::Fraction(0.8)),
+            max_width: Some(ImageLength::Fraction(0.5)),
+            container_width: Some(rebook_publication::ImageContainerWidth {
+                fraction: Some(0.6),
+                pixels: Some(400.0),
+            }),
+            ..ImageStyle::default()
+        };
+        let (width, height) = paginator.image_display_size(&image, style);
+        assert!((width - 200.0).abs() < 0.001);
+        assert!((height - 150.0).abs() < 0.001);
+        let (width, height) = paginator.image_display_size(
+            &image,
+            ImageStyle {
+                width: None,
+                max_width: None,
+                ..style
+            },
+        );
+        assert!((width - 400.0).abs() < 0.001);
+        assert!((height - 300.0).abs() < 0.001);
     }
 
     #[test]

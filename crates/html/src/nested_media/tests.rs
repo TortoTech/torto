@@ -107,7 +107,7 @@ fn nested_link_wrappers_preserve_figure_caption_anchor_and_dimensions() {
 #[test]
 fn before_caption_multiple_images_and_surrounding_text_keep_order() {
     let section = parse(
-        r#"<p>Leading <span>words.</span><span><div><p class="captions">Diagram description</p><div><p><img src="a.png"/></p><p><img src="b.png"/></p></div></div></span>Trailing words.</p>"#,
+        r#"<p>Leading <span>words.</span><span><div><p role="caption">Diagram description</p><div><p><img src="a.png"/></p><p><img src="b.png"/></p></div></div></span>Trailing words.</p>"#,
     );
     let [Block::Text(first), Block::Figure(figure), Block::Text(last)] = &section.blocks[..] else {
         panic!("{:?}", section.blocks)

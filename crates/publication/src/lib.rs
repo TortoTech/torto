@@ -1001,12 +1001,35 @@ pub struct ImageStyle {
     pub height: Option<ImageLength>,
     pub max_width: Option<ImageLength>,
     pub max_height: Option<ImageLength>,
+    /// Effective containing block retained when HTML wrappers are flattened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_width: Option<ImageContainerWidth>,
     /// Block spacing before the image, inherited from an image-only container when present.
     #[serde(default)]
     pub margin_before: f32,
     /// Block spacing after the image, inherited from an image-only container when present.
     #[serde(default)]
     pub margin_after: f32,
+}
+
+/// A containing width limited by a percentage, absolute pixels, or both.
+/// Nested percentages and max-width declarations compose without knowing the
+/// reader viewport. When both limits are present, the smaller one wins.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ImageContainerWidth {
+    pub fraction: Option<f32>,
+    pub pixels: Option<f32>,
+}
+
+impl ImageContainerWidth {
+    pub fn resolve(self, containing: f32) -> f32 {
+        match (self.fraction, self.pixels) {
+            (Some(fraction), Some(pixels)) => (containing * fraction).min(pixels),
+            (Some(fraction), None) => containing * fraction,
+            (None, Some(pixels)) => pixels,
+            (None, None) => containing,
+        }
+    }
 }
 
 /// RGBA color stored without renderer coupling.

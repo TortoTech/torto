@@ -14,6 +14,10 @@ use roxmltree::{Document, Node};
 use thiserror::Error;
 
 mod font_size;
+mod image_context;
+#[cfg(test)]
+mod media_context_tests;
+mod media_semantics;
 mod nested_media;
 mod table_captions;
 use font_size::FontSize;
@@ -28,9 +32,14 @@ pub enum HtmlError {
 
 /// Publication-level semantic hints that cannot be derived reliably from one HTML resource.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SectionParseHints {
+pub struct SectionParseHints<'a> {
     /// The publication navigation identifies this entire resource as Notes/Endnotes.
     pub note_section: bool,
+    /// Known navigation resources and ancestor chapter targets, not guessed filenames.
+    pub navigation_documents: &'a [PublicationUrl],
+    pub ancestor_targets: &'a [PublicationUrl],
+    /// Explicit TOC destinations must never be absorbed into a media caption.
+    pub heading_targets: &'a [PublicationUrl],
 }
 
 fn classify_footnote_links(
@@ -291,6 +300,22 @@ pub fn parse_section_with_hints_and_image_classifier(
         footnote_links,
         &mut is_decorative_separator_image,
     );
+    parser.navigation_documents.extend(
+        hints
+            .navigation_documents
+            .iter()
+            .map(|h| h.path().to_owned()),
+    );
+    parser
+        .ancestor_targets
+        .extend(hints.ancestor_targets.iter().map(ToString::to_string));
+    parser.heading_fragments.extend(
+        hints
+            .heading_targets
+            .iter()
+            .filter(|h| h.path() == descriptor.href.path())
+            .filter_map(|h| h.fragment().map(str::to_owned)),
+    );
     parser.queue_node_anchors(root);
     if hints.note_section {
         parser.parse_note_section_children(root)?;
@@ -353,6 +378,11 @@ struct ReadingIrParser<'a> {
     footnote_links: HashMap<usize, LinkRole>,
     paragraph_list_indents: Vec<f32>,
     suppressed_content: bool,
+    inside_breadcrumb: bool,
+    image_width_contexts: HashMap<roxmltree::NodeId, rebook_publication::ImageContainerWidth>,
+    navigation_documents: HashSet<String>,
+    ancestor_targets: HashSet<String>,
+    heading_fragments: HashSet<String>,
     inside_quote: bool,
     inside_nested_media: bool,
     inside_note_definition: bool,
@@ -387,6 +417,11 @@ impl<'a> ReadingIrParser<'a> {
             footnote_links,
             paragraph_list_indents: Vec::new(),
             suppressed_content: false,
+            inside_breadcrumb: false,
+            image_width_contexts: HashMap::new(),
+            navigation_documents: HashSet::new(),
+            ancestor_targets: HashSet::new(),
+            heading_fragments: HashSet::new(),
             inside_quote: false,
             inside_nested_media: false,
             inside_note_definition: false,
@@ -404,14 +439,15 @@ impl<'a> ReadingIrParser<'a> {
                     index += consumed;
                     continue;
                 }
-                if let Some(caption_index) = inferred_figure_caption_sibling(
+                if let Some(captions) = inferred_figure_caption_sibling(
                     &children,
                     index,
                     &self.footnote_links,
                     &self.styles,
+                    &self.heading_fragments,
                 ) {
-                    self.parse_inferred_figure_pair(node, children[caption_index])?;
-                    index = caption_index + 1;
+                    self.parse_inferred_figure_group(node, &children[captions.clone()])?;
+                    index = captions.end;
                     continue;
                 }
                 if note_section_starts_at(node, &children[index + 1..], &self.footnote_links) {
@@ -436,10 +472,10 @@ impl<'a> ReadingIrParser<'a> {
         Ok(())
     }
 
-    fn parse_inferred_figure_pair(
+    fn parse_inferred_figure_group(
         &mut self,
         image: Node<'_, '_>,
-        caption: Node<'_, '_>,
+        captions: &[Node<'_, '_>],
     ) -> Result<(), HtmlError> {
         let image_start = self.blocks.len();
         self.parse_node(image)?;
@@ -448,13 +484,25 @@ impl<'a> ReadingIrParser<'a> {
                 .iter()
                 .all(|block| matches!(block, Block::Image(_)));
 
-        let caption_start = self.blocks.len();
-        self.parse_node(caption)?;
-        if parsed_as_images
-            && let [Block::Text(caption)] = &mut self.blocks[caption_start..]
-            && caption.kind == TextBlockKind::Paragraph
-        {
-            caption.kind = TextBlockKind::Caption;
+        for node in captions.iter().copied().filter(Node::is_element) {
+            let caption_start = self.blocks.len();
+            self.parse_node(node)?;
+            if parsed_as_images {
+                for block in &mut self.blocks[caption_start..] {
+                    if let Block::Text(caption) = block
+                        && caption.kind == TextBlockKind::Paragraph
+                    {
+                        caption.kind = TextBlockKind::Caption;
+                    }
+                }
+            }
+        }
+        if parsed_as_images && captions.iter().filter(|node| node.is_element()).count() > 1 {
+            let parsed = self.blocks.split_off(image_start);
+            self.blocks.extend(nested_media::group_images_and_captions(
+                parsed,
+                BlockStyle::default(),
+            ));
         }
         Ok(())
     }
@@ -557,6 +605,19 @@ impl<'a> ReadingIrParser<'a> {
     }
 
     fn parse_block_container(&mut self, container: Node<'_, '_>) -> Result<(), HtmlError> {
+        if !self.inside_quote
+            && has_pullquote_semantics(container)
+            && !has_descendant_image(container)
+            && !container.descendants().any(|n| {
+                n.is_element()
+                    && matches!(
+                        n.tag_name().name(),
+                        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "table"
+                    )
+            })
+        {
+            return self.parse_semantic_quote(container);
+        }
         if self.try_parse_structural_quote(container)? {
             return Ok(());
         }
@@ -592,14 +653,15 @@ impl<'a> ReadingIrParser<'a> {
                     index += consumed;
                     continue;
                 }
-                if let Some(caption_index) = inferred_figure_caption_sibling(
+                if let Some(captions) = inferred_figure_caption_sibling(
                     &children,
                     index,
                     &self.footnote_links,
                     &self.styles,
+                    &self.heading_fragments,
                 ) {
-                    self.parse_inferred_figure_pair(child, children[caption_index])?;
-                    index = caption_index + 1;
+                    self.parse_inferred_figure_group(child, &children[captions.clone()])?;
+                    index = captions.end;
                     continue;
                 }
                 if note_section_starts_at(child, &children[index + 1..], &self.footnote_links) {
@@ -883,6 +945,33 @@ impl<'a> ReadingIrParser<'a> {
             self.suppressed_content = true;
             return Ok(());
         }
+        if !self.inside_breadcrumb
+            && media_semantics::is_navigation_breadcrumb(
+                node,
+                &self.section_href,
+                &self.footnote_links,
+                &self.navigation_documents,
+                &self.ancestor_targets,
+                &self.styles,
+                &self.heading_fragments,
+            )
+        {
+            // Allocate the same source nodes as before filtering. Saved reading
+            // positions, annotations and translations must not shift when a
+            // navigation-only paragraph disappears from the visible flow.
+            let block_start = self.blocks.len();
+            let anchor_start = self.anchors.len();
+            let pending = std::mem::take(&mut self.pending_anchors);
+            self.inside_breadcrumb = true;
+            let result = self.parse_node(node);
+            self.inside_breadcrumb = false;
+            self.blocks.truncate(block_start);
+            self.anchors.truncate(anchor_start);
+            self.pending_anchors = pending;
+            result?;
+            self.suppressed_content = true;
+            return Ok(());
+        }
         if name != "p" {
             self.paragraph_list_indents.clear();
         }
@@ -923,9 +1012,9 @@ impl<'a> ReadingIrParser<'a> {
             "p" => {
                 if (!has_descendant_image(node) || node_has_visible_text(node))
                     && !is_numbered_media_paragraph(node)
-                    && self.styles.has_standalone_quote_layout(node)
-                    && (has_quote_semantic_word(node)
-                        || self.styles.has_distinct_quote_typography(node))
+                    && (has_pullquote_semantics(node)
+                        || self.styles.has_standalone_quote_layout(node)
+                            && self.styles.has_distinct_quote_typography(node))
                 {
                     self.parse_standalone_quote(node)?;
                 } else {
@@ -1006,7 +1095,7 @@ impl<'a> ReadingIrParser<'a> {
     fn try_parse_symbol_separator(&mut self, node: Node<'_, '_>) -> Result<bool, HtmlError> {
         if self.inside_quote
             || self.inside_note_definition
-            || has_quote_semantic_word(node)
+            || has_pullquote_semantics(node)
             || node.ancestors().filter(Node::is_element).any(|ancestor| {
                 matches!(
                     ancestor.tag_name().name(),
@@ -1933,6 +2022,7 @@ impl<'a> ReadingIrParser<'a> {
         });
         self.bind_pending_anchors(&source.start);
         let mut style = self.styles.image_style(node);
+        style.container_width = self.image_container_width(node);
         if let Some((margin_before, margin_after)) = container_style {
             style.margin_before = style.margin_before.max(margin_before);
             style.margin_after = style.margin_after.max(margin_after);
@@ -2044,30 +2134,7 @@ fn block_source_range(block: &Block) -> Option<&SourceRange> {
     }
 }
 
-fn inferred_figure_caption_sibling(
-    siblings: &[Node<'_, '_>],
-    image_index: usize,
-    footnote_links: &HashMap<usize, LinkRole>,
-    styles: &StyleSheet,
-) -> Option<usize> {
-    let image = *siblings.get(image_index)?;
-    if !is_captionable_image_container(image, footnote_links) {
-        return None;
-    }
-    for (index, sibling) in siblings.iter().copied().enumerate().skip(image_index + 1) {
-        if sibling.is_text() {
-            if sibling.text().is_some_and(|text| !text.trim().is_empty()) {
-                return None;
-            }
-            continue;
-        }
-        if !sibling.is_element() {
-            continue;
-        }
-        return is_inferred_figure_caption(sibling, styles).then_some(index);
-    }
-    None
-}
+use media_semantics::inferred_figure_caption_sibling;
 
 fn is_captionable_image_container(
     node: Node<'_, '_>,
@@ -2130,35 +2197,31 @@ fn is_inferred_figure_caption(node: Node<'_, '_>, styles: &StyleSheet) -> bool {
 }
 
 fn has_caption_semantic_attribute(node: Node<'_, '_>) -> bool {
-    [
-        attribute_local(node, "class"),
-        attribute_local(node, "type"),
-        attribute_local(node, "role"),
-    ]
-    .into_iter()
-    .flatten()
-    .flat_map(str::split_whitespace)
-    .map(|token| {
-        token
-            .chars()
-            .filter(|character| !matches!(character, '-' | '_'))
-            .collect::<String>()
-            .to_ascii_lowercase()
-    })
-    .any(|token| {
-        matches!(
-            token.as_str(),
-            "caption"
-                | "captions"
-                | "fcaption"
-                | "figcaption"
-                | "figurecaption"
-                | "doccaption"
-                | "legend"
-                | "finure"
-                | "tushuo"
-        )
-    })
+    [attribute_local(node, "type"), attribute_local(node, "role")]
+        .into_iter()
+        .flatten()
+        .flat_map(str::split_whitespace)
+        .map(|token| {
+            token
+                .chars()
+                .filter(|character| !matches!(character, '-' | '_'))
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .any(|token| {
+            matches!(
+                token.as_str(),
+                "caption"
+                    | "captions"
+                    | "fcaption"
+                    | "figcaption"
+                    | "figurecaption"
+                    | "doccaption"
+                    | "legend"
+                    | "finure"
+                    | "tushuo"
+            )
+        })
 }
 
 fn starts_with_numbered_caption_label(text: &str) -> bool {
@@ -3008,12 +3071,12 @@ fn is_quote_text_candidate(node: Node<'_, '_>) -> bool {
     })
 }
 
-fn has_quote_semantic_word(node: Node<'_, '_>) -> bool {
-    attribute_local(node, "class").is_some_and(|classes| {
-        classes
-            .split_ascii_whitespace()
-            .any(|class| class.to_ascii_lowercase().contains("quote"))
-    })
+fn has_pullquote_semantics(node: Node<'_, '_>) -> bool {
+    [attribute_local(node, "type"), attribute_local(node, "role")]
+        .into_iter()
+        .flatten()
+        .flat_map(str::split_whitespace)
+        .any(|kind| matches!(kind, "pullquote" | "doc-pullquote"))
 }
 
 fn effective_start_offset(style: BlockStyle) -> f32 {
@@ -5281,7 +5344,10 @@ mod tests {
             &descriptor,
             |_| unreachable!(),
             |_| false,
-            SectionParseHints { note_section: true },
+            SectionParseHints {
+                note_section: true,
+                ..SectionParseHints::default()
+            },
         )
         .unwrap();
         assert!(
@@ -5537,7 +5603,7 @@ mod tests {
     }
 
     #[test]
-    fn marks_adjacent_class_and_numbered_paragraphs_as_inferred_captions() {
+    fn marks_adjacent_semantic_and_numbered_paragraphs_as_inferred_captions() {
         let descriptor = SpineItem {
             id: SpineItemId::new("chapter").unwrap(),
             href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
@@ -5547,7 +5613,7 @@ mod tests {
         };
         let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><div>
             <p class="IMG"><a id="leaf"/><img src="images/leaf.jpg"/></p>
-            <p class="caption">A leaf without a numbered label.</p>
+            <p role="caption">A leaf without a numbered label.</p>
             <div class="calibre21"><img src="images/chart.jpg"/></div>
             <p class="calibre7"><span>▲图6-5 实战中的图表</span></p>
             <img src="images/direct.jpg"/>
@@ -6724,7 +6790,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_a_standalone_paragraph_with_the_quote_semantic_word() {
+    fn recognizes_a_standalone_paragraph_with_explicit_pullquote_semantics() {
         let descriptor = SpineItem {
             id: SpineItemId::new("chapter").unwrap(),
             href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
@@ -6735,7 +6801,7 @@ mod tests {
         let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
             .prosequote { margin: 1em 2em; text-indent: 0; }
         </style></head><body>
-            <p class="prosequote">A standalone quotation without an attribution.</p>
+            <p class="prosequote" role="doc-pullquote">A standalone quotation without an attribution.</p>
             <p>Ordinary prose after the quotation.</p>
         </body></html>"#;
 

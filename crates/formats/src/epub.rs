@@ -22,6 +22,9 @@ use zip::{CompressionMethod, ZipArchive};
 
 use crate::source::{TocHeadingHint, collect_toc_heading_hints, promote_toc_headings};
 
+mod continuations;
+mod html_context;
+
 /// Resource budgets applied before and during decompression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EpubLimits {
@@ -74,6 +77,7 @@ pub(super) struct EpubPublication {
     decorative_separator_images: Mutex<HashMap<String, bool>>,
     note_section_paths: HashSet<String>,
     toc_heading_hints: HashMap<String, Vec<TocHeadingHint>>,
+    html_context: html_context::HtmlContext,
 }
 
 impl EpubPublication {
@@ -124,6 +128,19 @@ impl EpubPublication {
             }
         }
         let toc_heading_hints = collect_toc_heading_hints(&table_of_contents);
+        let html_context = html_context::HtmlContext::new(
+            &package_model,
+            &package,
+            &package_url,
+            &table_of_contents,
+        );
+        if package_model.metadata.layout == RenditionLayout::Reflowable {
+            continuations::mark_quote_continuations(
+                &archive,
+                &mut reading_order,
+                &table_of_contents,
+            );
+        }
         let digest = Sha256::digest(bytes.as_ref());
         let id = PublicationId::new(format!("{digest:x}"))?;
 
@@ -141,6 +158,7 @@ impl EpubPublication {
             decorative_separator_images: Mutex::new(HashMap::new()),
             note_section_paths,
             toc_heading_hints,
+            html_context,
         })
     }
 }
@@ -278,6 +296,17 @@ impl EpubPublication {
             |href| self.is_decorative_separator_image(href),
             SectionParseHints {
                 note_section: self.note_section_paths.contains(descriptor.href.path()),
+                navigation_documents: &self.html_context.navigation_documents,
+                ancestor_targets: self
+                    .html_context
+                    .ancestors
+                    .get(descriptor.href.path())
+                    .map_or(&[], Vec::as_slice),
+                heading_targets: self
+                    .html_context
+                    .headings
+                    .get(descriptor.href.path())
+                    .map_or(&[], Vec::as_slice),
             },
         )?;
         if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {

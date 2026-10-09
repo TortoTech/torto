@@ -4801,7 +4801,7 @@ mod tests {
         };
         let section = rebook_html::parse_section_with_hints_and_image_classifier(
             "<html><body><section role='doc-endnotes'><h1>Notes</h1><section><h2>Introduction</h2><ol class='notes'><li class='endnote' id='en1'><p><a href='body.xhtml#r1' role='doc-backlink'>1</a>. First note.</p></li><li class='endnote' id='en2'><p><a href='body.xhtml#r2' role='doc-backlink'>2</a>. Second note.</p><p>Continuation.</p></li></ol></section></section></body></html>",
-            &descriptor, |_| None, |_| false, rebook_html::SectionParseHints { note_section: true },
+            &descriptor, |_| None, |_| false, rebook_html::SectionParseHints { note_section: true, ..Default::default() },
         ).unwrap();
         for (id, marker, expected) in [("en1", "1", "First note."), ("en2", "2", "Second note.")] {
             let target = descriptor.href.resolve(&format!("#{id}")).unwrap();

@@ -40,7 +40,7 @@ fn is_caption(block: &Block) -> bool {
     matches!(block,Block::Text(text) if text.kind==TextBlockKind::Caption)
 }
 
-fn group_images_and_captions(blocks: Vec<Block>, style: BlockStyle) -> Vec<Block> {
+pub(super) fn group_images_and_captions(blocks: Vec<Block>, style: BlockStyle) -> Vec<Block> {
     let mut pending = blocks.into_iter().peekable();
     let mut result = Vec::new();
     while let Some(block) = pending.next() {
