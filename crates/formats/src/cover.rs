@@ -93,6 +93,44 @@ pub(super) fn page_thumbnail(source: &dyn BookSource) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn bilinear_image_sampling_keeps_taps_aligned_at_boundaries() {
+        // Regress the u8 image-sampling rounding failure fixed by Vello #1950.
+        // The repeated two-color image must sample red at this texel boundary.
+        use hayro::vello_cpu::color::palette::css::{BLUE, RED};
+        use hayro::vello_cpu::peniko::{Extend, ImageQuality, ImageSampler};
+        use hayro::vello_cpu::{Image, ImageSource, Pixmap, RenderContext, Resources};
+        use kurbo::{Affine, Rect};
+        use std::sync::Arc;
+
+        let mut image = Pixmap::new(2, 1);
+        image.set_pixel(0, 0, RED.premultiply().to_rgba8());
+        image.set_pixel(1, 0, BLUE.premultiply().to_rgba8());
+        let mut context = RenderContext::new(100, 100);
+        context.set_paint(Image {
+            image: ImageSource::Pixmap(Arc::new(image)),
+            sampler: ImageSampler {
+                x_extend: Extend::Repeat,
+                y_extend: Extend::Pad,
+                quality: ImageQuality::Medium,
+                alpha: 1.0,
+            },
+        });
+        let image_from_scene = Affine::translate((f64::from(0.5_f32.next_down()), 0.25))
+            * Affine::scale_non_uniform(1.0e-12, 1.0)
+            * Affine::translate((-10.5, -10.5));
+        context.set_paint_transform(image_from_scene.inverse());
+        context.fill_rect(&Rect::new(10.0, 10.0, 25.0, 90.0));
+        context.flush();
+        let mut target = Pixmap::new(100, 100);
+        context.render(&mut target, &mut Resources::new());
+        for y in 11..89 {
+            for x in 11..24 {
+                assert_eq!(target.sample(x, y), RED.premultiply().to_rgba8());
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires TORTO_PERF_BOOK local EPUB"]
     fn profile_local_references() {
         let book = crate::open_file(std::path::PathBuf::from(

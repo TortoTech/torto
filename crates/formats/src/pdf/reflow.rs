@@ -3,8 +3,10 @@
 mod extract;
 mod layout;
 mod paragraphs;
+mod provenance;
 mod quality;
 mod raster;
+mod spool;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -18,7 +20,7 @@ use rebook_publication::*;
 use serde::{Deserialize, Serialize};
 
 // The revision also isolates semantic/translation caches from older grouping.
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 pub const PAGE_ANCHOR_PREFIX: &str = "pdf-page-";
 pub use quality::{Assessment, TextRoute, assess};
 const MAX_SECTION_BYTES: u64 = 32 * 1024 * 1024;
@@ -67,6 +69,11 @@ pub struct ConversionTimings {
     pub region_pages: usize,
     pub full_pages: usize,
     pub raster_pixels: u64,
+    /// Producer backpressure and final image barrier; wall time on this worker.
+    pub raster_wait_ms: f64,
+    pub raster_workers: usize,
+    /// Scheduling estimate including queued jobs, not measured process memory.
+    pub raster_peak_estimated_bytes: usize,
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
@@ -79,6 +86,7 @@ fn elapsed_ms(started: Instant) -> f64 {
 pub struct SourceSlice {
     pub source: SourceRange,
     pub page: usize,
+    #[serde(serialize_with = "serialize_source_rect")]
     pub rect: [f64; 4],
     pub original_glyph: usize,
 }
@@ -87,6 +95,52 @@ pub struct SourceSlice {
 pub struct StoredSection {
     pub section: Section,
     pub provenance: Vec<SourceSlice>,
+}
+
+// Keep reading IR in JSON and transport source mappings as optional resources.
+// Legacy combined JSON remains readable; older readers can still display the
+// new section and preserve its sidecar when exporting all manifest resources.
+#[derive(Deserialize)]
+struct ReadingSection {
+    section: Section,
+    #[serde(default)]
+    provenance_resource: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FullSection {
+    #[serde(flatten)]
+    stored: StoredSection,
+    #[serde(default)]
+    provenance_resource: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SectionFile<'a> {
+    section: &'a Section,
+    provenance: &'a [SourceSlice],
+    provenance_resource: &'a str,
+}
+
+fn serialize_source_rect<S: serde::Serializer>(
+    rect: &[f64; 4],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    // Provenance is persisted only after geometry/layout decisions. Retain the
+    // original values in memory and in any future binary transport.
+    if !serializer.is_human_readable() {
+        return rect.serialize(serializer);
+    }
+    rect.map(|value| {
+        let scaled = value * 10_000.0;
+        if scaled.is_finite() {
+            let rounded = scaled.round() / 10_000.0;
+            if rounded == 0.0 { 0.0 } else { rounded }
+        } else {
+            value
+        }
+    })
+    .serialize(serializer)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -120,6 +174,10 @@ struct NativePage {
     images: Vec<[f64; 4]>,
     #[serde(default)]
     encoded_images: Vec<Option<EncodedImage>>,
+    /// Scheduling estimate for all visible rasters, including masked/clipped
+    /// images that are deliberately ineligible for direct export.
+    #[serde(default)]
+    raster_decode_bytes: usize,
     #[serde(default)]
     image_obstacles: Vec<[f64; 4]>,
     rules: Vec<[f64; 4]>,
@@ -260,7 +318,7 @@ pub fn convert(
             edges.observe(&page, index);
         }
         let writing = Instant::now();
-        write_json(&directory.join(format!("raw/{index}.json")), &page)?;
+        spool::write(&directory.join(format!("raw/{index}.bin")), &page)?;
         stats.timings.raw_write_ms += elapsed_ms(writing);
         progress(index + 1, count, "extract");
     }
@@ -302,163 +360,176 @@ pub fn convert(
     let mut floats = paragraphs::Floats::new();
     let mut anchor_targets = HashMap::new();
     let laying_out = Instant::now();
-    let mut render_cache = RenderCache::with_outline_budget(8 * 1024 * 1024);
-    for index in 0..count {
-        check_cancelled(cancelled)?;
-        let raw = directory.join(format!("raw/{index}.json"));
-        let reading = Instant::now();
-        let page: NativePage = read_json(&raw)?;
-        stats.timings.raw_read_ms += elapsed_ms(reading);
-        let frame = layout::body_frame(&page, body_size);
-        let labels = outline_spans
-            .iter()
-            .filter(|(start, end, _)| *start <= index && index < *end)
-            .map(|(_, _, label)| label.as_str())
-            .collect::<Vec<_>>();
-        let repeated = edges.removed_keys(index, &labels);
-        let (mut stored, regions) = layout::build(&page, index, body_size, &repeated, &mut stats)?;
-        paragraphs::register_floats(&stored, &regions, index + 1, &mut floats);
-        paragraphs::same_page(&mut stored, body_size, &floats);
-        raster::save_regions(
+    std::thread::scope(|scope| -> Result<(), String> {
+        let pipeline = raster::Pipeline::new(
+            scope,
             &publication,
-            index,
-            &page,
-            &regions,
             directory,
             cancelled,
-            &mut render_cache,
-            &mut stats.timings,
-        )?;
-        resources.extend(regions.into_iter().map(|region| region.path));
-        let chapter = chapter_pages.contains(&index);
-        // One physical page of semantic boundary spill is permitted. Do not
-        // retain an arbitrarily long paragraph spanning the whole document.
-        if pending.is_some() && (chapter || chunk_pages >= 9) {
-            save_section(
-                directory,
-                &mut book,
-                pending.take().unwrap(),
-                &mut stats.timings,
-            )?;
-            chunk_pages = 0;
-        }
-        let cut = pending.is_some() && chunk_pages >= 8;
-        let section_index = book.sections.len() + usize::from(cut);
-        relocate(
-            &mut stored,
-            spine_id(section_index)?,
-            section_href(section_index)?,
+            raster::Pipeline::worker_count(),
         );
-        for (destination_index, destination) in destinations
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.page == index && d.top.is_some())
-        {
-            let point = publication.pdf.pages()[index]
-                .initial_transform(true)
-                .to_kurbo()
-                * Point::new(
-                    destination.left.unwrap_or(0.0),
-                    destination.top.unwrap_or(0.0),
-                );
-            if let Some(slice) = stored.provenance.iter().min_by(|a, b| {
-                let distance = |s: &SourceSlice| {
-                    (s.rect[1] - point.y).abs() * 4.0
-                        + if destination.left.is_some() {
-                            (s.rect[0] - point.x).abs()
-                        } else {
-                            0.0
-                        }
-                };
-                distance(a).total_cmp(&distance(b))
-            }) {
-                let fragment = format!("pdf-native-outline-{destination_index}");
-                stored.section.anchors.push(SectionAnchor {
-                    fragment: fragment.clone(),
-                    source: slice.source.start.clone(),
-                });
-                outline_targets.insert(
-                    (index, destination.label.clone()),
-                    stored
-                        .section
-                        .href
-                        .resolve(&format!("#{fragment}"))
-                        .map_err(|e| e.to_string())?,
-                );
-            }
-        }
-        let href = stored.section.href.clone();
-        page_targets.push(
-            PublicationUrl::parse(&format!("{href}#{PAGE_ANCHOR_PREFIX}{}", index + 1))
-                .map_err(|e| e.to_string())?,
-        );
-        if let Some(previous) = pending.as_mut() {
-            paragraphs::across_pages(
-                previous,
-                &mut stored,
-                body_size,
-                previous_frame,
-                frame,
-                &floats,
-            );
-            // Retain the existing conservative join for sparse pages without a
-            // reliable body frame. Never use it across a storage cut.
-            if !cut {
-                join_page_paragraph(
-                    previous,
-                    &mut stored,
-                    &page,
-                    body_size,
-                    previous_frame,
-                    frame,
-                );
-            }
-            for anchor in &previous.section.anchors {
-                anchor_targets.insert(anchor.fragment.clone(), previous.section.href.clone());
-            }
-            if cut && !stored.section.blocks.is_empty() {
+        for index in 0..count {
+            check_cancelled(cancelled)?;
+            let raw = directory.join(format!("raw/{index}.bin"));
+            let reading = Instant::now();
+            let page = spool::read(&raw)?;
+            stats.timings.raw_read_ms += elapsed_ms(reading);
+            let frame = layout::body_frame(&page, body_size);
+            let labels = outline_spans
+                .iter()
+                .filter(|(start, end, _)| *start <= index && index < *end)
+                .map(|(_, _, label)| label.as_str())
+                .collect::<Vec<_>>();
+            let repeated = edges.removed_keys(index, &labels);
+            let (mut stored, regions) =
+                layout::build(&page, index, body_size, &repeated, &mut stats)?;
+            paragraphs::register_floats(&stored, &regions, index + 1, &mut floats);
+            paragraphs::same_page(&mut stored, body_size, &floats);
+            resources.extend(regions.iter().map(|region| region.path.clone()));
+            let chapter = chapter_pages.contains(&index);
+            // One physical page of semantic boundary spill is permitted. Do not
+            // retain an arbitrarily long paragraph spanning the whole document.
+            if pending.is_some() && (chapter || chunk_pages >= 9) {
                 save_section(
                     directory,
                     &mut book,
+                    &mut resources,
                     pending.take().unwrap(),
                     &mut stats.timings,
                 )?;
                 chunk_pages = 0;
-                pending = Some(stored);
-            } else {
-                // A page consumed entirely by a continuation does not create an
-                // empty spine item; keep its notes and anchors with that owner.
-                relocate(
-                    &mut stored,
-                    previous.section.id.clone(),
-                    previous.section.href.clone(),
-                );
-                previous.section.blocks.append(&mut stored.section.blocks);
-                previous.section.anchors.append(&mut stored.section.anchors);
-                previous.provenance.append(&mut stored.provenance);
             }
-        } else {
-            pending = Some(stored);
-        }
-        chunk_pages += 1;
-        previous_frame = frame;
-        for anchor in &pending.as_ref().unwrap().section.anchors {
-            anchor_targets.insert(
-                anchor.fragment.clone(),
-                pending.as_ref().unwrap().section.href.clone(),
+            let cut = pending.is_some() && chunk_pages >= 8;
+            let section_index = book.sections.len() + usize::from(cut);
+            relocate(
+                &mut stored,
+                spine_id(section_index)?,
+                section_href(section_index)?,
             );
+            for (destination_index, destination) in destinations
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.page == index && d.top.is_some())
+            {
+                let point = publication.pdf.pages()[index]
+                    .initial_transform(true)
+                    .to_kurbo()
+                    * Point::new(
+                        destination.left.unwrap_or(0.0),
+                        destination.top.unwrap_or(0.0),
+                    );
+                if let Some(slice) = stored.provenance.iter().min_by(|a, b| {
+                    let distance = |s: &SourceSlice| {
+                        (s.rect[1] - point.y).abs() * 4.0
+                            + if destination.left.is_some() {
+                                (s.rect[0] - point.x).abs()
+                            } else {
+                                0.0
+                            }
+                    };
+                    distance(a).total_cmp(&distance(b))
+                }) {
+                    let fragment = format!("pdf-native-outline-{destination_index}");
+                    stored.section.anchors.push(SectionAnchor {
+                        fragment: fragment.clone(),
+                        source: slice.source.start.clone(),
+                    });
+                    outline_targets.insert(
+                        (index, destination.label.clone()),
+                        stored
+                            .section
+                            .href
+                            .resolve(&format!("#{fragment}"))
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+            }
+            let href = stored.section.href.clone();
+            page_targets.push(
+                PublicationUrl::parse(&format!("{href}#{PAGE_ANCHOR_PREFIX}{}", index + 1))
+                    .map_err(|e| e.to_string())?,
+            );
+            if let Some(previous) = pending.as_mut() {
+                paragraphs::across_pages(
+                    previous,
+                    &mut stored,
+                    body_size,
+                    previous_frame,
+                    frame,
+                    &floats,
+                );
+                // Retain the existing conservative join for sparse pages without a
+                // reliable body frame. Never use it across a storage cut.
+                if !cut {
+                    join_page_paragraph(
+                        previous,
+                        &mut stored,
+                        &page,
+                        body_size,
+                        previous_frame,
+                        frame,
+                    );
+                }
+                for anchor in &previous.section.anchors {
+                    anchor_targets.insert(anchor.fragment.clone(), previous.section.href.clone());
+                }
+                if cut && !stored.section.blocks.is_empty() {
+                    save_section(
+                        directory,
+                        &mut book,
+                        &mut resources,
+                        pending.take().unwrap(),
+                        &mut stats.timings,
+                    )?;
+                    chunk_pages = 0;
+                    pending = Some(stored);
+                } else {
+                    // A page consumed entirely by a continuation does not create an
+                    // empty spine item; keep its notes and anchors with that owner.
+                    relocate(
+                        &mut stored,
+                        previous.section.id.clone(),
+                        previous.section.href.clone(),
+                    );
+                    previous.section.blocks.append(&mut stored.section.blocks);
+                    previous.section.anchors.append(&mut stored.section.anchors);
+                    previous.provenance.append(&mut stored.provenance);
+                }
+            } else {
+                pending = Some(stored);
+            }
+            chunk_pages += 1;
+            previous_frame = frame;
+            for anchor in &pending.as_ref().unwrap().section.anchors {
+                anchor_targets.insert(
+                    anchor.fragment.clone(),
+                    pending.as_ref().unwrap().section.href.clone(),
+                );
+            }
+            floats.retain(|_, (p, _)| *p + 9 > index);
+            fs::remove_file(raw).map_err(|e| e.to_string())?;
+            let submitting = Instant::now();
+            pipeline.submit(index, page, regions)?;
+            stats.timings.raster_wait_ms += elapsed_ms(submitting);
+            progress(index + 1, count, "layout");
         }
-        floats.retain(|_, (p, _)| *p + 9 > index);
-        fs::remove_file(raw).map_err(|e| e.to_string())?;
-        progress(index + 1, count, "layout");
-    }
+        let waiting = Instant::now();
+        pipeline.finish(&mut stats.timings)?;
+        stats.timings.raster_wait_ms += elapsed_ms(waiting);
+        Ok(())
+    })?;
     if let Some(stored) = pending {
-        save_section(directory, &mut book, stored, &mut stats.timings)?;
+        save_section(
+            directory,
+            &mut book,
+            &mut resources,
+            stored,
+            &mut stats.timings,
+        )?;
     }
     stats.timings.layout_ms = (elapsed_ms(laying_out)
         - stats.timings.raw_read_ms
-        - stats.timings.raster_ms
-        - stats.timings.image_write_ms
+        - stats.timings.raster_wait_ms
         - stats.timings.section_write_ms)
         .max(0.0);
     let finalizing = Instant::now();
@@ -567,6 +638,7 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
 fn save_section(
     directory: &Path,
     book: &mut Book,
+    resources: &mut Vec<String>,
     stored: StoredSection,
     timings: &mut ConversionTimings,
 ) -> Result<(), String> {
@@ -579,7 +651,17 @@ fn save_section(
         linear: true,
         properties: Vec::new(),
     });
-    write_json(&directory.join(format!("sections/{index}.json")), &stored)?;
+    let mapping = provenance::name(index);
+    provenance::write(&directory.join(&mapping), &stored.provenance)?;
+    write_json(
+        &directory.join(format!("sections/{index}.json")),
+        &SectionFile {
+            section: &stored.section,
+            provenance: &[],
+            provenance_resource: &mapping,
+        },
+    )?;
+    resources.push(mapping);
     timings.section_write_ms += elapsed_ms(writing);
     Ok(())
 }
@@ -756,8 +838,11 @@ fn join_page_paragraph(
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    use std::io::Write;
     let file = fs::File::create(path).map_err(|e| e.to_string())?;
-    serde_json::to_writer(std::io::BufWriter::new(file), value).map_err(|e| e.to_string())
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer(&mut writer, value).map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
@@ -829,14 +914,54 @@ impl ReflowSource {
         if index >= self.manifest.book.sections.len() {
             return Err("PDF reflow section is out of range".into());
         }
-        let stored: StoredSection =
+        let mut file: FullSection =
             read_json(&self.directory.join(format!("sections/{index}.json")))?;
-        if stored.section.id != self.manifest.book.sections[index].id
-            || stored.section.href != self.manifest.book.sections[index].href
-        {
+        self.validate_section(
+            index,
+            &file.stored.section,
+            file.provenance_resource.as_deref(),
+        )?;
+        if let Some(path) = file.provenance_resource {
+            if !file.stored.provenance.is_empty() {
+                return Err("Ambiguous PDF provenance storage".into());
+            }
+            file.stored.provenance = provenance::read(&self.directory.join(path))?;
+        }
+        Ok(file.stored)
+    }
+
+    fn validate_section(
+        &self,
+        index: usize,
+        section: &Section,
+        mapping: Option<&str>,
+    ) -> Result<(), String> {
+        let item = self
+            .manifest
+            .book
+            .sections
+            .get(index)
+            .ok_or("PDF reflow section is out of range")?;
+        if section.id != item.id || section.href != item.href {
             return Err("PDF reflow section identity mismatch".into());
         }
-        Ok(stored)
+        if let Some(mapping) = mapping
+            && (mapping != provenance::name(index)
+                || !self.manifest.resources.iter().any(|p| p == mapping))
+        {
+            return Err("Invalid PDF provenance resource".into());
+        }
+        Ok(())
+    }
+
+    fn reading_section(&self, index: usize) -> Result<Section, String> {
+        if index >= self.manifest.book.sections.len() {
+            return Err("PDF reflow section is out of range".into());
+        }
+        let file: ReadingSection =
+            read_json(&self.directory.join(format!("sections/{index}.json")))?;
+        self.validate_section(index, &file.section, file.provenance_resource.as_deref())?;
+        Ok(file.section)
     }
 }
 
@@ -856,8 +981,7 @@ impl BookSource for ReflowSource {
             return Ok(prepared.section.clone());
         }
         let section = self
-            .stored(index)
-            .map(|s| s.section)
+            .reading_section(index)
             .map_err(PublicationError::InvalidPublication)?;
         self.prepared.store(Some(Arc::new(PreparedSection {
             index,
@@ -881,7 +1005,12 @@ impl BookSource for ReflowSource {
             fs::read(path).map_err(|e| PublicationError::InvalidPublication(e.to_string()))?;
         Ok(Resource {
             href: href.clone(),
-            media_type: "image/png".into(),
+            media_type: if href.path().ends_with(".bin.z") {
+                "application/octet-stream"
+            } else {
+                "image/png"
+            }
+            .into(),
             bytes: Arc::from(bytes),
         })
     }
@@ -898,6 +1027,37 @@ fn section_href(index: usize) -> Result<PublicationUrl, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provenance_json_is_compact_without_rounding_memory_or_binary_transport() {
+        let anchor = SourceAnchor {
+            spine: SpineItemId::new("test").unwrap(),
+            node: "p1-g0".into(),
+            text_offset: 0,
+        };
+        let original = SourceSlice {
+            source: SourceRange {
+                start: anchor.clone(),
+                end: anchor,
+            },
+            page: 0,
+            rect: [1.23456789, -0.000000001, -204.64221820355954, 500.0],
+            original_glyph: 0,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("\"rect\":[1.2346,0.0,-204.6422,500.0]"));
+        let restored: SourceSlice = serde_json::from_str(&json).unwrap();
+        for (saved, raw) in restored.rect.into_iter().zip(original.rect) {
+            assert!((saved - raw).abs() <= 0.00005);
+        }
+        assert_eq!(original.rect[0].to_bits(), 1.23456789_f64.to_bits());
+        let restored: SourceSlice =
+            bincode::deserialize(&bincode::serialize(&original).unwrap()).unwrap();
+        assert_eq!(
+            restored.rect.map(f64::to_bits),
+            original.rect.map(f64::to_bits)
+        );
+    }
 
     #[test]
     fn storage_continuation_hints_preserve_chapter_boundaries_and_other_properties() {
@@ -1080,7 +1240,93 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(plain.matches("Hello native PDF.").count(), 2);
+        let stored = source.stored(0).unwrap();
+        let mapping = root.join("cache").join(provenance::name(0));
+        let original_mapping = fs::read(&mapping).unwrap();
+        assert!(source.manifest.resources.contains(&provenance::name(0)));
+        let section_path = root.join("cache/sections/0.json");
+        let json = fs::read(&section_path).unwrap();
+        // Older ordinary readers can display IR; source mappings are explicit,
+        // separately synchronized resources for the current implementation.
+        let legacy_reader: StoredSection = serde_json::from_slice(&json).unwrap();
+        assert_eq!(legacy_reader.section, section);
+        assert!(legacy_reader.provenance.is_empty());
+        fs::write(&mapping, b"corrupt").unwrap();
+        source.prepared.store(None);
+        assert_eq!(source.parse_section(0).unwrap(), section);
+        assert!(source.provenance(0).is_err());
+        fs::write(&mapping, original_mapping).unwrap();
+        let mut unsafe_path: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        unsafe_path["provenance_resource"] = "resources/other.bin.z".into();
+        write_json(&section_path, &unsafe_path).unwrap();
+        source.prepared.store(None);
+        assert!(source.parse_section(0).is_err());
+        assert!(source.provenance(0).is_err());
+        // Existing combined JSON retains both its reading and mapping support.
+        write_json(&section_path, &stored).unwrap();
+        source.prepared.store(None);
+        assert_eq!(source.parse_section(0).unwrap(), section);
+        assert_eq!(source.provenance(0).unwrap().len(), stored.provenance.len());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_TEST_NATIVE_BASE and TORTO_TEST_NATIVE_GENERATION"]
+    fn local_native_storage_comparison() {
+        let base = PathBuf::from(std::env::var("TORTO_TEST_NATIVE_BASE").unwrap());
+        let next = PathBuf::from(std::env::var("TORTO_TEST_NATIVE_GENERATION").unwrap());
+        let manifest: Manifest = read_json(&next.join("manifest.json")).unwrap();
+        let old = ReflowSource::open(&base, manifest.book.id.as_str()).unwrap();
+        let new = ReflowSource::open(&next, manifest.book.id.as_str()).unwrap();
+        assert_eq!(old.book(), new.book());
+        assert_eq!(old.manifest.page_targets, new.manifest.page_targets);
+        let mut slices = 0;
+        let mut max_error = 0.0f64;
+        let mut section_bytes = 0;
+        let mut map_bytes = 0;
+        let mut image_bytes = 0;
+        for index in 0..new.book().sections.len() {
+            assert_eq!(
+                old.parse_section(index).unwrap(),
+                new.parse_section(index).unwrap(),
+                "IR section {index}"
+            );
+            let a = old.provenance(index).unwrap();
+            let b = new.provenance(index).unwrap();
+            assert_eq!(a.len(), b.len());
+            slices += a.len();
+            for (a, b) in a.iter().zip(&b) {
+                assert_eq!(a.source, b.source);
+                assert_eq!(a.page, b.page);
+                assert_eq!(a.original_glyph, b.original_glyph);
+                for (a, b) in a.rect.into_iter().zip(b.rect) {
+                    max_error = max_error.max((a - b).abs());
+                    assert!((a - b).abs() <= 0.0000500001);
+                }
+            }
+            section_bytes += fs::metadata(next.join(format!("sections/{index}.json")))
+                .unwrap()
+                .len();
+            map_bytes += fs::metadata(next.join(provenance::name(index)))
+                .unwrap()
+                .len();
+        }
+        for name in &old.manifest.resources {
+            assert!(new.manifest.resources.contains(name));
+            let a = image::open(base.join(name)).unwrap().into_rgba8();
+            let b = image::open(next.join(name)).unwrap().into_rgba8();
+            assert_eq!(a, b, "decoded image {name}");
+            image_bytes += fs::metadata(next.join(name)).unwrap().len();
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "sections": new.book().sections.len(), "source_slices": slices,
+                "pixel_identical_images": old.manifest.resources.len(),
+                "section_bytes": section_bytes, "provenance_bytes": map_bytes,
+                "image_bytes": image_bytes, "max_coordinate_difference_from_4dp_json": max_error,
+            })
+        );
     }
 
     #[test]

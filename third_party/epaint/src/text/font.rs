@@ -274,6 +274,7 @@ impl FontCell {
             ctx.set_transform(kurbo::Affine::translate((-bounds.x0, -bounds.y0)));
             ctx.set_paint(color::OpaqueColor::<color::Srgb>::WHITE);
             ctx.fill_path(&path);
+            ctx.flush();
             let mut dest = vello_cpu::Pixmap::new(width, height);
             let mut resources = vello_cpu::Resources::new();
             ctx.render(&mut dest, &mut resources);

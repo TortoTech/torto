@@ -1,9 +1,12 @@
 //! Conversion-only image work. No render cache is shared with the reader.
+mod encoding;
+mod pipeline;
 use super::*;
 use hayro::hayro_interpret::font::Glyph;
 use hayro::hayro_interpret::{
     BlendMode, ClipPath, Device, GlyphDrawMode, Image, Paint, PathDrawMode, SoftMask,
 };
+pub(super) use pipeline::Pipeline;
 
 // Vello CPU 0.0.8 uses 256 x 4 wide tiles. Keep the local viewport on
 // the original tile grid to preserve edge coverage and image sampling.
@@ -115,10 +118,7 @@ pub(super) fn save_regions<'a>(
             let start = row as usize * stride + (rect[0] - x0) as usize * 4;
             pixels.extend_from_slice(&pixmap.data_as_u8_slice()[start..start + w as usize * 4]);
         }
-        image::RgbaImage::from_raw(w, h, pixels)
-            .ok_or("Invalid PDF crop pixels")?
-            .save(directory.join(&region.path))
-            .map_err(|e| e.to_string())?;
+        encoding::save(&directory.join(&region.path), pixels, w, h)?;
     }
     timings.image_write_ms += elapsed_ms(writing);
     Ok(())
@@ -276,14 +276,7 @@ impl Device<'_> for Exporter<'_> {
                             &pixmap.data_as_u8_slice()[start..start + width as usize * 4],
                         );
                     }
-                    match image::save_buffer_with_format(
-                        self.directory.join(&crop.path),
-                        &pixels,
-                        width,
-                        height,
-                        image::ColorType::Rgba8,
-                        image::ImageFormat::Png,
-                    ) {
+                    match encoding::save(&self.directory.join(&crop.path), pixels, width, height) {
                         Ok(()) => {
                             self.exported.insert(crop.path.clone());
                         }
@@ -344,7 +337,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn fixture(rotate: u16, content: &str, masked: bool) -> Vec<u8> {
+    pub(super) fn fixture(rotate: u16, content: &str, masked: bool) -> Vec<u8> {
         let mut jpeg = Vec::new();
         let rgb = image::RgbImage::from_fn(32, 24, |x, y| {
             image::Rgb([(x * 7) as u8, (y * 9) as u8, 70])

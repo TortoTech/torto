@@ -26,6 +26,7 @@ impl PaintScene for VelloScene<'_> {
 
     fn push_layer(
         &mut self,
+        fill: Fill,
         blend: impl Into<BlendMode>,
         alpha: f32,
         transform: Affine,
@@ -33,12 +34,11 @@ impl PaintScene for VelloScene<'_> {
         _filter: Option<Arc<Filter>>,
         _backdrop_filter: Option<Arc<Filter>>,
     ) {
-        self.scene
-            .push_layer(Fill::NonZero, blend, alpha, transform, clip);
+        self.scene.push_layer(fill, blend, alpha, transform, clip);
     }
 
-    fn push_clip_layer(&mut self, transform: Affine, clip: &impl Shape) {
-        self.scene.push_clip_layer(Fill::NonZero, transform, clip);
+    fn push_clip_layer(&mut self, fill: Fill, transform: Affine, clip: &impl Shape) {
+        self.scene.push_clip_layer(fill, transform, clip);
     }
 
     fn pop_layer(&mut self) {

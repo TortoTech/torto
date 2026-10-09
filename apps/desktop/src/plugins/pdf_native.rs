@@ -166,6 +166,12 @@ pub(crate) fn generate(
                 Field::F32("layout_ms", timings.layout_ms as f32),
                 Field::F32("raster_ms", timings.raster_ms as f32),
                 Field::F32("image_write_ms", timings.image_write_ms as f32),
+                Field::F32("raster_wait_ms", timings.raster_wait_ms as f32),
+                Field::Usize("raster_workers", timings.raster_workers),
+                Field::Usize(
+                    "raster_peak_estimated_bytes",
+                    timings.raster_peak_estimated_bytes,
+                ),
                 Field::F32("section_write_ms", timings.section_write_ms as f32),
                 Field::F32("finalize_ms", timings.finalize_ms as f32),
                 Field::Usize("direct_images", timings.direct_images),
@@ -246,6 +252,9 @@ pub(crate) fn import(book_id: &str, files: Vec<(String, Vec<u8>)>) -> io::Result
         let source = ReflowSource::open(&stage, book_id).map_err(io::Error::other)?;
         for index in 0..source.book().sections.len() {
             source.parse_section(index).map_err(io::Error::other)?;
+            // Validate lossless sidecars on this background import path. Normal
+            // reading loads only IR and never inflates per-glyph mappings.
+            source.provenance(index).map_err(io::Error::other)?;
         }
         publish(&root, &generation).map_err(io::Error::other)
     })();
@@ -536,6 +545,18 @@ mod tests {
         assert!(import(&id, vec![("manifest.json".into(), b"invalid".to_vec())]).is_err());
         assert_eq!(fs::read(root.join("current.json")).unwrap(), pointer);
         assert!(open(&id).unwrap().is_some());
+
+        let mut broken_mapping = files.clone();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&broken_mapping[0].1).unwrap();
+        manifest["resources"] = serde_json::json!(["resources/provenance-0.bin.z"]);
+        broken_mapping[0].1 = serde_json::to_vec(&manifest).unwrap();
+        let mut section: serde_json::Value = serde_json::from_slice(&broken_mapping[1].1).unwrap();
+        section["provenance_resource"] = "resources/provenance-0.bin.z".into();
+        broken_mapping[1].1 = serde_json::to_vec(&section).unwrap();
+        broken_mapping.push(("resources/provenance-0.bin.z".into(), b"corrupt".to_vec()));
+        assert!(import(&id, broken_mapping).is_err());
+        assert_eq!(fs::read(root.join("current.json")).unwrap(), pointer);
+        assert_eq!(export(&id).unwrap().unwrap(), files);
 
         // A reader's lazy reload must retain its original immutable generation,
         // even when sync publishes a replacement while that mode is inactive.

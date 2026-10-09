@@ -123,7 +123,7 @@ impl Renderer {
             renderer.draw_image(rgb_data, Some(alpha_data));
             renderer.ctx.flush();
             let mut resources = vello_cpu::Resources::default();
-            renderer.ctx.render_to_pixmap(&mut resources, &mut mask_pix);
+            renderer.ctx.render(&mut mask_pix, &mut resources);
             Mask::new_alpha(&mask_pix)
         };
 
@@ -384,11 +384,14 @@ impl Renderer {
             rgba_data = padded_image;
         }
 
-        let pixmap = Pixmap::from_parts_with_opacity(
-            bytemuck::cast_vec(rgba_data),
+        let pixmap = Pixmap::from_parts(
+            rgba_data,
             img_width as u16,
             img_height as u16,
-            may_have_transparency,
+            vello_cpu::PixelMetadata::new(
+                peniko::ImageAlphaType::AlphaPremultiplied,
+                may_have_transparency,
+            ),
         );
 
         self.draw_pixmap(
@@ -465,11 +468,14 @@ impl Renderer {
                             may_have_transparency || self.force_images_may_have_transparency();
                         paint_transform = path_transform.inverse() * transform;
 
-                        let pixmap = Pixmap::from_parts_with_opacity(
-                            image,
+                        let pixmap = Pixmap::from_parts(
+                            bytemuck::cast_vec(image),
                             width as u16,
                             height as u16,
-                            may_have_transparency,
+                            vello_cpu::PixelMetadata::new(
+                                peniko::ImageAlphaType::AlphaPremultiplied,
+                                may_have_transparency,
+                            ),
                         );
 
                         let image = Image {
@@ -531,7 +537,7 @@ impl Renderer {
                         let mut pix = Pixmap::new(pix_width, pix_height);
                         renderer.ctx.flush();
                         let mut resources = vello_cpu::Resources::default();
-                        renderer.ctx.render_to_pixmap(&mut resources, &mut pix);
+                        renderer.ctx.render(&mut pix, &mut resources);
 
                         // TODO: Fix these
                         if x_step < 0.0 {
@@ -586,7 +592,7 @@ impl Renderer {
         }
         self.ctx.stroke_path(path);
         if clip_path.is_some() {
-            self.ctx.pop_clip_path();
+            self.ctx.pop_clip();
         }
     }
 
@@ -608,7 +614,7 @@ impl Renderer {
         self.ctx.fill_path(path);
 
         if clip_path.is_some() {
-            self.ctx.pop_clip_path();
+            self.ctx.pop_clip();
         }
     }
 
@@ -813,9 +819,7 @@ impl<'a> Device<'a> for Renderer {
                                     sub_renderer.draw_image(rgb_bytes, Some(stencil));
                                     sub_renderer.ctx.flush();
                                     let mut resources = vello_cpu::Resources::default();
-                                    sub_renderer
-                                        .ctx
-                                        .render_to_pixmap(&mut resources, &mut sub_pix);
+                                    sub_renderer.ctx.render(&mut sub_pix, &mut resources);
                                     sub_pix
                                 };
 
@@ -835,7 +839,7 @@ impl<'a> Device<'a> for Renderer {
                                 }
                                 self.ctx.fill_rect(&stencil_rect);
                                 if clip_path.is_some() {
-                                    self.ctx.pop_clip_path();
+                                    self.ctx.pop_clip();
                                 }
 
                                 self.ctx.pop_layer();
@@ -900,7 +904,7 @@ impl<'a> Device<'a> for Renderer {
     }
 
     fn pop_clip_path(&mut self) {
-        self.ctx.pop_clip_path();
+        self.ctx.pop_clip();
     }
 
     fn pop_transparency_group(&mut self) {
@@ -964,7 +968,7 @@ impl<'a> Device<'a> for Renderer {
                 self.ctx.fill_rect(rect);
 
                 if clip_path.is_some() {
-                    self.ctx.pop_clip_path();
+                    self.ctx.pop_clip();
                 }
             }
             PathDrawMode::Stroke(s) => {
@@ -1075,7 +1079,7 @@ fn draw_soft_mask(mask: &SoftMask<'_>, settings: RenderSettings, width: u16, hei
     let mut pix = Pixmap::new(width, height);
     renderer.ctx.flush();
     let mut resources = vello_cpu::Resources::default();
-    renderer.ctx.render_to_pixmap(&mut resources, &mut pix);
+    renderer.ctx.render(&mut pix, &mut resources);
 
     let mut rendered_mask = match mask.mask_type() {
         MaskType::Luminosity => Mask::new_luminance(&pix),

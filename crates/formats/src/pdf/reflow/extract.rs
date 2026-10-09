@@ -378,6 +378,13 @@ impl Device<'_> for Extractor {
             .last()
             .map_or(bounds, |clip| bounds.intersect(*clip));
         if rect_is_finite(clipped) && clipped.width() > 2.0 && clipped.height() > 2.0 {
+            if matches!(&image, Image::Raster(_)) {
+                self.page.raster_decode_bytes = self.page.raster_decode_bytes.saturating_add(
+                    (image.width() as usize)
+                        .saturating_mul(image.height() as usize)
+                        .saturating_mul(8),
+                );
+            }
             let matrix = transform.as_coeffs();
             let plain = self.rectangular_clips.last().copied().unwrap_or(false)
                 && self.opaque_groups.last().copied().unwrap_or(false)

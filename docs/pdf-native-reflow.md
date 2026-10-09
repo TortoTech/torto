@@ -128,3 +128,110 @@ Validation includes rotated/clipped/alpha-masked synthetic pages, rejection of u
 A quiet local comparison on the same i7-6800K machine and the same dev optimization profile measured V10 conversion at **130.0 s** and the final V11 conversion at **109.9 s** (about **15.4% less elapsed time**). Full/region rasterization fell from 79.8 s to 65.2 s. The headless verification tool took 122.2 s including its extra post-generation parsing checks; those checks are not desktop generation time. The final run used 328 regional page viewports, retained 40 full-page fallbacks and directly exported 2 isolated images. Most figures in this book have clipping, overlays or grouped content and therefore use the conservative region path.
 
 All 550 output image dimensions matched V10. Of those resources, 362 were byte-identical and the remaining 188 differed by at most 2 levels per 8-bit RGB channel; no narrow high-contrast edge discrepancies remained after tile alignment. All 812 physical pages, 108 sections, 1,748,551 retained source glyphs, 1,456 anchors and 31 internal links passed the complete-book source audit. The job's measured peak working set was approximately 379 MiB; this is a headless generation process measurement, not desktop resident memory, and no equivalent pre-change peak was recorded.
+
+## Bounded native image pipeline
+
+Native generation now submits image pages to up to four scoped workers while the conversion worker continues ordered semantic layout, float recovery, section writes and source mapping. All workers use the same raster path, resolution, crop grid, color decoding and PNG settings. Scheduling alone retained V11; the subsequent renderer upgrade below advances generation to V12 because some derived pixels change.
+
+The queue is bounded by worker count. A shared 192 MiB scheduling budget accounts for queued and active page geometry, estimated decoded image buffers, raster/compositing buffers, the largest saved crop and an 8 MiB outline allowance per job. A page whose estimate exceeds the budget is admitted alone. This is a conservative scheduling estimate, not an allocator limit or a bound on process working set: complex PDF decoders and compositing layers may require additional transient memory. Each worker creates its own renderer cache and releases decoded fonts/images/colors after each page; only bounded outlines remain until the conversion ends. The original PDF is shared, and no renderer/interpreter cache is shared across workers or retained by the reader.
+
+Cancellation or image-write failure stops admission and discards queued work. Every worker is joined before returning, so staging cleanup cannot race image writes. The final image barrier must succeed before writing the manifest or publishing the generation. Worker panics are converted to generation errors. Queue/budget waits occur only on the background conversion worker; image workers sleep on the queue rather than polling the UI.
+
+`raster_ms` and `image_write_ms` now sum worker durations and may overlap each other and layout. `raster_wait_ms` measures producer backpressure plus the final image barrier on the conversion worker; only this wall time is subtracted from layout elapsed time. `raster_workers` and `raster_peak_estimated_bytes` report worker count and peak budget reservation. None of these diagnostics enters the synchronized manifest.
+
+Pipeline regressions check byte-identical serial/parallel PNGs for isolated images, rotated pages, clipping, masks and text overlays; failed writes and cancellation; oversized-page admission and permit release. Whole-book comparisons must use equivalent builds, with no concurrent compilation, and compare manifest/section/image bytes as well as conversion time. The existing dev-profile benchmark must not be compared directly to release-profile times.
+
+On the same i7-6800K (6 cores / 12 threads), quiet release-profile conversions of the same 812-page book took **61.3 s** and **62.1 s** with the preserved serial executable. The final bounded pipeline took **29.2 s**, approximately **53% less elapsed time** than the instrumented 62.1 s serial run. Its diagnostic tool took 35.8 s including post-generation reading/provenance checks; those checks are excluded from conversion time. No compilation overlapped these runs, and no GPU was used. These results do not compare release performance to the earlier 109.9 s dev-profile measurement.
+
+All **659 output files** (manifest, 108 sections and 550 PNG resources) were SHA-256 identical to the serial result. The pipeline retained 328 regional viewports, 40 full-page fallbacks, 2 direct image exports and 211,758,459 rasterized pixels. Process peak working set, sampled through the process peak counter every 50 ms, was **378.8 MiB serial** and **389.3 MiB parallel** (about 10.5 MiB higher). These are isolated headless conversion process measurements, not desktop resident memory. Peak scheduling reservation was approximately 191.9 MiB, within the 192 MiB admission budget. Runtime evidence is stored under `target/pdf-native-parallel-final-comparison.json` and the matching release benchmark logs.
+
+## Vello CPU 0.3.0 upgrade experiment
+
+On 2026-10-09, the vendored Hayro adapter was temporarily migrated from Vello CPU 0.0.8 to 0.3.0. The interpreter, native layout, four-worker pipeline, crop alignment, sampling quality, resolution and PNG settings were unchanged. The migration used the new `render` and `pop_clip` APIs and explicit premultiplied pixel metadata. It kept the u8 raster pipeline and disabled internal renderer threading. See the [upstream changelog](https://github.com/linebender/vello/blob/main/vello_cpu/CHANGELOG.md) for the rendering API and sampling changes.
+
+The same release-profile diagnostic and 812-page PDF were used on the same i7-6800K, with no concurrent compilation or GPU generation. Runs alternated 0.3.0, 0.0.8, 0.3.0, 0.0.8. Conversion time excludes post-generation reading and provenance checks.
+
+| Version | Conversion runs | Mean conversion time | Sum of worker raster time, mean | Process peak working set |
+| --- | --- | --- | --- | --- |
+| 0.0.8 | 28.38 s, 28.73 s | 28.55 s | 33.33 s | 388.1–405.7 MiB |
+| 0.3.0 | 28.25 s, 28.39 s | 28.32 s | 32.69 s | 392.6–397.7 MiB |
+
+The mean whole-book difference was only **0.8%**, smaller than the observed 0.0.8 run-to-run spread. Two runs per version do not establish a stable speed improvement. Summed worker raster time was approximately 1.9% lower, but this overlapping duration is not whole-book wall time. No meaningful memory reduction was established.
+
+All 109 manifest/section files and 504 of 550 PNG resources were SHA-256 identical. All image dimensions matched, but 46 images had pixel changes, including differences greater than 16 color levels at some edges. The largest mean RGBA channel difference among changed images was 0.235 on the 0–255 scale. Visual checks of the two images with the largest mean differences found no missing content; these checks do not prove equivalent quality across every changed image. This is not evidence that the new renderer is worse, but the upgrade cannot claim unchanged pixels.
+
+The initial performance experiment passed 104 format tests and a separate 27-image real-book check confirming pixel-identical region versus full-page sampling under 0.3.0. It did not establish a worthwhile generation speedup. The upgrade was subsequently **retained for rendering correctness**, after expanding evaluation to all reader uses of Vello CPU. The measurements above precede the generation revision and cover/backend dependency alignment described below; they do not establish a UI performance improvement. Evidence and the initial migration patch are under `target/vello030-comparison.json`, `target/vello030-experiment.patch` and the `target/pdf-native-vello*` benchmark logs and generated directories.
+
+### Reader-wide adoption
+
+All three production CPU-rendering uses now share Vello CPU 0.3.0:
+
+- Vendored Hayro renders original PDF pages, future OCR input/special-page images and native image exports. Existing stored OCR resources are preserved.
+- AnyRender's CPU backend renders generated first-page covers for books with no usable cover. It is upgraded to 0.18.0 with AnyRender 0.14.0, retaining the existing bounded image cache and disabled internal multithreading.
+- Vendored epaint rasterizes interface glyph outlines. It is upgraded from 0.1.0 to 0.3.0 and flushes the context before rendering. Hinting, subpixel bins, font selection and atlas color transfer are unchanged.
+
+The [filtered-image boundary fix](https://github.com/linebender/vello/pull/1950) corrects mismatched interpolation weights and texel indices, while the [opaque-image mask/blend fix](https://github.com/linebender/vello/pull/1697) and layer-clipping fixes improve renderer correctness in the PDF/cover drawing paths. These are applicable code-path improvements, not a claim that each defect was observed in the current library. A focused regression checks the two-color repeated-image boundary against its known correct color. Pixel differences from 0.0.8 therefore need correctness assessment rather than blanket rejection.
+
+AnyRender 0.14 carries explicit clip fill rules. The desktop GPU adapter now forwards those rules instead of assuming nonzero winding, preserving recorded scenes' clipping semantics. This does not change the GPU renderer version. Ordinary book SVGs, body/chat formulas and chat SVG assets continue to use resvg/tiny-skia; their rendering is not attributed to this CPU upgrade.
+
+Native generation advances to **V12** so old derived image/translation/semantic caches are not mixed with changed renderer output. Existing library data is not rewritten during validation. Regenerating a native result uses the usual staged conversion and publication path.
+
+Validation passed 104 existing format tests, 31 renderer tests, the new sampling regression, 46 standalone epaint tests and 767 desktop tests (41 optional/local desktop tests remain ignored). The local 草枕 cover/ruby diagnostic passed with 4,603 ruby runs, and its generated cover was visually checked. A fresh release-profile V12 conversion of the 812-page PDF completed in 28.0 s with a 384.2 MiB headless peak working set; all 550 PNG resources were SHA-256 identical to the preceding 0.3.0 experiment. Native navigation and seven floating-paragraph cases passed against that V12 output. The earlier 27-image region/full-page pixel comparison also passed. These results validate the relevant rendering and source/navigation behavior; they do not measure desktop scrolling or interface-frame performance.
+
+## Lossless binary page spool
+
+Conversion-only `raw/` pages now use bincode 1.3.3, already present in the dependency graph, instead of JSON. Published sections, manifests and synchronized reading data keep their existing JSON format. The temporary codec preserves every glyph, coordinate bit, image reference, obstacle, structure tag, link and outline association. It uses explicit fixed-width integer encoding, little-endian floats, a 32 MiB per-entry limit and trailing-byte rejection. Reads retain at most one bounded byte buffer; pages are deleted after use. Writes explicitly flush the buffer and propagate errors. The spool lives only within one staged conversion, so it needs no old-data migration or separate generation revision.
+
+Two quiet release-profile runs per implementation alternated binary, JSON, binary, JSON on the same 812-page PDF and i7-6800K. Both implementations include the same four-worker pipeline and Vello CPU 0.3.0; compilation and output hashing did not overlap timed runs. Times exclude the diagnostic tool's post-generation source checks.
+
+| Temporary format | Conversion runs | Mean conversion | Mean spool write + read | Peak process working set |
+| --- | --- | --- | --- | --- |
+| JSON | 28.31 s, 28.57 s | 28.44 s | 5.32 s | 388.6–395.7 MiB |
+| Binary | 25.59 s, 25.21 s | 25.40 s | 1.23 s | 390.0–393.4 MiB |
+
+Whole-book generation was approximately **10.7% faster**, and temporary I/O/serialization time fell approximately **76.9%**. The full reduction in spool time does not translate into wall-time savings because the old second-pass reads overlapped raster workers. No meaningful process-memory improvement was established.
+
+All **550 PNG resources** were SHA-256 identical. File sets, 108 sections, all strings and nonnumeric JSON content, chapter ownership and statistics matched. This is not whole-output byte equality: preserving original coordinate bits instead of JSON reader rounding changed 632,133 coordinate number tokens, with a maximum absolute difference of **7 × 10^-14**. Two coincident glyph IDs on page 4 exchanged order in provenance; they retain the same source node and coincident rectangles, with unchanged reading text. A structural JSON comparison and a separate numeric-token comparison isolate those differences; neither uses image-quality sampling to excuse changed pixels.
+
+Validation passed **107 format tests**, including exact binary field/float round trips, malformed/truncated spool rejection, staged conversion/cancellation and serial/parallel image regressions. The real-book floating-paragraph cases and desktop native-navigation regression passed against the binary generation. Both binary runs produced **659 SHA-256-identical files**, confirming repeatable output under this fixture. Evidence is under `target/page-spool-*-comparison.json`, `target/page-spool-benchmark-summary.json` and `target/pdf-native-{binary,json}-spool-*.log`.
+
+Of the four proposed optimization areas, image parallelism and layout/raster pipelining are implemented, and the binary spool is now implemented. Resource reuse remains partial: rendering workers retain bounded outlines and the PDF shares its parsed stream cache, but extraction and raster interpretation do not share decoded-font caches or replayable page scenes. The interpreter cache currently exposes no byte-budget or eviction interface; retaining it across both whole-book passes would conflict with bounded memory. Cross-pass command/resource reuse has not been implemented or benchmarked, and the measurements above must not be attributed to it.
+
+## Persisted coordinate precision
+
+Per-glyph provenance rectangles now serialize to at most four decimal places in final section JSON. Extraction, geometric grouping, glyph ordering, raster bounds, matrices, and binary page spooling retain their original precision. The serialization error is approximately at most 0.00005 page-coordinate units per component; zero is canonicalized to positive zero. Source ranges, character offsets and original glyph IDs remain exact. The V12 schema and source identities are unchanged, so existing generations remain readable. Regenerate local reflow to obtain compact provenance.
+
+The workspace explicitly enables serde_json's `float_roundtrip` feature. The desktop already received it transitively from Rig, but formats-only builds previously used best-effort float parsing. This removes that build-dependent behavior; it does not mean desktop JSON parsing was previously imprecise.
+
+The final 108-section, 812-page fixture reduced section JSON from 489,966,556 to 429,109,050 bytes (60.9 MB, 12.42%). After canonicalizing only provenance rectangle numbers, every section was byte-identical to the preceding binary-spool generation. All 550 PNG resources, book navigation and physical-page targets matched. This is a storage measurement, not a measured conversion-speed or live-memory improvement: an in-memory f64 still occupies eight bytes. The unchanged binary spool remains lossless. Evidence is in `target/float-precision-final-comparison.json`; the final generated fixture is `target/pdf-native-precision-final`.
+
+## Separate, lossless source mapping
+
+New generations keep reading IR in `sections/{index}.json` and store per-glyph source mappings in `resources/provenance-{index}.bin.z`. A node dictionary removes repeated spine/node strings; varint integer encoding preserves Unicode offsets, physical page numbers and original glyph IDs. Coordinates retain their complete f64 bits, including signed zero, rather than the previous JSON's four-decimal presentation. The sidecar has its own `TRTPRV01` format header and zlib integrity check. Compressed and decompressed payloads are independently limited to 32 MiB, and truncated, trailing or invalid dictionary references are rejected.
+
+Normal reading loads only IR. It also skips deserialization of provenance in existing combined JSON files. Explicit source-mapping queries decode one sidecar on demand; no whole-book mapping cache is introduced. Import validates mappings on its background worker before publishing the staged generation. Every sidecar is listed in manifest resources, so existing archive export paths include it and older clients preserve it during synchronization. New section JSON retains an empty legacy `provenance` field: older clients can display the reading IR but need the new implementation to query the sidecar's mapping. New clients continue to read old combined JSON in full. The optional storage extension leaves V12 source identities, navigation and semantic/translation cache keys unchanged. Existing immutable generations are not rewritten automatically.
+
+Packing and compression buffer only one bounded section at a time. Feeding bincode directly into zlib was rejected after the first measurement: compressing thousands of individual tiny writes took 20.60 s across section writes. A single bounded binary buffer reduced section writes to 1.17 s in the final whole-book run. That buffer preserves every coordinate bit and is released after the section write.
+
+## Lossless image storage
+
+Both regional raster crops and isolated-image exports now use one PNG encoder. It selects gray or RGB channels only when **every** RGBA pixel proves the conversion exact; any transparency keeps RGBA. Channels are compacted in the existing crop buffer. Default compression and adaptive filtering replace Fast RGBA encoding. Renderers, resolution, sampling, crop geometry, color conversion and alpha blending are unchanged.
+
+JPEG is appropriate for photographs, but newly encoding rendered crops is lossy and can damage screenshots, formulas, subfigure labels and thin lines. The current direct-image path also samples PDF images and composes their crop margins; retaining the original JPEG byte stream is not a general replacement for that operation. No automatic lossy conversion or heuristic photo classifier is enabled by this change. The image optimization preserves decoded pixels exactly. Storage savings do not imply smaller decoded textures or GPU allocations.
+
+### Whole-book validation
+
+The same 151,782,128-byte PDF (812 pages, 108 generated sections) was regenerated in a quiet release-profile run. Results use decimal MB:
+
+| Component | Previous generation | Final generation |
+| --- | ---: | ---: |
+| Reading IR / section wrapper | 11,947,214 bytes | 11,954,880 bytes |
+| Per-glyph provenance | 417,161,836 bytes | 43,536,302 bytes |
+| 550 image resources | 109,167,926 bytes | 88,140,882 bytes |
+| All generation files | 538,617,818 bytes | 143,976,360 bytes |
+
+Total stored size fell **73.27%**. Provenance fell approximately 89.56%, and image storage approximately 19.26%. All 108 reading sections and navigation targets matched, every one of the 1,748,551 retained source records preserved its page/glyph/anchor/offset fields, and all 550 images decoded to identical RGBA pixels and dimensions. Comparing full binary coordinates against the previous four-decimal JSON produced the expected maximum difference of approximately 0.00005; the binary round-trip regression separately verifies exact f64 bits.
+
+The final conversion took **26.13 s**, excluding 1.53 s of the diagnostic's additional reading/provenance validation. This is one final run, not evidence of a generation-speed improvement over the earlier 25.40 s binary-spool mean. PNG encoding increased summed overlapping worker write time, while the new source storage kept section write time near the earlier value. No desktop scrolling or decoded-texture memory improvement is claimed. Existing library generations were preserved; regenerate local text to use the new storage. Evidence is in `target/compact-storage-final-size-report.json`, `target/compact-storage-final-comparison.log` and `target/pdf-native-compact-storage-final.log`.
+
+Final verification passed 112 format tests and 771 desktop tests, the production desktop check, and formatting/diff checks. The local floating-paragraph diagnostic and native chapter-continuation/navigation diagnostic passed against the final generation. Regressions cover exact binary field/float round trips, decompression limits and malformed mappings, old combined JSON, lazy reading independent of a damaged sidecar, rejection of corrupt imported mappings without replacing the current generation, and exact gray/RGB/RGBA PNG pixel round trips.
