@@ -80,8 +80,9 @@ pub(super) fn style(block: &TextBlock) -> Value {
         }
     }
     let total = total.max(1.0);
-    json!({"bold_ratio":bold/total,"italic_ratio":italic/total,"relative_font_size":size/total,
-        "align":format!("{:?}",block.style.align),"margin_before":block.style.margin_before,"margin_after":block.style.margin_after})
+    use super::super::numbers::round_request_number as rounded;
+    json!({"bold_ratio":rounded(bold/total),"italic_ratio":rounded(italic/total),"relative_font_size":rounded(size/total),
+        "align":format!("{:?}",block.style.align),"margin_before":rounded(f64::from(block.style.margin_before)),"margin_after":rounded(f64::from(block.style.margin_after))})
 }
 
 pub(super) fn context(section: &Section, start: usize) -> Value {

@@ -251,6 +251,37 @@ fn image_cache_and_search_do_not_call_a_model() {
         );
     });
 }
+
+#[test]
+fn crop_cache_uses_actual_pixels_and_survives_a_new_session() {
+    runtime().block_on(async {
+        let source = source();
+        let mut session = Session::new(source.clone(), goals()).unwrap();
+        let crop = [0.1_f64, 0.1, 0.5, 0.5];
+        let first = session
+            .execute("read_pages", json!({"pages":[3],"crop":crop}))
+            .await
+            .unwrap();
+        assert_eq!(first.value["cache_hits"], 0);
+        let mut adjacent = crop;
+        adjacent[0] = f64::from_bits(crop[0].to_bits() + 1);
+        let mut reopened = Session::new(source.clone(), goals()).unwrap();
+        let cached = reopened
+            .execute("read_pages", json!({"pages":[3],"crop":adjacent}))
+            .await
+            .unwrap();
+        assert_eq!(cached.value["cache_hits"], 1);
+        assert_eq!(cached.images, first.images);
+        assert_eq!(source.renders.load(Ordering::SeqCst), 1);
+        adjacent[0] = 0.1005;
+        let changed = reopened
+            .execute("read_pages", json!({"pages":[3],"crop":adjacent}))
+            .await
+            .unwrap();
+        assert_eq!(changed.value["cache_hits"], 0);
+        assert_eq!(source.renders.load(Ordering::SeqCst), 2);
+    });
+}
 #[test]
 fn schemas_are_valid_and_finish_rejects_unverified_navigation() {
     for tool in tools().as_array().unwrap() {

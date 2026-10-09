@@ -10,6 +10,7 @@ mod commands;
 pub(crate) mod glossary;
 pub(crate) mod llm;
 mod llm_json;
+mod numbers;
 pub(crate) mod pdf_native;
 mod pdf_ocr;
 mod pdf_toc;

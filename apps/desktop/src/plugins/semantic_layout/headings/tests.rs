@@ -1,6 +1,47 @@
 use super::*;
 use crate::plugins::semantic_layout::tests::{original_source, section, text};
 use crate::plugins::{BlockTranslation, TranslationBookSource, TranslationMode};
+use rebook_publication::{TextRun, TextStyle};
+
+#[test]
+fn descriptive_style_numbers_do_not_expose_binary_float_tails() {
+    let block = TextBlock {
+        kind: TextBlockKind::Paragraph,
+        source: None,
+        style: Default::default(),
+        content: vec![
+            Inline::Text(TextRun {
+                text: "a".into(),
+                link: None,
+                style: TextStyle {
+                    bold: true,
+                    size_scale: 1.2,
+                    ..Default::default()
+                },
+            }),
+            Inline::Text(TextRun {
+                text: "bc".into(),
+                link: None,
+                style: TextStyle {
+                    size_scale: 1.2,
+                    ..Default::default()
+                },
+            }),
+        ],
+    };
+    let input = style(&block);
+    assert_eq!(input["bold_ratio"], json!(0.3333));
+    assert_eq!(input["relative_font_size"], json!(1.2));
+    assert_eq!(
+        block.content[0]
+            .text_runs()
+            .first()
+            .unwrap()
+            .style
+            .size_scale,
+        1.2
+    );
+}
 
 #[test]
 #[ignore = "uses configured AI model and local TORTO_SEMANTIC_BOOK; makes paid requests"]

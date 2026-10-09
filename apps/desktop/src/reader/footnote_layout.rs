@@ -341,6 +341,9 @@ impl FootnoteRenderer {
         if width < 84.0 {
             return Err("popup column is narrower than the reader minimum".into());
         }
+        // Match the integer viewport used for shaping, including SVG extent and
+        // cache identity. Subpixel width noise cannot change the actual layout.
+        let width = width.floor();
         let mut style = reader_style.clone();
         style.typography.font_size = size;
         style.typography.minimum_font_size = size;
@@ -1014,6 +1017,17 @@ mod tests {
                 )
                 .unwrap();
             assert!(Arc::ptr_eq(&layout, &cached));
+            let fractional = renderer
+                .layout(
+                    &source,
+                    text,
+                    &ReaderStyle::default(),
+                    14.0,
+                    egui::Color32::BLACK,
+                    width + 0.25,
+                )
+                .unwrap();
+            assert!(Arc::ptr_eq(&layout, &fractional));
         }
     }
 }

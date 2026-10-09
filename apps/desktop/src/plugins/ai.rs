@@ -1792,7 +1792,7 @@ fn format_reading_context(current: &ChatReadingContext) -> String {
 }
 
 fn round_context_number(value: f64) -> f64 {
-    (value * 10_000.0).round() / 10_000.0
+    super::numbers::round_request_number(value)
 }
 
 #[allow(clippy::too_many_lines)]

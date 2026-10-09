@@ -231,7 +231,6 @@ impl SyncStore {
         } else {
             connection.transaction()?
         };
-        let locator_json = serde_json::to_string(locator)?;
         if !refresh_activity {
             let current: Option<String> = transaction
                 .query_row(
@@ -240,10 +239,15 @@ impl SyncStore {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if current.as_deref() == Some(locator_json.as_str()) {
+            if current
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<LocatorV1>(json).ok())
+                .is_some_and(|current| same_progress_location(&current, locator))
+            {
                 return Ok(());
             }
         }
+        let locator_json = serde_json::to_string(locator)?;
         let updated_at = tick(&transaction, &self.device_id, None)?;
         let sql = if refresh_activity {
             "INSERT INTO progress(book_id, locator_json, updated_hlc) VALUES (?1, ?2, ?3) \
@@ -806,6 +810,28 @@ fn unix_timestamp_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+// Keep the stored fractions lossless: fallback navigation uses floor(), so
+// rounding a value at a segment boundary can restore the previous segment.
+fn same_progress_location(a: &LocatorV1, b: &LocatorV1) -> bool {
+    // The reader currently restores precise source anchors, but does not use
+    // CFI/position alone before falling back to fractions.
+    let precise = a.source.is_some();
+    let same_fraction = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(a), Some(b)) => a == b || (precise && (a - b).abs() <= 8.0 * f64::EPSILON),
+        (None, None) => true,
+        _ => false,
+    };
+    a.version == b.version
+        && a.publication_id == b.publication_id
+        && a.href == b.href
+        && a.position == b.position
+        && a.source == b.source
+        && a.partial_cfi == b.partial_cfi
+        && a.text == b.text
+        && same_fraction(a.progression, b.progression)
+        && same_fraction(a.total_progression, b.total_progression)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1009,6 +1035,40 @@ mod tests {
         let saved = store.load_progress("book").unwrap().unwrap();
         assert_eq!(saved.locator, precise);
         assert!(saved.updated_at > previous_time);
+        cleanup(&store);
+    }
+
+    #[test]
+    fn progress_float_noise_is_ignored_only_with_matching_precise_anchors() {
+        let store = test_store("progress-float-noise");
+        let mut initial = locator("book", 1.0 / 3.0);
+        initial.progression = Some(1.0 / 3.0);
+        initial.source = Some(source_range());
+        store.save_progress("book", &initial).unwrap();
+        let saved = store.load_progress("book").unwrap().unwrap();
+        let mut changed = initial.clone();
+        changed.progression = initial.progression.map(|p| f64::from_bits(p.to_bits() + 1));
+        changed.total_progression = changed.progression;
+        store.save_progress("book", &changed).unwrap();
+        assert_eq!(store.load_progress("book").unwrap().unwrap(), saved);
+
+        changed.source.as_mut().unwrap().start.text_offset += 1;
+        store.save_progress("book", &changed).unwrap();
+        assert_eq!(
+            store.load_progress("book").unwrap().unwrap().locator,
+            changed
+        );
+
+        changed.source = None;
+        changed.partial_cfi = Some("/4/2".into());
+        store.save_progress("book", &changed).unwrap();
+        changed.progression = initial.progression;
+        store.save_progress("book", &changed).unwrap();
+        assert_eq!(
+            store.load_progress("book").unwrap().unwrap().locator,
+            changed
+        );
+        assert_eq!((changed.progression.unwrap() * 3.0).floor(), 1.0);
         cleanup(&store);
     }
 

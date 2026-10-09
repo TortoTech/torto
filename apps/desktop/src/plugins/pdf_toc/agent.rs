@@ -263,37 +263,67 @@ impl Session {
         overview: bool,
         crop: Option<[f64; 4]>,
     ) -> Result<(String, bool), String> {
-        let key = format!(
-            "{:x}",
-            Sha256::digest(format!("v1:{pages:?}:{overview}:{crop:?}").as_bytes())
-        );
-        let path = self.directory.join(format!("{key}.image"));
-        if let Ok(url) = std::fs::read_to_string(&path) {
-            return Ok((url, true));
-        }
         let source = self.source.clone();
-        let url = tokio::task::spawn_blocking(move || {
+        let directory = self.directory.clone();
+        tokio::task::spawn_blocking(move || {
             use image::{DynamicImage, Rgb, RgbImage, imageops::FilterType};
+            let dimension = if overview {
+                560
+            } else if crop.is_some() {
+                2400
+            } else {
+                1600
+            };
+            let dimensions_path =
+                |page: usize| directory.join(format!("v2-{page}-{dimension}.dimensions.json"));
+            // Small persisted dimension records allow crop-cache lookup before
+            // rendering/decoding. Keys use exactly the rectangles passed to crop_imm.
+            let dimensions = if crop.is_some() {
+                pages
+                    .iter()
+                    .map(|page| {
+                        std::fs::read(dimensions_path(*page))
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<[u32; 2]>(&bytes).ok())
+                            .filter(|[w, h]| *w > 0 && *h > 0)
+                    })
+                    .collect::<Option<Vec<_>>>()
+            } else {
+                Some(Vec::new())
+            };
+            let cache_path = |dimensions: &[[u32; 2]]| {
+                let crops = crop.map(|crop| {
+                    dimensions
+                        .iter()
+                        .map(|[w, h]| pixel_crop(crop, *w, *h))
+                        .collect::<Vec<_>>()
+                });
+                let key = format!(
+                    "{:x}",
+                    Sha256::digest(
+                        format!("v2:{pages:?}:{overview}:{dimension}:{dimensions:?}:{crops:?}")
+                            .as_bytes()
+                    )
+                );
+                directory.join(format!("{key}.image"))
+            };
+            if let Some(dimensions) = &dimensions
+                && let Ok(url) = std::fs::read_to_string(cache_path(dimensions))
+            {
+                return Ok((url, true));
+            }
             let mut images = Vec::new();
+            let mut rendered_dimensions = Vec::new();
             for &page in &pages {
-                let mut image = pdf_vision::render_page_image(
-                    source.as_ref(),
-                    page - 1,
-                    if overview {
-                        560
-                    } else if crop.is_some() {
-                        2400
-                    } else {
-                        1600
-                    },
-                )?;
-                if let Some([x, y, w, h]) = crop {
+                let mut image =
+                    pdf_vision::render_page_image(source.as_ref(), page - 1, dimension)?;
+                if let Some(crop) = crop {
                     let width = image.width();
                     let height = image.height();
-                    let x = (x * width as f64) as u32;
-                    let y = (y * height as f64) as u32;
-                    let w = ((w * width as f64) as u32).max(1).min(width - x);
-                    let h = ((h * height as f64) as u32).max(1).min(height - y);
+                    rendered_dimensions.push([width, height]);
+                    crate::persistence::write_json_atomic(&dimensions_path(page), &[width, height])
+                        .map_err(|e| e.to_string())?;
+                    let [x, y, w, h] = pixel_crop(crop, width, height);
                     image = image
                         .crop_imm(x, y, w, h)
                         .resize(1600, 1600, FilterType::Triangle);
@@ -320,12 +350,16 @@ impl Session {
             } else {
                 images.remove(0)
             };
-            pdf_vision::encode_jpeg_data_url(&image, pages[0] - 1)
+            let url = pdf_vision::encode_jpeg_data_url(&image, pages[0] - 1)?;
+            crate::persistence::write_bytes_atomic(
+                &cache_path(&rendered_dimensions),
+                url.as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok((url, false))
         })
         .await
-        .map_err(|e| e.to_string())??;
-        crate::persistence::write_bytes_atomic(&path, url.as_bytes()).map_err(|e| e.to_string())?;
-        Ok((url, false))
+        .map_err(|e| e.to_string())?
     }
     fn patch(&mut self, patch: Patch) -> Result<Value, String> {
         let mut draft = self.draft.clone();
@@ -434,7 +468,12 @@ impl Session {
                     serde_json::from_value(args.get("crop").cloned().unwrap_or(Value::Null))
                         .map_err(|e| e.to_string())?;
                 if let Some([x, y, w, h]) = crop {
-                    if w <= 0.0 || h <= 0.0 || x + w > 1.0 || y + h > 1.0 {
+                    if [x, y, w, h].iter().any(|v| !v.is_finite() || *v < 0.0)
+                        || w <= 0.0
+                        || h <= 0.0
+                        || x + w > 1.0
+                        || y + h > 1.0
+                    {
                         return Err("Crop must be a non-empty rectangle inside the page".into());
                     }
                 }
@@ -450,7 +489,10 @@ impl Session {
                     let (url, hit) = self.image(group.clone(), overview, crop).await?;
                     output.value["cache_hits"] =
                         json!(output.value["cache_hits"].as_u64().unwrap() + u64::from(hit));
-                    output.images.push(json!({"type":"text","text":format!("{name}: physical PDF pages {group:?}; crop {crop:?}")}));
+                    let crop_label = json!(
+                        crop.map(|rect| rect.map(super::super::numbers::round_request_number))
+                    );
+                    output.images.push(json!({"type":"text","text":format!("{name}: physical PDF pages {group:?}; crop {crop_label}")}));
                     output
                         .images
                         .push(json!({"type":"image_url","image_url":{"url":url}}));
@@ -971,6 +1013,14 @@ where
         return Err(reason);
     }
     Ok(result)
+}
+
+fn pixel_crop([x, y, w, h]: [f64; 4], width: u32, height: u32) -> [u32; 4] {
+    let x = ((x * f64::from(width)) as u32).min(width - 1);
+    let y = ((y * f64::from(height)) as u32).min(height - 1);
+    let w = ((w * f64::from(width)) as u32).max(1).min(width - x);
+    let h = ((h * f64::from(height)) as u32).max(1).min(height - y);
+    [x, y, w, h]
 }
 
 #[cfg(test)]

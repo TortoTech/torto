@@ -1507,6 +1507,7 @@ pub(super) fn validate_translation_math_placeholders(
 fn push_translation_style_markup(output: &mut String, run: &TextRun) {
     let mut closing = Vec::new();
     if let Some(scale) = run.style.keyword_size_scale {
+        let scale = super::numbers::size_attribute(scale);
         output.push_str(&format!("<t-size scale=\"{scale}\">"));
         closing.push("</t-size>");
     }
@@ -1683,8 +1684,9 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
         }
     }
     let style = neutral_translation_style(style, original);
-    let styled = parse_inline_style_markup(&text, style)
+    let mut styled = parse_inline_style_markup(&text, style)
         .unwrap_or_else(|| restore_original_baselines(&text, style, original));
+    restore_source_sizes(&mut styled, original);
     let mut content = Vec::new();
     for (text, style) in styled {
         append_translated_span(&mut content, &text, style, original, &math);
@@ -1696,6 +1698,34 @@ fn replacement_content(text: &str, style: TextStyle, original: Option<&[Inline]>
     }
     restore_inline_images(&mut content, original);
     content
+}
+
+fn restore_source_sizes(styled: &mut [(String, TextStyle)], original: &[Inline]) {
+    let mut scales = std::collections::HashMap::<u32, Option<f32>>::new();
+    for run in original.iter().flat_map(Inline::text_runs) {
+        if let Some(scale) = run.style.keyword_size_scale {
+            let key = super::numbers::size_attribute(scale)
+                .parse::<f32>()
+                .expect("formatted scale parses")
+                .to_bits();
+            scales
+                .entry(key)
+                .and_modify(|saved| {
+                    if *saved != Some(scale) {
+                        *saved = None;
+                    }
+                })
+                .or_insert(Some(scale));
+        }
+    }
+    for (_, style) in styled {
+        if let Some(scale) = style.keyword_size_scale
+            && let Some(Some(original)) = scales.get(&scale.to_bits())
+        {
+            style.keyword_size_scale = Some(*original);
+            style.size_scale = *original;
+        }
+    }
 }
 
 fn restore_inline_images(content: &mut Vec<Inline>, original: &[Inline]) {
@@ -3332,6 +3362,55 @@ mod tests {
         assert!(
             matches!(&uniform[0], Inline::Text(run) if run.style.keyword_size_scale == Some(0.75))
         );
+    }
+
+    #[test]
+    fn compact_size_attributes_restore_original_precision() {
+        let scale = 8.0_f32 / 9.0;
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            source: None,
+            style: Default::default(),
+            content: vec![Inline::Text(TextRun {
+                text: "small".into(),
+                link: None,
+                style: TextStyle {
+                    keyword_size_scale: Some(scale),
+                    size_scale: scale,
+                    ..Default::default()
+                },
+            })],
+        };
+        assert_eq!(
+            translation_text(&block),
+            "<t-size scale=\"0.8889\">small</t-size>"
+        );
+        let translated = replacement_content(
+            "<t-size scale=\"0.8889\">小字</t-size>",
+            TextStyle::default(),
+            Some(&block.content),
+        );
+        let Inline::Text(run) = &translated[0] else {
+            panic!("text")
+        };
+        assert_eq!(run.style.size_scale.to_bits(), scale.to_bits());
+        assert_eq!(run.style.keyword_size_scale, Some(scale));
+        assert_eq!(super::super::numbers::size_attribute(0.000_001), "0.000001");
+
+        // Nearby authored scales can share a compact token. Do not select an
+        // arbitrary original style when that token is ambiguous.
+        let mut original = block.content.clone();
+        let mut other = original[0].clone();
+        if let Inline::Text(run) = &mut other {
+            run.style.keyword_size_scale = Some(0.88889);
+        }
+        original.push(other);
+        let translated = replacement_content(
+            "<t-size scale=\"0.8889\">小字</t-size>",
+            TextStyle::default(),
+            Some(&original),
+        );
+        assert!(matches!(&translated[0], Inline::Text(run) if run.style.size_scale == 0.8889));
     }
 
     #[test]
