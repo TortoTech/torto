@@ -3,6 +3,7 @@
 //! The optimization core is renderer-independent. Integrations with shaping
 //! engines live in sibling adapter modules.
 
+mod engine;
 pub mod knuth_plass;
 
 pub(crate) mod hyphenation;

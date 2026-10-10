@@ -129,6 +129,7 @@ fn connection_retry_resends_same_round_before_tool_execution() {
         .block_on(complete_round(
             &provider,
             "test",
+            ReasoningEffort::High,
             &[json!({"role":"user","content":"inspect"})],
             &tools(),
             &mut |p| progress.push(p),
@@ -138,6 +139,7 @@ fn connection_retry_resends_same_round_before_tool_execution() {
     assert_eq!(progress.len(), 1);
     let requests = handle.join().unwrap();
     assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests[1]["reasoning_effort"], "high");
 }
 
 #[test]
@@ -158,6 +160,7 @@ fn connection_retry_is_bounded_and_preserves_final_error() {
         .block_on(complete_round(
             &provider,
             "test",
+            ReasoningEffort::Default,
             &[json!({"role":"user","content":"inspect"})],
             &tools(),
             &mut |p| progress.push(p),
@@ -182,6 +185,7 @@ fn connection_retry_does_not_retry_authentication_errors() {
         .block_on(complete_round(
             &provider,
             "test",
+            ReasoningEffort::Default,
             &[json!({"role":"user","content":"inspect"})],
             &tools(),
             &mut |_| panic!("must not retry"),
@@ -359,6 +363,7 @@ fn agent_chooses_pages_saves_then_finishes_using_real_tool_history() {
         ),
     ]);
     let mut settings = PluginSettings::default().with_test_model();
+    settings.ocr_reasoning_effort = ReasoningEffort::High;
     settings.providers[0].base_url = url;
     settings.providers[0].api_key = "fixture".into();
     let result = runtime()
@@ -369,6 +374,7 @@ fn agent_chooses_pages_saves_then_finishes_using_real_tool_history() {
     assert_eq!(result.page_roles.len(), 1);
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 4);
+    assert!(requests.iter().all(|r| r["reasoning_effort"] == "high"));
     assert!(
         requests[1]["messages"]
             .as_array()

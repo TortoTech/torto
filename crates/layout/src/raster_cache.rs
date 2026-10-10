@@ -149,7 +149,19 @@ impl DeferredRaster {
     /// UI-safe cache lookup: never waits for source I/O, a codec, or a lock.
     pub fn ready(&self) -> Option<RasterImage> {
         let mut cache = CACHE.try_lock().ok()?;
-        if !self.valid(&cache) {
+        self.ready_in_cache(&mut cache)
+    }
+
+    // Tests inspect residency after synchronous loading/retirement. A busy UI
+    // lookup means "try again", not "missing pixels", so await the lock here.
+    #[cfg(test)]
+    pub(super) fn ready_for_test(&self) -> Option<RasterImage> {
+        let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+        self.ready_in_cache(&mut cache)
+    }
+
+    fn ready_in_cache(&self, cache: &mut Cache) -> Option<RasterImage> {
+        if !self.valid(cache) {
             return None;
         }
         let key = cache
@@ -569,6 +581,40 @@ fn sufficient_detail(image: &RasterImage, target: [u32; 2]) -> bool {
 mod tests {
     use super::*;
     use rebook_publication::{Book, Metadata, PublicationId};
+
+    #[test]
+    fn resident_pixels_can_be_temporarily_unavailable_to_nonblocking_lookup() {
+        let owner = ("nonblocking-cache-lookup-test".to_owned(), false);
+        let key = u64::MAX - 123;
+        let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+        let request = DeferredRaster {
+            key,
+            resource_key: key,
+            owner: owner.clone(),
+            generation: cache.generation,
+            block: ImageBlock {
+                href: PublicationUrl::parse("contention.png").unwrap(),
+                alt: String::new(),
+                style: ImageStyle::default(),
+                source: None,
+                formula_image: false,
+                formula: None,
+                text_layer: None,
+            },
+            target: [2, 2],
+            dimensions: [2, 2],
+        };
+        cache.insert(key, raster(2, 2, vec![255; 16].into(), None), BUDGET);
+        cache.owners.insert(key, owner.clone());
+        cache.variants.insert(key, key);
+        // Same-thread contention must return immediately, even with pixels
+        // resident. It cannot be used as an assertion that pixels are absent.
+        assert!(request.ready().is_none());
+        drop(cache);
+        assert!(request.ready_for_test().is_some());
+        retire_publication_rasters(&owner.0, owner.1);
+        assert!(request.ready_for_test().is_none());
+    }
 
     #[test]
     fn speculation_cannot_evict_visible_pixels_or_expand_the_viewport_budget() {

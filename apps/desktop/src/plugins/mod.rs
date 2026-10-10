@@ -348,6 +348,8 @@ pub struct PluginSettings {
     pub ocr_enabled: bool,
     pub ocr_provider: String,
     pub ocr_model: String,
+    #[serde(default)]
+    pub ocr_reasoning_effort: ReasoningEffort,
     pub pdf_ocr_enabled: bool,
     pub pdf_ocr_reflow_enabled: bool,
     pub pdf_ocr_provider: PdfOcrProviderKind,
@@ -390,6 +392,7 @@ impl Default for PluginSettings {
             ocr_enabled: true,
             ocr_provider: DEFAULT_PROVIDER_ID.into(),
             ocr_model: String::new(),
+            ocr_reasoning_effort: ReasoningEffort::Default,
             pdf_ocr_enabled: false,
             pdf_ocr_reflow_enabled: false,
             pdf_ocr_provider: PdfOcrProviderKind::PaddleOcr,
@@ -1046,6 +1049,17 @@ mod tests {
             serde_json::from_value(serde_json::to_value(expert).unwrap()).unwrap();
         assert!(restored.expert_translation);
         assert_eq!(settings.chat_reasoning_effort, ReasoningEffort::Default);
+        assert_eq!(settings.ocr_reasoning_effort, ReasoningEffort::Default);
+        let mut ocr = settings.clone();
+        ocr.ocr_reasoning_effort = ReasoningEffort::High;
+        let restored: PluginSettings =
+            serde_json::from_value(serde_json::to_value(ocr).unwrap()).unwrap();
+        assert_eq!(restored.ocr_reasoning_effort, ReasoningEffort::High);
+        assert_eq!(restored.chat_reasoning_effort, ReasoningEffort::Default);
+        assert_eq!(
+            restored.translation_reasoning_effort,
+            ReasoningEffort::Default
+        );
         assert_eq!(
             settings.semantic_layout.reasoning_effort,
             ReasoningEffort::None

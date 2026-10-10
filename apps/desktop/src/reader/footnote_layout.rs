@@ -1,6 +1,6 @@
 //! Popup text uses the reader's shaping, hyphenation and justification pipeline.
 use base64::Engine as _;
-use parley::PositionedLayoutItem;
+use rebook_layout::text_layout::PositionedLayoutItem;
 use rebook_layout::{
     LayoutEngine, LayoutViewport, PageItem, ReaderStyle, SpreadMode, TypesettingMode,
 };
@@ -464,8 +464,7 @@ impl FootnoteRenderer {
                     }) {
                         line_starts.push(text.origin_x + run.offset());
                     }
-                    bottom = bottom
-                        .max(text.origin_y + line.metrics().baseline + line.metrics().descent);
+                    bottom = bottom.max(text.origin_y + line.metrics().content_block_max_coord);
                     for item in line.items() {
                         if let PositionedLayoutItem::InlineBox(inline_box) = &item {
                             if let Some(image) = text
@@ -522,7 +521,7 @@ impl FootnoteRenderer {
                             let diameter = (run.font_size() * 0.78).clamp(8.0, 12.0);
                             let radius = diameter / 2.0;
                             let x = text.origin_x + glyph_run.offset() + glyph_run.advance() / 2.0;
-                            let metrics = run.metrics();
+                            let metrics = run.font_metrics();
                             let y = page_y + text.origin_y + glyph_run.baseline()
                                 - (metrics.ascent - metrics.descent) * 0.5;
                             // Website links keep their link color independently
@@ -546,11 +545,11 @@ impl FootnoteRenderer {
                             text_bounds.push(egui::Rect::from_min_max(
                                 egui::pos2(
                                     text.origin_x + glyph_run.offset(),
-                                    baseline - run.metrics().ascent,
+                                    baseline - run.font_metrics().ascent,
                                 ),
                                 egui::pos2(
                                     text.origin_x + glyph_run.offset() + glyph_run.advance(),
-                                    baseline + run.metrics().descent,
+                                    baseline + run.font_metrics().descent,
                                 ),
                             ));
                         }
@@ -560,7 +559,7 @@ impl FootnoteRenderer {
                         let coords: Vec<_> = run
                             .normalized_coords()
                             .iter()
-                            .map(|c| skrifa::instance::NormalizedCoord::from_bits(*c))
+                            .map(|c| skrifa::instance::NormalizedCoord::from_bits(c.to_bits()))
                             .collect();
                         for glyph in glyph_run.positioned_glyphs() {
                             let Some(outline) = outlines.get(GlyphId::new(glyph.id)) else {

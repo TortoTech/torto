@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use anyrender::{Glyph, NormalizedCoord, PaintScene};
 use kurbo::{Affine, BezPath, Circle, Line, Point, Rect, RoundedRect, Shape, Stroke, Vec2};
-use parley::editing::{Cursor, Selection};
-use parley::layout::{Affinity, BreakReason, Cluster, ClusterSide};
-use parley::{FontData, Layout, PositionedLayoutItem};
+use parley::FontData;
+use parley::layout::{Affinity, BreakReason, ClusterSide};
 use peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
+use rebook_layout::text_layout::{Cluster, Cursor, Layout, PositionedLayoutItem, Selection};
 use rebook_layout::{
     ImagePlacement, PageItem, PageLayout, QuotePlacement, TablePlacement, TextBrush, TextPlacement,
 };
@@ -133,7 +133,10 @@ struct FootnoteRegion {
 
 const FOOTNOTE_ICON_CENTER_ABOVE_BASELINE: f32 = 0.68;
 
-fn footnote_activation_bar_y(origin_y: f32, metrics: &parley::layout::LineMetrics) -> f64 {
+fn footnote_activation_bar_y(
+    origin_y: f32,
+    metrics: rebook_layout::text_layout::LineMetrics,
+) -> f64 {
     // Center the short indicator on the body line's lower boundary rather than
     // under the superscript glyph. This leaves layout and line spacing intact.
     f64::from(origin_y + metrics.block_max_coord - 1.0)
@@ -1893,7 +1896,7 @@ impl ShapedTextRegion {
     }
 }
 
-fn positioned_line_content_end(line: parley::layout::Line<'_, TextBrush>) -> f32 {
+fn positioned_line_content_end(line: rebook_layout::text_layout::Line<'_, TextBrush>) -> f32 {
     let mut glyph_end = 0.0_f32;
     let mut inline_end = 0.0_f32;
     for item in line.items() {
@@ -1906,7 +1909,7 @@ fn positioned_line_content_end(line: parley::layout::Line<'_, TextBrush>) -> f32
             }
         }
     }
-    (glyph_end - line.metrics().trailing_whitespace)
+    (glyph_end - line.metrics().hanging_advance)
         .max(inline_end)
         .max(0.0)
 }
@@ -2828,7 +2831,12 @@ fn compile_text_commands(
                         commands.push(DisplayCommand::Glyphs(GlyphCommand {
                             font: run.font().clone(),
                             font_size: run.font_size(),
-                            normalized_coords: run.normalized_coords().to_vec().into(),
+                            normalized_coords: run
+                                .normalized_coords()
+                                .iter()
+                                .map(|c| c.to_bits())
+                                .collect::<Vec<_>>()
+                                .into(),
                             embolden: Vec2::ZERO,
                             color: color(glyph_run.style().brush.color),
                             transform,
@@ -2851,7 +2859,7 @@ fn compile_text_commands(
             .runs()
             .filter(|run| {
                 run.clusters().any(|cluster| {
-                    let brush = cluster.first_style().brush;
+                    let brush = cluster.style().brush;
                     !brush.footnote_reference && brush.baseline == TextBaseline::Normal
                 })
             })
@@ -2967,7 +2975,12 @@ fn compile_text_commands(
                     let command = GlyphCommand {
                         font: run.font().clone(),
                         font_size: run.font_size(),
-                        normalized_coords: run.normalized_coords().to_vec().into(),
+                        normalized_coords: run
+                            .normalized_coords()
+                            .iter()
+                            .map(|c| c.to_bits())
+                            .collect::<Vec<_>>()
+                            .into(),
                         embolden: Vec2::ZERO,
                         color: color(brush.color),
                         transform,
@@ -3031,7 +3044,7 @@ fn compile_text_commands(
                     let bounds = if website.is_some() {
                         let size = (run.font_size() * 0.78).clamp(8.0, 12.0);
                         let center_y = text.origin_y + glyph_run.baseline()
-                            - (run.metrics().ascent - run.metrics().descent) * 0.5;
+                            - (run.font_metrics().ascent - run.font_metrics().descent) * 0.5;
                         Rect::new(
                             f64::from(center_x - size * 0.5),
                             f64::from(center_y - size * 0.5),
@@ -3083,7 +3096,12 @@ fn compile_text_commands(
             commands.push(DisplayCommand::Glyphs(GlyphCommand {
                 font: run.font().clone(),
                 font_size: run.font_size(),
-                normalized_coords: run.normalized_coords().to_vec().into(),
+                normalized_coords: run
+                    .normalized_coords()
+                    .iter()
+                    .map(|c| c.to_bits())
+                    .collect::<Vec<_>>()
+                    .into(),
                 embolden,
                 color: color(brush.color),
                 transform,
@@ -3092,7 +3110,7 @@ fn compile_text_commands(
             }));
 
             if brush.underline {
-                let metrics = run.metrics();
+                let metrics = run.font_metrics();
                 let y = f64::from(
                     glyph_run.baseline() + baseline_offset - metrics.underline_offset
                         + metrics.underline_size / 2.0,
@@ -3393,7 +3411,7 @@ mod tests {
         // Force the semantic marker into several glyph runs independently of the
         // fonts installed on the test machine. All runs must still become one icon.
         builder.push(StyleProperty::FontSize(17.0), 4..5);
-        let mut layout = builder.build(text.as_ref());
+        let mut layout: Layout<TextBrush> = builder.build(text.as_ref()).into();
         layout.break_all_lines(Some(240.0));
         layout.align(Alignment::Start, AlignmentOptions::default());
         let source = SourceRange {
@@ -3511,7 +3529,7 @@ mod tests {
             footnote_reference: false,
             footnote_reference_group: 0,
         }));
-        let mut layout = builder.build(text.as_ref());
+        let mut layout: Layout<TextBrush> = builder.build(text.as_ref()).into();
         layout.break_all_lines(Some(240.0));
         layout.align(Alignment::Start, AlignmentOptions::default());
         let spine = SpineItemId::new("chapter-1").unwrap();
@@ -3607,7 +3625,7 @@ mod tests {
             footnote_reference: false,
             footnote_reference_group: 0,
         }));
-        let mut layout = builder.build(text.as_ref());
+        let mut layout: Layout<TextBrush> = builder.build(text.as_ref()).into();
         layout.break_all_lines(Some(240.0));
         layout.align(Alignment::Start, AlignmentOptions::default());
         let spine = SpineItemId::new("chapter-1").unwrap();
@@ -3672,8 +3690,10 @@ mod tests {
             index: text.len(),
             width: 220.0,
             height: 60.0,
+            baseline: None,
+            vertical_align: parley::VerticalAlign::BASELINE,
         });
-        let mut layout = builder.build(text.as_ref());
+        let mut layout: Layout<TextBrush> = builder.build(text.as_ref()).into();
         layout.break_all_lines(Some(160.0));
         layout.align(Alignment::Start, AlignmentOptions::default());
         let line_count = layout.len();
@@ -3765,8 +3785,10 @@ mod tests {
             index: 0,
             width: 180.0,
             height: 44.0,
+            baseline: None,
+            vertical_align: parley::VerticalAlign::BASELINE,
         });
-        let mut layout = builder.build(text.as_ref());
+        let mut layout: Layout<TextBrush> = builder.build(text.as_ref()).into();
         layout.break_all_lines(Some(240.0));
         layout.align(Alignment::Start, AlignmentOptions::default());
         let line_count = layout.len();
@@ -3840,7 +3862,7 @@ mod tests {
             footnote_reference: false,
             footnote_reference_group: 0,
         }));
-        let mut layout = builder.build(text.as_ref());
+        let mut layout: Layout<TextBrush> = builder.build(text.as_ref()).into();
         layout.break_all_lines(Some(150.0));
         layout.align(Alignment::Justify, AlignmentOptions::default());
 
@@ -3928,7 +3950,7 @@ mod tests {
             footnote_reference: false,
             footnote_reference_group: 0,
         }));
-        let mut layout = builder.build(text.as_ref());
+        let mut layout: Layout<TextBrush> = builder.build(text.as_ref()).into();
         layout.break_all_lines(None);
         let source_start = "•\u{00a0}".len();
         let initial = Selection::new(
@@ -4139,7 +4161,7 @@ mod tests {
                                     PositionedLayoutItem::InlineBox(_) => None,
                                 })
                                 .fold(0.0_f32, f32::max)
-                                - line.metrics().trailing_whitespace;
+                                - line.metrics().hanging_advance;
                             extends_source_glyphs |= hyphen.end > glyph_end + 0.01;
                             let x = f64::from(region.origin_x + hyphen.end);
                             let y = region.origin_y + line.metrics().baseline;
@@ -4213,7 +4235,7 @@ mod tests {
             footnote_reference: false,
             footnote_reference_group: 0,
         }));
-        let mut layout = builder.build(text.as_ref());
+        let mut layout: Layout<TextBrush> = builder.build(text.as_ref()).into();
         layout.break_all_lines(Some(180.0));
         layout.align(Alignment::Justify, AlignmentOptions::default());
         assert!(layout.len() >= 2);
@@ -4403,7 +4425,7 @@ mod tests {
             footnote_reference: false,
             footnote_reference_group: 0,
         }));
-        let mut layout = builder.build(text.as_ref());
+        let mut layout: Layout<TextBrush> = builder.build(text.as_ref()).into();
         layout.break_all_lines(Some(80.0));
         layout.align(Alignment::Start, AlignmentOptions::default());
         let line_count = layout.len();

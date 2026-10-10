@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use icu_segmenter::{LineSegmenter, options::LineBreakOptions};
-use parley::{InlineBox, InlineBoxKind, Layout};
+use crate::text_layout::Layout;
+use parley::{InlineBox, InlineBoxKind};
 use unicode_script::{Script, UnicodeScript};
 
 use crate::{TextBaseline, TextBrush};
@@ -13,6 +13,24 @@ use super::knuth_plass::{self, ClusterItem, LineBreak, ParagraphOptions};
 
 const MIXED_SCRIPT_SPACING_EM: f32 = 0.25;
 const MIXED_SCRIPT_SHRINK_EM: f32 = 0.125;
+
+/// Reuse font fallback and shaped glyphs when only cluster advances change.
+pub(crate) fn reuse_spacing(
+    layout: &Layout<TextBrush>,
+    text: &str,
+    plan: &ParagraphPlan,
+    width: f32,
+) -> Option<Layout<TextBrush>> {
+    let _timing = crate::timing::stage(crate::timing::TimingStage::LineBreak);
+    let mut adjusted = layout.clone();
+    apply_breaks(&mut adjusted, text, &plan.lines, width)?;
+    adjusted.align(
+        parley::Alignment::Start,
+        parley::AlignmentOptions::default(),
+    );
+    adjusted.apply_spacing(&plan.adjustments)?;
+    Some(adjusted)
+}
 
 /// Justify already wrapped LTR prose, including explicit subparagraph breaks.
 /// Keep the selected breaks and share excess space with CJK boundaries after
@@ -37,7 +55,6 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
     if layout.is_rtl()
         || layout
             .inline_boxes()
-            .iter()
             .any(|item| item.kind != InlineBoxKind::InFlow)
     {
         return None;
@@ -69,7 +86,7 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
                 clusters.push((
                     cluster.text_range(),
                     cluster.advance(),
-                    cluster.first_style().brush,
+                    cluster.style().brush,
                 ));
             }
         }
@@ -77,7 +94,7 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
         // each in-flow formula/image is one indivisible item, too.
         let box_count = line
             .items()
-            .filter(|item| matches!(item, parley::PositionedLayoutItem::InlineBox(_)))
+            .filter(|item| matches!(item, crate::text_layout::PositionedLayoutItem::InlineBox(_)))
             .count();
         let cluster_count = u32::try_from(clusters.len() + box_count).ok()?;
         if cluster_count == 0 {
@@ -85,7 +102,7 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
         }
         breakpoint += cluster_count;
         let metrics = line.metrics();
-        let natural_width = metrics.advance - metrics.trailing_whitespace;
+        let natural_width = metrics.advance - metrics.hanging_advance;
         lines.push(LineBreak {
             cluster_count,
             breakpoint,
@@ -115,7 +132,7 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
             let source = &text[range.clone()];
             let space = matches!(source, " " | "\u{00a0}" | "\u{3000}");
             let cjk = index + 1 < end
-                && !layout.inline_boxes().iter().any(|item| {
+                && !layout.inline_boxes().any(|item| {
                     item.index >= range.end && item.index <= clusters[index + 1].0.start
                 })
                 && source.chars().last().is_some_and(is_cjk_justification_char)
@@ -164,7 +181,7 @@ fn preserve_sentence_prefix(
     let end = text.find('\n')?;
     if end == 0
         || original.is_rtl()
-        || !original.inline_boxes().is_empty()
+        || original.inline_boxes().next().is_some()
         || original_text.get(..end)? != &text[..end]
     {
         return None;
@@ -185,8 +202,8 @@ fn preserve_sentence_prefix(
                 if range.end > end {
                     return None;
                 }
+                count += u32::try_from(text[range.clone()].chars().count()).ok()?;
                 original_clusters.push((range, cluster.advance()));
-                count += 1;
             }
         }
         if count > 0 {
@@ -295,7 +312,6 @@ pub(crate) fn plan_optimized_with_hanging_indent(
     let _timing = crate::timing::stage(crate::timing::TimingStage::LineBreak);
     let has_in_flow_box = layout
         .inline_boxes()
-        .iter()
         .any(|inline_box| inline_box.kind == InlineBoxKind::InFlow);
     if (text.is_empty() && !has_in_flow_box)
         || !column_width.is_finite()
@@ -324,7 +340,7 @@ pub(crate) fn plan_optimized_with_hanging_indent(
                 return None;
             }
             let range = cluster.text_range();
-            let brush = cluster.first_style().brush;
+            let brush = cluster.style().brush;
             clusters.push(MeasuredCluster {
                 range,
                 advance: cluster.advance(),
@@ -338,7 +354,7 @@ pub(crate) fn plan_optimized_with_hanging_indent(
     plan_measured_content(
         text,
         &clusters,
-        layout.inline_boxes(),
+        &layout.inline_boxes().collect::<Vec<_>>(),
         column_width,
         first_line_indent,
         continuation_indent,
@@ -395,9 +411,7 @@ fn plan_measured_content(
     {
         return None;
     }
-    let legal_breaks = LineSegmenter::new_auto(LineBreakOptions::default())
-        .segment_str(text)
-        .collect::<Vec<_>>();
+    let legal_breaks = super::engine::legal_breaks(text);
     let mut expected_start = 0;
     let mut text_clusters = Vec::with_capacity(measured.len());
     for cluster in measured {
@@ -508,6 +522,7 @@ fn plan_measured_content(
 /// Forces a rebuilt layout to use the selected cluster counts.
 pub(crate) fn apply_breaks(
     layout: &mut Layout<TextBrush>,
+    text: &str,
     lines: &[LineBreak],
     column_width: f32,
 ) -> Option<()> {
@@ -516,10 +531,18 @@ pub(crate) fn apply_breaks(
         return None;
     }
     layout.break_all_lines(None);
+    let counts = item_character_counts(layout, text)?;
+    let mut offset = 0;
     let mut breaker = layout.break_lines();
     for line in lines {
-        breaker.break_next_with_length(line.cluster_count)?;
+        let end = offset + usize::try_from(line.cluster_count).ok()?;
+        let count = counts
+            .get(offset..end)?
+            .iter()
+            .try_fold(0_u32, |total, count| total.checked_add(*count))?;
+        breaker.break_next_with_length(count)?;
         breaker.set_prior_line_width(column_width);
+        offset = end;
     }
     breaker.finish();
     if layout.len() != lines.len() {
@@ -541,21 +564,43 @@ pub(crate) fn apply_breaks(
     Some(())
 }
 
+fn item_character_counts(layout: &Layout<TextBrush>, text: &str) -> Option<Vec<u32>> {
+    let mut boxes = layout
+        .inline_boxes()
+        .filter(|b| b.kind == InlineBoxKind::InFlow)
+        .peekable();
+    let mut counts = Vec::new();
+    for line in layout.lines() {
+        for run in line.runs() {
+            for cluster in run.clusters() {
+                let range = cluster.text_range();
+                while boxes.peek().is_some_and(|b| b.index <= range.start) {
+                    boxes.next();
+                    counts.push(1);
+                }
+                counts.push(u32::try_from(text.get(range)?.chars().count()).ok()?);
+            }
+        }
+    }
+    counts.extend(boxes.map(|_| 1));
+    Some(counts)
+}
+
 #[cfg(test)]
-pub(crate) fn positioned_line_content_end(line: parley::layout::Line<'_, TextBrush>) -> f32 {
+pub(crate) fn positioned_line_content_end(line: crate::text_layout::Line<'_, TextBrush>) -> f32 {
     let mut glyph_end = 0.0_f32;
     let mut inline_end = 0.0_f32;
     for item in line.items() {
         match item {
-            parley::PositionedLayoutItem::GlyphRun(glyph_run) => {
+            crate::text_layout::PositionedLayoutItem::GlyphRun(glyph_run) => {
                 glyph_end = glyph_end.max(glyph_run.offset() + glyph_run.advance());
             }
-            parley::PositionedLayoutItem::InlineBox(inline_box) => {
+            crate::text_layout::PositionedLayoutItem::InlineBox(inline_box) => {
                 inline_end = inline_end.max(inline_box.x + inline_box.width);
             }
         }
     }
-    (glyph_end - line.metrics().trailing_whitespace)
+    (glyph_end - line.metrics().hanging_advance)
         .max(inline_end)
         .max(0.0)
 }
@@ -641,7 +686,7 @@ pub(crate) fn repair_trailing_footnote_line(
     width: f32,
 ) {
     if layout.is_rtl()
-        || !layout.inline_boxes().is_empty()
+        || layout.inline_boxes().next().is_some()
         || text.contains('\t')
         || layout.len() < 2
     {
@@ -650,7 +695,7 @@ pub(crate) fn repair_trailing_footnote_line(
     if !layout.lines().any(|line| {
         line.runs().any(|run| {
             run.clusters()
-                .any(|cluster| cluster.first_style().brush.footnote_reference)
+                .any(|cluster| cluster.style().brush.footnote_reference)
         })
     }) {
         return;
@@ -666,7 +711,7 @@ pub(crate) fn repair_trailing_footnote_line(
                             (
                                 cluster.text_range(),
                                 cluster.advance(),
-                                cluster.first_style().brush.footnote_reference,
+                                cluster.style().brush.footnote_reference,
                             )
                         })
                         .collect::<Vec<_>>()
@@ -676,9 +721,7 @@ pub(crate) fn repair_trailing_footnote_line(
         .collect::<Vec<_>>();
     let mut counts = clusters.iter().map(Vec::len).collect::<Vec<_>>();
     let mut changed = false;
-    let legal = LineSegmenter::new_auto(LineBreakOptions::default())
-        .segment_str(text)
-        .collect::<Vec<_>>();
+    let legal = super::engine::legal_breaks(text);
     for last in 1..clusters.len() {
         // Repair every sentence's soft-wrapped tail, without crossing a hard break.
         if lines[last - 1].break_reason() == parley::layout::BreakReason::Explicit {
@@ -716,15 +759,23 @@ pub(crate) fn repair_trailing_footnote_line(
     if !changed {
         return;
     }
+    let character_counts = clusters
+        .iter()
+        .flatten()
+        .map(|(range, _, _)| text[range.clone()].chars().count())
+        .collect::<Vec<_>>();
+    let mut offset = 0;
     let mut breaker = layout.break_lines();
     for count in counts {
-        let Ok(count) = u32::try_from(count) else {
+        let end = offset + count;
+        let Ok(count) = u32::try_from(character_counts[offset..end].iter().sum::<usize>()) else {
             return;
         };
         if breaker.break_next_with_length(count).is_none() {
             return;
         }
         breaker.set_prior_line_width(width);
+        offset = end;
     }
     breaker.finish();
 }
@@ -1019,7 +1070,35 @@ mod tests {
         let mut layout_context = LayoutContext::<TextBrush>::new();
         let mut builder = layout_context.ranged_builder(&mut font_context, text, 1.0, false);
         builder.push_default(StyleProperty::FontSize(font_size));
-        builder.build(text)
+        builder.build(text).into()
+    }
+
+    #[test]
+    fn forced_breaks_convert_graphemes_to_scalar_lengths() {
+        for text in ["e\u{301}xy", "👩\u{200d}🔬xy", "🇨🇳xy"] {
+            let mut layout = layout_for(text, 24.);
+            layout.break_all_lines(None);
+            let ranges = layout
+                .lines()
+                .flat_map(|line| line.runs())
+                .flat_map(|run| run.clusters().map(|c| c.text_range()))
+                .collect::<Vec<_>>();
+            assert_eq!(ranges.len(), 3, "{text}");
+            let make = |count, breakpoint| LineBreak {
+                cluster_count: count,
+                breakpoint,
+                natural_width: 0.,
+                adjustment_ratio: 0.,
+                badness: 0.,
+                hyphenated: false,
+            };
+            apply_breaks(&mut layout, text, &[make(1, 1), make(2, 3)], 500.).unwrap();
+            assert_eq!(layout.get(0).unwrap().text_range(), ranges[0]);
+            assert_eq!(
+                layout.get(1).unwrap().text_range(),
+                ranges[1].start..text.len()
+            );
+        }
     }
 
     #[test]
@@ -1039,7 +1118,7 @@ mod tests {
                 }),
                 body.len()..marker_end,
             );
-            let mut layout = builder.build(&text);
+            let mut layout: Layout<TextBrush> = builder.build(&text).into();
             for width in 140..330 {
                 layout.break_all_lines(Some(width as f32));
                 repair_trailing_footnote_line(&mut layout, &text, width as f32);
@@ -1103,7 +1182,7 @@ mod tests {
                 }),
                 marker_start..marker_start + marker.len(),
             );
-            let mut layout = builder.build(&text);
+            let mut layout: Layout<TextBrush> = builder.build(&text).into();
             let mut original = layout_for(&original_text, 18.0);
             for width in 140..600 {
                 original.break_all_lines(Some(width as f32));
@@ -1149,7 +1228,7 @@ mod tests {
                     }),
                     body.len()..body.len() + marker.len(),
                 );
-                let mut layout = builder.build(&text);
+                let mut layout: Layout<TextBrush> = builder.build(&text).into();
                 layout.break_all_lines(Some(2000.0));
                 let ranges: Vec<_> = layout
                     .lines()
@@ -1192,6 +1271,8 @@ mod tests {
                 index: text.find("概率").unwrap(),
                 width: 90.0,
                 height: 22.0,
+                baseline: None,
+                vertical_align: parley::VerticalAlign::BASELINE,
             },
             InlineBox {
                 id: 2,
@@ -1199,6 +1280,8 @@ mod tests {
                 index: text.find("进行排序").unwrap(),
                 width: 260.0,
                 height: 22.0,
+                baseline: None,
+                vertical_align: parley::VerticalAlign::BASELINE,
             },
         ];
         let build = |adjustments: &[SpacingAdjustment]| {
@@ -1215,7 +1298,7 @@ mod tests {
                     adjustment.range.clone(),
                 );
             }
-            builder.build(text)
+            builder.build(text).into()
         };
         for width in [400.0, 600.0, 800.0] {
             let mut natural = build(&[]);
@@ -1226,7 +1309,7 @@ mod tests {
                 .map(|line| (line.text_range(), line.break_reason()))
                 .collect();
             let mut adjusted = build(&plan.adjustments);
-            apply_breaks(&mut adjusted, &plan.lines, width).unwrap();
+            apply_breaks(&mut adjusted, text, &plan.lines, width).unwrap();
             adjusted.align(
                 parley::Alignment::Start,
                 parley::AlignmentOptions::default(),
@@ -1236,7 +1319,7 @@ mod tests {
                 assert_eq!(line.text_range(), range);
                 assert_eq!(line.break_reason(), reason);
                 for item in line.items() {
-                    if let parley::PositionedLayoutItem::InlineBox(inline_box) = item {
+                    if let crate::text_layout::PositionedLayoutItem::InlineBox(inline_box) = item {
                         box_count += 1;
                         assert!(inline_box.x + inline_box.width <= width + 0.1);
                     }
@@ -1339,8 +1422,8 @@ mod tests {
                     adjustment.range.clone(),
                 );
             }
-            let mut adjusted = builder.build(text);
-            apply_breaks(&mut adjusted, &plan.lines, width).unwrap();
+            let mut adjusted = builder.build(text).into();
+            apply_breaks(&mut adjusted, text, &plan.lines, width).unwrap();
             adjusted.align(
                 parley::Alignment::Start,
                 parley::AlignmentOptions::default(),
@@ -1414,8 +1497,8 @@ mod tests {
                 adjustment.range.clone(),
             );
         }
-        let mut adjusted = builder.build(text);
-        apply_breaks(&mut adjusted, &plan.lines, width).expect("breaks should apply");
+        let mut adjusted = builder.build(text).into();
+        apply_breaks(&mut adjusted, text, &plan.lines, width).expect("breaks should apply");
 
         assert_eq!(adjusted.len(), plan.lines.len());
         assert!(
@@ -1505,8 +1588,10 @@ mod tests {
             index: "中文排版".len(),
             width: 36.0,
             height: 18.0,
+            baseline: None,
+            vertical_align: parley::VerticalAlign::BASELINE,
         });
-        let mut layout = builder.build(text);
+        let mut layout = builder.build(text).into();
         let plan = plan_optimized(&mut layout, text, 75.0, 0.0, 18.0, &HashMap::new())
             .expect("inline boxes should remain optimizable");
 
@@ -1523,7 +1608,8 @@ mod tests {
                 .iter()
                 .all(|adjustment| !adjustment.range.is_empty())
         );
-        apply_breaks(&mut layout, &plan.lines, 75.0).expect("breaks should include the inline box");
+        apply_breaks(&mut layout, text, &plan.lines, 75.0)
+            .expect("breaks should include the inline box");
     }
 
     #[test]

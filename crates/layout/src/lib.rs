@@ -6,15 +6,19 @@ mod ruby_tests;
 mod deferred_tests;
 pub mod image_processing;
 pub mod linebreak;
+pub mod text_layout;
 pub mod timing;
+use text_layout::{Layout, PositionedLayoutItem};
 
 mod caption_labels;
 mod formula_images;
 mod headings;
+mod hyphen_cache;
 mod note_spacing;
 mod raster_cache;
 mod semantic_lists;
 mod table_captions;
+mod table_shaping;
 mod web_links;
 pub use raster_cache::{
     DeferredRaster, RasterCacheStats, RasterOrigin, clear_raster_cache, load_original_raster,
@@ -176,8 +180,8 @@ use image::ImageError;
 use parley::setting::Tag;
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontVariation, FontVariations,
-    FontWeight, IndentOptions, InlineBox as ParleyInlineBox, InlineBoxKind, Layout, LayoutContext,
-    LineHeight, PositionedLayoutItem, StyleProperty,
+    FontWeight, IndentOptions, InlineBox as ParleyInlineBox, InlineBoxKind, LayoutContext,
+    LineHeight, StyleProperty,
 };
 use read_fonts::{FontRef, TableProvider as _};
 use rebook_publication::{
@@ -1055,6 +1059,7 @@ pub struct SeparatorPlacement {
 pub struct LayoutEngine {
     font_context: FontContext,
     layout_context: LayoutContext<TextBrush>,
+    hyphen_glyphs: hyphen_cache::HyphenGlyphCache,
     svg_options: resvg::usvg::Options<'static>,
     publication_languages: Vec<String>,
     raster_target: [u32; 2],
@@ -1266,6 +1271,7 @@ impl LayoutEngine {
         Self {
             font_context,
             layout_context: LayoutContext::new(),
+            hyphen_glyphs: hyphen_cache::HyphenGlyphCache::default(),
             svg_options,
             publication_languages: Vec::new(),
             raster_target: [2048, 2048],
@@ -2413,7 +2419,7 @@ impl LayoutEngine {
         let table_metrics = resolve_table_metrics(reader_style);
         let unified = reader_style.typesetting.mode == TypesettingMode::Unified;
         let equal_column_width = content_width / column_count as f32;
-        let column_widths = if unified {
+        let (column_widths, measured_cells) = if unified {
             self.adaptive_table_column_widths(
                 &grid_cells,
                 &rasters,
@@ -2423,14 +2429,19 @@ impl LayoutEngine {
                 table_metrics,
             )
         } else {
-            vec![equal_column_width; column_count]
+            (
+                vec![equal_column_width; column_count],
+                std::iter::repeat_with(|| None)
+                    .take(grid_cells.len())
+                    .collect(),
+            )
         };
         let minimum_row_height = (reader_style.typography.font_size * table_metrics.font_scale)
             .mul_add(table_metrics.line_height, table_metrics.cell_padding * 2.0);
         let mut row_heights = vec![minimum_row_height; row_count];
         let mut cells = Vec::with_capacity(grid_cells.len());
-        for ((row, row_span, column, column_span, cell), rasters) in
-            grid_cells.into_iter().zip(&rasters)
+        for (((row, row_span, column, column_span, cell), rasters), measured) in
+            grid_cells.into_iter().zip(&rasters).zip(measured_cells)
         {
             let block = table_cell_text_block(cell);
             let block = resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
@@ -2438,7 +2449,11 @@ impl LayoutEngine {
                 .iter()
                 .sum::<f32>();
             let text_width = (cell_width - table_metrics.cell_padding * 2.0).max(20.0);
-            let mut text = self.shape_table_cell(&block, reader_style, text_width, 8.0, rasters);
+            let mut text = if let Some(measured) = measured {
+                Self::reflow_table_cell(measured, &block, text_width, 8.0)
+            } else {
+                self.shape_table_cell(&block, reader_style, text_width, 8.0, rasters)
+            };
             if unified {
                 // Ignore empty publisher wrappers at cell edges while retaining
                 // the complete source text and deliberate internal line breaks.
@@ -2501,13 +2516,14 @@ impl LayoutEngine {
         content_width: f32,
         reader_style: &ReaderStyle,
         table_metrics: ResolvedTableMetrics,
-    ) -> Vec<f32> {
+    ) -> (Vec<f32>, Vec<Option<PreparedText>>) {
         let equal_column_width = content_width / column_count as f32;
         let minimum_column_width = (reader_style.typography.font_size * 3.0)
             .min(equal_column_width)
             .max(1.0);
         let mut preferred_widths = vec![minimum_column_width; column_count];
         let mut minimum_widths = vec![minimum_column_width; column_count];
+        let mut measured_cells = Vec::with_capacity(grid_cells.len());
         for ((_, _, column, column_span, cell), rasters) in grid_cells.iter().zip(inline_rasters) {
             let block = table_cell_text_block(cell);
             let block = resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
@@ -2555,8 +2571,13 @@ impl LayoutEngine {
                     *width += addition;
                 }
             }
+            let reusable = table_shaping::reusable_measurement(&block, &unwrapped);
+            measured_cells.push(reusable.then_some(unwrapped));
         }
-        fit_adaptive_column_widths(&preferred_widths, &minimum_widths, content_width)
+        (
+            fit_adaptive_column_widths(&preferred_widths, &minimum_widths, content_width),
+            measured_cells,
+        )
     }
 
     fn shape_text_with_min_width(
@@ -2603,6 +2624,11 @@ impl LayoutEngine {
         minimum_width: f32,
         inline_rasters: &[Option<RasterImage>],
     ) -> PreparedText {
+        if let Some(empty) =
+            Self::empty_table_cell(block, reader_style, content_width, minimum_width)
+        {
+            return empty;
+        }
         self.shape_text_with_sources(
             block,
             reader_style,
@@ -2709,13 +2735,16 @@ impl LayoutEngine {
             let base_width = base.layout.width();
             let annotation_width = annotation.layout.width();
             let width = base_width.max(annotation_width);
-            let metrics = base.layout.get(0).map(|line| *line.metrics());
+            let metrics = base.layout.get(0).map(|line| line.metrics());
             let gap = typography.font_size * 0.06;
             let offset_y = if spec.run.below {
-                metrics.map_or(typography.font_size * 0.2, |m| m.descent) + gap
+                metrics.map_or(typography.font_size * 0.2, |m| {
+                    m.content_block_max_coord - m.baseline
+                }) + gap
             } else {
-                -metrics.map_or(typography.font_size, |m| m.ascent)
-                    - annotation.layout.height()
+                -metrics.map_or(typography.font_size, |m| {
+                    m.baseline - m.content_block_min_coord
+                }) - annotation.layout.height()
                     - gap
             };
             let placement = RubyPlacement {
@@ -2839,32 +2868,44 @@ impl LayoutEngine {
                     );
                     continue;
                 }
-                let mut adjusted = self.build_text_layout_with_boundaries(
-                    &text,
-                    &spans,
-                    &inline_images,
-                    &font_stack,
-                    typography,
-                    block.style.line_height,
-                    reader_style.foreground,
-                    &plan.adjustments,
-                    &shaping_breaks,
-                    block.style.direction,
-                    parley::OverflowWrap::Normal,
-                );
-                self.apply_text_indents(
-                    &mut adjusted,
-                    block,
-                    &text[..source_text_start],
-                    typography,
-                    &font_stack,
-                    first_line_indent,
-                );
-                if linebreak::parley::apply_breaks(&mut adjusted, &plan.lines, available_width)
-                    .is_none()
+                let adjusted = if let Some(adjusted) =
+                    linebreak::parley::reuse_spacing(&layout, &text, &plan, available_width)
                 {
-                    break;
-                }
+                    adjusted
+                } else {
+                    let mut adjusted = self.build_text_layout_with_boundaries(
+                        &text,
+                        &spans,
+                        &inline_images,
+                        &font_stack,
+                        typography,
+                        block.style.line_height,
+                        reader_style.foreground,
+                        &plan.adjustments,
+                        &shaping_breaks,
+                        block.style.direction,
+                        parley::OverflowWrap::Normal,
+                    );
+                    self.apply_text_indents(
+                        &mut adjusted,
+                        block,
+                        &text[..source_text_start],
+                        typography,
+                        &font_stack,
+                        first_line_indent,
+                    );
+                    if linebreak::parley::apply_breaks(
+                        &mut adjusted,
+                        &text,
+                        &plan.lines,
+                        available_width,
+                    )
+                    .is_none()
+                    {
+                        break;
+                    }
+                    adjusted
+                };
                 selected_hyphens = plan
                     .hyphen_offsets
                     .iter()
@@ -2918,57 +2959,44 @@ impl LayoutEngine {
                     block.style.align == TextAlignment::Justify,
                 )
             {
-                let mut adjusted = self.build_text_layout(
-                    &text,
-                    &spans,
-                    &inline_images,
-                    &font_stack,
-                    typography,
-                    block.style.line_height,
-                    reader_style.foreground,
-                    &plan.adjustments,
-                    block.style.direction,
-                );
-                self.apply_text_indents(
-                    &mut adjusted,
-                    block,
-                    &text[..source_text_start],
-                    typography,
-                    &font_stack,
-                    first_line_indent,
-                );
-                if linebreak::parley::apply_breaks(&mut adjusted, &plan.lines, available_width)
-                    .is_some()
-                {
+                let adjusted =
+                    linebreak::parley::reuse_spacing(&layout, &text, &plan, available_width)
+                        .or_else(|| {
+                            let mut adjusted = self.build_text_layout(
+                                &text,
+                                &spans,
+                                &inline_images,
+                                &font_stack,
+                                typography,
+                                block.style.line_height,
+                                reader_style.foreground,
+                                &plan.adjustments,
+                                block.style.direction,
+                            );
+                            self.apply_text_indents(
+                                &mut adjusted,
+                                block,
+                                &text[..source_text_start],
+                                typography,
+                                &font_stack,
+                                first_line_indent,
+                            );
+                            linebreak::parley::apply_breaks(
+                                &mut adjusted,
+                                &text,
+                                &plan.lines,
+                                available_width,
+                            )?;
+                            Some(adjusted)
+                        });
+                if let Some(adjusted) = adjusted {
                     layout = adjusted;
                     optimized = true;
                 }
             }
         }
-        let alignment = if optimized {
-            Alignment::Start
-        } else {
-            let alignment = text_alignment(block.style.align);
-            if layout.is_rtl() && !block.style.logical_alignment {
-                match alignment {
-                    Alignment::Start => Alignment::End,
-                    Alignment::End => Alignment::Start,
-                    other => other,
-                }
-            } else {
-                alignment
-            }
-        };
-        let translated_ranges = rtl_translation_ranges(block.style.direction, &spans);
-        layout.align_with_left_ranges(alignment, AlignmentOptions::default(), &translated_ranges);
-        if !inline_images.is_empty() {
-            layout.reserve_inline_box_paint_bounds(
-                &inline_images
-                    .iter()
-                    .map(|image| (image.id, image.offset_y, image.height))
-                    .collect::<Vec<_>>(),
-            );
-        }
+        let alignment = table_shaping::resolved_text_alignment(&layout, block, optimized);
+        layout.align(alignment, AlignmentOptions::default());
         if !ruby.is_empty() {
             layout.reserve_text_paint_bounds(
                 &ruby
@@ -2999,7 +3027,7 @@ impl LayoutEngine {
                     image: image.image,
                     width: image.width,
                     height: image.height,
-                    offset_y: image.offset_y,
+                    offset_y: 0.0,
                 })
                 .collect::<Vec<_>>()
                 .into(),
@@ -3062,6 +3090,14 @@ impl LayoutEngine {
                 prepared.insert(offset, glyph.clone());
                 continue;
             }
+            if let Some(glyph) =
+                self.hyphen_glyphs
+                    .get(style, font_stack, typography, line_height, foreground)
+            {
+                style_cache.push((style, glyph.clone()));
+                prepared.insert(offset, glyph);
+                continue;
+            }
             let hyphen_span = StyledRange {
                 ruby: None,
                 range: 0..hyphen_text.len(),
@@ -3093,6 +3129,14 @@ impl LayoutEngine {
                 text: Arc::clone(&hyphen_text),
                 width,
             };
+            self.hyphen_glyphs.insert(
+                style,
+                font_stack,
+                typography,
+                line_height,
+                foreground,
+                glyph.clone(),
+            );
             style_cache.push((style, glyph.clone()));
             prepared.insert(offset, glyph);
         }
@@ -3195,16 +3239,128 @@ impl LayoutEngine {
         direction: rebook_publication::TextDirection,
         overflow_wrap: parley::OverflowWrap,
     ) -> Layout<TextBrush> {
+        let ranges = rtl_translation_ranges(direction, spans);
+        let Some(translation) = ranges.first() else {
+            return self
+                .build_text_layout_paragraph(
+                    text,
+                    spans,
+                    inline_images,
+                    font_stack,
+                    typography,
+                    line_height,
+                    foreground,
+                    spacing,
+                    shaping_breaks,
+                    optical,
+                    direction,
+                    overflow_wrap,
+                )
+                .into();
+        };
+        let mut boundaries = vec![0, translation.start, text.len()];
+        boundaries.dedup();
+        let mut parts = Vec::new();
+        for range in boundaries.windows(2).map(|w| w[0]..w[1]) {
+            let part_spans = spans
+                .iter()
+                .filter_map(|span| {
+                    let start = span.range.start.max(range.start);
+                    let end = span.range.end.min(range.end);
+                    (start < end).then(|| {
+                        let mut span = span.clone();
+                        span.range = start - range.start..end - range.start;
+                        span
+                    })
+                })
+                .collect::<Vec<_>>();
+            let images = inline_images
+                .iter()
+                .filter(|image| {
+                    range.contains(&image.index)
+                        || (range.end == text.len() && image.index == text.len())
+                })
+                .map(|image| {
+                    let mut image = image.clone();
+                    image.index -= range.start;
+                    image
+                })
+                .collect::<Vec<_>>();
+            let translated = range.start >= translation.start;
+            let part_direction = if translated {
+                rebook_publication::TextDirection::Ltr
+            } else {
+                direction
+            };
+            let clip = |adjustments: &[linebreak::SpacingAdjustment]| {
+                adjustments
+                    .iter()
+                    .filter_map(|a| {
+                        let start = a.range.start.max(range.start);
+                        let end = a.range.end.min(range.end);
+                        (start < end).then(|| linebreak::SpacingAdjustment {
+                            range: start - range.start..end - range.start,
+                            amount: a.amount,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let part_spacing = clip(spacing);
+            let part_optical = clip(optical);
+            let part_breaks = shaping_breaks
+                .iter()
+                .filter(|offset| range.contains(offset))
+                .map(|offset| offset - range.start)
+                .collect::<Vec<_>>();
+            let layout = self.build_text_layout_paragraph(
+                &text[range.clone()],
+                &part_spans,
+                &images,
+                font_stack,
+                typography,
+                line_height,
+                foreground,
+                &part_spacing,
+                &part_breaks,
+                &part_optical,
+                part_direction,
+                overflow_wrap,
+            );
+            parts.push((
+                layout,
+                range.start,
+                translated,
+                range.end < text.len() && text[..range.end].ends_with('\n'),
+            ));
+        }
+        Layout::paragraphs(parts)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_text_layout_paragraph(
+        &mut self,
+        text: &str,
+        spans: &[StyledRange],
+        inline_images: &[PreparedInlineImage],
+        font_stack: &str,
+        typography: &ReaderTypography,
+        line_height: f32,
+        foreground: Rgba,
+        spacing: &[linebreak::parley::SpacingAdjustment],
+        shaping_breaks: &[usize],
+        optical: &[linebreak::parley::SpacingAdjustment],
+        direction: rebook_publication::TextDirection,
+        overflow_wrap: parley::OverflowWrap,
+    ) -> parley::Layout<TextBrush> {
         let _timing = timing::stage(timing::TimingStage::GlyphShape);
         let mut builder =
             self.layout_context
                 .ranged_builder(&mut self.font_context, text, 1.0, false);
-        builder.set_base_level(match direction {
-            rebook_publication::TextDirection::Auto => None,
-            rebook_publication::TextDirection::Ltr => Some(0),
-            rebook_publication::TextDirection::Rtl => Some(1),
+        builder.set_base_direction(match direction {
+            rebook_publication::TextDirection::Auto => parley::BaseDirection::Auto,
+            rebook_publication::TextDirection::Ltr => parley::BaseDirection::Ltr,
+            rebook_publication::TextDirection::Rtl => parley::BaseDirection::Rtl,
         });
-        builder.set_ltr_ranges(&rtl_translation_ranges(direction, spans));
         builder.push_default(StyleProperty::FontFamily(FontFamily::from(font_stack)));
         builder.push_default(StyleProperty::FontSize(typography.font_size));
         builder.push_default(StyleProperty::OverflowWrap(overflow_wrap));
@@ -3355,7 +3511,9 @@ impl LayoutEngine {
                 kind: InlineBoxKind::InFlow,
                 index: image.index,
                 width: image.width,
-                height: image.box_height,
+                height: image.height,
+                baseline: Some(image.box_height - image.offset_y),
+                vertical_align: parley::VerticalAlign::BASELINE,
             });
         }
         // Parley out-of-flow boxes split shaping runs but consume neither
@@ -3369,6 +3527,8 @@ impl LayoutEngine {
                     index: offset,
                     width: 0.0,
                     height: 0.0,
+                    baseline: None,
+                    vertical_align: parley::VerticalAlign::BASELINE,
                 });
             }
         }
@@ -3414,7 +3574,7 @@ impl LayoutEngine {
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(f32::from(
             typography.font_weight,
         ))));
-        let mut layout = builder.build(marker);
+        let mut layout: Layout<TextBrush> = builder.build(marker).into();
         break_text_lines(&mut layout, None);
         layout.full_width()
     }
@@ -4157,6 +4317,7 @@ pub fn reading_content_width(page_width: f32, reader_style: &ReaderStyle) -> f32
     resolve_horizontal_page_geometry(page_width, reader_style).1
 }
 
+#[derive(Clone)]
 struct StyledRange {
     ruby: Option<Arc<RubyPlacement>>,
     range: Range<usize>,
@@ -4321,6 +4482,7 @@ fn fit_adaptive_column_widths(
     fitted
 }
 
+#[derive(Clone)]
 struct PreparedInlineImage {
     formula_presentation: Option<FormulaPresentation>,
     id: u64,
@@ -5004,7 +5166,7 @@ fn inline_image_vertical_metrics(
     (box_height, paint_offset)
 }
 
-fn positioned_line_content_end(line: parley::layout::Line<'_, TextBrush>) -> f32 {
+fn positioned_line_content_end(line: crate::text_layout::Line<'_, TextBrush>) -> f32 {
     let mut glyph_end = 0.0_f32;
     let mut inline_end = 0.0_f32;
     for item in line.items() {
@@ -5017,7 +5179,7 @@ fn positioned_line_content_end(line: parley::layout::Line<'_, TextBrush>) -> f32
             }
         }
     }
-    (glyph_end - line.metrics().trailing_whitespace)
+    (glyph_end - line.metrics().hanging_advance)
         .max(inline_end)
         .max(0.0)
 }
@@ -5950,6 +6112,7 @@ pub enum LayoutError {
 
 #[cfg(test)]
 mod tests {
+    include!("shaping_reuse_tests.rs");
 
     #[test]
     fn rtl_website_icons_keep_paragraph_direction_and_physical_alignment() {
@@ -6554,7 +6717,7 @@ mod tests {
                     let last = prepared.layout.lines().last().unwrap();
                     assert!(
                         last.runs().any(|run| run.clusters().any(|cluster| {
-                            !cluster.first_style().brush.footnote_reference
+                            !cluster.style().brush.footnote_reference
                                 && prepared.text[cluster.text_range()]
                                     .chars()
                                     .any(|c| !c.is_whitespace() && !matches!(c, '。' | '”'))
@@ -6647,7 +6810,8 @@ mod tests {
                         let m = line.metrics();
                         let bottom = m.block_max_coord.max(m.block_min_coord + m.line_height);
                         for item in line.items() {
-                            if let parley::PositionedLayoutItem::InlineBox(item) = item {
+                            if let crate::text_layout::PositionedLayoutItem::InlineBox(item) = item
+                            {
                                 let image = prepared
                                     .inline_images
                                     .iter()
@@ -6668,13 +6832,8 @@ mod tests {
                         }
                     }
                     let mut again = (*prepared.layout).clone();
-                    again.reserve_inline_box_paint_bounds(
-                        &prepared
-                            .inline_images
-                            .iter()
-                            .map(|image| (image.id, image.offset_y, image.height))
-                            .collect::<Vec<_>>(),
-                    );
+                    again.break_all_lines(Some(prepared.available_width));
+                    again.align(Alignment::Start, AlignmentOptions::default());
                     assert!(
                         (again.height() - prepared.layout.height()).abs() < 0.01,
                         "must be idempotent"
@@ -7620,7 +7779,13 @@ mod tests {
             .unwrap();
         assert!(table.column_widths.iter().sum::<f32>() < 744.0);
         assert!(
-            table.cells.iter().all(|cell| cell.text.layout.len() == 1),
+            table.cells.iter().all(|cell| {
+                if cell.text.text.is_empty() {
+                    cell.text.lines.is_empty()
+                } else {
+                    cell.text.layout.len() == 1
+                }
+            }),
             "short table cells should remain unwrapped"
         );
     }
@@ -8375,7 +8540,7 @@ mod tests {
             if let Some(features) = features {
                 builder.push_default(StyleProperty::FontFeatures(FontFeatures::from(features)));
             }
-            let mut layout: Layout<TextBrush> = builder.build("0123456789");
+            let mut layout: Layout<TextBrush> = builder.build("0123456789").into();
             layout.break_all_lines(None);
             layout
                 .get(0)
@@ -8890,16 +9055,18 @@ mod tests {
                                 });
                                 let mut glyph_end = 0.0_f32;
                                 for item in line.items() {
-                                    if let parley::PositionedLayoutItem::GlyphRun(run) = item {
+                                    if let crate::text_layout::PositionedLayoutItem::GlyphRun(run) =
+                                        item
+                                    {
                                         for glyph in run.positioned_glyphs() {
                                             glyph_end = glyph_end.max(glyph.x + glyph.advance);
                                         }
                                     }
                                 }
                                 let metrics = line.metrics();
-                                let actual = glyph_end - metrics.trailing_whitespace;
+                                let actual = glyph_end - metrics.hanging_advance;
                                 let measured =
-                                    metrics.offset + metrics.advance - metrics.trailing_whitespace;
+                                    metrics.offset + metrics.advance - metrics.hanging_advance;
                                 assert!(
                                     (actual - measured).abs() < 0.05,
                                     "font={size} width={width} actual={actual} measured={measured} text={}",
@@ -9262,7 +9429,7 @@ mod tests {
 
     #[test]
     fn paragraph_margin_starts_after_the_complete_last_line_box() {
-        use parley::editing::{Cursor, Selection};
+        use crate::text_layout::{Cursor, Selection};
         use parley::layout::Affinity;
 
         let source = EmptySource {

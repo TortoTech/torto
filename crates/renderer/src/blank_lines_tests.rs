@@ -55,7 +55,7 @@ fn blank_lines_have_no_highlight_but_remain_in_copied_text() {
             })
             .collect();
         assert!(blank_lines.len() >= 4);
-        let layout = Arc::new(layout);
+        let layout: Arc<Layout<TextBrush>> = Arc::new(layout.into());
         // Exercise both the whole paragraph and page fragments that begin/end
         // on blank lines. Copy/source mapping must not depend on painted boxes.
         for lines in [

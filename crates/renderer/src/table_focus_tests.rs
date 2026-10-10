@@ -257,7 +257,7 @@ fn text(node: &str, value: &str, y: f32) -> TextPlacement {
         ruby: Arc::from([]),
         citations: Arc::from([]),
         lines: 0..layout.len(),
-        layout: Arc::new(layout),
+        layout: Arc::new(layout.into()),
         text: value.into(),
         source_text_start: 0,
         origin_x: 25.0,

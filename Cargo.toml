@@ -24,7 +24,7 @@ exclude = [
 resolver = "3"
 
 [workspace.package]
-version = "0.7.3"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.97"
 license = "AGPL-3.0-only"
@@ -58,7 +58,8 @@ jsonrepair-rs = "0.2.1"
 kurbo = "0.13.1"
 libchm = "0.2.0"
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
-parley = { version = "0.11.1", features = ["complex-scripts"] }
+parley = { version = "=0.12.0", features = ["complex-scripts"] }
+parley_engine = { version = "=0.12.0", features = ["complex-scripts"] }
 peniko = "0.6.1"
 percent-encoding = "2.3.2"
 pollster = "0.4.0"
@@ -126,7 +127,6 @@ debug = 1
 strip = "none"
 
 [patch.crates-io]
-parley = { path = "third_party/parley" }
 egui = { path = "third_party/egui" }
 egui_extras = { path = "third_party/egui_extras" }
 epaint = { path = "third_party/epaint" }

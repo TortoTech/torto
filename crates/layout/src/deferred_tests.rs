@@ -198,24 +198,24 @@ fn only_requested_pixels_are_loaded_and_view_retirement_releases_pixels() {
     .unwrap();
     let first = first.deferred.unwrap();
     let second = second.deferred.unwrap();
-    assert!(first.ready().is_none());
-    assert!(second.ready().is_none());
+    assert!(first.ready_for_test().is_none());
+    assert!(second.ready_for_test().is_none());
     first.load(&source).unwrap();
-    let loaded = first.ready().unwrap();
+    let loaded = first.ready_for_test().unwrap();
     assert_eq!((loaded.width, loaded.height), (120, 80));
-    assert!(second.ready().is_none());
+    assert!(second.ready_for_test().is_none());
     let weak = Arc::downgrade(&loaded.pixels);
     let blob = loaded.blob.as_ref().unwrap().id();
     first.load(&source).unwrap();
-    assert_eq!(first.ready().unwrap().blob.unwrap().id(), blob);
+    assert_eq!(first.ready_for_test().unwrap().blob.unwrap().id(), blob);
     drop(loaded);
     retire_publication_rasters(source.book.id.as_str(), false);
     assert!(weak.upgrade().is_none());
-    assert!(first.ready().is_none());
-    assert!(second.ready().is_none());
+    assert!(first.ready_for_test().is_none());
+    assert!(second.ready_for_test().is_none());
     // Returning to a view can reuse already-prepared geometry after retirement.
     first.load(&source).unwrap();
-    assert!(first.ready().is_some());
+    assert!(first.ready_for_test().is_some());
 }
 
 #[test]
@@ -239,9 +239,9 @@ fn retirement_during_decode_rejects_the_result_but_allows_a_new_visible_request(
             true
         })
         .unwrap();
-    assert!(request.ready().is_none());
+    assert!(request.ready_for_test().is_none());
     request.load(&source).unwrap();
-    assert!(request.ready().is_some());
+    assert!(request.ready_for_test().is_some());
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn a_cancelled_decode_cannot_publish_pixels() {
             checks.get() < 3
         })
         .unwrap();
-    assert!(request.ready().is_none());
+    assert!(request.ready_for_test().is_none());
 }
 
 #[test]
@@ -281,5 +281,5 @@ fn changed_resource_fails_once_instead_of_publishing_obsolete_pixels() {
     bytes.push(0);
     source.bytes = bytes.into();
     assert!(request.load(&source).is_err());
-    assert!(request.ready().is_none());
+    assert!(request.ready_for_test().is_none());
 }

@@ -82,13 +82,13 @@ fn local_book_blank_lines_do_not_paint_highlight_bars() {
                         if placed.source.is_none() {
                             continue;
                         }
-                        let selection = parley::editing::Selection::new(
-                            parley::editing::Cursor::from_byte_index(
+                        let selection = rebook_layout::text_layout::Selection::new(
+                            rebook_layout::text_layout::Cursor::from_byte_index(
                                 &placed.layout,
                                 0,
                                 parley::layout::Affinity::Downstream,
                             ),
-                            parley::editing::Cursor::from_byte_index(
+                            rebook_layout::text_layout::Cursor::from_byte_index(
                                 &placed.layout,
                                 placed.text.len(),
                                 parley::layout::Affinity::Upstream,

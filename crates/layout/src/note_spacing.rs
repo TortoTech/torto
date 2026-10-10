@@ -1,6 +1,6 @@
 //! Optical note spacing measured from the actual fallback font and shaped glyphs.
 use super::{StyledRange, TextBrush, linebreak::parley::SpacingAdjustment};
-use parley::Layout;
+use crate::text_layout::Layout;
 use skrifa::{
     FontRef, GlyphId, MetadataProvider,
     instance::{LocationRef, NormalizedCoord, Size},
@@ -99,7 +99,7 @@ pub(super) fn measure(
             let coords: Vec<_> = run
                 .normalized_coords()
                 .iter()
-                .map(|coord| NormalizedCoord::from_bits(*coord))
+                .map(|coord| NormalizedCoord::from_bits(coord.to_bits()))
                 .collect();
             let metrics = font.glyph_metrics(Size::new(run.font_size()), LocationRef::new(&coords));
             for cluster in run.clusters() {
@@ -271,7 +271,7 @@ mod tests {
                 );
                 assert!(adjusted.lines().all(|line| line.runs().any(|run| {
                     run.clusters()
-                        .any(|cluster| !cluster.first_style().brush.footnote_reference)
+                        .any(|cluster| !cluster.style().brush.footnote_reference)
                 })));
             }
         }

@@ -1490,6 +1490,20 @@ fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     );
                 });
                 ui.end_row();
+
+                settings_row_label(ui, language.text("思考等级", "Reasoning effort"));
+                settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                    reasoning_effort_selector(
+                        ui,
+                        "ocr-reasoning-effort",
+                        &mut settings.ocr_reasoning_effort,
+                        options.iter().find(|m| {
+                            m.provider_id == settings.ocr_provider && m.model == settings.ocr_model
+                        }),
+                        language,
+                    );
+                });
+                ui.end_row();
             });
     });
     ui.add_space(12.0);

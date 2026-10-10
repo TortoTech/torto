@@ -701,6 +701,7 @@ fn transient_connection_failure(error: &str) -> bool {
 async fn complete_round<F: FnMut(String)>(
     provider: &AiProvider,
     model: &str,
+    reasoning_effort: ReasoningEffort,
     messages: &[Value],
     tools: &Value,
     progress: &mut F,
@@ -712,7 +713,7 @@ async fn complete_round<F: FnMut(String)>(
             messages,
             Some(tools),
             Some(8192),
-            ReasoningEffort::Default,
+            reasoning_effort,
             None,
         )
         .await;
@@ -805,7 +806,14 @@ where
         let request_started = Instant::now();
         let response = tokio::time::timeout(
             remaining,
-            complete_round(provider, model, &messages, &tools, &mut progress),
+            complete_round(
+                provider,
+                model,
+                settings.ocr_reasoning_effort,
+                &messages,
+                &tools,
+                &mut progress,
+            ),
         )
         .await;
         crate::diagnostics::log(

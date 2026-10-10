@@ -1,9 +1,17 @@
 # 核心依赖已知问题
 
-- 最近更新：2026-10-09
+- 最近更新：2026-10-10
 - 记录范围：已经在 Torto 中复现、确认与上游依赖、Windows 图形栈或渲染帧时序有关，并需要本地兼容代码或长期回归检查的问题
 
 依赖升级时应逐项检查本文。只有在上游修复已经进入当前版本，并且移除本地兼容代码后相关回归测试仍能通过，才删除对应兼容代码和本文条目。
+
+## 2026-10-10 Parley 0.12 / Engine 核查
+
+[Parley 0.12.0](https://github.com/linebender/parley/releases/tag/v0.12.0) 已于 2026-10-09 16:16 UTC 发布，并新增 `parley_engine`。正式项目已迁移到 crates.io 原版 Parley / Engine 0.12.0，移除 0.11.1 本地 fork 和 Cargo patch。下文 10 月 9 日“没有新版”的记录是当时的核查快照。
+
+官方 `set_base_direction`、InlineBox baseline 与 vertical-align 已替换本地方向/图片位置补丁；ruby 边界、双语段落的局部方向/对齐由产品的共同文本几何接口承担。新版的簇、Unicode scalar 断行计数、行高和字体坐标语义已适配。两端对齐选区 [#396](https://github.com/linebender/parley/issues/396) 仍开放，纯上游 0.12 探针的中间行选区仍不足，现有 renderer 修正继续保留。
+
+源码比较、兼容变化、实际调用链及验证条件见 [Parley Engine 接入评估](parley-engine-evaluation.md)。正式接入通过 1091 项测试、三本真实书籍的 465 个布局案例及正式客户端最小化恢复检查；实际打开计时与迁移前纯塑形探针分别记录，不混用两者结论。
 
 ## Rig：OpenAI 兼容网关的签名扩展导致响应解析失败或回传丢失
 
