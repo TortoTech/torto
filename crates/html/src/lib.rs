@@ -1,6 +1,8 @@
 //! Shared HTML/CSS to format-neutral reading IR parser.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use rebook_publication::{
     Block, BlockStyle, CaptionPosition, FigureBlock, HyphenationMode, ImageBlock, ImageLength,
@@ -19,8 +21,10 @@ mod image_context;
 mod media_context_tests;
 mod media_semantics;
 mod nested_media;
+mod style_query;
 mod table_captions;
 use font_size::FontSize;
+use style_query::{NodeStyleCache, RuleIndex};
 
 #[derive(Debug, Error)]
 pub enum HtmlError {
@@ -1636,7 +1640,12 @@ impl<'a> ReadingIrParser<'a> {
             if caption
                 .ancestors()
                 .filter(Node::is_element)
-                .find_map(|node| self.styles.cascaded_properties(node).remove("caption-side"))
+                .find_map(|node| {
+                    self.styles
+                        .cascaded_properties(node)
+                        .get("caption-side")
+                        .cloned()
+                })
                 .as_deref()
                 .is_some_and(|side| side.eq_ignore_ascii_case("bottom"))
             {
@@ -3330,6 +3339,10 @@ impl QuoteLayoutMetrics {
 #[derive(Default)]
 struct StyleSheet {
     rules: Vec<StyleRule>,
+    rule_index: RuleIndex,
+    // A sheet belongs to one parsed document. Never retain node IDs across
+    // section parses, where roxmltree starts numbering nodes again.
+    cascaded_cache: RefCell<NodeStyleCache>,
     next_order: usize,
     root_font_size: Option<f32>,
 }
@@ -3393,6 +3406,7 @@ impl StyleSheet {
     }
 
     fn add_css(&mut self, css: &str) {
+        self.cascaded_cache.get_mut().clear();
         let css = strip_css_comments(css);
         let mut cursor = 0;
         while let Some(relative_open) = css[cursor..].find('{') {
@@ -3407,6 +3421,7 @@ impl StyleSheet {
                     let Some(selector) = SimpleSelector::parse(raw_selector) else {
                         continue;
                     };
+                    self.rule_index.insert(self.rules.len(), &selector);
                     self.rules.push(StyleRule {
                         specificity: selector.specificity(),
                         selector,
@@ -3802,13 +3817,11 @@ impl StyleSheet {
         }
     }
 
-    fn cascaded_properties(&self, node: Node<'_, '_>) -> HashMap<String, String> {
-        let mut matching = self
-            .rules
-            .iter()
-            .filter(|rule| rule.selector.matches(node))
-            .collect::<Vec<_>>();
-        matching.sort_by_key(|rule| (rule.specificity, rule.order));
+    fn cascaded_properties(&self, node: Node<'_, '_>) -> Rc<HashMap<String, String>> {
+        if let Some(properties) = self.cascaded_cache.borrow().get(node.id()) {
+            return properties;
+        }
+        let matching = self.rule_index.matching(node, &self.rules);
 
         let mut properties = HashMap::new();
         for rule in matching {
@@ -3817,6 +3830,10 @@ impl StyleSheet {
         if let Some(inline) = attribute_local(node, "style") {
             insert_declarations(&mut properties, declarations(inline));
         }
+        let properties = Rc::new(properties);
+        self.cascaded_cache
+            .borrow_mut()
+            .insert(node.id(), Rc::clone(&properties));
         properties
     }
 }
