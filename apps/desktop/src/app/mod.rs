@@ -82,6 +82,20 @@ impl DesktopApp {
         }
     }
 
+    /// Whether the reader's chat composer owns the keyboard, which decides
+    /// where a pasted clipboard image goes.
+    pub(crate) fn chat_composer_accepts_paste(&self, ctx: &egui::Context) -> bool {
+        self.reader
+            .as_ref()
+            .is_some_and(|reader| reader.chat_composer_accepts_paste(ctx))
+    }
+
+    pub(crate) fn attach_pasted_chat_image(&mut self, paste: crate::platform::ClipboardImage) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.attach_pasted_chat_image(paste);
+        }
+    }
+
     pub(crate) fn ui(
         &mut self,
         ui: &mut egui::Ui,

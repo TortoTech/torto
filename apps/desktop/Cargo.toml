@@ -36,6 +36,7 @@ osx_info_plist_exts = ["assets/macos/document-types.plist"]
 
 [dependencies]
 anyrender.workspace = true
+arboard.workspace = true
 parley.workspace = true
 skrifa = "0.48.0"
 atomicwrites.workspace = true

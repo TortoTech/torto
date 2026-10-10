@@ -3721,6 +3721,17 @@ struct ChatUiState {
     suggestion_index: usize,
     suggestions_dismissed: bool,
     move_cursor_to_end: bool,
+    /// Images pasted into the composer; they join the next message and are
+    /// cleared when it is sent.
+    pending_images: Vec<crate::plugins::chat_media::PendingChatImage>,
+    /// Composer widget from the last frame it was shown, used to route a
+    /// pasted image to the panel that owns the keyboard.
+    composer_id: Option<egui::Id>,
+    /// Height the error line, the confirmation list and the composer took
+    /// below the transcript in the last frame they were drawn. The transcript
+    /// is given what the panel has left, so a taller composer cannot push its
+    /// input row out of the window. Zero until the first frame measures it.
+    footer_height: f32,
     references: Vec<ChatReference>,
     reference_options_location: Option<(usize, usize, usize)>,
     reference_options: Vec<ChatReference>,
@@ -3743,6 +3754,9 @@ impl Default for ChatUiState {
             suggestion_index: 0,
             suggestions_dismissed: false,
             move_cursor_to_end: false,
+            pending_images: Vec::new(),
+            composer_id: None,
+            footer_height: 0.0,
             references: Vec::new(),
             reference_options_location: None,
             reference_options: Vec::new(),
