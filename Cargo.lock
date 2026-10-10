@@ -4243,6 +4243,7 @@ name = "rebook-desktop"
 version = "0.7.3"
 dependencies = [
  "anyrender",
+ "arboard",
  "arc-swap",
  "atomicwrites",
  "base64 0.22.1",

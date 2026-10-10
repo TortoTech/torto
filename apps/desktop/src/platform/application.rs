@@ -5,10 +5,9 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 #[cfg(target_os = "windows")]
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{StartCause, WindowEvent};
+use winit::event::{ElementState, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-#[cfg(target_os = "windows")]
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 #[cfg(target_os = "windows")]
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(not(target_os = "windows"))]
@@ -231,6 +230,78 @@ fn native_open_settings_shortcut_matches(
     )
 }
 
+/// Hand a clipboard image to the chat composer, which egui cannot see:
+/// egui-winit answers the paste shortcut by pushing `Event::Paste` for text
+/// only, so a copied screenshot produces no event and the key never reaches the
+/// composer. Both shapes of clipboard image are taken: pixels, and the image
+/// files a screenshot tool leaves on the clipboard. Returns whether the
+/// shortcut was claimed.
+fn claim_pasted_chat_image(
+    event: &WindowEvent,
+    modifiers: ModifiersState,
+    app: &mut DesktopApp,
+    ctx: &egui::Context,
+) -> bool {
+    if !is_paste_shortcut(event, modifiers) || !app.chat_composer_accepts_paste(ctx) {
+        return false;
+    }
+    let images = crate::platform::images_without_text();
+    if images.is_empty() {
+        return false;
+    }
+    for image in images {
+        app.attach_pasted_chat_image(image);
+    }
+    true
+}
+
+/// The paste shortcut as egui-winit defines it: Ctrl+V (Cmd+V on macOS),
+/// Shift+Insert on Windows, and the dedicated Paste key.
+fn is_paste_shortcut(event: &WindowEvent, modifiers: ModifiersState) -> bool {
+    let WindowEvent::KeyboardInput { event, .. } = event else {
+        return false;
+    };
+    is_paste_key(
+        &event.logical_key,
+        event.physical_key,
+        event.state,
+        event.repeat,
+        modifiers,
+    )
+}
+
+fn is_paste_key(
+    logical_key: &Key,
+    physical_key: PhysicalKey,
+    state: ElementState,
+    repeat: bool,
+    modifiers: ModifiersState,
+) -> bool {
+    if state != ElementState::Pressed || repeat {
+        return false;
+    }
+    // Keys the layout does not translate still count through their physical
+    // key, matching egui-winit's logical-or-physical fallback.
+    let untranslated = matches!(logical_key, Key::Unidentified(_) | Key::Dead(_));
+    let character =
+        |name: &str| matches!(logical_key, Key::Character(text) if text.eq_ignore_ascii_case(name));
+    if *logical_key == Key::Named(NamedKey::Paste) {
+        return true;
+    }
+    let insert = *logical_key == Key::Named(NamedKey::Insert)
+        || (untranslated && physical_key == PhysicalKey::Code(KeyCode::Insert));
+    if insert {
+        return cfg!(target_os = "windows") && modifiers.shift_key();
+    }
+    let v = character("v") || (untranslated && physical_key == PhysicalKey::Code(KeyCode::KeyV));
+    let command = if cfg!(target_os = "macos") {
+        modifiers.super_key()
+    } else {
+        modifiers.control_key()
+    };
+    v && command
+}
+
 struct WindowState {
     window: Arc<Window>,
     #[cfg(target_os = "windows")]
@@ -256,7 +327,6 @@ struct Application {
     fatal_error: Option<String>,
     proxy: EventLoopProxy<UserEvent>,
     runtime: tokio::runtime::Runtime,
-    #[cfg(target_os = "windows")]
     modifiers: ModifiersState,
     #[cfg(target_os = "windows")]
     open_settings_modifiers_released_at: Option<Instant>,
@@ -295,7 +365,6 @@ impl Application {
             fatal_error: None,
             proxy,
             runtime,
-            #[cfg(target_os = "windows")]
             modifiers: ModifiersState::default(),
             #[cfg(target_os = "windows")]
             open_settings_modifiers_released_at: None,
@@ -603,6 +672,16 @@ impl ApplicationHandler<UserEvent> for Application {
                 state.window.request_redraw();
             }
         }
+        #[cfg(not(target_os = "windows"))]
+        if let WindowEvent::ModifiersChanged(modifiers) = &event {
+            self.modifiers = modifiers.state();
+        }
+        if claim_pasted_chat_image(&event, self.modifiers, &mut self.app, &self.egui_ctx) {
+            // The composer claimed the shortcut, so egui must not also read the
+            // clipboard; the new attachment needs a frame to appear.
+            state.window.request_redraw();
+            return;
+        }
         let response = state.egui_state.on_window_event(&state.window, &event);
         // RedrawRequested is already being serviced below. egui-winit marks
         // it as needing paint, but requesting another frame here creates a
@@ -759,6 +838,54 @@ impl ApplicationHandler<UserEvent> for Application {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_shortcuts_match_what_egui_winit_swallows() {
+        let pressed = ElementState::Pressed;
+        let released = ElementState::Released;
+        let key = |text: &str| -> Key { Key::Character(text.into()) };
+        let v = PhysicalKey::Code(KeyCode::KeyV);
+        let command = if cfg!(target_os = "macos") {
+            ModifiersState::SUPER
+        } else {
+            ModifiersState::CONTROL
+        };
+        let shift = ModifiersState::SHIFT;
+        let none = ModifiersState::empty();
+
+        assert!(is_paste_key(&key("v"), v, pressed, false, command));
+        assert!(is_paste_key(&key("V"), v, pressed, false, command));
+        assert!(is_paste_key(
+            &Key::Named(NamedKey::Paste),
+            PhysicalKey::Code(KeyCode::F13),
+            pressed,
+            false,
+            none,
+        ));
+        #[cfg(target_os = "windows")]
+        assert!(is_paste_key(
+            &Key::Named(NamedKey::Insert),
+            PhysicalKey::Code(KeyCode::Insert),
+            pressed,
+            false,
+            shift,
+        ));
+        // Anything else keeps its normal meaning, so egui still sees it.
+        assert!(!is_paste_key(&key("v"), v, pressed, false, none));
+        assert!(!is_paste_key(&key("v"), v, released, false, command));
+        assert!(!is_paste_key(&key("v"), v, pressed, true, command));
+        assert!(!is_paste_key(
+            &key("c"),
+            PhysicalKey::Code(KeyCode::KeyC),
+            pressed,
+            false,
+            command,
+        ));
+        // A layout that translates the key elsewhere keeps that meaning.
+        assert!(!is_paste_key(&key("x"), v, pressed, false, command));
+        // An untranslated key still counts through its physical position.
+        assert!(is_paste_key(&Key::Dead(None), v, pressed, false, command));
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

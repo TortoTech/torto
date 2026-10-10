@@ -504,8 +504,12 @@ pub(crate) fn icon_button(ui: &mut Ui, glyph: Icon) -> Response {
     painted_icon_button(ui, glyph, false)
 }
 
+/// Side of the compact icon action, for callers that have to reserve room for
+/// one before it is drawn.
+pub(crate) const SMALL_ICON_BUTTON_SIZE: f32 = 28.0;
+
 pub(crate) fn small_icon_button(ui: &mut Ui, glyph: Icon) -> Response {
-    painted_icon_button_sized(ui, glyph, false, 28.0, 15.0)
+    painted_icon_button_sized(ui, glyph, false, SMALL_ICON_BUTTON_SIZE, 15.0)
 }
 
 /// Icon action used as a tab. The selected state uses a quiet accent surface

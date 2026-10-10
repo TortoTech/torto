@@ -1341,6 +1341,83 @@ impl DesktopReader {
         }
     }
 
+    /// Whether the assistant panel is open. Closing keeps the panel in place until the
+    /// motion settles, so the target has to be checked as well.
+    fn assistant_panel_is_open(&self) -> bool {
+        self.ui.assistant_panel.is_some() && self.ui.assistant_motion.target > 0.5
+    }
+
+    /// Whether a pasted clipboard image goes to the composer.
+    ///
+    /// A focused composer owns the keyboard. Clipboard managers paste without
+    /// the user touching the composer first — they restore the window and send
+    /// the shortcut — so an image-only clipboard is also accepted while nothing
+    /// else holds the keyboard. Otherwise the paste is dropped without a trace,
+    /// which is indistinguishable from the shortcut not working.
+    pub(crate) fn chat_composer_accepts_paste(&self, ctx: &egui::Context) -> bool {
+        if !self.assistant_panel_is_open() {
+            return false;
+        }
+        let Some(id) = self.chat.composer_id else {
+            return false;
+        };
+        ctx.memory(|memory| memory.has_focus(id) || memory.focused().is_none())
+    }
+
+    /// Attach clipboard pixels to the next message. Reading the clipboard and
+    /// encoding the attachment both happen here, so a rejection is reported in
+    /// the composer instead of failing the turn later.
+    pub(crate) fn attach_pasted_chat_image(&mut self, paste: crate::platform::ClipboardImage) {
+        // The paste may have arrived with the keyboard elsewhere; hand it back
+        // so the attachment and any rejection are both visible.
+        self.chat.move_cursor_to_end = true;
+        let crate::platform::ClipboardImage {
+            width,
+            height,
+            rgba,
+        } = paste;
+        if self.chat.pending_images.len() >= crate::plugins::chat_media::MAX_IMAGES_PER_MESSAGE {
+            let message = self
+                .language
+                .text(
+                    "一条消息最多附带 8 张图片，请先发送或移除已有图片。",
+                    "A message carries 8 images at most; send or remove one first.",
+                )
+                .to_owned();
+            self.chat.error = Some(message);
+            return;
+        }
+        let ordinal = self.chat.pending_images.len() + 1;
+        match crate::plugins::chat_media::PendingChatImage::from_clipboard(
+            ordinal, width, height, rgba,
+        ) {
+            Ok(image) => {
+                self.chat.pending_images.push(image);
+                self.chat.error = None;
+            }
+            Err(reason) => {
+                crate::diagnostics::log(
+                    "chat.paste_image.rejected",
+                    &[crate::diagnostics::Field::Detail("reason", &reason)],
+                );
+                let message = self
+                    .language
+                    .text(
+                        "无法附加剪贴板图片，请改用尺寸更小的截图后重试。",
+                        "Could not attach the clipboard image; try a smaller screenshot.",
+                    )
+                    .to_owned();
+                self.chat.error = Some(message);
+            }
+        }
+    }
+
+    pub(super) fn remove_chat_pending_image(&mut self, index: usize) {
+        if index < self.chat.pending_images.len() {
+            self.chat.pending_images.remove(index);
+        }
+    }
+
     pub(super) fn restore_book_chat_session(&mut self) {
         let Some(previous_key) = self.focus_chat_session_key.take() else {
             return;
@@ -1414,7 +1491,11 @@ impl DesktopReader {
 
     pub(super) fn send_chat(&mut self) {
         let raw = self.chat.input.trim().to_owned();
-        if (raw.is_empty() && self.chat.references.is_empty()) || self.chat.task.is_pending() {
+        if (raw.is_empty()
+            && self.chat.references.is_empty()
+            && self.chat.pending_images.is_empty())
+            || self.chat.task.is_pending()
+        {
             return;
         }
         match resolve_chat_command(&raw) {
@@ -1776,6 +1857,9 @@ impl DesktopReader {
                 ranges: unit.paint_ranges.clone(),
             });
         }
+        // Whether the images in this turn came from the book selection, which
+        // is what the prompt note below describes.
+        let mut book_images = false;
         if kind == ChatRequestKind::Normal
             && let Some(selection) = &mut selection
         {
@@ -1795,6 +1879,7 @@ impl DesktopReader {
                             *image = cached.clone();
                         }
                     }
+                    book_images = !images.is_empty();
                     selection.images = images;
                 }
                 Err(error) => {
@@ -1803,6 +1888,19 @@ impl DesktopReader {
                     return;
                 }
             }
+        }
+        let pasted_images: Vec<_> = std::mem::take(&mut self.chat.pending_images)
+            .into_iter()
+            .map(crate::plugins::chat_media::PendingChatImage::into_image)
+            .collect();
+        if !pasted_images.is_empty() {
+            // A pasted image needs a turn even when no book text is selected.
+            let selection = selection.get_or_insert_with(|| ChatSelection {
+                images: Vec::new(),
+                text: String::new(),
+                ranges: Vec::new(),
+            });
+            selection.images.extend(pasted_images);
         }
         let images = selection
             .as_ref()
@@ -1830,9 +1928,12 @@ impl DesktopReader {
         let display_content = if images.is_empty() && footnotes.is_none() {
             display_content
         } else {
-            display_content.or_else(|| Some(question.clone()))
+            display_content
+                .or_else(|| Some(question.clone()))
+                .filter(|content| !content.trim().is_empty())
+                .or_else(|| Some(self.language.text("（图片）", "(image)").to_owned()))
         };
-        let question = if !images.is_empty() {
+        let question = if book_images {
             format!(
                 "{question}\n\n以下图片来自本次选中的书籍内容，按原文顺序附上。请结合图片和以下文字回答：\n{}",
                 selection

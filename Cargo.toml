@@ -34,6 +34,7 @@ authors = ["TortoTech"]
 
 [workspace.dependencies]
 anyrender = "0.14.0"
+arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
 atomicwrites = "0.4.4"
 base64 = "0.22.1"
 bytemuck = "1.25.2"

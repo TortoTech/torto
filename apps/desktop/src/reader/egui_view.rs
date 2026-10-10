@@ -48,6 +48,7 @@ mod focus_chat_sidebar_tests;
 const ASSISTANT_BOTTOM_PADDING: f32 = 12.0;
 const ASSISTANT_COMPOSER_RESERVED_HEIGHT: f32 = 52.0;
 const ASSISTANT_INPUT_HEIGHT: f32 = 32.0;
+const ASSISTANT_PENDING_IMAGE_SIZE: f32 = 40.0;
 const ASSISTANT_SELECTION_SCROLL_EDGE: f32 = 36.0;
 const ASSISTANT_SELECTION_SCROLL_MIN_SPEED: f32 = 90.0;
 const ASSISTANT_SELECTION_SCROLL_MAX_SPEED: f32 = 640.0;
@@ -3836,29 +3837,29 @@ impl DesktopReader {
         }
 
         let busy = self.chat.task.is_pending();
-        let reference_rows =
-            u16::try_from(self.chat.references.len().div_ceil(2)).unwrap_or(u16::MAX);
-        let reference_height = f32::from(reference_rows) * 28.0;
-        let error_height = if self.chat.error.is_some() { 54.0 } else { 0.0 };
-        let confirmation_height = if self.chat.pending_annotation_actions.is_empty() {
-            0.0
+        // The rows below the transcript are measured rather than predicted:
+        // their height follows the chips' aspect ratios, the reference rows,
+        // the error line and the confirmation list, and a prediction that runs
+        // short pushes the input row out of the panel. The first frame has no
+        // measurement yet and falls back to the composer's reserved height.
+        let footer_reserve = if self.chat.footer_height > 0.0 {
+            self.chat.footer_height
         } else {
-            78.0 + 18.0
-                * f32::from(
-                    u16::try_from(self.chat.pending_annotation_actions.len().min(3)).unwrap_or(3),
-                )
+            ASSISTANT_COMPOSER_RESERVED_HEIGHT + ASSISTANT_BOTTOM_PADDING
         };
-        let conversation_height = (ui.available_height()
-            - ASSISTANT_COMPOSER_RESERVED_HEIGHT
-            - ASSISTANT_BOTTOM_PADDING
-            - reference_height
-            - error_height
-            - confirmation_height)
-            .max(96.0);
+        let conversation_height = (ui.available_height() - footer_reserve).max(96.0);
         self.assistant_conversation(ui, conversation_height, busy);
+        let footer_top = ui.cursor().min.y;
         self.assistant_error(ui);
         self.assistant_annotation_confirmation(ui);
         self.assistant_composer(ui);
+        let measured = ui.cursor().min.y - footer_top + ASSISTANT_BOTTOM_PADDING;
+        if (measured - self.chat.footer_height).abs() > 0.5 {
+            self.chat.footer_height = measured;
+            // The transcript was sized against the height measured last frame,
+            // so the panel needs one more frame to take the new one.
+            ui.ctx().request_repaint();
+        }
     }
 
     fn assistant_header(&mut self, ui: &mut egui::Ui) {
@@ -4226,8 +4227,12 @@ impl DesktopReader {
         show_reference_chips: bool,
         show_container: bool,
     ) -> AssistantComposerRender {
+        // The event loop routes a pasted image by widget id, so the composer
+        // has to be on record for every frame it is shown.
+        self.chat.composer_id = Some(input_id);
         let references = self.chat.references.clone();
         let mut remove_reference = None;
+        let mut pending_image_action = None;
         let mut input_response = None;
         let mut submit = false;
         let move_cursor_to_end = std::mem::take(&mut self.chat.move_cursor_to_end);
@@ -4240,6 +4245,8 @@ impl DesktopReader {
             if show_reference_chips {
                 remove_reference = chat_reference_chips(ui, &references, self.language);
             }
+            pending_image_action =
+                chat_pending_image_chips(ui, &mut self.chat.pending_images, self.language);
             ui.horizontal(|ui| {
                 let input_width = (ui.available_width() - 76.0).max(48.0);
                 let hint_text = self.language.text(
@@ -4292,6 +4299,13 @@ impl DesktopReader {
         });
         if let Some(id) = remove_reference {
             self.remove_chat_reference(&id);
+        }
+        match pending_image_action {
+            Some(PendingImageAction::Remove(index)) => self.remove_chat_pending_image(index),
+            Some(PendingImageAction::Preview(image)) => {
+                self.open_color_image_preview(ui.ctx(), image, "chat-pending-image");
+            }
+            None => {}
         }
         AssistantComposerRender {
             composer_rect: composer.response.rect,
@@ -5619,6 +5633,91 @@ fn chat_reference_chips(
     removed
 }
 
+/// What a click on a pasted-image thumbnail asked for.
+enum PendingImageAction {
+    Remove(usize),
+    Preview(egui::ColorImage),
+}
+
+/// Thumbnails of the images pasted into the composer. Clicking one opens the
+/// same full-size preview the transcript uses; the cross removes it.
+fn chat_pending_image_chips(
+    ui: &mut egui::Ui,
+    pending: &mut [crate::plugins::chat_media::PendingChatImage],
+    language: crate::preferences::AppLanguage,
+) -> Option<PendingImageAction> {
+    if pending.is_empty() {
+        return None;
+    }
+    let mut action = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        for (index, image) in pending.iter_mut().enumerate() {
+            if let Some(chip) = chat_pending_image_chip(ui, index, image, language) {
+                action = Some(chip);
+            }
+        }
+    });
+    ui.add_space(3.0);
+    action
+}
+
+/// One chip: the thumbnail and the cross that removes it, laid out together so
+/// a row can never end with the thumbnail and start with a stray cross. The
+/// wrapped row places a chip by the size it asks for, so the chip reserves the
+/// size its own contents will take.
+fn chat_pending_image_chip(
+    ui: &mut egui::Ui,
+    index: usize,
+    image: &mut crate::plugins::chat_media::PendingChatImage,
+    language: crate::preferences::AppLanguage,
+) -> Option<PendingImageAction> {
+    let texture = image.texture(ui.ctx());
+    let thumbnail = image.thumbnail_size();
+    let mut action = None;
+    ui.allocate_ui_with_layout(
+        pending_image_chip_size(ui, thumbnail),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            // egui takes the declared texture size as the aspect ratio, so the
+            // chip is bounded by `max_size` instead of being squashed square.
+            let response = ui
+                .add(
+                    egui::Image::new((texture.id(), thumbnail))
+                        .max_size(Vec2::splat(ASSISTANT_PENDING_IMAGE_SIZE))
+                        .corner_radius(6)
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text(language.text("查看大图", "View full size"));
+            if response.clicked()
+                && let Ok(preview) = image.image().preview_image()
+            {
+                action = Some(PendingImageAction::Preview(preview));
+            }
+            if crate::ui::small_icon_button(ui, Icon::X)
+                .on_hover_text(language.text("移除图片", "Remove image"))
+                .clicked()
+            {
+                action = Some(PendingImageAction::Remove(index));
+            }
+        },
+    );
+    action
+}
+
+/// The room one chip takes: the thumbnail at the size `Image::max_size` draws
+/// it, the gap, and the cross.
+fn pending_image_chip_size(ui: &egui::Ui, thumbnail: Vec2) -> Vec2 {
+    let max = Vec2::splat(ASSISTANT_PENDING_IMAGE_SIZE);
+    let scale = (max.x / thumbnail.x).min(max.y / thumbnail.y).min(1.0);
+    let drawn = thumbnail * scale;
+    let cross = crate::ui::SMALL_ICON_BUTTON_SIZE;
+    Vec2::new(
+        drawn.x + ui.spacing().item_spacing.x + cross,
+        drawn.y.max(cross),
+    )
+}
+
 fn chat_reference_kind_label(
     language: crate::preferences::AppLanguage,
     kind: ChatReferenceKind,
@@ -6891,6 +6990,132 @@ mod reference_suggestion_label_tests {
         }
     }
 
+    /// A chip is a thumbnail and the cross that removes it, and the wrapped row
+    /// places a chip by the size it asks for. A chip that asks for nothing is
+    /// never wrapped, so the thumbnails used to run past the composer's edge and
+    /// the cross could end up alone on the next row.
+    #[test]
+    fn pasted_image_chips_wrap_inside_the_composer() {
+        let ctx = egui::Context::default();
+        let mut pending: Vec<crate::plugins::chat_media::PendingChatImage> = (1..=8)
+            .map(|ordinal| {
+                crate::plugins::chat_media::PendingChatImage::from_clipboard(
+                    ordinal,
+                    320,
+                    180,
+                    vec![7; 320 * 180 * 4],
+                )
+                .expect("a 320x180 image is a valid attachment")
+            })
+            .collect();
+        let mut widths = Vec::new();
+        for width in [120.0, 300.0, 420.0] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 400.0))),
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        let over = ui
+                            .allocate_ui_with_layout(
+                                Vec2::new(width, 200.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    chat_pending_image_chips(
+                                        ui,
+                                        &mut pending,
+                                        crate::preferences::AppLanguage::SimplifiedChinese,
+                                    );
+                                    ui.min_rect().right() - ui.max_rect().right()
+                                },
+                            )
+                            .inner;
+                        widths.push((width, over));
+                    });
+                },
+            );
+            output.textures_delta.clear();
+        }
+        for (width, over) in widths {
+            assert!(over <= 0.5, "chips ran {over} past a {width}-wide composer");
+        }
+    }
+
+    /// A pasted image adds a row to the composer, and the transcript above it
+    /// has to be told how tall the composer became. Counting those rows from a
+    /// constant left the composer floating above the bottom of the panel, and
+    /// once a row cost more than the constant said, the input row was pushed
+    /// out of the window. The composer now takes its height from the panel's
+    /// bottom, so adding a row moves the transcript, never the input row.
+    #[test]
+    fn pasted_images_leave_the_composer_against_the_bottom_of_the_panel() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        reader.ui.assistant_panel = Some(AssistantPanel::Chat);
+        let panel = Vec2::new(422.0, 517.0);
+        let ctx = egui::Context::default();
+        let mut margins = Vec::new();
+        for images in [0_usize, 5, 6, 8] {
+            reader.chat.pending_images.clear();
+            for ordinal in 1..=images {
+                reader.chat.pending_images.push(
+                    crate::plugins::chat_media::PendingChatImage::from_clipboard(
+                        ordinal,
+                        320,
+                        180,
+                        vec![7; 320 * 180 * 4],
+                    )
+                    .expect("a 320x180 image is a valid attachment"),
+                );
+            }
+            for frame in 0..3 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1280.0, 760.0),
+                        )),
+                        time: Some(frame as f64),
+                        ..Default::default()
+                    },
+                    |root| {
+                        egui::CentralPanel::default().show(root, |ui| {
+                            let gap = ui
+                                .allocate_ui_with_layout(
+                                    panel,
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        reader.assistant(ui);
+                                        ui.max_rect().bottom() - ui.min_rect().bottom()
+                                    },
+                                )
+                                .inner;
+                            if frame > 0 {
+                                margins.push((images, gap));
+                            }
+                        });
+                    },
+                );
+                output.textures_delta.clear();
+            }
+        }
+        let first = margins.first().expect("the panel was laid out").1;
+        for (images, gap) in &margins {
+            assert!(
+                (gap - first).abs() < 1.0,
+                "the composer moved when the pending images changed: {margins:?}"
+            );
+            assert!(
+                *gap >= 0.0,
+                "{images} pending images pushed the composer out of the panel: {margins:?}"
+            );
+        }
+    }
+
+    /// Turning to another paragraph while the docked panel stays open has to
+    /// carry that paragraph into the conversation, exactly as opening the panel
+    /// on it would; the paragraph left behind keeps its own reference, and a
+    /// closed panel leaves the context alone.
     #[cfg(target_os = "windows")]
     #[test]
     fn pdf_header_buttons_keep_their_slots_from_opening_through_loaded_source_states() {
