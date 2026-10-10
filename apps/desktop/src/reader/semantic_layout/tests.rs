@@ -1259,18 +1259,25 @@ pub(in crate::reader) fn fixture() -> (DesktopReader, Section, SourceRange) {
 }
 
 fn fixture_with_numbered_heading(numbered_heading: bool) -> (DesktopReader, Section, SourceRange) {
-    fixture_with_optional_blocks(numbered_heading, None)
+    fixture_with_optional_blocks(numbered_heading, None, vec![])
 }
 
 pub(in crate::reader) fn fixture_with_blocks(
     blocks: Vec<Block>,
 ) -> (DesktopReader, Section, SourceRange) {
-    fixture_with_optional_blocks(false, Some(blocks))
+    fixture_with_optional_blocks(false, Some(blocks), vec![])
+}
+
+pub(in crate::reader) fn fixture_with_toc(
+    toc: Vec<rebook_publication::TocEntry>,
+) -> (DesktopReader, Section, SourceRange) {
+    fixture_with_optional_blocks(false, None, toc)
 }
 
 fn fixture_with_optional_blocks(
     numbered_heading: bool,
     blocks: Option<Vec<Block>>,
+    toc: Vec<rebook_publication::TocEntry>,
 ) -> (DesktopReader, Section, SourceRange) {
     let spine = SpineItemId::new("chapter").unwrap();
     let href = PublicationUrl::parse("chapter.xhtml").unwrap();
@@ -1331,7 +1338,7 @@ href:PublicationUrl::parse("image.png").unwrap(),alt:String::new(),style:Default
                 linear: true,
                 properties: vec![],
             }],
-            table_of_contents: vec![],
+            table_of_contents: toc,
         },
         section: section.clone(),
     });

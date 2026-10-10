@@ -1,12 +1,15 @@
 mod background;
 pub(crate) mod covers;
 mod opening;
+mod opening_view;
+#[cfg(test)]
+pub(crate) use opening_view::OpeningShell;
 mod reading_activity;
 mod sync_button;
 mod sync_monitor;
 mod sync_schedule;
 
-pub(crate) use opening::OpenTaskMessage;
+pub(crate) use opening::{OpenHeaderMessage, OpenTaskMessage};
 pub(crate) use sync_monitor::SyncCheckMessage;
 
 use background::BackgroundJob;
@@ -73,6 +76,7 @@ pub(crate) struct ShelfFeature {
     import_task: TaskSlot<()>,
     pending_reader: Option<DesktopReader>,
     opening: opening::Opening,
+    sidebar_preferences: crate::reader::chrome::SidebarPreferences,
     /// Book most recently handed to the reader. Reading activity is refreshed
     /// asynchronously, so on return the shelf cannot yet re-derive the
     /// highlight from the order without lagging one book behind.
@@ -190,9 +194,8 @@ impl ShelfFeature {
         self.cover_textures.bytes()
     }
     pub(crate) fn startup_error(&self) -> Option<&str> {
-        self.shelf
-            .error
-            .as_deref()
+        self.opening_error()
+            .or(self.shelf.error.as_deref())
             .or(self.sync.import_error.as_deref())
     }
     pub(crate) fn update_book_metadata(
@@ -252,6 +255,9 @@ impl ShelfFeature {
         let initial_error_dismiss_at = initial_error
             .as_ref()
             .map(|_| Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
+        let sidebar_preferences = crate::reader::chrome::SidebarPreferences::load();
+        let mut opening = opening::Opening::default();
+        opening.classic_sidebar = sidebar_preferences.classic;
         let mut feature = Self {
             statistics: crate::statistics::Page::default(),
             shelf: ShelfState {
@@ -267,7 +273,8 @@ impl ShelfFeature {
             },
             import_task: TaskSlot::default(),
             pending_reader: None,
-            opening: opening::Opening::default(),
+            opening,
+            sidebar_preferences,
             last_opened_book_id: None,
             reader_fonts,
             local_store,
@@ -614,6 +621,7 @@ impl ShelfFeature {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<crate::platform::UserEvent>,
     ) {
+        self.sidebar_preferences.spawn_pending(runtime);
         self.opening
             .spawn(Arc::clone(&self.reader_fonts), runtime, proxy);
         let wake = proxy.clone();
@@ -670,6 +678,7 @@ impl ShelfFeature {
                 .books()
                 .iter()
                 .map(|book| LibraryBook {
+                    cached_toc: None,
                     id: book.id.clone(),
                     title: book.title.clone(),
                     authors: book.authors.clone(),
@@ -992,6 +1001,7 @@ impl ShelfFeature {
                     // Covers remain in the library; copying their encoded
                     // bytes on every animation frame dominates shelf CPU work.
                     .map(|book| LibraryBook {
+                        cached_toc: None,
                         id: book.id.clone(),
                         title: book.title.clone(),
                         authors: book.authors.clone(),
@@ -1833,6 +1843,7 @@ mod tests {
 
     fn book(id: &str, added_at: u64) -> LibraryBook {
         LibraryBook {
+            cached_toc: None,
             id: id.into(),
             title: id.into(),
             authors: Vec::new(),

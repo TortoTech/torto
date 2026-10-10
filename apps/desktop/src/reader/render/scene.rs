@@ -133,11 +133,22 @@ impl DesktopReader {
         let layers = self.page_scene_layers();
         let mut scene = Scene::new();
         scene.append(&layers.underlay, None);
+        let mut images = Vec::new();
         match self.reader.current_spread() {
             Ok(spread) => {
                 let mut bridge = VelloScene::new(&mut scene);
+                images.extend(spread.primary.paint_image_layer_in(
+                    &mut bridge,
+                    spread.primary_offset_x,
+                    None,
+                ));
                 self.paint_page_overlays(&spread.primary, &mut bridge, spread.primary_offset_x);
                 if let Some(secondary) = spread.secondary {
+                    images.extend(secondary.paint_image_layer_in(
+                        &mut bridge,
+                        spread.secondary_offset_x,
+                        None,
+                    ));
                     self.paint_page_overlays(&secondary, &mut bridge, spread.secondary_offset_x);
                 }
             }
@@ -154,7 +165,7 @@ impl DesktopReader {
             }
             Err(error) => self.error = Some(format!("组合双页失败：{error}")),
         }
-        ReaderScene::new(scene, Arc::clone(&layers.images))
+        ReaderScene::new(scene, images.into())
     }
 
     fn scroll_page_scene(&mut self) -> ReaderScene {
@@ -234,7 +245,6 @@ impl DesktopReader {
                 continue;
             }
             let layers = self.scroll_page_layers(entry);
-            images.extend(layers.images.iter().cloned());
             let mut page_scene = Scene::new();
             let clip = Rect::new(
                 0.0,
@@ -244,6 +254,18 @@ impl DesktopReader {
             );
             page_scene.push_clip_layer(peniko::Fill::NonZero, Affine::IDENTITY, &clip);
             page_scene.append(&layers.underlay, None);
+            let origin = layout.page_origins[index];
+            let visible_clip = clip.intersect(Rect::new(
+                clip.x0,
+                f64::from(viewport.offset_y - top + origin),
+                clip.x1,
+                f64::from(visible_bottom - top + origin),
+            ));
+            images.extend(entry.page.paint_image_layer_in(
+                &mut VelloScene::new(&mut page_scene),
+                0.0,
+                Some(visible_clip),
+            ));
             self.paint_page_overlays(&entry.page, &mut VelloScene::new(&mut page_scene), 0.0);
             page_scene.append(&layers.content, None);
             page_scene.pop_layer();
@@ -294,9 +316,7 @@ impl DesktopReader {
             return layers;
         }
 
-        let mut underlay = Scene::new();
-        let mut underlay_bridge = VelloScene::new(&mut underlay);
-        entry.page.paint_images_at(&mut underlay_bridge, 0.0);
+        let underlay = Scene::new();
         let mut content = Scene::new();
         entry
             .page
@@ -304,7 +324,7 @@ impl DesktopReader {
         let layers = Arc::new(PageSceneLayers {
             underlay: Arc::new(underlay),
             content: Arc::new(content),
-            images: entry.page.image_data().cloned().collect(),
+            images: Arc::from([]),
         });
         self.page_scenes.insert(key, Arc::clone(&layers));
         self.touch_page_scene(key);
@@ -325,19 +345,10 @@ impl DesktopReader {
 
         let mut underlay = Scene::new();
         let mut content = Scene::new();
-        let mut images = Vec::new();
         match self.reader.current_spread() {
             Ok(spread) => {
-                images.extend(spread.primary.image_data().cloned());
                 let mut underlay_bridge = VelloScene::new(&mut underlay);
                 spread.primary.paint_background(&mut underlay_bridge);
-                spread
-                    .primary
-                    .paint_images_at(&mut underlay_bridge, spread.primary_offset_x);
-                if let Some(secondary) = &spread.secondary {
-                    images.extend(secondary.image_data().cloned());
-                    secondary.paint_images_at(&mut underlay_bridge, spread.secondary_offset_x);
-                }
 
                 let mut content_bridge = VelloScene::new(&mut content);
                 spread
@@ -350,16 +361,18 @@ impl DesktopReader {
             }
             Err(error) => {
                 self.error = Some(format!("组合双页失败：{error}"));
-                images.extend(self.reader.current_page().image_data().cloned());
                 self.reader
                     .current_page()
-                    .paint(&mut VelloScene::new(&mut underlay));
+                    .paint_background(&mut VelloScene::new(&mut underlay));
+                self.reader
+                    .current_page()
+                    .paint_non_image_content_at(&mut VelloScene::new(&mut content), 0.0);
             }
         }
         let layers = Arc::new(PageSceneLayers {
             underlay: Arc::new(underlay),
             content: Arc::new(content),
-            images: images.into(),
+            images: Arc::from([]),
         });
         self.page_scenes.insert(key, Arc::clone(&layers));
         self.touch_page_scene(key);

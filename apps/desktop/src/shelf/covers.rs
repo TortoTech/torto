@@ -30,6 +30,10 @@ pub(crate) struct CoverCache {
 }
 
 impl CoverCache {
+    #[cfg(test)]
+    pub(crate) fn pending_decode_count(&self) -> usize {
+        self.wanted.len()
+    }
     pub fn begin_frame(&mut self, ctx: &Context) {
         self.frame = self.frame.wrapping_add(1);
         if let Some((generation, results)) = self.job.poll()

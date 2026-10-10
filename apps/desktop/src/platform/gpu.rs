@@ -78,6 +78,22 @@ impl ReaderGpuResidency {
     }
 }
 
+pub(crate) struct RendererReady {
+    pub id: u64,
+    pub result: Result<Box<VelloRenderer>, String>,
+}
+
+fn new_reader_renderer(device: &wgpu::Device) -> Result<VelloRenderer, String> {
+    VelloRenderer::new(
+        device,
+        VelloOptions {
+            antialiasing_support: AaSupport::area_only(),
+            ..Default::default()
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
 pub(super) struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -85,6 +101,7 @@ pub(super) struct GpuState {
     surface_config: wgpu::SurfaceConfiguration,
     egui_renderer: Renderer,
     vello_renderer: Option<VelloRenderer>,
+    prewarm_id: Option<u64>,
     page_target: Option<PageTarget>,
     retired_page_textures: Vec<TextureId>,
     clear_color: wgpu::Color,
@@ -166,6 +183,7 @@ impl GpuState {
             surface_config,
             egui_renderer,
             vello_renderer: None,
+            prewarm_id: None,
             page_target: None,
             retired_page_textures: Vec::new(),
             last_frame: None,
@@ -182,6 +200,64 @@ impl GpuState {
                 a: 1.0,
             },
         })
+    }
+
+    /// Called after presentation, so pipeline creation cannot delay the first
+    /// reader-shell frame. Completion wakes the native event loop once.
+    pub(super) fn prewarm_reader(
+        &mut self,
+        app: &DesktopApp,
+        runtime: &tokio::runtime::Runtime,
+        proxy: &winit::event_loop::EventLoopProxy<super::UserEvent>,
+    ) {
+        if !app.opening_drawn() || self.vello_renderer.is_some() || self.prewarm_id.is_some() {
+            return;
+        }
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.prewarm_id = Some(id);
+        let device = self.device.clone();
+        let proxy = proxy.clone();
+        runtime.spawn_blocking(move || {
+            let started = Instant::now();
+            let result = new_reader_renderer(&device).map(Box::new);
+            crate::diagnostics::log(
+                "render.reader_prewarm",
+                &[
+                    crate::diagnostics::Field::F32(
+                        "renderer_init_ms",
+                        started.elapsed().as_secs_f32() * 1000.0,
+                    ),
+                    crate::diagnostics::Field::Bool("success", result.is_ok()),
+                ],
+            );
+            let _ = proxy.send_event(super::UserEvent::ReaderRendererReady(RendererReady {
+                id,
+                result,
+            }));
+        });
+    }
+
+    pub(super) fn complete_prewarm(
+        &mut self,
+        message: RendererReady,
+        expected: bool,
+        runtime: &tokio::runtime::Runtime,
+    ) {
+        if self.prewarm_id != Some(message.id) {
+            runtime.spawn_blocking(move || drop(message));
+            return;
+        }
+        self.prewarm_id = None;
+        match message.result {
+            Ok(renderer) if expected && self.vello_renderer.is_none() => {
+                self.vello_renderer = Some(*renderer);
+            }
+            Ok(renderer) => {
+                runtime.spawn_blocking(move || drop(renderer));
+            }
+            Err(error) => tracing::warn!(%error, "reader renderer prewarm failed"),
+        }
     }
 
     pub(super) fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -379,9 +455,26 @@ impl GpuState {
                     .page_target
                     .as_ref()
                     .is_some_and(|target| reader_scene_needs_render(target.rendered_scene, plan));
-            if needs_render && let Some(scene) = app.reader_scene() {
-                self.render_reader_scene(&scene, plan, pixels_per_point)?;
-                self.reader_residency.observe(&scene, Instant::now());
+            if needs_render && self.prewarm_id.is_none() {
+                let capture_timings = self
+                    .page_target
+                    .as_ref()
+                    .is_some_and(|target| target.rendered_scene.is_none());
+                let encoding_started = Instant::now();
+                if let Some(scene) = app.reader_scene() {
+                    let encoding_ms = encoding_started.elapsed().as_secs_f32() * 1000.0;
+                    if cfg!(debug_assertions) && capture_timings {
+                        crate::diagnostics::log(
+                            "render.reader_scene_encoding",
+                            &[crate::diagnostics::Field::F32(
+                                "scene_encoding_ms",
+                                encoding_ms,
+                            )],
+                        );
+                    }
+                    self.render_reader_scene(&scene, plan, pixels_per_point)?;
+                    self.reader_residency.observe(&scene, Instant::now());
+                }
             }
             if let Some(delay) = self.reader_residency.trim_delay(Instant::now()) {
                 egui_ctx.request_repaint_after(delay.max(Duration::from_millis(1)));
@@ -392,7 +485,14 @@ impl GpuState {
             if let Some(target) = self.page_target.take() {
                 self.retired_page_textures.push(target.texture_id);
             }
-            self.vello_renderer = None;
+            // Release the previous book's atlas once, while retaining the fresh
+            // empty renderer prepared for this open across header/TOC frames.
+            if !app.opening_visible()
+                || !self.reader_residency.images.is_empty()
+                || self.reader_residency.rendered_at.is_some()
+            {
+                self.vello_renderer = None;
+            }
             self.reader_residency = ReaderGpuResidency::default();
         }
         if page_target_recreated {
@@ -504,7 +604,7 @@ impl GpuState {
                     .as_ref()
                     .is_some_and(|target| !reader_scene_needs_render(target.rendered_scene, plan))
         });
-        app.record_open_presentation(reader_ready);
+        app.record_open_presentation(reader_ready, egui_ctx);
         if presentation_finished.as_millis() >= 100 {
             use crate::diagnostics::{Field, log};
             let ms = |duration: std::time::Duration| duration.as_secs_f32() * 1000.0;
@@ -758,19 +858,15 @@ impl GpuState {
         plan: ReaderFramePlan,
         pixels_per_point: f32,
     ) -> Result<(), String> {
+        let capture_timings = self
+            .page_target
+            .as_ref()
+            .is_some_and(|target| target.rendered_scene.is_none());
         let started = std::time::Instant::now();
         if self.vello_renderer.is_none() {
-            self.vello_renderer = Some(
-                VelloRenderer::new(
-                    &self.device,
-                    VelloOptions {
-                        antialiasing_support: AaSupport::area_only(),
-                        ..Default::default()
-                    },
-                )
-                .map_err(|error| error.to_string())?,
-            );
+            self.vello_renderer = Some(new_reader_renderer(&self.device)?);
         }
+        let init_finished = started.elapsed();
         let renderer = self.vello_renderer.as_mut().unwrap();
         // Vello 0.10 can still omit a previously resolved ImageData on subsequent
         // render_to_texture calls (linebender/vello#1809). Explicitly marking
@@ -797,6 +893,7 @@ impl GpuState {
                 renderer.mark_override_image_dirty(image);
             }
         }
+        let atlas_finished = started.elapsed();
         let Some(target) = self.page_target.as_mut() else {
             return Ok(());
         };
@@ -805,6 +902,7 @@ impl GpuState {
             &scene.scene,
             Some(Affine::scale(f64::from(pixels_per_point))),
         );
+        let append_finished = started.elapsed();
         renderer
             .render_to_texture(
                 &self.device,
@@ -819,7 +917,21 @@ impl GpuState {
                 },
             )
             .map_err(|error| error.to_string())?;
+        let submit_finished = started.elapsed();
         target.rendered_scene = Some((plan.scene_id, plan.scene_revision));
+        if cfg!(debug_assertions) && capture_timings {
+            use crate::diagnostics::{Field, log};
+            let ms = |duration: Duration| duration.as_secs_f32() * 1000.0;
+            log(
+                "render.reader_breakdown",
+                &[
+                    Field::F32("renderer_init_ms", ms(init_finished)),
+                    Field::F32("atlas_prepare_ms", ms(atlas_finished - init_finished)),
+                    Field::F32("scene_append_ms", ms(append_finished - atlas_finished)),
+                    Field::F32("render_submit_ms", ms(submit_finished - append_finished)),
+                ],
+            );
+        }
         if started.elapsed().as_millis() >= 16 {
             crate::diagnostics::log(
                 "render.reader_scene_slow",

@@ -33,6 +33,7 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
     reference: Option<(&Layout<TextBrush>, &str)>,
     justify_suffix: bool,
 ) -> Option<ParagraphPlan> {
+    let _timing = crate::timing::stage(crate::timing::TimingStage::LineBreak);
     if layout.is_rtl()
         || layout
             .inline_boxes()
@@ -291,6 +292,7 @@ pub(crate) fn plan_optimized_with_hanging_indent(
     default_em: f32,
     hyphen_breaks: &HashMap<usize, f32>,
 ) -> Option<ParagraphPlan> {
+    let _timing = crate::timing::stage(crate::timing::TimingStage::LineBreak);
     let has_in_flow_box = layout
         .inline_boxes()
         .iter()
@@ -509,6 +511,7 @@ pub(crate) fn apply_breaks(
     lines: &[LineBreak],
     column_width: f32,
 ) -> Option<()> {
+    let _timing = crate::timing::stage(crate::timing::TimingStage::LineBreak);
     if lines.is_empty() || !column_width.is_finite() || column_width <= 0.0 {
         return None;
     }

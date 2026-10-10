@@ -11,10 +11,15 @@ pub enum TimingStage {
     SectionParse,
     Fonts,
     ImageSource,
+    ImageMetadata,
     ImageCache,
     ImageDecode,
     ImagePixels,
     Layout,
+    GlyphShape,
+    Hyphenation,
+    LineBreak,
+    Pagination,
     DisplayList,
 }
 

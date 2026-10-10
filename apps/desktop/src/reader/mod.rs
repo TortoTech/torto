@@ -68,6 +68,8 @@ mod blank_lines_tests;
 mod chat_autocomplete;
 mod chat_footnotes;
 mod chat_markdown;
+pub(crate) mod chrome;
+pub(crate) use egui_view::paint_toolbar_title;
 #[cfg(test)]
 mod citation_tests;
 mod completion;
@@ -76,6 +78,7 @@ mod focus_lists;
 mod focus_wheel;
 mod footnote_layout;
 mod footnote_navigation;
+mod images;
 mod interaction;
 mod navigation;
 pub(super) mod render;
@@ -92,7 +95,7 @@ use render::{PageSceneKey, PageSceneLayers};
 
 // Reader page colors follow the app theme; the light pair matches
 // ReaderStyle::default so existing books keep their warm paper look.
-fn apply_theme_colors(style: &mut ReaderStyle, theme: egui::Theme) {
+pub(crate) fn apply_theme_colors(style: &mut ReaderStyle, theme: egui::Theme) {
     match theme {
         egui::Theme::Light => {
             style.foreground = Rgba::BLACK;
@@ -159,6 +162,7 @@ pub(crate) fn open_viewport(ui: &egui::Ui) -> LayoutViewport {
     clippy::too_many_lines,
     reason = "reader construction keeps source wrappers and persisted state restoration together"
 )]
+#[cfg(any(test, all(target_os = "windows", feature = "memory-profiling")))]
 pub(crate) fn open_reader_in_viewport(
     path: &Path,
     reader_fonts: Arc<[Blob<u8>]>,
@@ -166,6 +170,34 @@ pub(crate) fn open_reader_in_viewport(
     shelf_cover: Option<Vec<u8>>,
     local_store: SyncStore,
     viewport: LayoutViewport,
+) -> Result<DesktopReader, Box<dyn std::error::Error + Send + Sync>> {
+    open_reader_staged(
+        path,
+        reader_fonts,
+        shelf_metadata,
+        shelf_cover,
+        local_store,
+        viewport,
+        None,
+        |_, _, _, _| true,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn open_reader_staged(
+    path: &Path,
+    reader_fonts: Arc<[Blob<u8>]>,
+    shelf_metadata: Option<BookDisplayMetadata>,
+    shelf_cover: Option<Vec<u8>>,
+    local_store: SyncStore,
+    viewport: LayoutViewport,
+    initial_href: Option<&rebook_publication::PublicationUrl>,
+    publish_toc: impl FnOnce(
+        Arc<[rebook_publication::TocEntry]>,
+        ReadingMode,
+        Option<String>,
+        chrome::PdfToolbarState,
+    ) -> bool,
 ) -> Result<DesktopReader, Box<dyn std::error::Error + Send + Sync>> {
     let started = Instant::now();
     let publication_started = Instant::now();
@@ -278,6 +310,54 @@ pub(crate) fn open_reader_in_viewport(
     let source_wrappers_ms = source_wrappers_started.elapsed().as_secs_f32() * 1_000.0;
     #[cfg(all(target_os = "windows", feature = "memory-profiling"))]
     crate::diagnostics::memory_checkpoint("pdf_ocr_loaded");
+    let reader_preferences = preferences::load_reader_preferences().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load reader preferences; using defaults");
+        ReaderPreferences::default()
+    });
+    let reading_mode = allowed_reading_mode(format, pdf_ocr_mode, reader_preferences.reading_mode);
+    let progress_store = Some(local_store.clone());
+    let progress_started = Instant::now();
+    let mut stored_progress = progress_store
+        .as_ref()
+        .map(|store| store.load_progress(&book_id))
+        .transpose()?
+        .flatten();
+    if let Some(progress) = stored_progress.as_mut()
+        && let Some(controller) = &pdf_ocr_controller
+    {
+        controller.remap_locator(&mut progress.locator);
+    }
+    let progress_ms = progress_started.elapsed().as_secs_f32() * 1_000.0;
+    let initial_title = initial_href
+        .or_else(|| {
+            stored_progress
+                .as_ref()
+                .map(|progress| &progress.locator.href)
+        })
+        .or_else(|| {
+            canonical_source
+                .book()
+                .sections
+                .first()
+                .map(|section| &section.href)
+        })
+        .and_then(|href| {
+            chrome::toc_label_for_href(&canonical_source.book().table_of_contents, href)
+        })
+        .map(str::to_owned);
+    if !publish_toc(
+        canonical_source.book().table_of_contents.clone().into(),
+        reading_mode,
+        initial_title,
+        chrome::PdfToolbarState {
+            available: pdf_ocr_available,
+            mode: pdf_ocr_mode,
+        },
+    ) {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "superseded book open").into(),
+        );
+    }
     let fixed_page = canonical_source.book().metadata.layout == RenditionLayout::PrePaginated;
     let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
     let translation_source = Arc::new(if fixed_page {
@@ -302,10 +382,6 @@ pub(crate) fn open_reader_in_viewport(
     let source: Arc<dyn BookSource> = structure_source.clone();
     let mut highlight_store = HighlightStore::from_repository(local_store.clone());
     let mut highlights = highlight_store.for_book(&book_id);
-    let reader_preferences = preferences::load_reader_preferences().unwrap_or_else(|error| {
-        tracing::warn!(%error, "failed to load reader preferences; using defaults");
-        ReaderPreferences::default()
-    });
     if reader_preferences.selection_granularity == SelectionGranularity::Paragraph {
         repair_legacy_translated_paragraph_highlights(
             rewrite_source.as_ref(),
@@ -313,7 +389,6 @@ pub(crate) fn open_reader_in_viewport(
             &mut highlight_store,
         );
     }
-    let reading_mode = allowed_reading_mode(format, pdf_ocr_mode, reader_preferences.reading_mode);
     let mut style = ReaderStyle {
         spread: if reading_mode == ReadingMode::Focus {
             SpreadMode::Scroll
@@ -350,44 +425,55 @@ pub(crate) fn open_reader_in_viewport(
         tracing::warn!(%error, "failed to load WebDAV credential");
         String::new()
     });
-    let progress_store = Some(local_store);
-    let progress_started = Instant::now();
-    let mut stored_progress = progress_store
-        .as_ref()
-        .map(|store| store.load_progress(&book_id))
-        .transpose()?
-        .flatten();
-    if let Some(progress) = stored_progress.as_mut()
-        && let Some(controller) = &pdf_ocr_controller
-    {
-        controller.remap_locator(&mut progress.locator);
-    }
+    let explicit_locator = initial_href.map(|href| {
+        let mut locator =
+            rebook_publication::LocatorV1::at_start(source.book().id.clone(), href.clone());
+        locator.progression = None;
+        locator
+    });
     let mut restored_source_range = stored_progress
         .as_ref()
         .and_then(|progress| progress.locator.source.clone());
-    let progress_ms = progress_started.elapsed().as_secs_f32() * 1_000.0;
     let resumed = stored_progress.is_some();
     let initial_layout_started = Instant::now();
     let timing_scope = cfg!(debug_assertions)
         .then(rebook_layout::timing::TimingScope::start)
         .flatten();
-    let mut reader = if let Some(progress) = stored_progress {
-        match ReaderSession::open_with_fonts_at_locator(
+    let open_locator = explicit_locator
+        .as_ref()
+        .or_else(|| stored_progress.as_ref().map(|progress| &progress.locator));
+    if explicit_locator.is_some() {
+        restored_source_range = None;
+    }
+    let mut reader = if let Some(locator) = open_locator {
+        match ReaderSession::open_deferred_with_fonts(
             Arc::clone(&source),
             viewport,
             style.clone(),
             Arc::clone(&reader_fonts),
-            &progress.locator,
+            Some(locator),
         ) {
             Ok(reader) => reader,
             Err(error) => {
                 tracing::warn!(%error, "failed to open at durable reading locator");
                 restored_source_range = None;
-                ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?
+                ReaderSession::open_deferred_with_fonts(
+                    Arc::clone(&source),
+                    viewport,
+                    style,
+                    reader_fonts,
+                    None,
+                )?
             }
         }
     } else {
-        ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?
+        ReaderSession::open_deferred_with_fonts(
+            Arc::clone(&source),
+            viewport,
+            style,
+            reader_fonts,
+            None,
+        )?
     };
     // Prepare the complete visible reading unit on the opening worker. The UI
     // must not discover and compile its remaining segments on the first frame.
@@ -408,10 +494,15 @@ pub(crate) fn open_reader_in_viewport(
                 Field::F32("section_parse_ms", ms(TimingStage::SectionParse)),
                 Field::F32("fonts_ms", ms(TimingStage::Fonts)),
                 Field::F32("image_source_ms", ms(TimingStage::ImageSource)),
+                Field::F32("image_metadata_ms", ms(TimingStage::ImageMetadata)),
                 Field::F32("image_cache_ms", ms(TimingStage::ImageCache)),
                 Field::F32("image_decode_ms", ms(TimingStage::ImageDecode)),
                 Field::F32("image_pixels_ms", ms(TimingStage::ImagePixels)),
                 Field::F32("layout_ms", ms(TimingStage::Layout)),
+                Field::F32("glyph_shape_ms", ms(TimingStage::GlyphShape)),
+                Field::F32("hyphenation_ms", ms(TimingStage::Hyphenation)),
+                Field::F32("line_break_ms", ms(TimingStage::LineBreak)),
+                Field::F32("pagination_ms", ms(TimingStage::Pagination)),
                 Field::F32("display_list_ms", ms(TimingStage::DisplayList)),
                 Field::F32("other_ms", ms(TimingStage::Other)),
                 Field::Usize(
@@ -675,6 +766,7 @@ pub(super) struct DesktopReader {
     footnote_layout: footnote_layout::FootnoteRenderer,
     statistics: crate::statistics::Tracker,
     reader: ReaderSession,
+    images: images::ImageLoader,
     source: Arc<dyn BookSource>,
     rewrite_source: Arc<RewriteBookSource>,
     translation_source: Arc<TranslationBookSource>,
@@ -2189,6 +2281,49 @@ fn reflow_anchor_offset(
 }
 
 impl DesktopReader {
+    pub(crate) fn cancel_open_and_return(&mut self) {
+        self.request_exit();
+    }
+
+    pub(crate) fn classic_sidebar_state(&self) -> chrome::SidebarState {
+        if self.reading_mode == ReadingMode::Classic {
+            chrome::SidebarState {
+                open: self.ui.sidebar_open,
+                pinned: self.ui.sidebar_pinned,
+                width: self.ui.sidebar_width,
+            }
+        } else {
+            self.ui.classic_sidebar
+        }
+    }
+
+    pub(crate) fn adopt_opening_chrome(
+        &mut self,
+        mode: ReadingMode,
+        sidebar: chrome::SidebarState,
+        classic: chrome::SidebarState,
+    ) {
+        self.ui.classic_sidebar = classic;
+        let sidebar = if mode == self.reading_mode {
+            sidebar
+        } else {
+            classic.for_mode(self.reading_mode)
+        };
+        self.ui.install_sidebar(sidebar);
+        self.ui.toolbar_motion = Motion::settled_with_duration(1.0, TOOLBAR_MOTION_DURATION);
+        self.ui.toolbar_hide_at = None;
+        self.ui.opening_toolbar_pending = true;
+    }
+
+    pub(crate) fn mark_open_presented(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.ui.opening_toolbar_pending) {
+            if !self.ui.toolbar_hovered && self.ui.overlay != ReaderOverlay::Menu {
+                self.ui.schedule_toolbar_hide(Instant::now());
+            }
+            self.request_frame_repaint(ctx);
+        }
+    }
+
     pub(crate) fn memory_stats(&self) -> (rebook_reader::ReaderCacheStats, usize) {
         (self.reader.cache_stats(), self.page_scene_cache_bytes())
     }
@@ -3952,7 +4087,7 @@ enum ReaderOverlay {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SidebarTab {
+pub(crate) enum SidebarTab {
     #[default]
     Toc,
     Highlights,
@@ -4053,6 +4188,8 @@ impl Motion {
     reason = "independent reader overlays and interaction states are intentionally orthogonal"
 )]
 struct ReaderUiState {
+    classic_sidebar: chrome::SidebarState,
+    opening_toolbar_pending: bool,
     sidebar_open: bool,
     sidebar_pinned: bool,
     sidebar_width: f32,
@@ -4086,6 +4223,13 @@ struct ReaderUiState {
 }
 
 impl ReaderUiState {
+    fn install_sidebar(&mut self, sidebar: chrome::SidebarState) {
+        self.sidebar_open = sidebar.open;
+        self.sidebar_pinned = sidebar.pinned;
+        self.sidebar_width = sidebar.width;
+        self.sidebar_motion = Motion::settled(if sidebar.open { 1.0 } else { 0.0 });
+    }
+
     fn set_toolbar_hovered(&mut self, hovered: bool, now: Instant) -> bool {
         if self.toolbar_hovered == hovered {
             return false;
@@ -4126,6 +4270,9 @@ impl ReaderUiState {
     }
 
     fn schedule_toolbar_hide(&mut self, now: Instant) {
+        if self.opening_toolbar_pending {
+            return;
+        }
         if self.toolbar_motion.is_visible() || self.toolbar_motion.is_animating() {
             self.toolbar_hide_at = Some(now + TOOLBAR_HIDE_DELAY);
         }
@@ -4281,6 +4428,7 @@ impl DesktopReader {
         let search = SearchUiState::default();
         Self {
             reader,
+            images: images::ImageLoader::default(),
             completion: None,
             semantic_layout: Default::default(),
             statistics: crate::statistics::Tracker::new(&book_id),
@@ -4321,6 +4469,8 @@ impl DesktopReader {
             pdf_toc,
             pdf_ocr,
             ui: ReaderUiState {
+                classic_sidebar: chrome::SidebarState::default(),
+                opening_toolbar_pending: false,
                 sidebar_open: reading_mode == ReadingMode::Classic,
                 sidebar_pinned: reading_mode == ReadingMode::Classic,
                 sidebar_width: egui_view::SIDEBAR_WIDTH,
@@ -5325,6 +5475,7 @@ mod tests {
             items: vec![PageItem::Image(ImagePlacement {
                 formula_presentation: None,
                 image: RasterImage {
+                    deferred: None,
                     origin: None,
                     blob: None,
                     width: 2,
@@ -5374,6 +5525,7 @@ mod tests {
                 items: vec![PageItem::Image(ImagePlacement {
                     formula_presentation: None,
                     image: RasterImage {
+                        deferred: None,
                         origin: None,
                         blob: None,
                         width: 2,
@@ -6586,6 +6738,8 @@ mod tests {
     fn toolbar_hide_delay_is_cancelled_when_pointer_returns() {
         let now = Instant::now();
         let mut ui = ReaderUiState {
+            classic_sidebar: crate::reader::chrome::SidebarState::default(),
+            opening_toolbar_pending: false,
             sidebar_open: false,
             sidebar_pinned: false,
             sidebar_width: super::egui_view::SIDEBAR_WIDTH,
@@ -6632,6 +6786,8 @@ mod tests {
     fn stationary_pointer_does_not_keep_postponing_toolbar_hide() {
         let now = Instant::now();
         let mut ui = ReaderUiState {
+            classic_sidebar: crate::reader::chrome::SidebarState::default(),
+            opening_toolbar_pending: false,
             sidebar_open: false,
             sidebar_pinned: false,
             sidebar_width: super::egui_view::SIDEBAR_WIDTH,

@@ -505,6 +505,16 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::Update(message) => self.app.complete_update(message),
             UserEvent::ShelfImport(message) => self.app.complete_shelf_import(message),
             UserEvent::ShelfOpen(message) => self.app.complete_shelf_open(message, &self.runtime),
+            UserEvent::ShelfOpenHeader(message) => self.app.complete_shelf_open_header(message),
+            UserEvent::ReaderRendererReady(message) => {
+                if let Some(state) = self.window.as_mut() {
+                    state
+                        .gpu
+                        .complete_prewarm(message, self.app.reader_expected(), &self.runtime);
+                } else {
+                    self.runtime.spawn_blocking(move || drop(message));
+                }
+            }
             UserEvent::ShelfSyncProgress(message) => self.app.update_shelf_sync_progress(message),
             UserEvent::ShelfSync(message) => self.app.complete_shelf_sync(message),
             UserEvent::SettingsProviderModels(message) => {
@@ -696,6 +706,9 @@ impl ApplicationHandler<UserEvent> for Application {
                     if self.app.take_fullscreen_toggle_request() {
                         toggle_fullscreen(state);
                     }
+                    state
+                        .gpu
+                        .prewarm_reader(&self.app, &self.runtime, &self.proxy);
                     self.app.spawn_pending_tasks(&self.runtime, &self.proxy);
                     #[cfg(target_os = "windows")]
                     if let Some(request) = self.app.take_update_install_request() {

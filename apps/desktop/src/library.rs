@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rebook_formats::open_bytes;
+use rebook_publication::TocEntry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 use crate::persistence::{write_bytes_atomic, write_json_atomic};
 
@@ -24,6 +26,7 @@ pub struct LibraryBook {
     pub file_name: String,
     pub path: PathBuf,
     pub cover_bytes: Option<Vec<u8>>,
+    pub cached_toc: Option<Arc<[TocEntry]>>,
     pub added_at: u64,
 }
 
@@ -72,6 +75,8 @@ struct StoredBook {
     file_name: String,
     storage_name: String,
     cover_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cached_toc: Option<Vec<TocEntry>>,
     added_at: u64,
 }
 
@@ -111,7 +116,10 @@ impl LocalLibrary {
                     .cover_name
                     .as_ref()
                     .and_then(|name| fs::read(root.join(COVERS_DIRECTORY).join(name)).ok());
+                let cached_toc =
+                    load_toc_metadata(&root, &book.id).or_else(|| book.cached_toc.map(Arc::from));
                 LibraryBook {
+                    cached_toc,
                     id: book.id,
                     title: book.title,
                     authors: book.authors,
@@ -124,6 +132,13 @@ impl LocalLibrary {
             .collect::<Vec<_>>();
         books.sort_by_key(|book| std::cmp::Reverse(book.added_at));
         Ok(Self { root, books })
+    }
+
+    /// In-memory adoption only; metadata I/O is performed by the opening worker.
+    pub(crate) fn adopt_cached_toc(&mut self, id: &str, toc: Arc<[TocEntry]>) {
+        if let Some(book) = self.books.iter_mut().find(|book| book.id == id) {
+            book.cached_toc = Some(toc);
+        }
     }
 
     pub fn books(&self) -> &[LibraryBook] {
@@ -175,6 +190,7 @@ impl LocalLibrary {
         let cover_bytes = publication.cover_bytes().map(<[u8]>::to_vec);
         let cover_name = cover_bytes.as_ref().map(|_| format!("{id}.cover"));
         let book = LibraryBook {
+            cached_toc: Some(publication.book().table_of_contents.clone().into()),
             id,
             title,
             authors: metadata.authors.clone(),
@@ -215,6 +231,7 @@ impl LocalLibrary {
             .or_else(|| publication.cover_bytes().map(<[u8]>::to_vec));
         let cover_name = cover_bytes.as_ref().map(|_| format!("{}.cover", remote.id));
         let book = LibraryBook {
+            cached_toc: Some(publication.book().table_of_contents.clone().into()),
             id: remote.id,
             title,
             authors,
@@ -340,6 +357,7 @@ impl LocalLibrary {
             books: books
                 .iter()
                 .map(|book| StoredBook {
+                    cached_toc: book.cached_toc.as_ref().map(|toc| toc.to_vec()),
                     id: book.id.clone(),
                     title: book.title.clone(),
                     authors: book.authors.clone(),
@@ -392,6 +410,7 @@ impl LocalLibrary {
     }
 
     fn cleanup_book_files(&self, book: &LibraryBook) {
+        remove_if_exists_warn(&toc_metadata_path(&self.root, &book.id));
         remove_if_exists_warn(&book.path);
         remove_if_exists_warn(
             &self
@@ -448,6 +467,7 @@ mod tests {
         let mut library = LocalLibrary::load_from(root.clone()).unwrap();
         for (id, cover) in [("missing", None), ("existing", Some(b"original".to_vec()))] {
             library.books.push(LibraryBook {
+                cached_toc: None,
                 id: id.into(),
                 title: id.into(),
                 authors: Vec::new(),
@@ -501,6 +521,7 @@ mod tests {
         let mut library = LocalLibrary::load_from(root.clone()).unwrap();
         for id in ["first", "second"] {
             library.books.push(LibraryBook {
+                cached_toc: None,
                 id: id.into(),
                 title: id.into(),
                 authors: Vec::new(),
@@ -558,6 +579,7 @@ mod tests {
         let managed_path = root.join(BOOKS_DIRECTORY).join("first.epub");
         fs::write(&managed_path, b"fixture").unwrap();
         library.books.push(LibraryBook {
+            cached_toc: None,
             id: "first".into(),
             title: "第一本书".into(),
             authors: vec!["作者".into()],
@@ -584,6 +606,7 @@ mod tests {
         let managed_path = root.join(BOOKS_DIRECTORY).join("managed.epub");
         fs::write(&managed_path, b"fixture").unwrap();
         library.books.push(LibraryBook {
+            cached_toc: None,
             id: "managed".into(),
             title: "Managed".into(),
             authors: Vec::new(),
@@ -633,6 +656,7 @@ mod tests {
         let managed_path = root.join(BOOKS_DIRECTORY).join("book.pdf");
         fs::write(&managed_path, b"fixture").unwrap();
         library.books.push(LibraryBook {
+            cached_toc: None,
             id: "book".into(),
             title: "filename".into(),
             authors: Vec::new(),
@@ -720,6 +744,7 @@ mod tests {
         let managed_path = root.join(BOOKS_DIRECTORY).join("managed.epub");
         fs::write(&managed_path, b"fixture").unwrap();
         library.books.push(LibraryBook {
+            cached_toc: None,
             id: "managed".into(),
             title: "Managed".into(),
             authors: Vec::new(),
@@ -772,5 +797,132 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+}
+
+// Per-book library metadata avoids racing background cache updates against
+// library.json imports/removals/sync. Normal manifest commits also retain TOCs.
+#[derive(Serialize, Deserialize)]
+struct TocMetadata {
+    version: u32,
+    book_id: String,
+    entries: Vec<TocEntry>,
+}
+
+fn toc_metadata_path(root: &Path, id: &str) -> PathBuf {
+    let key = format!("{:x}", Sha256::digest(id.as_bytes()));
+    root.join("metadata").join(format!("{key}.toc.json"))
+}
+
+fn load_toc_metadata(root: &Path, id: &str) -> Option<Arc<[TocEntry]>> {
+    let path = toc_metadata_path(root, id);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read library TOC cache");
+            return None;
+        }
+    };
+    match serde_json::from_slice::<TocMetadata>(&bytes) {
+        Ok(cache) if cache.version == 1 && cache.book_id == id => Some(cache.entries.into()),
+        _ => {
+            tracing::warn!("ignoring invalid library TOC cache");
+            None
+        }
+    }
+}
+
+pub(crate) fn cache_book_toc(book: &LibraryBook, entries: &[TocEntry]) -> LibraryResult<()> {
+    let Some(root) = book.path.parent().and_then(Path::parent) else {
+        return Ok(());
+    };
+    if !book.path.is_file() {
+        return Ok(());
+    }
+    let path = toc_metadata_path(root, &book.id);
+    fs::create_dir_all(path.parent().expect("metadata parent"))?;
+    write_json_atomic(
+        &path,
+        &TocMetadata {
+            version: 1,
+            book_id: book.id.clone(),
+            entries: entries.to_vec(),
+        },
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod toc_cache_tests {
+    use super::*;
+    fn entry(label: &str) -> TocEntry {
+        TocEntry {
+            label: label.into(),
+            href: Some(rebook_publication::PublicationUrl::parse("chapter.xhtml#part").unwrap()),
+            children: vec![TocEntry {
+                label: "Child".into(),
+                href: None,
+                children: vec![],
+            }],
+        }
+    }
+    #[test]
+    fn old_manifest_loads_and_toc_cache_round_trips_without_replacing_library_metadata() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("toc-cache-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let manifest = serde_json::json!({ "version": 1, "books": [{
+            "id": "immutable-book", "title": "Title", "authors": [], "file_name": "book.epub",
+            "storage_name": "immutable-book.epub", "cover_name": null, "added_at": 1
+        }] });
+        fs::write(root.join(MANIFEST_FILE), manifest.to_string()).unwrap();
+        let mut library = LocalLibrary::load_from(root.clone()).unwrap();
+        assert!(library.books()[0].cached_toc.is_none());
+        fs::write(&library.books()[0].path, b"fixture").unwrap();
+        let before = fs::read(root.join(MANIFEST_FILE)).unwrap();
+        let entries = vec![entry("Chapter")];
+        cache_book_toc(&library.books()[0], &entries).unwrap();
+        assert_eq!(before, fs::read(root.join(MANIFEST_FILE)).unwrap());
+        let loaded = LocalLibrary::load_from(root.clone()).unwrap();
+        assert_eq!(
+            loaded.books()[0].cached_toc.as_deref(),
+            Some(entries.as_slice())
+        );
+        library.adopt_cached_toc("immutable-book", entries.clone().into());
+        library.persist().unwrap();
+        let stored: StoredLibrary =
+            serde_json::from_slice(&fs::read(root.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert_eq!(stored.books[0].cached_toc, Some(entries));
+        assert_eq!(stored.books[0].title, "Title");
+        // A damaged optional cache must not make the shelf or book unreadable.
+        fs::write(toc_metadata_path(&root, "immutable-book"), b"{broken}").unwrap();
+        assert!(
+            LocalLibrary::load_from(root).unwrap().books()[0]
+                .cached_toc
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn toc_metadata_cannot_be_applied_to_another_book_or_future_version() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp")
+            .join(format!("toc-identity-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("metadata")).unwrap();
+        let file = toc_metadata_path(&root, "book");
+        for (version, id) in [(1, "other"), (2, "book")] {
+            write_json_atomic(
+                &file,
+                &TocMetadata {
+                    version,
+                    book_id: id.into(),
+                    entries: vec![entry("Wrong")],
+                },
+            )
+            .unwrap();
+            assert!(load_toc_metadata(&root, "book").is_none());
+        }
     }
 }

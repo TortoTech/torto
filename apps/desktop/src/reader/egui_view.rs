@@ -9,6 +9,7 @@ use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, chat_reference_token, move_suggestion_index,
 };
 use super::chat_markdown::ChatMarkdownState;
+use super::chrome;
 use super::{
     AnnotationDraft, AssistantPanel, DesktopReader, GeneratedTocDraft, ImagePointerState,
     ImagePressCandidate, MOTION_EPSILON, ReaderOverlay, SelectedImage, SidebarTab,
@@ -52,9 +53,9 @@ const ASSISTANT_SELECTION_SCROLL_MIN_SPEED: f32 = 90.0;
 const ASSISTANT_SELECTION_SCROLL_MAX_SPEED: f32 = 640.0;
 const ASSISTANT_KEYBOARD_SCROLL_STEP: f32 = 64.0;
 pub(super) const TOOLBAR_HEIGHT: f32 = 44.0;
-const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
+pub(super) const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
 const TOOLBAR_TITLE_SIZE: f32 = 15.0;
-const TOC_ROW_HEIGHT: f32 = 36.0;
+const TOC_ROW_HEIGHT: f32 = chrome::TOC_ROW_HEIGHT;
 const TOC_SCROLL_ID_SALT: &str = "reader-toc-scroll";
 const WHEEL_PAGE_THRESHOLD: f32 = 18.0;
 const WHEEL_TURN_COOLDOWN: Duration = Duration::from_millis(120);
@@ -560,9 +561,9 @@ impl DesktopReader {
     ) {
         covers.begin_frame(ctx);
         self.cover_texture = if self.ui.sidebar_motion.value > 0.001 {
-            self.cover
-                .as_deref()
-                .and_then(|bytes| covers.texture_sized(ctx, &self.book_id, bytes, [52, 74]))
+            self.cover.as_deref().and_then(|bytes| {
+                covers.texture_sized(ctx, &self.book_id, bytes, chrome::SIDEBAR_COVER_SIZE)
+            })
         } else {
             None
         };
@@ -633,11 +634,18 @@ impl DesktopReader {
         let background = self.reader.style().background;
         let background_ui = color32(background);
         let mut page_rect = Rect::NOTHING;
+        let mut toolbar_rect = Rect::NOTHING;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(background_ui))
             .show(root_ui, |ui| {
                 #[cfg(not(target_os = "windows"))]
-                self.toolbar(ui, background_ui);
+                {
+                    toolbar_rect = Rect::from_min_size(
+                        ui.next_widget_position(),
+                        Vec2::new(ui.available_width(), TOOLBAR_HEIGHT),
+                    );
+                    self.toolbar(ui, background_ui);
+                }
                 #[cfg(target_os = "windows")]
                 {
                     let (row, _) = ui.allocate_exact_size(
@@ -649,7 +657,7 @@ impl DesktopReader {
                         - TOOLBAR_CONTROL_SIZE
                         - 12.0)
                         .min(row.right());
-                    let toolbar_rect = Rect::from_min_max(
+                    toolbar_rect = Rect::from_min_max(
                         row.min,
                         Pos2::new(right.max(row.left() + 1.0), row.bottom()),
                     );
@@ -730,6 +738,15 @@ impl DesktopReader {
             self.floating_sidebar(&ctx, sidebar_progress);
         }
         self.header_sidebar_toggles(&ctx, page_rect, sidebar_progress);
+        if self.ui.toolbar_motion.value > 0.02 || self.ui.overlay == ReaderOverlay::Menu {
+            paint_toolbar_title(
+                root_ui,
+                toolbar_rect,
+                page_rect.center().x,
+                self.current_chapter_title(),
+                3.0 + self.pdf_ocr_toolbar_control_count(),
+            );
+        }
         if self.is_focus_mode() {
             self.focus_actions_overlay(&ctx, page_rect);
             self.focus_assistant_overlay(&ctx, page_rect);
@@ -778,6 +795,7 @@ impl DesktopReader {
             ctx.set_cursor_icon(egui::CursorIcon::None);
         }
 
+        self.prepare_visible_images(&ctx);
         ReaderFramePlan {
             rect: page_rect,
             scene_id: self.scene_id,
@@ -1062,22 +1080,11 @@ impl DesktopReader {
                     .unwrap_or(0.0);
         }
         if sidebar_consumes_width {
-            #[cfg(target_os = "windows")]
-            let sidebar_margin = egui::Margin {
-                top: ((TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) / 2.0) as i8,
-                ..egui::Margin::same(SIDEBAR_PADDING)
-            };
-            #[cfg(not(target_os = "windows"))]
-            let sidebar_margin = egui::Margin::same(SIDEBAR_PADDING);
             egui::Panel::left("reader-sidebar")
                 .exact_size(self.ui.sidebar_width * sidebar_progress)
                 .resizable(false)
                 .show_separator_line(false)
-                .frame(
-                    egui::Frame::new()
-                        .fill(palette().surface)
-                        .inner_margin(sidebar_margin),
-                )
+                .frame(chrome::sidebar_frame(false))
                 .show(root_ui, |ui| self.sidebar(ui));
         }
         if assistant_consumes_width {
@@ -2189,14 +2196,12 @@ impl DesktopReader {
             page_rect.left()
         };
         #[cfg(target_os = "windows")]
-        let right = page_rect.right().min(
-            screen.right()
-                - crate::app::window_chrome::reserve_width(ctx)
-                - TOOLBAR_CONTROL_SIZE
-                - 12.0,
-        );
+        let menu_left = screen.right()
+            - crate::app::window_chrome::reserve_width(ctx)
+            - TOOLBAR_CONTROL_SIZE
+            - 12.0;
         #[cfg(not(target_os = "windows"))]
-        let right = page_rect.right() - TOOLBAR_CONTROL_SIZE - 12.0;
+        let menu_left = page_rect.right() - TOOLBAR_CONTROL_SIZE - 12.0;
         let y = screen.top() + (TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) * 0.5;
         if (hovered || self.ui.sidebar_open || floating)
             && !(self.is_focus_mode() && (self.ui.sidebar_open || floating))
@@ -2222,7 +2227,10 @@ impl DesktopReader {
         if hovered || self.ui.assistant_panel.is_some() {
             egui::Area::new(egui::Id::new("reader-right-sidebar-toggle"))
                 .order(egui::Order::Foreground)
-                .fixed_pos(Pos2::new(right - TOOLBAR_CONTROL_SIZE - 12.0, y))
+                .fixed_pos(Pos2::new(
+                    super::chrome::right_sidebar_button_left(page_rect.right(), menu_left),
+                    y,
+                ))
                 .constrain(false)
                 .default_size(Vec2::splat(TOOLBAR_CONTROL_SIZE))
                 .show(ctx, |ui| {
@@ -2252,7 +2260,6 @@ impl DesktopReader {
         let content_left = self.toolbar_content_left(toolbar_width);
         let toolbar_actions_visible = self.ui.toolbar_motion.value.clamp(0.0, 1.0) > 0.02
             || self.ui.overlay == ReaderOverlay::Menu;
-        let chapter_title = self.current_chapter_title().to_owned();
         egui::Frame::new()
             .fill(background)
             .inner_margin(egui::Margin::symmetric(0, vertical_padding))
@@ -2327,9 +2334,6 @@ impl DesktopReader {
                     }
                 });
             });
-        if toolbar_actions_visible {
-            paint_toolbar_title(ui, hover_rect, content_left, true, &chapter_title);
-        }
         #[cfg(target_os = "windows")]
         let hovered = crate::app::window_chrome::state(ui.ctx()).header_hovered;
         #[cfg(not(target_os = "windows"))]
@@ -2345,10 +2349,7 @@ impl DesktopReader {
     }
 
     fn pdf_ocr_toolbar_control_count(&self) -> f32 {
-        if self.format != rebook_formats::BookFormat::Pdf {
-            return 0.0;
-        }
-        1.0 + if self.pdf_ocr.available { 1.0 } else { 0.0 }
+        chrome::pdf_toolbar_control_count(Some(self.format))
     }
 
     fn pdf_ocr_toolbar_controls(&mut self, ui: &mut egui::Ui) {
@@ -2440,29 +2441,18 @@ impl DesktopReader {
                 }
             });
         });
-        if self.pdf_ocr.available {
-            let pending = self.pdf_ocr.original_task.is_pending();
-            let switch = ui
-                .add_enabled_ui(!pending, |ui| {
-                    selectable_icon_button(
-                        ui,
-                        Icon::Type,
-                        self.pdf_ocr.mode == PdfOcrViewMode::Reflow,
-                    )
-                })
-                .inner
-                .on_disabled_hover_text(
-                    self.language
-                        .text("正在切换阅读模式…", "Switching reading view…"),
-                )
-                .on_hover_text(if self.pdf_ocr.mode == PdfOcrViewMode::Reflow {
-                    self.language.text("切换到原始 PDF", "Show original PDF")
-                } else {
-                    self.language.text("切换到文字版式", "Show text reflow")
-                });
-            if switch.clicked() && self.toggle_pdf_ocr_view() {
-                ui.ctx().request_repaint();
-            }
+        let switch = chrome::pdf_text_switch(
+            ui,
+            self.language,
+            chrome::PdfToolbarState {
+                available: self.pdf_ocr.available,
+                mode: self.pdf_ocr.mode,
+            },
+            true,
+            self.pdf_ocr.original_task.is_pending(),
+        );
+        if switch.clicked() && self.toggle_pdf_ocr_view() {
+            ui.ctx().request_repaint();
         }
     }
 
@@ -2499,59 +2489,21 @@ impl DesktopReader {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !self.is_focus_mode()
-                    && icon_button(
-                        ui,
-                        if self.ui.sidebar_pinned {
-                            Icon::Pin
-                        } else {
-                            Icon::PinOff
-                        },
-                    )
-                    .on_hover_text(if self.ui.sidebar_pinned {
-                        self.language.text("取消固定", "Unpin sidebar")
-                    } else {
-                        self.language.text("固定侧栏", "Pin sidebar")
-                    })
-                    .clicked()
-                {
-                    self.ui.sidebar_pinned = !self.ui.sidebar_pinned;
-                }
-
-                if selectable_icon_button(
-                    ui,
-                    Icon::ListTree,
-                    self.ui.sidebar_tab == SidebarTab::Toc,
-                )
-                .on_hover_text(self.language.text("目录", "Contents"))
-                .clicked()
-                {
-                    self.set_sidebar_tab(SidebarTab::Toc);
-                }
-                if selectable_icon_button(
-                    ui,
-                    Icon::MessageSquareText,
-                    self.ui.sidebar_tab == SidebarTab::Highlights,
-                )
-                .on_hover_text(self.language.text("高亮与批注", "Highlights & notes"))
-                .clicked()
-                {
-                    self.set_sidebar_tab(SidebarTab::Highlights);
-                }
-                if selectable_icon_button(
-                    ui,
-                    Icon::Search,
-                    self.ui.sidebar_tab == SidebarTab::Search,
-                )
-                .on_hover_text(self.language.text("搜索", "Search"))
-                .clicked()
-                {
-                    self.open_search();
-                }
-            });
-        });
+        match chrome::sidebar_toolbar(
+            ui,
+            self.language,
+            self.reading_mode,
+            self.ui.sidebar_pinned,
+            self.ui.sidebar_tab,
+            true,
+        ) {
+            Some(chrome::SidebarAction::TogglePin) => {
+                self.ui.sidebar_pinned = !self.ui.sidebar_pinned
+            }
+            Some(chrome::SidebarAction::Tab(SidebarTab::Search)) => self.open_search(),
+            Some(chrome::SidebarAction::Tab(tab)) => self.set_sidebar_tab(tab),
+            None => {}
+        }
         self.book_summary(ui);
         ui.separator();
         ui.add_space(4.0);
@@ -2610,13 +2562,7 @@ impl DesktopReader {
             .default_size(Vec2::new(self.ui.sidebar_width, screen.height()))
             .show(ctx, |ui| {
                 ui.set_clip_rect(screen);
-                let frame = egui::Frame::new()
-                    .fill(palette().surface)
-                    .stroke(egui::Stroke::new(1.0, palette().border))
-                    .inner_margin(egui::Margin {
-                        top: ((TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) / 2.0) as i8 - 1,
-                        ..egui::Margin::same(SIDEBAR_PADDING)
-                    });
+                let frame = chrome::sidebar_frame(true);
                 let inset = frame.total_margin().sum();
                 frame.show(ui, |ui| {
                     ui.set_width((self.ui.sidebar_width - inset.x).max(1.0));
@@ -3473,44 +3419,13 @@ impl DesktopReader {
     }
 
     fn book_summary(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            if let Some(texture) = &self.cover_texture {
-                ui.add(egui::Image::new(texture).fit_to_exact_size(Vec2::new(52.0, 74.0)));
-            } else {
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(52.0, 74.0), egui::Sense::hover());
-                ui.painter().rect_filled(rect, 5.0, palette().surface_muted);
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    self.format.label(),
-                    egui::FontId::proportional(crate::ui::scaled_font_size(10.0)),
-                    palette().accent,
-                );
-            }
-            let summary_width = ui.available_width().max(1.0);
-            ui.allocate_ui_with_layout(
-                Vec2::new(summary_width, 74.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.label(
-                        RichText::new(&self.display_metadata.title)
-                            .strong()
-                            .color(palette().text),
-                    )
-                    .on_hover_text(&self.display_metadata.title);
-                    let authors = self.display_metadata.authors.join(" / ");
-                    if !authors.is_empty() {
-                        ui.label(
-                            RichText::new(authors)
-                                .size(crate::ui::scaled_font_size(12.0))
-                                .color(palette().muted),
-                        );
-                    }
-                },
-            );
-        });
-        ui.add_space(10.0);
+        chrome::sidebar_book_summary(
+            ui,
+            &self.display_metadata.title,
+            &self.display_metadata.authors,
+            self.format.label(),
+            self.cover_texture.as_ref(),
+        );
     }
 
     fn visible_toc_row_indices(&self) -> Vec<usize> {
@@ -3551,59 +3466,21 @@ impl DesktopReader {
             } else {
                 &row.label
             };
-            let (row_rect, row_response) = ui.allocate_exact_size(
-                Vec2::new(content_width, TOC_ROW_HEIGHT),
-                egui::Sense::click(),
+            let action = chrome::toc_row(
+                ui,
+                chrome::TocRowAppearance {
+                    id: &row.id,
+                    label: display_label,
+                    depth: row.depth,
+                    has_children: row.has_children,
+                    expanded: self.ui.expanded_toc.contains(&row.id),
+                    selected,
+                    keyboard_focused,
+                },
+                self.language,
             );
-            let mut row_response = row_response.on_hover_cursor(egui::CursorIcon::PointingHand);
-            let row_fill = if selected {
-                palette().accent_soft
-            } else if keyboard_focused || row_response.hovered() {
-                ui.visuals().widgets.hovered.weak_bg_fill
-            } else {
-                Color32::TRANSPARENT
-            };
-            if row_fill != Color32::TRANSPARENT {
-                ui.painter().rect_filled(row_rect, 6.0, row_fill);
-            }
-            if keyboard_focused {
-                ui.painter().rect_stroke(
-                    row_rect,
-                    6.0,
-                    egui::Stroke::new(1.0, palette().accent.gamma_multiply(0.72)),
-                    egui::StrokeKind::Inside,
-                );
-            }
-            let depth = u16::try_from(row.depth).unwrap_or(u16::MAX);
-            let toggle_rect = Rect::from_min_size(
-                Pos2::new(
-                    row_rect.left() + 2.0 + f32::from(depth) * 12.0,
-                    row_rect.top() + 5.0,
-                ),
-                Vec2::splat(26.0),
-            );
-            let toggle = if row.has_children {
-                let expanded = self.ui.expanded_toc.contains(&row.id);
-                toc_toggle_button(
-                    ui,
-                    toggle_rect.center(),
-                    &row.id,
-                    expanded,
-                    selected || keyboard_focused,
-                    self.language.text("折叠", "Collapse"),
-                    self.language.text("展开", "Expand"),
-                )
-            } else {
-                false
-            };
-            let label_rect = toc_label_rect(row_rect, toggle_rect);
-            if paint_toc_label(ui, label_rect, display_label, selected || keyboard_focused) {
-                row_response = row_response.on_hover_text(display_label);
-            }
-            row_response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), display_label)
-            });
-            let navigate = row_response.clicked() && !toggle;
+            let toggle = matches!(action, Some(chrome::TocRowAction::Toggle));
+            let navigate = matches!(action, Some(chrome::TocRowAction::Navigate));
 
             if toggle {
                 self.toggle_toc(&row.id);
@@ -5380,7 +5257,7 @@ impl DesktopReader {
     }
 }
 
-fn paint_toc_label(ui: &egui::Ui, rect: Rect, label: &str, selected: bool) -> bool {
+pub(super) fn paint_toc_label(ui: &egui::Ui, rect: Rect, label: &str, selected: bool) -> bool {
     if rect.width() <= 0.0 {
         return false;
     }
@@ -5438,7 +5315,7 @@ fn elide_text_to_width(
     (format!("{}…", &label[..boundaries[lower]]), true)
 }
 
-fn toc_label_rect(row: Rect, toggle: Rect) -> Rect {
+pub(super) fn toc_label_rect(row: Rect, toggle: Rect) -> Rect {
     // Keep an arrow-sized leading slot even for leaf entries so labels align
     // with expandable rows instead of crowding the sidebar edge.
     let left = toggle.right() + 2.0;
@@ -5586,7 +5463,7 @@ fn stable_virtual_row_range(
     min_row..max_row
 }
 
-fn toc_toggle_button(
+pub(super) fn toc_toggle_button(
     ui: &mut egui::Ui,
     center: Pos2,
     id: &str,
@@ -6669,32 +6546,32 @@ fn unit_f32(value: f64) -> f32 {
     value.clamp(0.0, 1.0) as f32
 }
 
-fn toolbar_title_x(toolbar_rect: Rect, content_left: f32, toolbar_visible: bool) -> f32 {
-    if toolbar_visible {
-        toolbar_rect.center().x
-    } else {
-        toolbar_rect.left() + content_left
-    }
-}
-
-fn paint_toolbar_title(
+pub(crate) fn paint_toolbar_title(
     ui: &egui::Ui,
     toolbar_rect: Rect,
-    content_left: f32,
-    toolbar_visible: bool,
+    title_x: f32,
     title: &str,
+    left_control_count: f32,
 ) {
-    let title_x = toolbar_title_x(toolbar_rect, content_left, toolbar_visible);
-    let title_inset = (TOOLBAR_CONTROL_SIZE * 3.0 + f32::from(SIDEBAR_PADDING))
-        .min((toolbar_rect.width() / 2.0 - 1.0).max(0.0));
-    let title_clip = if toolbar_visible {
-        toolbar_rect.shrink2(Vec2::new(title_inset, 0.0))
-    } else {
-        Rect::from_min_max(
-            Pos2::new(toolbar_rect.left() + content_left, toolbar_rect.top()),
-            toolbar_rect.max,
-        )
-    };
+    // The title follows the body center. Controls only constrain its available
+    // width, so asymmetric native caption buttons cannot shift the title.
+    #[cfg(target_os = "windows")]
+    let right_controls_width = TOOLBAR_CONTROL_SIZE;
+    #[cfg(not(target_os = "windows"))]
+    let right_controls_width = TOOLBAR_CONTROL_SIZE * 2.0 + 12.0;
+    let title_clip = Rect::from_min_max(
+        Pos2::new(
+            toolbar_rect.left()
+                + TOOLBAR_CONTROL_SIZE * left_control_count
+                + f32::from(SIDEBAR_PADDING)
+                + 8.0,
+            toolbar_rect.top(),
+        ),
+        Pos2::new(
+            toolbar_rect.right() - right_controls_width - 8.0,
+            toolbar_rect.bottom(),
+        ),
+    );
     #[cfg(target_os = "windows")]
     let title_clip = {
         let mut title_clip = title_clip;
@@ -6709,11 +6586,10 @@ fn paint_toolbar_title(
         }
         title_clip
     };
-    let width = if toolbar_visible {
-        ((title_x - title_clip.left()).min(title_clip.right() - title_x) * 2.0).max(0.0)
-    } else {
-        title_clip.width().max(0.0)
-    };
+    let width = ((title_x - title_clip.left()).min(title_clip.right() - title_x) * 2.0).max(0.0);
+    if width <= 0.0 {
+        return;
+    }
     let mut job = egui::text::LayoutJob::simple(
         title.to_owned(),
         egui::FontId::proportional(crate::ui::scaled_font_size(TOOLBAR_TITLE_SIZE)),
@@ -6723,11 +6599,7 @@ fn paint_toolbar_title(
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     let galley = ui.painter().layout_job(job);
-    let left = if toolbar_visible {
-        title_x - galley.size().x * 0.5
-    } else {
-        title_x
-    };
+    let left = title_x - galley.size().x * 0.5;
     ui.painter().with_clip_rect(title_clip).galley(
         Pos2::new(left, toolbar_rect.center().y - galley.size().y * 0.5),
         galley,
@@ -6879,6 +6751,250 @@ mod reference_suggestion_label_tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn opening_sidebar_header_and_toc_match_loaded_reader_with_and_without_cover_texture() {
+        use crate::app::window_chrome;
+        use crate::preferences::ReadingMode;
+        for width in [220.0, 310.0, 420.0] {
+            for title in ["Designing Type", "Thinking in Systems: A Primer (2008)"] {
+                let classic = chrome::SidebarState {
+                    width,
+                    ..Default::default()
+                };
+                let toc = vec![rebook_publication::TocEntry {
+                    label: "Parent chapter".into(), href: None,
+                    children: vec![rebook_publication::TocEntry {
+                        label: "A long nested chapter label which is truncated in a narrow directory".into(),
+                        href: Some(rebook_publication::PublicationUrl::parse("chapter.xhtml").unwrap()), children: vec![],
+                    }],
+                }, rebook_publication::TocEntry { label: "Leaf chapter".into(), href: None, children: vec![] }];
+                let (mut reader, _, _) =
+                    crate::reader::semantic_layout::tests::fixture_with_toc(toc.clone());
+                let book = crate::library::LibraryBook {
+                    id: "sidebar-audit".into(),
+                    title: title.into(),
+                    authors: vec!["Karen Cheng".into()],
+                    file_name: "book.epub".into(),
+                    path: "book.epub".into(),
+                    cover_bytes: None,
+                    added_at: 0,
+                    cached_toc: Some(toc.into()),
+                };
+                let mut opening = crate::shelf::OpeningShell::new(
+                    book.clone(),
+                    Instant::now(),
+                    ReadingMode::Classic,
+                    classic,
+                );
+                opening.expand_toc_path(&[0]);
+                reader.reading_mode = ReadingMode::Classic;
+                reader.display_metadata = crate::reader::BookDisplayMetadata::from(&book);
+                reader.format = rebook_formats::BookFormat::Epub;
+                reader.adopt_opening_chrome(ReadingMode::Classic, classic, classic);
+                let ctx = egui::Context::default();
+                let mut covers = crate::shelf::covers::CoverCache::default();
+                let mut positions = Vec::new();
+                for stage in 0..3 {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1200.0, 800.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |root| {
+                            window_chrome::begin_frame(root.ctx());
+                            if stage == 0 {
+                                opening.ui(
+                                    root,
+                                    &mut covers,
+                                    AppLanguage::English,
+                                    &Default::default(),
+                                    false,
+                                );
+                            } else {
+                                if stage == 2 {
+                                    reader.cover_texture = Some(ctx.load_texture(
+                                        "sidebar-audit-cover",
+                                        egui::ColorImage::filled([2, 2], Color32::WHITE),
+                                        Default::default(),
+                                    ));
+                                }
+                                reader.ui(root, None, false);
+                            }
+                        },
+                    );
+                    output.textures_delta.clear();
+                    let text_rect = |label: &str| {
+                        output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                egui::Shape::Text(text)
+                                    if text.galley.text() == label
+                                        && shape.clip_rect.right() <= width =>
+                                {
+                                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                                }
+                                _ => None,
+                            })
+                            .expect("book metadata is visible in every stage")
+                    };
+                    let title_rect = text_rect(title);
+                    let author_rect = text_rect("Karen Cheng");
+                    let mut controls: Vec<_> = window_chrome::geometry(&ctx)
+                        .excluded
+                        .into_iter()
+                        .filter(|rect| rect.right() <= width && rect.center().y < TOOLBAR_HEIGHT)
+                        .collect();
+                    controls.sort_by(|a, b| a.left().total_cmp(&b.left()));
+                    assert_eq!(
+                        controls.len(),
+                        4,
+                        "all directory tools paint from stage={stage}"
+                    );
+                    let toc_labels: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text)
+                                if shape.clip_rect.right() <= width
+                                    && ["Parent chapter", "A long ", "Leaf chapter"]
+                                        .iter()
+                                        .any(|label| text.galley.text().starts_with(label)) =>
+                            {
+                                Some((
+                                    text.galley.text().to_owned(),
+                                    Rect::from_min_size(text.pos, text.galley.size()),
+                                ))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        toc_labels.len(),
+                        3,
+                        "parent, nested and leaf directory rows are visible, stage={stage}"
+                    );
+                    positions.push((title_rect, author_rect, controls, toc_labels));
+                    output.textures_delta.clear();
+                }
+                assert_eq!(
+                    positions[0], positions[1],
+                    "loading and loaded directory geometry must match, width={width} title={title}"
+                );
+                assert_eq!(
+                    positions[1], positions[2],
+                    "cover decoding must not move book metadata or directory tools"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn pdf_header_buttons_keep_their_slots_from_opening_through_loaded_source_states() {
+        use crate::app::window_chrome;
+        use crate::preferences::ReadingMode;
+        use rebook_formats::BookFormat;
+        for format in [
+            BookFormat::Pdf,
+            BookFormat::Epub,
+            BookFormat::Mobi,
+            BookFormat::Azw,
+            BookFormat::Azw3,
+            BookFormat::Fb2,
+            BookFormat::Fbz,
+            BookFormat::Cbz,
+            BookFormat::Chm,
+        ] {
+            for (available, mode) in [
+                (false, PdfOcrViewMode::Original),
+                (true, PdfOcrViewMode::Original),
+                (true, PdfOcrViewMode::Reflow),
+            ] {
+                let sidebar = chrome::SidebarState::default();
+                let book = crate::library::LibraryBook {
+                    id: "pdf-header-audit".into(),
+                    title: "Current chapter".into(),
+                    authors: vec![],
+                    file_name: format!("book.{}", format.storage_extension()),
+                    path: "book".into(),
+                    cover_bytes: None,
+                    added_at: 0,
+                    cached_toc: None,
+                };
+                let mut opening = crate::shelf::OpeningShell::new(
+                    book.clone(),
+                    Instant::now(),
+                    ReadingMode::Classic,
+                    sidebar,
+                );
+                opening.header_title = Some(book.title.clone());
+                opening.pdf_toolbar = chrome::PdfToolbarState { available, mode };
+                let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+                reader.reading_mode = ReadingMode::Classic;
+                reader.display_metadata = crate::reader::BookDisplayMetadata::from(&book);
+                reader.format = format;
+                reader.pdf_ocr.available = available;
+                reader.pdf_ocr.mode = mode;
+                reader.adopt_opening_chrome(ReadingMode::Classic, sidebar, sidebar);
+                let ctx = egui::Context::default();
+                let mut covers = crate::shelf::covers::CoverCache::default();
+                for stage in 0..2 {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1200.0, 800.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |root| {
+                            window_chrome::begin_frame(root.ctx());
+                            if stage == 0 {
+                                opening.ui(
+                                    root,
+                                    &mut covers,
+                                    AppLanguage::English,
+                                    &Default::default(),
+                                    false,
+                                );
+                            } else {
+                                reader.ui(root, None, false);
+                            }
+                        },
+                    );
+                    output.textures_delta.clear();
+                    for center in [sidebar.width + 120.0, sidebar.width + 152.0] {
+                        let present = window_chrome::geometry(&ctx).excluded.iter().any(|rect| {
+                            rect.size() == Vec2::splat(32.0)
+                                && (rect.center().x - center).abs() < 1.0
+                                && (rect.center().y - 22.0).abs() < 1.0
+                        });
+                        assert_eq!(
+                            present,
+                            format == BookFormat::Pdf,
+                            "PDF-only controls must be present in fixed slots, stage={stage} format={format:?} available={available}"
+                        );
+                    }
+                    if format == BookFormat::Pdf {
+                        let selected = output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect)
+                            if rect.rect.width() <= 32.0 && rect.rect.height() <= 32.0 && rect.rect.contains(Pos2::new(sidebar.width + 152.0, 22.0))));
+                        assert_eq!(
+                            selected,
+                            mode == PdfOcrViewMode::Reflow,
+                            "loading controls preserve the resolved PDF source state"
+                        );
+                    }
+                    output.textures_delta.clear();
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn window_header_spans_pinned_panels_and_native_hover_reveals_reader_actions() {
         use crate::app::window_chrome;
         let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
@@ -6957,6 +7073,117 @@ mod reference_suggestion_label_tests {
         );
     }
     use rebook_layout::ReaderStyle;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn reader_title_tracks_body_center_and_both_action_groups_use_equal_spacing() {
+        use crate::app::window_chrome;
+        use crate::preferences::ReadingMode;
+        for width in [1200.0, 2560.0] {
+            for fullscreen in [false, true] {
+                for (mode, sidebar, spread) in [
+                    (ReadingMode::Focus, false, SpreadMode::Scroll),
+                    (ReadingMode::Classic, false, SpreadMode::Single),
+                    (ReadingMode::Classic, true, SpreadMode::Double),
+                    (ReadingMode::Classic, true, SpreadMode::Scroll),
+                ] {
+                    for assistant in [false, true] {
+                        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+                        reader.reading_mode = mode;
+                        let mut style = reader.reader.style();
+                        style.spread = spread;
+                        reader.snapshot = reader.reader.set_style(style).unwrap();
+                        reader.ui.sidebar_pinned = true;
+                        reader.ui.sidebar_open = sidebar;
+                        reader.ui.sidebar_motion.value = if sidebar { 1.0 } else { 0.0 };
+                        reader.ui.sidebar_motion.target = reader.ui.sidebar_motion.value;
+                        reader.ui.toolbar_motion.value = 1.0;
+                        reader.ui.toolbar_motion.target = 1.0;
+                        reader.ui.toolbar_hovered = true;
+                        if assistant {
+                            reader.ui.assistant_panel = Some(AssistantPanel::Chat);
+                            reader.ui.assistant_motion.value = 1.0;
+                            reader.ui.assistant_motion.target = 1.0;
+                        }
+                        let ctx = egui::Context::default();
+                        window_chrome::set_state(
+                            &ctx,
+                            window_chrome::WindowState {
+                                fullscreen,
+                                header_hovered: true,
+                                ..Default::default()
+                            },
+                        );
+                        for frame in 0..2 {
+                            let mut body = Rect::NOTHING;
+                            let mut output = ctx.run_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(Rect::from_min_size(
+                                        Pos2::ZERO,
+                                        Vec2::new(width, 800.0),
+                                    )),
+                                    ..Default::default()
+                                },
+                                |root| {
+                                    window_chrome::begin_frame(&ctx);
+                                    body = reader.ui(root, None, false).rect;
+                                    window_chrome::paint_controls(&ctx);
+                                },
+                            );
+                            let label = reader.current_chapter_title();
+                            let text = output
+                                .shapes
+                                .iter()
+                                .find_map(|shape| match &shape.shape {
+                                    egui::Shape::Text(text)
+                                        if text.pos.y < TOOLBAR_HEIGHT
+                                            && text.galley.text() == label =>
+                                    {
+                                        Some(text)
+                                    }
+                                    _ => None,
+                                })
+                                .expect("reader header title is visible");
+                            let center = text.pos.x + text.galley.size().x * 0.5;
+                            assert!(
+                                (center - body.center().x).abs() < 1.0,
+                                "frame={frame} width={width} mode={mode:?} assistant={assistant}: title={center}, body={}",
+                                body.center().x
+                            );
+                            if frame == 1 && !assistant {
+                                let geometry = window_chrome::geometry(&ctx);
+                                let menu = ctx
+                                    .memory(|memory| {
+                                        memory.area_rect(egui::Id::new("reader-window-menu"))
+                                    })
+                                    .unwrap();
+                                let right = ctx
+                                    .memory(|memory| {
+                                        memory
+                                            .area_rect(egui::Id::new("reader-right-sidebar-toggle"))
+                                    })
+                                    .unwrap();
+                                assert!(
+                                    (menu.left() - right.right()).abs() < 1.0,
+                                    "right actions have the same zero slot gap as the left actions"
+                                );
+                                for x in
+                                    [body.left() + 24.0, body.left() + 56.0, body.left() + 88.0]
+                                {
+                                    assert!(geometry.excluded.iter().any(|rect| {
+                                        (rect.width() - 32.0).abs() < 1.0
+                                            && (rect.center().x - x).abs() < 1.0
+                                            && (rect.center().y - 22.0).abs() < 1.0
+                                    }));
+                                }
+                            }
+                            output.textures_delta.clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[cfg(target_os = "windows")]
     #[test]
@@ -8711,14 +8938,6 @@ mod reference_suggestion_label_tests {
             .abs()
                 <= f32::EPSILON
         );
-    }
-
-    #[test]
-    fn chapter_title_aligns_with_content_when_hidden_and_centers_when_toolbar_is_visible() {
-        let toolbar = Rect::from_min_size(Pos2::new(20.0, 10.0), Vec2::new(1000.0, 48.0));
-
-        assert!((toolbar_title_x(toolbar, 140.0, false) - 160.0).abs() <= f32::EPSILON);
-        assert!((toolbar_title_x(toolbar, 140.0, true) - 520.0).abs() <= f32::EPSILON);
     }
 
     #[test]

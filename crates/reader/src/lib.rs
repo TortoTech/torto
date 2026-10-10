@@ -534,6 +534,7 @@ impl PrefetchWorker {
         repository: Arc<SectionRepository>,
         fonts: Arc<[ReaderFontBlob]>,
         raster_generation: u64,
+        deferred_images: bool,
     ) -> Result<Self, ReaderError> {
         let (request_sender, request_receiver) = mpsc::channel::<PrefetchRequest>();
         let (result_sender, result_receiver) = mpsc::channel::<PrefetchResult>();
@@ -548,6 +549,7 @@ impl PrefetchWorker {
             .spawn(move || {
                 let mut layout_engine = LayoutEngine::with_fonts(fonts.iter().cloned());
                 layout_engine.set_raster_cache_generation(raster_generation);
+                layout_engine.set_deferred_images(deferred_images);
                 let display_compiler = DisplayListCompiler;
                 while let Ok(request) = request_receiver.recv() {
                     if worker_cancelled.load(Ordering::Acquire) {
@@ -747,6 +749,7 @@ pub struct ReaderRefreshRequest {
     style: ReaderStyle,
     locator: LocatorV1,
     raster_generation: u64,
+    deferred_images: bool,
 }
 
 impl ReaderRefreshRequest {
@@ -757,6 +760,7 @@ impl ReaderRefreshRequest {
             self.style,
             self.fonts,
             Some(self.raster_generation),
+            self.deferred_images,
         )?;
         reader.restore_locator(&self.locator)?;
         reader.cache_capacity = usize::MAX;
@@ -802,6 +806,7 @@ impl ReaderSession {
             style: self.style.clone(),
             locator,
             raster_generation: self.layout_engine.raster_cache_generation(),
+            deferred_images: self.layout_engine.deferred_images(),
         }
     }
 
@@ -880,7 +885,7 @@ impl ReaderSession {
         style: ReaderStyle,
         fonts: Arc<[ReaderFontBlob]>,
     ) -> Result<Self, ReaderError> {
-        let mut session = Self::new_unpositioned(source, viewport, style, fonts, None)?;
+        let mut session = Self::new_unpositioned(source, viewport, style, fonts, None, false)?;
         session.ensure_segment(session.current_key())?;
         Ok(session)
     }
@@ -895,8 +900,26 @@ impl ReaderSession {
         fonts: Arc<[ReaderFontBlob]>,
         locator: &LocatorV1,
     ) -> Result<Self, ReaderError> {
-        let mut session = Self::new_unpositioned(source, viewport, style, fonts, None)?;
+        let mut session = Self::new_unpositioned(source, viewport, style, fonts, None, false)?;
         session.restore_locator(locator)?;
+        Ok(session)
+    }
+
+    /// Read interactively with pixel-free image placements. Eager entry points
+    /// remain available for complete rendering and exports.
+    pub fn open_deferred_with_fonts(
+        source: Arc<dyn BookSource>,
+        viewport: LayoutViewport,
+        style: ReaderStyle,
+        fonts: Arc<[ReaderFontBlob]>,
+        locator: Option<&LocatorV1>,
+    ) -> Result<Self, ReaderError> {
+        let mut session = Self::new_unpositioned(source, viewport, style, fonts, None, true)?;
+        if let Some(locator) = locator {
+            session.restore_locator(locator)?;
+        } else {
+            session.ensure_segment(session.current_key())?;
+        }
         Ok(session)
     }
 
@@ -906,6 +929,7 @@ impl ReaderSession {
         mut style: ReaderStyle,
         fonts: Arc<[ReaderFontBlob]>,
         raster_generation: Option<u64>,
+        deferred_images: bool,
     ) -> Result<Self, ReaderError> {
         if source.book().sections.is_empty() {
             return Err(ReaderError::EmptyBook);
@@ -933,6 +957,7 @@ impl ReaderSession {
             build_fixed_reading_units(source.as_ref(), &toc_items, &section_indices_by_path);
         let repository = Arc::new(SectionRepository::new(Arc::clone(&source)));
         let mut layout_engine = LayoutEngine::with_fonts(fonts.iter().cloned());
+        layout_engine.set_deferred_images(deferred_images);
         if let Some(generation) = raster_generation {
             layout_engine.set_raster_cache_generation(generation);
         }
@@ -943,6 +968,7 @@ impl ReaderSession {
             Arc::clone(&repository),
             Arc::clone(&fonts),
             layout_engine.raster_cache_generation(),
+            deferred_images,
         )?;
         let current_section =
             first_visible_section(source.book().sections.len(), &hidden_sections).unwrap_or(0);
@@ -1126,6 +1152,12 @@ impl ReaderSession {
             return Ok(result);
         }
 
+        if locator.source.is_none()
+            && locator.progression.is_none()
+            && locator.href.fragment().is_some()
+        {
+            return self.go_to_href(&locator.href);
+        }
         let (requested_section, mut progression) =
             if let Some(index) = self.section_index_for_href(&locator.href) {
                 (index, locator.progression.unwrap_or(0.0))
@@ -1465,6 +1497,89 @@ impl ReaderSession {
             return Ok(pages);
         }
         self.reading_unit_pages_for_section(self.current_section, self.current_reading_unit)
+    }
+
+    /// Already-prepared pages in the active semantic unit. Viewport scheduling
+    /// must not parse or compile a neighboring segment on the UI thread.
+    pub fn cached_reading_unit_pages(&self) -> Vec<ReaderSectionPage> {
+        let entries = |key: SegmentKey, layout: &SegmentLayout| {
+            layout
+                .pages
+                .iter()
+                .enumerate()
+                .map(|(page_index, page)| ReaderSectionPage {
+                    position: ReaderPosition {
+                        section_index: key.section_index,
+                        segment_index: key.segment_index,
+                        page_index,
+                    },
+                    page: page.clone(),
+                    placeholder: false,
+                    visible_top: None,
+                    visible_bottom: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut pages = Vec::new();
+        if let Some(unit) = self.current_continuous_unit() {
+            for part in &unit.parts {
+                let mut ranges = Vec::new();
+                for block in part.section.fragments[part.section.reading_units[part.unit_index]
+                    .fragment_range
+                    .clone()]
+                .iter()
+                .flat_map(|f| &f.blocks)
+                {
+                    append_block_geometry_sources(block, &mut ranges);
+                }
+                let section_pages = unit
+                    .layouts
+                    .iter()
+                    .filter(|(key, _)| key.section_index == part.section_index)
+                    .flat_map(|(key, layout)| entries(*key, layout))
+                    .collect();
+                pages.extend(crop_reading_unit_pages(section_pages, &ranges));
+            }
+            return pages;
+        }
+        let group = self.current_reading_unit_sections();
+        for section_index in group.clone() {
+            let mut cached = self
+                .cache
+                .iter()
+                .filter(|(key, _)| key.section_index == section_index)
+                .collect::<Vec<_>>();
+            cached.sort_by_key(|(key, _)| key.segment_index);
+            let Some((_, first)) = cached.first() else {
+                continue;
+            };
+            let unit_index = if group.len() > 1 {
+                0
+            } else {
+                self.current_reading_unit
+            };
+            let Some(unit) = first.section.reading_units.get(unit_index) else {
+                continue;
+            };
+            let mut ranges = Vec::new();
+            for block in first.section.fragments[unit.fragment_range.clone()]
+                .iter()
+                .flat_map(|f| &f.blocks)
+            {
+                append_block_geometry_sources(block, &mut ranges);
+            }
+            let section_pages = cached
+                .into_iter()
+                .filter(|(key, layout)| {
+                    let segment = &layout.section.segments[key.segment_index];
+                    segment.fragment_range.start < unit.fragment_range.end
+                        && unit.fragment_range.start < segment.fragment_range.end
+                })
+                .flat_map(|(key, layout)| entries(*key, layout))
+                .collect();
+            pages.extend(crop_reading_unit_pages(section_pages, &ranges));
+        }
+        pages
     }
 
     fn reading_unit_pages_for_section(
@@ -2748,6 +2863,7 @@ impl ReaderSession {
             Arc::clone(&repository),
             Arc::clone(&self.fonts),
             self.layout_engine.raster_cache_generation(),
+            self.layout_engine.deferred_images(),
         )?;
         let target_page = target
             .and_then(PublicationUrl::fragment)
@@ -5715,6 +5831,7 @@ mod tests {
                 rebook_layout::ImagePlacement {
                     formula_presentation: None,
                     image: rebook_layout::RasterImage {
+                        deferred: None,
                         origin: None,
                         blob: None,
                         width: 400,
@@ -7460,6 +7577,24 @@ mod tests {
         assert_eq!(reader.location().page_index, resolved_location.page_index);
         assert!(reader.location().page_index > 0);
         assert_eq!(source.parse_count(1), 1);
+        let parsed_first = source.parse_count(0);
+        let mut locator = LocatorV1::at_start(source.book().id.clone(), target);
+        locator.progression = None;
+        let direct = ReaderSession::open_deferred_with_fonts(
+            source.clone(),
+            viewport(600, 400),
+            ReaderStyle::default(),
+            Arc::default(),
+            Some(&locator),
+        )
+        .unwrap();
+        assert_eq!(direct.location().section_index, 1);
+        assert_eq!(direct.location().page_index, resolved_location.page_index);
+        assert_eq!(
+            source.parse_count(0),
+            parsed_first,
+            "opening at a TOC fragment must not parse the cover"
+        );
     }
 
     #[test]
@@ -9206,6 +9341,7 @@ mod tests {
             Arc::new(SectionRepository::new(source)),
             Arc::default(),
             LayoutEngine::new().raster_cache_generation(),
+            false,
         )
         .unwrap();
         worker

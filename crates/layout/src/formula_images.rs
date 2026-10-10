@@ -785,6 +785,7 @@ pub(super) fn padded_display_row(
     }
     Some((
         RasterImage {
+            deferred: None,
             origin: None,
             blob: None,
             width: canvas.width(),

@@ -2,6 +2,8 @@
 #[cfg(test)]
 mod ruby_tests;
 
+#[cfg(test)]
+mod deferred_tests;
 pub mod image_processing;
 pub mod linebreak;
 pub mod timing;
@@ -15,8 +17,8 @@ mod semantic_lists;
 mod table_captions;
 mod web_links;
 pub use raster_cache::{
-    RasterCacheStats, RasterOrigin, clear_raster_cache, load_original_raster, raster_cache_stats,
-    retire_publication_rasters,
+    DeferredRaster, RasterCacheStats, RasterOrigin, clear_raster_cache, load_original_raster,
+    raster_cache_stats, retire_publication_rasters,
 };
 pub use semantic_lists::semantic_list_groups;
 
@@ -1000,9 +1002,11 @@ pub struct InlineImage {
     pub offset_y: f32,
 }
 
-/// Decoded RGBA image ready for upload by the renderer.
+/// Stable image geometry with either decoded RGBA pixels or a pixel-free
+/// descriptor resolved by the interactive renderer's bounded cache.
 #[derive(Clone)]
 pub struct RasterImage {
+    pub deferred: Option<DeferredRaster>,
     pub origin: Option<RasterOrigin>,
     pub blob: Option<peniko::Blob<u8>>,
     pub width: u32,
@@ -1055,6 +1059,7 @@ pub struct LayoutEngine {
     publication_languages: Vec<String>,
     raster_target: [u32; 2],
     raster_generation: u64,
+    deferred_images: bool,
 }
 
 fn should_layout_flow_block(block: &Block, reader_style: &ReaderStyle) -> bool {
@@ -1224,6 +1229,11 @@ fn include_available_family(all: &[String], category: &mut Vec<String>, family: 
     }
 }
 
+fn break_text_lines(layout: &mut Layout<TextBrush>, width: Option<f32>) {
+    let _timing = timing::stage(timing::TimingStage::LineBreak);
+    layout.break_all_lines(width);
+}
+
 impl Default for LayoutEngine {
     fn default() -> Self {
         Self::new()
@@ -1233,15 +1243,34 @@ impl Default for LayoutEngine {
 impl LayoutEngine {
     pub fn new() -> Self {
         let _timing = timing::stage(timing::TimingStage::Fonts);
-        let mut svg_options = resvg::usvg::Options::default();
-        svg_options.fontdb_mut().load_system_fonts();
+        static FONT_CONTEXT: std::sync::OnceLock<FontContext> = std::sync::OnceLock::new();
+        static SVG_FONTS: std::sync::OnceLock<Arc<resvg::usvg::fontdb::Database>> =
+            std::sync::OnceLock::new();
+        let font_context = FONT_CONTEXT
+            .get_or_init(|| {
+                // Keep mutable registrations and byte-cache locks private to
+                // each engine; cloning reuses immutable system discovery.
+                FontContext::new()
+            })
+            .clone();
+        let svg_options = resvg::usvg::Options {
+            fontdb: SVG_FONTS
+                .get_or_init(|| {
+                    let mut fonts = resvg::usvg::fontdb::Database::new();
+                    fonts.load_system_fonts();
+                    Arc::new(fonts)
+                })
+                .clone(),
+            ..Default::default()
+        };
         Self {
-            font_context: FontContext::new(),
+            font_context,
             layout_context: LayoutContext::new(),
             svg_options,
             publication_languages: Vec::new(),
             raster_target: [2048, 2048],
             raster_generation: raster_cache::generation(),
+            deferred_images: false,
         }
     }
 
@@ -1262,6 +1291,31 @@ impl LayoutEngine {
 
     pub fn set_raster_cache_generation(&mut self, generation: u64) {
         self.raster_generation = generation;
+    }
+
+    pub fn set_deferred_images(&mut self, enabled: bool) {
+        self.deferred_images = enabled;
+    }
+    pub fn deferred_images(&self) -> bool {
+        self.deferred_images
+    }
+
+    fn load_raster(
+        &self,
+        source: &dyn BookSource,
+        image: &ImageBlock,
+    ) -> Result<RasterImage, LayoutError> {
+        // Exact overlays and formula conversion inspect pixels before painting.
+        if self.deferred_images
+            && source.book().metadata.layout != RenditionLayout::PrePaginated
+            && image.text_layer.is_none()
+            && !image.formula_image
+            && image.formula.is_none()
+        {
+            raster_cache::prepare(source, image, self.raster_target, self.raster_generation)
+        } else {
+            raster_cache::load(source, image, self.raster_target, self.raster_generation)
+        }
     }
 
     pub fn available_font_families(&mut self) -> Vec<String> {
@@ -1391,6 +1445,7 @@ impl LayoutEngine {
         );
         paginator.push_image(
             RasterImage {
+                deferred: None,
                 origin: None,
                 blob: None,
                 width: dimensions.width.max(1),
@@ -1406,6 +1461,7 @@ impl LayoutEngine {
             for item in &mut page.items {
                 if let PageItem::Image(image) = item {
                     image.image = RasterImage {
+                        deferred: None,
                         origin: None,
                         blob: None,
                         width: 1,
@@ -1825,12 +1881,7 @@ impl LayoutEngine {
                         block_index += 1;
                         continue;
                     }
-                    let raster = raster_cache::load(
-                        source,
-                        image,
-                        self.raster_target,
-                        self.raster_generation,
-                    )?;
+                    let raster = self.load_raster(source, image)?;
                     let formula_presentation = (!unified_reflow)
                         .then(|| image.formula.as_ref())
                         .flatten()
@@ -1895,12 +1946,7 @@ impl LayoutEngine {
                             SeparatorKind::Rule => paginator.push_separator(),
                             SeparatorKind::Ornament => {
                                 if let Some(image) = &separator.image {
-                                    let raster = raster_cache::load(
-                                        source,
-                                        image,
-                                        self.raster_target,
-                                        self.raster_generation,
-                                    )?;
+                                    let raster = self.load_raster(source, image)?;
                                     let replacements = paginator.push_image(
                                         raster,
                                         image.style,
@@ -1968,11 +2014,7 @@ impl LayoutEngine {
             // child would double the gap between an image and its caption.
             style.margin_before = 0.0;
             style.margin_after = 0.0;
-            images.push((
-                raster_cache::load(source, image, self.raster_target, self.raster_generation)?,
-                style,
-                image,
-            ));
+            images.push((self.load_raster(source, image)?, style, image));
         }
         let captions = self.shape_figure_captions(
             source,
@@ -2123,12 +2165,7 @@ impl LayoutEngine {
         let mut rasters = Vec::with_capacity(block.content.len());
         for inline in &block.content {
             rasters.push(match inline {
-                Inline::Image(run) => Some(raster_cache::load(
-                    source,
-                    &run.image,
-                    self.raster_target,
-                    self.raster_generation,
-                )?),
+                Inline::Image(run) => Some(self.load_raster(source, &run.image)?),
                 Inline::Text(_) | Inline::Ruby(_) | Inline::Math(_) | Inline::Break => None,
             });
         }
@@ -2866,7 +2903,7 @@ impl LayoutEngine {
             );
         }
         if !optimized {
-            layout.break_all_lines(Some(available_width));
+            break_text_lines(&mut layout, Some(available_width));
             linebreak::parley::repair_trailing_footnote_line(&mut layout, &text, available_width);
             if optimize_line_breaks
                 && ruby.is_empty()
@@ -2981,6 +3018,7 @@ impl LayoutEngine {
         line_height: f32,
         foreground: Rgba,
     ) -> HashMap<usize, PreparedHyphenGlyph> {
+        let _timing = timing::stage(timing::TimingStage::Hyphenation);
         let hyphenation_spans = spans
             .iter()
             .filter(|span| !span.range.is_empty())
@@ -3042,7 +3080,7 @@ impl LayoutEngine {
                 &[],
                 rebook_publication::TextDirection::Auto,
             );
-            layout.break_all_lines(None);
+            break_text_lines(&mut layout, None);
             let Some(line) = layout.get(0) else {
                 continue;
             };
@@ -3119,7 +3157,7 @@ impl LayoutEngine {
             overflow_wrap,
         );
         if note_spacing::needs_measurement(text, spans) {
-            layout.break_all_lines(None);
+            break_text_lines(&mut layout, None);
             let optical = note_spacing::measure(&layout, text, spans, typography.font_size);
             if !optical.is_empty() {
                 layout = self.build_text_layout_raw(
@@ -3157,6 +3195,7 @@ impl LayoutEngine {
         direction: rebook_publication::TextDirection,
         overflow_wrap: parley::OverflowWrap,
     ) -> Layout<TextBrush> {
+        let _timing = timing::stage(timing::TimingStage::GlyphShape);
         let mut builder =
             self.layout_context
                 .ranged_builder(&mut self.font_context, text, 1.0, false);
@@ -3376,7 +3415,7 @@ impl LayoutEngine {
             typography.font_weight,
         ))));
         let mut layout = builder.build(marker);
-        layout.break_all_lines(None);
+        break_text_lines(&mut layout, None);
         layout.full_width()
     }
 
@@ -5065,6 +5104,7 @@ fn rasterize_formula(
     );
     Ok((
         RasterImage {
+            deferred: None,
             origin: None,
             blob: None,
             width: pixel_width,
@@ -5247,6 +5287,7 @@ impl Paginator {
     }
 
     fn push_text(&mut self, prepared: &PreparedText, block: &TextBlock) -> Result<(), LayoutError> {
+        let _timing = timing::stage(timing::TimingStage::Pagination);
         self.forced_page_break = false;
         let is_paragraph = matches!(block.kind, TextBlockKind::Paragraph);
         let display_formula = matches!(block.content.as_slice(), [Inline::Math(run)] if run.original.is_some() && run.display);
@@ -5359,6 +5400,7 @@ impl Paginator {
     }
 
     fn push_table(&mut self, table: &PreparedTable, trailing_height: f32) {
+        let _timing = timing::stage(timing::TimingStage::Pagination);
         self.forced_page_break = false;
         self.previous_block_was_paragraph = false;
         if table.row_heights.is_empty() || table.column_widths.is_empty() {
@@ -5603,6 +5645,7 @@ impl Paginator {
         minimum_before: f32,
         minimum_after: f32,
     ) -> Vec<FixedPageReplacementRequest> {
+        let _timing = timing::stage(timing::TimingStage::Pagination);
         let restore_gap_on_empty_page = !self.column_has_content
             && self.items.is_empty()
             && !self.pages.is_empty()
@@ -5671,6 +5714,7 @@ impl Paginator {
         prepared: &PreparedText,
         request: FixedPageReplacementRequest,
     ) -> Result<(), LayoutError> {
+        let _timing = timing::stage(timing::TimingStage::Pagination);
         let Some(first) = prepared.layout.get(0) else {
             return Ok(());
         };
@@ -5748,6 +5792,7 @@ impl Paginator {
     }
 
     fn push_separator(&mut self) {
+        let _timing = timing::stage(timing::TimingStage::Pagination);
         self.forced_page_break = false;
         self.previous_block_was_paragraph = false;
         self.add_spacing(12.0);
@@ -5859,6 +5904,7 @@ impl Paginator {
     }
 
     fn finish(mut self) -> Vec<PageLayout> {
+        let _timing = timing::stage(timing::TimingStage::Pagination);
         self.commit_page();
         if self.pages.is_empty() {
             self.pages.push(PageLayout {
@@ -6572,6 +6618,7 @@ mod tests {
                         source: None,
                     };
                     let raster = RasterImage {
+                        deferred: None,
                         origin: None,
                         blob: None,
                         width: 40,
@@ -6667,6 +6714,7 @@ mod tests {
             source: None,
         };
         let raster = RasterImage {
+            deferred: None,
             origin: None,
             blob: None,
             width: 200,
@@ -6724,6 +6772,7 @@ mod tests {
             source: None,
         };
         let raster = RasterImage {
+            deferred: None,
             origin: None,
             blob: None,
             width: 12,
@@ -9933,6 +9982,7 @@ mod tests {
         );
         paginator.push_image(
             RasterImage {
+                deferred: None,
                 origin: None,
                 blob: None,
                 width: 800,
@@ -9975,6 +10025,7 @@ mod tests {
             0.0,
         );
         let image = RasterImage {
+            deferred: None,
             origin: None,
             blob: None,
             width: 800,
@@ -10401,6 +10452,7 @@ mod tests {
         paginator.push_separator();
         paginator.push_image(
             RasterImage {
+                deferred: None,
                 origin: None,
                 blob: None,
                 width: 200,
@@ -10886,6 +10938,7 @@ mod tests {
         paginator.prepare_group(300.0, outer_gap);
         paginator.push_image_with_gaps(
             RasterImage {
+                deferred: None,
                 origin: None,
                 blob: None,
                 width: 200,
@@ -10923,6 +10976,7 @@ mod tests {
         );
         paginator.push_image_with_gaps(
             RasterImage {
+                deferred: None,
                 origin: None,
                 blob: None,
                 width: 200,
@@ -10964,6 +11018,7 @@ mod tests {
         );
         paginator.push_image_with_gaps(
             RasterImage {
+                deferred: None,
                 origin: None,
                 blob: None,
                 width: 200,
@@ -10981,6 +11036,7 @@ mod tests {
         paginator.add_preserved_spacing(5.0);
         paginator.push_image_with_gaps(
             RasterImage {
+                deferred: None,
                 origin: None,
                 blob: None,
                 width: 100,
@@ -11018,6 +11074,7 @@ mod tests {
         );
         paginator.push_image_with_gaps(
             RasterImage {
+                deferred: None,
                 origin: None,
                 blob: None,
                 width: 200,
@@ -11032,6 +11089,7 @@ mod tests {
         );
         paginator.push_image_with_gaps(
             RasterImage {
+                deferred: None,
                 origin: None,
                 blob: None,
                 width: 100,
@@ -11069,6 +11127,7 @@ mod tests {
         );
         paginator.push_image(
             RasterImage {
+                deferred: None,
                 origin: None,
                 blob: None,
                 width: 200,
@@ -11770,5 +11829,23 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod font_reuse_tests {
+    use super::*;
+    #[test]
+    fn svg_font_discovery_is_shared_across_sessions_and_threads() {
+        let first = LayoutEngine::new();
+        let second = LayoutEngine::new();
+        assert!(Arc::ptr_eq(
+            &first.svg_options.fontdb,
+            &second.svg_options.fontdb
+        ));
+        let other = std::thread::spawn(|| LayoutEngine::new().svg_options.fontdb)
+            .join()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.svg_options.fontdb, &other));
     }
 }

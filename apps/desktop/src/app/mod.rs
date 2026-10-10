@@ -40,8 +40,10 @@ impl DesktopApp {
     }
     pub(crate) fn new(library: LocalLibrary, reader_fonts: Arc<[Blob<u8>]>) -> Self {
         let settings = SettingsFeature::new(&reader_fonts);
+        let mut shelf = ShelfFeature::new(library, reader_fonts);
+        shelf.apply_global_settings(settings.applied());
         Self {
-            shelf: ShelfFeature::new(library, reader_fonts),
+            shelf,
             reader: None,
             settings,
             applied_settings_revision: 0,
@@ -71,6 +73,7 @@ impl DesktopApp {
         message: crate::shelf::OpenTaskMessage,
         runtime: &tokio::runtime::Runtime,
     ) {
+        self.remember_reader_sidebar();
         if self.shelf.complete_open(message, runtime)
             && let Some(current) = self.reader.take()
         {
@@ -99,13 +102,24 @@ impl DesktopApp {
             self.settings.open();
         }
         let interaction_blocked = self.settings.is_open();
-        let plan = if let Some(reader) = self.reader.as_mut() {
+        let plan = if self.shelf.opening_visible() {
+            self.shelf.opening_ui(ui, interaction_blocked);
+            if !self.shelf.opening_visible()
+                && let Some(reader) = &mut self.reader
+            {
+                reader.cancel_open_and_return();
+            }
+            None
+        } else if let Some(reader) = self.reader.as_mut() {
             let covers = self.shelf.reader_cover_cache();
             reader.prepare_sidebar_cover(ui.ctx(), covers);
             covers.trim_for_reader();
             Some(reader.ui(ui, page_texture, interaction_blocked))
         } else {
             self.shelf.ui(ui, interaction_blocked);
+            if self.shelf.opening_visible() {
+                ui.ctx().request_repaint();
+            }
             None
         };
 
@@ -152,6 +166,9 @@ impl DesktopApp {
                 .overlay(ui.ctx(), self.settings.applied().language);
         }
         self.apply_settings_if_changed(ui.ctx());
+        if !ui.ctx().input(|input| input.pointer.any_down()) {
+            self.remember_reader_sidebar();
+        }
         if ui_started.elapsed() >= std::time::Duration::from_millis(100) {
             crate::diagnostics::log(
                 "ui.slow_frame",
@@ -241,12 +258,29 @@ impl DesktopApp {
         }
     }
 
+    pub(crate) fn reader_expected(&self) -> bool {
+        self.shelf.opening_visible() || self.reader.is_some()
+    }
+
+    pub(crate) fn opening_visible(&self) -> bool {
+        self.shelf.opening_visible()
+    }
+    pub(crate) fn opening_drawn(&self) -> bool {
+        self.shelf.opening_drawn()
+    }
+    pub(crate) fn complete_shelf_open_header(&mut self, message: crate::shelf::OpenHeaderMessage) {
+        self.shelf.complete_open_header(message);
+    }
+
     pub(crate) fn reader_scene(&mut self) -> Option<ReaderScene> {
         self.reader.as_mut().map(DesktopReader::page_scene)
     }
 
-    pub(crate) fn record_open_presentation(&mut self, ready: bool) {
+    pub(crate) fn record_open_presentation(&mut self, ready: bool, ctx: &egui::Context) {
         self.shelf.record_open_presentation(ready);
+        if ready && let Some(reader) = self.reader.as_mut() {
+            reader.mark_open_presented(ctx);
+        }
     }
 
     pub(crate) fn spawn_pending_tasks(
@@ -430,6 +464,9 @@ impl DesktopApp {
     }
 
     fn reconcile_state(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.pointer.any_down()) {
+            self.remember_reader_sidebar();
+        }
         let reopen = self.reader.as_mut().and_then(|reader| {
             reader.take_reopen_request().map(|path| {
                 (
@@ -476,6 +513,16 @@ impl DesktopApp {
                 next_reader.show_notice(notice);
             }
             self.reader = Some(next_reader);
+        }
+    }
+
+    fn remember_reader_sidebar(&mut self) {
+        if self.shelf.opening_visible() {
+            return;
+        }
+        if let Some(reader) = &self.reader {
+            self.shelf
+                .remember_reader_sidebar(reader.classic_sidebar_state());
         }
     }
 

@@ -185,6 +185,114 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opening_header_waits_for_presented_body_then_uses_existing_hide_timer() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let classic = crate::reader::chrome::SidebarState {
+            open: false,
+            pinned: false,
+            width: 300.0,
+        };
+        let mode = reader.reading_mode;
+        reader.adopt_opening_chrome(mode, classic.for_mode(mode), classic);
+        assert_eq!(reader.classic_sidebar_state(), classic);
+        assert_eq!(reader.ui.toolbar_motion.value, 1.0);
+        let now = Instant::now();
+        reader.ui.schedule_toolbar_hide(now);
+        reader.advance_motion(now + Duration::from_secs(10));
+        assert!(reader.ui.opening_toolbar_pending);
+        assert_eq!(reader.ui.toolbar_hide_at, None);
+        assert_eq!(reader.ui.toolbar_motion.value, 1.0);
+        let ctx = egui::Context::default();
+        reader.mark_open_presented(&ctx);
+        let deadline = reader.ui.toolbar_hide_at.unwrap();
+        assert!(!reader.ui.opening_toolbar_pending);
+        assert!(deadline >= now + crate::reader::TOOLBAR_HIDE_DELAY);
+        reader.mark_open_presented(&ctx);
+        assert_eq!(reader.ui.toolbar_hide_at, Some(deadline));
+        reader.advance_motion(deadline);
+        assert!(reader.ui.toolbar_motion.is_animating());
+        reader.advance_motion(deadline + crate::reader::TOOLBAR_MOTION_DURATION);
+        assert_eq!(reader.ui.toolbar_motion.value, 0.0);
+        assert!(!reader.ui.needs_motion_tick());
+    }
+
+    #[test]
+    fn header_hover_keeps_it_open_and_handoff_preserves_sidebar_action() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let mode = reader.reading_mode;
+        let classic = crate::reader::chrome::SidebarState {
+            open: false,
+            ..Default::default()
+        };
+        let sidebar = crate::reader::chrome::SidebarState {
+            open: true,
+            pinned: false,
+            width: 300.0,
+        };
+        reader.adopt_opening_chrome(mode, sidebar, classic);
+        assert!(reader.ui.sidebar_open);
+        assert!(!reader.ui.sidebar_pinned);
+        assert_eq!(reader.ui.sidebar_width, 300.0);
+        let now = Instant::now();
+        reader.set_toolbar_hovered(true);
+        reader.mark_open_presented(&egui::Context::default());
+        assert_eq!(reader.ui.toolbar_hide_at, None);
+        assert_eq!(reader.ui.toolbar_motion.value, 1.0);
+        reader.ui.set_toolbar_hovered(false, now);
+        assert_eq!(
+            reader.ui.toolbar_hide_at,
+            Some(now + crate::reader::TOOLBAR_HIDE_DELAY)
+        );
+        reader.ui.classic_sidebar = classic;
+        reader
+            .ui
+            .install_sidebar(classic.for_mode(crate::preferences::ReadingMode::Focus));
+        assert!(!reader.ui.sidebar_open && !reader.ui.sidebar_pinned);
+        reader.reading_mode = crate::preferences::ReadingMode::Focus;
+        reader.leave_focus_mode_for_pdf();
+        assert!(!reader.ui.sidebar_open && reader.ui.sidebar_pinned);
+    }
+
+    #[test]
+    fn switching_modes_restores_classic_sidebar_without_reopening_focus_sidebar() {
+        use crate::preferences::{ReaderPreferences, ReadingMode};
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let preferences = ReaderPreferences::default();
+        let mut settings = crate::settings::AppliedSettings {
+            spread: preferences.spread,
+            reading_mode: ReadingMode::Classic,
+            hide_cursor_in_focus_mode: preferences.hide_cursor_in_focus_mode,
+            interface_typography: preferences.interface_typography,
+            typography: preferences.typography,
+            typesetting: preferences.typesetting,
+            plugin_settings: reader.plugin_settings.clone(),
+            language: preferences.language,
+            theme: preferences.theme,
+            selection_granularity: preferences.selection_granularity,
+            shortcuts: preferences.shortcuts,
+            sync_settings: reader.sync_settings.clone(),
+            sync_password: reader.sync_password.clone(),
+        };
+        let classic = crate::reader::chrome::SidebarState {
+            open: false,
+            pinned: false,
+            width: 310.0,
+        };
+        reader.ui.classic_sidebar = classic;
+        reader.apply_global_settings(&settings);
+        assert_eq!(reader.reading_mode, ReadingMode::Classic);
+        assert_eq!(reader.classic_sidebar_state(), classic);
+        settings.reading_mode = ReadingMode::Focus;
+        reader.apply_global_settings(&settings);
+        assert_eq!(reader.reading_mode, ReadingMode::Focus);
+        assert!(!reader.ui.sidebar_open && !reader.ui.sidebar_pinned);
+        reader.set_sidebar_open(true);
+        settings.reading_mode = ReadingMode::Classic;
+        reader.apply_global_settings(&settings);
+        assert_eq!(reader.classic_sidebar_state(), classic);
+    }
+
+    #[test]
     fn idle_reader_waits_for_toolbar_deadline_and_paces_layout_polling() {
         let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
         reader.ui.toolbar_motion = crate::reader::Motion::settled(0.0);

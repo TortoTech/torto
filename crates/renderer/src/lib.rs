@@ -349,14 +349,47 @@ impl PageDisplayList {
             .reduce(|bounds, next| bounds.union(next))
     }
 
+    /// Deferred requests and their stable geometry, including inline/table images.
+    pub fn deferred_rasters(&self) -> impl Iterator<Item = (&rebook_layout::DeferredRaster, Rect)> {
+        self.commands.iter().filter_map(|command| match command {
+            DisplayCommand::Image(image) => image.deferred.as_ref().map(|r| (r, image.bounds)),
+            _ => None,
+        })
+    }
+
+    /// Draw intersecting rasters while preserving page-mask order. Return exactly
+    /// the blobs encoded into the scene, so later cache eviction cannot change
+    /// its image-atlas input.
+    pub fn paint_image_layer_in(
+        &self,
+        scene: &mut impl PaintScene,
+        offset_x: f32,
+        clip: Option<Rect>,
+    ) -> Vec<ImageData> {
+        let transform = Affine::translate((f64::from(offset_x), 0.0));
+        let mut images = Vec::new();
+        for command in &self.commands {
+            if let DisplayCommand::Image(image) = command {
+                if clip.is_none_or(|clip| image.bounds.intersect(clip).area() > 0.0)
+                    && let Some(data) = image.paint_ready(scene, transform)
+                {
+                    images.push(data);
+                }
+            } else if command.paints_below_source_overlays() {
+                command.paint(scene, transform);
+            }
+        }
+        images
+    }
+
     /// Raster resources referenced by this retained page.
     ///
     /// The desktop GPU renderer uses these handles to refresh Vello's image
     /// atlas before replaying a scene. Cloning an [`ImageData`] is cheap and
     /// preserves the blob identity encoded into the Vello scene.
-    pub fn image_data(&self) -> impl Iterator<Item = &ImageData> {
+    pub fn image_data(&self) -> impl Iterator<Item = ImageData> + '_ {
         self.commands.iter().filter_map(|command| match command {
-            DisplayCommand::Image(command) => Some(&command.image.image),
+            DisplayCommand::Image(command) => command.ready_data(),
             DisplayCommand::Glyphs(_)
             | DisplayCommand::FillRect(_)
             | DisplayCommand::FillRoundedRect(_)
@@ -370,7 +403,7 @@ impl PageDisplayList {
         self.commands
             .iter()
             .filter_map(|command| match command {
-                DisplayCommand::Image(command) => Some([
+                DisplayCommand::Image(command) if command.deferred.is_none() => Some([
                     (command.pixels.as_ptr() as usize, command.pixels.len()),
                     (
                         command.image.image.data.as_ref().as_ptr() as usize,
@@ -438,13 +471,19 @@ impl PageDisplayList {
                 DisplayCommand::Image(command)
                     if command.interactive && command.bounds.contains(point) =>
                 {
+                    let ready = command
+                        .deferred
+                        .as_ref()
+                        .and_then(|request| request.ready());
                     Some(PageImageHit {
-                        origin: command.origin.clone(),
+                        origin: ready
+                            .as_ref()
+                            .map_or_else(|| command.origin.clone(), |r| r.origin.clone()),
                         formula: command.formula.clone(),
                         bounds: command.bounds,
-                        width: command.width,
-                        height: command.height,
-                        pixels: Arc::clone(&command.pixels),
+                        width: ready.as_ref().map_or(command.width, |r| r.width),
+                        height: ready.as_ref().map_or(command.height, |r| r.height),
+                        pixels: ready.map_or_else(|| Arc::clone(&command.pixels), |r| r.pixels),
                     })
                 }
                 DisplayCommand::Glyphs(_)
@@ -2178,7 +2217,7 @@ impl DisplayCommand {
                 command.glyphs.iter().copied(),
             ),
             Self::Image(command) => {
-                scene.draw_image(command.image.as_ref(), page_transform * command.transform);
+                command.paint_ready(scene, page_transform);
             }
             Self::FillRect(command) => scene.fill(
                 Fill::NonZero,
@@ -2222,6 +2261,7 @@ struct ImageCommand {
     origin: Option<rebook_layout::RasterOrigin>,
     formula: Option<String>,
     image: ImageBrush,
+    deferred: Option<rebook_layout::DeferredRaster>,
     transform: Affine,
     bounds: Rect,
     width: u32,
@@ -2229,6 +2269,41 @@ struct ImageCommand {
     pixels: Arc<[u8]>,
     interactive: bool,
     source: Option<SourceRange>,
+}
+
+impl ImageCommand {
+    fn ready_data(&self) -> Option<ImageData> {
+        if let Some(request) = &self.deferred {
+            let raster = request.ready()?;
+            Some(ImageData {
+                data: raster.blob?,
+                format: ImageFormat::Rgba8,
+                alpha_type: ImageAlphaType::Alpha,
+                width: raster.width,
+                height: raster.height,
+            })
+        } else {
+            Some(self.image.image.clone())
+        }
+    }
+
+    fn paint_ready(
+        &self,
+        scene: &mut impl PaintScene,
+        page_transform: Affine,
+    ) -> Option<ImageData> {
+        let data = self.ready_data()?;
+        let transform = self.transform
+            * Affine::scale_non_uniform(
+                f64::from(self.image.image.width.max(1)) / f64::from(data.width.max(1)),
+                f64::from(self.image.image.height.max(1)) / f64::from(data.height.max(1)),
+            );
+        scene.draw_image(
+            ImageBrush::new(data.clone()).as_ref(),
+            page_transform * transform,
+        );
+        Some(data)
+    }
 }
 
 #[derive(Clone)]
@@ -2392,6 +2467,7 @@ impl DisplayListCompiler {
                         origin: image.image.origin.clone(),
                         formula: image.formula_presentation.as_ref().map(|f| f.latex.clone()),
                         image: ImageBrush::new(data),
+                        deferred: image.image.deferred.clone(),
                         transform,
                         bounds: Rect::new(
                             f64::from(image.x),
@@ -2815,6 +2891,7 @@ fn compile_text_commands(
                     origin: image.image.origin.clone(),
                     formula: image.formula_presentation.as_ref().map(|f| f.latex.clone()),
                     image: ImageBrush::new(data),
+                    deferred: image.image.deferred.clone(),
                     transform: image_transform,
                     bounds: Rect::new(
                         f64::from(x),
@@ -3230,6 +3307,7 @@ mod tests {
     #[test]
     fn rendered_formula_preview_keeps_original_pixels_and_latex() {
         let original = rebook_layout::RasterImage {
+            deferred: None,
             origin: None,
             blob: None,
             width: 3,
@@ -3247,6 +3325,7 @@ mod tests {
                     latex: r"\sigma=\sqrt{k\theta^2}".into(),
                 }),
                 image: rebook_layout::RasterImage {
+                    deferred: None,
                     origin: None,
                     blob: None,
                     width: 40,
@@ -3640,6 +3719,7 @@ mod tests {
                     formula_presentation: None,
                     id: 1,
                     image: RasterImage {
+                        deferred: None,
                         origin: None,
                         blob: None,
                         width: 1,
@@ -3723,6 +3803,7 @@ mod tests {
                     formula_presentation: None,
                     id: 7,
                     image: RasterImage {
+                        deferred: None,
                         origin: None,
                         blob: None,
                         width: 1,
@@ -4254,6 +4335,7 @@ mod tests {
             items: vec![PageItem::Image(ImagePlacement {
                 formula_presentation: None,
                 image: RasterImage {
+                    deferred: None,
                     origin: None,
                     blob: None,
                     width: 100,
@@ -4345,6 +4427,7 @@ mod tests {
             items: vec![PageItem::Image(ImagePlacement {
                 formula_presentation: None,
                 image: RasterImage {
+                    deferred: None,
                     origin: None,
                     blob: None,
                     width: 100,

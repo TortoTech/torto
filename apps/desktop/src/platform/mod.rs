@@ -17,6 +17,8 @@ pub(crate) enum UserEvent {
     Update(crate::updater::UpdateTaskMessage),
     ShelfImport(crate::shelf::ShelfImportTaskMessage),
     ShelfOpen(crate::shelf::OpenTaskMessage),
+    ShelfOpenHeader(crate::shelf::OpenHeaderMessage),
+    ReaderRendererReady(gpu::RendererReady),
     ShelfSyncProgress(crate::shelf::SyncProgressMessage),
     ShelfSync(crate::shelf::SyncTaskMessage),
     ShelfSyncCheck(crate::shelf::SyncCheckMessage),

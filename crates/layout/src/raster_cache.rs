@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -27,6 +27,7 @@ struct Cache {
     variants: HashMap<u64, u64>,
     owners: HashMap<u64, (String, bool)>,
     mode_generations: HashMap<(String, bool), u64>,
+    protected: HashMap<(String, bool), HashSet<u64>>,
     clock: u64,
     generation: u64,
     stats: RasterCacheStats,
@@ -59,12 +60,266 @@ pub fn retire_publication_rasters(publication_id: &str, fixed_page: bool) {
 
 fn raster(width: u32, height: u32, pixels: Arc<[u8]>, origin: Option<RasterOrigin>) -> RasterImage {
     RasterImage {
+        deferred: None,
         origin,
         blob: Some(peniko::Blob::new(Arc::new(pixels.clone()))),
         width,
         height,
         pixels,
     }
+}
+
+/// Pixel-free resource descriptor. Layout and retained commands never own the
+/// decoded allocation; only the bounded cache and active scenes do.
+#[derive(Clone, Debug)]
+pub struct DeferredRaster {
+    key: u64,
+    resource_key: u64,
+    owner: (String, bool),
+    generation: u64,
+    block: ImageBlock,
+    target: [u32; 2],
+    dimensions: [u32; 2],
+}
+
+impl DeferredRaster {
+    /// Keep visible resources resident without retaining pixels in chapter IR.
+    /// Returns false on contention; the caller must never wait on the UI.
+    pub fn protect_visible(source: &dyn BookSource, requests: impl Iterator<Item = Self>) -> bool {
+        let owner = (
+            source.book().id.to_string(),
+            source.book().metadata.layout == RenditionLayout::PrePaginated,
+        );
+        let requests = requests.filter(|r| r.owner == owner).collect::<Vec<_>>();
+        let Ok(mut cache) = CACHE.try_lock() else {
+            return false;
+        };
+        let keys = requests
+            .iter()
+            .map(|r| {
+                if cache.entries.contains_key(&r.key) {
+                    return r.key;
+                }
+                cache
+                    .variants
+                    .iter()
+                    .filter_map(|(key, resource)| {
+                        let (image, _) = cache.entries.get(key)?;
+                        (*resource == r.resource_key && sufficient_detail(image, r.target))
+                            .then_some((*key, image.pixels.len()))
+                    })
+                    .min_by_key(|(_, bytes)| *bytes)
+                    .map_or(r.key, |(key, _)| key)
+            })
+            .collect();
+        // Pin only the selected resolution, releasing obsolete DPI buckets.
+        // The desktop has one active reading viewport. Replacing pins also
+        // releases the previous book when a file is opened directly over it.
+        cache.protected.clear();
+        cache.protected.insert(owner, keys);
+        true
+    }
+
+    pub fn can_prefetch(&self) -> bool {
+        let Ok(cache) = CACHE.try_lock() else {
+            return false;
+        };
+        let protected_bytes: usize = cache
+            .entries
+            .iter()
+            .filter(|(key, _)| cache.is_protected(**key))
+            .map(|(_, (raster, _))| raster.pixels.len())
+            .sum();
+        protected_bytes.saturating_add(self.estimated_bytes()) <= BUDGET
+    }
+
+    pub fn key(&self) -> u64 {
+        self.key ^ self.generation.rotate_left(17)
+    }
+
+    pub fn estimated_bytes(&self) -> usize {
+        let scale = (f64::from(self.target[0]) / f64::from(self.dimensions[0]))
+            .min(f64::from(self.target[1]) / f64::from(self.dimensions[1]))
+            .min(1.0);
+        let width = (f64::from(self.dimensions[0]) * scale).round().max(1.0) as usize;
+        let height = (f64::from(self.dimensions[1]) * scale).round().max(1.0) as usize;
+        width.saturating_mul(height).saturating_mul(4)
+    }
+
+    /// UI-safe cache lookup: never waits for source I/O, a codec, or a lock.
+    pub fn ready(&self) -> Option<RasterImage> {
+        let mut cache = CACHE.try_lock().ok()?;
+        if !self.valid(&cache) {
+            return None;
+        }
+        let key = cache
+            .entries
+            .contains_key(&self.key)
+            .then_some(self.key)
+            .or_else(|| {
+                cache
+                    .variants
+                    .iter()
+                    .filter_map(|(key, resource)| {
+                        let (image, _) = cache.entries.get(key)?;
+                        (*resource == self.resource_key && sufficient_detail(image, self.target))
+                            .then_some((*key, image.pixels.len()))
+                    })
+                    .min_by_key(|(_, bytes)| *bytes)
+                    .map(|(key, _)| key)
+            })?;
+        cache.clock = cache.clock.wrapping_add(1);
+        let clock = cache.clock;
+        let (image, touched) = cache.entries.get_mut(&key)?;
+        *touched = clock;
+        Some(image.clone())
+    }
+
+    fn valid(&self, cache: &Cache) -> bool {
+        cache.generation == self.generation
+    }
+
+    /// Background-only materialization. A retired descriptor cannot repopulate
+    /// the cache, including when retirement happens during decoding.
+    pub fn load(&self, source: &dyn BookSource) -> Result<(), LayoutError> {
+        self.load_guarded(source, || true)
+    }
+
+    pub fn load_guarded(
+        &self,
+        source: &dyn BookSource,
+        needed: impl Fn() -> bool,
+    ) -> Result<(), LayoutError> {
+        if !needed() {
+            return Ok(());
+        }
+        if self.ready().is_some() {
+            return Ok(());
+        }
+        // Capture the view epoch at dispatch, not at metadata preparation. A
+        // rapid PDF mode round-trip can retire a view after its next layout has
+        // already been prepared; that active layout must remain loadable.
+        let mode_generation = {
+            let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.valid(&cache) {
+                return Err(PublicationError::InvalidPublication(
+                    "Image cache lease expired".into(),
+                )
+                .into());
+            }
+            cache
+                .mode_generations
+                .get(&self.owner)
+                .copied()
+                .unwrap_or_default()
+        };
+        let resource = {
+            let _timing = timing::stage(timing::TimingStage::ImageSource);
+            source.resource(&self.block.href)?
+        };
+        // Revalidate sources with no resource revision, before publishing pixels.
+        let (resource_key, key) = encoded_keys(source, &self.block, &resource.bytes, self.target);
+        if !needed() {
+            return Ok(());
+        }
+        if key != self.key || resource_key != self.resource_key {
+            return Err(PublicationError::InvalidPublication(
+                "Image resource changed during preparation".into(),
+            )
+            .into());
+        }
+        let decoded = {
+            let _timing = timing::stage(timing::TimingStage::ImageDecode);
+            image::load_from_memory(&resource.bytes)?
+        };
+        if !needed() {
+            return Ok(());
+        }
+        let image = display_raster(decoded, &self.block.href, self.target);
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if !needed() {
+            return Ok(());
+        }
+        if !self.valid(&cache) {
+            return Err(
+                PublicationError::InvalidPublication("Image cache lease expired".into()).into(),
+            );
+        }
+        if cache
+            .mode_generations
+            .get(&self.owner)
+            .copied()
+            .unwrap_or_default()
+            != mode_generation
+        {
+            // Reject this in-flight result; a still-visible image can retry
+            // under the new epoch without caching a permanent decode failure.
+            return Ok(());
+        }
+        cache.clock = cache.clock.wrapping_add(1);
+        cache.stats.misses += 1;
+        cache.owners.insert(self.key, self.owner.clone());
+        cache.variants.insert(self.key, self.resource_key);
+        cache.insert(self.key, image, BUDGET);
+        if !cache.entries.contains_key(&self.key) {
+            cache.owners.remove(&self.key);
+            cache.variants.remove(&self.key);
+        }
+        Ok(())
+    }
+}
+
+fn encoded_keys(
+    source: &dyn BookSource,
+    block: &ImageBlock,
+    bytes: &[u8],
+    target: [u32; 2],
+) -> (u64, u64) {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    source.book().id.hash(&mut hash);
+    (source.book().metadata.layout == RenditionLayout::PrePaginated).hash(&mut hash);
+    block.href.hash(&mut hash);
+    false.hash(&mut hash);
+    bytes.hash(&mut hash);
+    let resource_key = hash.finish();
+    target.hash(&mut hash);
+    (resource_key, hash.finish())
+}
+
+pub(super) fn prepare(
+    source: &dyn BookSource,
+    block: &ImageBlock,
+    target: [u32; 2],
+    generation: u64,
+) -> Result<RasterImage, LayoutError> {
+    let _timing = timing::stage(timing::TimingStage::ImageMetadata);
+    let resource = source.resource(&block.href)?;
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(&resource.bytes))
+        .with_guessed_format()
+        .map_err(image::ImageError::IoError)?
+        .into_dimensions()?;
+    let (resource_key, key) = encoded_keys(source, block, &resource.bytes, target);
+    let owner = (source.book().id.to_string(), false);
+    Ok(RasterImage {
+        origin: Some(RasterOrigin {
+            href: block.href.clone(),
+            width,
+            height,
+        }),
+        deferred: Some(DeferredRaster {
+            key,
+            resource_key,
+            owner,
+            generation,
+            block: block.clone(),
+            target,
+            dimensions: [width.max(1), height.max(1)],
+        }),
+        blob: None,
+        width,
+        height,
+        pixels: Arc::from([]),
+    })
 }
 
 pub fn load_original_raster(
@@ -115,8 +370,16 @@ fn resize_display_image(image: image::DynamicImage, target: [u32; 2]) -> image::
 }
 
 impl Cache {
+    fn is_protected(&self, key: u64) -> bool {
+        self.owners
+            .get(&key)
+            .and_then(|owner| self.protected.get(owner))
+            .is_some_and(|keys| keys.contains(&key))
+    }
+
     fn retire_view(&mut self, publication_id: &str, fixed_page: bool) {
         let owner = (publication_id.to_owned(), fixed_page);
+        self.protected.remove(&owner);
         let epoch = self.mode_generations.entry(owner.clone()).or_default();
         *epoch = epoch.wrapping_add(1);
         let retired = self
@@ -146,10 +409,16 @@ impl Cache {
                 let Some(oldest) = self
                     .entries
                     .iter()
+                    .filter(|(key, _)| !self.is_protected(**key))
                     .min_by_key(|(_, (_, tick))| *tick)
                     .map(|(key, _)| *key)
                 else {
-                    break;
+                    if self.is_protected(key) {
+                        break;
+                    }
+                    // Speculation cannot push out visible pixels or expand
+                    // the soft budget reserved for the active viewport.
+                    return raster;
                 };
                 if let Some((image, _)) = self.entries.remove(&oldest) {
                     self.owners.remove(&oldest);
@@ -300,6 +569,39 @@ fn sufficient_detail(image: &RasterImage, target: [u32; 2]) -> bool {
 mod tests {
     use super::*;
     use rebook_publication::{Book, Metadata, PublicationId};
+
+    #[test]
+    fn speculation_cannot_evict_visible_pixels_or_expand_the_viewport_budget() {
+        let mut cache = Cache::default();
+        let owner = ("protected-book".to_owned(), false);
+        for key in [1, 2] {
+            cache.insert(key, raster(2, 2, vec![255; 16].into(), None), 32);
+            cache.owners.insert(key, owner.clone());
+            cache.variants.insert(key, key + 100);
+        }
+        cache.protected.insert(owner.clone(), HashSet::from([1]));
+        cache.insert(3, raster(2, 2, vec![255; 16].into(), None), 32);
+        assert!(cache.entries.contains_key(&1));
+        assert!(!cache.entries.contains_key(&2));
+        assert!(cache.entries.contains_key(&3));
+        cache.owners.insert(3, owner.clone());
+        cache.variants.insert(3, 103);
+        cache.protected.insert(owner.clone(), HashSet::from([1, 3]));
+        cache.insert(4, raster(2, 2, vec![255; 16].into(), None), 32);
+        assert!(!cache.entries.contains_key(&4));
+        assert_eq!(cache.stats.bytes, 32);
+        // Only visible resources may exceed the soft cache limit.
+        cache.owners.insert(4, owner.clone());
+        cache.variants.insert(4, 104);
+        cache
+            .protected
+            .insert(owner.clone(), HashSet::from([1, 3, 4]));
+        cache.insert(4, raster(2, 2, vec![255; 16].into(), None), 32);
+        assert_eq!(cache.stats.bytes, 48);
+        cache.retire_view(&owner.0, owner.1);
+        assert_eq!(cache.stats.bytes, 0);
+        assert!(!cache.protected.contains_key(&owner));
+    }
 
     #[test]
     fn retiring_one_view_keeps_other_views_and_books() {

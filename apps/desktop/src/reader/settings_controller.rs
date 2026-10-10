@@ -72,8 +72,10 @@ impl DesktopReader {
         self.invalidate_focus_units();
         self.focus_target_offset = None;
         self.ui.focus_scroll_motion = None;
-        self.ui.sidebar_pinned = true;
-        self.set_sidebar_open(true);
+        let sidebar = self.ui.classic_sidebar;
+        self.ui.sidebar_pinned = sidebar.pinned;
+        self.ui.sidebar_width = sidebar.width;
+        self.set_sidebar_open(sidebar.open);
         self.close_assistant_panel();
         self.ui.focus_actions_visible = false;
         self.focus_toc_override = None;
@@ -142,6 +144,9 @@ impl DesktopReader {
             settings.reading_mode
         };
         let mode_changed = self.reading_mode != reading_mode;
+        if mode_changed {
+            self.ui.classic_sidebar = self.classic_sidebar_state();
+        }
         self.reading_mode = reading_mode;
         let mut style = self.reader.style();
         style.spread = if self.reading_mode == crate::preferences::ReadingMode::Focus {
@@ -185,11 +190,10 @@ impl DesktopReader {
                     self.invalidate_focus_units();
                     self.focus_target_offset = None;
                     self.ui.focus_scroll_motion = None;
-                    self.ui.sidebar_pinned =
-                        self.reading_mode == crate::preferences::ReadingMode::Classic;
-                    self.set_sidebar_open(
-                        self.reading_mode == crate::preferences::ReadingMode::Classic,
-                    );
+                    let sidebar = self.ui.classic_sidebar.for_mode(self.reading_mode);
+                    self.ui.sidebar_pinned = sidebar.pinned;
+                    self.ui.sidebar_width = sidebar.width;
+                    self.set_sidebar_open(sidebar.open);
                     self.close_assistant_panel();
                     self.ui.focus_actions_visible = false;
                     self.focus_toc_override = None;
