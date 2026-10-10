@@ -2191,7 +2191,7 @@ mod tests {
                                 for line in text.layout.lines() {
                                     assert!(
                                         line.metrics().offset + line.metrics().advance
-                                            - line.metrics().trailing_whitespace
+                                            - line.metrics().hanging_advance
                                             <= text.available_width + 0.5,
                                         "table text overflow: viewport {width}, font {font_size}, available {}, advance {}, text {:?}",
                                         text.available_width,

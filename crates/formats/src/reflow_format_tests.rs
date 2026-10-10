@@ -221,7 +221,7 @@ fn local_science_captions_preserve_author_alignment() {
                             centered += 1;
                             let metrics = first.metrics();
                             let expected = (text.available_width - metrics.advance
-                                + metrics.trailing_whitespace)
+                                + metrics.hanging_advance)
                                 .max(0.0)
                                 * 0.5;
                             assert!(
@@ -412,7 +412,7 @@ fn local_thinking_systems_ordinary_captions_use_automatic_alignment() {
                         let metrics = line.metrics();
                         if width == 1200 {
                             let expected = (item.available_width - metrics.advance
-                                + metrics.trailing_whitespace)
+                                + metrics.hanging_advance)
                                 .max(0.0)
                                 * 0.5;
                             assert!(expected > 0.0 && (metrics.offset - expected).abs() < 0.1);

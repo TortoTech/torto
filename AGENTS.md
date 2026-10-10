@@ -12,6 +12,7 @@ Apply these principles when changing the shelf, statistics, reader, settings, or
 - **Quiet background work:** Keep periodic checks in background timers and notify the UI only when needed. Preserve debouncing, bounded delays, retries, and required full synchronization.
 - **Memory diagnosis:** Distinguish live allocations, CPU caches, GPU resources, and driver-retained capacity. A high working set or delayed memory reduction alone does not prove a leak; check resource ownership and cache retention.
 - **Verification:** Build the production code path before runtime checks and run relevant existing regression tests. Check settled idle behavior, loading completion, popup closure, and focus/minimize transitions on affected screens. Compare equivalent books, builds, window sizes, DPI, and background activity; record GPU/driver details. Keep diagnostics lightweight and report measured improvements only when actually measured.
+- **Dependency upgrades and releases:** After changing shared rendering/layout APIs or preparing a release tag, run the CI test command `cargo test --locked --workspace`. A production build, `cargo check`, or tests limited to the directly changed packages do not compile every dependent package's test code. Keep intentionally ignored real-library checks separate from this required workspace run.
 
 ## GitHub Release Notes
 
@@ -67,6 +68,13 @@ Apply these principles when changing the shelf, statistics, reader, settings, or
 
 - Keep all English-only content before `<details>`. Put all Chinese-only content inside the matching `<details>` block.
 - If a Full Changelog link should appear in both languages, include it in both sections rather than placing it after `</details>`.
+
+### Encoding and Publication Verification
+
+- Write release-note files as UTF-8 explicitly and publish with `--notes-file`. Prefer `apply_patch` for Chinese text; do not pipe Unicode-containing PowerShell here-strings into native programs unless the pipe's encoding is explicitly controlled. A Python file writer using `encoding="utf-8"`, or `PYTHONIOENCODING`, cannot recover characters already replaced while passing the script through the shell.
+- Before publishing or editing a release, read the actual notes file as UTF-8 and inspect the Chinese text and punctuation. Verify the exact `<summary>中文更新说明</summary>` marker and reject replacement characters (`U+FFFD`), unexpected question marks replacing text, and other garbled content.
+- After publishing or editing, fetch the release body from GitHub and repeat the content checks, as well as verifying the title and comparing it with the local file. Local/remote equality alone is insufficient: both copies can contain the same damaged text. Display and inspect the fetched Chinese section with UTF-8 output.
+- If encoding damage is found, regenerate the text from the intended wording in UTF-8, update the existing release, and verify the fetched body again; do not reuse the corrupted text as the source.
 
 ### Contributor Attribution
 
