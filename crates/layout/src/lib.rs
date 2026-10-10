@@ -2,7 +2,9 @@
 #[cfg(test)]
 mod ruby_tests;
 
+pub mod image_processing;
 pub mod linebreak;
+pub mod timing;
 
 mod caption_labels;
 mod formula_images;
@@ -1230,6 +1232,7 @@ impl Default for LayoutEngine {
 
 impl LayoutEngine {
     pub fn new() -> Self {
+        let _timing = timing::stage(timing::TimingStage::Fonts);
         let mut svg_options = resvg::usvg::Options::default();
         svg_options.fontdb_mut().load_system_fonts();
         Self {
@@ -1243,6 +1246,7 @@ impl LayoutEngine {
     }
 
     pub fn with_fonts(fonts: impl IntoIterator<Item = ReaderFontBlob>) -> Self {
+        let _timing = timing::stage(timing::TimingStage::Fonts);
         let mut engine = Self::new();
         for font in fonts {
             engine.font_context.collection.register_fonts(font, None);
@@ -1273,6 +1277,7 @@ impl LayoutEngine {
     }
 
     pub fn available_reader_font_families(&mut self) -> ReaderFontFamilies {
+        let _timing = timing::stage(timing::TimingStage::Fonts);
         let discovered = self.available_font_families();
         let mut families = ReaderFontFamilies::default();
         for family_name in &discovered {
@@ -1431,6 +1436,7 @@ impl LayoutEngine {
         viewport: LayoutViewport,
         reader_style: &ReaderStyle,
     ) -> Result<SectionLayout, LayoutError> {
+        let _timing = timing::stage(timing::TimingStage::Layout);
         // Quantize variants so minor window resizing does not fill the cache.
         let physical = |size: u32| {
             (((size as f32 * viewport.raster_scale).ceil() as u32).clamp(256, 4096)).div_ceil(256)
@@ -1510,11 +1516,12 @@ impl LayoutEngine {
                 && caption.kind == TextBlockKind::Caption
                 && image.formula.is_none()
             {
+                let captions = consecutive_captions(&layout_blocks[block_index + 1..]);
                 self.push_figure(
                     &mut paginator,
                     source,
                     std::slice::from_ref(image),
-                    std::slice::from_ref(caption),
+                    &captions,
                     CaptionPosition::After,
                     BlockStyle::default(),
                     reader_style,
@@ -1522,7 +1529,7 @@ impl LayoutEngine {
                     media_start_offset,
                     true,
                 )?;
-                block_index += 2;
+                block_index += 1 + captions.len();
                 continue;
             }
 
@@ -1570,6 +1577,29 @@ impl LayoutEngine {
                         )?
                     {
                         block_index += 1;
+                        continue;
+                    }
+                    if unified_reflow && block.kind == TextBlockKind::Caption {
+                        let captions = consecutive_captions(&layout_blocks[block_index..]);
+                        for (mut prepared, resolved) in self.shape_figure_captions(
+                            source,
+                            &captions,
+                            reader_style,
+                            content_width,
+                            true,
+                        )? {
+                            if resolved.source.is_none()
+                                && let Some(Block::Text(primary)) = block_index
+                                    .checked_sub(1)
+                                    .and_then(|i| layout_blocks.get(i).copied())
+                            {
+                                for citation in Arc::make_mut(&mut prepared.citations) {
+                                    citation.owner.clone_from(&primary.source);
+                                }
+                            }
+                            paginator.push_text(&prepared, &resolved)?;
+                            block_index += 1;
+                        }
                         continue;
                     }
                     let resolved = resolve_text_block(block, reader_style, TextContext::Flow);
@@ -1705,9 +1735,9 @@ impl LayoutEngine {
                     let captions = table_captions::presentation(table, unified_reflow);
                     let width = (content_width - media_start_offset).max(1.0);
                     let mut prepared = if captions.skip_title {
-                        self.shape_table_rows(&table.rows[1..], reader_style, width)
+                        self.shape_table_rows(source, &table.rows[1..], reader_style, width)?
                     } else {
-                        self.shape_table(table, reader_style, width)
+                        self.shape_table(source, table, reader_style, width)?
                     };
                     if captions.before.is_empty() && captions.after.is_empty()
                         || prepared.row_heights.is_empty()
@@ -2066,6 +2096,30 @@ impl LayoutEngine {
         content_width: f32,
         source_spans: Vec<TextSourceSpan>,
     ) -> Result<PreparedText, LayoutError> {
+        let rasters = self.load_inline_rasters(source, block)?;
+        Ok(self.shape_text_with_sources(
+            block,
+            reader_style,
+            content_width,
+            40.0,
+            &rasters,
+            source_spans,
+            true,
+        ))
+    }
+
+    fn load_inline_rasters(
+        &self,
+        source: &dyn BookSource,
+        block: &TextBlock,
+    ) -> Result<Vec<Option<RasterImage>>, LayoutError> {
+        if !block
+            .content
+            .iter()
+            .any(|inline| matches!(inline, Inline::Image(_)))
+        {
+            return Ok(Vec::new());
+        }
         let mut rasters = Vec::with_capacity(block.content.len());
         for inline in &block.content {
             rasters.push(match inline {
@@ -2078,14 +2132,7 @@ impl LayoutEngine {
                 Inline::Text(_) | Inline::Ruby(_) | Inline::Math(_) | Inline::Break => None,
             });
         }
-        Ok(self.shape_text_with_sources(
-            block,
-            reader_style,
-            content_width,
-            40.0,
-            &rasters,
-            source_spans,
-        ))
+        Ok(rasters)
     }
 
     fn shape_figure_caption<'a>(
@@ -2095,6 +2142,7 @@ impl LayoutEngine {
         reader_style: &ReaderStyle,
         content_width: f32,
         unified_reflow: bool,
+        compound_caption: bool,
     ) -> Result<(PreparedText, Cow<'a, TextBlock>), LayoutError> {
         let note = caption.kind != TextBlockKind::Caption;
         let mut resolved = if unified_reflow && note {
@@ -2102,14 +2150,25 @@ impl LayoutEngine {
             text.kind = TextBlockKind::Caption;
             let mut resolved =
                 resolve_text_block(&text, reader_style, TextContext::Flow).into_owned();
-            resolved.style.align = TextAlignment::Start;
+            resolved.style.align = caption
+                .style
+                .authored_alignment
+                .unwrap_or(TextAlignment::Start);
             Cow::Owned(resolved)
         } else {
             resolve_text_block(caption, reader_style, TextContext::Flow)
         };
+        let authored_alignment = caption_authored_alignment(caption, compound_caption);
+        if unified_reflow && !note {
+            resolved.to_mut().style.align = authored_alignment.unwrap_or(TextAlignment::Center);
+        }
         let mut prepared =
             self.shape_text_from_source(source, &resolved, reader_style, content_width)?;
-        if unified_reflow && caption_visible_line_count(&prepared) > 1 {
+        if unified_reflow
+            && !note
+            && authored_alignment.is_none()
+            && caption_has_natural_wrap(&prepared)
+        {
             resolved.to_mut().style.align = TextAlignment::Start;
             prepared =
                 self.shape_text_from_source(source, &resolved, reader_style, content_width)?;
@@ -2148,16 +2207,40 @@ impl LayoutEngine {
         join: Option<usize>,
     ) -> Result<Vec<(PreparedText, Cow<'a, TextBlock>)>, LayoutError> {
         let mut shaped = Vec::with_capacity(captions.len());
-        let mut caption_flags = Vec::with_capacity(captions.len());
+        let mut automatic_caption_flags = Vec::with_capacity(captions.len());
+        // Several styled inline runs (for example a bold figure number followed
+        // by normal prose) are still an ordinary caption. Separate caption
+        // blocks form a compound structure whose authored alignments matter.
+        let compound_caption = captions
+            .iter()
+            .filter(|caption| caption.kind == TextBlockKind::Caption)
+            .take(2)
+            .count()
+            > 1;
         let mut index = 0;
         while index < captions.len() {
             let caption = &captions[index];
-            caption_flags.push(caption.kind == TextBlockKind::Caption);
-            if join == Some(index) && unified_reflow {
+            automatic_caption_flags.push(
+                caption.kind == TextBlockKind::Caption
+                    && caption_authored_alignment(caption, compound_caption).is_none(),
+            );
+            if join == Some(index)
+                && unified_reflow
+                && captions.get(index + 1).is_some_and(|title| {
+                    // Joining must not erase either block's authored alignment,
+                    // including physical left/right versus logical start/end.
+                    caption.style.authored_alignment == title.style.authored_alignment
+                        && (caption.style.authored_alignment.is_none()
+                            || caption.style.logical_alignment == title.style.logical_alignment)
+                })
+            {
                 let label = resolve_text_block(caption, reader_style, TextContext::Flow);
                 let title =
                     resolve_text_block(&captions[index + 1], reader_style, TextContext::Flow);
                 let mut combined = title.into_owned();
+                combined.style.align =
+                    caption_authored_alignment(&captions[index + 1], compound_caption)
+                        .unwrap_or(TextAlignment::Center);
                 let title_content = std::mem::take(&mut combined.content);
                 combined.content = table_captions::join_content(&label.content, &title_content);
                 let title_start = label.content.len() + 1;
@@ -2180,7 +2263,9 @@ impl LayoutEngine {
                     content_width,
                     spans,
                 )?;
-                if caption_visible_line_count(&prepared) > 1 {
+                if caption_authored_alignment(&combined, compound_caption).is_none()
+                    && caption_has_natural_wrap(&prepared)
+                {
                     combined.style.align = TextAlignment::Start;
                     let sources = Arc::clone(&prepared.source_spans);
                     prepared = self.shape_text_from_source(
@@ -2201,24 +2286,25 @@ impl LayoutEngine {
                     reader_style,
                     content_width,
                     unified_reflow,
+                    compound_caption,
                 )?);
                 index += 1;
             }
         }
         // The semantic caption can consist of several authored paragraphs (or
-        // bilingual companions). Apply the single-line/multi-line rule to the
-        // entire caption, not independently to each fragment.
+        // bilingual companions). Authored breaks do not make it a long caption;
+        // only a soft wrap in an automatically aligned fragment switches the
+        // automatic parts. Explicit author declarations stay independent.
         if unified_reflow
             && shaped
                 .iter()
-                .zip(caption_flags)
+                .zip(automatic_caption_flags.iter().copied())
                 .filter(|(_, caption)| *caption)
-                .map(|((text, _), _)| caption_visible_line_count(text))
-                .sum::<usize>()
-                > 1
+                .any(|((text, _), _)| caption_has_natural_wrap(text))
         {
-            for (prepared, resolved) in &mut shaped {
-                if resolved.style.align != TextAlignment::Start {
+            for ((prepared, resolved), automatic) in shaped.iter_mut().zip(automatic_caption_flags)
+            {
+                if automatic && resolved.style.align != TextAlignment::Start {
                     resolved.to_mut().style.align = TextAlignment::Start;
                     let sources = Arc::clone(&prepared.source_spans);
                     *prepared =
@@ -2237,11 +2323,12 @@ impl LayoutEngine {
     )]
     fn shape_table(
         &mut self,
+        source: &dyn BookSource,
         table: &TableBlock,
         reader_style: &ReaderStyle,
         content_width: f32,
-    ) -> PreparedTable {
-        self.shape_table_rows(&table.rows, reader_style, content_width)
+    ) -> Result<PreparedTable, LayoutError> {
+        self.shape_table_rows(source, &table.rows, reader_style, content_width)
     }
 
     #[allow(
@@ -2250,10 +2337,11 @@ impl LayoutEngine {
     )]
     fn shape_table_rows(
         &mut self,
+        source: &dyn BookSource,
         rows: &[rebook_publication::TableRow],
         reader_style: &ReaderStyle,
         content_width: f32,
-    ) -> PreparedTable {
+    ) -> Result<PreparedTable, LayoutError> {
         let row_count = rows.len();
         let mut occupied = vec![Vec::<bool>::new(); row_count];
         let mut grid_cells = Vec::new();
@@ -2277,14 +2365,21 @@ impl LayoutEngine {
             }
         }
         if column_count == 0 || row_count == 0 {
-            return PreparedTable::default();
+            return Ok(PreparedTable::default());
         }
+        // Decode once per cell through the shared cache, then reuse the same
+        // handles for column measurement and final shaping at the cell width.
+        let rasters = grid_cells
+            .iter()
+            .map(|(_, _, _, _, cell)| self.load_inline_rasters(source, &cell.text))
+            .collect::<Result<Vec<_>, _>>()?;
         let table_metrics = resolve_table_metrics(reader_style);
         let unified = reader_style.typesetting.mode == TypesettingMode::Unified;
         let equal_column_width = content_width / column_count as f32;
         let column_widths = if unified {
             self.adaptive_table_column_widths(
                 &grid_cells,
+                &rasters,
                 column_count,
                 content_width,
                 reader_style,
@@ -2297,14 +2392,16 @@ impl LayoutEngine {
             .mul_add(table_metrics.line_height, table_metrics.cell_padding * 2.0);
         let mut row_heights = vec![minimum_row_height; row_count];
         let mut cells = Vec::with_capacity(grid_cells.len());
-        for (row, row_span, column, column_span, cell) in grid_cells {
+        for ((row, row_span, column, column_span, cell), rasters) in
+            grid_cells.into_iter().zip(&rasters)
+        {
             let block = table_cell_text_block(cell);
             let block = resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
             let cell_width = column_widths[column..column + column_span]
                 .iter()
                 .sum::<f32>();
             let text_width = (cell_width - table_metrics.cell_padding * 2.0).max(20.0);
-            let mut text = self.shape_text_with_min_width(&block, reader_style, text_width, 8.0);
+            let mut text = self.shape_table_cell(&block, reader_style, text_width, 8.0, rasters);
             if unified {
                 // Ignore empty publisher wrappers at cell edges while retaining
                 // the complete source text and deliberate internal line breaks.
@@ -2336,7 +2433,7 @@ impl LayoutEngine {
                 }
             }
         }
-        PreparedTable {
+        Ok(PreparedTable {
             horizontal_offset: centered_table_offset(unified, content_width, &column_widths),
             column_widths,
             row_heights,
@@ -2352,7 +2449,7 @@ impl LayoutEngine {
                 alpha: 22,
                 ..reader_style.foreground
             },
-        }
+        })
     }
 
     #[allow(
@@ -2362,6 +2459,7 @@ impl LayoutEngine {
     fn adaptive_table_column_widths(
         &mut self,
         grid_cells: &[(usize, usize, usize, usize, &TableCell)],
+        inline_rasters: &[Vec<Option<RasterImage>>],
         column_count: usize,
         content_width: f32,
         reader_style: &ReaderStyle,
@@ -2373,22 +2471,38 @@ impl LayoutEngine {
             .max(1.0);
         let mut preferred_widths = vec![minimum_column_width; column_count];
         let mut minimum_widths = vec![minimum_column_width; column_count];
-        for (_, _, column, column_span, cell) in grid_cells {
+        for ((_, _, column, column_span, cell), rasters) in grid_cells.iter().zip(inline_rasters) {
             let block = table_cell_text_block(cell);
             let block = resolve_text_block(&block, reader_style, TextContext::Table).into_owned();
-            let unwrapped = self.shape_text_with_min_width(&block, reader_style, 16_384.0, 8.0);
+            let unwrapped = self.shape_table_cell(&block, reader_style, 16_384.0, 8.0, rasters);
             let inline_slack = reader_style.typography.font_size * table_metrics.font_scale * 0.5;
             let preferred = (unwrapped.layout.full_width().ceil()
                 + table_metrics.cell_padding * 2.0
                 + inline_slack)
                 .clamp(minimum_column_width, content_width);
             let range = *column..(*column + *column_span);
+            let text_minimum = if block
+                .content
+                .iter()
+                .any(|inline| matches!(inline, Inline::Image(_)))
+            {
+                // Pictures scale to their eventual column. Their unwrapped
+                // placeholder width must not crowd out unbreakable text.
+                let mut text_only = block.clone();
+                text_only
+                    .content
+                    .retain(|inline| !matches!(inline, Inline::Image(_)));
+                self.shape_table_cell(&text_only, reader_style, 16_384.0, 8.0, &[])
+                    .layout
+                    .calculate_content_widths()
+                    .min
+            } else {
+                unwrapped.layout.calculate_content_widths().min
+            };
             // The shared three-em floor is not enough for an unbreakable word
             // (especially a bold header). Reserve its measured width and padding
             // before distributing the remaining space to wrapping prose.
-            let minimum = (unwrapped.layout.calculate_content_widths().min.ceil()
-                + table_metrics.cell_padding * 2.0
-                + inline_slack)
+            let minimum = (text_minimum.ceil() + table_metrics.cell_padding * 2.0 + inline_slack)
                 .clamp(minimum_column_width, content_width);
             let current_minimum = minimum_widths[range.clone()].iter().sum::<f32>();
             if minimum > current_minimum {
@@ -2440,6 +2554,26 @@ impl LayoutEngine {
             minimum_width,
             inline_rasters,
             Vec::new(),
+            true,
+        )
+    }
+
+    fn shape_table_cell(
+        &mut self,
+        block: &TextBlock,
+        reader_style: &ReaderStyle,
+        content_width: f32,
+        minimum_width: f32,
+        inline_rasters: &[Option<RasterImage>],
+    ) -> PreparedText {
+        self.shape_text_with_sources(
+            block,
+            reader_style,
+            content_width,
+            minimum_width,
+            inline_rasters,
+            Vec::new(),
+            reader_style.typesetting.mode != TypesettingMode::Unified,
         )
     }
 
@@ -2452,6 +2586,7 @@ impl LayoutEngine {
         minimum_width: f32,
         inline_rasters: &[Option<RasterImage>],
         mut source_spans: Vec<TextSourceSpan>,
+        optimize_line_breaks: bool,
     ) -> PreparedText {
         let (start_offset, available_width, first_line_indent) =
             resolve_text_measure(block, content_width, minimum_width);
@@ -2467,12 +2602,14 @@ impl LayoutEngine {
                 .retain(|inline| !matches!(inline, Inline::Break));
             original.style.sentence_indents = false;
             original.style.preserve_sentence_prefix = false;
-            Some(self.shape_text_with_min_width_and_rasters(
+            Some(self.shape_text_with_sources(
                 &original,
                 reader_style,
                 content_width,
                 minimum_width,
                 inline_rasters,
+                Vec::new(),
+                optimize_line_breaks,
             ))
         } else {
             None
@@ -2559,7 +2696,7 @@ impl LayoutEngine {
             }
             ruby.push(placement);
         }
-        let mut layout = self.build_text_layout(
+        let mut layout = self.build_text_layout_with_boundaries(
             &text,
             &spans,
             &inline_images,
@@ -2568,7 +2705,13 @@ impl LayoutEngine {
             block.style.line_height,
             reader_style.foreground,
             &[],
+            &[],
             block.style.direction,
+            if optimize_line_breaks {
+                parley::OverflowWrap::Normal
+            } else {
+                parley::OverflowWrap::BreakWord
+            },
         );
         self.apply_text_indents(
             &mut layout,
@@ -2578,8 +2721,8 @@ impl LayoutEngine {
             &font_stack,
             first_line_indent,
         );
-        let should_optimize = reader_style.typesetting.line_break_strategy
-            == LineBreakStrategy::Optimized
+        let should_optimize = optimize_line_breaks
+            && reader_style.typesetting.line_break_strategy == LineBreakStrategy::Optimized
             && ruby.is_empty()
             && matches!(
                 block.style.align,
@@ -2647,6 +2790,7 @@ impl LayoutEngine {
                         &[],
                         &shaping_breaks,
                         block.style.direction,
+                        parley::OverflowWrap::Normal,
                     );
                     self.apply_text_indents(
                         &mut layout,
@@ -2669,6 +2813,7 @@ impl LayoutEngine {
                     &plan.adjustments,
                     &shaping_breaks,
                     block.style.direction,
+                    parley::OverflowWrap::Normal,
                 );
                 self.apply_text_indents(
                     &mut adjusted,
@@ -2723,7 +2868,8 @@ impl LayoutEngine {
         if !optimized {
             layout.break_all_lines(Some(available_width));
             linebreak::parley::repair_trailing_footnote_line(&mut layout, &text, available_width);
-            if ruby.is_empty()
+            if optimize_line_breaks
+                && ruby.is_empty()
                 && (block.style.align == TextAlignment::Justify || sentence_reference.is_some())
                 && let Some(plan) = linebreak::parley::plan_wrapped_with_sentence_prefix(
                     &mut layout,
@@ -2939,6 +3085,7 @@ impl LayoutEngine {
             spacing,
             &[],
             direction,
+            parley::OverflowWrap::Normal,
         )
     }
 
@@ -2955,6 +3102,7 @@ impl LayoutEngine {
         spacing: &[linebreak::parley::SpacingAdjustment],
         shaping_breaks: &[usize],
         direction: rebook_publication::TextDirection,
+        overflow_wrap: parley::OverflowWrap,
     ) -> Layout<TextBrush> {
         let mut layout = self.build_text_layout_raw(
             text,
@@ -2968,6 +3116,7 @@ impl LayoutEngine {
             shaping_breaks,
             &[],
             direction,
+            overflow_wrap,
         );
         if note_spacing::needs_measurement(text, spans) {
             layout.break_all_lines(None);
@@ -2985,6 +3134,7 @@ impl LayoutEngine {
                     shaping_breaks,
                     &optical,
                     direction,
+                    overflow_wrap,
                 );
             }
         }
@@ -3005,6 +3155,7 @@ impl LayoutEngine {
         shaping_breaks: &[usize],
         optical: &[linebreak::parley::SpacingAdjustment],
         direction: rebook_publication::TextDirection,
+        overflow_wrap: parley::OverflowWrap,
     ) -> Layout<TextBrush> {
         let mut builder =
             self.layout_context
@@ -3017,6 +3168,7 @@ impl LayoutEngine {
         builder.set_ltr_ranges(&rtl_translation_ranges(direction, spans));
         builder.push_default(StyleProperty::FontFamily(FontFamily::from(font_stack)));
         builder.push_default(StyleProperty::FontSize(typography.font_size));
+        builder.push_default(StyleProperty::OverflowWrap(overflow_wrap));
         let default_variations = optical_size_variations(typography.font_size);
         builder.push_default(StyleProperty::FontVariations(FontVariations::from(
             &default_variations,
@@ -3474,7 +3626,8 @@ fn resolve_text_block<'a>(
         }
         TextContext::Flow => match block.kind {
             TextBlockKind::Caption => {
-                resolved.style.align = TextAlignment::Center;
+                resolved.style.align =
+                    caption_authored_alignment(block, false).unwrap_or(TextAlignment::Center);
                 resolved.style.margin_start = 0.0;
                 resolved.style.margin_start_fraction = 0.0;
             }
@@ -4083,15 +4236,19 @@ fn fit_adaptive_column_widths(
     if preferred_widths.is_empty() || available_width <= 0.0 {
         return Vec::new();
     }
-    let column_count = preferred_widths.len();
-    let equal_width = available_width / column_count as f32;
     let minimum = minimum_widths
         .iter()
         .map(|width| width.max(1.0))
         .collect::<Vec<_>>();
     let minimum_total = minimum.iter().sum::<f32>();
     if minimum_total >= available_width {
-        return vec![equal_width; column_count];
+        // Keep wider words in wider columns even when every minimum cannot
+        // fit. Equal widths unnecessarily split long headers while wasting
+        // room in shorter columns; emergency wrapping handles the remainder.
+        return minimum
+            .iter()
+            .map(|width| available_width * width / minimum_total)
+            .collect();
     }
 
     let preferred = preferred_widths
@@ -4183,8 +4340,43 @@ fn content_visible_lines(prepared: &PreparedText) -> impl Iterator<Item = usize>
         .map(|(index, _)| index)
 }
 
-fn caption_visible_line_count(prepared: &PreparedText) -> usize {
-    content_visible_lines(prepared).count()
+fn consecutive_captions(blocks: &[&Block]) -> Vec<TextBlock> {
+    blocks
+        .iter()
+        .map_while(|block| match block {
+            Block::Text(caption) if caption.kind == TextBlockKind::Caption => Some(caption.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn caption_authored_alignment(
+    caption: &TextBlock,
+    compound_caption: bool,
+) -> Option<TextAlignment> {
+    let hard_break = caption.content.iter().any(|inline| {
+        matches!(inline, Inline::Break)
+            || inline
+                .text_runs()
+                .iter()
+                .any(|run| run.text.contains(['\n', '\r']))
+    });
+    if compound_caption || hard_break {
+        caption.style.authored_alignment
+    } else {
+        None
+    }
+}
+
+fn caption_has_natural_wrap(prepared: &PreparedText) -> bool {
+    content_visible_lines(prepared).any(|index| {
+        prepared.layout.get(index).is_some_and(|line| {
+            matches!(
+                line.break_reason(),
+                parley::layout::BreakReason::Regular | parley::layout::BreakReason::Emergency
+            )
+        })
+    })
 }
 
 fn edge_content_lines(prepared: &PreparedText) -> Range<usize> {
@@ -7192,6 +7384,73 @@ mod tests {
         assert!(widths[0] < widths[1]);
         assert!((widths.iter().sum::<f32>() - 250.0).abs() < 0.001);
         assert!(widths.iter().all(|width| *width >= 40.0));
+        let cramped = fit_adaptive_column_widths(&[300.0, 300.0], &[80.0, 160.0], 200.0);
+        assert!(cramped[1] > cramped[0]);
+        assert!((cramped.iter().sum::<f32>() - 200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn unified_tables_use_ordinary_breaks_even_when_body_optimization_is_enabled() {
+        let source = EmptySource::new("table-ordinary-breaks");
+        let mut engine = LayoutEngine::new();
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let mut body_style = style.clone();
+        body_style.typesetting.line_break_strategy = LineBreakStrategy::Greedy;
+        for alignment in [TextAlignment::Start, TextAlignment::Justify] {
+            let cell = TableCell {
+                text: TextBlock {
+                    kind: TextBlockKind::Paragraph,
+                    content: vec![Inline::Text(TextRun {
+                        text: "The skin needs added water and oil to protect it from dry air and wind.".into(),
+                        style: TextStyle::default(),
+                        link: None,
+                    })],
+                    style: BlockStyle::default(),
+                    source: None,
+                },
+                authored_alignment: Some(alignment),
+                column_span: 1,
+                row_span: 1,
+                header: false,
+            };
+            let table = TableBlock {
+                before: Vec::new(),
+                after: Vec::new(),
+                rows: vec![TableRow { cells: vec![cell] }],
+                source: None,
+            };
+            for width in [110.0, 180.0, 260.0] {
+                let prepared = engine.shape_table(&source, &table, &style, width).unwrap();
+                let actual = &prepared.cells[0].text;
+                let mut ordinary = resolve_text_block(
+                    &table_cell_text_block(&table.rows[0].cells[0]),
+                    &style,
+                    TextContext::Table,
+                )
+                .into_owned();
+                ordinary.style.align = TextAlignment::Start;
+                let expected = engine.shape_text_with_min_width(
+                    &ordinary,
+                    &body_style,
+                    (prepared.column_widths[0] - prepared.cell_padding * 2.0).max(20.0),
+                    8.0,
+                );
+                assert!(
+                    actual.hyphens.is_empty(),
+                    "tables must not invent discretionary hyphens"
+                );
+                let ranges = |text: &PreparedText| {
+                    text.layout
+                        .lines()
+                        .map(|line| line.text_range())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(ranges(actual), ranges(&expected));
+            }
+        }
     }
 
     #[test]
@@ -7225,7 +7484,9 @@ mod tests {
             ..ReaderStyle::default()
         };
 
-        let table = LayoutEngine::new().shape_table(&table, &style, 500.0);
+        let table = LayoutEngine::new()
+            .shape_table(&EmptySource::new("table-alignment"), &table, &style, 500.0)
+            .unwrap();
         let centered_offset = table.cells[0]
             .text
             .layout
@@ -7300,7 +7561,14 @@ mod tests {
         style.typography.font_size = 16.0;
         style.typesetting.table_font_scale = 0.8;
 
-        let table = LayoutEngine::new().shape_table(&table, &style, 744.0);
+        let table = LayoutEngine::new()
+            .shape_table(
+                &EmptySource::new("table-short-cells"),
+                &table,
+                &style,
+                744.0,
+            )
+            .unwrap();
         assert!(table.column_widths.iter().sum::<f32>() < 744.0);
         assert!(
             table.cells.iter().all(|cell| cell.text.layout.len() == 1),
@@ -7374,7 +7642,14 @@ mod tests {
             };
             style.typography.font_size = size;
             for width in [size * 30.0, size * 42.0] {
-                let prepared = engine.shape_table(&table, &style, width);
+                let prepared = engine
+                    .shape_table(
+                        &EmptySource::new("table-label-width"),
+                        &table,
+                        &style,
+                        width,
+                    )
+                    .unwrap();
                 assert!(prepared.column_widths.iter().sum::<f32>() <= width + 0.1);
                 for cell in &prepared.cells {
                     let usable = prepared.column_widths[cell.column] - prepared.cell_padding * 2.0;
@@ -8431,6 +8706,20 @@ mod tests {
 
     struct EmptySource {
         book: Book,
+    }
+
+    impl EmptySource {
+        fn new(id: &str) -> Self {
+            Self {
+                book: Book {
+                    id: PublicationId::new(id).unwrap(),
+                    metadata: Metadata::default(),
+                    cover: None,
+                    sections: vec![],
+                    table_of_contents: vec![],
+                },
+            }
+        }
     }
 
     impl BookSource for EmptySource {
@@ -9932,7 +10221,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_figure_captions_center_one_line_and_left_align_multiple_lines() {
+    fn unified_figure_captions_center_short_text_and_left_align_natural_wraps() {
         let source = EmptySource {
             book: Book {
                 id: PublicationId::new("caption-test").unwrap(),
@@ -9960,7 +10249,7 @@ mod tests {
 
         let short = caption("Figure 1. A leaf.");
         let (short, _) = engine
-            .shape_figure_caption(&source, &short, &style, 320.0, true)
+            .shape_figure_caption(&source, &short, &style, 320.0, true, false)
             .unwrap();
         assert_eq!(short.layout.len(), 1);
         assert!(
@@ -9975,7 +10264,7 @@ mod tests {
             "Figure 2. A deliberately long caption that wraps across several lines at this width.",
         );
         let (long, _) = engine
-            .shape_figure_caption(&source, &long, &style, 180.0, true)
+            .shape_figure_caption(&source, &long, &style, 180.0, true, false)
             .unwrap();
         assert!(long.layout.len() > 1);
         assert!(
@@ -10021,7 +10310,7 @@ mod tests {
             },
         )));
         let (prepared, resolved) = engine
-            .shape_figure_caption(&source, &with_symbol, &style, 180.0, true)
+            .shape_figure_caption(&source, &with_symbol, &style, 180.0, true, false)
             .unwrap();
         assert!(prepared.layout.len() > 1);
         assert_eq!(prepared.inline_images.len(), 1);
@@ -10169,16 +10458,25 @@ mod tests {
             typesetting: ReaderTypesetting::unified(),
             ..ReaderStyle::default()
         };
-        for group in [&captions[..2], &captions[..]] {
+        for (group, width, alignment) in [
+            (&captions[..2], 240.0, TextAlignment::Center),
+            (&captions[..], 240.0, TextAlignment::Start),
+            (&captions[..], 1600.0, TextAlignment::Center),
+            (&captions[..2], 90.0, TextAlignment::Start),
+        ] {
             let shaped = engine
-                .shape_figure_captions(&source, group, &style, 240.0, true)
+                .shape_figure_captions(&source, group, &style, width, true)
                 .unwrap();
             assert!(shaped.iter().all(|(text, resolved)| {
-                resolved.style.align == TextAlignment::Start
-                    && text
-                        .layout
-                        .lines()
-                        .all(|line| line.metrics().offset.abs() < 0.01)
+                resolved.style.align == alignment
+                    && content_visible_lines(text).all(|index| {
+                        let offset = text.layout.get(index).unwrap().metrics().offset;
+                        if alignment == TextAlignment::Center {
+                            offset > 0.0
+                        } else {
+                            offset.abs() < 0.01
+                        }
+                    })
             }));
         }
         let single = engine
@@ -10199,6 +10497,258 @@ mod tests {
                 .iter()
                 .all(|caption| caption.style.align == TextAlignment::Center)
         );
+    }
+
+    #[test]
+    fn ordinary_captions_use_automatic_alignment_despite_author_declarations() {
+        let source = EmptySource::new("ordinary-caption-alignment");
+        let mut engine = LayoutEngine::new();
+        for alignment in [
+            TextAlignment::Start,
+            TextAlignment::Center,
+            TextAlignment::End,
+            TextAlignment::Justify,
+        ] {
+            // A bold label plus normal prose is not a compound caption.
+            let caption = TextBlock {
+                kind: TextBlockKind::Caption,
+                content: vec![
+                    Inline::Text(TextRun {
+                        text: "Figure 16. ".into(),
+                        style: TextStyle {
+                            bold: true,
+                            ..Default::default()
+                        },
+                        link: None,
+                    }),
+                    Inline::Text(TextRun {
+                        text: "A cold room warms quickly to the thermostat setting.".into(),
+                        style: TextStyle::default(),
+                        link: None,
+                    }),
+                ],
+                style: BlockStyle {
+                    align: alignment,
+                    authored_alignment: Some(alignment),
+                    ..Default::default()
+                },
+                source: None,
+            };
+            let original = caption.clone();
+            for strategy in [LineBreakStrategy::Greedy, LineBreakStrategy::Optimized] {
+                let mut style = ReaderStyle {
+                    typesetting: ReaderTypesetting::unified(),
+                    ..Default::default()
+                };
+                style.typesetting.line_break_strategy = strategy;
+                for (width, expected) in [
+                    (1600.0, TextAlignment::Center),
+                    (160.0, TextAlignment::Start),
+                ] {
+                    let (prepared, resolved) = engine
+                        .shape_figure_caption(&source, &caption, &style, width, true, false)
+                        .unwrap();
+                    assert_eq!(resolved.style.align, expected);
+                    assert_eq!(caption_has_natural_wrap(&prepared), width == 160.0);
+                    assert!(content_visible_lines(&prepared).all(|index| {
+                        let offset = prepared.layout.get(index).unwrap().metrics().offset;
+                        if expected == TextAlignment::Center {
+                            offset > 0.0
+                        } else {
+                            offset.abs() < 0.01
+                        }
+                    }));
+                }
+                style.typesetting.mode = TypesettingMode::Book;
+                let (_, resolved) = engine
+                    .shape_figure_caption(&source, &caption, &style, 1600.0, false, false)
+                    .unwrap();
+                assert_eq!(resolved.style.align, alignment);
+            }
+            assert_eq!(caption, original);
+        }
+    }
+
+    #[test]
+    fn caption_author_alignment_survives_hard_breaks_and_natural_wraps() {
+        let source = EmptySource::new("caption-author-alignment");
+        let run = |text: &str| {
+            Inline::Text(TextRun {
+                text: text.into(),
+                style: TextStyle::default(),
+                link: None,
+            })
+        };
+        let mut engine = LayoutEngine::new();
+        for alignment in [
+            TextAlignment::Start,
+            TextAlignment::Center,
+            TextAlignment::End,
+            TextAlignment::Justify,
+        ] {
+            let caption = TextBlock {
+                kind: TextBlockKind::Caption,
+                content: vec![
+                    run("A leaf."),
+                    Inline::Break,
+                    run(
+                        "A much longer authored line describing the leaf and its appearance in detail.",
+                    ),
+                ],
+                style: BlockStyle {
+                    align: alignment,
+                    authored_alignment: Some(alignment),
+                    logical_alignment: false,
+                    ..Default::default()
+                },
+                source: None,
+            };
+            let original = caption.clone();
+            for strategy in [LineBreakStrategy::Greedy, LineBreakStrategy::Optimized] {
+                let mut style = ReaderStyle {
+                    typesetting: ReaderTypesetting::unified(),
+                    ..Default::default()
+                };
+                style.typesetting.line_break_strategy = strategy;
+                for width in [160.0, 1600.0] {
+                    let (prepared, resolved) = engine
+                        .shape_figure_caption(&source, &caption, &style, width, true, false)
+                        .unwrap();
+                    assert_eq!(resolved.style.align, alignment);
+                    assert!(!resolved.style.logical_alignment);
+                    assert_eq!(
+                        prepared.text.as_ref(),
+                        "A leaf.\nA much longer authored line describing the leaf and its appearance in detail."
+                    );
+                    assert_eq!(caption_has_natural_wrap(&prepared), width == 160.0);
+                    if alignment == TextAlignment::Start {
+                        assert!(
+                            prepared
+                                .layout
+                                .lines()
+                                .all(|line| line.metrics().offset.abs() < 0.01)
+                        );
+                    } else if matches!(alignment, TextAlignment::Center | TextAlignment::End) {
+                        assert!(prepared.layout.get(0).unwrap().metrics().offset > 0.0);
+                    }
+                }
+            }
+            assert_eq!(caption, original);
+        }
+    }
+
+    #[test]
+    fn compound_captions_keep_author_parts_independent_of_automatic_parts() {
+        let source = EmptySource::new("caption-mixed-alignment");
+        let caption = |text: &str, alignment: Option<TextAlignment>| TextBlock {
+            kind: TextBlockKind::Caption,
+            content: vec![Inline::Text(TextRun {
+                text: text.into(),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: BlockStyle {
+                authored_alignment: alignment,
+                align: alignment.unwrap_or(TextAlignment::Start),
+                ..Default::default()
+            },
+            source: None,
+        };
+        let captions = [
+            caption(
+                "A deliberately long centered title describing this illustration across several lines.",
+                Some(TextAlignment::Center),
+            ),
+            caption("Left label.", Some(TextAlignment::Start)),
+            caption("Auto label.", None),
+            caption(
+                "An automatic description that needs several lines at a narrow width.",
+                None,
+            ),
+        ];
+        let original = captions.clone();
+        let mut engine = LayoutEngine::new();
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..Default::default()
+        };
+        for (parts, width, expected_auto) in [
+            (&captions[..3], 180.0, TextAlignment::Center),
+            (&captions[..], 180.0, TextAlignment::Start),
+            (&captions[..], 1600.0, TextAlignment::Center),
+        ] {
+            let shaped = engine
+                .shape_figure_captions(&source, parts, &style, width, true)
+                .unwrap();
+            assert_eq!(shaped[0].1.style.align, TextAlignment::Center);
+            assert_eq!(shaped[1].1.style.align, TextAlignment::Start);
+            assert!(
+                shaped[2..]
+                    .iter()
+                    .all(|(_, resolved)| resolved.style.align == expected_auto)
+            );
+        }
+        let mut note = caption("Source: example.", Some(TextAlignment::End));
+        note.kind = TextBlockKind::Paragraph;
+        let (_, resolved) = engine
+            .shape_figure_caption(&source, &note, &style, 180.0, true, false)
+            .unwrap();
+        assert_eq!(resolved.style.align, TextAlignment::End);
+        assert_eq!(captions, original);
+    }
+
+    #[test]
+    fn authored_caption_breaks_center_until_one_authored_line_wraps() {
+        let source = EmptySource::new("caption-authored-breaks");
+        let text = |value: &str| {
+            Inline::Text(TextRun {
+                text: value.into(),
+                style: TextStyle::default(),
+                link: None,
+            })
+        };
+        let caption = TextBlock {
+            kind: TextBlockKind::Caption,
+            content: vec![
+                Inline::Break,
+                text("A leaf."),
+                Inline::Break,
+                Inline::Break,
+                text("A longer authored line."),
+                Inline::Break,
+            ],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let mut engine = LayoutEngine::new();
+        for strategy in [LineBreakStrategy::Greedy, LineBreakStrategy::Optimized] {
+            let mut style = ReaderStyle {
+                typesetting: ReaderTypesetting::unified(),
+                ..ReaderStyle::default()
+            };
+            style.typesetting.line_break_strategy = strategy;
+            for (width, alignment) in [(400.0, TextAlignment::Center), (90.0, TextAlignment::Start)]
+            {
+                let (prepared, resolved) = engine
+                    .shape_figure_caption(&source, &caption, &style, width, true, false)
+                    .unwrap();
+                assert_eq!(resolved.style.align, alignment);
+                assert_eq!(
+                    prepared.text.as_ref(),
+                    "\nA leaf.\n\nA longer authored line.\n"
+                );
+                assert_eq!(prepared.lines.start, 1);
+                assert!(prepared.layout.get(2).unwrap().text_range().len() <= 1);
+                assert!(content_visible_lines(&prepared).all(|index| {
+                    let offset = prepared.layout.get(index).unwrap().metrics().offset;
+                    if alignment == TextAlignment::Center {
+                        offset > 0.0
+                    } else {
+                        offset.abs() < 0.01
+                    }
+                }));
+            }
+        }
     }
 
     #[test]

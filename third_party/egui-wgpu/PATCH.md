@@ -1,3 +1,7 @@
+# Retired compatibility patch
+
+As of 2026-10-09 this directory is excluded and no longer referenced by `[patch.crates-io]`. The desktop uses official egui-wgpu 0.36.2 and Vello 0.11.0 on wgpu 30.0.1. The old wgpu 29 adapter below is retained only as historical source.
+
 # Local compatibility patch
 
 Torto uses Vello 0.10 and egui-wgpu in the same render pass. Vello 0.10 currently

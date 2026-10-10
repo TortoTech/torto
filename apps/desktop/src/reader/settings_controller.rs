@@ -16,20 +16,27 @@ impl DesktopReader {
         std::mem::take(&mut self.settings_requested)
     }
 
+    pub(in crate::reader) fn pdf_focus_mode_hint(&self) -> &'static str {
+        if self.pdf_ocr.available {
+            self.language.text(
+                "专注模式需要文字版式，请先切换。",
+                "Focus mode requires text reflow. Switch to the text view first.",
+            )
+        } else {
+            self.language.text(
+                "请先生成 PDF 文字，再使用专注模式。",
+                "Generate PDF text before using Focus mode.",
+            )
+        }
+    }
+
     pub(in crate::reader) fn request_settings_change(&mut self, change: ReaderSettingsChange) {
         if change == ReaderSettingsChange::ReadingMode(crate::preferences::ReadingMode::Focus)
             && !self.focus_mode_allowed()
         {
-            self.notice_timer.show(
-                &mut self.notice,
-                self.language
-                    .text(
-                        "原始 PDF 不支持专注模式，请先切换到 OCR 版式",
-                        "Focus mode requires the OCR reflow view for PDF",
-                    )
-                    .into(),
-                std::time::Instant::now(),
-            );
+            let hint = self.pdf_focus_mode_hint();
+            self.notice_timer
+                .show(&mut self.notice, hint.into(), std::time::Instant::now());
             return;
         }
         self.cancel_text_selection();

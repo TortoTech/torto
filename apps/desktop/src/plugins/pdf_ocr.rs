@@ -45,7 +45,7 @@ const PAGE_ROLES_FILE: &str = "page-roles.json";
 const PAGE_ROLES_VERSION: u8 = 1;
 const PADDLE_JOB_FILE: &str = "paddle-job.json";
 const PADDLE_JOB_VERSION: u8 = 1;
-const PADDLE_PAGE_CHUNK_SIZE: usize = 100;
+const PADDLE_PAGE_CHUNK_SIZE: usize = 1000;
 const MAX_RESULT_BYTES: usize = 512 * 1024 * 1024;
 pub(crate) const PDF_PAGE_ANCHOR_PREFIX: &str = "pdf-page-";
 
@@ -392,6 +392,7 @@ struct OcrReflowBookSource {
     page_roles: HashMap<usize, PdfOcrPageRole>,
     resources: HashMap<String, StoredResourceLocation>,
     heading_hints: rebook_formats::reflow::HeadingHints,
+    html_context: rebook_formats::HtmlContext,
     normalize: bool,
 }
 
@@ -946,6 +947,36 @@ fn paddle_page_chunks(page_count: usize) -> Vec<StoredPaddleChunk> {
         .collect()
 }
 
+fn paddle_chunks_are_resumable(chunks: &[StoredPaddleChunk], page_count: usize) -> bool {
+    let page_count = page_count.max(1);
+    let covers_document = chunks.first().is_some_and(|chunk| chunk.start_page == 1)
+        && chunks
+            .last()
+            .is_some_and(|chunk| chunk.end_page == page_count)
+        && chunks.iter().all(|chunk| {
+            chunk.end_page >= chunk.start_page
+                && chunk.end_page <= page_count
+                && chunk.end_page - chunk.start_page < PADDLE_PAGE_CHUNK_SIZE
+        })
+        && chunks
+            .windows(2)
+            .all(|pair| pair[0].end_page.checked_add(1) == Some(pair[1].start_page));
+    // Keep already submitted jobs in their original ranges. Changing a range
+    // while retaining its jobId would mislabel pages; discarding it repeats OCR.
+    // An unsubmitted legacy plan can safely adopt the new batch size.
+    if !covers_document {
+        return false;
+    }
+    if chunks.iter().any(|chunk| chunk.job_id.is_some()) {
+        return true;
+    }
+    let expected = paddle_page_chunks(page_count);
+    chunks.len() == expected.len()
+        && chunks.iter().zip(&expected).all(|(stored, expected)| {
+            stored.start_page == expected.start_page && stored.end_page == expected.end_page
+        })
+}
+
 fn load_or_create_paddle_job(
     book_id: &str,
     model: &str,
@@ -965,14 +996,7 @@ fn load_or_create_paddle_job(
         && job.book_id == book_id
         && job.model == model
         && job.page_count == page_count
-        && job.chunks.len() == expected_chunks.len()
-        && job
-            .chunks
-            .iter()
-            .zip(&expected_chunks)
-            .all(|(stored, expected)| {
-                stored.start_page == expected.start_page && stored.end_page == expected.end_page
-            })
+        && paddle_chunks_are_resumable(&job.chunks, page_count)
     {
         return Ok(job);
     }
@@ -1973,6 +1997,8 @@ impl OcrReflowBookSource {
             }
         };
         let heading_hints = rebook_formats::reflow::HeadingHints::new(&book.table_of_contents);
+        let html_context = rebook_formats::HtmlContext::new(&book.table_of_contents, Vec::new());
+        html_context.mark_note_sections(&mut book.sections);
         Ok(Self {
             inner,
             book,
@@ -1983,6 +2009,7 @@ impl OcrReflowBookSource {
             page_roles,
             resources,
             heading_hints,
+            html_context,
             normalize: reflow_content,
         })
     }
@@ -2263,8 +2290,18 @@ impl BookSource for OcrReflowBookSource {
         let document = format!(
             "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title></title><style>h1 {{ font-size: 1.75em; margin-top: 32px; margin-bottom: 12px; }} h2 {{ font-size: 1.5em; margin-top: 28px; margin-bottom: 10px; }} h3 {{ font-size: 1.28em; margin-top: 22px; margin-bottom: 8px; }} h4, h5, h6 {{ font-size: 1.12em; margin-top: 18px; margin-bottom: 6px; }}</style></head><body>{body}</body></html>"
         );
-        let mut section = rebook_html::parse_section(&document, descriptor, |_| None)
-            .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
+        let mut section = rebook_html::parse_section_with_hints_and_image_classifier(
+            &document,
+            descriptor,
+            |_| None,
+            |href| {
+                self.html_context.is_separator_image(href, || {
+                    self.resource(href).ok().map(|resource| resource.bytes)
+                })
+            },
+            self.html_context.hints(descriptor),
+        )
+        .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
         if self.normalize {
             let continuations = structure::apply(&mut section, &self.pages[range.clone()]);
             rebook_formats::reflow::normalize_ocr_with_continuations(
@@ -3188,6 +3225,203 @@ fn value_as_usize(value: &Value) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "uploads TORTO_PADDLE_UPLOAD_TEST_PDF to the configured real PaddleOCR service"]
+    fn local_paddle_oversized_pdf_upload() {
+        let path = PathBuf::from(std::env::var_os("TORTO_PADDLE_UPLOAD_TEST_PDF").unwrap());
+        let report_path = std::env::var_os("TORTO_PADDLE_UPLOAD_TEST_REPORT").map(PathBuf::from);
+        let existing_job = std::env::var("TORTO_PADDLE_UPLOAD_TEST_JOB_ID").ok();
+        let settings = PluginSettings::load_default().unwrap();
+        assert!(
+            !settings.paddle_ocr_token.trim().is_empty(),
+            "PaddleOCR token is not configured"
+        );
+        let bytes = Bytes::from(fs::read(&path).unwrap());
+        assert!(bytes.len() > 50 * 1024 * 1024);
+        let original = rebook_formats::open_file_for_reading(
+            &path,
+            path.file_stem().and_then(|name| name.to_str()),
+        )
+        .unwrap();
+        let page_count = original.book().sections.len();
+        let chunks = paddle_page_chunks(page_count);
+        assert_eq!(
+            chunks.len(),
+            1,
+            "the selected fixture should fit one configured batch"
+        );
+        let chunk = &chunks[0];
+        let started = std::time::Instant::now();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut report = json!({"file_name":path.file_name().unwrap().to_string_lossy(),
+            "file_bytes":bytes.len(), "model":settings.paddle_ocr_model, "page_count":page_count,
+            "batch_size":PADDLE_PAGE_CHUNK_SIZE,
+            "page_ranges":format!("{}-{}", chunk.start_page, chunk.end_page)});
+        runtime.block_on(async {
+            let client = crate::http::builder()
+                .connect_timeout(Duration::from_secs(30))
+                .timeout(Duration::from_mins(3))
+                .build()
+                .unwrap();
+            let submitted = if let Some(job_id) = &existing_job {
+                Ok(job_id.clone())
+            } else {
+                submit_paddle_chunk(
+                    &client,
+                    PADDLE_OCR_JOBS_URL,
+                    settings.paddle_ocr_token.trim(),
+                    settings.paddle_ocr_model.trim(),
+                    &paddle_optional_payload(settings.paddle_ocr_model.trim()),
+                    path.file_name().unwrap().to_str().unwrap(),
+                    bytes,
+                    chunk,
+                    0,
+                    1,
+                )
+                .await
+            };
+            match submitted {
+                Err(error) => {
+                    report["submission"] = json!("failed");
+                    report["error"] = json!(error);
+                }
+                Ok(job_id) => {
+                    report["submission"] = json!(if existing_job.is_some() {
+                        "reused"
+                    } else {
+                        "accepted"
+                    });
+                    report["job_id"] = json!(job_id);
+                    println!("Upload accepted; querying remote task {job_id}");
+                    // Publish the accepted upload before polling; leave user caches untouched.
+                    if let Some(path) = &report_path {
+                        fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+                    }
+                    let mut progress = |message| println!("{message}");
+                    match tokio::time::timeout(
+                        Duration::from_mins(30),
+                        poll_paddle_job(
+                            &client,
+                            PADDLE_OCR_JOBS_URL,
+                            settings.paddle_ocr_token.trim(),
+                            &job_id,
+                            chunk,
+                            page_count,
+                            0,
+                            1,
+                            &mut progress,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(PaddlePollResult::Done(urls))) => {
+                            report["remote_task"] = json!("done");
+                            println!("Downloading and parsing OCR result in memory");
+                            let downloaded = async {
+                                let namespace =
+                                    format!("pages-{}-{}", chunk.start_page, chunk.end_page);
+                                let mut pages = Vec::new();
+                                let mut resources = Vec::new();
+                                if let Some(url) = urls.get("jsonUrl").and_then(Value::as_str) {
+                                    let text =
+                                        download_text(&client, url, "PaddleOCR JSON").await?;
+                                    parse_paddle_jsonl(
+                                        &client,
+                                        &text,
+                                        &namespace,
+                                        &mut pages,
+                                        &mut resources,
+                                    )
+                                    .await?;
+                                }
+                                if pages.is_empty()
+                                    && let Some(url) =
+                                        urls.get("markdownUrl").and_then(Value::as_str)
+                                {
+                                    pages.push(StoredOcrPage {
+                                        markdown: download_text(&client, url, "PaddleOCR Markdown")
+                                            .await?,
+                                        ..Default::default()
+                                    });
+                                }
+                                if pages.is_empty() {
+                                    return Err("No readable pages in OCR result".to_owned());
+                                }
+                                report["returned_pages"] = json!(pages.len());
+                                if pages.len() != page_count {
+                                    return Err(format!(
+                                        "Expected {page_count} pages, received {}",
+                                        pages.len()
+                                    ));
+                                }
+                                report["nonempty_pages"] = json!(
+                                    pages
+                                        .iter()
+                                        .filter(|page| !page.markdown.trim().is_empty())
+                                        .count()
+                                );
+                                report["image_resources"] = json!(resources.len());
+                                report["resource_bytes"] = json!(
+                                    resources
+                                        .iter()
+                                        .map(|resource| resource.bytes.len())
+                                        .sum::<usize>()
+                                );
+                                normalize_page_range(&mut pages, chunk.start_page, chunk.end_page);
+                                normalize_page_count(&mut pages, page_count);
+                                assert_eq!(pages.len(), page_count);
+                                let mut parsed_blocks = 0;
+                                // Check reader markup in memory without saving a document or images.
+                                for (index, page) in pages.iter().enumerate() {
+                                    let html = format!(
+                                        "<html><head><title></title></head><body>{}</body></html>",
+                                        markdown_to_html(&page.markdown)
+                                    );
+                                    let section = rebook_html::parse_section(
+                                        &html,
+                                        &original.book().sections[index],
+                                        |_| None,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                    parsed_blocks += section.blocks.len();
+                                }
+                                report["parsed_blocks"] = json!(parsed_blocks);
+                                Ok::<(), String>(())
+                            }
+                            .await;
+                            match downloaded {
+                                Ok(()) => report["result_parsing"] = json!("passed"),
+                                Err(error) => {
+                                    report["result_parsing"] = json!("failed");
+                                    report["error"] = json!(error);
+                                }
+                            }
+                        }
+                        Ok(Ok(PaddlePollResult::Failed(error))) | Ok(Err(error)) => {
+                            report["remote_task"] = json!("failed");
+                            report["error"] = json!(error);
+                        }
+                        Ok(Ok(PaddlePollResult::Resubmit)) => {
+                            report["remote_task"] = json!("expired_or_missing")
+                        }
+                        Err(_) => {
+                            report["remote_task"] = json!("still_pending_after_thirty_minutes")
+                        }
+                    }
+                }
+            }
+        });
+        report["elapsed_seconds"] = json!(started.elapsed().as_secs_f64());
+        if let Some(path) = report_path {
+            fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+        println!("{report}");
+        assert_eq!(
+            report["result_parsing"], "passed",
+            "live PaddleOCR pipeline failed: {report}"
+        );
+    }
 
     #[test]
     #[ignore = "reads an explicitly selected local OCR cache without changing it"]
@@ -4149,12 +4383,55 @@ mod tests {
     }
 
     #[test]
-    fn paddle_jobs_split_long_pdfs_into_hundred_page_ranges() {
-        let chunks = paddle_page_chunks(250);
+    fn paddle_jobs_split_long_pdfs_into_thousand_page_ranges() {
+        let chunks = paddle_page_chunks(2500);
         assert_eq!(chunks.len(), 3);
-        assert_eq!((chunks[0].start_page, chunks[0].end_page), (1, 100));
-        assert_eq!((chunks[1].start_page, chunks[1].end_page), (101, 200));
-        assert_eq!((chunks[2].start_page, chunks[2].end_page), (201, 250));
+        assert_eq!((chunks[0].start_page, chunks[0].end_page), (1, 1000));
+        assert_eq!((chunks[1].start_page, chunks[1].end_page), (1001, 2000));
+        assert_eq!((chunks[2].start_page, chunks[2].end_page), (2001, 2500));
+        for count in [0, 1, 999, 1000] {
+            let chunks = paddle_page_chunks(count);
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(
+                (chunks[0].start_page, chunks[0].end_page),
+                (1, count.max(1))
+            );
+        }
+        let chunks = paddle_page_chunks(1001);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!((chunks[1].start_page, chunks[1].end_page), (1001, 1001));
+    }
+
+    #[test]
+    fn paddle_submitted_legacy_batches_remain_resumable_without_repeating_ocr() {
+        let mut chunks = vec![
+            StoredPaddleChunk {
+                start_page: 1,
+                end_page: 100,
+                job_id: Some("existing-job".into()),
+            },
+            StoredPaddleChunk {
+                start_page: 101,
+                end_page: 200,
+                job_id: None,
+            },
+            StoredPaddleChunk {
+                start_page: 201,
+                end_page: 250,
+                job_id: None,
+            },
+        ];
+        assert!(paddle_chunks_are_resumable(&chunks, 250));
+        assert_eq!(chunks[0].job_id.as_deref(), Some("existing-job"));
+        assert!(!paddle_chunks_are_resumable(&chunks, 251));
+        chunks[1].start_page = 102;
+        assert!(!paddle_chunks_are_resumable(&chunks, 250));
+        chunks[1].start_page = 100;
+        assert!(!paddle_chunks_are_resumable(&chunks, 250));
+        chunks[1].start_page = 101;
+        chunks[0].job_id = None;
+        assert!(!paddle_chunks_are_resumable(&chunks, 250));
+        assert!(paddle_chunks_are_resumable(&paddle_page_chunks(2500), 2500));
     }
 
     #[test]

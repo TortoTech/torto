@@ -20,7 +20,7 @@ use rebook_publication::*;
 use serde::{Deserialize, Serialize};
 
 // The revision also isolates semantic/translation caches from older grouping.
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
 pub const PAGE_ANCHOR_PREFIX: &str = "pdf-page-";
 pub use quality::{Assessment, TextRoute, assess};
 const MAX_SECTION_BYTES: u64 = 32 * 1024 * 1024;
@@ -898,6 +898,8 @@ impl ReflowSource {
                 return Err("Invalid PDF reflow section".into());
             }
         }
+        crate::HtmlContext::new(&manifest.book.table_of_contents, Vec::new())
+            .mark_note_sections(&mut manifest.book.sections);
         mark_storage_continuations(&mut manifest);
         Ok(Self {
             directory: directory.to_owned(),
@@ -1267,6 +1269,18 @@ mod tests {
         source.prepared.store(None);
         assert_eq!(source.parse_section(0).unwrap(), section);
         assert_eq!(source.provenance(0).unwrap().len(), stored.provenance.len());
+        let original_provenance = fs::read(&mapping).unwrap();
+        let manifest_path = root.join("cache/manifest.json");
+        let mut manifest: Manifest = read_json(&manifest_path).unwrap();
+        for entry in &mut manifest.book.table_of_contents {
+            entry.label = "Notes".into();
+        }
+        write_json(&manifest_path, &manifest).unwrap();
+        let notes = ReflowSource::open(&root.join("cache"), book.id.as_str()).unwrap();
+        assert!(notes.book().sections[0].is_note_section());
+        assert_eq!(notes.parse_section(0).unwrap(), section);
+        assert_eq!(notes.provenance(0).unwrap().len(), stored.provenance.len());
+        assert_eq!(fs::read(&mapping).unwrap(), original_provenance);
         fs::remove_dir_all(root).unwrap();
     }
 

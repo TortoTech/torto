@@ -24,6 +24,7 @@ pub struct RasterCacheStats {
 #[derive(Default)]
 struct Cache {
     entries: HashMap<u64, (RasterImage, u64)>,
+    variants: HashMap<u64, u64>,
     owners: HashMap<u64, (String, bool)>,
     mode_generations: HashMap<(String, bool), u64>,
     clock: u64,
@@ -74,7 +75,7 @@ pub fn load_original_raster(
         return Ok(raster(image.width, image.height, image.pixels, None));
     }
     let resource = source.resource(href)?;
-    let decoded = image::load_from_memory(&resource.bytes)?.to_rgba8();
+    let decoded = image::load_from_memory(&resource.bytes)?.into_rgba8();
     Ok(raster(
         decoded.width(),
         decoded.height(),
@@ -88,14 +89,15 @@ fn display_raster(
     href: &PublicationUrl,
     target: [u32; 2],
 ) -> RasterImage {
+    let _timing = timing::stage(timing::TimingStage::ImagePixels);
     let (width, height) = (image.width(), image.height());
     let reduced = width > target[0] || height > target[1];
     let decoded = if reduced {
-        image.thumbnail(target[0], target[1])
+        resize_display_image(image, target)
     } else {
         image
     }
-    .to_rgba8();
+    .into_rgba8();
     raster(
         decoded.width(),
         decoded.height(),
@@ -106,6 +108,10 @@ fn display_raster(
             height,
         }),
     )
+}
+
+fn resize_display_image(image: image::DynamicImage, target: [u32; 2]) -> image::DynamicImage {
+    image_processing::resize(image, target, image::imageops::FilterType::Lanczos3)
 }
 
 impl Cache {
@@ -121,6 +127,7 @@ impl Cache {
             .collect::<Vec<_>>();
         for key in retired {
             self.owners.remove(&key);
+            self.variants.remove(&key);
             if let Some((image, _)) = self.entries.remove(&key) {
                 self.stats.bytes -= image.pixels.len();
             }
@@ -146,6 +153,7 @@ impl Cache {
                 };
                 if let Some((image, _)) = self.entries.remove(&oldest) {
                     self.owners.remove(&oldest);
+                    self.variants.remove(&oldest);
                     self.stats.bytes -= image.pixels.len();
                 }
             }
@@ -163,6 +171,7 @@ pub(super) fn load(
     target: [u32; 2],
     generation: u64,
 ) -> Result<RasterImage, LayoutError> {
+    let _timing = timing::stage(timing::TimingStage::ImageCache);
     let owner = (
         source.book().id.to_string(),
         source.book().metadata.layout == RenditionLayout::PrePaginated,
@@ -178,19 +187,21 @@ pub(super) fn load(
     // PDF text coordinates and formulas require exact pixels; they still reuse
     // decoded data and its upload identity.
     let exact = block.text_layer.is_some() || block.formula_image || block.formula.is_some();
-    let decoded = source.raster_resource(&block.href)?;
-    let encoded = if decoded.is_none() {
-        Some(source.resource(&block.href)?)
-    } else {
-        None
+    let (decoded, encoded) = {
+        let _timing = timing::stage(timing::TimingStage::ImageSource);
+        let decoded = source.raster_resource(&block.href)?;
+        let encoded = if decoded.is_none() {
+            Some(source.resource(&block.href)?)
+        } else {
+            None
+        };
+        (decoded, encoded)
     };
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     source.book().id.hash(&mut hash);
+    owner.1.hash(&mut hash);
     block.href.hash(&mut hash);
     exact.hash(&mut hash);
-    if !exact {
-        target.hash(&mut hash);
-    }
     if let Some(image) = &decoded {
         image.width.hash(&mut hash);
         image.height.hash(&mut hash);
@@ -198,12 +209,34 @@ pub(super) fn load(
     } else if let Some(resource) = &encoded {
         resource.bytes.hash(&mut hash);
     }
+    let resource_key = hash.finish();
+    if !exact {
+        target.hash(&mut hash);
+    }
     let key = hash.finish();
     {
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.clock = cache.clock.wrapping_add(1);
         let clock = cache.clock;
-        if let Some((image, touched)) = cache.entries.get_mut(&key) {
+        // Reuse the smallest sufficiently detailed variant, preserving its Blob
+        // identity. A viewport/DPI bucket change must not decode the resource
+        // again when retained pixels already meet the requested resolution.
+        let reusable = (!exact)
+            .then(|| {
+                cache
+                    .variants
+                    .iter()
+                    .filter_map(|(candidate, resource)| {
+                        let (image, _) = cache.entries.get(candidate)?;
+                        (*resource == resource_key && sufficient_detail(image, target))
+                            .then_some((*candidate, image.pixels.len()))
+                    })
+                    .min_by_key(|(_, bytes)| *bytes)
+                    .map(|(candidate, _)| candidate)
+            })
+            .flatten();
+        let hit = cache.entries.contains_key(&key).then_some(key).or(reusable);
+        if let Some((image, touched)) = hit.and_then(|key| cache.entries.get_mut(&key)) {
             *touched = clock;
             let image = image.clone();
             cache.stats.hits += 1;
@@ -215,9 +248,13 @@ pub(super) fn load(
         // Source-owned rasters (notably PDF) have their own resolution policy.
         raster(image.width, image.height, image.pixels, None)
     } else {
-        let image = image::load_from_memory(&encoded.expect("encoded image resource").bytes)?;
+        let image = {
+            let _timing = timing::stage(timing::TimingStage::ImageDecode);
+            image::load_from_memory(&encoded.expect("encoded image resource").bytes)?
+        };
         if exact {
-            let rgba = image.to_rgba8();
+            let _timing = timing::stage(timing::TimingStage::ImagePixels);
+            let rgba = image.into_rgba8();
             raster(rgba.width(), rgba.height(), rgba.into_raw().into(), None)
         } else {
             display_raster(image, &block.href, target)
@@ -238,8 +275,25 @@ pub(super) fn load(
     let image = cache.insert(key, image, BUDGET);
     if cache.entries.contains_key(&key) {
         cache.owners.insert(key, owner);
+        if !exact {
+            cache.variants.insert(key, resource_key);
+        }
     }
     Ok(image)
+}
+
+fn sufficient_detail(image: &RasterImage, target: [u32; 2]) -> bool {
+    let Some(origin) = &image.origin else {
+        // The full original is already retained; no larger decode is possible.
+        return true;
+    };
+    let scale = (f64::from(target[0]) / f64::from(origin.width))
+        .min(f64::from(target[1]) / f64::from(origin.height))
+        .min(1.0);
+    // Match the display resizer's rounded dimensions exactly;
+    // rounding up would falsely reject an equally detailed retained thumbnail.
+    f64::from(image.width) >= (f64::from(origin.width) * scale).round().max(1.0)
+        && f64::from(image.height) >= (f64::from(origin.height) * scale).round().max(1.0)
 }
 
 #[cfg(test)]
@@ -253,6 +307,7 @@ mod tests {
         for (key, book, fixed) in [(1, "book", true), (2, "book", false), (3, "other", true)] {
             cache.insert(key, raster(2, 2, vec![255; 16].into(), None), 128);
             cache.owners.insert(key, (book.into(), fixed));
+            cache.variants.insert(key, key + 10);
         }
         cache.retire_view("book", true);
         assert!(!cache.entries.contains_key(&1));
@@ -261,6 +316,8 @@ mod tests {
         assert_eq!(cache.stats.bytes, 32);
         assert_eq!(cache.stats.images, 2);
         assert_eq!(cache.mode_generations.get(&("book".into(), true)), Some(&1));
+        assert!(!cache.variants.contains_key(&1));
+        assert_eq!(cache.variants.len(), 2);
     }
 
     #[test]
@@ -314,13 +371,45 @@ mod tests {
             formula: None,
             text_layer: None,
         };
+        let capture = timing::TimingScope::start().unwrap();
         let first = load(&source, &block, [512, 1024], generation()).unwrap();
+        let cold = capture.finish();
+        assert_eq!(cold.calls(timing::TimingStage::ImageDecode), 1);
+        assert_eq!(cold.calls(timing::TimingStage::ImagePixels), 1);
+        let capture = timing::TimingScope::start().unwrap();
         let repeated = load(&source, &block, [512, 1024], generation()).unwrap();
+        let warm = capture.finish();
+        assert_eq!(warm.calls(timing::TimingStage::ImageDecode), 0);
+        assert_eq!(warm.calls(timing::TimingStage::ImagePixels), 0);
         assert!(Arc::ptr_eq(&first.pixels, &repeated.pixels));
         assert_eq!(
             first.blob.as_ref().unwrap().id(),
             repeated.blob.unwrap().id()
         );
+        for target in [[384, 768], [1024, 512]] {
+            let smaller = load(&source, &block, target, generation()).unwrap();
+            assert!(Arc::ptr_eq(&first.pixels, &smaller.pixels));
+            assert_eq!(
+                first.blob.as_ref().unwrap().id(),
+                smaller.blob.unwrap().id()
+            );
+        }
+        let larger = load(&source, &block, [1024, 2048], generation()).unwrap();
+        assert!(!Arc::ptr_eq(&first.pixels, &larger.pixels));
+        assert!(larger.width > first.width && larger.height > first.height);
+        // Exact formula pixels never use a display-size variant.
+        let exact = load(
+            &source,
+            &ImageBlock {
+                formula_image: true,
+                ..block.clone()
+            },
+            [384, 768],
+            generation(),
+        )
+        .unwrap();
+        assert_eq!((exact.width, exact.height), (1200, 1800));
+        assert!(exact.origin.is_none());
         let mut geometry = Vec::new();
         for scale in [1.0, 2.0] {
             let layout = LayoutEngine::new()
@@ -370,9 +459,62 @@ mod tests {
     }
 
     #[test]
+    fn resizing_transparent_pixels_does_not_bleed_hidden_color() {
+        let source = image::RgbaImage::from_fn(2, 2, |x, _| {
+            if x == 0 {
+                image::Rgba([255, 0, 0, 0])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let resized = display_raster(
+            source.into(),
+            &PublicationUrl::parse("transparent.png").unwrap(),
+            [1, 1],
+        );
+        assert_eq!((resized.width, resized.height), (1, 1));
+        assert!(resized.pixels[0] <= 1);
+        assert!(resized.pixels[2] >= 254);
+        assert!((127..=128).contains(&resized.pixels[3]));
+    }
+
+    #[test]
+    fn display_resize_handles_grayscale_rgb_alpha_and_high_bit_depth() {
+        for color in [
+            image::ColorType::L8,
+            image::ColorType::La8,
+            image::ColorType::Rgb8,
+            image::ColorType::Rgba8,
+            image::ColorType::L16,
+            image::ColorType::La16,
+            image::ColorType::Rgb16,
+            image::ColorType::Rgba16,
+            image::ColorType::Rgb32F,
+            image::ColorType::Rgba32F,
+        ] {
+            let source = image::DynamicImage::new(33, 17, color);
+            let color_space = source.color_space();
+            let resized = resize_display_image(source, [16, 16]);
+            assert_eq!(resized.color(), color);
+            assert_eq!(resized.color_space(), color_space);
+            assert_eq!((resized.width(), resized.height()), (16, 8));
+        }
+        let source = image::RgbaImage::from_pixel(3, 2, image::Rgba([42, 43, 44, 128]));
+        let displayed = display_raster(
+            source.into(),
+            &PublicationUrl::parse("small.png").unwrap(),
+            [256, 256],
+        );
+        assert_eq!((displayed.width, displayed.height), (3, 2));
+        assert!(displayed.origin.is_none());
+        assert_eq!(&displayed.pixels[..4], &[42, 43, 44, 128]);
+    }
+
+    #[test]
     fn cache_budget_and_concurrent_insert_preserve_shared_identity() {
         let mut cache = Cache::default();
         let first = cache.insert(1, raster(2, 2, vec![255; 16].into(), None), 32);
+        cache.variants.insert(1, 10);
         let same = cache.insert(1, raster(2, 2, vec![255; 16].into(), None), 32);
         assert!(Arc::ptr_eq(&first.pixels, &same.pixels));
         assert_eq!(first.blob.as_ref().unwrap().id(), same.blob.unwrap().id());
@@ -382,6 +524,30 @@ mod tests {
         cache.insert(3, raster(2, 2, vec![255; 16].into(), None), 32);
         assert_eq!(cache.stats.bytes, 32);
         assert!(!cache.entries.contains_key(&1));
+        assert!(!cache.variants.contains_key(&1));
         assert_eq!(first.pixels.len(), 16);
+    }
+
+    #[test]
+    fn detail_check_respects_both_dimensions_and_native_resolution() {
+        let origin = Some(RasterOrigin {
+            href: PublicationUrl::parse("portrait.png").unwrap(),
+            width: 1200,
+            height: 1800,
+        });
+        let small = raster(512, 768, Arc::from([]), origin);
+        assert!(sufficient_detail(&small, [384, 768]));
+        assert!(sufficient_detail(&small, [1024, 512]));
+        assert!(!sufficient_detail(&small, [1024, 2048]));
+        assert!(sufficient_detail(
+            &raster(1200, 1800, Arc::from([]), None),
+            [2400, 3600]
+        ));
+        let rounded = display_raster(
+            image::DynamicImage::new_rgba8(2001, 3001),
+            &PublicationUrl::parse("rounded.png").unwrap(),
+            [512, 768],
+        );
+        assert!(sufficient_detail(&rounded, [1024, 768]));
     }
 }

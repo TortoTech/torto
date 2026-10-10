@@ -120,16 +120,52 @@ fn apply_theme_colors(style: &mut ReaderStyle, theme: egui::Theme) {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "reader construction keeps source wrappers and persisted state restoration together"
-)]
+#[cfg(any(test, all(target_os = "windows", feature = "memory-profiling")))]
 pub(super) fn open_reader(
     path: &Path,
     reader_fonts: Arc<[Blob<u8>]>,
     shelf_metadata: Option<BookDisplayMetadata>,
     shelf_cover: Option<Vec<u8>>,
     local_store: SyncStore,
+) -> Result<DesktopReader, Box<dyn std::error::Error + Send + Sync>> {
+    open_reader_in_viewport(
+        path,
+        reader_fonts,
+        shelf_metadata,
+        shelf_cover,
+        local_store,
+        default_open_viewport(),
+    )
+}
+
+pub(crate) fn default_open_viewport() -> LayoutViewport {
+    LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT).expect("valid initial viewport")
+}
+
+pub(crate) fn open_viewport(ui: &egui::Ui) -> LayoutViewport {
+    let rect = ui.max_rect();
+    LayoutViewport::new(
+        logical_dimension(f64::from(rect.width())).max(1),
+        logical_dimension(f64::from(
+            rect.height() - egui_view::TOOLBAR_HEIGHT - ui.spacing().item_spacing.y - 3.0,
+        ))
+        .max(1),
+    )
+    .expect("nonzero opening viewport")
+    .with_raster_scale(ui.ctx().pixels_per_point())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "reader construction keeps source wrappers and persisted state restoration together"
+)]
+pub(crate) fn open_reader_in_viewport(
+    path: &Path,
+    reader_fonts: Arc<[Blob<u8>]>,
+    shelf_metadata: Option<BookDisplayMetadata>,
+    shelf_cover: Option<Vec<u8>>,
+    local_store: SyncStore,
+    viewport: LayoutViewport,
 ) -> Result<DesktopReader, Box<dyn std::error::Error + Send + Sync>> {
     let started = Instant::now();
     let publication_started = Instant::now();
@@ -266,7 +302,6 @@ pub(super) fn open_reader(
     let source: Arc<dyn BookSource> = structure_source.clone();
     let mut highlight_store = HighlightStore::from_repository(local_store.clone());
     let mut highlights = highlight_store.for_book(&book_id);
-    let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
     let reader_preferences = preferences::load_reader_preferences().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load reader preferences; using defaults");
         ReaderPreferences::default()
@@ -333,7 +368,10 @@ pub(super) fn open_reader(
     let progress_ms = progress_started.elapsed().as_secs_f32() * 1_000.0;
     let resumed = stored_progress.is_some();
     let initial_layout_started = Instant::now();
-    let reader = if let Some(progress) = stored_progress {
+    let timing_scope = cfg!(debug_assertions)
+        .then(rebook_layout::timing::TimingScope::start)
+        .flatten();
+    let mut reader = if let Some(progress) = stored_progress {
         match ReaderSession::open_with_fonts_at_locator(
             Arc::clone(&source),
             viewport,
@@ -351,7 +389,40 @@ pub(super) fn open_reader(
     } else {
         ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?
     };
+    // Prepare the complete visible reading unit on the opening worker. The UI
+    // must not discover and compile its remaining segments on the first frame.
+    if reading_mode == ReadingMode::Focus || reader.style().spread == SpreadMode::Scroll {
+        reader.current_reading_unit_pages()?;
+    }
+    let breakdown = timing_scope.map(rebook_layout::timing::TimingScope::finish);
     let initial_layout_ms = initial_layout_started.elapsed().as_secs_f32() * 1_000.0;
+    if let Some(breakdown) = breakdown {
+        use crate::diagnostics::{Field, log};
+        use rebook_layout::timing::TimingStage;
+        let ms = |stage| breakdown.duration(stage).as_secs_f32() * 1_000.0;
+        log(
+            "reader.open_breakdown",
+            &[
+                Field::Detail("book_id", &book_id),
+                Field::F32("total_ms", breakdown.total.as_secs_f32() * 1_000.0),
+                Field::F32("section_parse_ms", ms(TimingStage::SectionParse)),
+                Field::F32("fonts_ms", ms(TimingStage::Fonts)),
+                Field::F32("image_source_ms", ms(TimingStage::ImageSource)),
+                Field::F32("image_cache_ms", ms(TimingStage::ImageCache)),
+                Field::F32("image_decode_ms", ms(TimingStage::ImageDecode)),
+                Field::F32("image_pixels_ms", ms(TimingStage::ImagePixels)),
+                Field::F32("layout_ms", ms(TimingStage::Layout)),
+                Field::F32("display_list_ms", ms(TimingStage::DisplayList)),
+                Field::F32("other_ms", ms(TimingStage::Other)),
+                Field::Usize(
+                    "sections_parsed",
+                    breakdown.calls(TimingStage::SectionParse),
+                ),
+                Field::Usize("images_loaded", breakdown.calls(TimingStage::ImageSource)),
+                Field::Usize("images_decoded", breakdown.calls(TimingStage::ImageDecode)),
+            ],
+        );
+    }
     #[cfg(all(target_os = "windows", feature = "memory-profiling"))]
     crate::diagnostics::memory_checkpoint("initial_layout_complete");
     let initial_location = reader.location();
@@ -363,6 +434,9 @@ pub(super) fn open_reader(
             crate::diagnostics::Field::F32("source_wrappers_ms", source_wrappers_ms),
             crate::diagnostics::Field::F32("progress_ms", progress_ms),
             crate::diagnostics::Field::Bool("resumed", resumed),
+            crate::diagnostics::Field::U64("viewport_width", u64::from(viewport.width)),
+            crate::diagnostics::Field::U64("viewport_height", u64::from(viewport.height)),
+            crate::diagnostics::Field::F32("raster_scale", viewport.raster_scale),
             crate::diagnostics::Field::F32("initial_layout_ms", initial_layout_ms),
             crate::diagnostics::Field::Usize("section", initial_location.section_index),
             crate::diagnostics::Field::Usize("segment", initial_location.segment_index),
@@ -375,7 +449,7 @@ pub(super) fn open_reader(
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         "opened book"
     );
-    Ok(DesktopReader::new(
+    let mut desktop = DesktopReader::new(
         reader,
         DesktopReaderResources {
             source,
@@ -408,7 +482,9 @@ pub(super) fn open_reader(
             sync_password,
             source_path: path.to_path_buf(),
         },
-    ))
+    );
+    desktop.canvas_size = Some((viewport.width, viewport.height));
+    Ok(desktop)
 }
 
 /// Opt-in headless reproduction. Reads local progress/settings but does not

@@ -1,13 +1,12 @@
 //! Safe, pull-based EPUB publication parser.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crc32fast::hash as crc32;
 use flate2::read::DeflateDecoder;
-use image::ImageReader;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use rebook_html::{SectionParseHints, parse_section_with_hints_and_image_classifier};
@@ -22,7 +21,7 @@ use zip::{CompressionMethod, ZipArchive};
 
 use crate::source::{TocHeadingHint, collect_toc_heading_hints, promote_toc_headings};
 
-mod continuations;
+use crate::continuations;
 mod html_context;
 
 /// Resource budgets applied before and during decompression.
@@ -74,10 +73,8 @@ pub(super) struct EpubPublication {
     book: Book,
     media_types: HashMap<String, String>,
     archive: EpubArchive,
-    decorative_separator_images: Mutex<HashMap<String, bool>>,
-    note_section_paths: HashSet<String>,
     toc_heading_hints: HashMap<String, Vec<TocHeadingHint>>,
-    html_context: html_context::HtmlContext,
+    html_context: crate::HtmlContext,
 }
 
 impl EpubPublication {
@@ -119,26 +116,15 @@ impl EpubPublication {
         let mut reading_order = build_reading_order(&package_model)?;
         let table_of_contents =
             promote_single_toc_root(parse_navigation(&archive, &package_model)?);
-        let note_section_paths = collect_note_section_paths(&table_of_contents);
-        for section in &mut reading_order {
-            if note_section_paths.contains(section.href.path()) && !section.is_note_section() {
-                section
-                    .properties
-                    .push(rebook_publication::NOTE_SECTION_PROPERTY.to_owned());
-            }
-        }
         let toc_heading_hints = collect_toc_heading_hints(&table_of_contents);
-        let html_context = html_context::HtmlContext::new(
-            &package_model,
-            &package,
-            &package_url,
-            &table_of_contents,
-        );
+        let html_context =
+            html_context::build(&package_model, &package, &package_url, &table_of_contents);
+        html_context.mark_note_sections(&mut reading_order);
         if package_model.metadata.layout == RenditionLayout::Reflowable {
             continuations::mark_quote_continuations(
-                &archive,
                 &mut reading_order,
                 &table_of_contents,
+                |href| archive.read_content_xml(href).ok(),
             );
         }
         let digest = Sha256::digest(bytes.as_ref());
@@ -155,62 +141,14 @@ impl EpubPublication {
             },
             media_types,
             archive,
-            decorative_separator_images: Mutex::new(HashMap::new()),
-            note_section_paths,
             toc_heading_hints,
             html_context,
         })
     }
 }
 
-fn collect_note_section_paths(entries: &[TocEntry]) -> HashSet<String> {
-    fn visit(entries: &[TocEntry], classifications: &mut HashMap<String, (bool, bool)>) {
-        for entry in entries {
-            if let Some(href) = &entry.href {
-                let classification = classifications.entry(href.path().to_owned()).or_default();
-                if is_note_navigation_label(&entry.label) {
-                    classification.0 = true;
-                } else {
-                    classification.1 = true;
-                }
-            }
-            visit(&entry.children, classifications);
-        }
-    }
-
-    let mut classifications = HashMap::new();
-    visit(entries, &mut classifications);
-    classifications
-        .into_iter()
-        .filter_map(|(path, (is_notes, has_non_note_entry))| {
-            (is_notes && !has_non_note_entry).then_some(path)
-        })
-        .collect()
-}
-
-fn is_note_navigation_label(label: &str) -> bool {
-    let label = label
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim_matches([':', '：'])
-        .to_owned();
-    matches!(
-        label.to_ascii_lowercase().as_str(),
-        "note"
-            | "notes"
-            | "endnote"
-            | "endnotes"
-            | "footnote"
-            | "footnotes"
-            | "注释"
-            | "注解"
-            | "尾注"
-            | "本章注"
-            | "章节注释"
-            | "作者附注"
-    )
-}
+#[cfg(test)]
+use crate::html_context::collect_note_section_paths;
 
 impl BookSource for EpubPublication {
     fn book(&self) -> &Book {
@@ -294,20 +232,7 @@ impl EpubPublication {
             descriptor,
             |href| self.archive.read_stylesheet(href).ok(),
             |href| self.is_decorative_separator_image(href),
-            SectionParseHints {
-                note_section: self.note_section_paths.contains(descriptor.href.path()),
-                navigation_documents: &self.html_context.navigation_documents,
-                ancestor_targets: self
-                    .html_context
-                    .ancestors
-                    .get(descriptor.href.path())
-                    .map_or(&[], Vec::as_slice),
-                heading_targets: self
-                    .html_context
-                    .headings
-                    .get(descriptor.href.path())
-                    .map_or(&[], Vec::as_slice),
-            },
+            self.html_context.hints(descriptor),
         )?;
         if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {
             promote_toc_headings(&mut section, hints);
@@ -316,35 +241,8 @@ impl EpubPublication {
     }
 
     fn is_decorative_separator_image(&self, href: &PublicationUrl) -> bool {
-        if let Some(classified) = self
-            .decorative_separator_images
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(href.path()).copied())
-        {
-            return classified;
-        }
-
-        let classified = self
-            .archive
-            .read(href)
-            .ok()
-            .and_then(|bytes| {
-                ImageReader::new(Cursor::new(bytes))
-                    .with_guessed_format()
-                    .ok()?
-                    .into_dimensions()
-                    .ok()
-            })
-            .is_some_and(|(width, height)| {
-                (1..=8).contains(&height)
-                    && (32..=512).contains(&width)
-                    && width >= height.saturating_mul(8)
-            });
-        if let Ok(mut cache) = self.decorative_separator_images.lock() {
-            cache.insert(href.path().to_owned(), classified);
-        }
-        classified
+        self.html_context
+            .is_separator_image(href, || self.archive.read(href).ok())
     }
 }
 
@@ -2188,6 +2086,212 @@ mod tests {
             .write_to(&mut output, ImageFormat::Png)
             .unwrap();
         output.into_inner()
+    }
+
+    #[test]
+    fn table_product_images_survive_parsing_layout_and_display_compilation() {
+        let page = br#"<html><head><style>
+            img { display: block; width: 100%; }
+        </style></head><body><table>
+            <tr><td/><td><div><img src="../Images/cleanser.png"/></div></td>
+                <td><div><img src="../Images/moisturizer.png"/></div></td>
+                <td><div><img src="../Images/sunscreen.png"/></div></td>
+                <td><div><img src="../Images/serum.png"/></div></td></tr>
+            <tr><td/><td>CLEANSER</td><td>MOISTURIZER</td><td>SUNSCREEN</td><td>SERUM</td></tr>
+            <tr><td>Protect</td><td>Removes substances</td><td>Protects skin</td>
+                <td>Blocks UV</td><td>Adds ingredients</td></tr>
+        </table></body></html>"#;
+        let mut entries = minimal_entries();
+        entries
+            .iter_mut()
+            .find(|entry| entry.0 == "OPS/Text/chapter.xhtml")
+            .unwrap()
+            .1 = page;
+        let image = png(40, 120);
+        entries.extend([
+            (
+                "OPS/Images/cleanser.png",
+                image.as_slice(),
+                CompressionMethod::Deflated,
+            ),
+            (
+                "OPS/Images/moisturizer.png",
+                image.as_slice(),
+                CompressionMethod::Deflated,
+            ),
+            (
+                "OPS/Images/sunscreen.png",
+                image.as_slice(),
+                CompressionMethod::Deflated,
+            ),
+            (
+                "OPS/Images/serum.png",
+                image.as_slice(),
+                CompressionMethod::Deflated,
+            ),
+        ]);
+        let source = EpubPublication::open_bytes(zip_entries(&entries)).unwrap();
+        let section = source.parse_section(0).unwrap();
+        let [Block::Table(table)] = section.blocks.as_slice() else {
+            panic!("expected one table containing its product images");
+        };
+        verify_product_image_table(&source, table);
+    }
+
+    fn verify_product_image_table(source: &dyn BookSource, table: &rebook_publication::TableBlock) {
+        use rebook_layout::{
+            LayoutEngine, LayoutViewport, PageItem, ReaderStyle, ReaderTypesetting, SpreadMode,
+        };
+        use rebook_renderer::DisplayListCompiler;
+
+        assert!(table.rows[0].cells[0].text.content.is_empty());
+        assert_eq!(
+            table.rows[0]
+                .cells
+                .iter()
+                .flat_map(|cell| &cell.text.content)
+                .filter(|inline| matches!(inline, Inline::Image(_)))
+                .count(),
+            4
+        );
+        let mut engine = LayoutEngine::new();
+        for unified in [false, true] {
+            for (width, font_size) in [(600, 16.0), (1000, 24.0)] {
+                let mut style = ReaderStyle {
+                    spread: SpreadMode::Single,
+                    typesetting: if unified {
+                        ReaderTypesetting::unified()
+                    } else {
+                        ReaderTypesetting::default()
+                    },
+                    ..ReaderStyle::default()
+                };
+                style.typography.font_size = font_size;
+                let layout = engine
+                    .layout_blocks(
+                        source,
+                        &[Block::Table(table.clone())],
+                        LayoutViewport::new(width, 1600).unwrap(),
+                        &style,
+                    )
+                    .unwrap();
+                let mut images = 0;
+                for page in &layout.pages {
+                    let display = DisplayListCompiler.compile(page);
+                    images += display.image_data().count();
+                    for item in &page.items {
+                        let PageItem::Table(table) = item else {
+                            continue;
+                        };
+                        for cell in &table.cells {
+                            let Some(text) = &cell.text else {
+                                continue;
+                            };
+                            if unified {
+                                for line in text.layout.lines() {
+                                    assert!(
+                                        line.metrics().offset + line.metrics().advance
+                                            - line.metrics().trailing_whitespace
+                                            <= text.available_width + 0.5,
+                                        "table text overflow: viewport {width}, font {font_size}, available {}, advance {}, text {:?}",
+                                        text.available_width,
+                                        line.metrics().advance,
+                                        &text.text[line.text_range()]
+                                    );
+                                }
+                            }
+                            for image in &*text.inline_images {
+                                assert!(image.width <= text.available_width + 0.01);
+                                assert!(image.height <= cell.height + 0.01);
+                                assert!(!image.image.pixels.is_empty());
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    images, 4,
+                    "all four product images must reach the display list"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_PERF_BOOK pointing to The Science of Beauty"]
+    fn local_science_of_beauty_product_table_images() {
+        let opened = crate::open_file(std::path::PathBuf::from(
+            std::env::var_os("TORTO_PERF_BOOK").expect("TORTO_PERF_BOOK"),
+        ))
+        .unwrap();
+        let source = opened.source();
+        let index = source
+            .book()
+            .sections
+            .iter()
+            .position(|section| {
+                section
+                    .href
+                    .path()
+                    .ends_with("056-057_Need-skincare_Cleansers.xhtml")
+            })
+            .expect("skincare chapter");
+        let section = source.parse_section(index).unwrap();
+        let table = section
+            .blocks
+            .iter()
+            .find_map(|block| {
+                let Block::Table(table) = block else {
+                    return None;
+                };
+                table
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.cells)
+                    .any(|cell| {
+                        cell.text.content.iter().any(|inline| {
+                            matches!(inline, Inline::Image(run)
+                    if run.image.href.path().ends_with("Page-057_1.png"))
+                        })
+                    })
+                    .then_some(table)
+            })
+            .expect("What skincare can do table with its product pictures");
+        verify_product_image_table(source.as_ref(), table);
+
+        if let Some(output) = std::env::var_os("TORTO_TABLE_PREVIEW") {
+            use anyrender::ImageRenderer;
+            use anyrender_vello_cpu::VelloCpuImageRenderer;
+            use rebook_layout::{
+                LayoutEngine, LayoutViewport, ReaderStyle, ReaderTypesetting, SpreadMode,
+            };
+            use rebook_renderer::DisplayListCompiler;
+            let mut style = ReaderStyle {
+                spread: SpreadMode::Single,
+                typesetting: ReaderTypesetting::unified(),
+                ..ReaderStyle::default()
+            };
+            style.typography.font_size = 24.0;
+            let layout = LayoutEngine::new()
+                .layout_blocks(
+                    source.as_ref(),
+                    &[Block::Table(table.clone())],
+                    LayoutViewport::new(1200, 1600).unwrap(),
+                    &style,
+                )
+                .unwrap();
+            assert_eq!(layout.pages.len(), 1);
+            let display = DisplayListCompiler.compile(&layout.pages[0]);
+            let mut renderer = VelloCpuImageRenderer::new(1200, 1600);
+            let mut pixels = Vec::new();
+            renderer.render_to_vec(
+                |scene| display.paint_scaled_at(scene, 1.0, 0.0, 0.0),
+                &mut pixels,
+            );
+            image::RgbaImage::from_raw(1200, 1600, pixels)
+                .unwrap()
+                .save(output)
+                .unwrap();
+        }
     }
 
     fn minimal_epub() -> Vec<u8> {

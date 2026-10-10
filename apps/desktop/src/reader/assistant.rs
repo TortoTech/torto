@@ -774,8 +774,8 @@ impl DesktopReader {
                         self.reopen_notice = Some(
                             self.language
                                 .text(
-                                    "PDF OCR 解析成功，已切换到 OCR 版式",
-                                    "PDF OCR completed; switched to OCR reflow",
+                                    "OCR 识别完成，已切换到文字版式",
+                                    "OCR completed; switched to text reflow",
                                 )
                                 .into(),
                         );

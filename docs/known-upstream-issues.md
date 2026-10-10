@@ -55,7 +55,71 @@
 2. 后续 SDK 升级继续回归多轮不透明字段回传、真正 SSE、跨端点/凭据/模型切换、翻译和排版的结构化输出。若上游增加端点和凭据保护，再评估移除本地作用域校验。
 3. 网关上游连接故障独立跟踪。SDK 升级不能替代上游根因排查，也不能据此删除有限重试。
 
-## 2026-09-10 上游版本核查
+## 2026-10-09 核心依赖升级
+
+已将 GPU 栈协调升级到 Vello / vello_encoding 0.11.0、wgpu 30.0.1、egui / epaint / egui_extras / egui-winit / egui-wgpu 0.36.2；PDF 栈升级到 Hayro / hayro-interpret / hayro-syntax 0.8.0。同时更新 resvg / usvg 0.48.1、image 0.25.10、fontdb 0.24.0、ICU segmenter 2.3.0，以及项目直接使用的 Skrifa 0.48.0 / read-fonts 0.45.0。上游组件自行约束的字体/SIMD 版本仍分别保留，不能强制合并不兼容类型。Parley、Vello CPU 和 egui_commonmark 没有新的稳定版。
+
+- egui-wgpu 改回官方 crate；旧 wgpu 29 适配目录不再被 `[patch.crates-io]` 引用，仅作为历史源代码保留。桌面适配 wgpu 30 的 adapter 参数和队列呈现接口，保留同帧 surface 恢复、原生背景和模拟全屏处理。
+- 回移已合并但尚未发布的 [egui #8316](https://github.com/emilk/egui/pull/8316)，同时修改 egui 和 egui_extras，保留上游诊断/虚拟占位回归测试。0.36.2 使用 `UiBuilder::id` / `Ui::id` 表达新版的稳定 scope ID；#8343 仍开放，暂不撤销现有全局误报兼容设置。
+- Hayro 区域渲染改用官方 `render_into`，删掉旧 renderer 模块和自定义区域/解码向量补丁。客户端仍保持整数像素原点、256×4 tile 网格及裁剪保护边。文字提取与图片导出同步迁移到 positioned glyph run 和逐次 draw props，继承资源使用新版已解析的页面 Resources。
+- Hayro 有界 outline 缓存、逐页解释器释放和权威 PDF 解码后的独立图片采样继续保留。原有图片图集刷新、EBDT 字体过滤、两端对齐选区、离屏 Markdown 选区以及目录虚拟化兼容代码未删除。
+- PDF 本地重排生成版本提高到 **V13**，防止旧解释器生成的像素/语义产物与新版混用。旧文件和已有 OCR 资源不在本次升级中批量重写。
+
+验证：最终生产路径 `cargo build -p rebook-desktop --locked` 和 `cargo check --workspace --locked` 通过；核心库 519 项、桌面 772 项、隔离运行的 egui/egui_extras/epaint 104 项单元回归共 **1,395 项**通过。回移的控件移动/合法替换诊断及虚拟占位 ID 测试通过；有界缓存、旋转/非零原点、遮罩、裁剪、独立图片及源映射回归通过。隔离上游测试启用项目实际使用的 PNG/JPEG/GIF/WebP 编解码功能。
+
+真实书籍验证：151,782,128 字节的《Pick, Click, Flick!》14 个物理页共 27 张图片，区域导出与新版整页对应像素完全一致；《The Science of Beauty》的产品表格图片及两项复杂图注诊断通过；《Thinking in Systems》Figure 15–17 在窄宽度自然折行时左对齐、宽宽度单行时居中。三本 PDF 直接调用公开 `assess` 接口，新旧生成版本的 12 页抽样结果逐项一致：Designing Type 为 Native（11 Native / 1 Sparse），Pick, Click, Flick! 为 Native（10 / 2），Thinking with Type 为 Ocr（4 Native / 7 Unreliable / 1 Sparse）。既有 `local_quality_signals` 诊断要求至少 8 个 Native 样本，不适用于最后一本；没有因此修改其实际 OCR 判断规则。
+
+Windows 运行检查使用 NVIDIA GTX 1080、NVIDIA 582.66、Vulkan。合成 PDF、《The Science of Beauty》和《Designing Type》通过 GPU 提交/内容呈现及最小化恢复后的持续帧检查。Science 曾有一次恢复后再次被最小化而超时，重跑通过。空书架启动检查通过；最小化恢复检查在新旧客户端均恢复后未满足持续帧要求而超时（旧版 40 帧、新版 36 帧），没有据此修改生产调度，也未将该场景记为通过；具体原因仍需单独排查。普通客户端使用现有书库进行空闲抽样：初次失焦运行存在间歇渲染/CPU 活动，旧版对照样本同时发生最小化，不能用作等价性能对比。重新启动新版后等待 20 秒加载，再连续采样 15.03 秒，CPU 时间增量为 0，日志未出现新的渲染记录；仅据此确认该次安静样本没有持续忙转，不声称性能提升。截图辅助通道缺少 native pipe，未完成画面/弹窗的人工式交互检查。Parley 随 ICU 2.3 的现有 BidiClass API 出现弃用警告，不影响构建；没有声称严格零警告 clippy 或速度/内存改善。
+
+日志及版本解析报告位于忽略目录 `tmp/dependency-upgrade-20261009/` 和 `tmp/dependency-upgrade-*.log`。
+
+## 2026-10-09 上游版本核查（升级前）
+
+以下记录是升级前的核查快照。本次核对 `Cargo.lock` 的实际解析版本、本地 `third_party` 补丁、crates.io 最新非撤回稳定版、官方 issue/PR 和发布版本源码。没有更新依赖或移除兼容代码，也没有运行新版的客户端回归；下列“可替代”表示源码层面的迁移候选，不代表 Torto 已验证新版行为。上一轮 2026-09-10 的结果保留在后面作为历史记录。
+
+### 当前可用版本
+
+| 依赖 | 项目实际版本 | 最新稳定版 | 核查结论 |
+| --- | --- | --- | --- |
+| egui / epaint / egui-wgpu / egui-winit / egui_extras | 0.36.1；前三项为本地 fork | [0.36.2](https://github.com/emilk/egui/releases/tag/0.36.2)，2026-09-08 | 已修复 TextEdit 最小高度、细长倾斜矩形、大写图片扩展名等。官方 egui-wgpu 0.36.2 [依赖 wgpu 30](https://github.com/emilk/egui/blob/0.36.2/Cargo.toml)，当前本地适配使用 wgpu 29，不能仅修改版本号并覆盖 fork。 |
+| Vello / vello_encoding | 0.10.0 | [0.11.0](https://github.com/linebender/vello/releases/tag/v0.11.0)，2026-10-02 | 已修复两类 sbix 位图字形定位，并升级到 wgpu/naga 30；不是宋体 EBDT 或图片重放问题的修复。 |
+| wgpu / wgpu-core / wgpu-hal | 29.0.4 | [30.0.1](https://github.com/gfx-rs/wgpu/releases/tag/v30.0.1)，2026-08-22 | 可与 Vello 0.11 和官方 egui-wgpu 0.36.2 对齐；未找到覆盖当前 Windows 黑帧问题的已发布修复。 |
+| Hayro / hayro-interpret / hayro-syntax | 0.7.1 本地 fork / 0.7.0 / 0.7.2 | [0.8.0](https://crates.io/crates/hayro/0.8.0)，2026-10-04 | 新增自定义变换/缓冲区渲染，修复图片解码尺寸受平移影响；包含解码、颜色转换、缓存和图片处理改进。解释器 Device API 也有变化，需迁移 PDF 提取与渲染两条路径。 |
+| Vello CPU / vello_common | 0.3.0 | [0.3.0](https://crates.io/crates/vello_cpu/0.3.0)，2026-10-02 | 已是最新稳定版。当前 Hayro fork 和 AnyRender CPU 后端已使用此版，不能把其中已有的修复算作再次升级 Hayro 的收益。 |
+| Parley | 0.11.1 本地 fork | [0.11.1](https://crates.io/crates/parley/0.11.1) | 无新版；选区 issue 仍开放，本地行内图片/ruby 边界和方向补丁也需保留。 |
+| egui_commonmark / backend | 0.25.0 本地 fork | [0.25.0](https://crates.io/crates/egui_commonmark/0.25.0) | 无新版，多组件选区 issue 仍开放。 |
+| winit | 0.30.13 | [0.30.13](https://crates.io/crates/winit/0.30.13) | 无新版稳定版；0.31.0-beta.3 仍为预发行版。 |
+| Skrifa / read-fonts | 0.44.0、0.42.1 / 0.41.0、0.39.2 | [0.48.0](https://crates.io/crates/skrifa/0.48.0) / [0.45.0](https://crates.io/crates/read-fonts/0.45.0)，2026-10-03 | 有新版，但 Vello 0.11 仍声明 Skrifa 0.44；单独增加最新版不会接通 Vello 的 EBDT mask 绘制。 |
+| resvg / usvg | 0.47.0 | [0.48.1](https://github.com/linebender/resvg/releases/tag/v0.48.1)，2026-08-02 | 0.48 改用 Skrifa/Harfrust，修复字形 advance、文本及嵌套 SVG 变换、渐变和过滤器崩溃；值得做 SVG 像素/文字回归，未对应本文主要兼容问题。见 [changelog](https://github.com/linebender/resvg/blob/v0.48.1/CHANGELOG.md)。 |
+| image | 精确锁定 0.25.6 | [0.25.10](https://github.com/image-rs/image/blob/v0.25.10/CHANGES.md) | 有新版；包含 PNG/GIF/WebP/BMP 解码修复，0.25.9 将 zune-jpeg 升到 0.5。更新前需核对现有颜色、透明度、JPEG 和封面像素，不保证速度改善。 |
+| fontdb | 0.23.0 | [0.24.0](https://github.com/RazrFalcon/fontdb/blob/master/CHANGELOG.md) | 新增 iOS 系统字体支持并去除 ttf-parser 依赖；没有本文 Windows 空白字形问题的对应修复。 |
+| ICU segmenter | 2.2.0 | [2.3.0](https://crates.io/crates/icu_segmenter/2.3.0) | 有新版；与本文图形栈兼容问题无直接对应关系。 |
+| AnyRender / AnyRender Vello CPU、Peniko、Kurbo、RaTeX、Rig | 0.14.0 / 0.18.0、0.6.1、0.13.1、0.1.14、0.44.0 | 与当前相同 | 已是最新稳定版；Rig 网关签名解析问题已在当前 0.44.0 升级中处理，见本文首节。 |
+
+### 记录问题与新修复的对应关系
+
+| 本地问题 | 2026-10-09 核查结果与处理 |
+| --- | --- |
+| 虚拟表格控件 ID/矩形误报 | [egui #8092](https://github.com/emilk/egui/issues/8092) 已由 [PR #8316](https://github.com/emilk/egui/pull/8316) 在 2026-10-05 合并后关闭。修复稳定表格自动 ID、避免虚拟占位行消耗 ID，并加入局部诊断豁免 API；尚未进入 0.36.2。可优先评估单独回移该修复，不能仅升 0.36.2 就撤销兼容设置。另一个 [#8343](https://github.com/emilk/egui/issues/8343) 仍开放。 |
+| 显式高度 TextEdit | [#8420](https://github.com/emilk/egui/pull/8420) 已进入 0.36.2；修复最小高度被忽略。已有感知区域和 hint 对齐修复不是此次新增；设计要求的显式 vertical_align 仍需保留。 |
+| Hayro 区域渲染与图片解码尺寸 | 0.8.0 已包含 [#1375](https://github.com/LaurenzV/hayro/pull/1375) 的 `render_into`，可以传入独立 RenderContext 和任意 Affine；[#1384](https://github.com/LaurenzV/hayro/pull/1384) 排除解码尺寸计算中的平移。两项能力与本地区域渲染/变换向量补丁相对应，是迁移候选；仍须验证 256×4 tile 对齐、旋转、非零页原点、遮罩和裁剪的像素一致性。0.8.0 的 RenderCache 仍无公开预算或逐页释放接口，不能删除有界缓存和独立图片导出等补丁。 |
+| Vello 图片重放缺失 | [#1809](https://github.com/linebender/vello/issues/1809) 仍开放，0.11.0 发布说明没有对应修复。保留图片图集刷新。 |
+| 宋体等 EBDT 字形空白 | [Fontations #1639](https://github.com/googlefonts/fontations/issues/1639) 仍开放；0.11.0 [发布源码](https://github.com/linebender/vello/blob/v0.11.0/research/vello_research/src/scene.rs) 仍遇到 unpacked mask 就跳过字形。sbix 定位修复是不同格式的问题，保留字体过滤。 |
+| Windows 全屏/IME 黑帧、窗口放大黑边 | [winit #3730](https://github.com/rust-windowing/winit/issues/3730)、[wgpu #5374](https://github.com/gfx-rs/wgpu/issues/5374) 仍开放，未找到完全覆盖 Torto 全屏/IME 场景的发布修复。wgpu 30.0.1 的 acquire fence 修复针对非 Windows；模拟全屏、同帧 surface 恢复和原生背景处理继续保留。 |
+| 两端对齐选区不足 | [Parley #396](https://github.com/linebender/parley/issues/396) 仍开放，无新版；保留选区几何修正。 |
+| 紧凑圆角羽化角线 | [#2735](https://github.com/emilk/egui/issues/2735)、[#7424](https://github.com/emilk/egui/issues/7424) 仍开放；0.36.2 的细长倾斜矩形修复不是圆角控件的一一对应修复。 |
+| Markdown 跨组件选区、离屏端点清空 | [egui_commonmark #80](https://github.com/lampsitter/egui_commonmark/issues/80) 仍开放；egui 0.36.2 的 Label 可见区域检查和端点未遇到时清空选区逻辑仍存在。保留不可选布局换行、本地 Label 与 AI 表格布局。 |
+| 虚拟目录底部抖动 | [#1787](https://github.com/emilk/egui/issues/1787)、[#3268](https://github.com/emilk/egui/issues/3268) 仍开放；0.36.2 的 `show_rows` 仍在末行越界时回补首行。保留目录虚拟化。 |
+| 专注模式滚轮跨小节闪首图 | 已有本地输入时序修复，不是依赖版本更新可替代的问题。 |
+
+### 建议的升级顺序
+
+1. 先评估 egui #8316 的回移及 0.36.2 的具体修复，保留现有选区、Markdown、epaint 和 wgpu 29 适配。#8316 同时修改 egui 和 egui_extras，不能只合并 Context 的一部分；恢复诊断前回归虚拟表格、反向布局和动态 UI。
+2. 独立评估 Hayro 0.8.0，迁移 PDF 提取和渲染的 API，并逐项对照 `third_party/hayro/TORTO_PATCHES.md`。有机会减少区域渲染/图片解码补丁，但有界缓存等补丁仍需维护。先跑旋转、裁剪、透明度、资源尺寸/来源审计，再比较同一构建配置的整本耗时和峰值内存，不能从上游优化提交推断 Torto 已更快。
+3. resvg 0.48.1、image 0.25.10 可以分别验证，避免一次改动多条像素路径后无法定位差异。字体栈升级需要和文本/图形依赖一起协调；fontdb、ICU 升级不作为本文主要 issue 的解决方案。
+4. Vello 0.11 + wgpu 30.0.1 + 官方 egui-wgpu 0.36.2 应作为一个图形栈迁移单独验证。主要已知问题仍需本地兼容代码；另有未关闭的 Windows [wgpu #9937](https://github.com/gfx-rs/wgpu/issues/9937) 报告 29→30 后 present 耗时增加，属于需要本机等条件回归的风险，不能据此断定 Torto 会发生同样退化。
+
+## 2026-09-10 上游版本核查（历史）
 
 本次对照 `Cargo.lock`、crates.io 的最新稳定版、GitHub issue/PR 状态、发布说明和相关源码核查；没有升级依赖，也没有移除本地兼容代码。以下结论是上游核查结果，不代表已经在 Torto 中验证新版行为。
 
@@ -373,7 +437,7 @@ egui 的多组件文字选择按各个 `Label` 独立生成选区网格，无法
 ## egui：合法布局触发控件 ID/矩形变化误报
 
 - 影响版本：`egui 0.36.1`
-- 上游状态：截至 2026-08-17 两项问题仍为 Open
+- 上游状态：截至 2026-10-09，#8092 已由 PR #8316 在 2026-10-05 修复并关闭，但尚未进入稳定版 0.36.2；#8343 仍为 Open。合入修复并完成本地回归前继续保留兼容设置。
 - 上游问题：[emilk/egui#8343](https://github.com/emilk/egui/issues/8343)、[emilk/egui#8092](https://github.com/emilk/egui/issues/8092)
 - 本地位置：`apps/desktop/src/ui/mod.rs` 中的 `configure`
 

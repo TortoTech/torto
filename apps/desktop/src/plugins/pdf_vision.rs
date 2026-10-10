@@ -155,7 +155,11 @@ pub(super) fn render_page_image(
         image::load_from_memory(&resource.bytes)
             .map_err(|error| format!("解码 PDF 第 {} 页图像失败：{error}", page_index + 1))?
     };
-    Ok(image.resize(max_dimension, max_dimension, FilterType::Triangle))
+    Ok(rebook_layout::image_processing::resize(
+        image,
+        [max_dimension, max_dimension],
+        FilterType::Triangle,
+    ))
 }
 
 pub(super) fn encode_jpeg_data_url(

@@ -1,10 +1,13 @@
 //! Recognize unlisted pull-quote spreads that repeat their preceding TOC unit.
-use super::*;
+use crate::html_context::attribute_local;
+use rebook_publication::{PublicationUrl, SpineItem, TocEntry};
+use roxmltree::{Document, Node};
+use std::collections::HashMap;
 
-pub(super) fn mark_quote_continuations(
-    archive: &EpubArchive,
+pub(crate) fn mark_quote_continuations(
     sections: &mut [SpineItem],
     toc: &[TocEntry],
+    mut read_document: impl FnMut(&PublicationUrl) -> Option<String>,
 ) {
     fn targets(entries: &[TocEntry], result: &mut HashMap<String, Vec<PublicationUrl>>) {
         for entry in entries {
@@ -39,7 +42,7 @@ pub(super) fn mark_quote_continuations(
         };
         // Read only unmapped candidates adjacent to a mapped unit, and only
         // read the previous document after the candidate proves quote-only.
-        let Ok(xml) = archive.read_content_xml(&current.href) else {
+        let Some(xml) = read_document(&current.href) else {
             continue;
         };
         let Ok(document) = Document::parse(&xml) else {
@@ -48,7 +51,7 @@ pub(super) fn mark_quote_continuations(
         let Some(quote) = quote_spread_text(&document) else {
             continue;
         };
-        let Ok(previous_xml) = archive.read_content_xml(&previous.href) else {
+        let Some(previous_xml) = read_document(&previous.href) else {
             continue;
         };
         let Ok(previous_document) = Document::parse(&previous_xml) else {

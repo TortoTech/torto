@@ -1,6 +1,87 @@
 use crate::reader::*;
 
 #[test]
+#[ignore = "requires TORTO_OPEN_BOOK and optional TORTO_OPEN_LOCATOR; read-only book/progress profiling"]
+fn local_book_open_performance() {
+    let path = PathBuf::from(std::env::var("TORTO_OPEN_BOOK").unwrap());
+    let store = crate::sync::SyncStore::open_at(
+        std::env::temp_dir().join(format!("torto-open-perf-{}.sqlite3", uuid::Uuid::new_v4())),
+        "open-performance",
+    )
+    .unwrap();
+    if let Ok(locator_path) = std::env::var("TORTO_OPEN_LOCATOR") {
+        let locator: rebook_publication::LocatorV1 =
+            serde_json::from_slice(&std::fs::read(locator_path).unwrap()).unwrap();
+        store
+            .save_progress(&locator.publication_id.to_string(), &locator)
+            .unwrap();
+    }
+    let ctx = egui::Context::default();
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1200.0, 800.0),
+        )),
+        ..Default::default()
+    };
+    let mut viewport = default_open_viewport();
+    let mut output = ctx.run_ui(input(), |ui| viewport = open_viewport(ui));
+    output.textures_delta.clear();
+    rebook_layout::clear_raster_cache();
+    let started = Instant::now();
+    let mut reader = open_reader_in_viewport(
+        &path,
+        crate::fonts::embedded_reader_fonts(),
+        None,
+        None,
+        store,
+        viewport,
+    )
+    .unwrap();
+    reader.progress_store = None;
+    println!(
+        "OPEN_PERF open_ms={:.3} section={} pages={} viewport={viewport:?}",
+        started.elapsed().as_secs_f64() * 1000.0,
+        reader.snapshot.location.section_index,
+        reader.snapshot.location.page_count
+    );
+    for frame in 0..6 {
+        let started = Instant::now();
+        let mut output = ctx.run_ui(input(), |ui| {
+            reader.ui(ui, None, false);
+        });
+        output.textures_delta.clear();
+        println!(
+            "OPEN_PERF frame={frame} ms={:.3} reflow_pending={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            reader.semantic_layout.pending_viewport.is_some()
+        );
+        assert!(
+            reader.semantic_layout.pending_viewport.is_none(),
+            "opening must match the real first canvas"
+        );
+    }
+    let before = rebook_layout::raster_cache_stats();
+    let started = Instant::now();
+    let prepared = reader
+        .reader
+        .prepare_resize_request(
+            LayoutViewport::new(1000, 700).unwrap(),
+            reader.progress_source_range(),
+        )
+        .prepare()
+        .unwrap();
+    let after = rebook_layout::raster_cache_stats();
+    println!(
+        "OPEN_PERF narrower_ms={:.3} raster_hits={} raster_misses={} pages={}",
+        started.elapsed().as_secs_f64() * 1000.0,
+        after.hits - before.hits,
+        after.misses - before.misses,
+        prepared.snapshot().location.page_count
+    );
+}
+
+#[test]
 #[ignore = "requires TORTO_SCROLL_BOOK; profiles OCR scrolling locally without model calls"]
 fn local_ocr_scroll_performance() {
     let path = PathBuf::from(std::env::var("TORTO_SCROLL_BOOK").unwrap());
@@ -561,6 +642,73 @@ fn background_reflow_adopts_latest_image_focus_and_rejects_stale_versions() {
     let style = reader.reader.style();
     assert!(!reader.adopt_semantic_reflow(&runtime, 1, unit, style, Ok(prepared)));
     assert!(reader.semantic_layout.reflow_dirty);
+}
+
+#[test]
+fn viewport_reflow_keeps_visible_pages_coalesces_dpi_and_rejects_old_geometry() {
+    let (mut reader, _, target) = fixture();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let old_viewport = reader.reader.viewport();
+    let old_page = reader.reader.current_page() as *const _;
+    reader.resize_canvas(720.0, 550.0, 2.0);
+    let version = reader.semantic_layout.reflow_version;
+    assert_eq!(reader.reader.viewport(), old_viewport);
+    assert_eq!(reader.reader.current_page() as *const _, old_page);
+    reader.resize_canvas(720.0, 550.0, 2.0);
+    assert_eq!(reader.semantic_layout.reflow_version, version);
+    let requested = reader.semantic_layout.pending_viewport.unwrap();
+    let prepared = reader
+        .reader
+        .prepare_resize_request(requested, Some(target.clone()))
+        .prepare()
+        .unwrap();
+    reader.resize_canvas(700.0, 540.0, 2.0);
+    let unit = reader.reader.reading_unit_location().index;
+    let style = reader.reader.style();
+    assert!(!reader.adopt_semantic_reflow(&runtime, version, unit, style.clone(), Ok(prepared)));
+    assert_eq!(reader.reader.viewport(), old_viewport);
+    let latest = reader.semantic_layout.pending_viewport.unwrap();
+    let prepared = reader
+        .reader
+        .prepare_resize_request(latest, Some(target.clone()))
+        .prepare()
+        .unwrap();
+    assert!(reader.adopt_semantic_reflow(
+        &runtime,
+        reader.semantic_layout.reflow_version,
+        unit,
+        style,
+        Ok(prepared)
+    ));
+    assert_eq!(reader.reader.viewport(), latest);
+    assert!(reader.semantic_layout.pending_viewport.is_none());
+    assert!(reader.reader.restore_cached_anchor(&target.start));
+    let version = reader.semantic_layout.reflow_version;
+    reader.resize_canvas(700.0, 540.0, 2.0);
+    assert_eq!(reader.semantic_layout.reflow_version, version);
+    reader.resize_canvas(700.0, 540.0, 1.0);
+    assert_eq!(reader.semantic_layout.reflow_version, version + 1);
+}
+
+#[test]
+fn initial_viewport_matches_first_reader_canvas() {
+    let (mut reader, _, _) = fixture();
+    let ctx = egui::Context::default();
+    let mut result = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            let opening = open_viewport(ui);
+            reader.ui(ui, None, false);
+            assert_eq!(Some(opening), reader.semantic_layout.pending_viewport);
+        },
+    );
+    result.textures_delta.clear();
 }
 
 #[test]

@@ -30,13 +30,23 @@ enum Mode {
 }
 
 pub(crate) fn html(source: &str, limits: Limits) -> Result<Cow<'_, str>, String> {
-    normalize(source, limits, Mode::Html)
-}
-pub(crate) fn fb2(source: &str) -> Result<Cow<'_, str>, String> {
-    normalize(source, Limits::default(), Mode::Fb2)
+    normalize(source, limits, Mode::Html, false)
 }
 
-fn normalize(source: &str, limits: Limits, mode: Mode) -> Result<Cow<'_, str>, String> {
+/// Container fragments may consist only of anchors or closing page wrappers.
+pub(crate) fn html_fragment(source: &str, limits: Limits) -> Result<Cow<'_, str>, String> {
+    normalize(source, limits, Mode::Html, true)
+}
+pub(crate) fn fb2(source: &str) -> Result<Cow<'_, str>, String> {
+    normalize(source, Limits::default(), Mode::Fb2, false)
+}
+
+fn normalize(
+    source: &str,
+    limits: Limits,
+    mode: Mode,
+    allow_empty: bool,
+) -> Result<Cow<'_, str>, String> {
     preflight(source, limits, mode)?;
     if valid_xml(source, limits).is_ok() {
         return Ok(Cow::Borrowed(source));
@@ -58,7 +68,7 @@ fn normalize(source: &str, limits: Limits, mode: Mode) -> Result<Cow<'_, str>, S
         .select(&scraper::Selector::parse("body").unwrap())
         .next()
         .ok_or("recovery produced no body")?;
-    if !body.descendants().any(|node| match node.value() {
+    if !allow_empty && !body.descendants().any(|node| match node.value() {
         Node::Text(text) => !text.trim().is_empty() && !node.ancestors().any(|ancestor| matches!(ancestor.value(), Node::Element(element) if matches!(element.name(), "script" | "style"))),
         Node::Element(element) => matches!(element.name(), "img" | "svg" | "math" | "hr"),
         _ => false,

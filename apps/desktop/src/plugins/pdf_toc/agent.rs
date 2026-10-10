@@ -324,9 +324,11 @@ impl Session {
                     crate::persistence::write_json_atomic(&dimensions_path(page), &[width, height])
                         .map_err(|e| e.to_string())?;
                     let [x, y, w, h] = pixel_crop(crop, width, height);
-                    image = image
-                        .crop_imm(x, y, w, h)
-                        .resize(1600, 1600, FilterType::Triangle);
+                    image = rebook_layout::image_processing::resize(
+                        image.crop_imm(x, y, w, h),
+                        [1600, 1600],
+                        FilterType::Triangle,
+                    );
                 }
                 images.push(image);
             }

@@ -8,7 +8,7 @@ use rebook_publication::{
 };
 
 /// Increment when OCR normalization changes source identities or offsets.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Directory validation shared with EPUB/CHM and native PDF outline recovery.
 pub struct HeadingHints(HashMap<String, Vec<crate::source::TocHeadingHint>>);

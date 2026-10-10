@@ -208,15 +208,15 @@ fn encode_image(bytes: &[u8]) -> Result<String, String> {
         }
     };
     let image = if image.width().max(image.height()) > MAX_DIMENSION {
-        image.resize(
-            MAX_DIMENSION,
-            MAX_DIMENSION,
+        rebook_layout::image_processing::resize(
+            image,
+            [MAX_DIMENSION, MAX_DIMENSION],
             image::imageops::FilterType::Lanczos3,
         )
     } else {
         image
     }
-    .to_rgba8();
+    .into_rgba8();
     let mut bytes = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image)
         .write_to(&mut bytes, image::ImageFormat::Png)
@@ -279,6 +279,30 @@ mod tests {
             encoded: Arc::new(OnceLock::new()),
         };
         assert!(message_content("Explain", &[image]).is_err());
+    }
+
+    #[test]
+    fn large_attachment_is_resized_once_and_keeps_transparency() {
+        let pixels =
+            image::RgbaImage::from_pixel(MAX_DIMENSION + 2, 8, image::Rgba([0, 0, 0, 128]));
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let image = ChatImage {
+            label: "large.png".into(),
+            bytes: bytes.into_inner().into(),
+            encoded: Arc::new(OnceLock::new()),
+        };
+        let url = image.data_url().unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD
+            .decode(url.split_once(',').unwrap().1)
+            .unwrap();
+        let decoded = image::load_from_memory(&encoded).unwrap().into_rgba8();
+        assert_eq!(decoded.width(), MAX_DIMENSION);
+        assert_eq!(decoded.height(), 8);
+        assert!(decoded.pixels().all(|pixel| pixel.0 == [0, 0, 0, 128]));
+        assert_eq!(image.clone().data_url().unwrap(), url);
     }
 
     #[test]

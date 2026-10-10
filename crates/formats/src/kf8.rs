@@ -255,6 +255,13 @@ fn parse_inner(bytes: &[u8]) -> Result<Kf8Book, String> {
     for section in &mut raw_sections {
         section.html = replace_resource_uris(&section.html, &resource_paths);
     }
+    for resource in &mut resources {
+        if resource.media_type == "text/css" {
+            let css = String::from_utf8_lossy(&resource.bytes);
+            // CSS URLs resolve from Styles/, the same depth as Text/.
+            resource.bytes = replace_resource_uris(&css, &resource_paths).into_bytes();
+        }
+    }
     Ok(Kf8Book {
         sections: raw_sections,
         table_of_contents,
@@ -1278,20 +1285,22 @@ fn load_flow_resources(
         .filter(|reference| reference.kind == ResourceKind::Flow)
         .collect::<HashSet<_>>();
     for reference in references {
-        if reference.mime.as_deref() != Some("image/svg+xml") {
-            continue;
-        }
+        let (directory, extension, media_type) = match reference.mime.as_deref() {
+            Some("image/svg+xml") => ("Images", "svg", "image/svg+xml"),
+            Some("text/css") => ("Styles", "css", "text/css"),
+            _ => continue,
+        };
         let Some(&(start, end)) = flow_table.get(reference.id) else {
             continue;
         };
         let Some(data) = raw.get(start..end) else {
             return Err("KF8 flow resource points outside decompressed text".to_owned());
         };
-        let path = format!("Images/flow-{}.svg", reference.id);
+        let path = format!("{directory}/flow-{}.{extension}", reference.id);
         paths.insert(ResourceKey::Flow(reference.id), path.clone());
         resources.push(SourceResource {
             path,
-            media_type: "image/svg+xml".to_owned(),
+            media_type: media_type.to_owned(),
             bytes: data.to_vec(),
         });
     }
@@ -1775,6 +1784,30 @@ fn uint_from_bytes(data: &[u8]) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn css_flows_are_loaded_and_references_keep_publication_relative_paths() {
+        let css = b".cell { text-align:right; background:url(kindle:embed:00001?mime=image/png) }";
+        let sections = [Kf8Section { title: "Chapter".into(), html: "<html><head><link rel='stylesheet' href='kindle:flow:00001?mime=text/css'/></head><body><p>Text</p></body></html>".into(), source_index: 0 }];
+        let mut resources = Vec::new();
+        let mut paths = HashMap::from([(ResourceKey::Embed(1), "Images/photo.png".into())]);
+        load_flow_resources(
+            css,
+            &[(0, 0), (0, css.len())],
+            &sections,
+            &mut resources,
+            &mut paths,
+        )
+        .unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].media_type, "text/css");
+        assert_eq!(resources[0].path, "Styles/flow-1.css");
+        assert!(replace_resource_uris(&sections[0].html, &paths).contains("../Styles/flow-1.css"));
+        assert!(
+            replace_resource_uris(std::str::from_utf8(&resources[0].bytes).unwrap(), &paths)
+                .contains("../Images/photo.png")
+        );
+    }
 
     #[test]
     fn decompresses_palmdoc_literals_back_references_and_spaces() {

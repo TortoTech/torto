@@ -1,10 +1,12 @@
 mod background;
-mod covers;
+pub(crate) mod covers;
+mod opening;
 mod reading_activity;
 mod sync_button;
 mod sync_monitor;
 mod sync_schedule;
 
+pub(crate) use opening::OpenTaskMessage;
 pub(crate) use sync_monitor::SyncCheckMessage;
 
 use background::BackgroundJob;
@@ -26,7 +28,7 @@ use peniko::Blob;
 use crate::async_task::{TaskResult, TaskSlot};
 use crate::library::{LibraryBook, LibraryMetadataUpdate, LocalLibrary};
 use crate::preferences::{self, AppLanguage};
-use crate::reader::{BookDisplayMetadata, DesktopReader, open_reader};
+use crate::reader::{BookDisplayMetadata, DesktopReader};
 use crate::settings::AppliedSettings;
 use crate::sync::{
     LocalSyncBook, SyncMode, SyncProgress, SyncReport, SyncSettings, SyncStage, SyncStore,
@@ -70,6 +72,7 @@ pub(crate) struct ShelfFeature {
     shelf: ShelfState,
     import_task: TaskSlot<()>,
     pending_reader: Option<DesktopReader>,
+    opening: opening::Opening,
     /// Book most recently handed to the reader. Reading activity is refreshed
     /// asynchronously, so on return the shelf cannot yet re-derive the
     /// highlight from the order without lagging one book behind.
@@ -179,6 +182,10 @@ struct ShelfRemoveConfirmation {
 }
 
 impl ShelfFeature {
+    pub(crate) fn reader_cover_cache(&mut self) -> &mut covers::CoverCache {
+        &mut self.cover_textures
+    }
+
     pub(crate) fn cover_cache_bytes(&self) -> usize {
         self.cover_textures.bytes()
     }
@@ -260,6 +267,7 @@ impl ShelfFeature {
             },
             import_task: TaskSlot::default(),
             pending_reader: None,
+            opening: opening::Opening::default(),
             last_opened_book_id: None,
             reader_fonts,
             local_store,
@@ -297,6 +305,7 @@ impl ShelfFeature {
     }
 
     pub(crate) fn open_book(&mut self, path: &Path) {
+        let started = std::time::Instant::now();
         let Some(local_store) = self.local_store.clone() else {
             self.show_error(
                 self.language
@@ -323,42 +332,8 @@ impl ShelfFeature {
             self.request_file_sync();
             self.cover_textures.clear();
         }
-        let metadata = Some(BookDisplayMetadata::from(&book));
         crate::statistics::register_book(&book);
-        match open_reader(
-            &book.path,
-            Arc::clone(&self.reader_fonts),
-            metadata,
-            book.cover_bytes.clone(),
-            local_store.clone(),
-        ) {
-            Ok(reader) => {
-                let opened_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX);
-                self.read_activity.record(
-                    local_store,
-                    book.id.clone(),
-                    reader.progress_locator(),
-                    opened_ms,
-                );
-                self.refresh_read_activity();
-                self.cover_textures.suspend();
-                self.pending_reader = Some(reader);
-                self.last_opened_book_id = Some(book.id.clone());
-                self.shelf.error = None;
-                self.shelf.error_dismiss_at = None;
-            }
-            Err(error) => {
-                self.show_error(format!(
-                    "{}: {error}",
-                    self.language.text("无法打开书籍", "Unable to open book")
-                ));
-            }
-        }
+        self.opening.begin_at(book, local_store, started);
     }
 
     fn import_books(&mut self, paths: &[PathBuf]) {
@@ -470,6 +445,9 @@ impl ShelfFeature {
                 force_statistics: false,
             });
         }
+        // Changes to layout, credentials or account must supersede an opening
+        // snapshot, even when its blocking preparation has already started.
+        self.opening.restart(settings, self.local_store.clone());
     }
 
     pub(crate) fn resume(&mut self) {
@@ -636,6 +614,8 @@ impl ShelfFeature {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<crate::platform::UserEvent>,
     ) {
+        self.opening
+            .spawn(Arc::clone(&self.reader_fonts), runtime, proxy);
         let wake = proxy.clone();
         self.read_activity.spawn(runtime, move || {
             let _ = wake.send_event(crate::platform::UserEvent::RepaintAfter(Duration::ZERO));

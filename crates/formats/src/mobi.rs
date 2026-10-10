@@ -2,14 +2,12 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
-use quick_xml::Reader;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesEnd, BytesStart, Event};
+use quick_xml::{Reader, Writer};
 use rebook_publication::{Metadata, RenditionLayout};
 use sha2::{Digest, Sha256};
 
-use crate::source::{
-    DirectBookSource, SectionContent, SourceBook, SourceSection, escape_attribute, escape_text,
-};
+use crate::source::{DirectBookSource, SectionContent, SourceBook, SourceSection, html_document};
 use crate::{BookFormat, FormatError, conversion_error, kf8};
 
 pub(crate) fn open(
@@ -58,6 +56,7 @@ fn convert(
                 title: section.title,
                 content: SectionContent::Html(body),
                 linear: true,
+                properties: Vec::new(),
             });
         }
     } else {
@@ -79,6 +78,7 @@ fn convert(
                     title,
                     content: SectionContent::Html(body),
                     linear: true,
+                    properties: Vec::new(),
                 });
             }
         }
@@ -124,178 +124,7 @@ fn convert(
     )
 }
 
-#[derive(Clone)]
-enum ContentType {
-    Paragraph,
-    Heading(u8),
-    Image,
-    Link,
-    ListItem,
-    BlockQuote,
-    CodeBlock,
-    HorizontalRule,
-    Text,
-    Other(String),
-}
-
-struct ContentItem {
-    content_type: ContentType,
-    text: String,
-    attributes: Vec<(String, String)>,
-    children: Vec<Self>,
-}
-
-impl ContentItem {
-    fn new(content_type: ContentType) -> Self {
-        Self {
-            content_type,
-            text: String::new(),
-            attributes: Vec::new(),
-            children: Vec::new(),
-        }
-    }
-}
-
-#[derive(Default)]
-struct HtmlParser {
-    items: Vec<ContentItem>,
-}
-
-impl HtmlParser {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn parse(&mut self, html: &str) -> Result<(), quick_xml::Error> {
-        let mut reader = Reader::from_str(html);
-        reader.config_mut().trim_text(false);
-        reader.config_mut().expand_empty_elements = true;
-        reader.config_mut().check_end_names = false;
-        let mut stack = Vec::new();
-        let mut in_body = false;
-        let mut has_body = false;
-        loop {
-            match reader.read_event()? {
-                Event::Eof => break,
-                Event::Start(element) => {
-                    let name = String::from_utf8_lossy(element.name().as_ref()).into_owned();
-                    if name.eq_ignore_ascii_case("body") {
-                        in_body = true;
-                        has_body = true;
-                        continue;
-                    }
-                    if !has_body && !is_document_wrapper(&name) {
-                        in_body = true;
-                    }
-                    if !in_body {
-                        continue;
-                    }
-                    let mut item = ContentItem::new(content_type(&name));
-                    item.attributes = element
-                        .attributes()
-                        .flatten()
-                        .map(|attribute| {
-                            (
-                                String::from_utf8_lossy(attribute.key.as_ref()).into_owned(),
-                                attribute
-                                    .decoded_and_normalized_value(
-                                        quick_xml::XmlVersion::Implicit1_0,
-                                        reader.decoder(),
-                                    )
-                                    .map(|value| decode_entities(&value))
-                                    .unwrap_or_default(),
-                            )
-                        })
-                        .collect();
-                    stack.push(item);
-                }
-                Event::End(element) => {
-                    let name = String::from_utf8_lossy(element.name().as_ref()).into_owned();
-                    if name.eq_ignore_ascii_case("body") {
-                        in_body = false;
-                        continue;
-                    }
-                    if in_body && let Some(item) = stack.pop() {
-                        push_item(&mut self.items, &mut stack, item);
-                    }
-                }
-                Event::Text(text) if in_body => {
-                    let value = String::from_utf8_lossy(text.as_ref());
-                    if !value.trim().is_empty() {
-                        if let Some(item) = stack.last_mut() {
-                            item.text.push_str(&value);
-                        } else {
-                            let mut item = ContentItem::new(ContentType::Text);
-                            item.text.push_str(&value);
-                            self.items.push(item);
-                        }
-                    }
-                }
-                Event::GeneralRef(reference) if in_body => {
-                    let value = reference
-                        .resolve_char_ref()?
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| {
-                            format!("&{};", String::from_utf8_lossy(reference.as_ref()))
-                        });
-                    if let Some(item) = stack.last_mut() {
-                        item.text.push_str(&value);
-                    } else {
-                        let mut item = ContentItem::new(ContentType::Text);
-                        item.text = value;
-                        self.items.push(item);
-                    }
-                }
-                Event::CData(text) if in_body => {
-                    if let Some(item) = stack.last_mut() {
-                        item.text.push_str(&String::from_utf8_lossy(text.as_ref()));
-                    }
-                }
-                _ => {}
-            }
-        }
-        while let Some(item) = stack.pop() {
-            push_item(&mut self.items, &mut stack, item);
-        }
-        Ok(())
-    }
-}
-
-fn push_item(items: &mut Vec<ContentItem>, stack: &mut [ContentItem], item: ContentItem) {
-    if let Some(parent) = stack.last_mut() {
-        parent.children.push(item);
-    } else {
-        items.push(item);
-    }
-}
-
-fn is_document_wrapper(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "html" | "head" | "meta" | "title" | "link" | "style"
-    )
-}
-
-fn content_type(name: &str) -> ContentType {
-    match name.to_ascii_lowercase().as_str() {
-        "p" => ContentType::Paragraph,
-        "h1" => ContentType::Heading(1),
-        "h2" => ContentType::Heading(2),
-        "h3" => ContentType::Heading(3),
-        "h4" => ContentType::Heading(4),
-        "h5" => ContentType::Heading(5),
-        "h6" => ContentType::Heading(6),
-        "img" => ContentType::Image,
-        "a" => ContentType::Link,
-        "li" => ContentType::ListItem,
-        "blockquote" => ContentType::BlockQuote,
-        "pre" | "code" => ContentType::CodeBlock,
-        "hr" => ContentType::HorizontalRule,
-        _ => ContentType::Other(name.to_owned()),
-    }
-}
-
-fn normalize_chapter(
+pub(crate) fn normalize_chapter(
     source: &str,
     images: &HashMap<usize, String>,
     format: BookFormat,
@@ -316,29 +145,108 @@ fn normalize_chapter(
     let source = rewrite_numeric_attributes(&source, "filepos", |value| {
         Some(format!("href=\"#filepos{value}\""))
     });
-    let source = strip_document_wrappers(&source);
-    let document = format!(
-        "<html xmlns:mbp=\"http://mobipocket.com/ns/mbp\"><head></head><body>{source}</body></html>"
-    );
-    let source = crate::markup::html(&document, Default::default())
-        .map_err(|error| conversion_error(format, error))?;
-    let source = protect_entities(&source);
-    let mut parser = HtmlParser::new();
-    parser
-        .parse(&source)
-        .map_err(|error| conversion_error(format, error))?;
-    let body = parser.items.iter().map(render_item).collect::<String>();
-    if body.trim().is_empty() {
-        let plain = strip_markup(&source);
-        return if plain.trim().is_empty() {
-            Ok(String::new())
-        } else {
-            Ok(format!("<p>{}</p>", escape_text(plain.trim())))
+    let document = html_document(&source).map_err(|error| conversion_error(format, error))?;
+    let mut reader = Reader::from_str(&document);
+    let mut writer = Writer::new(Vec::new());
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|error| conversion_error(format, error))?;
+        let event = match event {
+            Event::Eof => break,
+            Event::Start(element) => Event::Start(normalize_element(&element, reader.decoder())),
+            Event::Empty(element) => Event::Empty(normalize_element(&element, reader.decoder())),
+            Event::End(element) => {
+                Event::End(BytesEnd::new(normalized_tag(element.name().as_ref())))
+            }
+            event => event,
         };
+        writer
+            .write_event(event)
+            .map_err(|error| conversion_error(format, error))?;
     }
-    Ok(body)
+    String::from_utf8(writer.into_inner()).map_err(|error| conversion_error(format, error))
 }
 
+fn normalize_element(
+    element: &BytesStart<'_>,
+    decoder: quick_xml::encoding::Decoder,
+) -> BytesStart<'static> {
+    let mut normalized = BytesStart::new(normalized_tag(element.name().as_ref()));
+    for attribute in element.attributes().flatten() {
+        let authored_name = String::from_utf8_lossy(attribute.key.as_ref());
+        let lower = authored_name.to_ascii_lowercase();
+        let name = if matches!(
+            lower.as_str(),
+            "id" | "aid"
+                | "name"
+                | "class"
+                | "style"
+                | "src"
+                | "href"
+                | "alt"
+                | "width"
+                | "height"
+                | "colspan"
+                | "rowspan"
+                | "align"
+                | "valign"
+                | "role"
+                | "type"
+                | "rel"
+                | "lang"
+                | "dir"
+                | "size"
+                | "color"
+                | "face"
+        ) {
+            lower.as_str()
+        } else {
+            authored_name.as_ref()
+        };
+        if let Ok(value) =
+            attribute.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+        {
+            normalized.push_attribute((name, value.as_ref()));
+        }
+    }
+    let has_id = normalized
+        .attributes()
+        .flatten()
+        .any(|attribute| attribute.key.as_ref() == b"id");
+    if !has_id {
+        let id = normalized
+            .attributes()
+            .flatten()
+            .find(|attribute| matches!(attribute.key.as_ref(), b"aid" | b"name"))
+            .and_then(|attribute| {
+                attribute
+                    .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+                    .ok()
+                    .map(std::borrow::Cow::into_owned)
+            });
+        if let Some(id) = id {
+            normalized.push_attribute(("id", id.as_str()));
+        }
+    }
+    normalized
+}
+
+fn normalized_tag(name: &[u8]) -> String {
+    let name = String::from_utf8_lossy(name);
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "mbp:pagebreak" => "br".into(),
+        "html" | "head" | "body" | "title" | "meta" | "link" | "style" | "p" | "h1" | "h2"
+        | "h3" | "h4" | "h5" | "h6" | "a" | "img" | "figure" | "figcaption" | "table"
+        | "caption" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "col" | "colgroup"
+        | "div" | "span" | "section" | "article" | "header" | "footer" | "nav" | "aside"
+        | "blockquote" | "ul" | "ol" | "li" | "dl" | "dt" | "dd" | "pre" | "code" | "b"
+        | "strong" | "i" | "em" | "u" | "s" | "sup" | "sub" | "cite" | "font" | "br" | "hr"
+        | "guide" | "reference" => lower,
+        _ => name.into_owned(),
+    }
+}
 fn rewrite_numeric_attributes(
     source: &str,
     name: &str,
@@ -409,170 +317,6 @@ fn rewrite_numeric_attributes(
     }
 }
 
-fn strip_document_wrappers(source: &str) -> String {
-    let lower = source.to_ascii_lowercase();
-    let mut output = String::with_capacity(source.len());
-    let mut copied = 0usize;
-    let mut search = 0usize;
-    while let Some(relative_start) = lower[search..].find('<') {
-        let start = search + relative_start;
-        let Some(relative_end) = lower[start..].find('>') else {
-            break;
-        };
-        let end = start + relative_end + 1;
-        let inner = lower[start + 1..end - 1].trim();
-        let name = inner
-            .trim_start_matches('/')
-            .split_ascii_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches('/');
-        if inner.starts_with("!doctype") || matches!(name, "html" | "body") {
-            output.push_str(&source[copied..start]);
-            copied = end;
-        } else if name == "head" && !inner.starts_with('/') {
-            output.push_str(&source[copied..start]);
-            let block_end = lower[end..]
-                .find("</head>")
-                .map_or(end, |relative| end + relative + "</head>".len());
-            copied = block_end;
-            search = block_end;
-            continue;
-        }
-        search = end;
-    }
-    if copied == 0 {
-        source.to_owned()
-    } else {
-        output.push_str(&source[copied..]);
-        output
-    }
-}
-
-fn render_item(item: &ContentItem) -> String {
-    let content = format!(
-        "{}{}",
-        escape_text(&decode_entities(item.text.trim())),
-        item.children.iter().map(render_item).collect::<String>()
-    );
-    match &item.content_type {
-        ContentType::Paragraph => wrap("p", item, &content),
-        ContentType::Heading(level) => wrap(&format!("h{}", (*level).clamp(1, 6)), item, &content),
-        ContentType::Image => {
-            let Some(src) = attribute(item, "src") else {
-                return String::new();
-            };
-            if !src.starts_with("../Images/") {
-                return String::new();
-            }
-            let alt = attribute(item, "alt").unwrap_or_default();
-            format!(
-                "<img src=\"{}\" alt=\"{}\"/>",
-                escape_attribute(src),
-                escape_attribute(alt)
-            )
-        }
-        ContentType::Link => {
-            let href = attribute(item, "href").unwrap_or_default();
-            let id = authored_identifier(item);
-            if !href.starts_with('#') && id.is_none() {
-                content
-            } else {
-                let id = id
-                    .map(|id| format!(" id=\"{}\"", escape_attribute(id)))
-                    .unwrap_or_default();
-                let href = if href.starts_with('#') {
-                    format!(" href=\"{}\"", escape_attribute(href))
-                } else {
-                    String::new()
-                };
-                format!("<a{id}{href}>{content}</a>")
-            }
-        }
-        ContentType::ListItem => wrap("li", item, &content),
-        ContentType::BlockQuote => wrap("blockquote", item, &content),
-        ContentType::CodeBlock => wrap("pre", item, &content),
-        ContentType::HorizontalRule => "<hr/>".to_owned(),
-        ContentType::Text => content,
-        ContentType::Other(tag) => match tag.to_ascii_lowercase().as_str() {
-            "br" | "mbp:pagebreak" => format!("<br/>{content}"),
-            "div" | "section" | "article" => wrap("div", item, &content),
-            "ul" => wrap("ul", item, &content),
-            "ol" => wrap("ol", item, &content),
-            "strong" | "b" => wrap("strong", item, &content),
-            "em" | "i" => wrap("em", item, &content),
-            "sup" => wrap("sup", item, &content),
-            "sub" => wrap("sub", item, &content),
-            _ => content,
-        },
-    }
-}
-
-fn wrap(tag: &str, item: &ContentItem, content: &str) -> String {
-    let id = authored_identifier(item)
-        .map(|id| format!(" id=\"{}\"", escape_attribute(id)))
-        .unwrap_or_default();
-    format!("<{tag}{id}>{content}</{tag}>")
-}
-
-fn authored_identifier(item: &ContentItem) -> Option<&str> {
-    attribute(item, "id")
-        .or_else(|| attribute(item, "name"))
-        .or_else(|| attribute(item, "aid"))
-}
-
-fn attribute<'a>(item: &'a ContentItem, name: &str) -> Option<&'a str> {
-    item.attributes
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
-}
-
-fn decode_entities(value: &str) -> String {
-    value
-        .replace('\u{e000}', "&")
-        .replace('\u{e001}', "<")
-        .replace('\u{e002}', ">")
-        .replace('\u{e003}', "\"")
-        .replace('\u{e004}', "'")
-        .replace('\u{e005}', " ")
-        .replace("&nbsp;", " ")
-        .replace("&#160;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
-
-fn protect_entities(value: &str) -> String {
-    value
-        .replace("&amp;", "\u{e000}")
-        .replace("&lt;", "\u{e001}")
-        .replace("&gt;", "\u{e002}")
-        .replace("&quot;", "\u{e003}")
-        .replace("&apos;", "\u{e004}")
-        .replace("&nbsp;", "\u{e005}")
-        .replace("&#160;", "\u{e005}")
-}
-
-fn strip_markup(value: &str) -> String {
-    let mut output = String::new();
-    let mut in_tag = false;
-    for character in value.chars() {
-        match character {
-            '<' => in_tag = true,
-            '>' => {
-                in_tag = false;
-                output.push(' ');
-            }
-            _ if !in_tag => output.push(character),
-            _ => {}
-        }
-    }
-    decode_entities(&output)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,7 +331,7 @@ mod tests {
             BookFormat::Mobi,
         )
         .unwrap();
-        assert!(body.contains("<h1 id=\"kindle-heading\">Title</h1>"));
+        assert!(body.contains("id=\"kindle-heading\""), "{body}");
         assert!(body.contains("<a id=\"chapter-start\"></a>"), "{body}");
         assert!(body.contains("Hello &amp; world"), "{body}");
         assert!(body.contains("src=\"../Images/image-1.jpg\""));

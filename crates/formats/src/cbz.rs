@@ -89,6 +89,7 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, Fo
                 alt: image.name.clone(),
             },
             linear: true,
+            properties: Vec::new(),
         });
     }
     let cover_path = resources.first().map(|resource| resource.path.clone());

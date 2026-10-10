@@ -15,16 +15,16 @@ pub fn set_pdf_timing_sink(sink: PdfTimingSink) {
     let _ = TIMING_SINK.set(sink);
 }
 
-use hayro::hayro_interpret::font::{FontData, FontQuery, Glyph};
+use hayro::RenderCache;
+use hayro::hayro_interpret::font::{FontData, FontQuery, Glyph, GlyphRun};
 use hayro::hayro_interpret::hayro_cmap::BfString;
 use hayro::hayro_interpret::util::TransformExt as _;
 use hayro::hayro_interpret::{
-    BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterCache,
-    InterpreterSettings, Paint, PathDrawMode, SoftMask, interpret_page,
+    BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
+    InterpreterCache, InterpreterSettings, SoftMask, interpret_page,
 };
 use hayro::hayro_syntax::{Pdf, PdfData};
 use hayro::vello_cpu::color::palette::css::WHITE;
-use hayro::{RenderCache, RenderSettings};
 use kurbo::{Affine, BezPath, Point, Rect, Shape};
 use rebook_publication::{
     Block, Book, BookSource, FixedPageDimensions, FixedPageTextLayer, FixedPageTextRect,
@@ -35,6 +35,90 @@ use sha2::{Digest, Sha256};
 
 use crate::source::{DirectBookSource, SectionContent, SourceBook, SourceSection};
 use crate::{BookFormat, FormatError, conversion_error};
+/// Settings to apply during rendering.
+#[derive(Clone, Copy)]
+struct PageRasterSettings {
+    /// How much the contents should be scaled into the x direction.
+    pub x_scale: f32,
+    /// How much the contents should be scaled into the y direction.
+    pub y_scale: f32,
+    /// The width of the viewport. If this is set to `None`, the width will be chosen
+    /// automatically based on the scale factor and the dimensions of the PDF.
+    pub width: Option<u16>,
+    /// The height of the viewport. If this is set to `None`, the height will be chosen
+    /// automatically based on the scale factor and the dimensions of the PDF.
+    pub height: Option<u16>,
+    /// The background color. Determines the color of the base
+    /// rectangle during rendering to a pixmap.
+    pub bg_color: hayro::vello_cpu::color::AlphaColor<hayro::vello_cpu::color::Srgb>,
+}
+
+impl Default for PageRasterSettings {
+    fn default() -> Self {
+        Self {
+            x_scale: 1.0,
+            y_scale: 1.0,
+            width: None,
+            height: None,
+            bg_color: hayro::vello_cpu::color::palette::css::TRANSPARENT,
+        }
+    }
+}
+
+fn render_page_region<'a>(
+    page: &'a hayro::hayro_syntax::page::Page<'a>,
+    cache: &RenderCache<'a>,
+    interpreter_settings: &InterpreterSettings,
+    settings: &PageRasterSettings,
+    origin: (u16, u16),
+) -> hayro::vello_cpu::Pixmap {
+    let (width, height) = page.render_dimensions();
+    let width = settings
+        .width
+        .unwrap_or((width * settings.x_scale).floor() as u16);
+    let height = settings
+        .height
+        .unwrap_or((height * settings.y_scale).floor() as u16);
+    let mut ctx = hayro::vello_cpu::RenderContext::new_with(
+        width,
+        height,
+        hayro::vello_cpu::RenderSettings {
+            num_threads: 0,
+            ..Default::default()
+        },
+    );
+    let transform = Affine::translate((-(origin.0 as f64), -(origin.1 as f64)))
+        * Affine::scale_non_uniform(settings.x_scale as f64, settings.y_scale as f64)
+        * page.initial_transform(true).to_kurbo();
+    hayro::render_into(
+        page,
+        cache,
+        interpreter_settings,
+        &hayro::RenderSettings::default(),
+        &mut ctx,
+        transform,
+    );
+    ctx.flush();
+    let mut pixmap = hayro::vello_cpu::Pixmap::new(width, height);
+    ctx.render_with(
+        &mut pixmap,
+        &mut hayro::vello_cpu::Resources::default(),
+        hayro::vello_cpu::RasterizerSettings {
+            target_init: hayro::vello_cpu::TargetInit::Clear(settings.bg_color),
+            ..Default::default()
+        },
+    );
+    pixmap
+}
+
+fn render_page<'a>(
+    page: &'a hayro::hayro_syntax::page::Page<'a>,
+    cache: &RenderCache<'a>,
+    interpreter_settings: &InterpreterSettings,
+    settings: &PageRasterSettings,
+) -> hayro::vello_cpu::Pixmap {
+    render_page_region(page, cache, interpreter_settings, settings, (0, 0))
+}
 
 const COVER_PATH: &str = "Cover/thumbnail.png";
 const PAGE_PATH_PREFIX: &str = "Pages/page-";
@@ -134,6 +218,7 @@ fn open_data(
                 alt: format!("PDF page {}", index + 1),
             },
             linear: true,
+            properties: Vec::new(),
         })
         .collect();
     let descriptor = DirectBookSource::open(
@@ -392,15 +477,15 @@ impl PdfPublication {
         let scale = (max_dimension / width.max(height).max(1.0)).min(MAX_RENDER_SCALE);
         let cache = RenderCache::new();
         let interpreter_settings = interpreter_settings();
-        Ok(hayro::render(
+        Ok(render_page(
             page,
             &cache,
             &interpreter_settings,
-            &RenderSettings {
+            &PageRasterSettings {
                 x_scale: scale,
                 y_scale: scale,
                 bg_color: WHITE,
-                ..RenderSettings::default()
+                ..PageRasterSettings::default()
             },
         ))
     }
@@ -445,71 +530,21 @@ struct ExtractedGlyph {
 }
 
 impl Device<'_> for PdfTextExtractor {
-    fn set_soft_mask(&mut self, _: Option<SoftMask<'_>>) {}
-
-    fn set_blend_mode(&mut self, _: BlendMode) {}
-
-    fn draw_path(&mut self, _: &BezPath, _: Affine, _: &Paint<'_>, _: &PathDrawMode) {}
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'_>, _: &DrawMode) {}
 
     fn push_clip_path(&mut self, _: &ClipPath) {}
 
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'_>>, _: BlendMode) {}
 
-    fn draw_glyph(
-        &mut self,
-        glyph: &Glyph<'_>,
-        transform: Affine,
-        glyph_transform: Affine,
-        _: &Paint<'_>,
-        _: &GlyphDrawMode,
-    ) {
-        let Some(unicode) = glyph.as_unicode() else {
-            return;
-        };
-        let text = match unicode {
-            BfString::Char(character) => character.to_string(),
-            BfString::String(value) => value,
+    fn draw_glyph_run(&mut self, run: &GlyphRun<'_, '_>, props: DrawProps<'_>, mode: &DrawMode) {
+        for glyph in run.glyphs() {
+            self.extract_glyph(glyph, props.transform, glyph.transform(), mode);
         }
-        .chars()
-        .filter(|character| !character.is_control() || matches!(character, '\t' | '\n' | '\r'))
-        .map(|character| match character {
-            '\t' | '\n' | '\r' => ' ',
-            other => other,
-        })
-        .collect::<String>();
-        if text.is_empty() {
-            return;
-        }
-
-        let combined = transform * glyph_transform;
-        let baseline = combined * Point::ORIGIN;
-        let advance_end = combined * Point::new(glyph_advance(glyph), 0.0);
-        let fallback = fallback_glyph_rect(glyph, combined);
-        let rect =
-            glyph_outline_rect(glyph, combined).map_or(fallback, |outline| outline.union(fallback));
-        if !rect_is_finite(rect) {
-            return;
-        }
-        if self.glyphs.last().is_some_and(|previous| {
-            previous.text == text
-                && (previous.rect.x0 - rect.x0).abs() < 0.01
-                && (previous.rect.y0 - rect.y0).abs() < 0.01
-                && (previous.rect.x1 - rect.x1).abs() < 0.01
-                && (previous.rect.y1 - rect.y1).abs() < 0.01
-        }) {
-            return;
-        }
-        self.glyphs.push(ExtractedGlyph {
-            text,
-            rect,
-            baseline,
-            advance_end,
-        });
     }
 
-    fn draw_image(&mut self, _: Image<'_, '_>, _: Affine) {}
+    fn draw_image(&mut self, _: Image<'_, '_>, _: ImageDrawProps<'_>) {}
 
-    fn pop_clip_path(&mut self) {}
+    fn pop_clip(&mut self) {}
 
     fn pop_transparency_group(&mut self) {}
 }
@@ -862,5 +897,58 @@ mod tests {
         )
         .unwrap();
         output
+    }
+}
+
+impl PdfTextExtractor {
+    fn extract_glyph(
+        &mut self,
+        glyph: &Glyph<'_>,
+        transform: Affine,
+        glyph_transform: Affine,
+        _: &DrawMode,
+    ) {
+        let Some(unicode) = glyph.as_unicode() else {
+            return;
+        };
+        let text = match unicode {
+            BfString::Char(character) => character.to_string(),
+            BfString::String(value) => value,
+        }
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\t' | '\n' | '\r'))
+        .map(|character| match character {
+            '\t' | '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect::<String>();
+        if text.is_empty() {
+            return;
+        }
+
+        let combined = transform * glyph_transform;
+        let baseline = combined * Point::ORIGIN;
+        let advance_end = combined * Point::new(glyph_advance(glyph), 0.0);
+        let fallback = fallback_glyph_rect(glyph, combined);
+        let rect =
+            glyph_outline_rect(glyph, combined).map_or(fallback, |outline| outline.union(fallback));
+        if !rect_is_finite(rect) {
+            return;
+        }
+        if self.glyphs.last().is_some_and(|previous| {
+            previous.text == text
+                && (previous.rect.x0 - rect.x0).abs() < 0.01
+                && (previous.rect.y0 - rect.y0).abs() < 0.01
+                && (previous.rect.x1 - rect.x1).abs() < 0.01
+                && (previous.rect.y1 - rect.y1).abs() < 0.01
+        }) {
+            return;
+        }
+        self.glyphs.push(ExtractedGlyph {
+            text,
+            rect,
+            baseline,
+            advance_end,
+        });
     }
 }

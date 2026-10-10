@@ -210,9 +210,13 @@ fn decode(bytes: &[u8]) -> Result<DynamicImage, String> {
 
 fn image_url(image: DynamicImage) -> Result<String, String> {
     let scale = (1600.0 / image.width().max(image.height()) as f32).min(3.0);
-    let enlarged = image.resize_exact(
+    let size = [
         (image.width() as f32 * scale).round().max(1.0) as u32,
         (image.height() as f32 * scale).round().max(1.0) as u32,
+    ];
+    let enlarged = rebook_layout::image_processing::resize_exact(
+        image,
+        size,
         image::imageops::FilterType::Lanczos3,
     );
     let mut canvas = RgbaImage::from_pixel(

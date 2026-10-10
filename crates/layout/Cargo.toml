@@ -7,13 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+fast_image_resize.workspace = true
 image.workspace = true
 peniko.workspace = true
 hyphenation.workspace = true
 icu_segmenter.workspace = true
 parley.workspace = true
 read-fonts.workspace = true
-skrifa = "0.44.0"
+skrifa = "0.48.0"
 rebook-math = { path = "../math" }
 rebook-publication = { path = "../publication" }
 resvg.workspace = true

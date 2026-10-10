@@ -62,6 +62,73 @@ fn table() -> TableBlock {
 }
 
 #[test]
+fn joined_captions_respect_distinct_author_alignments_and_source_ranges() {
+    let source = EmptySource(Book {
+        id: PublicationId::new("caption-join-alignment").unwrap(),
+        metadata: Metadata::default(),
+        cover: None,
+        sections: vec![],
+        table_of_contents: vec![],
+    });
+    let style = ReaderStyle {
+        typesetting: ReaderTypesetting::unified(),
+        ..Default::default()
+    };
+    let mut engine = LayoutEngine::new();
+    for (label_alignment, title_alignment, joined) in [
+        (
+            Some(crate::TextAlignment::Center),
+            Some(crate::TextAlignment::Start),
+            false,
+        ),
+        (Some(crate::TextAlignment::Center), None, false),
+        (
+            Some(crate::TextAlignment::Center),
+            Some(crate::TextAlignment::Center),
+            true,
+        ),
+    ] {
+        let mut captions = [
+            text("Table 3.1", TextBlockKind::Caption),
+            text(
+                "A title long enough to naturally wrap at the narrow measure",
+                TextBlockKind::Caption,
+            ),
+        ];
+        captions[0].style.authored_alignment = label_alignment;
+        captions[1].style.authored_alignment = title_alignment;
+        let original = captions.clone();
+        let shaped = engine
+            .shape_captions_with_join(&source, &captions, &style, 180.0, true, Some(0))
+            .unwrap();
+        assert_eq!(shaped.len(), if joined { 1 } else { 2 });
+        assert_eq!(shaped[0].1.style.align, crate::TextAlignment::Center);
+        if joined {
+            assert_eq!(shaped[0].0.source_spans.len(), 2);
+            assert!(
+                shaped[0]
+                    .0
+                    .source_spans
+                    .iter()
+                    .any(|span| span.source == captions[0].source.clone().unwrap())
+            );
+            assert!(
+                shaped[0]
+                    .0
+                    .source_spans
+                    .iter()
+                    .any(|span| span.source == captions[1].source.clone().unwrap())
+            );
+        } else {
+            assert_eq!(shaped[1].1.style.align, crate::TextAlignment::Start);
+            assert_eq!(shaped[0].1.source, captions[0].source);
+            assert_eq!(shaped[1].1.source, captions[1].source);
+        }
+        assert_eq!(captions, original);
+    }
+}
+
+#[test]
 fn absent_or_number_only_caption_promotes_title_without_mutating_ir() {
     for label in [None, Some("TABLE 3.1"), Some("3.1"), Some("表 3.1")] {
         let mut table = table();
@@ -358,7 +425,16 @@ fn unified_table_cell_keeps_formula_only_line_between_edge_breaks() {
         typesetting: ReaderTypesetting::unified(),
         ..Default::default()
     };
-    let prepared = LayoutEngine::new().shape_table(&table, &style, 400.0);
+    let source = EmptySource(Book {
+        id: PublicationId::new("table-formula-only").unwrap(),
+        metadata: Metadata::default(),
+        cover: None,
+        sections: vec![],
+        table_of_contents: vec![],
+    });
+    let prepared = LayoutEngine::new()
+        .shape_table(&source, &table, &style, 400.0)
+        .unwrap();
     let text = &prepared.cells[0].text;
     assert_eq!(text.lines, 1..2);
     assert_eq!(text.inline_images.len(), 1);
@@ -425,7 +501,7 @@ fn actual_layout_extracts_once_in_unified_only_and_preserves_title_location() {
 }
 
 #[test]
-fn promoted_caption_ignores_empty_lines_but_keeps_whole_group_alignment_rule() {
+fn promoted_caption_centers_authored_lines_without_natural_wraps() {
     let source = EmptySource(Book {
         id: PublicationId::new("caption-alignment-test").unwrap(),
         metadata: Metadata::default(),
@@ -436,7 +512,8 @@ fn promoted_caption_ignores_empty_lines_but_keeps_whole_group_alignment_rule() {
     for (label, second_line, centered) in [
         (false, false, true),
         (true, false, true),
-        (false, true, false),
+        (false, true, true),
+        (true, true, true),
     ] {
         let mut table = table();
         let original_title = table.rows[0].cells[0].text.clone();
@@ -484,8 +561,8 @@ fn promoted_caption_ignores_empty_lines_but_keeps_whole_group_alignment_rule() {
             shaped.last().unwrap().1.source,
             table.rows[0].cells[0].text.source
         );
-        if label {
-            assert!(!promoted.text.contains('\n'));
+        if view.join.is_some() {
+            assert_eq!(promoted.text.contains('\n'), second_line);
             assert_eq!(promoted.source_spans.len(), 2);
         } else {
             assert!(promoted.text.starts_with("\u{a0}\n"));
@@ -606,7 +683,7 @@ fn caption_trim_keeps_internal_blank_lines_media_and_original_book_layout() {
     };
     let mut engine = LayoutEngine::new();
     let unified = engine
-        .shape_figure_caption(&source, &caption, &style, 600.0, true)
+        .shape_figure_caption(&source, &caption, &style, 600.0, true, false)
         .unwrap();
     assert_eq!(unified.0.lines, 1..4);
     assert!(
@@ -615,7 +692,14 @@ fn caption_trim_keeps_internal_blank_lines_media_and_original_book_layout() {
             .is_empty()
     );
     let book = engine
-        .shape_figure_caption(&source, &caption, &ReaderStyle::default(), 600.0, false)
+        .shape_figure_caption(
+            &source,
+            &caption,
+            &ReaderStyle::default(),
+            600.0,
+            false,
+            false,
+        )
         .unwrap();
     assert_eq!(book.0.lines, 0..5);
     assert!(
@@ -624,7 +708,7 @@ fn caption_trim_keeps_internal_blank_lines_media_and_original_book_layout() {
     );
     let blank = text("\u{a0}\n\u{a0}", TextBlockKind::Caption);
     let blank = engine
-        .shape_figure_caption(&source, &blank, &style, 600.0, true)
+        .shape_figure_caption(&source, &blank, &style, 600.0, true, false)
         .unwrap();
     assert!(blank.0.lines.is_empty());
     assert_eq!(super::super::prepared_flow_height(&blank.0), 0.0);
@@ -643,7 +727,7 @@ fn caption_trim_keeps_internal_blank_lines_media_and_original_book_layout() {
         .content
         .extend(text("\u{a0}", TextBlockKind::Caption).content);
     let formula = engine
-        .shape_figure_caption(&source, &formula, &style, 600.0, true)
+        .shape_figure_caption(&source, &formula, &style, 600.0, true, false)
         .unwrap();
     assert_eq!(formula.0.lines, 1..2);
     assert!(!formula.0.inline_images.is_empty());

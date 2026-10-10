@@ -19,7 +19,7 @@ struct Entry {
 }
 
 #[derive(Default)]
-pub(super) struct CoverCache {
+pub(crate) struct CoverCache {
     entries: HashMap<Key, Entry>,
     wanted: Vec<(Key, Arc<[u8]>)>,
     failed: HashSet<Key>,
@@ -137,6 +137,10 @@ impl CoverCache {
         self.trim_to(BUDGET);
     }
 
+    pub fn trim_for_reader(&mut self) {
+        self.trim_to(READER_BUDGET);
+    }
+
     fn trim_to(&mut self, budget: usize) {
         let mut bytes = self.bytes();
         let mut candidates = self
@@ -192,7 +196,7 @@ fn thumbnail(bytes: &[u8], scale: u32, size: [u32; 2]) -> Result<ColorImage, ima
     let digest = format!("{:x}", Sha256::digest(bytes));
     let path = crate::smoke::project_dirs().map(|p| {
         p.cache_dir()
-            .join("cover-thumbnails-v1")
+            .join("cover-thumbnails-v2")
             .join(if size == SHELF_SIZE {
                 format!("{digest}-{scale}.png")
             } else {
@@ -207,7 +211,11 @@ fn thumbnail(bytes: &[u8], scale: u32, size: [u32; 2]) -> Result<ColorImage, ima
     let image = if let Some(image) = cached {
         image
     } else {
-        let image = image::load_from_memory(bytes)?.thumbnail(width, height);
+        let image = rebook_layout::image_processing::resize(
+            image::load_from_memory(bytes)?,
+            [width, height],
+            image::imageops::FilterType::Lanczos3,
+        );
         if let Some(path) = path {
             let mut encoded = Cursor::new(Vec::new());
             if image
@@ -222,7 +230,7 @@ fn thumbnail(bytes: &[u8], scale: u32, size: [u32; 2]) -> Result<ColorImage, ima
         }
         image
     };
-    let rgba = image.to_rgba8();
+    let rgba = image.into_rgba8();
     Ok(ColorImage::from_rgba_unmultiplied(
         [rgba.width() as usize, rgba.height() as usize],
         rgba.as_raw(),
@@ -301,7 +309,7 @@ mod tests {
         let result = thumbnail(png.get_ref(), 2, SHELF_SIZE).unwrap();
         assert!(result.size[0] <= 320 && result.size[1] <= 456);
         assert!(result.pixels.len() * 4 < 600_000);
-        for size in [[48, 72], [100, 150]] {
+        for size in [[48, 72], [100, 150], [52, 74]] {
             let result = thumbnail(png.get_ref(), 2, size).unwrap();
             assert!(result.size[0] <= size[0] as usize * 2);
             assert!(result.size[1] <= size[1] as usize * 2);
@@ -309,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn statistics_reuses_a_larger_shelf_texture_without_copying_cover_bytes() {
+    fn statistics_and_reader_reuse_a_larger_shelf_texture_without_copying_cover_bytes() {
         let ctx = Context::default();
         let mut cache = CoverCache::default();
         let texture = ctx.load_texture(
@@ -327,7 +335,7 @@ mod tests {
             },
         );
         cache.begin_frame(&ctx);
-        for size in [[48, 72], [100, 150]] {
+        for size in [[48, 72], [100, 150], [52, 74]] {
             assert_eq!(
                 cache
                     .texture_sized(&ctx, "book", &[1, 2, 3], size)
@@ -339,6 +347,49 @@ mod tests {
         assert_eq!(cache.entries.len(), 1);
         assert!(cache.wanted.is_empty());
         assert_eq!(cache.entries.values().next().unwrap().touched, cache.frame);
+    }
+
+    #[test]
+    fn reader_cover_is_prepared_by_worker_and_removed_results_cannot_return() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let ctx = Context::default();
+        let mut cache = CoverCache::default();
+        let image = image::DynamicImage::new_rgb8(400, 600);
+        let mut png = Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        cache.begin_frame(&ctx);
+        assert!(
+            cache
+                .texture_sized(&ctx, "reader", png.get_ref(), [52, 74])
+                .is_none()
+        );
+        assert_eq!(cache.wanted.len(), 1);
+        assert!(cache.entries.is_empty());
+        cache.spawn(&runtime, move || {
+            sender.send(()).unwrap();
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        cache.begin_frame(&ctx);
+        let texture = cache
+            .texture_sized(&ctx, "reader", png.get_ref(), [52, 74])
+            .unwrap();
+        assert!(texture.size()[0] <= 52 && texture.size()[1] <= 74);
+        assert!(cache.wanted.is_empty());
+        cache.remove("reader");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        cache.texture_sized(&ctx, "reader", png.get_ref(), [52, 74]);
+        cache.spawn(&runtime, move || {
+            sender.send(()).unwrap();
+        });
+        cache.remove("reader");
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        cache.begin_frame(&ctx);
+        assert!(cache.entries.is_empty());
     }
 
     #[test]

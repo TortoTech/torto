@@ -150,28 +150,23 @@ impl DesktopReader {
     pub(in crate::reader) fn resize_canvas(&mut self, width: f64, height: f64, raster_scale: f32) {
         let width = logical_dimension(width);
         let height = logical_dimension(height);
-        if width == 0
-            || height == 0
-            || (self.canvas_size == Some((width, height))
-                && self.reader.viewport().raster_scale == raster_scale.clamp(1.0, 4.0))
-        {
+        if width == 0 || height == 0 {
             return;
         }
         let Ok(viewport) = LayoutViewport::new(width, height) else {
             return;
         };
-        let result = self.reader.resize(viewport.with_raster_scale(raster_scale));
-        match result {
-            Ok(snapshot) => {
-                self.canvas_size = Some((width, height));
-                // Resizing repaginates the current spread and can expose source
-                // ranges that were outside the previous viewport. Re-run the
-                // incremental scheduler so those newly visible blocks are
-                // translated without requiring an artificial page turn.
-                self.apply_snapshot(snapshot, SnapshotEffects::viewport_change());
-            }
-            Err(error) => self.error = Some(format!("调整页面失败：{error}")),
+        let viewport = viewport.with_raster_scale(raster_scale);
+        if self
+            .semantic_layout
+            .pending_viewport
+            .unwrap_or(self.reader.viewport())
+            == viewport
+        {
+            return;
         }
+        self.canvas_size = Some((width, height));
+        self.request_viewport_reflow(viewport);
     }
 
     pub(in crate::reader) fn prefetch(&mut self) {

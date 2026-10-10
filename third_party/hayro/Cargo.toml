@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.92"
 name = "hayro"
-version = "0.7.1"
+version = "0.8.0"
 authors = ["Laurenz Stampfl <laurenz.stampfl@gmail.com>"]
 build = false
 autolib = false
@@ -31,10 +31,17 @@ resolver = "2"
 default = [
     "embed-fonts",
     "embed-cmaps",
+    "simd",
 ]
 embed-cmaps = ["hayro-interpret/embed-cmaps"]
 embed-fonts = ["hayro-interpret/embed-fonts"]
 logging = ["hayro-interpret/logging"]
+simd = [
+    "pic-scale/neon",
+    "pic-scale/rdm",
+    "pic-scale/sse",
+    "pic-scale/avx",
+]
 
 [lib]
 name = "hayro"
@@ -48,8 +55,11 @@ path = "examples/render.rs"
 version = "1"
 features = ["bytemuck_derive"]
 
+[dependencies.fearless_simd]
+version = "1.0.0"
+
 [dependencies.hayro-interpret]
-version = "0.7.0"
+version = "0.8.0"
 default-features = false
 
 [dependencies.image]
@@ -62,16 +72,13 @@ version = "0.13.0"
 
 [dependencies.pic-scale]
 version = "0.7.9"
-features = [
-    "neon",
-    "rdm",
-    "sse",
-    "avx",
-]
 default-features = false
 
+[dependencies.rustc-hash]
+version = "2"
+
 [dependencies.vello_cpu]
-version = "0.3.0"
+version = "0.3"
 features = [
     "std",
     "png",

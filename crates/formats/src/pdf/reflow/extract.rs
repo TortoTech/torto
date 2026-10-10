@@ -122,8 +122,6 @@ struct Extractor {
     clips: Vec<Rect>,
     rectangular_clips: Vec<bool>,
     opaque_groups: Vec<bool>,
-    soft_mask: bool,
-    normal_blend: bool,
 }
 
 pub(super) fn page(pdf: &Pdf, index: usize, tags: &StructureTags) -> NativePage {
@@ -137,10 +135,7 @@ pub(super) fn page(pdf: &Pdf, index: usize, tags: &StructureTags) -> NativePage 
         page.xref(),
         interpreter_settings(),
     );
-    let mut extractor = Extractor {
-        normal_blend: true,
-        ..Extractor::default()
-    };
+    let mut extractor = Extractor::default();
     extractor.rectangular_clips.push(true);
     extractor.opaque_groups.push(true);
     extractor.page.width = f64::from(width);
@@ -151,24 +146,20 @@ pub(super) fn page(pdf: &Pdf, index: usize, tags: &StructureTags) -> NativePage 
     interpret_page(page, &mut context, &mut extractor);
     // Form MCIDs have their own scope. The interpreter callback does not expose
     // that scope, so never guess a page structure association when Forms exist.
-    let mut resources = Some(page.resources());
-    let mut has_forms = false;
-    while let Some(current) = resources {
-        if current.x_objects.keys().any(|key| {
-            current
-                .x_objects
-                .get::<Stream<'_>>(key.as_ref())
-                .is_some_and(|s| {
-                    s.dict()
-                        .get::<Name<'_>>(b"Subtype")
-                        .is_some_and(|n| n.as_ref() == b"Form")
-                })
-        }) {
-            has_forms = true;
-            break;
-        }
-        resources = current.parent();
-    }
+    // Hayro 0.8 resolves the nearest inherited Resources dictionary while
+    // walking the page tree; there is no longer a resource-parent chain.
+    let resources = page.resources();
+    let has_forms = resources.x_objects.keys().any(|key| {
+        resources
+            .x_objects
+            .get::<Stream<'_>>(key.as_ref())
+            .is_some_and(|stream| {
+                stream
+                    .dict()
+                    .get::<Name<'_>>(b"Subtype")
+                    .is_some_and(|name| name.as_ref() == b"Form")
+            })
+    });
     if !has_forms {
         for glyph in &mut extractor.page.glyphs {
             if let Some(mcid) = glyph.mcid
@@ -227,12 +218,6 @@ fn array(rect: Rect) -> [f64; 4] {
 }
 
 impl Device<'_> for Extractor {
-    fn set_soft_mask(&mut self, mask: Option<SoftMask<'_>>) {
-        self.soft_mask = mask.is_some();
-    }
-    fn set_blend_mode(&mut self, mode: BlendMode) {
-        self.normal_blend = mode == BlendMode::Normal;
-    }
     fn push_transparency_group(
         &mut self,
         opacity: f32,
@@ -243,9 +228,7 @@ impl Device<'_> for Extractor {
             self.opaque_groups.last().copied().unwrap_or(true)
                 && opacity == 1.0
                 && mask.is_none()
-                && mode == BlendMode::Normal
-                && !self.soft_mask
-                && self.normal_blend,
+                && mode == BlendMode::Normal,
         );
     }
     fn pop_transparency_group(&mut self) {
@@ -263,7 +246,7 @@ impl Device<'_> for Extractor {
                 .map_or(bounds, |old| old.intersect(bounds)),
         );
     }
-    fn pop_clip_path(&mut self) {
+    fn pop_clip(&mut self) {
         if self.clips.len() > 1 {
             self.clips.pop();
             self.rectangular_clips.pop();
@@ -277,96 +260,14 @@ impl Device<'_> for Extractor {
         self.tags.pop();
     }
 
-    fn draw_glyph(
-        &mut self,
-        glyph: &Glyph<'_>,
-        transform: Affine,
-        glyph_transform: Affine,
-        _: &Paint<'_>,
-        mode: &GlyphDrawMode,
-    ) {
-        if matches!(mode, GlyphDrawMode::Invisible) {
-            self.page.invisible += 1;
+    fn draw_glyph_run(&mut self, run: &GlyphRun<'_, '_>, props: DrawProps<'_>, mode: &DrawMode) {
+        for glyph in run.glyphs() {
+            self.extract_glyph(glyph, props.transform, glyph.transform(), mode);
         }
-        let unicode = glyph.as_unicode();
-        let unmapped = unicode.is_none();
-        if unmapped {
-            self.page.unmapped += 1;
-        }
-        let text = match unicode {
-            Some(BfString::Char(c)) => c.to_string(),
-            Some(BfString::String(s)) => s,
-            None => "\u{fffc}".into(),
-        }
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>();
-        if text.is_empty() {
-            return;
-        }
-        let combined = transform * glyph_transform;
-        let baseline = combined * Point::ORIGIN;
-        let advance = combined * Point::new(glyph_advance(glyph), 0.0);
-        let rect = fallback_glyph_rect(glyph, combined);
-        if !rect_is_finite(rect)
-            || self
-                .clips
-                .last()
-                .is_some_and(|clip| !clip.contains(rect.center()))
-        {
-            return;
-        }
-        let matrix = combined.as_coeffs();
-        let size = matrix[2].hypot(matrix[3]) * 1000.0;
-        if !size.is_finite() || !(0.5..=500.0).contains(&size) {
-            self.page.unmapped += 1;
-            return;
-        }
-        let (bold, italic) = if let Glyph::Outline(g) = glyph {
-            *self.fonts.entry(g.font_cache_key()).or_insert_with(|| {
-                g.font_data().map_or((false, false), |data| {
-                    (
-                        data.weight.is_some_and(|w| w >= 600)
-                            || data
-                                .postscript_name
-                                .as_deref()
-                                .is_some_and(|n| n.to_ascii_lowercase().contains("bold")),
-                        data.is_italic,
-                    )
-                })
-            })
-        } else {
-            (false, false)
-        };
-        if self.page.glyphs.last().is_some_and(|old| {
-            old.text == text
-                && old
-                    .rect
-                    .iter()
-                    .zip(array(rect))
-                    .all(|(a, b)| (*a - b).abs() < 0.01)
-        }) {
-            return;
-        }
-        let tag = self.tags.iter().rev().find(|(t, _)| t != "Span");
-        self.page.glyphs.push(NativeGlyph {
-            text,
-            rect: array(rect),
-            baseline: [baseline.x, baseline.y],
-            advance: [advance.x, advance.y],
-            size,
-            bold,
-            italic,
-            rotated: matrix[1].abs() > matrix[0].abs() * 0.15 || matrix[0] <= 0.0,
-            tag: tag.map(|(t, _)| t.clone()),
-            mcid: self.tags.iter().rev().find_map(|(_, id)| *id),
-            link: None,
-            index: self.page.glyphs.len(),
-            unmapped,
-        });
     }
 
-    fn draw_image(&mut self, image: Image<'_, '_>, transform: Affine) {
+    fn draw_image(&mut self, image: Image<'_, '_>, props: ImageDrawProps<'_>) {
+        let transform = props.transform;
         let bounds = transform.transform_rect_bbox(Rect::new(
             0.0,
             0.0,
@@ -388,8 +289,8 @@ impl Device<'_> for Extractor {
             let matrix = transform.as_coeffs();
             let plain = self.rectangular_clips.last().copied().unwrap_or(false)
                 && self.opaque_groups.last().copied().unwrap_or(false)
-                && !self.soft_mask
-                && self.normal_blend
+                && props.soft_mask.is_none()
+                && props.blend_mode == BlendMode::Normal
                 && matrix[0] > 0.0
                 && matrix[3] > 0.0
                 && matrix[1].abs() < 1e-8
@@ -409,9 +310,10 @@ impl Device<'_> for Extractor {
         }
     }
 
-    fn draw_path(&mut self, path: &BezPath, transform: Affine, _: &Paint<'_>, mode: &PathDrawMode) {
+    fn draw_path(&mut self, path: &BezPath, props: DrawProps<'_>, mode: &DrawMode) {
+        let transform = props.transform;
         let padding = match mode {
-            PathDrawMode::Stroke(props) => {
+            DrawMode::Stroke(props) | DrawMode::FillAndStroke(_, props) => {
                 f64::from(props.line_width) * max_scale(transform) * 8.0 + 2.0
             }
             _ => 2.0,
@@ -528,4 +430,94 @@ fn simple_image(stream: &Stream<'_>, width: u32, height: u32) -> Option<EncodedI
         width,
         height,
     })
+}
+
+impl Extractor {
+    fn extract_glyph(
+        &mut self,
+        glyph: &Glyph<'_>,
+        transform: Affine,
+        glyph_transform: Affine,
+        mode: &DrawMode,
+    ) {
+        if matches!(mode, DrawMode::Invisible) {
+            self.page.invisible += 1;
+        }
+        let unicode = glyph.as_unicode();
+        let unmapped = unicode.is_none();
+        if unmapped {
+            self.page.unmapped += 1;
+        }
+        let text = match unicode {
+            Some(BfString::Char(c)) => c.to_string(),
+            Some(BfString::String(s)) => s,
+            None => "\u{fffc}".into(),
+        }
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+        if text.is_empty() {
+            return;
+        }
+        let combined = transform * glyph_transform;
+        let baseline = combined * Point::ORIGIN;
+        let advance = combined * Point::new(glyph_advance(glyph), 0.0);
+        let rect = fallback_glyph_rect(glyph, combined);
+        if !rect_is_finite(rect)
+            || self
+                .clips
+                .last()
+                .is_some_and(|clip| !clip.contains(rect.center()))
+        {
+            return;
+        }
+        let matrix = combined.as_coeffs();
+        let size = matrix[2].hypot(matrix[3]) * 1000.0;
+        if !size.is_finite() || !(0.5..=500.0).contains(&size) {
+            self.page.unmapped += 1;
+            return;
+        }
+        let (bold, italic) = if let Glyph::Outline(g) = glyph {
+            *self.fonts.entry(g.font_cache_key()).or_insert_with(|| {
+                g.font_data().map_or((false, false), |data| {
+                    (
+                        data.weight.is_some_and(|w| w >= 600)
+                            || data
+                                .postscript_name
+                                .as_deref()
+                                .is_some_and(|n| n.to_ascii_lowercase().contains("bold")),
+                        data.is_italic,
+                    )
+                })
+            })
+        } else {
+            (false, false)
+        };
+        if self.page.glyphs.last().is_some_and(|old| {
+            old.text == text
+                && old
+                    .rect
+                    .iter()
+                    .zip(array(rect))
+                    .all(|(a, b)| (*a - b).abs() < 0.01)
+        }) {
+            return;
+        }
+        let tag = self.tags.iter().rev().find(|(t, _)| t != "Span");
+        self.page.glyphs.push(NativeGlyph {
+            text,
+            rect: array(rect),
+            baseline: [baseline.x, baseline.y],
+            advance: [advance.x, advance.y],
+            size,
+            bold,
+            italic,
+            rotated: matrix[1].abs() > matrix[0].abs() * 0.15 || matrix[0] <= 0.0,
+            tag: tag.map(|(t, _)| t.clone()),
+            mcid: self.tags.iter().rev().find_map(|(_, id)| *id),
+            link: None,
+            index: self.page.glyphs.len(),
+            unmapped,
+        });
+    }
 }

@@ -232,6 +232,7 @@ mod tests {
                 &[],
                 &[],
                 rebook_publication::TextDirection::Auto,
+                parley::OverflowWrap::Normal,
             );
             raw.break_all_lines(None);
             let measured = measure(&raw, &text, &spans, typography.font_size);

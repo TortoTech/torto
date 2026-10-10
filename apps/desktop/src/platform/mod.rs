@@ -16,6 +16,7 @@ pub(crate) enum UserEvent {
     #[cfg(target_os = "windows")]
     Update(crate::updater::UpdateTaskMessage),
     ShelfImport(crate::shelf::ShelfImportTaskMessage),
+    ShelfOpen(crate::shelf::OpenTaskMessage),
     ShelfSyncProgress(crate::shelf::SyncProgressMessage),
     ShelfSync(crate::shelf::SyncTaskMessage),
     ShelfSyncCheck(crate::shelf::SyncCheckMessage),

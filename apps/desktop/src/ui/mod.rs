@@ -711,7 +711,7 @@ pub(crate) fn dialog_danger_button(ui: &mut Ui, label: &str) -> Response {
 }
 
 pub(crate) fn decode_color_image(bytes: &[u8]) -> Result<ColorImage, image::ImageError> {
-    let image = image::load_from_memory(bytes)?.to_rgba8();
+    let image = image::load_from_memory(bytes)?.into_rgba8();
     let size = [image.width() as usize, image.height() as usize];
     Ok(ColorImage::from_rgba_unmultiplied(size, image.as_raw()))
 }

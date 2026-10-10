@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rebook_html::parse_section;
+use rebook_html::parse_section_with_hints_and_image_classifier;
 use rebook_publication::{
     Block, Book, BookSource, ImageBlock, ImageStyle, Inline, Metadata, PublicationError,
     PublicationId, PublicationUrl, RenditionLayout, Resource, Section, SpineItem, SpineItemId,
@@ -24,6 +24,7 @@ pub(crate) struct SourceSection {
     pub title: String,
     pub content: SectionContent,
     pub linear: bool,
+    pub properties: Vec<String>,
 }
 
 pub(crate) enum SectionContent {
@@ -50,6 +51,9 @@ pub(crate) struct DirectBookSource {
     sections: Vec<SectionContent>,
     resources: HashMap<String, StoredResource>,
     toc_heading_hints: HashMap<String, Vec<TocHeadingHint>>,
+    html_context: crate::HtmlContext,
+    cover_page: Option<PublicationUrl>,
+    fragment_sections: HashMap<String, Option<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,7 +312,7 @@ impl DirectBookSource {
                 href,
                 media_type: "application/xhtml+xml".into(),
                 linear: section.linear,
-                properties: Vec::new(),
+                properties: section.properties,
             });
             sections.push(section.content);
         }
@@ -335,6 +339,48 @@ impl DirectBookSource {
         } else {
             HashMap::new()
         };
+        let mut navigation_documents = Vec::new();
+        let mut cover_page = None;
+        let mut fragment_sections = HashMap::new();
+        for (index, content) in sections.iter().enumerate() {
+            let SectionContent::Html(content) = content else {
+                continue;
+            };
+            collect_fragment_sections(content, index, &mut fragment_sections);
+            // Parse only metadata candidates; normal chapters remain lazy.
+            if content.contains("<nav")
+                || content.contains("<guide")
+                || content.contains("doc-cover")
+                || content.contains("\"cover\"")
+                || content.contains("'cover'")
+            {
+                if let Ok(xml) = html_document(content) {
+                    navigation_documents.extend(crate::html_context::navigation_documents(
+                        &xml,
+                        &descriptors[index].href,
+                    ));
+                    if cover_page.is_none() {
+                        cover_page =
+                            crate::html_context::cover_page(&xml, &descriptors[index].href);
+                    }
+                }
+            }
+        }
+        let html_context = crate::HtmlContext::new(&table_of_contents, navigation_documents);
+        if book.metadata.layout == RenditionLayout::Reflowable {
+            html_context.mark_note_sections(&mut descriptors);
+            crate::continuations::mark_quote_continuations(
+                &mut descriptors,
+                &table_of_contents,
+                |href| {
+                    let index = descriptors_index(href, sections.len())?;
+                    let SectionContent::Html(content) = &sections[index] else {
+                        return None;
+                    };
+                    html_document(content).ok()
+                },
+            );
+        }
         let cover = book
             .cover_path
             .as_deref()
@@ -367,6 +413,9 @@ impl DirectBookSource {
             sections,
             resources,
             toc_heading_hints,
+            html_context,
+            cover_page,
+            fragment_sections,
         })
     }
 }
@@ -378,6 +427,16 @@ impl BookSource for DirectBookSource {
 
     fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
         self.table_of_contents_origin
+    }
+
+    fn cover_section(&self) -> Result<Option<Section>, PublicationError> {
+        let Some(href) = &self.cover_page else {
+            return Ok(None);
+        };
+        let Some(index) = descriptors_index(href, self.sections.len()) else {
+            return Ok(None);
+        };
+        self.parse_section(index).map(Some)
     }
 
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
@@ -392,13 +451,27 @@ impl BookSource for DirectBookSource {
             .ok_or_else(|| PublicationError::ResourceNotFound(format!("section {index}")))?;
         match content {
             SectionContent::Html(body) => {
-                let document = format!(
-                    "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title></title></head><body>{body}</body></html>"
-                );
-                let document = crate::markup::html(&document, Default::default())
+                let document = html_document(body).map_err(PublicationError::InvalidPublication)?;
+                let document = resolve_fragment_links(document, index, &self.fragment_sections)
                     .map_err(PublicationError::InvalidPublication)?;
-                let mut section = parse_section(&document, descriptor, |_| None)
-                    .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
+                let mut section = parse_section_with_hints_and_image_classifier(
+                    &document,
+                    descriptor,
+                    |href| {
+                        self.resources
+                            .get(href.path())
+                            .map(|resource| String::from_utf8_lossy(&resource.bytes).into_owned())
+                    },
+                    |href| {
+                        self.html_context.is_separator_image(href, || {
+                            self.resources
+                                .get(href.path())
+                                .map(|resource| Arc::clone(&resource.bytes))
+                        })
+                    },
+                    self.html_context.hints(descriptor),
+                )
+                .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
                 if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {
                     promote_toc_headings(&mut section, hints);
                 }
@@ -435,6 +508,133 @@ impl BookSource for DirectBookSource {
             bytes: Arc::clone(&resource.bytes),
         })
     }
+}
+
+pub(crate) fn html_document(content: &str) -> Result<String, String> {
+    if content.to_ascii_lowercase().contains("<html") {
+        crate::markup::html(content, crate::markup::Limits::default())
+            .map(std::borrow::Cow::into_owned)
+    } else {
+        let document = format!(
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\" xmlns:mbp=\"http://mobipocket.com/ns/mbp\"><head></head><body>{content}</body></html>"
+        );
+        crate::markup::html_fragment(&document, crate::markup::Limits::default())
+            .map(std::borrow::Cow::into_owned)
+    }
+}
+
+fn descriptors_index(href: &PublicationUrl, section_count: usize) -> Option<usize> {
+    let index = href
+        .path()
+        .strip_prefix("Text/section-")?
+        .strip_suffix(".xhtml")?
+        .parse::<usize>()
+        .ok()?
+        .checked_sub(1)?;
+    (index < section_count).then_some(index)
+}
+
+fn collect_fragment_sections(
+    content: &str,
+    index: usize,
+    fragments: &mut HashMap<String, Option<usize>>,
+) {
+    let mut reader = quick_xml::Reader::from_str(content);
+    loop {
+        match reader.read_event() {
+            Ok(
+                quick_xml::events::Event::Start(element) | quick_xml::events::Event::Empty(element),
+            ) => {
+                for attribute in element
+                    .attributes()
+                    .flatten()
+                    .filter(|attribute| matches!(attribute.key.as_ref(), b"id" | b"name" | b"aid"))
+                {
+                    if let Ok(id) = attribute.decoded_and_normalized_value(
+                        quick_xml::XmlVersion::Implicit1_0,
+                        reader.decoder(),
+                    ) {
+                        fragments
+                            .entry(id.into_owned())
+                            .and_modify(|section| {
+                                if *section != Some(index) {
+                                    *section = None;
+                                }
+                            })
+                            .or_insert(Some(index));
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+}
+
+fn resolve_fragment_links(
+    document: String,
+    index: usize,
+    fragments: &HashMap<String, Option<usize>>,
+) -> Result<String, String> {
+    use quick_xml::events::{BytesStart, Event};
+    if !document.contains('#') {
+        return Ok(document);
+    }
+    let mut reader = quick_xml::Reader::from_str(&document);
+    let mut writer = quick_xml::Writer::new(Vec::new());
+    loop {
+        let event = reader.read_event().map_err(|error| error.to_string())?;
+        let empty = matches!(event, Event::Empty(_));
+        let event = match event {
+            Event::Eof => break,
+            Event::Start(element) | Event::Empty(element) => {
+                let target = element
+                    .attributes()
+                    .flatten()
+                    .find(|attribute| attribute.key.as_ref() == b"href")
+                    .and_then(|attribute| {
+                        attribute
+                            .decoded_and_normalized_value(
+                                quick_xml::XmlVersion::Implicit1_0,
+                                reader.decoder(),
+                            )
+                            .ok()
+                            .map(|value| value.into_owned())
+                    })
+                    .and_then(|href| {
+                        let fragment = href.strip_prefix('#')?;
+                        let section = fragments.get(fragment).copied().flatten()?;
+                        (section != index)
+                            .then(|| format!("section-{}.xhtml#{fragment}", section + 1))
+                    });
+                let element = if let Some(target) = target {
+                    let name = String::from_utf8_lossy(element.name().as_ref()).into_owned();
+                    let mut rewritten = BytesStart::new(name);
+                    for attribute in element
+                        .attributes()
+                        .flatten()
+                        .filter(|attribute| attribute.key.as_ref() != b"href")
+                    {
+                        rewritten.push_attribute(attribute);
+                    }
+                    rewritten.push_attribute(("href", target.as_str()));
+                    rewritten
+                } else {
+                    element
+                };
+                if empty {
+                    Event::Empty(element)
+                } else {
+                    Event::Start(element)
+                }
+            }
+            event => event,
+        };
+        writer
+            .write_event(event)
+            .map_err(|error| error.to_string())?;
+    }
+    String::from_utf8(writer.into_inner()).map_err(|error| error.to_string())
 }
 
 fn parse_toc_entry(entry: SourceTocEntry) -> Result<TocEntry, PublicationError> {
@@ -477,6 +677,7 @@ mod tests {
                     title: "Chapter".into(),
                     content: SectionContent::Html(xml.into()),
                     linear: true,
+                    properties: Vec::new(),
                 }],
                 table_of_contents: vec![SourceTocEntry {
                     label: label.into(),
@@ -570,6 +771,7 @@ mod tests {
                     title: "Page 1".into(),
                     content: SectionContent::Html("<p>Page 1</p>".into()),
                     linear: true,
+                    properties: Vec::new(),
                 }],
                 table_of_contents: vec![SourceTocEntry {
                     label: "目 录".into(),
@@ -616,6 +818,7 @@ mod tests {
                         "<h1 id=\"chapter\">Chapter</h1><img src=\"../Images/cover.png\"/>".into(),
                     ),
                     linear: true,
+                    properties: Vec::new(),
                 }],
                 table_of_contents: vec![SourceTocEntry {
                     label: "Chapter".into(),
@@ -666,6 +869,7 @@ mod tests {
                             .into(),
                     ),
                     linear: true,
+                    properties: Vec::new(),
                 }],
                 table_of_contents: vec![SourceTocEntry {
                     label: "Alignment".into(),
@@ -708,6 +912,7 @@ mod tests {
                             .into(),
                     ),
                     linear: true,
+                    properties: Vec::new(),
                 }],
                 table_of_contents: vec![SourceTocEntry {
                     label: "Chapter 1: Why Goal Setting Is Broken".into(),
@@ -749,6 +954,7 @@ mod tests {
                         "<h2 id=\"part-one\">Part I</h2><h2>Introduction</h2><p>Body.</p>".into(),
                     ),
                     linear: true,
+                    properties: Vec::new(),
                 }],
                 table_of_contents: vec![SourceTocEntry {
                     label: "Part I Introduction".into(),
@@ -790,6 +996,7 @@ mod tests {
                         "<p id=\"chapter-1\">1</p><p>A numbered body paragraph.</p>".into(),
                     ),
                     linear: true,
+                    properties: Vec::new(),
                 }],
                 table_of_contents: vec![SourceTocEntry {
                     label: "Chapter 1: A Different Title".into(),
@@ -829,6 +1036,7 @@ mod tests {
                     title: "Page 1".into(),
                     content: SectionContent::Html("<p id=\"title\">Title</p>".into()),
                     linear: true,
+                    properties: Vec::new(),
                 }],
                 table_of_contents: vec![SourceTocEntry {
                     label: "Title".into(),

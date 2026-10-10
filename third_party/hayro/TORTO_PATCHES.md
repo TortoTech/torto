@@ -1,12 +1,11 @@
-# Local Hayro 0.7.1 patch
+# Local Hayro 0.8.0 patch
 
-Copied from the crates.io Hayro 0.7.1 release (Apache-2.0 OR MIT). Both original license files are retained. The interpreter and syntax crates remain unmodified upstream dependencies.
+Copied from the crates.io Hayro 0.8.0 release (Apache-2.0 OR MIT). Both original license files are retained. Interpreter and syntax 0.8.0 remain unmodified upstream dependencies.
 
-- Vello CPU is upgraded to 0.3.0, retaining the u8 raster pipeline and single-threaded per-page contexts. Rendering uses the unified `render` API after flushing; image buffers declare their existing premultiplied alpha representation explicitly. The sampling-boundary, opaque-image/mask and layer-clipping fixes apply to original PDF pages, OCR input images and native image exports. Native generation V12 isolates the changed derived pixels from earlier caches. See the [upstream changelog](https://github.com/linebender/vello/blob/main/vello_cpu/CHANGELOG.md).
+- The renderer uses upstream `render_into` and its translation-independent image-resolution calculation. The old renderer module, custom `render_region` and decode-vector workaround are removed. Torto constructs pixel-aligned viewports in `crates/formats/src/pdf.rs`; conversion retains the Vello CPU 256 x 4 tile grid and padded union viewport.
+- `render_embedded_image` samples a proven isolated opaque decoded image through the same upstream PDF image sampler, with the ordinary crop dimensions. It retains authoritative calibrated/CMYK color decoding and uses explicit single-threaded rendering.
+- `RenderCache::with_outline_budget` limits retained outlines, including conservative Vec/hash-table overhead. Oversized outlines are not cached. `begin_page` releases interpreted fonts, images and color objects; outline reuse is confined to one conversion worker/document. Default caches remain unchanged.
 
-- `render_region` adds an integer pixel origin while retaining the page scale, transform, compositing, masks and clipping. Native conversion uses one padded union viewport per physical page, aligned to Vello CPU wide tiles (256 x 4 pixels) so changing the viewport does not change edge sampling.
-- Image decoder resolution hints use transformed **vectors**, excluding translation. Otherwise changing a crop origin changes JPEG decoding resolution. Out-of-viewport images are skipped before decoding.
-- `render_embedded_image` samples a proven isolated opaque image through the same renderer image pipeline. Torto uses the existing PDF decoder, including CMYK/calibrated colors, rather than interpreting JPEG color independently. Sampling preserves the ordinary crop dimensions.
-- `RenderCache::with_outline_budget` limits retained outline accounting (including conservative Vec/hash-table overhead). Oversized outlines are not retained. `begin_page` releases interpreted fonts, images and color objects; outline reuse remains confined to one conversion worker and document. Existing default caches are unchanged.
+Vello CPU 0.3.0 is already the upstream dependency. Native generation V13 isolates changed interpretation and derived pixels from prior caches.
 
-Synthetic format tests compare viewports across page rotation, nonzero page origins, clipping and alpha masks/transparency, and reject unsafe isolated-image candidates. Subpixel floating-point rounding in the CPU renderer can differ by a few color levels under compositing; geometry and output dimensions must match. Format tests exercise zero/small outline budgets across page resets and compare their actual rendered pixels against fresh unbounded caches.
+Existing format regressions compare rotation, nonzero page origins, clipping, masks/transparency, isolated-image eligibility, direct-export sampling, and zero/small outline budgets across page resets.

@@ -58,20 +58,24 @@ impl DesktopApp {
     pub(crate) fn open_book(&mut self, path: &Path) {
         self.pending_reader_notice = None;
         self.pending_reader_error = None;
-        // Release reusable pixels from the previous book before decoding the
-        // replacement. Its visible layout still owns everything needed to paint.
-        rebook_layout::clear_raster_cache();
+        // A cancellable open must not invalidate the still-visible reader's
+        // cache generation. Both books share the bounded cache until adoption.
+        if self.reader.is_none() {
+            rebook_layout::clear_raster_cache();
+        }
         self.shelf.open_book(path);
-        if let Some(mut next_reader) = self.shelf.take_opened_reader() {
-            if let Some(current_reader) = self.reader.as_ref() {
-                current_reader.prepare_for_shutdown();
-            }
-            // The reader may have been constructed asynchronously from settings
-            // that were superseded while the book was opening. Apply the
-            // authoritative in-memory snapshot before its first frame so an old
-            // compiled section cannot survive until the next settings change.
-            next_reader.apply_global_settings(self.settings.applied());
-            self.reader = Some(next_reader);
+    }
+
+    pub(crate) fn complete_shelf_open(
+        &mut self,
+        message: crate::shelf::OpenTaskMessage,
+        runtime: &tokio::runtime::Runtime,
+    ) {
+        if self.shelf.complete_open(message, runtime)
+            && let Some(current) = self.reader.take()
+        {
+            current.prepare_for_shutdown();
+            runtime.spawn_blocking(move || drop(current));
         }
     }
 
@@ -84,6 +88,7 @@ impl DesktopApp {
         #[cfg(target_os = "windows")]
         window_chrome::begin_frame(ui.ctx());
         self.reconcile_state(ui.ctx());
+        self.shelf.update_open_viewport(ui);
         self.shelf.poll_background_tasks();
         let open_settings_shortcut = self.settings.applied().shortcuts.open_settings;
         if !self.settings.is_open()
@@ -95,6 +100,9 @@ impl DesktopApp {
         }
         let interaction_blocked = self.settings.is_open();
         let plan = if let Some(reader) = self.reader.as_mut() {
+            let covers = self.shelf.reader_cover_cache();
+            reader.prepare_sidebar_cover(ui.ctx(), covers);
+            covers.trim_for_reader();
             Some(reader.ui(ui, page_texture, interaction_blocked))
         } else {
             self.shelf.ui(ui, interaction_blocked);
@@ -235,6 +243,10 @@ impl DesktopApp {
 
     pub(crate) fn reader_scene(&mut self) -> Option<ReaderScene> {
         self.reader.as_mut().map(DesktopReader::page_scene)
+    }
+
+    pub(crate) fn record_open_presentation(&mut self, ready: bool) {
+        self.shelf.record_open_presentation(ready);
     }
 
     pub(crate) fn spawn_pending_tasks(
@@ -451,18 +463,19 @@ impl DesktopApp {
     }
 
     fn promote_opened_reader(&mut self) {
-        if self.reader.is_none() {
+        if let Some(mut next_reader) = self.shelf.take_opened_reader() {
+            if let Some(current) = &self.reader {
+                current.prepare_for_shutdown();
+            }
             let applied = self.settings.applied().clone();
-            self.reader = self.shelf.take_opened_reader().map(|mut reader| {
-                reader.apply_global_settings(&applied);
-                if let Some(error) = self.pending_reader_error.take() {
-                    self.pending_reader_notice = None;
-                    reader.report_settings_error(error);
-                } else if let Some(notice) = self.pending_reader_notice.take() {
-                    reader.show_notice(notice);
-                }
-                reader
-            });
+            next_reader.apply_global_settings(&applied);
+            if let Some(error) = self.pending_reader_error.take() {
+                self.pending_reader_notice = None;
+                next_reader.report_settings_error(error);
+            } else if let Some(notice) = self.pending_reader_notice.take() {
+                next_reader.show_notice(notice);
+            }
+            self.reader = Some(next_reader);
         }
     }
 

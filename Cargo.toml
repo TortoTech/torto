@@ -16,6 +16,7 @@ exclude = [
     "third_party/hayro",
     "third_party/epaint",
     "third_party/egui",
+    "third_party/egui_extras",
     "third_party/egui-wgpu",
     "third_party/egui_commonmark",
     "third_party/egui_commonmark_backend",
@@ -39,19 +40,20 @@ bytemuck = "1.25.2"
 bytes = "1.12.1"
 crc32fast = "1.5.0"
 directories = "6.0.0"
-egui = "0.36.1"
+egui = "0.36.2"
 egui_commonmark = { version = "0.25.0", features = ["embedded_image"] }
 egui_commonmark_backend = "0.25.0"
-egui_extras = { version = "0.36.1", features = ["image"] }
-egui-wgpu = { version = "0.36.1", default-features = false }
-egui-winit = { version = "0.36.1", default-features = false, features = ["clipboard", "links"] }
+egui_extras = { version = "0.36.2", features = ["image"] }
+egui-wgpu = { version = "0.36.2", default-features = false }
+egui-winit = { version = "0.36.2", default-features = false, features = ["clipboard", "links"] }
 encoding_rs = "0.8.35"
+fast_image_resize = { version = "=6.1.0", default-features = false, features = ["std", "image"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
-fontdb = "0.23.0"
-hayro = "0.7.1"
+fontdb = "0.24.0"
+hayro = "0.8.0"
 hyphenation = "=0.8.4"
-image = { version = "=0.25.6", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
-icu_segmenter = "2.2.0"
+image = { version = "=0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+icu_segmenter = "2.3.0"
 jsonrepair-rs = "0.2.1"
 kurbo = "0.13.1"
 libchm = "0.2.0"
@@ -62,14 +64,14 @@ percent-encoding = "2.3.2"
 pollster = "0.4.0"
 pulldown-cmark = "0.13.0"
 quick-xml = { version = "0.41.0", features = ["encoding", "escape-html"] }
-read-fonts = "0.41.0"
+read-fonts = "0.45.0"
 ratex-layout = "0.1.14"
 ratex-parser = "0.1.14"
 ratex-svg = { version = "0.1.14", features = ["embed-fonts"] }
 ratex-types = "0.1.14"
 regex = "1.12.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "multipart", "query", "rustls-no-provider", "system-proxy"] }
-resvg = "0.47.0"
+resvg = "0.48.1"
 rfd = "0.17.2"
 roxmltree = "0.21.1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
@@ -85,8 +87,8 @@ tokio = { version = "1.49.0", features = ["rt-multi-thread", "sync", "time"] }
 unicode-segmentation = "1.13.3"
 unicode-script = "0.5.8"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
-vello = { version = "0.10.0", default-features = false, features = ["wgpu"] }
-wgpu = { version = "29.0.3", default-features = false, features = ["std", "parking_lot", "wgsl"] }
+vello = { version = "0.11.0", default-features = false, features = ["wgpu"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 winit = "0.30.13"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 keyring = { version = "4.1.5", default-features = false, features = ["v1"] }
@@ -126,8 +128,8 @@ strip = "none"
 [patch.crates-io]
 parley = { path = "third_party/parley" }
 egui = { path = "third_party/egui" }
+egui_extras = { path = "third_party/egui_extras" }
 epaint = { path = "third_party/epaint" }
-egui-wgpu = { path = "third_party/egui-wgpu" }
 egui_commonmark = { path = "third_party/egui_commonmark" }
 egui_commonmark_backend = { path = "third_party/egui_commonmark_backend" }
 

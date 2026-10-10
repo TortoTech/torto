@@ -1,6 +1,7 @@
 #![warn(missing_docs)] // Let's keep `Context` well-documented.
 
-use std::{borrow::Cow, cell::RefCell, panic::Location, sync::Arc, time::Duration};
+use core::{cell::RefCell, panic::Location, time::Duration};
+use std::{borrow::Cow, sync::Arc};
 
 use emath::GuiRounding as _;
 use epaint::{
@@ -98,7 +99,7 @@ impl ContextImpl {
     fn begin_pass_repaint_logic(&mut self, viewport_id: ViewportId) {
         let viewport = self.viewports.entry(viewport_id).or_default();
 
-        std::mem::swap(
+        core::mem::swap(
             &mut viewport.repaint.prev_causes,
             &mut viewport.repaint.causes,
         );
@@ -264,14 +265,14 @@ pub struct RepaintCause {
     pub reason: Cow<'static, str>,
 }
 
-impl std::fmt::Debug for RepaintCause {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for RepaintCause {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}:{} {}", self.file, self.line, self.reason)
     }
 }
 
-impl std::fmt::Display for RepaintCause {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for RepaintCause {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}:{} {}", self.file, self.line, self.reason)
     }
 }
@@ -459,7 +460,7 @@ impl ContextImpl {
 
         self.memory.begin_pass(&new_raw_input, &all_viewport_ids);
 
-        viewport.input = std::mem::take(&mut viewport.input).begin_pass(
+        viewport.input = core::mem::take(&mut viewport.input).begin_pass(
             new_raw_input,
             viewport.repaint.requested_immediate_repaint_prev_pass(),
             pixels_per_point,
@@ -653,7 +654,7 @@ impl ContextImpl {
     }
 
     fn all_viewport_ids(&self) -> ViewportIdSet {
-        std::iter::chain(self.viewports.keys().copied(), [ViewportId::ROOT]).collect()
+        core::iter::chain(self.viewports.keys().copied(), [ViewportId::ROOT]).collect()
     }
 
     /// The current active viewport
@@ -721,13 +722,13 @@ impl ContextImpl {
 #[derive(Clone)]
 pub struct Context(Arc<RwLock<ContextImpl>>);
 
-impl std::fmt::Debug for Context {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Context {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Context").finish_non_exhaustive()
     }
 }
 
-impl std::cmp::PartialEq for Context {
+impl core::cmp::PartialEq for Context {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -737,7 +738,7 @@ impl Default for Context {
     fn default() -> Self {
         let ctx_impl = ContextImpl {
             embed_viewports: true,
-            viewports: std::iter::once((ViewportId::ROOT, ViewportState::default())).collect(),
+            viewports: core::iter::once((ViewportId::ROOT, ViewportState::default())).collect(),
             ..Default::default()
         };
         let ctx = Self(Arc::new(RwLock::new(ctx_impl)));
@@ -847,7 +848,7 @@ impl Context {
             self.write(|ctx| {
                 let viewport = ctx.viewport_for(viewport_id);
                 viewport.output.num_completed_passes =
-                    std::mem::take(&mut output.platform_output.num_completed_passes);
+                    core::mem::take(&mut output.platform_output.num_completed_passes);
                 output.platform_output.request_discard_reasons.clear();
             });
 
@@ -929,12 +930,12 @@ impl Context {
         logic(self);
 
         self.write(|ctx| LogicOutput {
-            platform_output: std::mem::take(&mut ctx.viewport_for(viewport_id).output),
+            platform_output: core::mem::take(&mut ctx.viewport_for(viewport_id).output),
             viewport_commands: ctx
                 .viewports
                 .iter_mut()
                 .filter(|(_, viewport)| !viewport.commands.is_empty())
-                .map(|(&id, viewport)| (id, std::mem::take(&mut viewport.commands)))
+                .map(|(&id, viewport)| (id, core::mem::take(&mut viewport.commands)))
                 .collect(),
         })
     }
@@ -1250,6 +1251,8 @@ impl Context {
         allow_focus: bool,
         options: crate::InteractOptions,
     ) -> Response {
+        debug_assert!(!w.rect.any_nan(), "widget rect is NaN: {:?}", w.rect);
+
         let interested_in_focus = w.enabled
             && w.sense.is_focusable()
             && self.memory(|mem| mem.allows_interaction(w.layer_id));
@@ -1340,6 +1343,15 @@ impl Context {
         });
 
         res
+    }
+
+    /// Allow intentional widget ID changes inside `rect` for this pass only.
+    /// This only suppresses the rectangle/ID diagnostic, not duplicate-ID checks.
+    pub fn allow_widget_id_changes_in(&self, rect: Rect) {
+        #[cfg(debug_assertions)]
+        self.pass_state_mut(|state| state.widget_id_change_warning_exclusions.push(rect));
+        #[cfg(not(debug_assertions))]
+        let _ = (self, rect);
     }
 
     /// Read the response of some widget, which may be called _before_ creating the widget (!).
@@ -1875,7 +1887,7 @@ impl Context {
     /// See [`Self::request_repaint_after`] for details.
     #[track_caller]
     pub fn request_repaint_after_secs(&self, seconds: f32) {
-        if let Ok(duration) = std::time::Duration::try_from_secs_f32(seconds) {
+        if let Ok(duration) = core::time::Duration::try_from_secs_f32(seconds) {
             self.request_repaint_after(duration);
         }
     }
@@ -2058,7 +2070,7 @@ impl Context {
         &self,
         f: impl FnOnce(&mut T) -> R,
     ) -> Option<R> {
-        let plugin = self.read(|ctx| ctx.plugins.get(std::any::TypeId::of::<T>()));
+        let plugin = self.read(|ctx| ctx.plugins.get(core::any::TypeId::of::<T>()));
         plugin.map(|plugin| f(plugin.lock().typed_plugin_mut()))
     }
 
@@ -2070,13 +2082,13 @@ impl Context {
         if let Some(plugin) = self.plugin_opt() {
             plugin
         } else {
-            panic!("Plugin of type {:?} not found", std::any::type_name::<T>());
+            panic!("Plugin of type {:?} not found", core::any::type_name::<T>());
         }
     }
 
     /// Get a handle to the plugin of type `T`, if it was registered.
     pub fn plugin_opt<T: plugin::Plugin>(&self) -> Option<TypedPluginHandle<T>> {
-        let plugin = self.read(|ctx| ctx.plugins.get(std::any::TypeId::of::<T>()));
+        let plugin = self.read(|ctx| ctx.plugins.get(core::any::TypeId::of::<T>()));
         plugin.map(TypedPluginHandle::new)
     }
 
@@ -2499,7 +2511,7 @@ impl Context {
     #[cfg(debug_assertions)]
     fn debug_painting(&self) {
         #![expect(clippy::iter_over_hash_type)] // ok to be sloppy in debug painting
-        use std::fmt::Write as _;
+        use core::fmt::Write as _;
 
         let paint_widget = |widget: &WidgetRect, text: &str, color: Color32| {
             let rect = widget.interact_rect;
@@ -2680,7 +2692,7 @@ impl ContextImpl {
         // Inform the backend of all textures that have been updated (including font atlas).
         let textures_delta = self.tex_manager.0.write().take_delta();
 
-        let mut platform_output: PlatformOutput = std::mem::take(&mut viewport.output);
+        let mut platform_output: PlatformOutput = core::mem::take(&mut viewport.output);
 
         if self.memory.should_interrupt_ime()
             && let Some(ime) = &mut platform_output.ime
@@ -2734,13 +2746,14 @@ impl ContextImpl {
                 &mut shapes,
                 &viewport.prev_pass.widgets,
                 &viewport.this_pass.widgets,
+                &viewport.this_pass.widget_id_change_warning_exclusions,
             );
             shapes
         } else {
             shapes
         };
 
-        std::mem::swap(&mut viewport.prev_pass, &mut viewport.this_pass);
+        core::mem::swap(&mut viewport.prev_pass, &mut viewport.this_pass);
 
         if repaint_needed {
             self.request_repaint(ended_viewport_id, RepaintCause::new());
@@ -2802,7 +2815,7 @@ impl ContextImpl {
                     // Let the primary immediate viewport handle the commands of its children too.
                     // This can make things easier for the backend, as otherwise we may get commands
                     // that affect a viewport while its egui logic is running.
-                    std::mem::take(&mut viewport.commands)
+                    core::mem::take(&mut viewport.commands)
                 } else {
                     vec![]
                 };
@@ -4277,6 +4290,7 @@ fn warn_if_rect_changes_id(
     out_shapes: &mut Vec<ClippedShape>,
     prev_widgets: &crate::WidgetRects,
     new_widgets: &crate::WidgetRects,
+    exclusions: &[Rect],
 ) {
     profiling::function_scope!();
 
@@ -4287,13 +4301,13 @@ fn warn_if_rect_changes_id(
     struct OrderedRect(Rect);
 
     impl PartialOrd for OrderedRect {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
             Some(self.cmp(other))
         }
     }
 
     impl Ord for OrderedRect {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fn cmp(&self, other: &Self) -> core::cmp::Ordering {
             let lhs = self.0;
             let rhs = other.0;
             lhs.min
@@ -4321,6 +4335,13 @@ fn warn_if_rect_changes_id(
         let new = create_lookup(new_layer_widgets.iter());
 
         for (hashable_rect, new_at_rect) in new {
+            if exclusions
+                .iter()
+                .any(|rect| rect.contains_rect(new_at_rect[0].rect))
+            {
+                continue;
+            }
+
             let Some(prev_at_rect) = prev.get(&hashable_rect) else {
                 continue; // this rect did not exist in the previous pass
             };
@@ -4336,6 +4357,11 @@ fn warn_if_rect_changes_id(
             // If they all still exist (just at a different rect), then the rect match
             // is just a coincidence caused by widgets shifting (e.g. a window being dragged).
             if prev_at_rect.iter().all(|w| new_widgets.contains(w.id)) {
+                continue;
+            }
+
+            // Existing widgets can legitimately move into a vacated rectangle.
+            if new_at_rect.iter().any(|w| prev_widgets.contains(w.id)) {
                 continue;
             }
 
@@ -4377,6 +4403,87 @@ fn warn_if_rect_changes_id(
 #[cfg(test)]
 mod test {
     use super::Context;
+    #[cfg(debug_assertions)]
+    #[test]
+    fn rect_id_change_ignores_widget_moving_into_vacated_rect() {
+        use crate::{Id, InteractOptions, LayerId, Rect, Sense, WidgetRect, WidgetRects, pos2};
+
+        let layer_id = LayerId::background();
+        let parent_id = Id::new("parent");
+        let vacated_rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 10.0));
+        let previous_rect = vacated_rect.translate((0.0, -10.0).into());
+        let old_id = Id::new("removed");
+        let moved_id = Id::new("moved");
+
+        let widget = |id, rect| WidgetRect {
+            id,
+            parent_id,
+            layer_id,
+            rect,
+            interact_rect: rect,
+            sense: Sense::hover(),
+            enabled: true,
+        };
+
+        let mut previous = WidgetRects::default();
+        previous.insert(
+            layer_id,
+            widget(old_id, vacated_rect),
+            InteractOptions::default(),
+        );
+        previous.insert(
+            layer_id,
+            widget(moved_id, previous_rect),
+            InteractOptions::default(),
+        );
+
+        let mut current = WidgetRects::default();
+        current.insert(
+            layer_id,
+            widget(moved_id, vacated_rect),
+            InteractOptions::default(),
+        );
+
+        let mut shapes = Vec::new();
+        super::warn_if_rect_changes_id(&mut shapes, &previous, &current, &[]);
+
+        assert!(shapes.is_empty());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn rect_id_change_warns_for_new_widget_replacing_existing_widget() {
+        use crate::{Id, InteractOptions, LayerId, Rect, Sense, WidgetRect, WidgetRects, pos2};
+
+        let layer_id = LayerId::background();
+        let parent_id = Id::new("parent");
+        let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 10.0));
+        let widget = |id| WidgetRect {
+            id,
+            parent_id,
+            layer_id,
+            rect,
+            interact_rect: rect,
+            sense: Sense::hover(),
+            enabled: true,
+        };
+
+        let mut previous = WidgetRects::default();
+        previous.insert(layer_id, widget(Id::new("old")), InteractOptions::default());
+
+        let mut current = WidgetRects::default();
+        current.insert(layer_id, widget(Id::new("new")), InteractOptions::default());
+
+        let mut shapes = Vec::new();
+        super::warn_if_rect_changes_id(&mut shapes, &previous, &current, &[]);
+
+        assert_eq!(shapes.len(), 1);
+
+        shapes.clear();
+        super::warn_if_rect_changes_id(&mut shapes, &previous, &current, &[rect]);
+
+        assert!(shapes.is_empty());
+    }
 
     #[test]
     fn test_single_pass() {

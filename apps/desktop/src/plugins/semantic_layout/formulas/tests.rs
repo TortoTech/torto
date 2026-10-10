@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn formula_request_keeps_threefold_enlargement_and_white_padding() {
+    let pixels = RgbaImage::from_pixel(3, 7, Rgba([0, 0, 0, 128]));
+    let url = image_url(pixels.into()).unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(url.split_once(',').unwrap().1)
+        .unwrap();
+    let image = image::load_from_memory(&bytes).unwrap().into_rgba8();
+    assert_eq!([image.width(), image.height()], [25, 37]);
+    assert_eq!(image.get_pixel(0, 0).0, [255; 4]);
+    let center = image.get_pixel(12, 18).0;
+    // Image's floating-point compositing may round opaque alpha down by one.
+    assert!((254..=255).contains(&center[3]));
+    assert!(
+        center[..3]
+            .iter()
+            .all(|channel| (126..=128).contains(channel))
+    );
+}
+
+#[test]
 fn formula_transcriptions_must_render_and_keep_negative_results_empty() {
     for latex in [
         r"\sigma=\sqrt{k\theta^2}",

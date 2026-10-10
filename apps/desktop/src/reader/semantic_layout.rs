@@ -58,6 +58,7 @@ struct Group {
 }
 #[derive(Default)]
 pub(super) struct SemanticLayoutState {
+    pub(super) pending_viewport: Option<rebook_layout::LayoutViewport>,
     expert_translation: bool,
     semantic_config: Option<(
         crate::plugins::semantic_layout::SemanticLayoutSettings,
@@ -954,6 +955,11 @@ impl DesktopReader {
         self.semantic_layout.reflow_dirty = true;
     }
 
+    pub(super) fn request_viewport_reflow(&mut self, viewport: rebook_layout::LayoutViewport) {
+        self.semantic_layout.pending_viewport = Some(viewport);
+        self.refresh_semantic_layout();
+    }
+
     fn poll_semantic_reflow(
         &mut self,
         runtime: &tokio::runtime::Runtime,
@@ -979,9 +985,12 @@ impl DesktopReader {
             let version = self.semantic_layout.reflow_version;
             let unit = self.reader.reading_unit_location().index;
             let style = self.reader.style();
-            let request = self
-                .reader
-                .prepare_refresh_request(self.progress_source_range());
+            let request = self.reader.prepare_resize_request(
+                self.semantic_layout
+                    .pending_viewport
+                    .unwrap_or(self.reader.viewport()),
+                self.progress_source_range(),
+            );
             let proxy = proxy.clone();
             let (tx, rx) = mpsc::channel();
             self.semantic_layout.reflow_receiver = Some(rx);
@@ -1014,7 +1023,11 @@ impl DesktopReader {
                 if version == self.semantic_layout.reflow_version
                     && unit == self.reader.reading_unit_location().index
                     && style == self.reader.style()
-                    && prepared.viewport() == self.reader.viewport() =>
+                    && prepared.viewport()
+                        == self
+                            .semantic_layout
+                            .pending_viewport
+                            .unwrap_or(self.reader.viewport()) =>
             {
                 let scroll_source = self
                     .progress_source_range()
@@ -1026,13 +1039,18 @@ impl DesktopReader {
                     runtime.spawn_blocking(move || drop(prepared));
                     self.semantic_layout.reflow_dirty = true;
                 } else {
+                    let viewport_changed = self.semantic_layout.pending_viewport.take().is_some();
                     let anchor =
                         self.capture_focus_reflow_anchor(super::FocusReflowKind::DocumentLayout);
                     let old = std::mem::replace(&mut self.reader, prepared);
                     runtime.spawn_blocking(move || drop(old));
                     self.apply_snapshot(
                         self.reader.snapshot(),
-                        SnapshotEffects::static_content_change(),
+                        if viewport_changed {
+                            SnapshotEffects::viewport_change()
+                        } else {
+                            SnapshotEffects::static_content_change()
+                        },
                     );
                     self.focus_reflow_anchor = anchor;
                     if self.is_scroll_mode() && !self.is_focus_mode() {
@@ -1045,7 +1063,21 @@ impl DesktopReader {
                 runtime.spawn_blocking(move || drop(prepared));
                 self.semantic_layout.reflow_dirty = true;
             }
-            Err(error) => tracing::warn!(%error, "background semantic reflow failed"),
+            Err(error) => {
+                tracing::warn!(%error, "background semantic reflow failed");
+                if version != self.semantic_layout.reflow_version {
+                    self.semantic_layout.reflow_dirty = true;
+                } else if self.semantic_layout.pending_viewport.is_some() {
+                    // Keep the failed target so every paint doesn't retry it.
+                    // A new viewport or explicit content refresh can retry.
+                    self.error = Some(format!(
+                        "{}: {error}",
+                        self.language
+                            .text("版式重排失败", "Unable to update layout")
+                    ));
+                    return true;
+                }
+            }
         }
         false
     }

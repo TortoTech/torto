@@ -6,14 +6,18 @@
 
 mod cbz;
 mod chm;
+mod continuations;
 mod cover;
 mod epub;
 mod fb2;
+mod html_context;
 mod kf8;
 mod markup;
 mod mobi;
 mod pdf;
 pub mod reflow;
+#[cfg(test)]
+mod reflow_format_tests;
 mod source;
 mod xml;
 
@@ -27,6 +31,7 @@ use thiserror::Error;
 
 use self::epub::{EpubError, EpubPublication};
 
+pub use self::html_context::HtmlContext;
 pub use self::pdf::cjk_fallback_font_bytes;
 pub use self::pdf::reflow as pdf_reflow;
 pub use self::pdf::{PdfTimingSink, set_pdf_timing_sink};

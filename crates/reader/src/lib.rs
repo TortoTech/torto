@@ -466,10 +466,13 @@ impl SectionRepository {
 
             let layout_boundaries = top_level_toc_fragments_for_section(self.source.book(), index);
             let reading_boundaries = semantic_toc_boundaries_for_section(self.source.book(), index);
-            let parsed = self
-                .source
-                .parse_section(index)
-                .map(|section| prepare_section(section, &layout_boundaries, &reading_boundaries));
+            let parsed = {
+                let _timing =
+                    rebook_layout::timing::stage(rebook_layout::timing::TimingStage::SectionParse);
+                self.source.parse_section(index).map(|section| {
+                    prepare_section(section, &layout_boundaries, &reading_boundaries)
+                })
+            };
             let mut state = slot
                 .state
                 .lock()
@@ -800,6 +803,17 @@ impl ReaderSession {
             locator,
             raster_generation: self.layout_engine.raster_cache_generation(),
         }
+    }
+
+    /// Prepare a viewport change without compiling or waiting on the UI thread.
+    pub fn prepare_resize_request(
+        &self,
+        viewport: LayoutViewport,
+        source: Option<SourceRange>,
+    ) -> ReaderRefreshRequest {
+        let mut request = self.prepare_refresh_request(source);
+        request.viewport = viewport;
+        request
     }
 
     /// Restore only within already-compiled pages; never start foreground work.
@@ -4055,11 +4069,14 @@ fn compile_segment_layout(
                 .map(|page| (anchor.fragment.clone(), page))
         })
         .collect();
-    let pages = layout
-        .pages
-        .iter()
-        .map(|page| Arc::new(display_compiler.compile(page)))
-        .collect();
+    let pages = {
+        let _timing = rebook_layout::timing::stage(rebook_layout::timing::TimingStage::DisplayList);
+        layout
+            .pages
+            .iter()
+            .map(|page| Arc::new(display_compiler.compile(page)))
+            .collect()
+    };
     Ok(SegmentLayout {
         section,
         pages,

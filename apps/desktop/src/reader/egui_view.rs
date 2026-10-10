@@ -20,9 +20,9 @@ use crate::plugins::{
 use crate::preferences::{AppLanguage, AppTheme};
 use crate::settings::ReaderSettingsChange;
 use crate::ui::{
-    Icon, ToastKind, decode_color_image, dialog_action_button, icon, icon_button,
-    navigation_button, navigation_text_button, paint_icon, palette, selectable_icon_button,
-    show_toast, small_icon_button,
+    Icon, ToastKind, dialog_action_button, icon, icon_button, navigation_button,
+    navigation_text_button, paint_icon, palette, selectable_icon_button, show_toast,
+    small_icon_button,
 };
 
 pub(super) const SIDEBAR_WIDTH: f32 = 256.0;
@@ -51,7 +51,7 @@ const ASSISTANT_SELECTION_SCROLL_EDGE: f32 = 36.0;
 const ASSISTANT_SELECTION_SCROLL_MIN_SPEED: f32 = 90.0;
 const ASSISTANT_SELECTION_SCROLL_MAX_SPEED: f32 = 640.0;
 const ASSISTANT_KEYBOARD_SCROLL_STEP: f32 = 64.0;
-const TOOLBAR_HEIGHT: f32 = 44.0;
+pub(super) const TOOLBAR_HEIGHT: f32 = 44.0;
 const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
 const TOOLBAR_TITLE_SIZE: f32 = 15.0;
 const TOC_ROW_HEIGHT: f32 = 36.0;
@@ -553,6 +553,21 @@ fn supports_image_preview(format: rebook_formats::BookFormat, ocr_mode: PdfOcrVi
 }
 
 impl DesktopReader {
+    pub(crate) fn prepare_sidebar_cover(
+        &mut self,
+        ctx: &egui::Context,
+        covers: &mut crate::shelf::covers::CoverCache,
+    ) {
+        covers.begin_frame(ctx);
+        self.cover_texture = if self.ui.sidebar_motion.value > 0.001 {
+            self.cover
+                .as_deref()
+                .and_then(|bytes| covers.texture_sized(ctx, &self.book_id, bytes, [52, 74]))
+        } else {
+            None
+        };
+    }
+
     pub(crate) fn ui(
         &mut self,
         root_ui: &mut egui::Ui,
@@ -2394,7 +2409,10 @@ impl DesktopReader {
                 }
                 // Preserve explicit access to existing independent derived sources.
                 if ui
-                    .button(self.language.text("使用本地重排", "Use local reflow"))
+                    .button(
+                        self.language
+                            .text("使用 PDF 自带文字", "Use embedded PDF text"),
+                    )
                     .clicked()
                 {
                     self.start_pdf_native(super::PdfNativeAction::Open);
@@ -2403,7 +2421,7 @@ impl DesktopReader {
                 if ui
                     .button(
                         self.language
-                            .text("重新生成本地重排", "Regenerate local reflow"),
+                            .text("重新提取 PDF 自带文字", "Extract embedded PDF text again"),
                     )
                     .clicked()
                 {
@@ -2413,7 +2431,7 @@ impl DesktopReader {
                 if ui
                     .button(
                         self.language
-                            .text("使用已有 OCR 文字", "Use existing OCR text"),
+                            .text("使用已有 OCR 识别结果", "Use existing OCR results"),
                     )
                     .clicked()
                 {
@@ -3457,16 +3475,6 @@ impl DesktopReader {
     fn book_summary(&mut self, ui: &mut egui::Ui) {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            if self.cover_texture.is_none()
-                && let Some(bytes) = &self.cover
-                && let Ok(image) = decode_color_image(bytes)
-            {
-                self.cover_texture = Some(ui.ctx().load_texture(
-                    "reader-cover",
-                    image,
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
             if let Some(texture) = &self.cover_texture {
                 ui.add(egui::Image::new(texture).fit_to_exact_size(Vec2::new(52.0, 74.0)));
             } else {
@@ -4529,13 +4537,11 @@ impl DesktopReader {
                         let mode_button = if focus_allowed {
                             mode_button.inner
                         } else {
-                            mode_button.inner.on_disabled_hover_text(self.language.text(
-                                "原始 PDF 不支持专注模式，请先切换到 OCR 版式",
-                                "Original PDF does not support Focus mode; switch to OCR reflow first",
-                            ))
+                            mode_button
+                                .inner
+                                .on_disabled_hover_text(self.pdf_focus_mode_hint())
                         };
-                        if mode_button.clicked()
-                        {
+                        if mode_button.clicked() {
                             let mode = if self.is_focus_mode() {
                                 crate::preferences::ReadingMode::Classic
                             } else {
@@ -4578,15 +4584,9 @@ impl DesktopReader {
                                 AppTheme::Dark => Icon::Moon,
                             },
                             match theme {
-                                AppTheme::System => {
-                                    self.language.text("跟随系统", "Follow system")
-                                }
-                                AppTheme::Light => {
-                                    self.language.text("浅色模式", "Light mode")
-                                }
-                                AppTheme::Dark => {
-                                    self.language.text("黑夜模式", "Dark mode")
-                                }
+                                AppTheme::System => self.language.text("跟随系统", "Follow system"),
+                                AppTheme::Light => self.language.text("浅色模式", "Light mode"),
+                                AppTheme::Dark => self.language.text("黑夜模式", "Dark mode"),
                             },
                             false,
                         )

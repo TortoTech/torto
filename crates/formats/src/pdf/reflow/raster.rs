@@ -2,13 +2,13 @@
 mod encoding;
 mod pipeline;
 use super::*;
-use hayro::hayro_interpret::font::Glyph;
+use hayro::hayro_interpret::font::GlyphRun;
 use hayro::hayro_interpret::{
-    BlendMode, ClipPath, Device, GlyphDrawMode, Image, Paint, PathDrawMode, SoftMask,
+    BlendMode, ClipPath, Device, DrawMode, DrawProps, Image, ImageDrawProps, SoftMask,
 };
 pub(super) use pipeline::Pipeline;
 
-// Vello CPU 0.0.8 uses 256 x 4 wide tiles. Keep the local viewport on
+// Vello CPU 0.3.0 uses 256 x 4 wide tiles. Keep the local viewport on
 // the original tile grid to preserve edge coverage and image sampling.
 const RASTER_TILE_WIDTH: u32 = 256;
 const RASTER_TILE_HEIGHT: u32 = 4;
@@ -93,11 +93,11 @@ pub(super) fn save_regions<'a>(
     timings.raster_pixels += u64::from(x1 - x0) * u64::from(y1 - y0);
     check_cancelled(cancelled)?;
     let rasterizing = Instant::now();
-    let pixmap = hayro::render_region(
+    let pixmap = render_page_region(
         page,
         cache,
         &interpreter_settings(),
-        &RenderSettings {
+        &PageRasterSettings {
             x_scale: scale,
             y_scale: scale,
             width: Some((x1 - x0) as u16),
@@ -180,23 +180,14 @@ fn export_simple_images(
 // renderer does. Only proven isolated targets are decoded and sampled; no text
 // outlines, page bitmap or second reading representation is built here.
 impl Device<'_> for Exporter<'_> {
-    fn set_soft_mask(&mut self, _: Option<SoftMask<'_>>) {}
-    fn set_blend_mode(&mut self, _: BlendMode) {}
     fn push_clip_path(&mut self, _: &ClipPath) {}
-    fn pop_clip_path(&mut self) {}
+    fn pop_clip(&mut self) {}
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'_>>, _: BlendMode) {}
     fn pop_transparency_group(&mut self) {}
-    fn draw_path(&mut self, _: &BezPath, _: Affine, _: &Paint<'_>, _: &PathDrawMode) {}
-    fn draw_glyph(
-        &mut self,
-        _: &Glyph<'_>,
-        _: Affine,
-        _: Affine,
-        _: &Paint<'_>,
-        _: &GlyphDrawMode,
-    ) {
-    }
-    fn draw_image(&mut self, image: Image<'_, '_>, transform: Affine) {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'_>, _: &DrawMode) {}
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, '_>, _: DrawProps<'_>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'_, '_>, props: ImageDrawProps<'_>) {
+        let transform = props.transform;
         if self.error.is_some() || self.cancelled.load(Ordering::Acquire) {
             return;
         }
@@ -388,18 +379,18 @@ mod tests {
             let pdf = Pdf::new(fixture(rotation, content, true)).unwrap();
             let page = &pdf.pages()[0];
             let cache = RenderCache::with_outline_budget(4096);
-            let settings = RenderSettings {
+            let settings = PageRasterSettings {
                 x_scale: 1.5,
                 y_scale: 1.5,
                 bg_color: WHITE,
-                ..RenderSettings::default()
+                ..PageRasterSettings::default()
             };
-            let full = hayro::render(page, &cache, &interpreter_settings(), &settings);
-            let local = hayro::render_region(
+            let full = render_page(page, &cache, &interpreter_settings(), &settings);
+            let local = render_page_region(
                 page,
                 &cache,
                 &interpreter_settings(),
-                &RenderSettings {
+                &PageRasterSettings {
                     width: Some(180),
                     height: Some(160),
                     ..settings
@@ -442,11 +433,11 @@ mod tests {
         ))
         .unwrap();
         let page = &pdf.pages()[0];
-        let settings = RenderSettings {
+        let settings = PageRasterSettings {
             bg_color: WHITE,
-            ..RenderSettings::default()
+            ..PageRasterSettings::default()
         };
-        let expected = hayro::render(
+        let expected = render_page(
             page,
             &RenderCache::new(),
             &interpreter_settings(),
@@ -456,7 +447,7 @@ mod tests {
             let mut cache = RenderCache::with_outline_budget(budget);
             for _ in 0..3 {
                 cache.begin_page();
-                let image = hayro::render(page, &cache, &interpreter_settings(), &settings);
+                let image = render_page(page, &cache, &interpreter_settings(), &settings);
                 assert_eq!(image.data_as_u8_slice(), expected.data_as_u8_slice());
                 assert!(cache.retained_outline_bytes() <= budget);
                 if budget == 0 {

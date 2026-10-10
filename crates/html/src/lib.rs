@@ -1685,7 +1685,7 @@ impl<'a> ReadingIrParser<'a> {
                         &self.styles,
                         &self.footnote_links,
                     )
-                    .with_inline_images(node_has_visible_text(cell)),
+                    .with_table_cell_images(),
                     &mut collector,
                 );
                 collector.finish();
@@ -2630,6 +2630,7 @@ struct InlineParseContext<'a> {
     styles: &'a StyleSheet,
     footnote_links: &'a HashMap<usize, LinkRole>,
     inline_images: bool,
+    table_cell_images: bool,
 }
 
 impl<'a> InlineParseContext<'a> {
@@ -2643,11 +2644,19 @@ impl<'a> InlineParseContext<'a> {
             styles,
             footnote_links,
             inline_images: false,
+            table_cell_images: false,
         }
     }
 
     const fn with_inline_images(mut self, enabled: bool) -> Self {
         self.inline_images = enabled;
+        self
+    }
+
+    const fn with_table_cell_images(mut self) -> Self {
+        // A cell has no separate block-image path. Retain even image-only and
+        // publisher block images as inline boxes inside its existing grid slot.
+        self.table_cell_images = true;
         self
     }
 }
@@ -2660,7 +2669,8 @@ fn node_has_visible_text(node: Node<'_, '_>) -> bool {
 }
 
 fn image_should_be_inline(node: Node<'_, '_>, context: &InlineParseContext<'_>) -> bool {
-    context.inline_images && !context.styles.image_establishes_block_layout(node)
+    context.table_cell_images
+        || (context.inline_images && !context.styles.image_establishes_block_layout(node))
 }
 
 fn inline_image(
@@ -4782,6 +4792,52 @@ mod tests {
 
         assert_eq!(breaks, 2);
         assert_eq!(lines, "• First item\n• Second item\n• Third item");
+    }
+
+    #[test]
+    fn table_cells_retain_image_only_and_block_images_in_authored_order() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+            <head><style>img { display: block; width: 100%; }</style></head>
+            <body><table><tr>
+                <td/>
+                <td><div><img src="images/cleanser.png" alt="Cleanser"/></div></td>
+                <td colspan="2"><img src="images/serum.png" alt="Serum"/></td>
+                <td><p>Before</p><div><img src="images/sunscreen.png"/></div><p>After</p></td>
+            </tr></table><img src="images/figure.png"/></body>
+        </html>"#;
+        let section = parse_section(xml, &descriptor, |_| None).unwrap();
+        let [Block::Table(table), Block::Image(figure)] = section.blocks.as_slice() else {
+            panic!("cell images should stay inside the table, with the following figure separate");
+        };
+        assert!(table.rows[0].cells[0].text.content.is_empty());
+        for (index, name) in [(1, "cleanser"), (2, "serum")] {
+            let [Inline::Image(image)] = table.rows[0].cells[index].text.content.as_slice() else {
+                panic!("image-only cells must retain their image");
+            };
+            assert_eq!(image.image.href.path(), format!("OPS/images/{name}.png"));
+            assert_eq!(image.image.style.width, Some(ImageLength::Fraction(1.0)));
+            assert!(image.intrinsic_sizing);
+        }
+        assert_eq!(table.rows[0].cells[2].column_span, 2);
+        let mixed = &table.rows[0].cells[3].text.content;
+        assert!(matches!(
+            mixed.as_slice(),
+            [
+                Inline::Text(_),
+                Inline::Break,
+                Inline::Image(_),
+                Inline::Break,
+                Inline::Text(_)
+            ]
+        ));
+        assert_eq!(figure.href.path(), "OPS/images/figure.png");
     }
 
     #[test]

@@ -109,6 +109,7 @@ impl GpuState {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                ..Default::default()
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -492,8 +493,18 @@ impl GpuState {
             .submit(callback_commands.into_iter().chain([encoder.finish()]));
         let submission_finished = frame_started.elapsed();
         window.pre_present_notify();
-        frame.present();
+        self.queue.present(frame);
         let presentation_finished = frame_started.elapsed();
+        // A newly allocated target was not yet part of this frame's UI shapes.
+        // Count opening only once the UI actually submits the prepared texture.
+        let reader_ready = plan.is_some_and(|plan| {
+            !page_target_recreated
+                && self
+                    .page_target
+                    .as_ref()
+                    .is_some_and(|target| !reader_scene_needs_render(target.rendered_scene, plan))
+        });
+        app.record_open_presentation(reader_ready);
         if presentation_finished.as_millis() >= 100 {
             use crate::diagnostics::{Field, log};
             let ms = |duration: std::time::Duration| duration.as_secs_f32() * 1000.0;
@@ -529,12 +540,6 @@ impl GpuState {
                     timeout: Some(std::time::Duration::from_secs(10)),
                 })
                 .map_err(|error| error.to_string())?;
-            let reader_ready = plan.is_some()
-                && !page_target_recreated
-                && self
-                    .page_target
-                    .as_ref()
-                    .is_some_and(|target| target.rendered_scene.is_some());
             crate::smoke::presented(reader_ready, app.startup_error())?;
         }
         for id in self.retired_page_textures.drain(..) {
@@ -678,7 +683,7 @@ impl GpuState {
         }
         self.queue.submit([encoder.finish()]);
         window.pre_present_notify();
-        frame.present();
+        self.queue.present(frame);
         self.resize_pending = false;
         // Keep the last complete frame, not this temporary partially empty one.
         Ok(())

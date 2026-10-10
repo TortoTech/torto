@@ -48,6 +48,16 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, Fo
         .collect();
 
     let (resources, image_references) = extract_images(root)?;
+    let cover_node = title_info.and_then(|node| {
+        node.descendants()
+            .find(|child| is_element(*child, "coverpage"))
+    });
+    let composed_cover = cover_node.is_some_and(|node| {
+        node.children()
+            .filter(|child| is_element(*child, "image"))
+            .count()
+            > 1
+    });
     let cover_path = title_info
         .and_then(|node| {
             node.descendants()
@@ -60,10 +70,25 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, Fo
         })
         .and_then(image_identifier)
         .and_then(|id| image_references.get(id))
-        .map(|image| image.path.clone());
-    let sections = extract_sections(root, &image_references);
+        .map(|image| image.path.clone())
+        .filter(|_| !composed_cover);
+    let mut sections = extract_sections(root, &image_references);
     if sections.is_empty() {
         return Err(conversion_error(BookFormat::Fb2, "没有可阅读的正文"));
+    }
+    if composed_cover {
+        let content = render_children(cover_node.unwrap(), &image_references);
+        sections.insert(
+            0,
+            SourceSection {
+                title: "Cover".into(),
+                content: SectionContent::Html(format!(
+                    "<section role=\"doc-cover\">{content}</section>"
+                )),
+                linear: false,
+                properties: Vec::new(),
+            },
+        );
     }
 
     DirectBookSource::open(
@@ -165,6 +190,13 @@ fn extract_sections(
         .enumerate()
     {
         let linear = body_index == 0 && attribute_local(body, "name").is_none();
+        let properties = if attribute_local(body, "name")
+            .is_some_and(crate::html_context::is_note_navigation_label)
+        {
+            vec![rebook_publication::NOTE_SECTION_PROPERTY.to_owned()]
+        } else {
+            Vec::new()
+        };
         let top_level_sections = body
             .children()
             .filter(|node| is_element(*node, "section"))
@@ -176,6 +208,7 @@ fn extract_sections(
                     title: section_title(body, sections.len()),
                     content: SectionContent::Html(body_markup),
                     linear,
+                    properties: properties.clone(),
                 });
             }
             continue;
@@ -191,6 +224,7 @@ fn extract_sections(
                 title: section_title(body, sections.len()),
                 content: SectionContent::Html(preface),
                 linear,
+                properties: properties.clone(),
             });
         }
         for section in top_level_sections {
@@ -198,6 +232,7 @@ fn extract_sections(
                 title: section_title(section, sections.len()),
                 content: SectionContent::Html(render_node(section, images)),
                 linear,
+                properties: properties.clone(),
             });
         }
     }
@@ -261,6 +296,16 @@ fn render_node(node: Node<'_, '_>, images: &HashMap<String, ImageReference>) -> 
     let mut attributes = String::new();
     if let Some(id) = attribute_local(node, "id") {
         write!(attributes, " id=\"{}\"", escape_attribute(id)).unwrap();
+    }
+    for name in [
+        "colspan", "rowspan", "align", "valign", "class", "style", "lang",
+    ] {
+        if let Some(value) = attribute_local(node, name) {
+            write!(attributes, " {name}=\"{}\"", escape_attribute(value)).unwrap();
+        }
+    }
+    if name == "a" && attribute_local(node, "type") == Some("note") {
+        attributes.push_str(" role=\"doc-noteref\"");
     }
     if name == "a"
         && let Some(href) = attribute_local(node, "href")

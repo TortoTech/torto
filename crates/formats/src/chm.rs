@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use encoding_rs::{Encoding, UTF_8, WINDOWS_1252};
 use libchm::{ChmFile, EntrySel};
-use rebook_html::parse_section;
+use rebook_html::parse_section_with_hints_and_image_classifier;
 use rebook_publication::{
     Book, BookSource, Metadata, PublicationError, PublicationId, PublicationUrl, RenditionLayout,
     Resource, Section, SpineItem, SpineItemId, TableOfContentsOrigin, TocEntry,
@@ -28,6 +28,8 @@ pub(crate) struct ChmPublication {
     table_of_contents_origin: TableOfContentsOrigin,
     resources: HashMap<String, StoredResource>,
     toc_heading_hints: HashMap<String, Vec<TocHeadingHint>>,
+    html_context: crate::HtmlContext,
+    cover_page: Option<PublicationUrl>,
 }
 
 struct StoredResource {
@@ -62,6 +64,7 @@ struct NavigationModel {
     section_hrefs: Vec<PublicationUrl>,
     default_topic: Option<PublicationUrl>,
     authored: bool,
+    navigation_documents: Vec<PublicationUrl>,
 }
 
 struct PublicationMetadata {
@@ -149,7 +152,7 @@ fn build_publication(
 ) -> Result<ChmPublication, FormatError> {
     let navigation = build_navigation(&resources, system)?;
     let metadata = build_metadata(&resources, system, file_name, &navigation);
-    let (sections, fallback_toc) = build_sections(
+    let (mut sections, fallback_toc) = build_sections(
         &resources,
         &navigation.section_hrefs,
         &navigation.table_of_contents,
@@ -165,6 +168,21 @@ fn build_publication(
         fallback_toc
     };
     let toc_heading_hints = collect_toc_heading_hints(&table_of_contents);
+    let html_context = crate::HtmlContext::new(&table_of_contents, navigation.navigation_documents);
+    html_context.mark_note_sections(&mut sections);
+    crate::continuations::mark_quote_continuations(&mut sections, &table_of_contents, |href| {
+        html_to_xhtml(&decode_text(resource_bytes(&resources, href)?)).ok()
+    });
+    let cover_page = navigation
+        .default_topic
+        .as_ref()
+        .or_else(|| sections.first().map(|s| &s.href))
+        .and_then(|href| {
+            crate::html_context::cover_page(
+                &html_to_xhtml(&decode_text(resource_bytes(&resources, href)?)).ok()?,
+                href,
+            )
+        });
     Ok(ChmPublication {
         book: Book {
             id: PublicationId::new(publication_id)?,
@@ -181,6 +199,8 @@ fn build_publication(
         table_of_contents_origin,
         resources,
         toc_heading_hints,
+        html_context,
+        cover_page,
     })
 }
 
@@ -239,6 +259,7 @@ fn build_navigation(
         section_hrefs,
         default_topic,
         authored,
+        navigation_documents: contents_href.into_iter().collect(),
     })
 }
 
@@ -347,14 +368,56 @@ impl BookSource for ChmPublication {
             .ok_or_else(|| PublicationError::ResourceNotFound(descriptor.href.to_string()))?;
         let xhtml =
             html_to_xhtml(&decode_text(bytes)).map_err(PublicationError::InvalidPublication)?;
-        let mut section = parse_section(&xhtml, descriptor, |href| {
-            resource_bytes(&self.resources, href).map(decode_text)
-        })
+        let mut section = parse_section_with_hints_and_image_classifier(
+            &xhtml,
+            descriptor,
+            |href| resource_bytes(&self.resources, href).map(decode_text),
+            |href| {
+                self.html_context
+                    .is_separator_image(href, || resource_bytes(&self.resources, href))
+            },
+            self.html_context.hints(descriptor),
+        )
         .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
         if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {
             promote_toc_headings(&mut section, hints);
         }
         Ok(section)
+    }
+
+    fn cover_section(&self) -> Result<Option<Section>, PublicationError> {
+        let Some(href) = &self.cover_page else {
+            return Ok(None);
+        };
+        if let Some(index) = self
+            .book
+            .sections
+            .iter()
+            .position(|section| section.href.path() == href.path())
+        {
+            return self.parse_section(index).map(Some);
+        }
+        let Some(bytes) = resource_bytes(&self.resources, href) else {
+            return Ok(None);
+        };
+        let descriptor = SpineItem {
+            id: SpineItemId::new("cover-page")?,
+            href: href.clone(),
+            media_type: "text/html".into(),
+            linear: false,
+            properties: Vec::new(),
+        };
+        let xhtml =
+            html_to_xhtml(&decode_text(bytes)).map_err(PublicationError::InvalidPublication)?;
+        parse_section_with_hints_and_image_classifier(
+            &xhtml,
+            &descriptor,
+            |href| resource_bytes(&self.resources, href).map(decode_text),
+            |_| false,
+            self.html_context.hints(&descriptor),
+        )
+        .map(Some)
+        .map_err(|error| PublicationError::InvalidPublication(error.to_string()))
     }
 
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
@@ -626,6 +689,7 @@ fn normalize_legacy_chm_layout(document: &mut Html) {
 
     let layout_tables = document
         .select(&layout_selector)
+        .filter(|table| is_legacy_layout_table(*table))
         .map(|element| element.id())
         .collect::<HashSet<_>>();
     let layout_cells = document
@@ -639,7 +703,6 @@ fn normalize_legacy_chm_layout(document: &mut Html) {
                 return None;
             }
             node.ancestors()
-                .skip(1)
                 .find(|ancestor| {
                     matches!(ancestor.value(), Node::Element(element) if element.name() == "table")
                 })
@@ -679,6 +742,54 @@ fn normalize_legacy_chm_layout(document: &mut Html) {
             node.detach();
         }
     }
+}
+
+fn is_legacy_layout_table(table: ElementRef<'_>) -> bool {
+    match table.attr("role") {
+        Some("presentation" | "none") => return true,
+        Some("table") => return false,
+        _ => {}
+    }
+    let owns = |element: ElementRef<'_>| {
+        element
+            .ancestors()
+            .filter_map(ElementRef::wrap)
+            .find(|ancestor| ancestor.value().name() == "table")
+            .is_some_and(|ancestor| ancestor.id() == table.id())
+    };
+    let elements = table
+        .descendent_elements()
+        .filter(|element| element.id() != table.id())
+        .collect::<Vec<_>>();
+    if elements.iter().any(|element| {
+        owns(*element) && matches!(element.value().name(), "caption" | "thead" | "th")
+    }) {
+        return false;
+    }
+    // Data grids remain grids. Single-column page shells and shells containing
+    // independent reading sections/nested tables are the legacy layout case.
+    let cells = elements
+        .iter()
+        .filter(|element| owns(**element) && matches!(element.value().name(), "td" | "th"))
+        .collect::<Vec<_>>();
+    let mut cells_per_row = HashMap::new();
+    for cell in cells {
+        if let Some(row) = cell
+            .ancestors()
+            .filter_map(ElementRef::wrap)
+            .find(|element| element.value().name() == "tr")
+        {
+            *cells_per_row.entry(row.id()).or_insert(0usize) += 1;
+        }
+    }
+    (cells_per_row.len() == 1 && cells_per_row.values().copied().max().unwrap_or(0) <= 1)
+        || elements.iter().any(|element| {
+            owns(*element)
+                && matches!(
+                    element.value().name(),
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "section" | "article" | "table"
+                )
+        })
 }
 
 fn decode_text(bytes: &[u8]) -> String {
@@ -824,6 +935,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_layout_cleanup_keeps_data_tables_inside_and_outside_page_shells() {
+        let xml = html_to_xhtml("<html><body><table><tr><td><h1>Book title</h1><p>Body</p><table><caption>Data</caption><tr><th>Name</th><th>Value</th></tr><tr><td>A</td><td>B</td></tr></table></td></tr></table><table><tr><td>C</td><td>D</td></tr></table></body></html>").unwrap();
+        let document = roxmltree::Document::parse(&xml).unwrap();
+        assert_eq!(
+            document
+                .descendants()
+                .filter(|node| node.has_tag_name("table"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            document
+                .descendants()
+                .filter(|node| node.has_tag_name("th"))
+                .count(),
+            2
+        );
+        assert!(document.descendants().any(|node| node.has_tag_name("h1")));
+    }
+
+    #[test]
+    fn chm_uses_shared_navigation_note_image_and_cover_context() {
+        use rebook_publication::{Block, Inline, TextAlignment};
+        let files = [
+            ("toc.hhc", b"<ul><li><object type='text/sitemap'><param name='Name' value='Parent'><param name='Local' value='parent.html#parent'></object><ul><li><object type='text/sitemap'><param name='Name' value='Child'><param name='Local' value='child.html#child'></object></ul><li><object type='text/sitemap'><param name='Name' value='Notes'><param name='Local' value='notes.html'></object></ul>".to_vec()),
+            ("parent.html", b"<html><head><title>Book title</title></head><body role='doc-cover'><h1 id='parent'>Book title</h1><img src='photo.png'/><p>Author</p></body></html>".to_vec()),
+            ("child.html", b"<html><head><link rel='stylesheet' href='book.css'/></head><body><div><a href='toc.hhc'>Contents</a> / <a href='parent.html#parent'>Parent</a></div><img src='photo.png'/><p id='child'>Child</p><img src='rule.png'/><table><tr><td colspan='2' class='cell'><img src='photo.png' style='display:block;width:100%'/></td><td>Text</td></tr></table></body></html>".to_vec()),
+            ("notes.html", b"<html><body><p id='n1'>1. First note.</p><p>Continuation of the note.</p></body></html>".to_vec()),
+            ("book.css", b".cell {text-align:right}".to_vec()),
+            ("photo.png", crate::reflow_format_tests::png(40, 50)),
+            ("rule.png", crate::reflow_format_tests::png(96, 3)),
+        ];
+        let resources = files
+            .into_iter()
+            .map(|(path, bytes)| {
+                let href = PublicationUrl::parse(path).unwrap();
+                (
+                    resource_key(&href),
+                    StoredResource {
+                        href,
+                        media_type: media_type_for_path(path).into(),
+                        bytes: bytes.into(),
+                    },
+                )
+            })
+            .collect();
+        let system = SystemMetadata {
+            contents: Some("toc.hhc".into()),
+            default_topic: Some("parent.html".into()),
+            title: None,
+        };
+        let source =
+            build_publication(resources, &system, "fixture.chm", "chm-context".into()).unwrap();
+        let child = source
+            .book
+            .sections
+            .iter()
+            .position(|section| section.href.path() == "child.html")
+            .unwrap();
+        let parsed = source.parse_section(child).unwrap();
+        assert!(!parsed.blocks.iter().any(|block| matches!(block, Block::Text(text) if crate::reflow::text(text).contains("Contents"))));
+        assert!(parsed.blocks.iter().any(|block| matches!(block, Block::Text(text) if matches!(text.kind, rebook_publication::TextBlockKind::Heading(_)) && crate::reflow::text(text) == "Child")));
+        assert!(
+            parsed
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Separator(_)))
+        );
+        let table = parsed
+            .blocks
+            .iter()
+            .find_map(|block| {
+                if let Block::Table(table) = block {
+                    Some(table)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(table.rows[0].cells[0].column_span, 2);
+        assert_eq!(
+            table.rows[0].cells[0].authored_alignment,
+            Some(TextAlignment::End)
+        );
+        assert!(
+            table.rows[0].cells[0]
+                .text
+                .content
+                .iter()
+                .any(|inline| matches!(inline, Inline::Image(_)))
+        );
+        let notes = source
+            .book
+            .sections
+            .iter()
+            .position(|section| section.href.path() == "notes.html")
+            .unwrap();
+        assert!(source.book.sections[notes].is_note_section());
+        assert!(
+            source
+                .parse_section(notes)
+                .unwrap()
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Note(_)))
+        );
+        assert!(source.cover_section().unwrap().is_some());
+        assert!(crate::cover::page_thumbnail(&source).is_some());
+    }
+
+    #[test]
     fn parses_nested_html_help_contents() {
         let entries = parse_hhc(
             r#"<html><body><ul>
@@ -888,10 +1110,27 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to parse CHM section {index}: {error}"));
             assert!(!section.blocks.is_empty(), "empty CHM section {index}");
             for block in &section.blocks {
-                if let rebook_publication::Block::Image(image) = block {
-                    source.resource(&image.href).unwrap_or_else(|error| {
-                        panic!("failed to load CHM image {}: {error}", image.href)
-                    });
+                use rebook_publication::{Block, Inline};
+                let mut images = Vec::new();
+                let mut collect_inline = |text: &rebook_publication::TextBlock| {
+                    images.extend(text.content.iter().filter_map(|inline| match inline {
+                        Inline::Image(run) => Some(run.image.href.clone()),
+                        _ => None,
+                    }));
+                };
+                match block {
+                    Block::Image(image) => images.push(image.href.clone()),
+                    Block::Figure(figure) => {
+                        images.extend(figure.images.iter().map(|image| image.href.clone()))
+                    }
+                    Block::Table(table) => table.text_blocks().for_each(&mut collect_inline),
+                    Block::Text(text) => collect_inline(text),
+                    _ => {}
+                }
+                for href in images {
+                    source
+                        .resource(&href)
+                        .unwrap_or_else(|error| panic!("failed to load CHM image {href}: {error}"));
                     image_count += 1;
                 }
             }

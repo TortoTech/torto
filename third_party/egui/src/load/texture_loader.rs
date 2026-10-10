@@ -194,7 +194,7 @@ impl TextureLoader for DefaultTextureLoader {
 }
 
 fn is_svg(uri: &str) -> bool {
-    uri.ends_with(".svg")
+    super::has_extension(uri, "svg")
 }
 
 #[cfg(test)]

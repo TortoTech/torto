@@ -504,6 +504,7 @@ impl ApplicationHandler<UserEvent> for Application {
             #[cfg(target_os = "windows")]
             UserEvent::Update(message) => self.app.complete_update(message),
             UserEvent::ShelfImport(message) => self.app.complete_shelf_import(message),
+            UserEvent::ShelfOpen(message) => self.app.complete_shelf_open(message, &self.runtime),
             UserEvent::ShelfSyncProgress(message) => self.app.update_shelf_sync_progress(message),
             UserEvent::ShelfSync(message) => self.app.complete_shelf_sync(message),
             UserEvent::SettingsProviderModels(message) => {
