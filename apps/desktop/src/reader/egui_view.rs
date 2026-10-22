@@ -3666,7 +3666,6 @@ impl DesktopReader {
                 self.toggle_toc(&row.id);
             }
             if navigate && let Some(target) = row.target {
-                self.ui.toc_keyboard_row = Some(visible_index);
                 self.go_to_toc(&row.id, &target);
                 navigated_row = Some(visible_index);
             }

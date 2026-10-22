@@ -557,6 +557,105 @@ fn real_book_sidebar_close_keeps_the_highlight_page() {
     );
 }
 
+#[test]
+fn reading_position_changes_own_the_toc_keyboard_focus() {
+    let (mut reader, section) = chapter_book(ReadingMode::Classic);
+    let ctx = egui::Context::default();
+    frames(&ctx, &mut reader, 4);
+
+    toc_jump(&mut reader, "Chapter 1");
+    frames(&ctx, &mut reader, 4);
+    let toc_id = |label: &str| {
+        reader
+            .reader
+            .toc_items()
+            .iter()
+            .find(|item| item.label == label)
+            .map(|item| item.id.clone())
+            .unwrap_or_else(|| panic!("no table of contents entry labelled {label}"))
+    };
+    let chapter_one = toc_id("Chapter 1");
+    let chapter_two = toc_id("Chapter 2");
+    assert_eq!(
+        reader.snapshot.active_toc_id.as_deref(),
+        Some(chapter_one.as_str()),
+        "the fixture did not start on chapter one: {}",
+        state_line(&reader)
+    );
+
+    // Keyboard focus resting on a later row stays usable while the reading
+    // position moves inside the chapter being read.
+    reader.ui.toc_keyboard_row = Some(8);
+    reader.ui.last_auto_scrolled_toc_keyboard_row = Some(8);
+    jump_to(&mut reader, &anchor_at(&section, "p25"));
+    assert_eq!(
+        reader.snapshot.active_toc_id.as_deref(),
+        Some(chapter_one.as_str()),
+        "the jump left chapter one: {}",
+        state_line(&reader)
+    );
+    assert_eq!(
+        reader.ui.toc_keyboard_row,
+        Some(8),
+        "a position change inside the chapter dropped the keyboard focus"
+    );
+    assert_eq!(
+        reader.ui.last_auto_scrolled_toc_keyboard_row,
+        Some(8),
+        "a position change inside the chapter reset the focus scroll marker"
+    );
+
+    // Crossing into the next chapter drops the stale focus, so the sidebar
+    // lights only the selected highlight.
+    jump_to(&mut reader, &anchor_at(&section, "p45"));
+    assert_eq!(
+        reader.snapshot.active_toc_id.as_deref(),
+        Some(chapter_two.as_str()),
+        "the jump did not reach chapter two: {}",
+        state_line(&reader)
+    );
+    assert_eq!(
+        reader.ui.toc_keyboard_row, None,
+        "the keyboard focus outlived the move to the next chapter"
+    );
+    assert_eq!(
+        reader.ui.last_auto_scrolled_toc_keyboard_row, None,
+        "the focus scroll marker outlived the move to the next chapter"
+    );
+}
+
+#[test]
+fn starting_a_toc_jump_clears_the_focus_while_layout_catches_up() {
+    let (mut reader, _) = chapter_book(ReadingMode::Classic);
+    let ctx = egui::Context::default();
+    frames(&ctx, &mut reader, 4);
+
+    toc_jump(&mut reader, "Chapter 1");
+    frames(&ctx, &mut reader, 4);
+
+    // Focus sits far down the list. Re-entering the chapter already being read
+    // keeps the selected highlight where it is, so only the jump start itself
+    // can clear the focus before the layout hands back its snapshot.
+    reader.ui.toc_keyboard_row = Some(8);
+    reader.ui.last_auto_scrolled_toc_keyboard_row = Some(8);
+    let item = reader
+        .reader
+        .toc_items()
+        .iter()
+        .find(|item| item.label == "Chapter 1")
+        .cloned()
+        .unwrap_or_else(|| panic!("no table of contents entry labelled Chapter 1"));
+    reader.go_to_toc(&item.id, item.target.as_ref().expect("navigable entry"));
+    assert_eq!(
+        reader.ui.toc_keyboard_row, None,
+        "the focused row stayed lit while the navigation was in flight"
+    );
+    assert_eq!(
+        reader.ui.last_auto_scrolled_toc_keyboard_row, None,
+        "the focus scroll marker stayed lit while the navigation was in flight"
+    );
+}
+
 fn state_line(reader: &DesktopReader) -> String {
     let visible = visible_nodes(reader);
     format!(

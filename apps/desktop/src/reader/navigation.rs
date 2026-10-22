@@ -18,6 +18,11 @@ impl DesktopReader {
         self.ui.focus_footnote_scroll_delta = 0.0;
         self.pending_page_turn = None;
         self.pending_reading_unit_turn = None;
+        // Until the background layout hands back the new snapshot the selected
+        // highlight still marks the old position; focus on the clicked row
+        // would light two rows for the whole wait.
+        self.ui.toc_keyboard_row = None;
+        self.ui.last_auto_scrolled_toc_keyboard_row = None;
         self.pending_toc_navigation = Some(PendingTocNavigation {
             id: id.to_owned(),
             target: target.clone(),
@@ -188,6 +193,7 @@ impl DesktopReader {
         self.ui
             .expanded_toc
             .extend(snapshot.active_toc_path.iter().cloned());
+        let previous_active_toc_id = self.snapshot.active_toc_id.clone();
         self.snapshot = snapshot;
         if let Some(id) = self.focus_toc_override.as_deref()
             && let Some(item) = self.reader.toc_items().iter().find(|item| item.id == id)
@@ -197,6 +203,14 @@ impl DesktopReader {
             if item.has_children {
                 self.snapshot.active_toc_path.push(item.id.clone());
             }
+        }
+        // The selected TOC highlight tracks the reading position, while a
+        // keyboard/click focus row is only cleared when the sidebar closes or
+        // the tab switches. Once the position moves to another entry the stale
+        // focus would keep lighting a second row, so drop it here.
+        if self.snapshot.active_toc_id != previous_active_toc_id {
+            self.ui.toc_keyboard_row = None;
+            self.ui.last_auto_scrolled_toc_keyboard_row = None;
         }
     }
 
