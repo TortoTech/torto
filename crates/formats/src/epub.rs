@@ -401,17 +401,17 @@ impl EpubArchive {
                     "encrypted ZIP entries are not supported".into(),
                 ));
             }
+            let entry_name = file.name()?;
             if file
                 .unix_mode()
                 .is_some_and(|mode| mode & 0o170_000 == 0o120_000)
             {
                 return Err(EpubError::InvalidArchive(format!(
-                    "symbolic-link ZIP entry is not allowed: {}",
-                    file.name()
+                    "symbolic-link ZIP entry is not allowed: {entry_name}"
                 )));
             }
 
-            let href = PublicationUrl::parse(file.name())?.resource_url();
+            let href = PublicationUrl::parse(&entry_name)?.resource_url();
             ensure_limit(
                 file.size() <= limits.entry_bytes,
                 format!(

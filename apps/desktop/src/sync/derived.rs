@@ -735,7 +735,7 @@ fn unpack_native_archive(bytes: Vec<u8>) -> io::Result<Vec<(String, Vec<u8>)>> {
         if entry.size() > MAX_ARCHIVE_ENTRY_BYTES || total > MAX_ARCHIVE_TOTAL_BYTES {
             return Err(io::Error::other("Native PDF archive is too large"));
         }
-        let name = entry.name().to_owned();
+        let name = entry.name()?.into_owned();
         let url = rebook_publication::PublicationUrl::parse(&name).map_err(io::Error::other)?;
         if url.path() != name
             || !seen.insert(name.clone())
@@ -833,7 +833,7 @@ fn unpack_ocr_archive(bytes: Vec<u8>) -> io::Result<PdfOcrSyncData> {
                 "synced PDF OCR archive entry is too large",
             ));
         }
-        let name = entry.name().replace('\\', "/");
+        let name = entry.name()?.replace('\\', "/");
         let mut contents = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or_default());
         entry.read_to_end(&mut contents)?;
         if name == "document.json" {

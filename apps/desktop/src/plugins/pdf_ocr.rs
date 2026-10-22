@@ -1297,7 +1297,10 @@ fn parse_mineru_zip(bytes: Vec<u8>) -> Result<(Vec<StoredOcrPage>, Vec<OcrResour
         let mut file = archive
             .by_index(index)
             .map_err(|error| format!("读取 MinerU ZIP 条目失败：{error}"))?;
-        if file.is_dir() || !safe_archive_name(file.name()) {
+        let Ok(name) = file.name().map(|name| name.into_owned()) else {
+            continue;
+        };
+        if file.is_dir() || !safe_archive_name(&name) {
             continue;
         }
         let size = usize::try_from(file.size()).unwrap_or(usize::MAX);
@@ -1308,7 +1311,7 @@ fn parse_mineru_zip(bytes: Vec<u8>) -> Result<(Vec<StoredOcrPage>, Vec<OcrResour
         let mut content = Vec::with_capacity(size.min(8 * 1024 * 1024));
         file.read_to_end(&mut content)
             .map_err(|error| format!("解压 MinerU 结果失败：{error}"))?;
-        entries.push((file.name().replace('\\', "/"), content));
+        entries.push((name.replace('\\', "/"), content));
     }
 
     let mut resources = Vec::new();

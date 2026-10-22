@@ -117,7 +117,11 @@ fn extract_xml(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
     let entry_index = (0..archive.len()).find(|index| {
         archive
             .by_index(*index)
-            .is_ok_and(|entry| entry.name().to_ascii_lowercase().ends_with(".fb2"))
+            .is_ok_and(|entry| {
+                entry
+                    .name()
+                    .is_ok_and(|name| name.to_ascii_lowercase().ends_with(".fb2"))
+            })
     });
     let Some(entry_index) = entry_index else {
         return Err(conversion_error(BookFormat::Fbz, "压缩包中没有 .fb2 文件"));

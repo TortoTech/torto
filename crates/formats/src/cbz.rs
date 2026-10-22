@@ -35,7 +35,7 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, Fo
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_owned();
+        let name = entry.name()?.into_owned();
         if name.eq_ignore_ascii_case("ComicInfo.xml") {
             comic_info_index = Some(index);
         }
