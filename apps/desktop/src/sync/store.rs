@@ -162,7 +162,8 @@ impl SyncStore {
 
     pub(crate) fn merge_annotations(&self, annotations: &[AnnotationState]) -> SyncResult<usize> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let changed = annotation_merge::merge(&transaction, &self.device_id, annotations)?;
         transaction.commit()?;
         Ok(changed)
@@ -170,7 +171,8 @@ impl SyncStore {
 
     fn compact_annotation_conflicts(&self, book_id: &str) -> SyncResult<usize> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let removed = annotation_merge::compact(&transaction, &self.device_id, book_id)?;
         transaction.commit()?;
         Ok(removed)
@@ -254,7 +256,7 @@ impl SyncStore {
             .map(|(locator, updated_at)| {
                 Ok(StoredProgress {
                     locator: serde_json::from_str(&locator)?,
-                    updated_at: serde_json::from_str(&updated_at)?,
+                    updated_at: HybridTimestamp::parse(&updated_at)?,
                 })
             })
             .transpose()
@@ -269,8 +271,16 @@ impl SyncStore {
         let mut activity_times = HashMap::new();
         for row in rows {
             let (book_id, updated_at) = row?;
-            let updated_at: HybridTimestamp = serde_json::from_str(&updated_at)?;
-            activity_times.insert(book_id, updated_at.wall_time_ms);
+            // One unreadable row must not hide every other book's activity:
+            // a failure here aborts the whole shelf snapshot upstream.
+            match HybridTimestamp::parse(&updated_at) {
+                Ok(timestamp) => {
+                    activity_times.insert(book_id, timestamp.wall_time_ms);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %book_id, "skipping unreadable progress activity row");
+                }
+            }
         }
         Ok(activity_times)
     }
@@ -292,8 +302,10 @@ impl SyncStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()?
-            .map(|value| serde_json::from_str::<HybridTimestamp>(&value))
-            .transpose()?;
+            // An unreadable current timestamp compares as absent, so the
+            // incoming value overwrites the row and heals it.
+            .map(|value| HybridTimestamp::parse(&value).ok())
+            .flatten();
         if current
             .as_ref()
             .is_some_and(|value| value >= &progress.updated_at)
@@ -360,7 +372,7 @@ impl SyncStore {
             Ok(DeviceBookEntry {
                 book_id,
                 present,
-                changed_at: serde_json::from_str(&changed_at)?,
+                changed_at: HybridTimestamp::parse(&changed_at)?,
             })
         })
         .filter(|entry: &SyncResult<DeviceBookEntry>| {
@@ -761,7 +773,7 @@ fn tick(
             row.get::<_, String>(0)
         })
         .optional()?
-        .map(|value| serde_json::from_str::<HybridTimestamp>(&value))
+        .map(|value| HybridTimestamp::parse(&value))
         .transpose()?;
     let now = unix_timestamp_millis();
     let previous_wall = previous.as_ref().map_or(0, |value| value.wall_time_ms);
@@ -810,10 +822,10 @@ fn read_annotation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnnotationSt
         quote: row.get(3)?,
         note: row.get(4)?,
         created_at: u64::try_from(row.get::<_, i64>(5)?).unwrap_or_default(),
-        updated_at: serde_json::from_str(&updated_at).map_err(json_error)?,
+        updated_at: HybridTimestamp::parse(&updated_at).map_err(json_error)?,
         clock: serde_json::from_str(&clock).map_err(json_error)?,
         deleted_at: deleted_at
-            .map(|value| serde_json::from_str(&value).map_err(json_error))
+            .map(|value| HybridTimestamp::parse(&value).map_err(json_error))
             .transpose()?,
         origin_device: row.get(9)?,
         conflict_of: row.get(10)?,
@@ -1068,6 +1080,80 @@ mod tests {
         assert_eq!(activity_times.len(), 2);
         assert!(activity_times.contains_key("first"));
         assert!(activity_times.contains_key("second"));
+        cleanup(&store);
+    }
+
+    #[test]
+    fn progress_activity_times_recovers_wrapped_and_skips_unreadable_rows() {
+        let store = test_store("progress-activity-times-corrupt");
+        store.save_progress("good", &locator("good", 0.2)).unwrap();
+        store
+            .save_progress("wrapped", &locator("wrapped", 0.4))
+            .unwrap();
+        store
+            .save_progress("garbage", &locator("garbage", 0.6))
+            .unwrap();
+        let before = store.progress_activity_times().unwrap();
+        let wrapped_time = before["wrapped"];
+        {
+            let connection = store.connection().unwrap();
+            let stored = connection
+                .query_row(
+                    "SELECT updated_hlc FROM progress WHERE book_id = 'wrapped'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            // A second encode turns the object into a quoted string.
+            connection
+                .execute(
+                    "UPDATE progress SET updated_hlc = ?1 WHERE book_id = 'wrapped'",
+                    [serde_json::to_string(&stored).unwrap()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE progress SET updated_hlc = 'not-json' WHERE book_id = 'garbage'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let activity_times = store.progress_activity_times().unwrap();
+
+        assert_eq!(activity_times.len(), 2);
+        assert_eq!(activity_times["good"], before["good"]);
+        assert_eq!(activity_times["wrapped"], wrapped_time);
+        assert!(!activity_times.contains_key("garbage"));
+        cleanup(&store);
+    }
+
+    #[test]
+    fn merge_progress_heals_an_unreadable_current_timestamp() {
+        let store = test_store("merge-progress-heal");
+        store.save_progress("book", &locator("book", 0.2)).unwrap();
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE progress SET updated_hlc = 'not-json' WHERE book_id = 'book'",
+                    [],
+                )
+                .unwrap();
+        }
+        let incoming = ProgressState {
+            locator: locator("book", 0.5),
+            updated_at: HybridTimestamp {
+                wall_time_ms: 1_000,
+                counter: 0,
+                device_id: "device-b".into(),
+            },
+        };
+
+        assert!(store.merge_progress(&incoming).unwrap());
+        let healed = store.load_progress("book").unwrap().unwrap();
+        assert_eq!(healed.locator.total_progression, Some(0.5));
+        assert_eq!(healed.updated_at.wall_time_ms, 1_000);
         cleanup(&store);
     }
 

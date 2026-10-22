@@ -154,10 +154,15 @@ fn load_shelf_snapshot(
         }
     }
     let statistics = crate::statistics::Page::shelf_snapshot(&books, store.as_ref())?;
+    // Activity times are a sort order; losing them must not discard the
+    // statistics snapshot the shelf badges depend on.
     let activity = store
         .as_ref()
         .map_or(Ok(HashMap::new()), SyncStore::progress_activity_times)
-        .map_err(|error| error.to_string())?;
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "continuing shelf refresh without activity times");
+            HashMap::new()
+        });
     Ok(ShelfSnapshot {
         statistics,
         activity,

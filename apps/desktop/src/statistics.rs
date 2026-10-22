@@ -518,20 +518,22 @@ impl Page {
     }
 
     pub(crate) fn badge(&self, id: &str, language: AppLanguage) -> String {
-        self.books.get(id).map_or_else(
-            || Status::NotStarted.label(language).into(),
-            |book| {
-                if book.status == Status::Reading {
-                    format!(
-                        "{} · {:.1}%",
-                        book.status.label(language),
-                        book.display_progress() * 100.0
-                    )
-                } else {
-                    book.status.label(language).into()
-                }
-            },
-        )
+        // A stored locator can already name a mid-book position while every
+        // statistics session is still under the 30s "started reading" threshold,
+        // or before the shelf snapshot lands. Surface any saved fraction so the
+        // card matches the locator resume already trusts.
+        let (status, progress) = match self.books.get(id) {
+            Some(book) => (book.status, book.display_progress()),
+            None => (
+                Status::NotStarted,
+                self.progress.get(id).copied().unwrap_or(0.0),
+            ),
+        };
+        if status == Status::Finished || progress <= 0.0 {
+            status.label(language).into()
+        } else {
+            format!("{} · {:.1}%", status.label(language), progress * 100.0)
+        }
     }
     pub(crate) fn show_book(
         &mut self,
@@ -2720,5 +2722,63 @@ mod tests {
         assert_eq!(books["book"].title, "Book");
         assert_eq!(books["book"].status, Status::NotStarted);
         assert!(books["book"].finished.is_none());
+    }
+
+    #[test]
+    fn shelf_badge_shows_saved_progress_before_a_session_marks_the_book_reading() {
+        // Scroll reading can persist a mid-book locator while every statistics
+        // session stays under the 30s "started reading" threshold. The card
+        // must still surface that fraction; resume already trusts the locator.
+        let mut page = Page::default();
+        page.books.insert(
+            "book".into(),
+            BookStats {
+                status: Status::NotStarted,
+                progress: 0.42,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            page.badge("book", AppLanguage::English),
+            "Not started · 42.0%"
+        );
+        page.books.insert(
+            "book".into(),
+            BookStats {
+                status: Status::Reading,
+                progress: 0.890_432,
+                ..Default::default()
+            },
+        );
+        assert_eq!(page.badge("book", AppLanguage::English), "Reading · 89.0%");
+        page.books.insert(
+            "book".into(),
+            BookStats {
+                status: Status::Finished,
+                progress: 0.12,
+                ..Default::default()
+            },
+        );
+        assert_eq!(page.badge("book", AppLanguage::English), "Finished");
+        page.books.insert(
+            "book".into(),
+            BookStats {
+                status: Status::NotStarted,
+                progress: 0.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(page.badge("book", AppLanguage::English), "Not started");
+        // Snapshot still in flight: only the progress map knows the locator.
+        let mut pending = Page::default();
+        pending.progress.insert("pending".into(), 0.66);
+        assert_eq!(
+            pending.badge("pending", AppLanguage::English),
+            "Not started · 66.0%"
+        );
+        assert_eq!(
+            pending.badge("unknown", AppLanguage::English),
+            "Not started"
+        );
     }
 }

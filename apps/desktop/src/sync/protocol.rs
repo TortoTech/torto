@@ -13,6 +13,22 @@ pub(crate) struct HybridTimestamp {
     pub device_id: String,
 }
 
+impl HybridTimestamp {
+    /// Read a stored timestamp, tolerating one extra layer of JSON string
+    /// encoding (a quoted object) left behind by an older writer; such a row
+    /// otherwise fails to deserialize and, via `progress_activity_times`,
+    /// used to abort the whole shelf snapshot.
+    pub(crate) fn parse(text: &str) -> serde_json::Result<Self> {
+        match serde_json::from_str(text) {
+            Ok(timestamp) => Ok(timestamp),
+            Err(error) => match serde_json::from_str::<String>(text) {
+                Ok(inner) => serde_json::from_str(&inner).map_err(|_| error),
+                Err(_) => Err(error),
+            },
+        }
+    }
+}
+
 impl Ord for HybridTimestamp {
     fn cmp(&self, other: &Self) -> Ordering {
         (self.wall_time_ms, self.counter, &self.device_id).cmp(&(
