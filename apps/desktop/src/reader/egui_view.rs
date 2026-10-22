@@ -18,8 +18,8 @@ use super::chat_markdown::ChatMarkdownState;
 use super::chrome;
 use super::{
     AnnotationDraft, AssistantPanel, DesktopReader, GeneratedTocDraft, ImagePointerState,
-    ImagePressCandidate, MOTION_EPSILON, ReaderOverlay, SelectedImage, SidebarTab,
-    focus_scroll_content_height, focus_unit_screen_center_y, focus_unit_target_offset_for_rect,
+    ImagePressCandidate, ReaderOverlay, SelectedImage, SidebarTab, focus_scroll_content_height,
+    focus_unit_screen_center_y, focus_unit_target_offset_for_rect,
 };
 use crate::plugins::{ChatCommand, ChatRole, PdfOcrViewMode, chat_command_suggestions};
 use crate::preferences::{AppLanguage, AppTheme};
@@ -64,6 +64,19 @@ const TOC_ROW_HEIGHT: f32 = chrome::TOC_ROW_HEIGHT;
 const TOC_SCROLL_ID_SALT: &str = "reader-toc-scroll";
 const WHEEL_PAGE_THRESHOLD: f32 = 18.0;
 const WHEEL_TURN_COOLDOWN: Duration = Duration::from_millis(120);
+// ScrollArea rounds the content origin and sizes to the UI/physical pixel
+// grid, so the resting offset at the end of a scroll trails the layout's own
+// maximum by a fraction of a pixel. The cross-section boundary check has to
+// tolerate that residue (MOTION_EPSILON is far below the rounding step) or
+// scrolling past the section end never reaches go_to_adjacent_section.
+const SCROLL_BOUNDARY_EPSILON: f32 = 2.0;
+
+fn scroll_at_boundary(direction: PageDirection, offset_y: f32, max_offset: f32) -> bool {
+    match direction {
+        PageDirection::Previous => offset_y <= SCROLL_BOUNDARY_EPSILON,
+        PageDirection::Next => offset_y >= max_offset - SCROLL_BOUNDARY_EPSILON,
+    }
+}
 const IMAGE_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
 const IMAGE_LONG_PRESS_MAX_TRAVEL: f32 = 8.0;
 
@@ -2007,9 +2020,9 @@ impl DesktopReader {
 
     fn scroll_with_keyboard(&mut self, direction: PageDirection, page_step: bool) {
         let at_boundary = match direction {
-            PageDirection::Previous => self
-                .scroll_viewport
-                .is_some_and(|viewport| viewport.offset_y <= MOTION_EPSILON),
+            PageDirection::Previous => self.scroll_viewport.is_some_and(|viewport| {
+                scroll_at_boundary(direction, viewport.offset_y, f32::INFINITY)
+            }),
             PageDirection::Next => self
                 .scroll_section
                 .as_ref()
@@ -2018,7 +2031,7 @@ impl DesktopReader {
                     let padding = self.scroll_content_padding(viewport.size.y);
                     let max_offset =
                         (layout.content_height + padding * 2.0 - viewport.size.y).max(0.0);
-                    viewport.offset_y >= max_offset - MOTION_EPSILON
+                    scroll_at_boundary(direction, viewport.offset_y, max_offset)
                 }),
         };
         if at_boundary {
@@ -2170,13 +2183,14 @@ impl DesktopReader {
             return;
         };
         let max_offset = (layout.content_height - viewport.size.y).max(0.0);
-        let direction = if delta > 0.0 && viewport.offset_y <= MOTION_EPSILON {
+        let direction = if delta > 0.0 {
             Some(PageDirection::Previous)
-        } else if delta < 0.0 && viewport.offset_y >= max_offset - MOTION_EPSILON {
+        } else if delta < 0.0 {
             Some(PageDirection::Next)
         } else {
             None
-        };
+        }
+        .filter(|direction| scroll_at_boundary(*direction, viewport.offset_y, max_offset));
         let Some(direction) = direction else {
             self.ui.wheel_accumulator = 0.0;
             return;
@@ -10316,5 +10330,113 @@ mod reference_suggestion_label_tests {
     #[test]
     fn selected_image_border_stays_below_foreground_modals() {
         assert_eq!(selected_image_layer_id().order, egui::Order::Middle);
+    }
+}
+
+#[cfg(test)]
+mod scroll_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn scroll_boundary_tolerates_the_rounding_residue() {
+        let max_offset = 12345.67_f32;
+        // The resting offset can trail the layout maximum by up to a pixel of
+        // ScrollArea rounding; MOTION_EPSILON (0.001) rejected every residue.
+        assert!(scroll_at_boundary(
+            PageDirection::Next,
+            max_offset,
+            max_offset
+        ));
+        assert!(scroll_at_boundary(
+            PageDirection::Next,
+            max_offset - 1.0,
+            max_offset
+        ));
+        assert!(!scroll_at_boundary(
+            PageDirection::Next,
+            max_offset - 3.0,
+            max_offset
+        ));
+        assert!(scroll_at_boundary(PageDirection::Previous, 0.0, max_offset));
+        assert!(scroll_at_boundary(PageDirection::Previous, 1.5, max_offset));
+        assert!(!scroll_at_boundary(
+            PageDirection::Previous,
+            4.0,
+            max_offset
+        ));
+    }
+
+    #[test]
+    fn scroll_area_resting_offset_reaches_the_boundary() {
+        let content_height = 12345.67_f32;
+        for pixels_per_point in [1.0_f32, 1.25, 1.5] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(pixels_per_point);
+            let mut offset = 0.0_f32;
+            let mut max_offset = 0.0_f32;
+            let mut settled_frames = 0_u32;
+            for frame in 0..120 {
+                let delta: f32 = if frame == 0 { 0.0 } else { -900.0 };
+                let mut next_offset = offset;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0))),
+                        ..Default::default()
+                    },
+                    |root| {
+                        egui::CentralPanel::default().show(root, |ui| {
+                            let size = Vec2::new(
+                                ui.available_width(),
+                                (ui.available_height() - 3.0).max(1.0),
+                            );
+                            ui.scope(|ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("reader-section-scroll")
+                                    .max_height(size.y)
+                                    .auto_shrink([false, false])
+                                    .show_viewport(ui, |ui, viewport| {
+                                        let visible_rect = ui.clip_rect();
+                                        let viewport_size =
+                                            Vec2::new(viewport.width(), visible_rect.height());
+                                        ui.set_width(viewport_size.x);
+                                        ui.set_height(content_height.max(viewport_size.y));
+                                        if delta.abs() > f32::EPSILON {
+                                            ui.scroll_with_delta_animation(
+                                                Vec2::new(0.0, delta),
+                                                egui::style::ScrollAnimation::none(),
+                                            );
+                                        }
+                                        next_offset = viewport.min.y;
+                                        max_offset = (content_height - viewport_size.y).max(0.0);
+                                    });
+                            });
+                        });
+                    },
+                );
+                output.textures_delta.clear();
+                if (next_offset - offset).abs() < 0.5 {
+                    settled_frames += 1;
+                } else {
+                    settled_frames = 0;
+                }
+                offset = next_offset;
+                if settled_frames >= 5 {
+                    break;
+                }
+            }
+            assert_eq!(
+                settled_frames, 5,
+                "scroll must rest at the end (ppp={pixels_per_point}, offset={offset})"
+            );
+            eprintln!(
+                "ppp={pixels_per_point} offset={offset} max={max_offset} residue={}",
+                max_offset - offset
+            );
+            assert!(
+                scroll_at_boundary(PageDirection::Next, offset, max_offset),
+                "resting offset {offset} vs layout maximum {max_offset}, residue {} px (ppp={pixels_per_point})",
+                max_offset - offset
+            );
+        }
     }
 }
