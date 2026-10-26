@@ -249,7 +249,7 @@ impl SyncSettings {
 }
 
 fn credential_entry(device_id: &str) -> SyncResult<Entry> {
-    Ok(Entry::new(CREDENTIAL_SERVICE, device_id)?)
+    Ok(crate::credentials::entry(CREDENTIAL_SERVICE, device_id)?)
 }
 
 fn settings_path() -> io::Result<PathBuf> {

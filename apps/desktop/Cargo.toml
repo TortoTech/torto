@@ -115,4 +115,5 @@ rebook-macos-open-file = { path = "../../crates/macos-open-file" }
 wgpu = { workspace = true, features = ["vulkan", "gles"] }
 
 [dev-dependencies]
+keyring-core = "1.0.0"
 rcgen = "0.14.10"

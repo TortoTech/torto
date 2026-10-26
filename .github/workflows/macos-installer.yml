@@ -43,6 +43,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "true"
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
 
     steps:
       - name: Check out repository
@@ -119,6 +120,12 @@ jobs:
         if: steps.cargo-bundle-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-bundle --version "$CARGO_BUNDLE_VERSION" --locked
 
+      - name: Import optional Developer ID certificate
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: bash scripts/macos-signing.sh import
+
       - name: Build and verify application bundle
         env:
           TARGET: ${{ matrix.target }}
@@ -143,8 +150,7 @@ jobs:
 
           file "$executable" | grep -F "$ARCH"
           plutil -lint "$app_bundle/Contents/Info.plist"
-          codesign --force --deep --sign - "$app_bundle"
-          codesign --verify --deep --strict --verbose=2 "$app_bundle"
+          bash scripts/macos-signing.sh sign "$app_bundle"
           minimum_os=$(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' "$app_bundle/Contents/Info.plist")
           test "$minimum_os" = "15.0"
           otool -L "$executable"
@@ -234,6 +240,10 @@ jobs:
             dist/*.dmg
             dist/*.sha256
           if-no-files-found: error
+
+      - name: Remove temporary signing keychain
+        if: always()
+        run: bash scripts/macos-signing.sh cleanup
 
   publish-macos-installers:
     name: Publish macOS installers

@@ -4319,6 +4319,7 @@ dependencies = [
  "jsonrepair-rs",
  "jsonschema",
  "keyring",
+ "keyring-core",
  "kurbo",
  "mermaid-rs-renderer",
  "parley",

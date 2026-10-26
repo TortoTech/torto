@@ -165,6 +165,24 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
+### macOS 凭据与发布签名
+
+单元测试使用内存凭据存储，WebDAV、AI、OCR 和搜索密钥都不会读取或修改系统钥匙串。
+正常运行的应用仍使用操作系统的凭据存储。
+
+macOS 安装包工作流已预留三个仓库 Secret：
+
+- `MACOS_SIGNING_IDENTITY`：完整的 `Developer ID Application: 名称 (TEAMID)` 签名身份。
+- `MACOS_CERTIFICATE_P12_BASE64`：包含证书及私钥的 `.p12` 文件经过 Base64 编码后的内容。
+- `MACOS_CERTIFICATE_PASSWORD`：导出 `.p12` 时设置的密码。
+
+各版本应保持相同的签名团队、分发类型和应用标识 `io.github.l-chris.torto`。
+工作流会将证书导入临时钥匙串，并在任务结束后清理。未配置这些 Secret 时继续使用临时签名，
+更新后的应用仍可能再次请求钥匙串授权；从临时签名切换到 Developer ID 时也可能需要授权一次。
+此配置预留了 Developer ID 签名，公证还需要另外配置 Apple 凭据。
+
+### 开发工具
+
 重新生成 Windows / macOS 多尺寸图标：
 
 ```powershell

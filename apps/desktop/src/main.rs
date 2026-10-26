@@ -4,6 +4,7 @@
 
 mod app;
 mod async_task;
+mod credentials;
 mod diagnostics;
 mod feedback;
 mod fonts;

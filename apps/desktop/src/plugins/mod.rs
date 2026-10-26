@@ -761,7 +761,7 @@ impl PluginSettings {
             ("paddle-ocr", &mut self.paddle_ocr_token),
             ("mineru", &mut self.mineru_token),
         ] {
-            match Entry::new(PDF_OCR_CREDENTIAL_SERVICE, account)
+            match crate::credentials::entry(PDF_OCR_CREDENTIAL_SERVICE, account)
                 .map_err(io::Error::other)?
                 .get_password()
             {
@@ -779,7 +779,7 @@ impl PluginSettings {
             ("mineru", self.mineru_token.trim()),
         ] {
             let entry =
-                Entry::new(PDF_OCR_CREDENTIAL_SERVICE, account).map_err(io::Error::other)?;
+                crate::credentials::entry(PDF_OCR_CREDENTIAL_SERVICE, account).map_err(io::Error::other)?;
             if token.is_empty() {
                 match entry.delete_credential() {
                     Ok(()) | Err(keyring::Error::NoEntry) => {}
@@ -840,7 +840,7 @@ fn deserialize_settings(bytes: &[u8]) -> io::Result<PluginSettings> {
 }
 
 fn ai_credential_entry(provider_id: &str) -> io::Result<Entry> {
-    Entry::new(AI_CREDENTIAL_SERVICE, provider_id).map_err(io::Error::other)
+    crate::credentials::entry(AI_CREDENTIAL_SERVICE, provider_id).map_err(io::Error::other)
 }
 
 fn normalized_models(models: Vec<AiModelConfig>) -> Vec<AiModelConfig> {
