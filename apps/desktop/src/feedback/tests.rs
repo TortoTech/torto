@@ -608,6 +608,124 @@ fn persisted_submission_survives_restart_without_new_context_or_request_id() {
 }
 
 #[test]
+fn focus_locations_bound_member_count_and_bytes_without_shortening_source_ids() {
+    use rebook_publication::{SourceAnchor, SourceRange, SpineItemId};
+    let start = SourceAnchor {
+        spine: SpineItemId::new("chapter").unwrap(),
+        node: "paragraph".into(),
+        text_offset: 3,
+    };
+    let range = SourceRange {
+        end: SourceAnchor {
+            text_offset: 11,
+            ..start.clone()
+        },
+        start,
+    };
+    let members = vec![range.clone(); 100];
+    let focus = FocusLocation::from_source(&range, &members).unwrap();
+    assert_eq!(focus.ranges.len(), 64);
+    assert_eq!(focus.total_ranges, 100);
+    let mut large = range.clone();
+    large.start.node = "&".repeat(500);
+    large.end.node = large.start.node.clone();
+    let focus = FocusLocation::from_source(&large, &vec![large.clone(); 64]).unwrap();
+    assert!(focus.ranges.len() < 64);
+    assert_eq!(focus.range.start.node, large.start.node);
+    assert_eq!(focus.total_ranges, 64);
+    assert!(
+        serde_json::to_string(&focus)
+            .unwrap()
+            .replace('&', "&amp;")
+            .len()
+            <= 16_000
+    );
+    assert!(FocusLocation::from_source(&range, &[]).is_some());
+    large.start.node.push('x');
+    assert!(FocusLocation::from_source(&large, &[]).is_none());
+}
+
+#[test]
+fn focus_location_round_trips_while_legacy_drafts_keep_their_exact_wire_shape() {
+    let original = draft();
+    let wire = serde_json::to_value(&original).unwrap();
+    let restored: Draft = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+    let old_location = serde_json::json!({ "document": "chapter.xhtml", "anchor": "heading" });
+    let restored: Location = serde_json::from_value(old_location.clone()).unwrap();
+    assert!(restored.focus.is_none());
+    assert_eq!(serde_json::to_value(restored).unwrap(), old_location);
+}
+
+#[test]
+fn feedback_context_displays_focus_separately_from_chapter_anchor_and_handles_missing_focus() {
+    let ctx = egui::Context::default();
+    let mut context = OpenContext::shelf(&ctx).context;
+    context.location = Some(serde_json::from_value(serde_json::json!({
+        "document": "chapter.xhtml", "anchor": "chapter-heading",
+        "focus": {
+            "range": { "start": { "spine": "chapter", "node": "paragraph-8", "textOffset": 4 },
+                       "end": { "spine": "chapter", "node": "paragraph-8", "textOffset": 19 } },
+            "ranges": [{ "start": { "spine": "chapter", "node": "paragraph-8", "textOffset": 4 },
+                         "end": { "spine": "chapter", "node": "paragraph-8", "textOffset": 19 } }],
+            "totalRanges": 2
+        }
+    })).unwrap());
+    context.reader = Some(Reader {
+        mode: "focus".into(),
+        typesetting: "unified".into(),
+        pdf_reflow: None,
+        translation: Translation {
+            enabled: false,
+            target_language: "zh-CN".into(),
+        },
+    });
+    let render = |context: &model::Context| {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 1600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| show_context(ui, context, AppLanguage::English),
+        );
+        output.textures_delta.clear();
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    render(&context);
+    let text = render(&context);
+    for expected in [
+        "Chapter anchor",
+        "chapter-heading",
+        "Focused block",
+        "paragraph-8",
+        "Focus source range",
+        "1/2 (truncated)",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    let mut report = draft();
+    report.payload.context = context.clone();
+    let wire = serde_json::to_value(&report).unwrap();
+    let restored: Draft = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+    context.location.as_mut().unwrap().focus = None;
+    assert!(render(&context).contains("Focus location unavailable"));
+    context.reader.as_mut().unwrap().mode = "classic".into();
+    assert!(!render(&context).contains("Focused block"));
+}
+
+#[test]
 fn closing_and_reopening_preserves_a_pending_report_and_its_cooldown() {
     let mut feature = FeedbackFeature {
         draft: Some(draft()),

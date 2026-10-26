@@ -26,7 +26,7 @@ The Microsoft Store edition receives updates through Microsoft Store. Other desk
 
 ## Feedback and feature requests
 
-When you submit feedback, Torto sends your description, selected report type, app version, operating system version, window size and display scale to TortoTech's feedback service, which creates a **public GitHub Issue**. Reports opened from the reader also include the book's original title, authors, languages, format and layout, the current chapter/book-relative location when available, and reader layout and translation settings. You can review the included information before submitting. Opening the feedback dialog alone does not send a report.
+When you submit feedback, Torto sends your description, selected report type, app version, operating system version, window size and display scale to TortoTech's feedback service, which creates a **public GitHub Issue**. Reports opened from the reader also include the book's original title, authors, languages, format and layout, the current chapter/book-relative location when available, and reader layout and translation settings. In focus mode, available source node identifiers and ranges for the active unit are included; the paragraph text is not automatically attached. You can review the included information before submitting. Opening the feedback dialog alone does not send a report.
 
 Complete books, screenshots, logs, API keys, account details, highlights and chat history are not automatically attached. Any personal information you enter in the description will be public. A pending submission is saved locally so retries can reuse the same report. The service retains the request identifier, content hash, submission state and Issue link to prevent duplicates; it does not retain the description or book metadata in its database. The published report is held by GitHub under its own policies. Contact the repository maintainers to request removal of a published report.
 
@@ -68,7 +68,7 @@ Microsoft Store 版本通过 Microsoft Store 获取更新。其他桌面版本�
 
 ## 问题反馈与功能请求
 
-提交反馈时，Torto 会将你填写的描述、反馈类型、应用版本、操作系统版本、窗口尺寸及显示缩放发送至 TortoTech 的反馈服务，由服务创建**公开的 GitHub Issue**。从阅读页打开的反馈还会附带原书书名、作者、语言、格式与版式，以及可获取的当前章节、书内相对位置、阅读版式和翻译设置。提交前可以查看附带信息；仅打开弹窗不会发送反馈。
+提交反馈时，Torto 会将你填写的描述、反馈类型、应用版本、操作系统版本、窗口尺寸及显示缩放发送至 TortoTech 的反馈服务，由服务创建**公开的 GitHub Issue**。从阅读页打开的反馈还会附带原书书名、作者、语言、格式与版式，以及可获取的当前章节、书内相对位置、阅读版式和翻译设置。专注模式下还会附带可获取的当前聚焦单元的原文节点标识与范围，不会自动附带段落正文。提交前可以查看附带信息；仅打开弹窗不会发送反馈。
 
 应用不会自动附带整本书、截图、日志、API Key、账号信息、高亮或聊天记录。你自行填写在描述中的个人信息会被公开。尚未确认结果的提交会保存在本地，以便重试时核对同一份反馈。服务端保留请求编号、内容哈希、提交状态及 Issue 链接来防止重复提交，不在数据库中保留描述或书籍元数据。已发布的反馈由 GitHub 按其自身政策保存；如需删除公开反馈，请联系仓库维护者。
 

@@ -182,13 +182,13 @@ impl DesktopApp {
             DesktopReader::take_feedback_request,
         );
         if feedback_requested || feedback_shortcut_requested {
-            if let Some(reader) = &mut self.reader {
-                reader.prepare_feedback_request();
-            }
             let context = self.reader.as_ref().map_or_else(
                 || crate::feedback::OpenContext::shelf(ui.ctx()),
                 |reader| reader.feedback_context(ui.ctx()),
             );
+            if let Some(reader) = &mut self.reader {
+                reader.prepare_feedback_request();
+            }
             self.feedback.open(context);
         }
         if let Some(change) = self

@@ -70,11 +70,28 @@ impl DesktopReader {
             .sections
             .get(self.snapshot.location.section_index)
             .map(|s| &s.href);
+        let focus_unit = self.focus_units.get(self.focus_unit_index).filter(|unit| {
+            self.is_focus_mode()
+                && self.focus_units_ready
+                && self.source
+                    .book()
+                    .sections
+                    .get(unit.position.section_index)
+                    .is_some_and(|section| section.id == unit.range.start.spine)
+        });
+        let focus_document = focus_unit
+            .and_then(|unit| self.source.book().sections.get(unit.position.section_index))
+            .and_then(|section| book_document(section.href.path()));
+        let focus = focus_unit
+            .filter(|_| focus_document.is_some())
+            .and_then(|unit| {
+                crate::feedback::FocusLocation::from_source(&unit.range, &unit.paint_ranges)
+            });
         seed.context.location = Some(Location {
             chapter: active
                 .map(|item| clipped(&item.label, 500))
                 .filter(|v| !v.is_empty()),
-            document: href.and_then(|href| book_document(href.path())),
+            document: focus_document.or_else(|| href.and_then(|href| book_document(href.path()))),
             anchor: active
                 .and_then(|item| item.target.as_ref())
                 .and_then(|href| href.fragment())
@@ -83,6 +100,7 @@ impl DesktopReader {
             page: (self.format == BookFormat::Pdf
                 && self.source.book().metadata.layout == RenditionLayout::PrePaginated)
                 .then_some(self.snapshot.location.section_index + 1),
+            focus,
         });
         let pdf = self.format == BookFormat::Pdf;
         let reflow = pdf && self.pdf_ocr.mode == super::PdfOcrViewMode::Reflow;

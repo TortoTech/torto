@@ -8,7 +8,9 @@ use crate::async_task::{TaskResult, TaskSlot};
 use crate::platform::UserEvent;
 use crate::preferences::AppLanguage;
 use crate::ui::{Icon, dialog_action_button, icon_button, palette};
-pub(crate) use model::{Book, Location, OpenContext, Reader, Translation, book_document, clipped};
+pub(crate) use model::{
+    Book, FocusLocation, Location, OpenContext, Reader, Translation, book_document, clipped,
+};
 use model::{Draft, Kind, Payload, character_count, valid_description};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -770,7 +772,51 @@ fn show_context(ui: &mut egui::Ui, c: &model::Context, l: AppLanguage) {
                         context_row(ui, width, l.text("书内文档", "Document"), document);
                     }
                     if let Some(anchor) = &p.anchor {
-                        context_row(ui, width, l.text("位置标识", "Anchor"), anchor);
+                        context_row(ui, width, l.text("章节锚点", "Chapter anchor"), anchor);
+                    }
+                    if let Some(focus) = &p.focus {
+                        context_row(
+                            ui,
+                            width,
+                            l.text("当前聚焦块", "Focused block"),
+                            &focus.range.start.node,
+                        );
+                        context_row(
+                            ui,
+                            width,
+                            l.text("聚焦范围", "Focus source range"),
+                            &focus.range.label(),
+                        );
+                        let count = format!(
+                            "{}/{}{}",
+                            focus.ranges.len(),
+                            focus.total_ranges,
+                            if focus.ranges.len() < focus.total_ranges {
+                                l.text("（已截断）", " (truncated)")
+                            } else {
+                                ""
+                            }
+                        );
+                        egui::CollapsingHeader::new(format!(
+                            "{} · {count}",
+                            l.text("成员范围", "Member ranges")
+                        ))
+                        .show(ui, |ui| {
+                            for (index, range) in focus.ranges.iter().enumerate() {
+                                context_row(ui, width, &(index + 1).to_string(), &range.label());
+                            }
+                        });
+                    } else if c
+                        .reader
+                        .as_ref()
+                        .is_some_and(|reader| reader.mode == "focus")
+                    {
+                        context_row(
+                            ui,
+                            width,
+                            l.text("当前聚焦块", "Focused block"),
+                            l.text("聚焦位置暂不可用", "Focus location unavailable"),
+                        );
                     }
                 }
             },

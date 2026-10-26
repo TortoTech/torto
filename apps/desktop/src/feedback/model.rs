@@ -118,6 +118,106 @@ pub(crate) struct Location {
     pub anchor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<FocusLocation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FocusLocation {
+    pub range: FocusRange,
+    pub ranges: Vec<FocusRange>,
+    pub total_ranges: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FocusRange {
+    pub start: FocusAnchor,
+    pub end: FocusAnchor,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FocusAnchor {
+    pub spine: String,
+    pub node: String,
+    pub text_offset: u64,
+}
+
+impl FocusRange {
+    fn from_source(source: &rebook_publication::SourceRange) -> Option<Self> {
+        let anchor = |value: &rebook_publication::SourceAnchor| {
+            let valid_id = |id: &str| !id.trim().is_empty() && id.encode_utf16().count() <= 500;
+            (valid_id(value.spine.as_str())
+                && valid_id(&value.node)
+                && value.text_offset <= 9_007_199_254_740_991)
+                .then(|| FocusAnchor {
+                    spine: value.spine.as_str().into(),
+                    node: value.node.clone(),
+                    text_offset: value.text_offset,
+                })
+        };
+        if source.start.spine != source.end.spine
+            || source.start.node == source.end.node
+                && source.start.text_offset > source.end.text_offset
+        {
+            return None;
+        }
+        Some(Self {
+            start: anchor(&source.start)?,
+            end: anchor(&source.end)?,
+        })
+    }
+
+    pub fn label(&self) -> String {
+        format!(
+            "{} / {} : {} → {} / {} : {}",
+            self.start.spine,
+            self.start.node,
+            self.start.text_offset,
+            self.end.spine,
+            self.end.node,
+            self.end.text_offset
+        )
+    }
+}
+
+impl FocusLocation {
+    pub fn from_source(
+        range: &rebook_publication::SourceRange,
+        members: &[rebook_publication::SourceRange],
+    ) -> Option<Self> {
+        let mut value = Self {
+            range: FocusRange::from_source(range)?,
+            ranges: Vec::new(),
+            total_ranges: members.len().max(1),
+        };
+        let fallback = [range.clone()];
+        let members = if members.is_empty() {
+            &fallback[..]
+        } else {
+            members
+        };
+        for member in members.iter().take(64) {
+            if member.start.spine != range.start.spine {
+                return None;
+            }
+            value.ranges.push(FocusRange::from_source(member)?);
+            // Match the service's escaped JSON byte budget without shortening identifiers.
+            let json = serde_json::to_string(&value)
+                .ok()?
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('@', "@\u{200b}");
+            if json.len() > 16_000 {
+                value.ranges.pop();
+                break;
+            }
+        }
+        (!value.ranges.is_empty()).then_some(value)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
