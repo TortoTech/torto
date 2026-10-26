@@ -143,6 +143,26 @@ cargo test --workspace
 
 The core reading path is `parser → Reading IR → layout → renderer`. See the [native rendering architecture decision](docs/adr-0001-native-epub-renderer.md), [AI layout batching](docs/ai-layout-batching.md), [AI layout and translation scheduling](docs/ai-layout-scheduling.md), [WebDAV sync protocol](docs/webdav-sync-v1.md), and [known upstream issues](docs/known-upstream-issues.md) for details.
 
+### macOS credentials and release signing
+
+Unit tests use an in-memory credential store for WebDAV, AI, OCR and search keys;
+they never read or change the system Keychain. Normal app builds still use the OS
+credential store.
+
+The macOS installer workflow supports these repository secrets:
+
+- `MACOS_SIGNING_IDENTITY`: the full `Developer ID Application: Name (TEAMID)` identity.
+- `MACOS_CERTIFICATE_P12_BASE64`: a base64-encoded `.p12` containing that certificate and private key.
+- `MACOS_CERTIFICATE_PASSWORD`: the `.p12` export password.
+
+Keep the signing team, distribution type and bundle identifier
+`io.github.l-chris.torto` consistent between releases. The workflow imports the
+certificate into a temporary keychain and deletes it after the job. With no
+signing secrets, builds retain ad-hoc signing and updates may ask for Keychain
+access again. Moving existing credentials from ad-hoc builds to Developer ID can
+also require one authorization. Developer ID signing is prepared here;
+notarization requires separate Apple credentials.
+
 ### Desktop feedback service
 
 The shelf toolbar and reader menu open the same feedback dialog. The current development endpoint is `http://100.109.172.125:8083/api/feedback` on the Pi and requires Tailscale connectivity. For a public distribution, set `TORTO_FEEDBACK_URL` to the deployed HTTPS feedback endpoint when building. The same environment variable can override the endpoint at runtime; a saved pending report retains its original endpoint and exact payload for safe retries. The URL must end in `/api/feedback` with no credentials, query or fragment. HTTP is accepted only for private, loopback or Tailscale IP addresses. GitHub App credentials stay on the service and are never bundled with the desktop app.

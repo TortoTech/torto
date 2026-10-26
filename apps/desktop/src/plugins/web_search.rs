@@ -186,7 +186,7 @@ impl SearchSettings {
     }
 }
 fn credential(id: &str) -> std::io::Result<keyring::Entry> {
-    keyring::Entry::new("Torto Web Search", id).map_err(std::io::Error::other)
+    crate::credentials::entry("Torto Web Search", id).map_err(std::io::Error::other)
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WebSource {
