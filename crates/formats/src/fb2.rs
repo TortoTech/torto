@@ -7,7 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rebook_publication::{Metadata, RenditionLayout};
 use roxmltree::{Document, Node};
 use sha2::{Digest, Sha256};
-use zip::ZipArchive;
+use zip::{ZipArchive, ZipReadOptions};
 
 use crate::source::{
     DirectBookSource, SectionContent, SourceBook, SourceResource, SourceSection, escape_attribute,
@@ -114,15 +114,23 @@ fn extract_xml(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
         return Ok(bytes.to_vec());
     }
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
-    let entry_index = (0..archive.len()).find(|index| {
-        archive
-            .by_index(*index)
-            .is_ok_and(|entry| entry.name().to_ascii_lowercase().ends_with(".fb2"))
-    });
+    let mut entry_index = None;
+    for index in 0..archive.len() {
+        let entry = archive.by_index_with_options(
+            index,
+            ZipReadOptions::new().enforce_header_consistency(true),
+        )?;
+        if entry.name()?.to_ascii_lowercase().ends_with(".fb2") {
+            entry_index.get_or_insert(index);
+        }
+    }
     let Some(entry_index) = entry_index else {
         return Err(conversion_error(BookFormat::Fbz, "压缩包中没有 .fb2 文件"));
     };
-    let mut entry = archive.by_index(entry_index)?;
+    let mut entry = archive.by_index_with_options(
+        entry_index,
+        ZipReadOptions::new().enforce_header_consistency(true),
+    )?;
     if entry.size() > MAX_ENTRY_BYTES {
         return Err(conversion_error(
             BookFormat::Fbz,

@@ -9,7 +9,7 @@ static DERIVED_REVISION: AtomicU64 = AtomicU64::new(0);
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use zip::{CompressionMethod, ZipArchive, ZipReadOptions, ZipWriter};
 
 use crate::plugins::{
     PdfOcrSyncData, export_pdf_ocr_sync_data, import_pdf_ocr_sync_data, pdf_ocr_sync_fingerprint,
@@ -730,12 +730,15 @@ fn unpack_native_archive(bytes: Vec<u8>) -> io::Result<Vec<(String, Vec<u8>)>> {
     let mut total = 0;
     let mut files = Vec::new();
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
+        let mut entry = archive.by_index_with_options(
+            index,
+            ZipReadOptions::new().enforce_header_consistency(true),
+        )?;
         total += entry.size();
         if entry.size() > MAX_ARCHIVE_ENTRY_BYTES || total > MAX_ARCHIVE_TOTAL_BYTES {
             return Err(io::Error::other("Native PDF archive is too large"));
         }
-        let name = entry.name().to_owned();
+        let name = entry.name()?.into_owned();
         let url = rebook_publication::PublicationUrl::parse(&name).map_err(io::Error::other)?;
         if url.path() != name
             || !seen.insert(name.clone())
@@ -825,7 +828,10 @@ fn unpack_ocr_archive(bytes: Vec<u8>) -> io::Result<PdfOcrSyncData> {
     let mut resources = BTreeMap::new();
     let mut total_size = 0_u64;
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
+        let mut entry = archive.by_index_with_options(
+            index,
+            ZipReadOptions::new().enforce_header_consistency(true),
+        )?;
         total_size = total_size.saturating_add(entry.size());
         if entry.size() > MAX_ARCHIVE_ENTRY_BYTES || total_size > MAX_ARCHIVE_TOTAL_BYTES {
             return Err(io::Error::new(
@@ -833,7 +839,7 @@ fn unpack_ocr_archive(bytes: Vec<u8>) -> io::Result<PdfOcrSyncData> {
                 "synced PDF OCR archive entry is too large",
             ));
         }
-        let name = entry.name().replace('\\', "/");
+        let name = entry.name()?.replace('\\', "/");
         let mut contents = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or_default());
         entry.read_to_end(&mut contents)?;
         if name == "document.json" {
@@ -976,6 +982,44 @@ fn require_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synced_archives_reject_files_renamed_only_in_the_central_directory() {
+        fn rename_entry(mut bytes: Vec<u8>, old: &[u8], name: &[u8]) -> Vec<u8> {
+            assert_eq!(old.len(), name.len());
+            let central = bytes
+                .windows(4)
+                .enumerate()
+                .find_map(|(offset, magic)| {
+                    (magic == b"PK\x01\x02"
+                        && bytes.get(offset + 46..offset + 46 + old.len()) == Some(old))
+                    .then_some(offset)
+                })
+                .unwrap();
+            bytes[central + 46..central + 46 + name.len()].copy_from_slice(name);
+            bytes
+        }
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("sections/a.json", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"{}").unwrap();
+        let native = writer.finish().unwrap().into_inner();
+        assert!(unpack_native_archive(native.clone()).is_ok());
+        assert!(
+            unpack_native_archive(rename_entry(native, b"sections/a.json", b"sections/b.json"))
+                .is_err()
+        );
+
+        let ocr = pack_ocr_archive(PdfOcrSyncData {
+            document: b"{}".to_vec(),
+            resources: vec![("a.x".into(), vec![1])],
+        })
+        .unwrap();
+        assert!(unpack_ocr_archive(ocr.clone()).is_ok());
+        // Both names are permitted by the unpacker; only the header disagreement fails.
+        assert!(unpack_ocr_archive(rename_entry(ocr, b"resources/a.x", b"resources/b.x")).is_err());
+    }
 
     #[test]
     fn incompatible_native_download_finishes_and_expired_local_cache_is_not_uploaded() {

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
-use zip::ZipArchive;
+use zip::{ZipArchive, ZipReadOptions};
 
 use super::{MINERU_API_URL, PADDLE_OCR_JOBS_URL, PdfOcrProviderKind, PluginSettings};
 use crate::generated_toc::GeneratedTocEntry;
@@ -1295,9 +1295,15 @@ fn parse_mineru_zip(bytes: Vec<u8>) -> Result<(Vec<StoredOcrPage>, Vec<OcrResour
     let mut total_size = 0_usize;
     for index in 0..archive.len() {
         let mut file = archive
-            .by_index(index)
+            .by_index_with_options(
+                index,
+                ZipReadOptions::new().enforce_header_consistency(true),
+            )
             .map_err(|error| format!("读取 MinerU ZIP 条目失败：{error}"))?;
-        if file.is_dir() || !safe_archive_name(file.name()) {
+        let Ok(name) = file.name().map(|name| name.into_owned()) else {
+            continue;
+        };
+        if file.is_dir() || !safe_archive_name(&name) {
             continue;
         }
         let size = usize::try_from(file.size()).unwrap_or(usize::MAX);
@@ -1308,7 +1314,7 @@ fn parse_mineru_zip(bytes: Vec<u8>) -> Result<(Vec<StoredOcrPage>, Vec<OcrResour
         let mut content = Vec::with_capacity(size.min(8 * 1024 * 1024));
         file.read_to_end(&mut content)
             .map_err(|error| format!("解压 MinerU 结果失败：{error}"))?;
-        entries.push((file.name().replace('\\', "/"), content));
+        entries.push((name.replace('\\', "/"), content));
     }
 
     let mut resources = Vec::new();
@@ -3311,6 +3317,25 @@ fn value_as_usize(value: &Value) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mineru_rejects_conflicting_zip_headers_before_parsing_content() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("result.md", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"Text").unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        let central = bytes
+            .windows(4)
+            .position(|magic| magic == b"PK\x01\x02")
+            .unwrap();
+        bytes[central + 46..central + 55].copy_from_slice(b"hidden.md");
+        let error = parse_mineru_zip(bytes)
+            .err()
+            .expect("conflicting headers must fail");
+        assert!(error.contains("header inconsistency"), "{error}");
+    }
 
     #[test]
     #[ignore = "uploads TORTO_PADDLE_UPLOAD_TEST_PDF to the configured real PaddleOCR service"]

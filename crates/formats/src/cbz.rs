@@ -4,7 +4,7 @@ use std::path::Path;
 use rebook_publication::{Metadata, RenditionLayout};
 use roxmltree::Document;
 use sha2::{Digest, Sha256};
-use zip::ZipArchive;
+use zip::{ZipArchive, ZipReadOptions};
 
 use crate::source::{DirectBookSource, SectionContent, SourceBook, SourceResource, SourceSection};
 use crate::xml::decode_xml;
@@ -31,11 +31,14 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, Fo
     let mut images = Vec::new();
     let mut comic_info_index = None;
     for index in 0..archive.len() {
-        let entry = archive.by_index(index)?;
+        let entry = archive.by_index_with_options(
+            index,
+            ZipReadOptions::new().enforce_header_consistency(true),
+        )?;
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_owned();
+        let name = entry.name()?.into_owned();
         if name.eq_ignore_ascii_case("ComicInfo.xml") {
             comic_info_index = Some(index);
         }
@@ -64,7 +67,10 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, Fo
     let mut resources = Vec::with_capacity(images.len());
     let mut sections = Vec::with_capacity(images.len());
     for (page_index, image) in images.into_iter().enumerate() {
-        let mut entry = archive.by_index(image.index)?;
+        let mut entry = archive.by_index_with_options(
+            image.index,
+            ZipReadOptions::new().enforce_header_consistency(true),
+        )?;
         if entry.size() > MAX_ENTRY_BYTES {
             return Err(conversion_error(
                 BookFormat::Cbz,
@@ -119,7 +125,10 @@ fn read_comic_info(
     archive: &mut ZipArchive<Cursor<&[u8]>>,
     index: usize,
 ) -> Result<ComicMetadata, FormatError> {
-    let mut entry = archive.by_index(index)?;
+    let mut entry = archive.by_index_with_options(
+        index,
+        ZipReadOptions::new().enforce_header_consistency(true),
+    )?;
     if entry.size() > MAX_ENTRY_BYTES {
         return Err(conversion_error(BookFormat::Cbz, "ComicInfo.xml 过大"));
     }

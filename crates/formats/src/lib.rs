@@ -24,6 +24,8 @@ pub mod reflow;
 mod reflow_format_tests;
 mod source;
 mod xml;
+#[cfg(test)]
+mod zip_tests;
 
 use std::fmt;
 use std::fs;
