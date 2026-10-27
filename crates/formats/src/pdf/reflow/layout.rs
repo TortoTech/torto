@@ -242,15 +242,11 @@ fn edge_key(line: &Line, height: f64) -> Option<String> {
         return None;
     };
     let raw = line.text();
-    let counter = raw
-        .split_whitespace()
-        .next()
-        .into_iter()
-        .chain(raw.split_whitespace().last())
-        .any(|word| !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()));
+    let counter_text = chrome::counter_text(&raw);
+    let counter = counter_text.is_some();
     let mut text = String::new();
     let mut digit = false;
-    for c in line.text().chars().filter(|c| !c.is_whitespace()) {
+    for c in counter_text.as_deref().unwrap_or(&raw).chars().filter(|c| !c.is_whitespace()) {
         if c.is_ascii_digit() {
             if !digit {
                 text.push('#');
@@ -633,7 +629,10 @@ pub(super) fn build_with_words(
     } else {
         stats.text_pages += 1;
         let mut remaining = vec![true; page.glyphs.len()];
-        for line in edge_lines(page, Some(body)) {
+        // Consume exactly the candidate geometry used by ChromeDetector. The
+        // selected keys already carry repetition/outline/counter proof; a
+        // second, stricter gap or page-local font gate can resurrect headers.
+        for line in edge_lines_with_gap(page, None, 1.2) {
             if edge_key(&line, page.height).is_some_and(|key| repeated.contains(&key)) {
                 for glyph in line.glyphs {
                     remaining[glyph.index] = false;
@@ -2889,11 +2888,43 @@ mod tests {
         for index in 0..3 { detector.observe(&make(index), index); }
         detector.finish();
         assert_eq!(detector.removed_keys(1, &[]).len(), 1);
+        let mut page = make(1);
+        // A few more body glyphs keep this on the native text route.
+        page.glyphs.push(glyph("Body continues.", 40.0, 70.0, 10.0, 2));
+        let mut stats = Statistics::default();
+        let (stored, _) = build(&page, 1, 10.0, &detector.removed_keys(1, &[]), &mut stats).unwrap();
+        let text: String = stored.section.blocks.iter().flat_map(Block::text_blocks).flat_map(|t| &t.content).flat_map(Inline::text_runs).map(|r| r.text.as_str()).collect();
+        assert!(!text.contains("Chapter name"), "{text}");
+        assert!(text.contains("Body begins") && text.contains("Body continues"), "{text}");
+        assert_eq!(stats.removed_chrome_glyphs, 1);
         let mut heading = make(0); heading.glyphs[0].tag = Some("H2".into());
         let mut protected = ChromeDetector::default();
         for index in 0..3 { protected.observe(&heading, index); }
         protected.finish();
         assert!(protected.removed_keys(1, &["Chapter name"]).is_empty());
+    }
+
+    #[test]
+    fn roman_folios_share_header_evidence_and_are_removed_from_native_text() {
+        let make = |index: usize, folio: &str| {
+            let mut page = NativePage { width: 600.0, height: 800.0, ..NativePage::default() };
+            let header = if index % 2 == 0 { format!("{folio} Preface: Social Animals") }
+                else { format!("Preface: Social Animals {folio}") };
+            row(&header, 40.0, 42.0, 10.0, &mut page.glyphs);
+            row("Body starts here and must remain.", 40.0, 66.0, 10.0, &mut page.glyphs);
+            page
+        };
+        let pages: Vec<_> = ["ix", "X", "xi", "XII", "xiii", "xiv"].iter().enumerate().map(|(i, n)| make(i, n)).collect();
+        let mut detector = ChromeDetector::default();
+        for (index, page) in pages.iter().enumerate() { detector.observe(page, index); }
+        detector.finish();
+        for (index, page) in pages.iter().enumerate() {
+            let keys = detector.removed_keys(index, &[]);
+            assert_eq!(keys.len(), 1, "page {}", index + 1);
+            let (stored, _) = build(page, index, 10.0, &keys, &mut Statistics::default()).unwrap();
+            let text: String = stored.section.blocks.iter().flat_map(Block::text_blocks).flat_map(|t| &t.content).flat_map(Inline::text_runs).map(|r| r.text.as_str()).collect();
+            assert_eq!(text, "Body starts here and must remain.");
+        }
     }
 
     #[test]

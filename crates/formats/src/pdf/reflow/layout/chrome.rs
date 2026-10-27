@@ -44,25 +44,58 @@ fn label_key(label: &str) -> String {
     }
 }
 
+fn printed_number(word: &str) -> Option<u32> {
+    if !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()) {
+        return word.parse::<u32>().ok().filter(|n| *n > 0);
+    }
+    // Front matter commonly uses roman folios. Accept canonical spellings
+    // only: ordinary words made from roman letters are not arbitrary counters.
+    if word.is_empty() || word.len() > 15 || !word.is_ascii() {
+        return None;
+    }
+    let word = word.to_ascii_lowercase();
+    let mut value = 0_i32;
+    let mut last = 0;
+    for c in word.bytes().rev() {
+        let digit = match c {
+            b'i' => 1, b'v' => 5, b'x' => 10, b'l' => 50,
+            b'c' => 100, b'd' => 500, b'm' => 1000, _ => return None,
+        };
+        value += if digit < last { -digit } else { digit };
+        last = last.max(digit);
+    }
+    if !(1..=3999).contains(&value) {
+        return None;
+    }
+    let mut remaining = value;
+    let mut canonical = String::new();
+    for (n, token) in [(1000,"m"),(900,"cm"),(500,"d"),(400,"cd"),(100,"c"),(90,"xc"),(50,"l"),(40,"xl"),(10,"x"),(9,"ix"),(5,"v"),(4,"iv"),(1,"i")] {
+        while remaining >= n { canonical.push_str(token); remaining -= n; }
+    }
+    (canonical == word).then_some(value as u32)
+}
+
 fn outer_counter(raw: &str) -> (Option<CounterSide>, Option<u32>, String) {
     let words = raw.split_whitespace().collect::<Vec<_>>();
-    let number = |word: &str| {
-        (!word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| word.parse::<u32>().ok())
-            .flatten()
-            .filter(|n| *n > 0)
-    };
-    if let Some(n) = words.last().and_then(|word| number(word)) {
+    if let Some(n) = words.last().and_then(|word| printed_number(word)) {
         (
             Some(CounterSide::End),
             Some(n),
             words[..words.len() - 1].join(" "),
         )
-    } else if let Some(n) = words.first().and_then(|word| number(word)) {
+    } else if let Some(n) = words.first().and_then(|word| printed_number(word)) {
         (Some(CounterSide::Start), Some(n), words[1..].join(" "))
     } else {
         (None, None, raw.to_owned())
     }
+}
+
+pub(super) fn counter_text(raw: &str) -> Option<String> {
+    let (side, _, label) = outer_counter(raw);
+    side.map(|side| match side {
+        CounterSide::Start => format!("# {label}"),
+        CounterSide::End => format!("{label} #"),
+    })
 }
 
 impl Detector {
@@ -176,5 +209,44 @@ impl Detector {
             }
         }
         removed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn printed_counters_accept_canonical_roman_folios() {
+        for (word, expected) in [("ix", 9), ("XIV", 14), ("xxii", 22), ("MCMXCIV", 1994), ("42", 42)] {
+            assert_eq!(printed_number(word), Some(expected));
+        }
+        for word in ["", "0", "iiii", "iix", "vx", "civil", "divid", "chapter", "4.2"] {
+            assert_eq!(printed_number(word), None, "{word}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_BAD_BELIEFS_PDF; read-only front-matter regression"]
+    fn local_bad_beliefs_roman_running_heads_are_removed() {
+        let path = std::env::var_os("TORTO_BAD_BELIEFS_PDF").unwrap();
+        let publication = crate::pdf::open(fs::read(path).unwrap(), "local.pdf").unwrap();
+        let tags = extract::structure_tags(&publication.pdf);
+        let mut detector = Detector::default();
+        for index in 0..publication.page_count {
+            detector.observe(&extract::page(&publication.pdf, index, &tags), index);
+        }
+        detector.finish();
+        for index in std::iter::once(8).chain(10..23) {
+            let page = extract::page(&publication.pdf, index, &tags);
+            let keys = detector.removed_keys(index, &["Acknowledgments", "Preface: Rational Social Animals Go Wild"]);
+            let header = lines(page.glyphs.clone()).into_iter().find(|line| line.baseline < page.height * 0.09 && counter_text(&line.text()).is_some()).unwrap();
+            let key = edge_key(&header, page.height).unwrap();
+            assert!(keys.contains(&key), "page {} missed {}", index + 1, header.text());
+            let (stored, _) = build(&page, index, 10.5, &keys, &mut Statistics::default()).unwrap();
+            for glyph in &header.glyphs {
+                assert!(!stored.provenance.iter().any(|slice| slice.original_glyph == glyph.index), "page {} retained header glyph {}", index + 1, glyph.index);
+            }
+        }
     }
 }
