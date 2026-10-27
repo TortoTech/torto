@@ -155,6 +155,9 @@ pub(super) fn is_navigation_breadcrumb(
     styles: &StyleSheet,
     headings: &HashSet<String>,
 ) -> bool {
+    if is_note_navigation(node) {
+        return true;
+    }
     if navigation_documents.is_empty()
         || ancestor_targets.is_empty()
         || !node.is_element()
@@ -249,6 +252,27 @@ pub(super) fn is_navigation_breadcrumb(
                         }))
             })
     })
+}
+
+fn is_note_navigation(node: Node<'_, '_>) -> bool {
+    if !node.is_element() || !matches!(node.tag_name().name(), "p" | "div")
+        || has_descendant_image(node)
+        || is_semantic_footnote_definition(node)
+    {
+        return false;
+    }
+    let links: Vec<_> = node.descendants().filter(|child| child.has_tag_name("a")).collect();
+    if links.len() != 1 || attribute_local(links[0], "href").is_none() {
+        return false;
+    }
+    let label = node_text(node).split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let link_label = node_text(links[0]).split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    if label != link_label || !matches!(label.as_str(), "skip notes" | "skip footnotes" | "skip endnotes" | "跳过注释" | "跳过脚注") {
+        return false;
+    }
+    node.next_siblings().skip(1).find(Node::is_element)
+        .is_some_and(|next| is_semantic_footnote_definition(next)
+            || next.descendants().any(is_semantic_footnote_definition))
 }
 
 fn starts_with_heading(mut node: Node<'_, '_>, headings: &HashSet<String>) -> bool {

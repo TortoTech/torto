@@ -4,6 +4,33 @@ use crate::plugins::{BlockTranslation, TranslationBookSource, TranslationMode};
 use rebook_publication::{TextRun, TextStyle};
 
 #[test]
+fn long_cjk_prose_is_not_a_heading_candidate_even_from_cache() {
+    let block = text(
+        "candidate",
+        &format!("1. {}", "这是一个完整的普通段落。".repeat(6)),
+    );
+    assert!(candidate(&block).is_none());
+    let annotation = Annotation::SectionHeading {
+        source: source(&block).unwrap().clone(),
+    };
+    assert!(!annotation_eligible(&section(vec![block]), &annotation));
+    assert!(candidate(&text("candidate", "1. 小节标题")).is_some());
+}
+
+#[test]
+fn date_prefixes_remain_eligible_for_contextual_heading_recognition() {
+    // Eligibility allows the model to decide; it does not promote the text.
+    for value in ["1996年政策改革", "1996年发生了变化。"] {
+        let block = text("candidate", value);
+        assert!(candidate(&block).is_some());
+        let annotation = Annotation::SectionHeading {
+            source: source(&block).unwrap().clone(),
+        };
+        assert!(annotation_eligible(&section(vec![block]), &annotation));
+    }
+}
+
+#[test]
 fn descriptive_style_numbers_do_not_expose_binary_float_tails() {
     let block = TextBlock {
         kind: TextBlockKind::Paragraph,

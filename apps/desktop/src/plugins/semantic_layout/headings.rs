@@ -41,6 +41,12 @@ pub(super) fn candidate(block: &Block) -> Option<()> {
     if value.is_empty() || value.chars().count() > MAX_CHARS {
         return None;
     }
+    // A 120-character Latin title is already long; the same limit in Chinese
+    // admits entire prose paragraphs.
+    let cjk = value.chars().any(|ch| matches!(ch as u32, 0x3400..=0x9fff));
+    if cjk && value.chars().count() > 48 || value.split_whitespace().count() > 20 {
+        return None;
+    }
     if block.content.iter().any(|inline| match inline {
         Inline::Text(run) => {
             run.style.inline_role != rebook_publication::InlineRole::Normal

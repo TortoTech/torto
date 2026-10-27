@@ -219,9 +219,8 @@ impl ReadingIrParser<'_> {
                 .flat_map(|inline| inline.text_runs())
                 .map(|run| run.text.as_str())
                 .collect();
-            !text.trim().is_empty()
-                && text.chars().count() <= 120
-                && text.chars().any(char::is_alphabetic)
+            text.trim().is_empty()
+                || text.chars().count() <= 120 && text.chars().any(char::is_alphabetic)
         });
         let header = row
             .parent()
@@ -264,8 +263,10 @@ impl ReadingIrParser<'_> {
         let repeated_groups = rows
             .iter()
             .skip(2)
-            .any(|row| row.cells.len() == 1 && usize::from(row.cells[0].column_span) >= width);
-        if named || labels && (header || distinct_centered) && !repeated_groups {
+            .any(|row| row.cells.len() == 1 && usize::from(row.cells[0].column_span) >= width
+                && !table_note_text(&row.cells[0].text));
+        let question = text.trim_end().ends_with(['?', '？']);
+        if named || labels && (header || distinct_centered || question) && !repeated_groups {
             rows[0].cells[0].text.kind = TextBlockKind::Caption;
         }
     }
@@ -542,6 +543,14 @@ impl ReadingIrParser<'_> {
             self.blocks.extend(after.into_iter().map(Block::Text));
         }
     }
+}
+
+fn table_note_text(text: &TextBlock) -> bool {
+    let value: String = text.content.iter().flat_map(|inline| inline.text_runs())
+        .map(|run| run.text.as_str()).collect();
+    let lower = value.trim_start().to_lowercase();
+    ["source:", "sources:", "note:", "notes:", "来源:", "来源：", "注:", "注："]
+        .iter().any(|prefix| lower.starts_with(prefix))
 }
 
 // Compute the remaining grid's width with row spans. Publishers sometimes

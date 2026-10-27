@@ -106,6 +106,15 @@ fn convert(
     };
     let cover_path = metadata_cover_path
         .filter(|cover| resources.iter().any(|resource| resource.path == *cover));
+    if !kf8::is_kf8(bytes)
+        && let Some(cover) = &cover_path
+        && let Some(SourceSection {
+            content: SectionContent::Html(html),
+            ..
+        }) = sections.first_mut()
+    {
+        repair_legacy_cover_reference(html, cover, &resources);
+    }
     DirectBookSource::open(
         SourceBook {
             id: format!("{:x}", Sha256::digest(bytes)),
@@ -124,12 +133,69 @@ fn convert(
     )
 }
 
+fn repair_legacy_cover_reference(
+    html: &mut String,
+    cover: &str,
+    resources: &[crate::source::SourceResource],
+) {
+    let Ok(document) = roxmltree::Document::parse(html) else {
+        return;
+    };
+    let Some(body) = document
+        .descendants()
+        .find(|node| node.has_tag_name("body"))
+    else {
+        return;
+    };
+    // Only the first, image-only SVG cover may use the explicitly declared
+    // cover record. Never guess replacements for missing chapter illustrations.
+    if body
+        .descendants()
+        .any(|node| node.is_text() && !node.text().unwrap_or_default().trim().is_empty())
+        || !body.descendants().any(|node| node.has_tag_name("svg"))
+    {
+        return;
+    }
+    let mut images = body
+        .descendants()
+        .filter(|node| node.has_tag_name("image") || node.has_tag_name("img"));
+    let Some(image) = images.next() else {
+        return;
+    };
+    if images.next().is_some() {
+        return;
+    }
+    let Some(attribute) = image
+        .attributes()
+        .find(|attribute| matches!(attribute.name(), "href" | "src"))
+    else {
+        return;
+    };
+    let base = rebook_publication::PublicationUrl::parse("Text/section-1.xhtml").unwrap();
+    if base.resolve(attribute.value()).ok().is_some_and(|href| {
+        resources
+            .iter()
+            .any(|resource| resource.path == href.path())
+    }) {
+        return;
+    }
+    let range = attribute.range_value();
+    html.replace_range(range, &format!("../{cover}"));
+}
+
 pub(crate) fn normalize_chapter(
     source: &str,
     images: &HashMap<usize, String>,
     format: BookFormat,
 ) -> Result<String, FormatError> {
     let mut source = source.to_owned();
+    // Legacy Kindle HTML uses SVG prefixes without declaring their namespace.
+    // HTML5 only recognizes an unprefixed <svg> as a readable image container.
+    for (prefixed, standard) in [("svg:svg", "svg"), ("svg:image", "image")] {
+        source = source
+            .replace(&format!("<{prefixed}"), &format!("<{standard}"))
+            .replace(&format!("</{prefixed}"), &format!("</{standard}"));
+    }
     for (index, path) in images {
         let replacement = format!("src=\"../{path}\"");
         for recindex in [format!("{index:05}"), index.to_string()] {
@@ -321,6 +387,40 @@ fn rewrite_numeric_attributes(
 mod tests {
     use super::*;
     use rebook_publication::BookSource as _;
+
+    #[test]
+    fn cover_only_mobi_fragment_recovers_undeclared_svg_prefixes() {
+        let body = normalize_chapter(
+            "<html><body><div><svg:svg viewBox='0 0 600 800'><svg:image xlink:href='cover.jpg'/></svg:svg></div>",
+            &HashMap::new(), BookFormat::Mobi,
+        ).unwrap();
+        assert!(body.contains("<svg"), "{body}");
+        assert!(body.contains("cover.jpg"), "{body}");
+    }
+
+    #[test]
+    fn legacy_cover_uses_declared_record_only_for_a_missing_image_only_cover() {
+        let resources = vec![crate::source::SourceResource {
+            path: "Images/cover.jpg".into(),
+            media_type: "image/jpeg".into(),
+            bytes: vec![],
+        }];
+        let mut html =
+            "<html><body><svg><image href='../images/original-name.jpg'/></svg></body></html>"
+                .to_owned();
+        repair_legacy_cover_reference(&mut html, "Images/cover.jpg", &resources);
+        assert!(html.contains("../Images/cover.jpg"));
+        for body in [
+            "<p>Chapter text.</p><svg><image href='missing.jpg'/></svg>",
+            "<svg><image href='../Images/cover.jpg'/></svg>",
+            "<svg><image href='one.jpg'/><image href='two.jpg'/></svg>",
+        ] {
+            let mut html = format!("<html><body>{body}</body></html>");
+            let original = html.clone();
+            repair_legacy_cover_reference(&mut html, "Images/cover.jpg", &resources);
+            assert_eq!(html, original);
+        }
+    }
 
     #[test]
     fn normalizes_mobi_html_and_embedded_images() {

@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 pub(super) struct Presentation<'a> {
     pub skip_title: bool,
+    pub skip_sources: usize,
     pub before: Cow<'a, [TextBlock]>,
     pub after: Cow<'a, [TextBlock]>,
     /// Number-only caption and promoted title to shape as one paragraph.
@@ -117,12 +118,74 @@ fn caption_state(block: &TextBlock) -> CaptionState {
 pub(super) fn presentation(table: &TableBlock, unified: bool) -> Presentation<'_> {
     let mut result = Presentation {
         skip_title: false,
+        skip_sources: 0,
         before: Cow::Borrowed(&table.before),
         after: Cow::Borrowed(&table.after),
         join: None,
     };
     if !unified {
         return result;
+    }
+    let width = table
+        .rows
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| usize::from(cell.column_span))
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0);
+    for row in table
+        .rows
+        .iter()
+        .rev()
+        .take(table.rows.len().saturating_sub(1))
+    {
+        let [cell] = row.cells.as_slice() else {
+            break;
+        };
+        let value: String = cell
+            .text
+            .content
+            .iter()
+            .flat_map(Inline::text_runs)
+            .map(|run| run.text.as_str())
+            .collect();
+        let lower = value.trim_start().to_lowercase();
+        if width < 2
+            || cell.row_span != 1
+            || usize::from(cell.column_span) < width
+            || ![
+                "source:",
+                "sources:",
+                "source：",
+                "note:",
+                "notes:",
+                "来源:",
+                "来源：",
+                "注:",
+                "注：",
+            ]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+        {
+            break;
+        }
+        result.skip_sources += 1;
+    }
+    if result.skip_sources > 0 {
+        let mut notes: Vec<_> = table.rows[table.rows.len() - result.skip_sources..]
+            .iter()
+            .map(|row| {
+                let mut text = row.cells[0].text.clone();
+                text.kind = TextBlockKind::QuoteAttribution;
+                text
+            })
+            .collect();
+        notes.extend_from_slice(&table.after);
+        result.after = Cow::Owned(notes);
     }
     let Some(title) = table
         .rows

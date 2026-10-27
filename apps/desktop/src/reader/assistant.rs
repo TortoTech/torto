@@ -1284,6 +1284,8 @@ impl DesktopReader {
         match navigation {
             Ok(navigation) => {
                 let focus_anchor = Some(result.range.start.clone());
+                self.focus_toc_override = None;
+                self.pending_toc_navigation = None;
                 self.focused_mark = Some(FocusedMark::search(result.range.clone()));
                 self.apply_snapshot(navigation.snapshot, SnapshotEffects::navigation());
                 if self.is_focus_mode() {

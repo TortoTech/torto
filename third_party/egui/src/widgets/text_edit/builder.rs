@@ -1468,7 +1468,7 @@ fn check_for_mutating_key_press(
             Some(CCursorRange::one(ccursor))
         }
 
-        Key::H if modifiers.ctrl => {
+        Key::H if modifiers.ctrl && os != OperatingSystem::Windows => {
             let ccursor = text.delete_previous_char(cursor_range.primary);
             Some(CCursorRange::one(ccursor))
         }

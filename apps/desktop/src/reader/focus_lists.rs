@@ -7,6 +7,7 @@ pub(super) struct ListGroup {
     pub split: bool,
     pub paint_ranges: Vec<SourceRange>,
     pub footnotes: Vec<FocusFootnote>,
+    pub share_notes: bool,
     parts: Vec<FocusUnit>,
 }
 
@@ -44,6 +45,7 @@ pub(super) fn group(
 ) -> Vec<FocusUnit> {
     let refs: Vec<_> = blocks.iter().collect();
     let mut scopes = rebook_layout::semantic_list_groups(&refs);
+    let list_scopes = scopes.len();
     scopes.extend(rebook_layout::semantic_paragraph_groups(&refs));
     let mut membership = HashMap::new();
     for (id, scope) in scopes.iter().enumerate() {
@@ -97,6 +99,7 @@ pub(super) fn group(
                 parts,
                 paint_ranges,
                 footnotes,
+                share_notes: id < list_scopes,
             },
             &mut output,
         );
@@ -211,18 +214,15 @@ mod tests {
     }
 
     #[test]
-    fn split_paragraph_groups_share_notes_in_source_order_without_copying_to_every_part() {
+    fn split_paragraph_groups_keep_independent_note_numbers_and_popups() {
         let r=reader("<html><body><p>Before.</p><div><p>One.<a href='#note-one'><sup>1</sup></a></p><p>Two.<a href='#note-two'><sup>2</sup></a></p><p>Three.</p></div><p>After.</p><aside id='note-one' role='doc-footnote'><p>First note.</p></aside><aside id='note-two' role='doc-footnote'><p>Second note.</p></aside></body></html>",50.0);
         let parts:Vec<_>=r.focus_units.iter().filter(|u|u.list_group.is_some()).collect();
         assert_eq!(parts.len(),3);
-        assert_eq!(parts[0].popup_footnotes().len(),2);
+        assert_eq!(parts[0].popup_footnotes().len(),1);
         assert_eq!(parts[0].popup_footnotes()[0].number,1);
-        assert_eq!(parts[0].popup_footnotes()[1].number,2);
-        for part in &parts {
-            assert_eq!(part.popup_footnotes().len(),2);
-            assert!(part.footnotes.len()<=1);
-        }
-        assert!(std::ptr::eq(parts[0].popup_footnotes(),parts[2].popup_footnotes()));
+        assert_eq!(parts[1].popup_footnotes().len(),1);
+        assert_eq!(parts[1].popup_footnotes()[0].number,1);
+        assert!(parts[2].popup_footnotes().is_empty());
     }
 
     #[test]

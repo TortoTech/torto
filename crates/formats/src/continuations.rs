@@ -48,16 +48,39 @@ pub(crate) fn mark_quote_continuations(
         let Ok(document) = Document::parse(&xml) else {
             continue;
         };
-        let Some(quote) = quote_spread_text(&document) else {
+        let heading = heading_only(&document);
+        let quote = quote_spread_text(&document);
+        if heading.is_none() && quote.is_none() {
             continue;
-        };
+        }
         let Some(previous_xml) = read_document(&previous.href) else {
             continue;
         };
         let Ok(previous_document) = Document::parse(&previous_xml) else {
             continue;
         };
-        if repeats_last_unit(&quote, &previous_document, previous_targets)
+        let split_heading = heading.as_ref().is_some_and(|(level, title)| {
+            rebook_publication::heading_ordinal_key(title).is_none()
+                && heading_only(&previous_document).is_some_and(|(previous_level, ordinal)| {
+                    previous_level == *level
+                        && rebook_publication::heading_ordinal_key(&ordinal).is_some()
+                })
+                && document
+                    .descendants()
+                    .find(|node| node.has_tag_name("body"))
+                    .and_then(|node| attribute_local(node, "id"))
+                    .is_some_and(|id| {
+                        previous_document
+                            .descendants()
+                            .find(|node| node.has_tag_name("body"))
+                            .and_then(|node| attribute_local(node, "id"))
+                            == Some(id)
+                    })
+        });
+        if (split_heading
+            || quote.as_ref().is_some_and(|quote| {
+                repeats_last_unit(quote, &previous_document, previous_targets)
+            }))
             && !current
                 .properties
                 .iter()
@@ -68,6 +91,46 @@ pub(crate) fn mark_quote_continuations(
                 .push(rebook_publication::CONTINUATION_SECTION_PROPERTY.to_owned());
         }
     }
+}
+
+// Conversion tools sometimes cut one title page across two spine documents.
+// Require heading-only pages and a shared authored body ID, so separate short
+// chapters or independently numbered subsections cannot be joined by accident.
+fn heading_only(document: &Document<'_>) -> Option<(String, String)> {
+    let body = document
+        .descendants()
+        .find(|node| node.has_tag_name("body"))?;
+    let headings: Vec<_> = body
+        .descendants()
+        .filter(|node| {
+            node.is_element()
+                && matches!(
+                    node.tag_name().name(),
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                )
+        })
+        .collect();
+    let [heading] = headings.as_slice() else {
+        return None;
+    };
+    if body.descendants().any(|node| {
+        node.is_element()
+            && matches!(
+                node.tag_name().name(),
+                "img" | "image" | "svg" | "table" | "nav"
+            )
+    }) || body.descendants().filter(Node::is_text).any(|node| {
+        !node.text().unwrap_or_default().trim().is_empty()
+            && !node.ancestors().any(|ancestor| ancestor == *heading)
+    }) {
+        return None;
+    }
+    let text: String = heading
+        .descendants()
+        .filter_map(|node| node.text().filter(|_| node.is_text()))
+        .collect();
+    (!text.trim().is_empty() && text.chars().count() <= 120)
+        .then(|| (heading.tag_name().name().to_owned(), text.trim().to_owned()))
 }
 
 fn normalized_text(nodes: impl Iterator<Item = char>) -> String {
@@ -230,6 +293,48 @@ fn contains_edited_quote(text: &str, quote: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_title_page_is_continuous_only_with_matching_body_and_heading_level() {
+        use rebook_publication::SpineItemId;
+        for (body_id, heading, expected) in [
+            ("same", "h1", true),
+            ("other", "h1", false),
+            ("same", "h2", false),
+        ] {
+            let mut sections: Vec<_> = ["ordinal.xhtml", "title.xhtml"]
+                .into_iter()
+                .map(|path| SpineItem {
+                    id: SpineItemId::new(path).unwrap(),
+                    href: PublicationUrl::parse(path).unwrap(),
+                    media_type: "application/xhtml+xml".into(),
+                    linear: true,
+                    properties: vec![],
+                })
+                .collect();
+            let toc = vec![TocEntry {
+                label: "Chapter 1: A title".into(),
+                href: Some(sections[0].href.clone()),
+                children: vec![],
+            }];
+            mark_quote_continuations(&mut sections, &toc, |href| {
+                Some(if href.path() == "ordinal.xhtml" {
+                    "<html><body id='same'><h1>1.</h1></body></html>".to_owned()
+                } else {
+                    format!(
+                        "<html><body id='{body_id}'><{heading}>A title</{heading}></body></html>"
+                    )
+                })
+            });
+            assert_eq!(
+                sections[1]
+                    .properties
+                    .iter()
+                    .any(|property| property == rebook_publication::CONTINUATION_SECTION_PROPERTY),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn quote_spreads_use_explicit_semantics_and_exclude_epigraphs_and_independent_content() {

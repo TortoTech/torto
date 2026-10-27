@@ -23,6 +23,8 @@ mod image_context;
 mod media_context_tests;
 #[cfg(test)]
 mod semantic_structures_tests;
+#[cfg(test)]
+mod reader_regressions;
 mod media_semantics;
 mod nested_media;
 mod paragraph_lists;
