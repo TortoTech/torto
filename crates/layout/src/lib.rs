@@ -2003,7 +2003,7 @@ impl LayoutEngine {
                     unified_reflow,
                 )?,
                 Block::Separator(separator) => {
-                    if !unified_reflow || separator.in_quote {
+                    if !unified_reflow || separator.in_quote || separator.kind == SeparatorKind::AuthoredSpacing {
                         match separator.kind {
                             SeparatorKind::Symbols => {
                                 if let Some(text) = &separator.text {
@@ -2016,6 +2016,11 @@ impl LayoutEngine {
                                     paginator.push_text(&prepared, text)?;
                                 }
                             }
+                            SeparatorKind::AuthoredSpacing => paginator.ensure_minimum_spacing(
+                                separator.style.margin_before.max(0.0)
+                                    + reader_style.typography.font_size * separator.style.line_height.max(0.0)
+                                    + separator.style.margin_after.max(0.0),
+                            ),
                             SeparatorKind::Spacing => paginator.ensure_minimum_spacing(
                                 separator.style.margin_before.max(0.0)
                                     + reader_style.typography.font_size
@@ -5039,6 +5044,10 @@ fn prepare_inline_content(
                 }
             }
             Inline::Text(run) => {
+                if unified_math && run.style.inline_role == InlineRole::PageMarker {
+                    text.extend(std::iter::repeat_n('\u{2060}', run.text.chars().count()));
+                    continue;
+                }
                 let numbered_note = numbered_notes
                     .iter()
                     .enumerate()
@@ -9681,6 +9690,21 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(text_origins.len(), 2);
         assert!(text_origins[1] - text_origins[0] > style.typography.font_size * 2.0);
+    }
+
+    #[test]
+    fn printed_page_numbers_hide_in_unified_prose_and_keep_source_positions() {
+        let source = EmptySource { book: Book { id: PublicationId::new("print-page-test").unwrap(), metadata: Metadata::default(), cover: None, sections: vec![], table_of_contents: vec![] } };
+        let runs = [("Before ", InlineRole::Normal), ("42", InlineRole::PageMarker), ("after.", InlineRole::Normal)];
+        let blocks = vec![Block::Text(TextBlock { kind: TextBlockKind::Paragraph, content: runs.into_iter().map(|(text, role)| Inline::Text(TextRun { text: text.into(), link: None, style: TextStyle { inline_role: role, ..Default::default() } })).collect(), style: Default::default(), source: None })];
+        for unified in [false, true] {
+            let style = ReaderStyle { typesetting: if unified { ReaderTypesetting::unified() } else { ReaderTypesetting::default() }, ..Default::default() };
+            let layout = LayoutEngine::new().layout_blocks(&source, &blocks, LayoutViewport::new(600, 600).unwrap(), &style).unwrap();
+            let text: String = layout.pages.iter().flat_map(|page| &page.items).filter_map(|item| match item { PageItem::Text(text) => Some(text.text.as_ref()), _ => None }).collect();
+            assert_eq!(text.contains("42"), !unified);
+            assert_eq!(text.replace('\u{2060}', "").replace("42", ""), "Before after.");
+            assert_eq!(text.chars().count(), "Before 42after.".chars().count());
+        }
     }
 
     #[test]

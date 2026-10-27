@@ -1495,7 +1495,7 @@ fn text_block_focus_text(block: &TextBlock) -> String {
         .iter()
         .filter_map(|inline| match inline {
             Inline::Ruby(run) => Some(run.base_text()),
-            Inline::Text(run) if run.style.inline_role == InlineRole::Footnote => None,
+            Inline::Text(run) if matches!(run.style.inline_role, InlineRole::Footnote | InlineRole::PageMarker) => None,
             Inline::Text(run) if run.style.link_role == LinkRole::FootnoteBacklink => {
                 leading_backlink |= !started;
                 None
@@ -5412,6 +5412,7 @@ mod tests {
                 source: Some(source.clone()),
             })],
             anchors: vec![SectionAnchor {
+                page_label: None,
                 fragment: "note".into(),
                 source: source.start,
             }],
@@ -5721,6 +5722,7 @@ mod tests {
                 ],
             })],
             anchors: vec![SectionAnchor {
+                page_label: None,
                 fragment: "note-1".into(),
                 source: first_source.start.clone(),
             }],

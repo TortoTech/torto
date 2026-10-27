@@ -995,7 +995,7 @@ impl ShelfFeature {
         if import_books && !self.import_task.is_pending() {
             self.import_task.begin(());
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         egui::Panel::top("shelf-window-header")
             .exact_size(crate::app::window_chrome::HEIGHT)
             .resizable(false)
@@ -1029,7 +1029,7 @@ impl ShelfFeature {
                     }),
             )
             .show(root_ui, |ui| {
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                 self.shelf_header(ui, interaction_blocked);
                 let search_hint =
                     shelf_search_hint(self.language, self.shelf.library.books().len());
@@ -1113,7 +1113,7 @@ impl ShelfFeature {
             |ui| {
                 let row = ui.max_rect();
                 let actions_left = (row.right() - 200.0).max(row.left());
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 {
                     let rect = ui.max_rect();
                     crate::app::window_chrome::exclude(

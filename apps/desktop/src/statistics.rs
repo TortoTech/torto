@@ -661,7 +661,9 @@ impl Page {
             .show(root, |ui| {
                 let header = ui.max_rect();
                 let content = header.shrink2(egui::vec2(16.0, 0.0));
-                #[cfg(target_os = "windows")]
+                #[cfg(target_os = "macos")]
+                let content = egui::Rect::from_min_max(egui::pos2(content.left().max(crate::app::window_chrome::left_edge(ui.ctx())), content.top()), content.max);
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 let content = {
                     crate::app::window_chrome::header(ui.ctx(), header);
                     let right = (content.right()
@@ -683,7 +685,7 @@ impl Page {
                                 } else {
                                     language.text("返回书架", "Back to library")
                                 });
-                            #[cfg(target_os = "windows")]
+                            #[cfg(any(target_os = "windows", target_os = "macos"))]
                             crate::app::window_chrome::exclude(ui.ctx(), back.rect);
                             if back.clicked() {
                                 if detail {
@@ -695,7 +697,7 @@ impl Page {
                             if detail {
                                 let library = icon_button(ui, Icon::Library)
                                     .on_hover_text(language.text("返回书架", "Back to library"));
-                                #[cfg(target_os = "windows")]
+                                #[cfg(any(target_os = "windows", target_os = "macos"))]
                                 crate::app::window_chrome::exclude(ui.ctx(), library.rect);
                                 if library.clicked() {
                                     self.selected = None;

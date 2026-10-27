@@ -60,6 +60,14 @@ impl DesktopReader {
         self.is_focus_mode() && self.focus_style == FocusStyle::BackgroundHighlight
     }
 
+    pub(in crate::reader) fn focus_background_visible(&self) -> bool {
+        self.focus_background_highlight()
+            || self.is_focus_mode()
+                && self.focus_units.get(self.focus_unit_index).is_some_and(|unit| {
+                    unit.list_group.as_ref().is_some_and(|group| group.share_notes)
+                })
+    }
+
     pub(super) fn paint_focus_surroundings(
         &self,
         scene: &mut Scene,
@@ -166,6 +174,21 @@ mod tests {
              </body></html>",
         )
         .0
+    }
+
+    #[test]
+    fn surrounding_dim_adds_background_only_to_real_list_groups() {
+        let (mut reader, _) = html_fixture("<html><body><p>Before.</p><ul><li>First.</li><li>Second.</li></ul><p>After.</p></body></html>");
+        reader.focus_style = FocusStyle::SurroundingDim;
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        let list = reader.focus_units.iter().position(|unit| unit.list_group.as_ref().is_some_and(|group| group.share_notes)).unwrap();
+        reader.focus_unit_index = list;
+        assert!(reader.focus_background_visible());
+        std::sync::Arc::make_mut(reader.focus_units[list].list_group.as_mut().unwrap()).share_notes = false;
+        assert!(!reader.focus_background_visible());
+        reader.focus_style = FocusStyle::BackgroundHighlight;
+        assert!(reader.focus_background_visible());
     }
 
     #[test]

@@ -446,6 +446,9 @@ pub struct Section {
 /// One authored HTML/XML fragment identifier and its normalized source position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SectionAnchor {
+    /// Printed-page location, independent of dynamic pagination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_label: Option<String>,
     /// Decoded value of the source element's `id` or legacy `name` attribute.
     pub fragment: String,
     /// Stable position of the first rendered block at or after that element.
@@ -604,6 +607,8 @@ pub enum SeparatorKind {
     Symbols,
     /// An authored blank paragraph or equivalent vertical spacer.
     Spacing,
+    /// An explicit empty CSS box, retained independently from decorative separators.
+    AuthoredSpacing,
     /// A semantic or visual horizontal rule such as HTML `hr`.
     #[default]
     Rule,
@@ -1275,6 +1280,8 @@ pub enum InlineRole {
     Normal,
     /// An inline footnote whose body is embedded directly in the prose.
     Footnote,
+    /// A printed-page number; retained in book style and omitted from unified prose.
+    PageMarker,
 }
 
 /// Semantic role carried by an inline publication link.

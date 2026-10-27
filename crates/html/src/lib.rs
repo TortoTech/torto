@@ -16,6 +16,9 @@ use roxmltree::{Document, Node};
 use thiserror::Error;
 
 mod font_size;
+mod page_markers;
+mod recognized_tables;
+pub use recognized_tables::{parse_recognized_table, validate_recognized_table};
 mod font_faces;
 pub use font_faces::FontTraits;
 mod image_context;
@@ -385,6 +388,7 @@ pub fn parse_section_with_resource_metadata(
         parser.push_text_block(root, TextBlockKind::Paragraph, style)?;
     }
 
+    page_markers::annotate(root, &mut parser);
     structured_figures::attach_sources(&mut parser.blocks);
 
     #[cfg(debug_assertions)]
@@ -1094,6 +1098,22 @@ impl<'a> ReadingIrParser<'a> {
             self.paragraph_list_indents.clear();
         }
         self.queue_node_anchors(node);
+        if page_markers::is_marker(node) {
+            self.queue_descendant_anchors(node);
+            if node_has_visible_text(node) {
+                let start = self.blocks.len();
+                let style = self.styles.block_style(node, BlockStyle::default());
+                self.push_text_block(node, TextBlockKind::Paragraph, style)?;
+                if self.blocks.len() > start && let Block::Text(text) = self.blocks.remove(start) {
+                    let mut separator = SeparatorBlock::rule();
+                    separator.kind = rebook_publication::SeparatorKind::Symbols;
+                    separator.text = Some(text);
+                    self.blocks.insert(start, Block::Separator(separator));
+                }
+            }
+            self.suppressed_content = true;
+            return Ok(());
+        }
         if is_semantic_footnote_definition(node) {
             self.parse_footnote_definition(node)?;
             return Ok(());
@@ -1107,6 +1127,24 @@ impl<'a> ReadingIrParser<'a> {
             return Ok(());
         }
         if matches!(name.as_str(), "p" | "div") && self.try_parse_symbol_separator(node)? {
+            return Ok(());
+        }
+        if matches!(name.as_str(), "p" | "div") && !node_has_visible_text(node)
+            && !has_descendant_image(node) && !node.descendants().skip(1).any(|n| n.is_element() && matches!(n.tag_name().name(), "p" | "div" | "table" | "br" | "hr" | "math" | "svg" | "li"))
+            && page_markers::has_spacing(&self.styles, node)
+        {
+            self.queue_descendant_anchors(node);
+            if name == "p" { self.allocate_node(); }
+            let mut style = self.styles.block_style(node, BlockStyle::default());
+            let properties = self.styles.cascaded_properties(node);
+            let spacing = self.styles.quote_layout_metrics(node);
+            style.margin_before = spacing.before;
+            style.margin_after = spacing.after;
+            style.line_height = properties.get("height").or_else(|| properties.get("min-height")).and_then(|value| css_length(value)).unwrap_or(0.0).max(0.0) / 16.0;
+            let mut separator = SeparatorBlock::spacing(style);
+            separator.kind = rebook_publication::SeparatorKind::AuthoredSpacing;
+            if ["border", "border-top", "border-bottom"].iter().any(|key| self.styles.cascaded_properties(node).get(*key).is_some_and(|v| !matches!(v.trim(), "none" | "0" | "0px"))) { separator.kind = rebook_publication::SeparatorKind::Rule; }
+            self.blocks.push(Block::Separator(separator));
             return Ok(());
         }
         if name == "p" && self.try_parse_nested_media(node)? {
@@ -2094,6 +2132,11 @@ impl<'a> ReadingIrParser<'a> {
         if !collector.content.is_empty() {
             let source = self.source_range(&node_id, text_len);
             self.bind_pending_anchors(&source.start);
+            for (fragment, offset) in &collector.page_positions {
+                if let Some(anchor) = self.anchors.iter_mut().find(|anchor| &anchor.fragment == fragment) {
+                    anchor.source.text_offset = (*offset).min(text_len);
+                }
+            }
             self.blocks.push(Block::Text(TextBlock {
                 kind,
                 content: collector.content,
@@ -2240,6 +2283,10 @@ impl<'a> ReadingIrParser<'a> {
     }
 
     fn queue_node_anchors(&mut self, node: Node<'_, '_>) {
+        if page_markers::is_marker(node) && attribute_local(node, "id").is_none() {
+            let fragment = page_markers::fragment(node);
+            if self.seen_anchors.insert(fragment.clone()) { self.pending_anchors.push(fragment); }
+        }
         for fragment in [attribute_local(node, "id"), attribute_local(node, "name")]
             .into_iter()
             .flatten()
@@ -2257,6 +2304,7 @@ impl<'a> ReadingIrParser<'a> {
             self.pending_anchors
                 .drain(..)
                 .map(|fragment| SectionAnchor {
+                    page_label: None,
                     fragment,
                     source: source.clone(),
                 }),
@@ -2683,6 +2731,7 @@ fn is_implicit_note_container(
 }
 
 struct InlineCollector {
+    page_positions: Vec<(String, u64)>,
     content: Vec<Inline>,
     preserve_whitespace: bool,
     last_was_space: bool,
@@ -2691,6 +2740,7 @@ struct InlineCollector {
 impl InlineCollector {
     fn new(preserve_whitespace: bool) -> Self {
         Self {
+            page_positions: Vec::new(),
             content: Vec::new(),
             preserve_whitespace,
             last_was_space: true,
@@ -3062,6 +3112,19 @@ fn collect_inline_node_with_block_boundaries(
         }).sum::<usize>();
         collector.push_text(&"\u{2060}".repeat(count), inherited, link.cloned());
         collector.last_was_space = hidden.last_was_space;
+        return;
+    }
+    if page_markers::is_marker(node) {
+        let offset = collector.content.iter().map(|inline| match inline {
+            Inline::Text(run) => run.text.chars().count() as u64,
+            Inline::Ruby(run) => run.source_char_len() as u64,
+            Inline::Break => 1, _ => 0,
+        }).sum();
+        collector.page_positions.push((page_markers::fragment(node), offset));
+        let mut style = inherited;
+        style.inline_role = InlineRole::PageMarker;
+        let value: String = node.descendants().filter(Node::is_text).filter_map(|n| n.text()).collect();
+        collector.push_text(&value, style, None);
         return;
     }
     if name == "ruby" {

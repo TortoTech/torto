@@ -239,6 +239,11 @@ impl TranslationBookSource {
                 ) {
                     return;
                 }
+                if matches!((raw, prepared), (Block::Image(_), Block::Table(_)))
+                    || matches!((raw, prepared), (Block::Figure(a), Block::Figure(b)) if a.body.iter().all(|b| !matches!(b, Block::Table(_))) && b.body.iter().any(|b| matches!(b, Block::Table(_))))
+                {
+                    if let Some(stored) = state.sections.get_mut(&section) { stored.remove(&index); }
+                }
                 state
                     .prepared_inputs
                     .insert((section, index), (raw.clone(), prepared.clone()));
@@ -685,8 +690,10 @@ fn translation_input_source_range(
 }
 
 fn source_range_nodes_overlap(source: &SourceRange, visible: &SourceRange) -> bool {
+    let image_child = |a: &str, b: &str| a.strip_prefix(b).is_some_and(|tail| tail.starts_with("-table-"));
     source.start.spine == visible.start.spine
-        && (source.start.node == visible.start.node
+        && (image_child(&source.start.node, &visible.start.node) || image_child(&source.start.node, &visible.end.node)
+            || source.start.node == visible.start.node
             || source.start.node == visible.end.node
             || source.end.node == visible.start.node
             || source.end.node == visible.end.node)
@@ -1384,6 +1391,7 @@ fn translation_text(block: &TextBlock) -> String {
     let mut website = 0;
     let notes = rebook_layout::paragraph_footnotes(block);
     for (index, inline) in block.content.iter().enumerate() {
+        if matches!(inline, Inline::Text(run) if run.style.inline_role == InlineRole::PageMarker) { continue; }
         let next = match inline {
             Inline::Text(run) => run.style.inline_citation,
             _ => 0,
@@ -2045,12 +2053,11 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
     {
         style.keyword_size_scale = None;
     }
-    if original.iter().flat_map(Inline::text_runs)
-        .filter(|run| run.style.baseline == TextBaseline::Normal)
-        .any(|run| run.style.inline_size_scale != style.inline_size_scale)
-    {
-        style.inline_size_scale = None;
-    }
+    // Unmarked output is the model's decision to use paragraph typography.
+    // Explicit returned t-size tags are restored separately, including exact
+    // authored ratios. Do not silently put an omitted inline variation back.
+    style.inline_size_scale = None;
+    style.size_scale = style.keyword_size_scale.unwrap_or(1.0);
     style.bold = false;
     style.italic = false;
     style.emphasis = false;
@@ -2395,7 +2402,7 @@ fn restore_original_baselines(
                 }
                 (run.style.baseline != TextBaseline::Normal
                     || run.style.link_role != LinkRole::Normal
-                    || run.style.inline_role != InlineRole::Normal)
+                    || run.style.inline_role == InlineRole::Footnote)
                     .then_some((
                         run.text.as_str(),
                         run.style,
@@ -3649,6 +3656,18 @@ mod tests {
             Some(&original),
         );
         assert!(matches!(&translated[0], Inline::Text(run) if run.style.size_scale == 0.8889));
+    }
+
+    #[test]
+    fn model_can_omit_typographic_sizes_or_retain_meaningful_sizes() {
+        let block = TextBlock { kind: TextBlockKind::Paragraph, source: None, style: Default::default(),
+            content: vec![Inline::Text(TextRun { text: "A.M.".into(), link: None,
+                style: TextStyle { size_scale: 0.75, inline_size_scale: Some(0.75), ..Default::default() } })] };
+        assert!(translation_text(&block).contains("<t-size scale=\"0.75\">A.M.</t-size>"));
+        let plain = replacement_content("凌晨", TextStyle::default(), Some(&block.content));
+        assert!(plain.iter().flat_map(Inline::text_runs).all(|run| run.style.inline_size_scale.is_none() && run.style.size_scale == 1.0));
+        let sized = replacement_content("<t-size scale=\"0.75\">特殊符号</t-size>", TextStyle::default(), Some(&block.content));
+        assert!(sized.iter().flat_map(Inline::text_runs).all(|run| run.style.size_scale == 0.75));
     }
 
     #[test]

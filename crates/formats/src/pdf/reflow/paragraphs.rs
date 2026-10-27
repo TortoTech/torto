@@ -131,6 +131,7 @@ fn merge(
     old_index: usize,
     next: &mut StoredSection,
     new_index: usize,
+    words: Option<&HashSet<String>>,
 ) {
     let Block::Text(first) = next.section.blocks.remove(new_index) else {
         unreachable!()
@@ -139,7 +140,13 @@ fn merge(
         unreachable!()
     };
     let new_node = first.source.as_ref().unwrap().start.node.clone();
-    let movement = crate::reflow::append_text(last, first).unwrap();
+    let old_end = last.source.as_ref().unwrap().end.text_offset;
+    let movement = crate::reflow::append_recovered_text(last, first, words).unwrap();
+    if movement.to.text_offset < old_end {
+        for slice in previous.provenance.iter_mut().filter(|slice| slice.source.start.node == movement.to.node) {
+            slice.source.end.text_offset = slice.source.end.text_offset.min(movement.to.text_offset).max(slice.source.start.text_offset);
+        }
+    }
     let offset = movement.to.text_offset;
     let old_node = movement.to.node.clone();
     let target = movement.to.spine.clone();
@@ -206,6 +213,7 @@ pub(super) fn across_pages(
     old_frame: Option<layout::BodyFrame>,
     new_frame: Option<layout::BodyFrame>,
     floats: &Floats,
+    words: Option<&HashSet<String>>,
 ) {
     let Some(old_index) = previous
         .section
@@ -286,7 +294,7 @@ pub(super) fn across_pages(
     {
         return;
     }
-    merge(previous, old_index, next, new_index);
+    merge(previous, old_index, next, new_index, words);
 }
 
 pub(super) fn same_page(stored: &mut StoredSection, body: f64, floats: &Floats) {
@@ -367,7 +375,7 @@ pub(super) fn same_page(stored: &mut StoredSection, body: f64, floats: &Floats) 
                 true
             }
         });
-        merge(stored, i, &mut next, j - i - 1);
+        merge(stored, i, &mut next, j - i - 1, None);
         // Keep the figures immediately after the now complete paragraph.
         let appended = stored
             .section
@@ -526,6 +534,7 @@ mod tests {
         );
         stored.section.blocks = vec![old, image, new];
         stored.section.anchors.push(SectionAnchor {
+            page_label: None,
             fragment: "continued".into(),
             source: stored.provenance.last().unwrap().source.start.clone(),
         });
@@ -632,7 +641,7 @@ mod tests {
             left: 100.0,
             right: 500.0,
         });
-        across_pages(&mut old, &mut next, 10.0, frame, frame, &floats(1));
+        across_pages(&mut old, &mut next, 10.0, frame, frame, &floats(1), None);
         assert!(next.section.blocks.is_empty());
         assert_eq!(
             plain(paragraph(&old.section.blocks[0]).unwrap()),
@@ -794,6 +803,7 @@ mod tests {
             r.link = Some(link.clone());
         }
         next.section.anchors.push(SectionAnchor {
+            page_label: None,
             fragment: "page".into(),
             source: next.provenance.last().unwrap().source.start.clone(),
         });
@@ -821,6 +831,7 @@ mod tests {
                 right: 480.0,
             }),
             &floats(2),
+            None,
         );
         assert_eq!(
             plain(paragraph(&old.section.blocks[0]).unwrap()),

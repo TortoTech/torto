@@ -137,6 +137,7 @@ fn chapter_book_with_progress(
     };
     let anchors = (0..CHAPTERS)
         .map(|chapter| SectionAnchor {
+            page_label: None,
             fragment: format!("nav_point_{chapter}"),
             source: chapter_start(chapter),
         })

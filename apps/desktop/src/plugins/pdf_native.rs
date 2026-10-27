@@ -544,6 +544,7 @@ mod tests {
                     source: Some(range.clone()),
                 })],
                 anchors: vec![SectionAnchor {
+                    page_label: None,
                     fragment: "pdf-page-1".into(),
                     source: range.start,
                 }],

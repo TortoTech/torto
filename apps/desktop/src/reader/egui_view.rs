@@ -466,10 +466,11 @@ fn panel_resize_pointer(
     edge_x: f32,
     covered_by_drawer: bool,
 ) -> Option<f32> {
-    #[cfg(not(target_os = "windows"))]
     let viewport = ctx.content_rect();
-    #[cfg(target_os = "windows")]
-    let viewport = crate::app::window_chrome::body_rect(ctx);
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let top = viewport.top();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let top = viewport.top() + TOOLBAR_HEIGHT;
     let response = egui::Area::new(id.into())
         .fade_in(false)
         .order(if covered_by_drawer {
@@ -479,11 +480,11 @@ fn panel_resize_pointer(
         })
         .fixed_pos(Pos2::new(
             edge_x - PANEL_RESIZE_HANDLE_WIDTH / 2.0,
-            viewport.top() + TOOLBAR_HEIGHT,
+            top,
         ))
         .show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(
-                Vec2::new(PANEL_RESIZE_HANDLE_WIDTH, (viewport.height() - TOOLBAR_HEIGHT).max(1.0)),
+                Vec2::new(PANEL_RESIZE_HANDLE_WIDTH, (viewport.bottom() - top).max(1.0)),
                 if covered_by_drawer { egui::Sense::hover() } else { egui::Sense::drag() },
             );
             let response = if covered_by_drawer {
@@ -506,6 +507,10 @@ fn panel_resize_pointer(
     if covered_by_drawer {
         return None;
     }
+    // The divider owns its strip through the integrated title bar as well.
+    // Resizing there must not also start a native window drag.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    crate::app::window_chrome::exclude(ctx, response.rect);
     response
         .dragged()
         .then(|| response.interact_pointer_pos().map(|position| position.x))
@@ -684,7 +689,7 @@ impl DesktopReader {
             ctx.request_repaint_after(deadline.saturating_duration_since(now));
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let screen = ctx.content_rect();
             crate::app::window_chrome::header(
@@ -697,10 +702,10 @@ impl DesktopReader {
             );
         }
         let (sidebar_progress, assistant_progress) = self.show_side_panels(root_ui);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         self.window_menu(&ctx);
         if self.completion.is_some() {
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             egui::Panel::top("completion-header-space")
                 .exact_size(TOOLBAR_HEIGHT)
                 .show(root_ui, |_| {});
@@ -714,7 +719,7 @@ impl DesktopReader {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(background_ui))
             .show(root_ui, |ui| {
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                 {
                     toolbar_rect = Rect::from_min_size(
                         ui.next_widget_position(),
@@ -722,7 +727,7 @@ impl DesktopReader {
                     );
                     self.toolbar(ui, background_ui);
                 }
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 {
                     let (row, _) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width(), TOOLBAR_HEIGHT),
@@ -843,16 +848,16 @@ impl DesktopReader {
         }
         self.image_preview_overlay(&ctx);
         self.media_preview_overlay(&ctx);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         if self.preview_is_open() {
             crate::app::window_chrome::block_drag(&ctx);
         }
         self.feedback(&ctx);
         self.pdf_toc_review(&ctx);
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let pointer_over_header = crate::app::window_chrome::state(&ctx).header_hovered;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let pointer_over_header = false;
         if !pointer_over_header
             && should_hide_reader_cursor(
@@ -1205,6 +1210,8 @@ impl DesktopReader {
                 .show(root_ui, |ui| {
                     // Reserve the final reader width once. Animate only the panel's
                     // paint and input bounds, so text is not repaginated each frame.
+                    let mut header_painter = ui.painter().clone();
+                    header_painter.set_opacity(assistant_progress);
                     let clip = ui.max_rect();
                     let rect = clip
                         .translate(Vec2::new(assistant_width * (1.0 - assistant_progress), 0.0));
@@ -1226,8 +1233,9 @@ impl DesktopReader {
                             TOOLBAR_HEIGHT,
                         ),
                     );
-                    ui.painter()
-                        .rect_filled(header, 0.0, color32(self.reader.style().background));
+                    // The header spans the panel frame, including both padding
+                    // strips; only transcript/input content uses the inset clip.
+                    header_painter.rect_filled(header, 0.0, color32(self.reader.style().background));
                     if ui.rect_contains_pointer(ui.max_rect())
                         && ui.input(|input| input.pointer.any_pressed())
                     {
@@ -2299,7 +2307,7 @@ impl DesktopReader {
         self.turn_page(direction);
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn window_menu(&mut self, ctx: &egui::Context) {
         if self.ui.toolbar_motion.value <= 0.02 && self.ui.overlay != ReaderOverlay::Menu {
             return;
@@ -2348,17 +2356,22 @@ impl DesktopReader {
         } else {
             page_rect.left()
         };
-        #[cfg(target_os = "windows")]
+        #[cfg(target_os = "macos")]
+        let left = left.max(crate::app::window_chrome::left_edge(ctx));
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let menu_left = screen.right()
             - crate::app::window_chrome::reserve_width(ctx)
             - TOOLBAR_CONTROL_SIZE
             - 12.0;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let menu_left = page_rect.right() - TOOLBAR_CONTROL_SIZE - 12.0;
         let y = screen.top() + (TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) * 0.5;
-        if (hovered || self.ui.sidebar_open || floating)
-            && !(self.is_focus_mode() && (self.ui.sidebar_open || floating))
-        {
+        let left_opacity = if self.is_focus_mode() {
+            chrome::header_opacity(1.0 - sidebar_progress)
+        } else {
+            chrome::header_opacity((sidebar_progress * 2.0 - 1.0).abs())
+        } * if self.ui.sidebar_open || floating { 1.0 } else { self.ui.toolbar_motion.value.clamp(0.0, 1.0) };
+        if (hovered || self.ui.sidebar_open || floating) && left_opacity > 0.02 {
             egui::Area::new(egui::Id::new("reader-left-sidebar-toggle"))
                 .fade_in(false)
                 .order(egui::Order::Foreground)
@@ -2366,6 +2379,7 @@ impl DesktopReader {
                 .constrain(false)
                 .default_size(Vec2::splat(TOOLBAR_CONTROL_SIZE))
                 .show(ctx, |ui| {
+                    ui.multiply_opacity(left_opacity);
                     if self.ui.opening_toolbar_pending {
                         chrome::dim_loading_controls(ui);
                     }
@@ -2411,6 +2425,17 @@ impl DesktopReader {
         }
     }
 
+    fn left_toolbar_opacity(&self) -> f32 {
+        let progress = self.ui.sidebar_motion.value.clamp(0.0, 1.0);
+        if self.is_focus_mode() || !self.ui.sidebar_pinned {
+            chrome::header_opacity(1.0 - progress)
+        } else {
+            // Fade moving actions out before handing the header to the other
+            // layout, then fade them back in as the panel reaches its endpoint.
+            chrome::header_opacity((progress * 2.0 - 1.0).abs())
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui, background: Color32) {
         let vertical_padding = ((TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) / 2.0) as i8;
         let toolbar_width = ui.available_width();
@@ -2419,6 +2444,8 @@ impl DesktopReader {
             Vec2::new(toolbar_width, TOOLBAR_HEIGHT),
         );
         let content_left = self.toolbar_content_left(toolbar_width);
+        let left_opacity = self.left_toolbar_opacity()
+            * if self.ui.overlay == ReaderOverlay::Menu { 1.0 } else { self.ui.toolbar_motion.value.clamp(0.0, 1.0) };
         let toolbar_actions_visible = self.ui.toolbar_motion.value.clamp(0.0, 1.0) > 0.02
             || self.ui.overlay == ReaderOverlay::Menu;
         egui::Frame::new()
@@ -2434,7 +2461,7 @@ impl DesktopReader {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let left_control_count = 3.0 + self.pdf_ocr_toolbar_control_count();
                     let left_controls_width = TOOLBAR_CONTROL_SIZE * left_control_count;
-                    #[cfg(target_os = "windows")]
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
                     if toolbar_actions_visible {
                         crate::app::window_chrome::exclude(
                             ui.ctx(),
@@ -2454,24 +2481,28 @@ impl DesktopReader {
                     let button_left = f32::from(SIDEBAR_PADDING);
                     ui.add_space(button_left);
                     if toolbar_actions_visible {
-                        ui.allocate_space(Vec2::splat(TOOLBAR_CONTROL_SIZE));
-                        if icon_button(ui, Icon::Library)
-                            .on_hover_text(self.language.text("返回书架", "Back to library"))
-                            .clicked()
-                        {
-                            self.request_exit();
-                        }
-                        if selectable_icon_button(ui, Icon::Languages, self.translation.enabled)
-                            .on_hover_text(if self.translation.enabled {
-                                self.language.text("关闭翻译", "Turn translation off")
-                            } else {
-                                self.language.text("开启翻译", "Turn translation on")
-                            })
-                            .clicked()
-                        {
-                            self.toggle_translation();
-                        }
-                        self.pdf_ocr_toolbar_controls(ui);
+                        ui.scope(|ui| {
+                            ui.multiply_opacity(left_opacity);
+                            if left_opacity <= 0.02 { ui.set_invisible(); }
+                            ui.allocate_space(Vec2::splat(TOOLBAR_CONTROL_SIZE));
+                            if icon_button(ui, Icon::Library)
+                                .on_hover_text(self.language.text("返回书架", "Back to library"))
+                                .clicked()
+                            {
+                                self.request_exit();
+                            }
+                            if selectable_icon_button(ui, Icon::Languages, self.translation.enabled)
+                                .on_hover_text(if self.translation.enabled {
+                                    self.language.text("关闭翻译", "Turn translation off")
+                                } else {
+                                    self.language.text("开启翻译", "Turn translation on")
+                                })
+                                .clicked()
+                            {
+                                self.toggle_translation();
+                            }
+                            self.pdf_ocr_toolbar_controls(ui);
+                        });
                     } else {
                         ui.allocate_space(Vec2::new(left_controls_width, TOOLBAR_CONTROL_SIZE));
                     }
@@ -2483,7 +2514,7 @@ impl DesktopReader {
                                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
                             |ui| {
                                 ui.add_space(12.0);
-                                #[cfg(not(target_os = "windows"))]
+                                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                                 if icon_button(ui, Icon::Menu)
                                     .on_hover_text(self.language.text("菜单", "Menu"))
                                     .clicked()
@@ -2498,9 +2529,9 @@ impl DesktopReader {
                     }
                 });
             });
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let hovered = crate::app::window_chrome::state(ui.ctx()).header_hovered;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let hovered = ui.ctx().input(|input| {
             input
                 .pointer
@@ -2530,7 +2561,7 @@ impl DesktopReader {
                     if pending {
                         let (rect, response) =
                             ui.allocate_exact_size(egui::Vec2::splat(32.0), egui::Sense::click());
-                        #[cfg(target_os = "windows")]
+                        #[cfg(any(target_os = "windows", target_os = "macos"))]
                         crate::app::window_chrome::exclude(ui.ctx(), rect);
                         crate::ui::LoadingSpinner::new()
                             .color(palette().accent)
@@ -2660,6 +2691,7 @@ impl DesktopReader {
             self.ui.sidebar_pinned,
             self.ui.sidebar_tab,
             !self.ui.opening_toolbar_pending,
+            self.ui.sidebar_motion.value,
         ) {
             Some(chrome::SidebarAction::TogglePin) => {
                 self.ui.sidebar_pinned = !self.ui.sidebar_pinned
@@ -2683,7 +2715,7 @@ impl DesktopReader {
         // The backdrop also covers the caption row; window controls receive the same dimming.
         let screen = ctx.content_rect();
         let scrim_rect = screen;
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         crate::app::window_chrome::dim_header(
             ctx,
             0.31 * progress,
@@ -2699,12 +2731,12 @@ impl DesktopReader {
                 ui.set_clip_rect(scrim_rect);
                 let (rect, response) =
                     ui.allocate_exact_size(scrim_rect.size(), egui::Sense::click());
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 let paint_rect = Rect::from_min_max(
                     Pos2::new(screen.left(), screen.top() + TOOLBAR_HEIGHT),
                     screen.max,
                 );
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                 let paint_rect = screen;
                 ui.painter().with_clip_rect(paint_rect).rect_filled(
                     rect,
@@ -2738,9 +2770,9 @@ impl DesktopReader {
 
     fn focus_assistant_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
         self.sync_focus_chat_session();
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let viewport = ctx.content_rect();
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let viewport = crate::app::window_chrome::body_rect(ctx);
         let style = self.reader.style();
         let content_right = page_rect.left()
@@ -2933,9 +2965,9 @@ impl DesktopReader {
             .copied()
             .unwrap_or(0.0);
         let mut next_scroll_offset = scroll_offset;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let viewport = ctx.content_rect();
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let viewport = crate::app::window_chrome::body_rect(ctx);
         let style = self.reader.style();
         let content_right = page_rect.left()
@@ -4565,13 +4597,13 @@ impl DesktopReader {
         if progress <= 0.001 {
             return;
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let assistant_inset = if self.is_focus_mode() {
             0.0
         } else {
             ASSISTANT_WIDTH * self.ui.assistant_motion.value.clamp(0.0, 1.0)
         };
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let assistant_inset = crate::app::window_chrome::reserve_width(ctx);
         let menu = egui::Area::new("reader-menu".into())
             .order(egui::Order::Tooltip)
@@ -6681,9 +6713,9 @@ pub(crate) fn paint_toolbar_title(
 ) {
     // The title follows the body center. Controls only constrain its available
     // width, so asymmetric native caption buttons cannot shift the title.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let right_controls_width = TOOLBAR_CONTROL_SIZE;
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let right_controls_width = TOOLBAR_CONTROL_SIZE * 2.0 + 12.0;
     let title_clip = Rect::from_min_max(
         Pos2::new(
@@ -6698,7 +6730,7 @@ pub(crate) fn paint_toolbar_title(
             toolbar_rect.bottom(),
         ),
     );
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let title_clip = {
         let mut title_clip = title_clip;
         for rect in crate::app::window_chrome::geometry(ui.ctx()).excluded {
@@ -7786,6 +7818,153 @@ mod reference_suggestion_label_tests {
         }
     }
 
+    #[test]
+    fn sidebar_header_icons_fade_on_reversal_and_respect_native_button_space() {
+        let ctx = egui::Context::default();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        crate::ui::configure(&ctx, &Default::default(), crate::preferences::AppLanguage::English, runtime.handle());
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+        let mut samples = Vec::new();
+        for progress in [0.25_f32, 0.5, 0.75, 1.0, 0.75, 0.5, 0.25] {
+            let mut alphas = Vec::new();
+            for _ in 0..2 {
+                let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |root| {
+                    let rect = Rect::from_min_max(Pos2::new(-256.0 * (1.0 - progress), 0.0), Pos2::new(256.0 * progress, TOOLBAR_HEIGHT));
+                    let mut sidebar = root.new_child(egui::UiBuilder::new().max_rect(rect));
+                    sidebar.set_clip_rect(screen.intersect(rect));
+                    chrome::sidebar_frame(true).show(&mut sidebar, |ui| {
+                        chrome::sidebar_toolbar(ui, crate::preferences::AppLanguage::English, crate::preferences::ReadingMode::Classic, false, SidebarTab::Toc, true, progress);
+                    });
+                });
+                output.textures_delta.clear();
+                alphas.clear();
+                for shape in &output.shapes {
+                    if let egui::Shape::Rect(icon) = &shape.shape {
+                        if icon.brush.is_none() { continue; }
+                        let visible = icon.rect.intersect(shape.clip_rect);
+                        if visible.is_positive() {
+                            #[cfg(target_os = "macos")]
+                            assert!(visible.left() >= crate::app::window_chrome::left_edge(&ctx), "animated icon entered the native traffic-light area");
+                            alphas.push(icon.fill.a());
+                        }
+                    }
+                }
+            }
+            samples.push(alphas.into_iter().max().unwrap_or(0));
+        }
+        assert!(samples[1] > 0 && samples[1] < samples[2] && samples[2] < samples[3], "icons must fade instead of snapping: {samples:?}");
+        assert_eq!(samples[0], samples[6]);
+        assert_eq!(samples[1], samples[5]);
+        assert_eq!(samples[2], samples[4]);
+    }
+
+    #[test]
+    fn reader_header_controls_fade_during_sidebar_layout_changes() {
+        use crate::preferences::ReadingMode;
+        for (mode, pinned) in [(ReadingMode::Classic, true), (ReadingMode::Classic, false), (ReadingMode::Focus, false)] {
+            let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+            reader.reading_mode = mode;
+            reader.ui.sidebar_pinned = pinned;
+            reader.ui.toolbar_motion = super::super::Motion::settled(1.0);
+            let ctx = egui::Context::default();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            crate::ui::configure(&ctx, &Default::default(), crate::preferences::AppLanguage::English, runtime.handle());
+            let mut samples = Vec::new();
+            for progress in [0.0_f32, 0.25, 0.5, 0.75, 1.0, 0.75, 0.5, 0.25, 0.0] {
+                reader.ui.sidebar_motion = super::super::Motion::settled(progress);
+                let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))), ..Default::default() }, |root| {
+                    reader.toolbar(root, Color32::WHITE);
+                });
+                output.textures_delta.clear();
+                let alpha = output.shapes.iter().filter_map(|shape| match &shape.shape { egui::Shape::Rect(icon) if icon.brush.is_some() => Some(icon.fill.a()), _ => None }).max().unwrap_or(0);
+                samples.push(alpha);
+            }
+            assert!(samples[0] > samples[1] && samples[1] > samples[2], "moving controls must fade out: {mode:?}, {samples:?}");
+            if mode == ReadingMode::Classic && pinned {
+                assert!(samples[2] < samples[3] && samples[3] < samples[4], "pinned header must fade back in at its new position");
+            } else {
+                assert_eq!(samples[4], 0, "drawer must fully cover the previous header actions");
+            }
+            assert_eq!(&samples[..4], &samples[5..].iter().copied().rev().collect::<Vec<_>>()[..], "reversing the motion must preserve opacity");
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn dragging_a_divider_in_the_header_does_not_drag_the_window() {
+        use crate::app::window_chrome;
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+        let mut resized = None;
+        for frame in 0..5 {
+            let point = Pos2::new(if frame < 3 { 240.0 } else { 280.0 }, 20.0);
+            let mut events = vec![egui::Event::PointerMoved(point)];
+            if frame == 2 || frame == 4 {
+                events.push(egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: frame == 2, modifiers: egui::Modifiers::NONE });
+            }
+            let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), events, ..Default::default() }, |_| {
+                window_chrome::begin_frame(&ctx);
+                window_chrome::header(&ctx, Rect::from_min_size(screen.min, Vec2::new(screen.width(), TOOLBAR_HEIGHT)));
+                resized = panel_resize_pointer(&ctx, "header-divider-test", 240.0, false).or(resized);
+                window_chrome::paint_controls(&ctx);
+            });
+            output.textures_delta.clear();
+            assert!(output.viewport_output.values().all(|viewport| viewport.commands.iter().all(|command| !matches!(command, egui::ViewportCommand::StartDrag))));
+        }
+        assert_eq!(resized, Some(280.0));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn side_panel_headers_and_dividers_cover_the_title_bar_in_both_modes() {
+        use crate::app::window_chrome;
+        use crate::preferences::ReadingMode;
+        for (mode, pinned) in [(ReadingMode::Classic, true), (ReadingMode::Classic, false), (ReadingMode::Focus, false)] {
+            let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+            reader.reading_mode = mode;
+            reader.ui.sidebar_pinned = pinned;
+            reader.ui.sidebar_open = true;
+            reader.ui.sidebar_motion = super::super::Motion::settled(1.0);
+            reader.ui.toolbar_motion = super::super::Motion::settled(1.0);
+            reader.ui.assistant_presentation = super::super::AssistantPresentation::Sidebar;
+            reader.ui.assistant_panel = Some(AssistantPanel::Chat);
+            reader.ui.assistant_motion = super::super::Motion::settled(1.0);
+            let ctx = egui::Context::default();
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+            for frame in 0..3 {
+                let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |root| {
+                    window_chrome::begin_frame(&ctx);
+                    reader.ui(root, None, false);
+                    window_chrome::paint_controls(&ctx);
+                });
+                output.textures_delta.clear();
+                if frame == 0 { continue; }
+                let panel = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("reader-assistant")).unwrap().outer_rect;
+                let header = Rect::from_min_max(panel.min, Pos2::new(panel.right(), panel.top() + TOOLBAR_HEIGHT));
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect)
+                    if rect.rect.height() == TOOLBAR_HEIGHT
+                        && rect.fill == color32(reader.reader.style().background)
+                        && rect.rect.intersect(shape.clip_rect).contains_rect(header))),
+                    "assistant header must paint through both frame padding strips: {mode:?}, pinned={pinned}");
+                let left_header = Rect::from_min_max(screen.min, Pos2::new(reader.ui.sidebar_display_width, TOOLBAR_HEIGHT));
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect)
+                    if rect.fill == palette().surface && rect.rect.intersect(shape.clip_rect).contains_rect(left_header))),
+                    "left sidebar frame must cover its complete header: {mode:?}, pinned={pinned}");
+                for edge in [reader.ui.sidebar_display_width, panel.left()] {
+                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::LineSegment { points, .. }
+                        if (points[0].x - edge).abs() < 0.1 && points[0].y == screen.top() && points[1].y == screen.bottom()
+                            && shape.clip_rect.contains(points[0]) && shape.clip_rect.contains(points[1]))),
+                        "divider must span header and body: {mode:?}, pinned={pinned}, edge={edge}");
+                }
+                let exclusions = window_chrome::geometry(&ctx).excluded;
+                assert!(exclusions.iter().any(|rect| rect.contains(Pos2::new(reader.ui.sidebar_display_width, 20.0))), "left divider must exclude native window dragging");
+                if pinned {
+                    assert!(exclusions.iter().any(|rect| rect.contains(Pos2::new(panel.left(), 20.0))), "right divider must exclude native window dragging");
+                }
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn three_column_headers_leave_caption_buttons_and_menu_clear() {
@@ -7982,13 +8161,9 @@ mod reference_suggestion_label_tests {
                 assert_eq!(scrim.top(), screen.top());
                 assert_eq!(scrim.bottom(), screen.bottom());
                 assert_eq!(scrim.width(), screen.width());
-                assert!(
-                    ctx.memory(
-                        |memory| memory.area_rect(egui::Id::new("reader-left-sidebar-toggle"))
-                    )
-                    .is_none(),
-                    "open focus drawer hides the external expansion button"
-                );
+                let toggle_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("reader-left-sidebar-toggle"));
+                assert_eq!(ctx.memory(|memory| memory.areas().is_visible(&toggle_layer)), progress < 0.999,
+                    "external expansion button fades during the transition and is hidden at the fully open endpoint");
                 assert!(!window_chrome::geometry(&ctx).drag_enabled);
                 assert!(
                     (window_chrome::geometry(&ctx).header_masks[0].1 - 0.31 * progress).abs()

@@ -156,14 +156,14 @@ pub(crate) fn toc_row(
 }
 
 pub(crate) fn sidebar_frame(floating: bool) -> egui::Frame {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let margin = egui::Margin {
         top: ((super::egui_view::TOOLBAR_HEIGHT - super::egui_view::TOOLBAR_CONTROL_SIZE) / 2.0)
             as i8
             - i8::from(floating),
         ..egui::Margin::same(8)
     };
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let margin = if floating {
         egui::Margin {
             top: ((super::egui_view::TOOLBAR_HEIGHT - super::egui_view::TOOLBAR_CONTROL_SIZE) / 2.0)
@@ -189,6 +189,12 @@ pub(crate) enum SidebarAction {
     Tab(super::SidebarTab),
 }
 
+/// Use the existing panel motion for fades; no independent timer or repaint loop.
+pub(crate) fn header_opacity(progress: f32) -> f32 {
+    let value = progress.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
+}
+
 pub(crate) fn sidebar_toolbar(
     ui: &mut egui::Ui,
     language: crate::preferences::AppLanguage,
@@ -196,10 +202,21 @@ pub(crate) fn sidebar_toolbar(
     pinned: bool,
     tab: super::SidebarTab,
     reader_ready: bool,
+    progress: f32,
 ) -> Option<SidebarAction> {
     use crate::ui::{Icon, icon_button, selectable_icon_button};
     let mut action = None;
     ui.horizontal(|ui| {
+        ui.multiply_opacity(header_opacity(progress));
+        if progress <= 0.001 { ui.set_invisible(); }
+        #[cfg(target_os = "macos")]
+        {
+            let left = crate::app::window_chrome::left_edge(ui.ctx());
+            let mut clip = ui.clip_rect();
+            clip.min.x = clip.min.x.max(left);
+            ui.set_clip_rect(clip);
+            ui.add_space((left - ui.max_rect().left()).max(0.0));
+        }
         if !reader_ready {
             dim_loading_controls(ui);
         }
