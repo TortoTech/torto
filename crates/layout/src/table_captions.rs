@@ -2,7 +2,7 @@
 use rebook_publication::{Inline, LinkRole, TableBlock, TextBlock, TextBlockKind, TextRun};
 use std::borrow::Cow;
 
-pub(super) struct Presentation<'a> {
+pub struct Presentation<'a> {
     pub skip_title: bool,
     pub skip_sources: usize,
     pub before: Cow<'a, [TextBlock]>,
@@ -115,7 +115,7 @@ fn caption_state(block: &TextBlock) -> CaptionState {
     }
 }
 
-pub(super) fn presentation(table: &TableBlock, unified: bool) -> Presentation<'_> {
+pub fn presentation(table: &TableBlock, unified: bool) -> Presentation<'_> {
     let mut result = Presentation {
         skip_title: false,
         skip_sources: 0,

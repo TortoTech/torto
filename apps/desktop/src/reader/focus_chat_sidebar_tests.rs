@@ -30,6 +30,8 @@ fn shortcut(reader: &mut DesktopReader, ctx: &egui::Context, binding: egui::Keyb
     );
     output.shapes.clear();
     output.textures_delta.clear();
+    // Allow finite transitions to finish before the next physical key press.
+    reader.advance_frame(Instant::now() + Duration::from_millis(200));
     // Every call is a separate physical key press.
     let mut output = ctx.run_ui(
         egui::RawInput {
@@ -49,6 +51,7 @@ fn shortcut(reader: &mut DesktopReader, ctx: &egui::Context, binding: egui::Keyb
 }
 
 fn sidebar_frame(reader: &mut DesktopReader, ctx: &egui::Context, events: Vec<egui::Event>) {
+    reader.advance_frame(Instant::now() + Duration::from_millis(200));
     let mut output = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1_200.0, 800.0))),
@@ -131,6 +134,7 @@ fn chat_shortcut_from_body_focuses_open_sidebar_input_and_keeps_book_session() {
     let ctx = egui::Context::default();
     let binding = reader.shortcuts.focus_chat;
     for frame in 0..4 {
+        reader.advance_frame(Instant::now() + Duration::from_millis(200));
         if frame == 1 {
             reader.ui.assistant_keyboard_focus = false;
             ctx.memory_mut(egui::Memory::stop_text_input);
@@ -298,6 +302,7 @@ fn sidebar_resize_and_close_keep_the_selected_source_anchor() {
             reader.close_assistant_panel();
         }
         for _ in 0..3 {
+            reader.advance_frame(Instant::now() + Duration::from_millis(200));
             let mut output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 800.0))),
@@ -317,6 +322,52 @@ fn sidebar_resize_and_close_keep_the_selected_source_anchor() {
         assert_eq!(reader.chat.session_id, session);
         assert_eq!(reader.ui.assistant_motion.is_animating(), false);
     }
+}
+
+#[test]
+fn sidebar_animation_reserves_width_once_and_releases_it_after_closing() {
+    let mut reader = reader();
+    reader.toggle_assistant_panel(AssistantPanel::Chat);
+    let ctx = egui::Context::default();
+    let mut widths = Vec::new();
+    for progress in [0.0, 0.25, 0.75, 1.0, 0.75, 0.25] {
+        reader.ui.assistant_motion.value = progress;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                ..Default::default()
+            },
+            |ui| {
+                reader.show_side_panels(ui);
+                widths.push(ui.available_width());
+            },
+        );
+        output.textures_delta.clear();
+    }
+    assert!(
+        widths
+            .windows(2)
+            .all(|pair| (pair[0] - pair[1]).abs() < 0.1),
+        "{widths:?}"
+    );
+    reader.close_assistant_panel();
+    assert!(reader.ui.assistant_panel.is_some());
+    reader.advance_motion(Instant::now() + Duration::from_millis(200));
+    assert!(reader.ui.assistant_panel.is_none());
+    assert!(!reader.ui.assistant_motion.is_animating());
+    let mut restored = 0.0;
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        },
+        |ui| {
+            reader.show_side_panels(ui);
+            restored = ui.available_width();
+        },
+    );
+    output.textures_delta.clear();
+    assert!(restored > widths[0] + 250.0);
 }
 
 #[test]

@@ -24,7 +24,7 @@ mod smoke;
 mod statistics;
 mod sync;
 mod ui;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 mod updater;
 
 use std::env;

@@ -93,7 +93,10 @@ pub(super) fn targets(section: &Section, index: usize) -> Vec<Target> {
         let mut images = Vec::new();
         let (kind, texts): (Option<MediaKind>, Vec<&TextBlock>) = match block {
             // Some books publish their numbered tables as images.
-            Block::Figure(figure) => (None, figure.text_blocks().filter(|text| text.kind == rebook_publication::TextBlockKind::Caption).collect()),
+            Block::Figure(figure) => {
+                captions.extend(adjacent_captions(section, at));
+                (None, figure.text_blocks().filter(|text| text.kind == rebook_publication::TextBlockKind::Caption).collect())
+            },
             Block::Table(table) => {
                 let mut texts: Vec<_> = table.before.iter().chain(&table.after).collect();
                 if let Some(Block::Text(text)) =
@@ -146,6 +149,12 @@ pub(super) fn targets(section: &Section, index: usize) -> Vec<Target> {
                 if images.is_empty() {
                     continue;
                 }
+                for image in &images {
+                    captions.extend(adjacent_captions(section, *image));
+                }
+                captions.extend(adjacent_captions(section, at));
+                captions.sort_unstable();
+                captions.dedup();
                 (None, vec![text])
             }
             _ => continue,
@@ -199,6 +208,75 @@ pub(super) fn targets(section: &Section, index: usize) -> Vec<Target> {
         }
     }
     result
+}
+
+// Collect only explicit adjacent caption/source semantics; prose is a boundary.
+fn adjacent_captions(section: &Section, at: usize) -> Vec<usize> {
+    let eligible = |block: &Block| {
+        matches!(block, Block::Text(text)
+        if text.kind == rebook_publication::TextBlockKind::Caption || rebook_layout::is_media_source(text))
+    };
+    let mut media_start = at;
+    let mut media_end = at + 1;
+    if matches!(section.blocks[at], Block::Image(_)) {
+        while media_start > 0 && matches!(section.blocks[media_start - 1], Block::Image(_)) {
+            media_start -= 1;
+        }
+        while media_end < section.blocks.len()
+            && matches!(section.blocks[media_end], Block::Image(_))
+        {
+            media_end += 1;
+        }
+    }
+    let mut start = media_start;
+    while start > 0 && eligible(&section.blocks[start - 1]) {
+        start -= 1;
+    }
+    let mut end = media_end;
+    while end < section.blocks.len() && eligible(&section.blocks[end]) {
+        end += 1;
+    }
+    (start..media_start).chain(media_end..end).collect()
+}
+
+fn image_target(section: &Section, index: usize, href: &PublicationUrl, source: Option<&SourceRange>) -> Option<Target> {
+    fn matches(block: &Block, href: &PublicationUrl, source: Option<&SourceRange>) -> bool {
+        let image_matches = |image: &rebook_publication::ImageBlock| &image.href == href
+            && source.is_none_or(|source| image.source.as_ref().is_some_and(|range| range.start.node == source.start.node));
+        match block {
+            Block::Image(image) => image_matches(image),
+            Block::Figure(figure) => figure.images.iter().any(image_matches)
+                || figure.body.iter().any(|block| matches(block, href, source)),
+            _ => false,
+        }
+    }
+    let mut candidates = section.blocks.iter().enumerate().filter(|(_, block)| matches(block, href, source));
+    let (at, _) = candidates.next()?;
+    // Without an authored identity, repeated logos/photos must not borrow another caption.
+    if candidates.next().is_some() { return None; }
+    if let Some(target) = targets(section, index)
+        .into_iter()
+        .find(|target| target.block == at || target.images.contains(&at))
+    {
+        return Some(target);
+    }
+    let captions = adjacent_captions(section, at);
+    let images = if matches!(section.blocks[at], Block::Image(_)) {
+        vec![at]
+    } else {
+        vec![]
+    };
+    Some(Target {
+        section: index,
+        block: at,
+        images,
+        captions,
+        group: None,
+        key: MediaKey {
+            kind: MediaKind::Figure,
+            number: String::new(),
+        },
+    })
 }
 
 fn subfigure_letter(value: &str) -> Option<u8> {
@@ -406,6 +484,14 @@ impl Index {
         if let Some((index, node)) = job.destination.clone().or_else(|| job.catalog.as_ref().and_then(|catalog| catalog.target_node(&job.origin, &job.key))) {
             if !needed() { return Err("Cancelled".into()); }
             let section = source.parse_section(index).map_err(|e| e.to_string())?;
+            if job.key.number.is_empty() {
+                if let Some((at, block)) = section.blocks.iter().enumerate().find(|(_, block)| matches!(block, Block::Figure(_) | Block::Image(_)) && super::block_source_range(block).is_some_and(|source| source.start.node == node)) {
+                    return Ok(Target { section: index, block: at,
+                        images: if matches!(block, Block::Image(_)) { vec![at] } else { vec![] },
+                        captions: adjacent_captions(&section, at), group: None, key: job.key.clone() });
+                }
+                return Err("The image changed. Please reopen the preview.".into());
+            }
             self.add(&section, index)?;
             if let Some(target) = select(self.entries[&index].iter().filter(|t| target_has_node(&section, t, &node)).cloned(), &job.key)? {
                 return Ok(target);
@@ -497,17 +583,22 @@ impl Index {
 }
 
 /// Bound each table shaping job before layout sees the rows. Never cut a rowspan.
+#[cfg(test)]
 fn table_chunks(table: &TableBlock) -> Result<Vec<Range<usize>>, String> {
+    table_chunks_rows(&table.rows)
+}
+
+fn table_chunks_rows(rows: &[rebook_publication::TableRow]) -> Result<Vec<Range<usize>>, String> {
     let mut chunks = Vec::new();
     let mut start = 0;
-    while start < table.rows.len() {
-        let mut end = (start + 24).min(table.rows.len());
+    while start < rows.len() {
+        let mut end = (start + 24).min(rows.len());
         let mut row = start;
         while row < end {
-            for cell in &table.rows[row].cells {
+            for cell in &rows[row].cells {
                 end = end.max(
                     row.saturating_add(usize::from(cell.row_span.max(1)))
-                        .min(table.rows.len()),
+                        .min(rows.len()),
                 );
             }
             if end - start > 128 {
@@ -582,6 +673,11 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
         .get(target.block)
         .ok_or("The figure/table changed. Please reopen the preview.")?;
     let mut caption_blocks: Vec<TextBlock> = Vec::new();
+    if matches!(block, Block::Figure(_) | Block::Table(_)) {
+        caption_blocks.extend(target.captions.iter().filter(|i| **i < target.block).filter_map(|i| match &section.blocks[*i] {
+            Block::Text(text) => Some(text.clone()), _ => None,
+        }));
+    }
     let (chunk, chunk_count, blocks) = match block {
         Block::Figure(figure) => {
             if let Some(Block::Figure(parent)) = target.group.and_then(|at| section.blocks.get(at)) {
@@ -620,25 +716,20 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
             }
         }
         Block::Table(table) => {
-            caption_blocks.extend(table.before.iter().chain(&table.after).cloned());
-            caption_blocks.extend(target.captions.iter().filter_map(|i| {
-                match &section.blocks[*i] {
-                    Block::Text(t) => Some(t.clone()),
-                    _ => None,
-                }
-            }));
-            let ranges = table_chunks(table)?;
+            let presentation = rebook_layout::table_presentation(table, true);
+            caption_blocks.extend(presentation.before.iter().chain(presentation.after.iter()).cloned());
+            let rows = &table.rows[usize::from(presentation.skip_title)..table.rows.len() - presentation.skip_sources];
+            let ranges = table_chunks_rows(rows)?;
             let at = job.cursor.chunk.min(ranges.len().saturating_sub(1));
             let range = ranges.get(at).ok_or("The table is empty.")?.clone();
             let mut part = TableBlock {
                 before: vec![],
                 after: vec![],
-                rows: table.rows[range].to_vec(),
+                rows: rows[range].to_vec(),
                 source: table.source.clone(),
             };
             if at > 0 {
-                let headers: Vec<_> = table
-                    .rows
+                let headers: Vec<_> = rows
                     .iter()
                     .take(8)
                     .take_while(|row| {
@@ -667,7 +758,7 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
         Block::Text(_) | Block::Image(_) if media_references::equation_target(block).is_some() => {
             (0, 1, vec![block.clone()])
         }
-        Block::Text(_) => {
+        Block::Text(_) | Block::Image(_) => {
             caption_blocks.extend(target.captions.iter().filter_map(|i| {
                 match &section.blocks[*i] {
                     Block::Text(t) => Some(t.clone()),
@@ -686,6 +777,16 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
         }
         _ => return Err("The figure/table changed. Please reopen the preview.".into()),
     };
+    if matches!(block, Block::Figure(_) | Block::Table(_)) {
+        caption_blocks.extend(target.captions.iter().filter(|i| **i > target.block).filter_map(|i| match &section.blocks[*i] {
+            Block::Text(text) => Some(text.clone()), _ => None,
+        }));
+    }
+    let mut seen = Vec::new();
+    caption_blocks.retain(|text| {
+        let identity = (text.source.clone(), caption_text(text));
+        if seen.contains(&identity) { false } else { seen.push(identity); true }
+    });
     let mut style = job.style.clone();
     style.typesetting.mode = rebook_layout::TypesettingMode::Unified;
     style.spread = SpreadMode::Single;
@@ -756,6 +857,16 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     );
     let image = egui::ColorImage::from_rgba_premultiplied([width, height], &pixels);
     drop(pixels);
+    let media_width = page.items.iter().filter_map(|item| match item {
+        rebook_layout::PageItem::Image(image) => Some(image.width),
+        rebook_layout::PageItem::FigureBody(body) => Some(body.width),
+        rebook_layout::PageItem::Table(table) => {
+            let left = table.cells.iter().map(|cell| cell.x).fold(f32::INFINITY, f32::min);
+            let right = table.cells.iter().map(|cell| cell.x + cell.width).fold(0.0, f32::max);
+            Some((right - left).max(1.0))
+        }
+        _ => None,
+    }).fold(1.0, f32::max);
     let captions = caption_blocks.iter().map(caption_text).collect();
     let mut caption_style = style.clone();
     caption_style.typography.font_size = 20.0;
@@ -772,13 +883,13 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
             caption.kind = rebook_publication::TextBlockKind::Caption;
         }
     }
-    let caption_blocks: Vec<_> = caption_blocks.into_iter().map(Block::Text).collect();
     let caption_layout = engine
-        .layout_blocks(
+        .layout_media_captions(
             job.source.as_ref(),
             &caption_blocks,
-            LayoutViewport::new(800, 2048).map_err(|e| e.to_string())?,
+            LayoutViewport::new(width as u32, 2048).map_err(|e| e.to_string())?,
             &caption_style,
+            media_width,
         )
         .map_err(|e| e.to_string())?;
     let mut caption_images = Vec::new();
@@ -792,7 +903,7 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
             continue;
         };
         let height = (bottom + 8.0).ceil().clamp(1.0, 2048.0) as usize;
-        retained_bytes += 800 * height * 4;
+        retained_bytes += width * height * 4;
         if retained_bytes > PIXEL_BUDGET {
             return Err("The caption exceeds the preview memory limit.".into());
         }
@@ -801,11 +912,11 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
                 .load_guarded(job.source.as_ref(), needed)
                 .map_err(|e| e.to_string())?;
         }
-        let mut renderer = anyrender_vello_cpu::VelloCpuImageRenderer::new(800, height as u32);
+        let mut renderer = anyrender_vello_cpu::VelloCpuImageRenderer::new(width as u32, height as u32);
         let mut pixels = Vec::new();
         renderer.render_to_vec(|scene| display.paint(scene), &mut pixels);
         caption_images.push(egui::ColorImage::from_rgba_premultiplied(
-            [800, height],
+            [width, height],
             &pixels,
         ));
     }
@@ -998,6 +1109,41 @@ impl super::DesktopReader {
             }
         };
         self.open_media_items(ctx, items, index);
+    }
+
+    pub(super) fn open_associated_image_preview(
+        &mut self,
+        ctx: &egui::Context,
+        image: &rebook_reader::ReaderImage,
+    ) -> bool {
+        let Some(raster) = &image.origin else {
+            return false;
+        };
+        let Some(sections) = self.reader.cached_reading_unit_content() else {
+            return false;
+        };
+        let Some((section, target)) = sections.iter().find_map(|(index, section)| {
+            (*index == image.position.section_index)
+                .then(|| image_target(section, *index, &raster.href, image.source.as_ref()))
+                .flatten()
+                .map(|target| (section, target))
+        }) else {
+            return false;
+        };
+        let Some(origin) = super::block_source_range(&section.blocks[target.block]).cloned() else {
+            return false;
+        };
+        let destination = Some((target.section, origin.start.node.clone()));
+        self.open_media_items(
+            ctx,
+            vec![PreviewItem {
+                origin,
+                key: target.key,
+                destination,
+            }],
+            0,
+        );
+        true
     }
 
     fn focus_reference_previews(&self, origin: &SourceRange) -> Vec<PreviewItem> {

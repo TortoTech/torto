@@ -27,6 +27,8 @@ mod raster_cache;
 mod semantic_lists;
 mod semantic_paragraphs;
 mod table_captions;
+mod media_captions;
+pub use table_captions::{Presentation as TablePresentation, presentation as table_presentation};
 mod table_shaping;
 mod web_links;
 pub use raster_cache::{
@@ -1871,7 +1873,7 @@ impl LayoutEngine {
                         block_index += 1;
                         continue;
                     }
-                    let before = self.shape_captions_with_join(
+                    let mut before = self.shape_captions_with_join(
                         source,
                         &captions.before,
                         reader_style,
@@ -1882,7 +1884,7 @@ impl LayoutEngine {
                             .filter(|(after, _)| !after)
                             .map(|(_, index)| index),
                     )?;
-                    let after = self.shape_captions_with_join(
+                    let mut after = self.shape_captions_with_join(
                         source,
                         &captions.after,
                         reader_style,
@@ -1905,6 +1907,11 @@ impl LayoutEngine {
                             })
                             .sum::<f32>()
                     };
+                    if unified_reflow {
+                        let media_width = prepared.column_widths.iter().sum();
+                        self.align_media_sources(source, &mut before, reader_style, width, media_width)?;
+                        self.align_media_sources(source, &mut after, reader_style, width, media_width)?;
+                    }
                     let before_height = height(&before) + if before.is_empty() { 0.0 } else { gap };
                     let after_height = height(&after) + if after.is_empty() { 0.0 } else { gap };
                     let outer_gap = prepared.block_gap;
@@ -2093,20 +2100,26 @@ impl LayoutEngine {
             CaptionPosition::After => 0,
             CaptionPosition::Split(index) => index.min(figure_captions.len()),
         };
-        let before_captions = self.shape_figure_captions(
+        let mut before_captions = self.shape_figure_captions(
             source,
             &figure_captions[..split],
             reader_style,
             (content_width - media_start_offset).max(1.0),
             unified_reflow,
         )?;
-        let after_captions = self.shape_figure_captions(
+        let mut after_captions = self.shape_figure_captions(
             source,
             &figure_captions[split..],
             reader_style,
             (content_width - media_start_offset).max(1.0),
             unified_reflow,
         )?;
+        if unified_reflow {
+            let width = (content_width - media_start_offset).max(1.0);
+            let media_width = images.iter().map(|(raster, style, _)| paginator.image_display_size(raster, *style).0).fold(0.0, f32::max);
+            self.align_media_sources(source, &mut before_captions, reader_style, width, media_width)?;
+            self.align_media_sources(source, &mut after_captions, reader_style, width, media_width)?;
+        }
         let outer_gap = if unified_reflow {
             reader_style.typography.font_size * reader_style.typesetting.media_gap_em
         } else {
@@ -2285,7 +2298,7 @@ impl LayoutEngine {
         preserve_bold: Option<bool>,
     ) -> Result<(PreparedText, Cow<'a, TextBlock>), LayoutError> {
         let note = caption.kind != TextBlockKind::Caption;
-        let source_note = note && is_media_source(caption);
+        let source_note = is_media_source(caption);
         let mut resolved = if unified_reflow && note {
             let mut text = caption.clone();
             text.kind = TextBlockKind::Caption;
@@ -2312,6 +2325,9 @@ impl LayoutEngine {
         let authored_alignment = caption_authored_alignment(caption, compound_caption);
         if unified_reflow && !note {
             resolved.to_mut().style.align = authored_alignment.unwrap_or(TextAlignment::Center);
+        }
+        if unified_reflow && source_note {
+            media_captions::neutral_source(resolved.to_mut());
         }
         let mut prepared =
             self.shape_text_from_source(source, &resolved, reader_style, content_width)?;
@@ -4832,7 +4848,7 @@ fn consecutive_captions(blocks: &[&Block]) -> Vec<TextBlock> {
         .collect()
 }
 
-fn is_media_source(caption: &TextBlock) -> bool {
+pub fn is_media_source(caption: &TextBlock) -> bool {
     let text: String = caption.content.iter().flat_map(Inline::text_runs).map(|run| run.text.as_str()).collect();
     let text = text.trim_start().to_lowercase();
     ["source:", "sources:", "source：", "credit:", "credits:", "credit：", "来源:", "来源：", "图片来源:", "图片来源："]
@@ -12488,6 +12504,101 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn media_source_alignment_uses_media_edge_and_preserves_author_ir() {
+        let source = EmptySource::new("source-alignment");
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..Default::default()
+        };
+        let mut engine = LayoutEngine::new();
+        for (value, media_width, expected) in [
+            ("Source: Author", 250.0, TextAlignment::End),
+            (
+                "Source: A longer credit to the photographer",
+                40.0,
+                TextAlignment::Center,
+            ),
+            (
+                "Source: First line\nSecond line",
+                250.0,
+                TextAlignment::Start,
+            ),
+        ] {
+            let block = TextBlock {
+                kind: TextBlockKind::QuoteAttribution,
+                content: vec![Inline::Text(TextRun {
+                    text: value.into(),
+                    style: TextStyle {
+                        bold: true,
+                        italic: true,
+                        emphasis: true,
+                        alternate_voice: true,
+                        citation: true,
+                        ..Default::default()
+                    },
+                    link: None,
+                })],
+                style: Default::default(),
+                source: None,
+            };
+            let (prepared, resolved) = engine
+                .shape_caption_with_emphasis(&source, &block, &style, 600.0, true, false, None)
+                .unwrap();
+            let mut captions = vec![(prepared, resolved)];
+            engine
+                .align_media_sources(&source, &mut captions, &style, 600.0, media_width)
+                .unwrap();
+            assert_eq!(captions[0].1.style.align, expected, "{value}");
+            assert!(
+                captions[0]
+                    .1
+                    .content
+                    .iter()
+                    .flat_map(Inline::text_runs)
+                    .all(|run| !run.style.bold
+                        && !run.style.italic
+                        && !run.style.emphasis
+                        && !run.style.alternate_voice
+                        && !run.style.citation)
+            );
+            assert!(
+                block.content[0].text_runs()[0].style.bold,
+                "authored IR remains intact"
+            );
+            if expected == TextAlignment::End {
+                assert!((captions[0].0.start_offset - 175.0).abs() < 0.1);
+            }
+        }
+        // An ordinary quote attribution does not become a media source.
+        let mut block = TextBlock {
+            kind: TextBlockKind::QuoteAttribution,
+            content: vec![Inline::Text(TextRun {
+                text: "Author Name".into(),
+                style: TextStyle {
+                    emphasis: true,
+                    ..Default::default()
+                },
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        };
+        assert!(!is_media_source(&block));
+        let (prepared, resolved) = engine
+            .shape_caption_with_emphasis(&source, &block, &style, 600.0, true, false, None)
+            .unwrap();
+        let before = resolved.clone().into_owned();
+        let mut captions = vec![(prepared, resolved)];
+        engine
+            .align_media_sources(&source, &mut captions, &style, 600.0, 100.0)
+            .unwrap();
+        assert_eq!(captions[0].1.as_ref(), &before);
+        block.kind = TextBlockKind::Blockquote;
+        assert!(!is_media_source(&block));
+    }
+
+
 }
 
 #[cfg(test)]
@@ -12506,4 +12617,5 @@ mod font_reuse_tests {
             .unwrap();
         assert!(Arc::ptr_eq(&first.svg_options.fontdb, &other));
     }
+
 }
