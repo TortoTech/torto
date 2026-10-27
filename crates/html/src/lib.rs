@@ -2197,6 +2197,11 @@ impl<'a> ReadingIrParser<'a> {
         let node_id = self.allocate_node();
         let source = self.source_range(&node_id, text_len);
         self.bind_pending_anchors(&source.start);
+        for (fragment, offset) in &collector.page_positions {
+            if let Some(anchor) = self.anchors.iter_mut().find(|anchor| &anchor.fragment == fragment) {
+                anchor.source.text_offset = (*offset).min(text_len);
+            }
+        }
         self.blocks.push(Block::Text(TextBlock {
             kind,
             content: collector.content,
@@ -3153,7 +3158,9 @@ fn collect_inline_node_with_block_boundaries(
     if matches!(name.as_str(), "script" | "style") {
         return;
     }
-    if preserve_block_boundaries && is_block_boundary(name.as_str()) {
+    if preserve_block_boundaries && is_block_boundary(name.as_str())
+        && !(page_markers::is_empty_wrapper(node) && !page_markers::has_spacing(context.styles, node))
+    {
         collector.push_block_break();
     }
 
