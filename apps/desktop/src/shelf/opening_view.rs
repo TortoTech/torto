@@ -140,7 +140,7 @@ impl OpeningShell {
         );
         let screen = root.ctx().content_rect();
         let format = rebook_formats::BookFormat::from_file_name(&self.book.file_name);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             crate::app::window_chrome::header(
                 root.ctx(),
@@ -163,7 +163,12 @@ impl OpeningShell {
                     header.max,
                 );
                 let title_center = header.center().x;
-                #[cfg(target_os = "windows")]
+                #[cfg(target_os = "macos")]
+                let header = egui::Rect::from_min_max(
+                    egui::pos2(header.left().max(crate::app::window_chrome::left_edge(ui.ctx())), header.top()),
+                    header.max,
+                );
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 let header = egui::Rect::from_min_max(
                     header.min,
                     egui::pos2(
@@ -225,9 +230,9 @@ impl OpeningShell {
                     },
                 );
                 // Keep the same control positions while reader-dependent actions prepare.
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 let menu_left = header.right();
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                 let menu_left = header.right() - 44.0;
                 for (glyph, left, hint) in [
                     (

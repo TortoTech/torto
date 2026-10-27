@@ -392,6 +392,12 @@ impl ApplicationHandler<UserEvent> for Application {
             .with_theme(native_window_theme(self.app.theme()))
             .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
             .with_min_inner_size(LogicalSize::new(720_u32, 520_u32));
+        #[cfg(target_os = "macos")]
+        let attributes = {
+            use winit::platform::macos::WindowAttributesExtMacOS as _;
+            attributes.with_title_hidden(true).with_titlebar_transparent(true)
+                .with_fullsize_content_view(true)
+        };
         #[cfg(target_os = "windows")]
         let attributes = {
             use winit::platform::windows::WindowAttributesExtWindows as _;

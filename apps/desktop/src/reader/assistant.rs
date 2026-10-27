@@ -3251,6 +3251,7 @@ mod tests {
                 }),
             })],
             anchors: vec![SectionAnchor {
+                page_label: None,
                 fragment: "note-1".into(),
                 source: first_note_range.start.clone(),
             }],

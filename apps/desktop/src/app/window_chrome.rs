@@ -1,7 +1,10 @@
 //! Shared client title bar. Native hit testing uses the same rectangles as painting.
-use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use egui::{Color32, Pos2, Rect};
+#[cfg(target_os = "windows")]
+use egui::{Sense, Stroke, Vec2};
 
 pub(crate) const HEIGHT: f32 = 44.0;
+#[cfg(target_os = "windows")]
 const BUTTON_WIDTH: f32 = 46.0;
 
 #[derive(Clone, Copy, Default)]
@@ -45,6 +48,16 @@ pub(crate) fn state(ctx: &egui::Context) -> WindowState {
         .unwrap_or_default()
 }
 pub(crate) fn begin_frame(ctx: &egui::Context) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(inset) = rebook_macos_open_file::titlebar_inset() {
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new("mac-titlebar-inset"), inset));
+        }
+        let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+        let header_bottom = ctx.content_rect().top() + HEIGHT;
+        let header_hovered = ctx.input(|input| input.pointer.hover_pos().is_some_and(|pos| pos.y < header_bottom));
+        set_state(ctx, WindowState { fullscreen, header_hovered, ..Default::default() });
+    }
     ctx.data_mut(|data| data.insert_temp(geometry_id(), Geometry::default()));
 }
 pub(crate) fn geometry(ctx: &egui::Context) -> Geometry {
@@ -65,6 +78,8 @@ pub(crate) fn bounded_ui<R>(
     rect: Rect,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    #[cfg(target_os = "macos")]
+    let rect = Rect::from_min_max(Pos2::new(rect.left().max(left_edge(ui.ctx())), rect.top()), rect.max);
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.set_clip_rect(ui.clip_rect().intersect(rect));
         content(ui)
@@ -73,11 +88,10 @@ pub(crate) fn bounded_ui<R>(
 }
 
 pub(crate) fn reserve_width(ctx: &egui::Context) -> f32 {
-    if state(ctx).fullscreen {
-        0.0
-    } else {
-        BUTTON_WIDTH * 3.0
-    }
+    #[cfg(target_os = "macos")]
+    { let _ = ctx; 0.0 }
+    #[cfg(target_os = "windows")]
+    { if state(ctx).fullscreen { 0.0 } else { BUTTON_WIDTH * 3.0 } }
 }
 pub(crate) fn header(ctx: &egui::Context, rect: Rect) {
     let drag_enabled = !state(ctx).fullscreen;
@@ -154,6 +168,7 @@ pub(crate) fn fallback_header(ui: &mut egui::Ui) {
         .frame(egui::Frame::new().fill(crate::ui::palette().background))
         .show(ui, |ui| {
             header(ui.ctx(), ui.max_rect());
+            #[cfg(target_os = "windows")]
             ui.painter().text(
                 ui.max_rect().left_center() + Vec2::new(16.0, 0.0),
                 egui::Align2::LEFT_CENTER,
@@ -164,6 +179,7 @@ pub(crate) fn fallback_header(ui: &mut egui::Ui) {
         });
 }
 
+#[cfg(target_os = "windows")]
 pub(crate) fn paint_controls(ctx: &egui::Context) {
     let state = state(ctx);
     if state.fullscreen {
@@ -304,7 +320,7 @@ pub(crate) fn take_close_request(ctx: &egui::Context) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
     #[test]
@@ -495,5 +511,64 @@ mod tests {
         );
         assert_eq!(reserve_width(&ctx), 0.0);
         assert!(!geometry(&ctx).drag_enabled);
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn left_edge(ctx: &egui::Context) -> f32 {
+    ctx.content_rect().left() + if state(ctx).fullscreen { 0.0 } else {
+        ctx.data(|data| data.get_temp::<f32>(egui::Id::new("mac-titlebar-inset"))).unwrap_or(86.0)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn paint_controls(ctx: &egui::Context) {
+    paint_header_masks(ctx);
+    let geometry = geometry(ctx);
+    let Some(header) = geometry.header.filter(|_| geometry.drag_enabled) else { return };
+    let pointer = ctx.input(|input| input.pointer.clone());
+    let Some(pos) = pointer.interact_pos() else { return };
+    if pos.x < left_edge(ctx) || !header.contains(pos) || geometry.excluded.iter().any(|rect| rect.contains(pos)) { return; }
+    if pointer.button_double_clicked(egui::PointerButton::Primary) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!ctx.input(|input| input.viewport().maximized.unwrap_or(false))));
+    } else if pointer.primary_pressed() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod mac_tests {
+    use super::*;
+    #[test]
+    fn pointer_hover_does_not_reenter_the_egui_context_lock() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 600.0))),
+            events: vec![egui::Event::PointerMoved(Pos2::new(300.0, 20.0))],
+            ..Default::default()
+        }, |ui| {
+            begin_frame(ui.ctx());
+            assert!(state(ui.ctx()).header_hovered);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn native_buttons_reserve_left_space_and_fullscreen_releases_it() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 600.0))), ..Default::default() }, |ui| {
+            let ctx = ui.ctx();
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new("mac-titlebar-inset"), 88.0_f32));
+            header(ctx, Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, HEIGHT)));
+            assert_eq!(left_edge(ctx), 88.0);
+            assert_eq!(reserve_width(ctx), 0.0);
+            assert!(geometry(ctx).buttons.iter().all(Option::is_none));
+            set_state(ctx, WindowState { fullscreen: true, ..Default::default() });
+            header(ctx, Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, HEIGHT)));
+            assert_eq!(left_edge(ctx), 0.0);
+            assert!(!geometry(ctx).drag_enabled);
+            assert_eq!(body_rect(ctx).top(), HEIGHT);
+        });
+        output.textures_delta.clear();
     }
 }

@@ -11,6 +11,27 @@ mod macos {
     use std::path::PathBuf;
     use std::rc::Rc;
 
+    /// Native traffic-light bounds in logical content coordinates, read on AppKit's main thread.
+    pub fn titlebar_inset() -> Option<f32> {
+        let marker = MainThreadMarker::new()?;
+        let application = NSApplication::sharedApplication(marker);
+        // SAFETY: AppKit owns these objects for the duration of this synchronous,
+        // main-thread query; no raw reference is retained or mutated.
+        unsafe {
+            let window: *mut AnyObject = objc2::msg_send![&application, keyWindow];
+            if window.is_null() { return None; }
+            let mut right = 0.0_f64;
+            for kind in 0_usize..3 {
+                let button: *mut AnyObject = objc2::msg_send![window, standardWindowButton: kind];
+                if !button.is_null() {
+                    let frame: objc2_foundation::NSRect = objc2::msg_send![button, frame];
+                    right = right.max(frame.origin.x + frame.size.width);
+                }
+            }
+            (right > 0.0).then_some((right + 16.0) as f32)
+        }
+    }
+
     type Callback = Rc<dyn Fn(PathBuf)>;
     thread_local! {
         static CALLBACK: RefCell<Option<Callback>> = const { RefCell::new(None) };
@@ -112,3 +133,6 @@ mod macos {
 
 #[cfg(target_os = "macos")]
 pub use macos::{OpenFileHandler, install};
+
+#[cfg(target_os = "macos")]
+pub use macos::titlebar_inset;

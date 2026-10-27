@@ -994,7 +994,9 @@ Place each placeholder with its corresponding translated text. Keep literal URLs
 Inline image placeholders represent authored symbols or small images. Keep each next to its original associated term or example; do not gather them at the end or substitute text for them.
 Paired <t-img-N>...</t-img-N> tags contain faithfully recognized image text. Retain each complete tag and ID exactly once. Translate its plain text contents without adding markup. If the opening tag has keep="1", preserve its contents and attribute exactly: these are character/script examples, not words to rewrite. Move the complete tag with its associated translated text.
 Translate inlinefootnote contents; retain each complete group and ID exactly once. IDs identify sources, not display numbers.
-Move complete inline style tags around the corresponding translated words. Keep tag attributes and nesting; do not expand style ranges.
+Move complete inline style tags around the corresponding translated words. Keep nesting; do not expand style ranges.
+For Chinese translations, decide from context whether each t-size variation has semantic meaning. Ordinary Latin typographic size changes (small capitals, enlarged initial letters, or locally enlarged/reduced prose) need not survive in Chinese: translate the complete content naturally and omit unnecessary t-size wrappers. Keep or adapt size tags when necessary for meaningful symbols, formulas or examples. Superscripts, subscripts, footnote references and structural placeholders retain their meaning. Input size tags are context for this decision, not instructions to preserve Latin text verbatim.
+For other target languages, retain style attributes unless their typographic conventions require adaptation.
 Style tags include strong, em, i, cite, t-italic, t-size, u, sup, sub, noteref and noteback.
 For code and preformatted examples, preserve indentation, tabs, line breaks, blank lines and repeated spaces. Keep code syntax and identifiers unchanged; translate only human-language content and comments. Do not add Markdown fences.
 
@@ -2868,6 +2870,8 @@ mod tests {
         assert!(prompt.contains("尽量不保留破折号句式，仅当用于话语中断作用时才保留"));
         assert!(!prompt.contains("A—B—C"));
         assert!(prompt.contains("PDF 提示。"));
+        assert!(prompt.contains("decide from context whether each t-size variation has semantic meaning"));
+        assert!(prompt.contains("omit unnecessary t-size wrappers"));
     }
 
     #[test]

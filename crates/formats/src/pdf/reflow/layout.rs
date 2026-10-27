@@ -272,6 +272,10 @@ fn edge_key(line: &Line, height: f64) -> Option<String> {
 }
 
 fn edge_lines(page: &NativePage, body: Option<f64>) -> Vec<Line> {
+    edge_lines_with_gap(page, body, 2.0)
+}
+
+fn edge_lines_with_gap(page: &NativePage, body: Option<f64>, separation: f64) -> Vec<Line> {
     let grouped = lines(page.glyphs.clone());
     grouped
         .iter()
@@ -296,13 +300,13 @@ fn edge_lines(page: &NativePage, body: Option<f64>) -> Vec<Line> {
                 && if line.baseline < page.height * 0.18 {
                     grouped
                         .get(index + 1)
-                        .is_some_and(|next| next.baseline - line.baseline >= line.size * 2.0)
+                        .is_some_and(|next| next.baseline - line.baseline >= line.size * separation)
                 } else {
                     index
                         .checked_sub(1)
                         .and_then(|i| grouped.get(i))
                         .is_some_and(|previous| {
-                            line.baseline - previous.baseline >= line.size * 2.0
+                            line.baseline - previous.baseline >= line.size * separation
                         })
                 }
         })
@@ -362,7 +366,8 @@ impl Region {
     }
 }
 
-struct Builder {
+struct Builder<'a> {
+    word_evidence: Option<&'a HashSet<String>>,
     section: Section,
     provenance: Vec<SourceSlice>,
     crops: Vec<Crop>,
@@ -372,7 +377,7 @@ struct Builder {
     height: f64,
 }
 
-impl Builder {
+impl Builder<'_> {
     fn range(&self, node: String, start: u64, end: u64) -> SourceRange {
         SourceRange {
             start: SourceAnchor {
@@ -392,7 +397,7 @@ impl Builder {
         let node = format!("p{}-g{}", self.page + 1, lines[0].glyphs[0].index);
         let mut runs: Vec<TextRun> = Vec::new();
         let mut offset = 0_u64;
-        let caption_words = (kind == TextBlockKind::Caption).then(|| {
+        let local_words = {
             lines
                 .iter()
                 .map(Line::text)
@@ -402,7 +407,10 @@ impl Builder {
                 .filter(|word| !word.is_empty())
                 .map(str::to_lowercase)
                 .collect::<HashSet<_>>()
-        });
+        };
+        let evidence = self.word_evidence.or((kind == TextBlockKind::Caption).then_some(&local_words));
+        let compounds: HashSet<_> = lines.iter().flat_map(|line| line.text().split_whitespace().map(|word| word.trim_matches(|c: char| !c.is_alphabetic() && c != '-').to_lowercase()).collect::<Vec<_>>())
+            .filter(|word| word.contains('-') && !word.ends_with('-')).collect();
         for (index, line) in lines.iter().enumerate() {
             if index > 0 {
                 let previous = &lines[index - 1];
@@ -419,11 +427,10 @@ impl Builder {
                         last.source.end.text_offset = last.source.start.text_offset;
                     }
                 } else if old == Some('-')
-                    && caption_words
-                        .as_ref()
-                        .is_some_and(|words| caption_hyphen_join(&runs, line, words))
+                    && evidence.is_some_and(|words| caption_hyphen_join(&runs, line, words))
+                    && !compounds.contains(&hyphenated_tail(&runs, line))
                 {
-                    // A complete spelling elsewhere in this caption proves this
+                    // A complete spelling elsewhere in the source proves this
                     // is a line-end split, rather than an authored compound.
                     runs.last_mut().unwrap().text.pop();
                     offset = offset.saturating_sub(1);
@@ -445,7 +452,23 @@ impl Builder {
                 }
             }
             let mut previous: Option<&NativeGlyph> = None;
-            for glyph in &line.glyphs {
+            for (glyph_index, glyph) in line.glyphs.iter().enumerate() {
+                // Some PDF proofs contain a space glyph whose advance lies
+                // inside a neighboring letter of a hyphenated word. It has no
+                // visual separating gap; retain its provenance with zero length.
+                let in_compound = glyph.text.chars().all(char::is_whitespace) && runs.iter().rev().flat_map(|run| run.text.chars().rev()).take_while(|c| !c.is_whitespace()).any(|c| c == '-');
+                let overlaps = |other: &NativeGlyph| {
+                    let width = (glyph.advance[0] - glyph.baseline[0]).abs();
+                    let overlap = glyph.advance[0].min(other.advance[0]) - glyph.baseline[0].max(other.baseline[0]);
+                    !other.text.chars().all(char::is_whitespace) && width > 0.0 && overlap > width * 0.85
+                };
+                if in_compound && glyph.text.chars().all(char::is_whitespace)
+                    && (previous.is_some_and(overlaps) || line.glyphs.get(glyph_index + 1).is_some_and(overlaps))
+                {
+                    self.provenance.push(SourceSlice { source: self.range(node.clone(), offset, offset),
+                        page: self.page + 1, rect: glyph.rect, original_glyph: glyph.index });
+                    continue;
+                }
                 let style = TextStyle {
                     bold: glyph.bold,
                     italic: glyph.italic,
@@ -480,6 +503,7 @@ impl Builder {
                     let gap = glyph.baseline[0] - old.advance[0];
                     if gap > line.size * 0.15
                         && !old.text.ends_with(char::is_whitespace)
+                        && !old.text.ends_with(['-', '\u{2010}', '\u{2011}'])
                         && !glyph.text.starts_with(char::is_whitespace)
                         && !old.text.chars().last().is_some_and(cjk)
                         && !glyph.text.chars().next().is_some_and(cjk)
@@ -566,6 +590,7 @@ impl Builder {
     }
 }
 
+#[cfg(test)]
 pub(super) fn build(
     page: &NativePage,
     index: usize,
@@ -573,7 +598,15 @@ pub(super) fn build(
     repeated: &HashSet<String>,
     stats: &mut Statistics,
 ) -> Result<(StoredSection, Vec<Crop>), String> {
+    build_with_words(page, index, body, repeated, stats, None)
+}
+
+pub(super) fn build_with_words(
+    page: &NativePage, index: usize, body: f64, repeated: &HashSet<String>, stats: &mut Statistics,
+    words: Option<&HashSet<String>>,
+) -> Result<(StoredSection, Vec<Crop>), String> {
     let mut builder = Builder {
+        word_evidence: words,
         section: Section {
             id: spine_id(index)?,
             href: section_href(index)?,
@@ -845,6 +878,7 @@ pub(super) fn build(
             text_offset: 0,
         });
     builder.section.anchors.push(SectionAnchor {
+        page_label: None,
         fragment: format!("{PAGE_ANCHOR_PREFIX}{}", index + 1),
         source,
     });
@@ -1025,6 +1059,13 @@ fn caption_prefix_len(text: &str) -> Option<usize> {
         .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '–'))
         .count();
     Some(text.chars().count() - number.chars().count() + digits)
+}
+
+fn hyphenated_tail(previous: &[TextRun], next: &Line) -> String {
+    let left: String = previous.iter().map(|run| run.text.as_str()).collect();
+    let prefix: String = left.trim_end_matches('-').chars().rev().take_while(|c| c.is_alphabetic()).collect::<Vec<_>>().into_iter().rev().collect();
+    let suffix: String = next.text().chars().take_while(|c| c.is_alphabetic()).collect();
+    format!("{prefix}-{suffix}").to_lowercase()
 }
 
 fn caption_hyphen_join(previous: &[TextRun], next: &Line, words: &HashSet<String>) -> bool {
@@ -1392,6 +1433,7 @@ fn extract_notes(
         let note = builder.text(&note_lines, TextBlockKind::FootnoteDefinition);
         if let Some(source) = &note.source {
             builder.section.anchors.push(SectionAnchor {
+                page_label: None,
                 fragment,
                 source: source.start.clone(),
             });
@@ -1761,6 +1803,7 @@ mod tests {
             ["Text12", "small print", "Next row"]
         );
         let mut builder = Builder {
+            word_evidence: None,
             section: Section {
                 id: spine_id(0).unwrap(),
                 href: section_href(0).unwrap(),
@@ -2817,4 +2860,59 @@ mod tests {
             "中文第一行中文第二行中文第三行"
         );
     }
+    #[test]
+    fn native_prose_joins_proven_words_but_keeps_compounds_and_provenance() {
+        let words = HashSet::from(["reason".into(), "replication".into(), "multilab".into()]);
+        let mut builder = Builder { word_evidence: Some(&words), section: Section {
+            id: spine_id(0).unwrap(), href: section_href(0).unwrap(), blocks: vec![], anchors: vec![] },
+            provenance: vec![], crops: vec![], page: 0, body: 10.0, width: 600.0, height: 800.0 };
+        let paragraph = lines(vec![glyph("For that rea-", 40.0, 100.0, 10.0, 0),
+            glyph("son and replica-", 40.0, 114.0, 10.0, 1),
+            glyph("tion. A multi-", 40.0, 128.0, 10.0, 2),
+            glyph("lab study is also called multi-lab.", 40.0, 142.0, 10.0, 3)]);
+        let block = builder.text(&paragraph, TextBlockKind::Paragraph);
+        let text: String = block.content.iter().flat_map(Inline::text_runs).map(|run| run.text.as_str()).collect();
+        assert!(text.contains("reason") && text.contains("replication"), "{text}");
+        assert!(text.contains("multi-lab") && !text.contains("multilab"), "{text}");
+        assert_eq!(builder.provenance.len(), 4);
+        assert_eq!(block.source.unwrap().end.text_offset, text.chars().count() as u64);
+    }
+
+    #[test]
+    fn compact_running_heads_need_repetition_and_protect_real_headings() {
+        let make = |index: usize| {
+            let mut page = NativePage::default(); page.width = 600.0; page.height = 800.0;
+            page.glyphs = vec![glyph(&format!("Chapter name {}", index + 1), 40.0, 40.0, 10.0, 0),
+                glyph("Body begins close to the running head.", 40.0, 55.0, 10.0, 1)]; page
+        };
+        let mut detector = ChromeDetector::default();
+        for index in 0..3 { detector.observe(&make(index), index); }
+        detector.finish();
+        assert_eq!(detector.removed_keys(1, &[]).len(), 1);
+        let mut heading = make(0); heading.glyphs[0].tag = Some("H2".into());
+        let mut protected = ChromeDetector::default();
+        for index in 0..3 { protected.observe(&heading, index); }
+        protected.finish();
+        assert!(protected.removed_keys(1, &["Chapter name"]).is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_BAD_BELIEFS_PDF; read-only original PDF audit"]
+    fn local_reported_bad_beliefs_headers_and_hyphens() {
+        let path = std::env::var_os("TORTO_BAD_BELIEFS_PDF").unwrap();
+        let publication = crate::pdf::open(fs::read(path).unwrap(), "local.pdf").unwrap();
+        let tags = extract::structure_tags(&publication.pdf);
+        let mut edges = ChromeDetector::default();
+        for index in 0..publication.page_count { edges.observe(&extract::page(&publication.pdf, index, &tags), index); }
+        edges.finish();
+        for index in [89, 90] {
+            let page = extract::page(&publication.pdf, index, &tags);
+            let (stored, _) = build_with_words(&page, index, 10.0, &edges.removed_keys(index, &[]), &mut Statistics::default(), Some(&edges.words)).unwrap();
+            let text: String = stored.section.blocks.iter().flat_map(Block::text_blocks).flat_map(|text| &text.content).flat_map(Inline::text_runs).map(|run| run.text.as_str()).collect();
+            for bad in ["rea-son", "replica-tion", "multi- lab", "multi-l ab", "file-d rawer"] { assert!(!text.contains(bad), "page {} still contains {bad}", index + 1); }
+            assert!(!text.to_uppercase().contains("HOW OUR MINDS ARE MADE UP"));
+            assert!(!text.to_uppercase().contains("BAD BELIEFS: WHY THEY HAPPEN TO GOOD PEOPLE"));
+        }
+    }
+
 }

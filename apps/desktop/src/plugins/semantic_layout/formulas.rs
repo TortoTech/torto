@@ -4,11 +4,12 @@ use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use rebook_publication::{ImageBlock, ImageFormula, ImageText};
 use std::io::Cursor;
 
+pub(super) const CHAPTER_PROMPT: &str = include_str!("formulas/chapter-v5-prompt.md");
 pub(super) const PROMPT: &str = include_str!("formulas/prompt.md");
 pub(super) const TRANSCRIBE_PROMPT: &str = include_str!("formulas/transcribe.md");
 const SYMBOL_PROMPT: &str = include_str!("formulas/symbols.md");
 const REPLACEMENT_PROMPT: &str = include_str!("formulas/replacement.md");
-pub(super) const TEXT_REVISION: u32 = 5;
+pub(super) const TEXT_REVISION: u32 = 6;
 mod batch;
 
 // Keep the chapter/group identity stable. Image policy has its own revision and
@@ -30,8 +31,26 @@ pub(super) fn chapter_cache_options() -> Value {
     })
 }
 
+fn current_image_options() -> Value {
+    let item = json!({"type":"object","additionalProperties":false,"properties":{
+        "image_id":{"type":"integer","description":"Copy an ID from requested_ids. IDs need not be consecutive."},
+        "status":{"type":"string","enum":["recognized","recognized_text","not_formula","unreadable","unreadable_text","recognized_table"],"description":"recognized: the whole image is mathematics or a formal rule. recognized_text: the whole meaningful image is faithful Unicode text, including letters or script examples. recognized_table: a complete legible data table, including merged headers and continued tables. not_formula: diagrams, plots, photos, decorations or mixed visual/text images. unreadable: formula details are unclear; unreadable_text: text details are unclear or unsupported. Never infer characters from the surrounding words."},
+        "table_html":{"type":["string","null"],"description":"For recognized_table only, a complete faithful XHTML table using table/thead/tbody/tfoot/tr/th/td/caption/br with rowspan and colspan. Preserve all visible cells, merged/multilevel headers, numbers, units, notes and continuation labels. Escape XML characters; close br as <br/>. No style, images, links, scripts or Markdown. For other statuses null."},
+        "text":{"type":["string","null"],"description":"Exact visible Unicode text for recognized_text only; otherwise null. Preserve case, accents, combining characters, punctuation and meaningful spaces. No Markdown, XML/HTML, LaTeX, explanation or guessed characters."},
+        "literal":{"type":"boolean","description":"For recognized_text, true for character/script/pronunciation examples and literal symbols which must remain unchanged in translation; false for ordinary prose/words. Otherwise false."},
+        "latex":{"type":["string","null"],"description":"Transcribe faithful supported LaTeX without dollar delimiters or Markdown. For a negative status, return null. Use standard math commands, text operators and matrix/aligned environments. Exclude custom macros, packages, images, URLs and executable commands. Encode each command backslash as two JSON backslashes; encode a row separator as four. Do not drop backslashes or turn command prefixes into control characters."},
+        "equation_number":{"type":["string","null"],"description":"Copy only a separate equation number visible in this image. Exclude it from latex. Do not infer it from context. If absent or the status is negative, return null."}
+    },"required":["image_id","status","latex","equation_number","text","literal","table_html"]});
+    json!({"temperature":0.0,"output_schema":{
+            "type":"object","additionalProperties":false,
+            "properties":{"results":{"type":"array","description":"Return one result per requested ID, including negative results. Use an array for a single image too. IDs must match exactly; order is unrestricted.","items":item}},
+            "required":["results"]
+        }
+    })
+}
+
 pub(super) fn options() -> Value {
-    let mut value = chapter_cache_options();
+    let mut value = current_image_options();
     let item = &mut value["output_schema"]["properties"]["results"]["items"];
     item["properties"]["replacement_safe"] = json!({"type":"boolean", "description":"True only if the proposed text or LaTeX preserves the complete meaning under ordinary reader reflow and typography. Otherwise retain the original image; use not_formula and null content. When uncertain, false."});
     item["required"].as_array_mut().unwrap().push(json!("replacement_safe"));
@@ -54,20 +73,6 @@ pub(super) fn candidates(section: &Section) -> Vec<Candidate> {
         for (i, block) in blocks.iter().enumerate() {
             match block {
                 Block::Image(image) if image.text_layer.is_none() => {
-                    let mut first = i;
-                    let mut last = i + 1;
-                    while first > 0 && matches!(blocks[first - 1], Block::Image(_)) {
-                        first -= 1;
-                    }
-                    while last < blocks.len() && matches!(blocks[last], Block::Image(_)) {
-                        last += 1;
-                    }
-                    let is_caption = |b: Option<&Block>| matches!(b,Some(Block::Text(t)) if t.kind==TextBlockKind::Caption);
-                    if is_caption(first.checked_sub(1).and_then(|p| blocks.get(p)))
-                        || is_caption(blocks.get(last))
-                    {
-                        continue;
-                    }
                     let context = blocks[i.saturating_sub(1)..(i + 2).min(blocks.len())]
                         .iter()
                         .filter_map(|b| match b {
@@ -95,10 +100,16 @@ pub(super) fn candidates(section: &Section) -> Vec<Candidate> {
                 }
                 Block::Note(n) => visit(&n.blocks, result),
                 Block::Figure(figure) => {
+                    for image in &figure.images {
+                        if image.text_layer.is_none() {
+                            result.push(Candidate { image: image.clone(), inline: false,
+                                context: figure.caption_blocks().map(text_block_text).collect::<Vec<_>>().join("\n").chars().take(900).collect() });
+                        }
+                    }
                     visit(&figure.body, result);
                     for caption in &figure.captions { text(caption, result); }
                 }
-                // Captioned figures and diagrams are not formula candidates.
+                // The recognizer judges captioned images along with other images.
                 _ => {}
             }
         }
@@ -176,6 +187,8 @@ pub(super) fn validate_formula(formula: &ImageFormula) -> Result<(), String> {
 #[serde(deny_unknown_fields)]
 struct Response {
     #[serde(default)]
+    table_html: Option<String>,
+    #[serde(default)]
     revision: u32,
     #[serde(default)]
     replacement_safe: bool,
@@ -192,6 +205,13 @@ struct Response {
 
 impl Response {
     fn formula(&self) -> Result<Option<ImageFormula>, String> {
+        if self.status == "recognized_table" {
+            if !self.replacement_safe { return Ok(None); }
+            if self.text.is_some() || self.latex.is_some() || self.equation_number.is_some() || self.literal { return Err("Invalid table result".into()); }
+            rebook_html::parse_recognized_table(self.table_html.as_deref().ok_or("Missing table HTML")?)?;
+            return Ok(None);
+        }
+        if self.table_html.is_some() { return Err("Unexpected table HTML".into()); }
         if !self.replacement_safe && matches!(self.status.as_str(), "recognized" | "recognized_text") {
             return Ok(None);
         }
@@ -294,6 +314,11 @@ fn record(
     };
     if response.transient {
         *failed += 1;
+    }
+    if response.replacement_safe && response.status == "recognized_table" && response.formula().is_ok() {
+        if let Ok(table) = rebook_html::parse_recognized_table(response.table_html.as_deref().unwrap_or_default()) {
+            annotations.push(Annotation::ImageTable { href: href.clone(), table });
+        }
     }
     if response.status == "unreadable" {
         annotations.push(Annotation::UnreadableFormula { href: href.clone() });
@@ -546,6 +571,7 @@ pub(super) fn compose(blocks: &mut [Block], href: &PublicationUrl, formula: Opti
 pub(super) fn validate_annotations(section: &Section, annotations: &[Annotation]) -> bool {
     let candidates = candidates(section);
     annotations.iter().all(|a| match a {
+        Annotation::ImageTable { href, table } => candidates.iter().any(|c| &c.image.href == href) && rebook_html::validate_recognized_table(table).is_ok(),
         Annotation::UnreadableFormula { href } => candidates.iter().any(|c| &c.image.href == href),
         Annotation::ImageFormula { href, formula } => {
             candidates.iter().any(|c| &c.image.href == href) && validate_formula(formula).is_ok()

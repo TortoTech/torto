@@ -1,6 +1,34 @@
 use super::*;
 
 #[test]
+fn printed_pages_are_semantic_locations_without_artificial_line_breaks() {
+    let section = parse("<p id='start'>Before <span epub:type='pagebreak' role='doc-pagebreak' id='p42' title='42'/>after.</p><div role='doc-pagebreak' id='p43' aria-label='43'/><p id='next'>Next.</p>");
+    assert_eq!(section.blocks.len(), 2);
+    assert_eq!(section.blocks.iter().flat_map(Block::text_blocks).map(text_block_text).collect::<String>(), "Before after.Next.");
+    let marker = section.anchors.iter().find(|a| a.fragment == "p42").unwrap();
+    assert_eq!(marker.page_label.as_deref(), Some("42"));
+    assert_eq!(marker.source.text_offset, 7);
+    assert_eq!(section.anchors.iter().find(|a| a.fragment == "p43").unwrap().source,
+        section.anchors.iter().find(|a| a.fragment == "next").unwrap().source);
+    let visible = parse("<div role='doc-pagebreak' id='page'>44</div><p>Body.</p>");
+    assert_eq!(visible.anchors.iter().find(|a| a.fragment == "page").unwrap().page_label.as_deref(), Some("44"));
+    assert!(matches!(visible.blocks[0], Block::Separator(_)));
+    let Block::Text(body) = &visible.blocks[1] else { panic!() };
+    assert_eq!(visible.anchors.iter().find(|a| a.fragment == "page").unwrap().source, body.source.as_ref().unwrap().start);
+}
+
+#[test]
+fn empty_zero_boxes_disappear_but_explicit_spacing_and_breaks_remain() {
+    let section = parse("<p>Before.</p><p style='margin:0;padding:0;width:0;height:0'> </p><div style='margin:0;padding:0;width:0;height:0'><span role='doc-pagebreak' id='page' title='2'/></div><p id='next'>After.</p>");
+    assert_eq!(section.blocks.len(), 2);
+    let spaced = parse("<p>Before.</p><div style='height:24px;margin:12px 0'/><p><br/></p><p>After.</p>");
+    assert!(spaced.blocks.iter().any(|block| matches!(block, Block::Separator(s) if s.kind == rebook_publication::SeparatorKind::AuthoredSpacing)));
+    assert!(spaced.blocks.iter().any(|block| matches!(block, Block::Separator(s) if s.kind == rebook_publication::SeparatorKind::Spacing)));
+    let padded = parse("<div style='padding:12px 0'/><p>Body.</p>");
+    assert!(matches!(&padded.blocks[0], Block::Separator(s) if s.style.margin_before == 12.0 && s.style.margin_after == 12.0));
+}
+
+#[test]
 fn transparent_content_uses_css_cascade_and_preserves_following_source_ids() {
     for hidden in [
         "<p style='opacity:0'>Hidden</p>",

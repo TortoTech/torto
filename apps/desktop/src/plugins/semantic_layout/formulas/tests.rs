@@ -53,7 +53,7 @@ fn live_text_entry_image_replacement_fidelity() {
 #[test]
 fn literal_radicals_strokes_and_punctuation_are_text_without_normalization() {
     for text in ["⺅", "㇏", "丨", "ㄅ", "ᄀ", "ə\u{301}", "↔", "<", ">", "⼀"] {
-        let response=Response { revision: TEXT_REVISION, replacement_safe: true,status:"recognized_text".into(),text:Some(text.into()),literal:true,
+        let response=Response { table_html: None, revision: TEXT_REVISION, replacement_safe: true,status:"recognized_text".into(),text:Some(text.into()),literal:true,
             latex:None,equation_number:None,transient:false};
         assert!(response.formula().is_ok(),"{text}");
         assert_eq!(response.text.as_deref(),Some(text));
@@ -67,7 +67,7 @@ fn text_results_preserve_images_and_do_not_become_formulas() {
     use super::super::tests::{image, section};
     let original = section(vec![image("text")]);
     let candidate = candidates(&original).pop().unwrap();
-    let response = Response { revision: TEXT_REVISION, replacement_safe: true, text: Some("か".into()), literal: true, transient: false,
+    let response = Response { table_html: None, revision: TEXT_REVISION, replacement_safe: true, text: Some("か".into()), literal: true, transient: false,
         status: "recognized_text".into(), latex: None, equation_number: None };
     let mut annotations = Vec::new();
     let mut failed = 0;
@@ -179,7 +179,7 @@ fn formula_transcriptions_must_render_and_keep_negative_results_empty() {
         );
     }
     assert!(
-        Response { revision: TEXT_REVISION, replacement_safe: true,
+        Response { table_html: None, revision: TEXT_REVISION, replacement_safe: true,
             text: None,
             literal: false,
             transient: false,
@@ -192,7 +192,7 @@ fn formula_transcriptions_must_render_and_keep_negative_results_empty() {
         .is_none()
     );
     assert!(
-        Response { revision: TEXT_REVISION, replacement_safe: true,
+        Response { table_html: None, revision: TEXT_REVISION, replacement_safe: true,
             text: None,
             literal: false,
             transient: false,
@@ -562,4 +562,34 @@ fn live_computational_formula_images() {
             "no number is printed inside these fixtures"
         );
     }
+}
+
+#[test]
+fn table_results_require_safe_complete_grid_and_preserve_captioned_candidates() {
+    use super::super::tests::{image, section};
+    let original = section(vec![image("table")]);
+    let href = candidates(&original)[0].image.href.clone();
+    let mut response = Response {
+        table_html: Some("<table><tr><th rowspan='2'>Category</th><th colspan='2'>Value</th></tr><tr><th>2023</th><th>2024</th></tr><tr><td>A</td><td>-1.2</td><td>3.4%</td></tr></table>".into()),
+        revision: TEXT_REVISION, replacement_safe: true, text: None, literal: false, transient: false,
+        status: "recognized_table".into(), latex: None, equation_number: None,
+    };
+    let mut annotations = Vec::new();
+    let mut failed = 0;
+    record(Some(&response), &href, &mut annotations, &mut failed);
+    assert_eq!(failed, 0);
+    assert!(matches!(&annotations[..], [Annotation::ImageTable { table, .. }] if table.rows[0].cells[0].row_span == 2));
+    assert!(validate_annotations(&original, &annotations));
+    response.table_html = Some("<table><tr><td rowspan='3'>Missing row</td></tr></table>".into());
+    assert!(response.formula().is_err());
+    let mut rejected = Vec::new();
+    record(Some(&response), &href, &mut rejected, &mut failed);
+    assert!(rejected.is_empty());
+    response.replacement_safe = false;
+    assert!(response.formula().unwrap().is_none());
+    let descriptor = rebook_publication::SpineItem { id: rebook_publication::SpineItemId::new("captioned").unwrap(), href: PublicationUrl::parse("chapter.xhtml").unwrap(), media_type: "application/xhtml+xml".into(), linear: true, properties: vec![] };
+    let section = rebook_html::parse_section("<html><body><figure><img src='table.png'/><figcaption>Table 1. Results.</figcaption></figure></body></html>", &descriptor, |_| None).unwrap();
+    let tables = candidates(&section);
+    assert_eq!(tables.len(), 1);
+    assert!(!tables[0].inline);
 }

@@ -3,12 +3,12 @@ use super::*;
 #[test]
 fn replacement_fidelity_is_required_and_unsafe_text_or_latex_is_terminal() {
     let item = json!({"image_id":0,"status":"recognized_text","text":"t = 0 sec",
-        "literal":true,"latex":null,"equation_number":null});
+        "literal":true,"latex":null,"equation_number":null,"table_html":null});
     assert!(parse(&json!({"results":[item.clone()]}).to_string(), &[0]).is_empty());
     let mut unsafe_text = item;
     unsafe_text["replacement_safe"] = json!(false);
     let unsafe_math = json!({"image_id":1,"status":"recognized","replacement_safe":false,
-        "text":null,"literal":true,"latex":"\\text{t = 0 sec}","equation_number":null});
+        "text":null,"literal":true,"latex":"\\text{t = 0 sec}","equation_number":null,"table_html":null});
     let value = json!({"results":[unsafe_text,unsafe_math]});
     let schema = options();
     assert!(jsonschema::validator_for(&schema["output_schema"]).unwrap().is_valid(&value));
@@ -31,6 +31,7 @@ fn complete_image_response(mut value: Value) -> Value {
             if let Some(object) = item.as_object_mut() {
                 object.entry("replacement_safe").or_insert(Value::Bool(true));
                 object.entry("text").or_insert(Value::Null);
+                object.entry("table_html").or_insert(Value::Null);
                 object.entry("literal").or_insert(Value::Bool(false));
             }
         }

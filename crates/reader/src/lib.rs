@@ -6131,6 +6131,7 @@ mod tests {
         };
         section.blocks = vec![Block::Table(table)];
         section.anchors = vec![SectionAnchor {
+            page_label: None,
             fragment: "table-label".into(),
             source: ranges[0].start.clone(),
         }];
@@ -6693,10 +6694,12 @@ mod tests {
             .clone();
         data.sections[0].anchors = vec![
             SectionAnchor {
+                page_label: None,
                 fragment: "middle".into(),
                 source: middle,
             },
             SectionAnchor {
+                page_label: None,
                 fragment: "unrelated".into(),
                 source: unrelated,
             },
@@ -7161,6 +7164,7 @@ mod tests {
         ];
         let title_source = block_source(&section.blocks[2]).unwrap().start.clone();
         section.anchors = vec![SectionAnchor {
+            page_label: None,
             fragment: "section-2-5".into(),
             source: title_source.clone(),
         }];
@@ -7513,6 +7517,7 @@ mod tests {
         let anchor = block.source.as_ref().unwrap().start.clone();
         source_mut.sections[0].blocks.push(second);
         source_mut.sections[0].anchors.push(SectionAnchor {
+            page_label: None,
             fragment: "second".into(),
             source: anchor,
         });
@@ -7593,6 +7598,7 @@ mod tests {
             }),
         ];
         target_section.anchors = vec![SectionAnchor {
+            page_label: None,
             fragment: "part-2".to_owned(),
             source: source_range("n1", 4).start,
         }];
@@ -7657,10 +7663,12 @@ mod tests {
         };
         source_mut.sections[0].anchors = vec![
             SectionAnchor {
+                page_label: None,
                 fragment: "first".into(),
                 source: source_range.start.clone(),
             },
             SectionAnchor {
+                page_label: None,
                 fragment: "second".into(),
                 source: SourceAnchor {
                     text_offset: 1,
@@ -7739,6 +7747,7 @@ mod tests {
             }),
         ];
         source_mut.sections[0].anchors = vec![SectionAnchor {
+            page_label: None,
             fragment: "target".into(),
             source: source_range("n1", 6).start,
         }];
@@ -7798,6 +7807,7 @@ mod tests {
         source_mut.sections[0].anchors = ["chapter-2", "chapter-3"]
             .into_iter()
             .map(|fragment| SectionAnchor {
+                page_label: None,
                 fragment: fragment.into(),
                 source: source_range(fragment).start,
             })
@@ -7875,6 +7885,7 @@ mod tests {
             }),
         ];
         source_mut.sections[0].anchors = vec![SectionAnchor {
+            page_label: None,
             fragment: "later".into(),
             source: source_range("n1", 5).start,
         }];
@@ -8260,6 +8271,7 @@ mod tests {
         ];
         source_mut.sections[0].anchors = vec![
             SectionAnchor {
+                page_label: None,
                 fragment: "chapter".into(),
                 source: SourceAnchor {
                     spine: spine.clone(),
@@ -8268,6 +8280,7 @@ mod tests {
                 },
             },
             SectionAnchor {
+                page_label: None,
                 fragment: "leaf-a".into(),
                 source: SourceAnchor {
                     spine: spine.clone(),
@@ -8276,6 +8289,7 @@ mod tests {
                 },
             },
             SectionAnchor {
+                page_label: None,
                 fragment: "leaf-b".into(),
                 source: SourceAnchor {
                     spine: spine.clone(),
@@ -8489,6 +8503,7 @@ mod tests {
             .start
             .clone();
         data.sections[2].anchors.push(SectionAnchor {
+            page_label: None,
             fragment: "b".into(),
             source: child_anchor,
         });
@@ -8615,6 +8630,7 @@ mod tests {
             })
         };
         let anchor = |fragment: &str, node: &str| SectionAnchor {
+            page_label: None,
             fragment: fragment.into(),
             source: SourceAnchor {
                 spine: spine.clone(),
@@ -8855,6 +8871,7 @@ mod tests {
         data.sections[0].blocks = previous;
         data.sections[1].blocks = continuation;
         data.sections[0].anchors = vec![SectionAnchor {
+            page_label: None,
             fragment: "direct".into(),
             source: block_source(&data.sections[0].blocks[0])
                 .unwrap()
@@ -8869,6 +8886,7 @@ mod tests {
                     .start
                     .clone();
                 SectionAnchor {
+                    page_label: None,
                     fragment: source.node.clone(),
                     source,
                 }
@@ -9014,6 +9032,7 @@ mod tests {
                 .start
                 .clone();
             data.sections[index].anchors.push(SectionAnchor {
+                page_label: None,
                 fragment: "heading".into(),
                 source: anchor,
             });

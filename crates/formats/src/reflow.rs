@@ -123,6 +123,11 @@ pub fn append_text(left: &mut TextBlock, right: TextBlock) -> Option<SourceMove>
     append_text_inner(left, right, false)
 }
 
+pub(crate) fn append_recovered_text(left: &mut TextBlock, right: TextBlock, words: Option<&HashSet<String>>) -> Option<SourceMove> {
+    let joined = words.is_some_and(|words| recover_ocr_hyphen(left, &right, words));
+    append_text_inner(left, right, joined)
+}
+
 fn append_text_inner(
     left: &mut TextBlock,
     mut right: TextBlock,

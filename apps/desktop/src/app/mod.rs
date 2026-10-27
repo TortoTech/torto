@@ -1,4 +1,4 @@
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) mod window_chrome;
 
 use std::path::Path;
@@ -131,7 +131,7 @@ impl DesktopApp {
         page_texture: Option<ReaderPageTexture>,
     ) -> Option<ReaderFramePlan> {
         let ui_started = std::time::Instant::now();
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         window_chrome::begin_frame(ui.ctx());
         self.reconcile_state(ui.ctx());
         self.shelf.update_open_viewport(ui);
@@ -200,7 +200,7 @@ impl DesktopApp {
         {
             reader.report_settings_error(error);
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             if window_chrome::geometry(ui.ctx()).header.is_none() {
                 window_chrome::fallback_header(ui);
@@ -244,7 +244,7 @@ impl DesktopApp {
                 ],
             );
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         window_chrome::paint_controls(ui.ctx());
         self.sample_memory(ui.ctx());
         plan

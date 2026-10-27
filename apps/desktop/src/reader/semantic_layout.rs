@@ -869,6 +869,29 @@ impl DesktopReader {
                     input.text = prepared.text;
                 }
             }
+            if self.semantic_enabled() {
+                for (block_index, raw) in original.blocks.iter().enumerate().filter(|(_, block)| matches!(block, rebook_publication::Block::Image(_) | rebook_publication::Block::Figure(_))) {
+                    if !self.translation_semantics_ready(index, block_index)
+                        || !block_ranges(raw).iter().any(|source| ranges.iter().any(|range| source.start.spine == range.start.spine && (source.start.node == range.start.node || source.start.node == range.end.node))) { continue; }
+                    let mut scope = scope_section(original, block_index..block_index + 1);
+                    self.semantic_source.prepare_citation_input(index, hash, &mut scope);
+                    for group in self.semantic_layout.groups.iter().filter(|group| group.index == index && group.hash == *hash) {
+                        if let Some(result) = &group.result { crate::plugins::semantic_layout::apply_translation_citations(&mut scope, result); }
+                    }
+                    let converted = scope.blocks.iter().any(|block| match block {
+                        rebook_publication::Block::Table(_) => true,
+                        rebook_publication::Block::Figure(figure) => figure.body.iter().any(|block| matches!(block, rebook_publication::Block::Table(_))),
+                        _ => false,
+                    });
+                    if !converted { continue; }
+                    self.translation_source.remember_translation_input(index, block_index, raw, &scope.blocks[0]);
+                    prepared.retain(|(input, _)| input.block_index != block_index);
+                    for (mut input, range) in crate::plugins::prepare_translation_inputs(&scope, false) {
+                        input.block_index = block_index;
+                        prepared.push((input, range));
+                    }
+                }
+            }
         }
         self.translation_source
             .untranslated_prepared(index, &prepared, ranges)

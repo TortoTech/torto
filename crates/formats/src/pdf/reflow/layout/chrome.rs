@@ -19,10 +19,12 @@ struct Observation {
     offset: Option<i64>,
     label: String,
     confirmed: bool,
+    isolated: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct Detector {
+    pub(crate) words: HashSet<String>,
     observations: BTreeMap<usize, Vec<Observation>>,
     occurrences: HashMap<String, Vec<usize>>,
     fonts: HashMap<i64, usize>,
@@ -73,8 +75,18 @@ impl Detector {
                     .or_default() += 1;
             }
         }
+        // A complete spelling elsewhere in the book proves a discretionary
+        // hard-hyphen split without guessing from a hyphenation pattern alone.
+        for line in lines(page.glyphs.clone()) {
+            for word in line.text().split(|c: char| !c.is_alphabetic()) {
+                if word.len() >= 2 && self.words.len() < 100_000 {
+                    self.words.insert(word.to_lowercase());
+                }
+            }
+        }
+        let isolated: HashSet<_> = edge_lines(page, None).iter().filter_map(|line| edge_key(line, page.height)).collect();
         let mut seen = HashSet::new();
-        for line in edge_lines(page, None) {
+        for line in edge_lines_with_gap(page, None, 1.2) {
             let Some(key) = edge_key(&line, page.height) else {
                 continue;
             };
@@ -92,7 +104,7 @@ impl Detector {
                 .or_default()
                 .push(Observation {
                     page: index,
-                    key,
+                    key: key.clone(),
                     top: line.baseline < page.height * 0.18,
                     y: line.baseline / page.height,
                     anchor,
@@ -101,6 +113,7 @@ impl Detector {
                     offset: number.map(|n| i64::from(n) - (index as i64 + 1)),
                     label: label_key(&label),
                     confirmed: false,
+                    isolated: isolated.contains(&key),
                 });
         }
     }
@@ -115,11 +128,9 @@ impl Detector {
             // Use the document body font, not a diagram-heavy page's median.
             observations.retain(|candidate| candidate.font <= body * 1.15);
             for candidate in observations {
-                candidate.confirmed = repeats_near_page(
-                    &self.occurrences[&candidate.key],
-                    candidate.page,
-                    &candidate.key,
-                );
+                let nearby = self.occurrences[&candidate.key].iter().filter(|page| page.abs_diff(candidate.page) <= 10).count();
+                candidate.confirmed = repeats_near_page(&self.occurrences[&candidate.key], candidate.page, &candidate.key)
+                    && (candidate.isolated || nearby >= 3);
             }
         }
     }
@@ -131,7 +142,7 @@ impl Detector {
             .map(|l| label_key(l))
             .collect::<HashSet<_>>();
         for candidate in self.observations.get(&index).into_iter().flatten() {
-            if candidate.confirmed {
+            if candidate.confirmed && (candidate.isolated || candidate.side.is_some() || labels.contains(&candidate.label)) {
                 removed.insert(candidate.key.clone());
                 continue;
             }

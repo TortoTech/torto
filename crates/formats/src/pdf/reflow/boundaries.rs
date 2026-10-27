@@ -203,6 +203,7 @@ mod tests {
             original_glyph: 0,
         });
         stored.section.anchors.push(SectionAnchor {
+            page_label: None,
             fragment: format!("anchor-{node}"),
             source: start,
         });

@@ -1314,6 +1314,7 @@ fn hidden_linked_notes_join_translation_requests_but_not_standalone_ai() {
             })],
         }));
     section.anchors.push(rebook_publication::SectionAnchor {
+        page_label: None,
         fragment: "note".into(),
         source: note_range.start.clone(),
     });
@@ -2676,4 +2677,36 @@ fn local_hearing_figures_keep_border_after_sentence_structure() {
             );
         }
     }
+}
+
+#[test]
+fn recognized_image_table_schedules_new_cell_translation_inputs() {
+    let (_, initial, _) = fixture();
+    let (mut reader, original, _) = fixture_with_blocks(initial.blocks);
+    reader.plugin_settings.semantic_layout.enabled = true;
+    reader.semantic_source.configure("image-table-regression", &reader.plugin_settings);
+    reader.translation_source.set_enabled(true).unwrap();
+    reader.translation_source.set_mode(crate::plugins::TranslationMode::Replace).unwrap();
+    let source = block_source_range(&original.blocks[2]).unwrap().clone();
+    let table = rebook_html::parse_recognized_table("<table><tr><th>Year</th><th>Amount</th></tr><tr><td>2024</td><td>12.5</td></tr></table>").unwrap();
+    let hash = crate::plugins::semantic_layout::fingerprint(&original);
+    let recognition = serde_json::from_value(serde_json::json!({
+        "fingerprint":hash, "image_text_revision":6, "formulas_checked":true,"skipped_groups":0,
+        "annotations":[{"ImageTable":{"href":{"path":"image.png"},"table":table}}]
+    })).unwrap();
+    let mut group = staged_group(&original, 2..3);
+    group.result = Some(recognition);
+    reader.stage_semantic_group(group);
+    reader.semantic_layout.done.insert((0, 2), hash);
+    let inputs = reader.missing_prepared(0, std::slice::from_ref(&source)).unwrap();
+    assert_eq!(inputs.len(), 4);
+    assert!(inputs.iter().all(|input| input.block_index == 2 && input.segment_index.is_some()));
+    reader.translation_source.store_batch(0, &inputs.iter().map(|input| crate::plugins::BlockTranslation {
+        block_index: input.block_index, segment_index: input.segment_index,
+        text: input.text.replace("Year", "年份").replace("Amount", "金额"),
+    }).collect::<Vec<_>>()).unwrap();
+    let translated = reader.translation_source.parse_section(0).unwrap();
+    assert!(matches!(&translated.blocks[2], Block::Table(_)));
+    assert!(super::super::block_focus_text(&translated.blocks[2]).contains("年份"));
+    assert!(reader.missing_prepared(0, &[source]).unwrap().is_empty());
 }

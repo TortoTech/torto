@@ -267,6 +267,7 @@ mod tests {
             .map(|index| {
                 let source = block_ranges(&section.blocks[index])[0].start.clone();
                 section.anchors.push(rebook_publication::SectionAnchor {
+                    page_label: None,
                     fragment: format!("a{index}"),
                     source,
                 });

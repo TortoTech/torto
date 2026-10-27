@@ -328,7 +328,7 @@ impl DesktopReader {
         if let Some(selection) = &self.selection {
             paint(&selection.ranges, TEXT_SELECTION_COLOR, false, false);
         }
-        if self.focus_background_highlight()
+        if self.focus_background_visible()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
@@ -353,7 +353,7 @@ impl DesktopReader {
         content_padding: f32,
     ) -> Rect {
         let mut bounds: Option<Rect> = None;
-        if self.focus_background_highlight()
+        if self.focus_background_visible()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
@@ -383,7 +383,7 @@ impl DesktopReader {
             bounds = Some(bounds.map_or(rect, |previous| previous.union(rect)));
             scene.fill(Fill::NonZero, Affine::IDENTITY, neutral, None, &background);
         }
-        if self.focus_background_highlight()
+        if self.focus_background_visible()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
@@ -579,7 +579,7 @@ impl DesktopReader {
             .is_focus_mode()
             .then(|| self.focus_units.get(self.focus_unit_index))
             .flatten();
-        let activation_visible = self.focus_background_highlight()
+        let activation_visible = self.focus_background_visible()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
@@ -672,7 +672,7 @@ impl DesktopReader {
         } else if !self.is_focus_mode() {
             page.paint_all_footnote_icons(scene, focus_footnote_icon_color(), offset_x);
         }
-        if self.focus_background_highlight()
+        if self.focus_background_visible()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),

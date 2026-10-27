@@ -201,7 +201,7 @@ pub(crate) fn show_image_preview_area(
     interactive: bool,
 ) -> ImagePreviewInteraction {
     let backdrop_screen = ctx.content_rect();
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     crate::app::window_chrome::dim_controls(ctx, 190.0 / 255.0 * opacity);
     let mut interaction = ImagePreviewInteraction {
         close: false,

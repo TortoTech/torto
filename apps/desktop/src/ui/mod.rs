@@ -25,11 +25,11 @@ use crate::preferences::{
 
 /// Space available to page overlays, excluding the Windows caption row.
 pub(crate) fn overlay_rect(ctx: &egui::Context) -> Rect {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         crate::app::window_chrome::body_rect(ctx)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         ctx.content_rect()
     }
@@ -51,7 +51,7 @@ pub(crate) fn modal_area(ctx: &egui::Context, id: egui::Id) -> egui::Area {
 /// Full-window modal with matching dimming for caption controls painted above it.
 pub(crate) fn modal(ctx: &egui::Context, id: egui::Id, opacity: f32) -> egui::Modal {
     let opacity = opacity.clamp(0.0, 1.0);
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     crate::app::window_chrome::dim_controls(ctx, opacity);
     egui::Modal::new(id)
         .area(modal_area(ctx, id))
@@ -531,7 +531,7 @@ fn painted_icon_button_sized(
     icon_size: f32,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(button_size), Sense::click());
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     crate::app::window_chrome::exclude(ui.ctx(), rect);
     let palette = palette();
     let fill = if selected {

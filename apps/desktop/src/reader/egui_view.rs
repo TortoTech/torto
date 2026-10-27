@@ -466,10 +466,14 @@ fn panel_resize_pointer(
     edge_x: f32,
     covered_by_drawer: bool,
 ) -> Option<f32> {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let viewport = ctx.content_rect();
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let viewport = crate::app::window_chrome::body_rect(ctx);
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let top = viewport.top();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let top = viewport.top() + TOOLBAR_HEIGHT;
     let response = egui::Area::new(id.into())
         .fade_in(false)
         .order(if covered_by_drawer {
@@ -479,11 +483,11 @@ fn panel_resize_pointer(
         })
         .fixed_pos(Pos2::new(
             edge_x - PANEL_RESIZE_HANDLE_WIDTH / 2.0,
-            viewport.top() + TOOLBAR_HEIGHT,
+            top,
         ))
         .show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(
-                Vec2::new(PANEL_RESIZE_HANDLE_WIDTH, (viewport.height() - TOOLBAR_HEIGHT).max(1.0)),
+                Vec2::new(PANEL_RESIZE_HANDLE_WIDTH, (viewport.bottom() - top).max(1.0)),
                 if covered_by_drawer { egui::Sense::hover() } else { egui::Sense::drag() },
             );
             let response = if covered_by_drawer {
@@ -684,7 +688,7 @@ impl DesktopReader {
             ctx.request_repaint_after(deadline.saturating_duration_since(now));
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let screen = ctx.content_rect();
             crate::app::window_chrome::header(
@@ -697,10 +701,10 @@ impl DesktopReader {
             );
         }
         let (sidebar_progress, assistant_progress) = self.show_side_panels(root_ui);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         self.window_menu(&ctx);
         if self.completion.is_some() {
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             egui::Panel::top("completion-header-space")
                 .exact_size(TOOLBAR_HEIGHT)
                 .show(root_ui, |_| {});
@@ -714,7 +718,7 @@ impl DesktopReader {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(background_ui))
             .show(root_ui, |ui| {
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                 {
                     toolbar_rect = Rect::from_min_size(
                         ui.next_widget_position(),
@@ -722,7 +726,7 @@ impl DesktopReader {
                     );
                     self.toolbar(ui, background_ui);
                 }
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 {
                     let (row, _) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width(), TOOLBAR_HEIGHT),
@@ -843,16 +847,16 @@ impl DesktopReader {
         }
         self.image_preview_overlay(&ctx);
         self.media_preview_overlay(&ctx);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         if self.preview_is_open() {
             crate::app::window_chrome::block_drag(&ctx);
         }
         self.feedback(&ctx);
         self.pdf_toc_review(&ctx);
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let pointer_over_header = crate::app::window_chrome::state(&ctx).header_hovered;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let pointer_over_header = false;
         if !pointer_over_header
             && should_hide_reader_cursor(
@@ -2299,7 +2303,7 @@ impl DesktopReader {
         self.turn_page(direction);
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn window_menu(&mut self, ctx: &egui::Context) {
         if self.ui.toolbar_motion.value <= 0.02 && self.ui.overlay != ReaderOverlay::Menu {
             return;
@@ -2348,12 +2352,14 @@ impl DesktopReader {
         } else {
             page_rect.left()
         };
-        #[cfg(target_os = "windows")]
+        #[cfg(target_os = "macos")]
+        let left = left.max(crate::app::window_chrome::left_edge(ctx));
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let menu_left = screen.right()
             - crate::app::window_chrome::reserve_width(ctx)
             - TOOLBAR_CONTROL_SIZE
             - 12.0;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let menu_left = page_rect.right() - TOOLBAR_CONTROL_SIZE - 12.0;
         let y = screen.top() + (TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) * 0.5;
         if (hovered || self.ui.sidebar_open || floating)
@@ -2434,7 +2440,7 @@ impl DesktopReader {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let left_control_count = 3.0 + self.pdf_ocr_toolbar_control_count();
                     let left_controls_width = TOOLBAR_CONTROL_SIZE * left_control_count;
-                    #[cfg(target_os = "windows")]
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
                     if toolbar_actions_visible {
                         crate::app::window_chrome::exclude(
                             ui.ctx(),
@@ -2483,7 +2489,7 @@ impl DesktopReader {
                                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
                             |ui| {
                                 ui.add_space(12.0);
-                                #[cfg(not(target_os = "windows"))]
+                                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                                 if icon_button(ui, Icon::Menu)
                                     .on_hover_text(self.language.text("菜单", "Menu"))
                                     .clicked()
@@ -2498,9 +2504,9 @@ impl DesktopReader {
                     }
                 });
             });
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let hovered = crate::app::window_chrome::state(ui.ctx()).header_hovered;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let hovered = ui.ctx().input(|input| {
             input
                 .pointer
@@ -2530,7 +2536,7 @@ impl DesktopReader {
                     if pending {
                         let (rect, response) =
                             ui.allocate_exact_size(egui::Vec2::splat(32.0), egui::Sense::click());
-                        #[cfg(target_os = "windows")]
+                        #[cfg(any(target_os = "windows", target_os = "macos"))]
                         crate::app::window_chrome::exclude(ui.ctx(), rect);
                         crate::ui::LoadingSpinner::new()
                             .color(palette().accent)
@@ -2683,7 +2689,7 @@ impl DesktopReader {
         // The backdrop also covers the caption row; window controls receive the same dimming.
         let screen = ctx.content_rect();
         let scrim_rect = screen;
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         crate::app::window_chrome::dim_header(
             ctx,
             0.31 * progress,
@@ -2699,12 +2705,12 @@ impl DesktopReader {
                 ui.set_clip_rect(scrim_rect);
                 let (rect, response) =
                     ui.allocate_exact_size(scrim_rect.size(), egui::Sense::click());
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 let paint_rect = Rect::from_min_max(
                     Pos2::new(screen.left(), screen.top() + TOOLBAR_HEIGHT),
                     screen.max,
                 );
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                 let paint_rect = screen;
                 ui.painter().with_clip_rect(paint_rect).rect_filled(
                     rect,
@@ -2738,9 +2744,9 @@ impl DesktopReader {
 
     fn focus_assistant_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
         self.sync_focus_chat_session();
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let viewport = ctx.content_rect();
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let viewport = crate::app::window_chrome::body_rect(ctx);
         let style = self.reader.style();
         let content_right = page_rect.left()
@@ -2933,9 +2939,9 @@ impl DesktopReader {
             .copied()
             .unwrap_or(0.0);
         let mut next_scroll_offset = scroll_offset;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let viewport = ctx.content_rect();
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let viewport = crate::app::window_chrome::body_rect(ctx);
         let style = self.reader.style();
         let content_right = page_rect.left()
@@ -4565,13 +4571,13 @@ impl DesktopReader {
         if progress <= 0.001 {
             return;
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let assistant_inset = if self.is_focus_mode() {
             0.0
         } else {
             ASSISTANT_WIDTH * self.ui.assistant_motion.value.clamp(0.0, 1.0)
         };
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let assistant_inset = crate::app::window_chrome::reserve_width(ctx);
         let menu = egui::Area::new("reader-menu".into())
             .order(egui::Order::Tooltip)
@@ -6681,9 +6687,9 @@ pub(crate) fn paint_toolbar_title(
 ) {
     // The title follows the body center. Controls only constrain its available
     // width, so asymmetric native caption buttons cannot shift the title.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let right_controls_width = TOOLBAR_CONTROL_SIZE;
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let right_controls_width = TOOLBAR_CONTROL_SIZE * 2.0 + 12.0;
     let title_clip = Rect::from_min_max(
         Pos2::new(
@@ -6698,7 +6704,7 @@ pub(crate) fn paint_toolbar_title(
             toolbar_rect.bottom(),
         ),
     );
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let title_clip = {
         let mut title_clip = title_clip;
         for rect in crate::app::window_chrome::geometry(ui.ctx()).excluded {

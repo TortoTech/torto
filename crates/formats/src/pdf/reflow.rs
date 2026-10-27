@@ -21,7 +21,7 @@ use rebook_publication::*;
 use serde::{Deserialize, Serialize};
 
 // The revision also isolates semantic/translation caches from older grouping.
-pub const VERSION: u32 = 16;
+pub const VERSION: u32 = 17;
 pub const PAGE_ANCHOR_PREFIX: &str = "pdf-page-";
 pub use quality::{Assessment, TextRoute, assess};
 const MAX_SECTION_BYTES: u64 = 32 * 1024 * 1024;
@@ -386,7 +386,7 @@ pub fn convert(
                 .collect::<Vec<_>>();
             let repeated = edges.removed_keys(index, &labels);
             let (mut stored, regions) =
-                layout::build(&page, index, body_size, &repeated, &mut stats)?;
+                layout::build_with_words(&page, index, body_size, &repeated, &mut stats, Some(&edges.words))?;
             paragraphs::register_floats(&stored, &regions, index + 1, &mut floats);
             paragraphs::same_page(&mut stored, body_size, &floats);
             resources.extend(regions.iter().map(|region| region.path.clone()));
@@ -417,14 +417,16 @@ pub fn convert(
                         previous_frame,
                         frame,
                         &floats,
+                        Some(&edges.words),
                     );
-                    join_page_paragraph(
+                    join_page_paragraph_with_words(
                         previous,
                         &mut prefix,
                         &page,
                         body_size,
                         previous_frame,
                         frame,
+                        Some(&edges.words),
                     );
                     previous.section.blocks.append(&mut prefix.section.blocks);
                     previous.section.anchors.append(&mut prefix.section.anchors);
@@ -491,6 +493,7 @@ pub fn convert(
                 if let Some(source) = source {
                     let fragment = format!("pdf-native-outline-{destination_index}");
                     stored.section.anchors.push(SectionAnchor {
+                        page_label: None,
                         fragment: fragment.clone(),
                         source,
                     });
@@ -512,6 +515,7 @@ pub fn convert(
                     if let Some(source) = boundaries::heading_source(&stored, label) {
                         let fragment = format!("pdf-native-heading-{index}-{label_index}");
                         stored.section.anchors.push(SectionAnchor {
+                            page_label: None,
                             fragment: fragment.clone(),
                             source,
                         });
@@ -539,17 +543,19 @@ pub fn convert(
                     previous_frame,
                     frame,
                     &floats,
+                    Some(&edges.words),
                 );
                 // Retain the existing conservative join for sparse pages without a
                 // reliable body frame. Never use it across a storage cut.
                 if !cut {
-                    join_page_paragraph(
+                    join_page_paragraph_with_words(
                         previous,
                         &mut stored,
                         &page,
                         body_size,
                         previous_frame,
                         frame,
+                        Some(&edges.words),
                     );
                 }
                 for anchor in &previous.section.anchors {
@@ -825,6 +831,7 @@ fn relocate(stored: &mut StoredSection, id: SpineItemId, href: PublicationUrl) {
     stored.section.href = href;
 }
 
+#[cfg(test)]
 fn join_page_paragraph(
     previous: &mut StoredSection,
     next: &mut StoredSection,
@@ -832,6 +839,18 @@ fn join_page_paragraph(
     body: f64,
     previous_frame: Option<layout::BodyFrame>,
     next_frame: Option<layout::BodyFrame>,
+) {
+    join_page_paragraph_with_words(previous, next, page, body, previous_frame, next_frame, None);
+}
+
+fn join_page_paragraph_with_words(
+    previous: &mut StoredSection,
+    next: &mut StoredSection,
+    page: &NativePage,
+    body: f64,
+    previous_frame: Option<layout::BodyFrame>,
+    next_frame: Option<layout::BodyFrame>,
+    words: Option<&HashSet<String>>,
 ) {
     // Notes belong to the paragraph and do not constitute a body-flow boundary.
     // Figures, tables and headings still stop cross-page joins.
@@ -920,9 +939,15 @@ fn join_page_paragraph(
     {
         return;
     }
-    let Some(movement) = crate::reflow::append_text(last, first.clone()) else {
+    let old_end = last.source.as_ref().unwrap().end.text_offset;
+    let Some(movement) = crate::reflow::append_recovered_text(last, first.clone(), words) else {
         return;
     };
+    if movement.to.text_offset < old_end {
+        for slice in previous.provenance.iter_mut().filter(|slice| slice.source.start.node == movement.to.node) {
+            slice.source.end.text_offset = slice.source.end.text_offset.min(movement.to.text_offset).max(slice.source.start.text_offset);
+        }
+    }
     for slice in &mut next.provenance {
         movement.apply(&mut slice.source.start);
         movement.apply(&mut slice.source.end);

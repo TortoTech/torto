@@ -23,6 +23,7 @@ pub(crate) use visible::{
 mod batching;
 mod citations;
 mod formulas;
+mod image_tables;
 mod headings;
 mod log;
 mod normalize;
@@ -118,8 +119,9 @@ struct Response {
     formulas: Vec<text_formulas::Proposal>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum Annotation {
+    ImageTable { href: PublicationUrl, table: rebook_publication::TableBlock },
     ImageText {
         href: PublicationUrl,
         text: rebook_publication::ImageText,
@@ -477,13 +479,15 @@ impl SemanticLayoutSource {
                 .get(&index)
                 .filter(|result| result.fingerprint == hash)
         {
-            apply_translation_citations(section, result);
+            apply_text_translation_citations(section, result);
+            if self.enabled.load(std::sync::atomic::Ordering::Relaxed) { image_tables::prepare(section, result); }
         }
         if let Ok(state) = self.partial.read()
             && let Some(results) = state.get(&index)
         {
             for result in results.values().filter(|result| result.fingerprint == hash) {
-                apply_translation_citations(section, result);
+                apply_text_translation_citations(section, result);
+                if self.enabled.load(std::sync::atomic::Ordering::Relaxed) { image_tables::prepare(section, result); }
             }
         }
     }
@@ -847,7 +851,7 @@ fn request_contract_fingerprint() -> &'static str {
                 "compact-wire-v1",
                 PROMPT,
                 citations::PROMPT,
-                formulas::PROMPT,
+                formulas::CHAPTER_PROMPT,
                 formulas::TRANSCRIBE_PROMPT,
                 formulas::chapter_cache_options(),
                 completion_options(&RecognitionRoles {
@@ -1012,7 +1016,7 @@ fn load_recognition_with_hash(
 
 fn image_annotation_href(annotation: &Annotation) -> Option<&PublicationUrl> {
     match annotation {
-        Annotation::ImageText { href, .. } | Annotation::ImageFormula { href, .. }
+        Annotation::ImageTable { href, .. } | Annotation::ImageText { href, .. } | Annotation::ImageFormula { href, .. }
         | Annotation::UnreadableFormula { href } => Some(href),
         _ => None,
     }
@@ -1053,7 +1057,7 @@ fn load_recognition_inner(section: &Section, identity: &Value, hash: &str, curre
                 a,
                 Annotation::InlineCitations { .. }
                     | Annotation::TextFormulas { .. }
-                    | Annotation::ImageText { .. }
+                    | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
                 | Annotation::ImageFormula { .. }
                     | Annotation::UnreadableFormula { .. }
             )
@@ -1062,7 +1066,7 @@ fn load_recognition_inner(section: &Section, identity: &Value, hash: &str, curre
             Some(match a {
                 Annotation::InlineCitations { .. }
                 | Annotation::TextFormulas { .. }
-                | Annotation::ImageText { .. }
+                | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
                 | Annotation::ImageFormula { .. }
                 | Annotation::UnreadableFormula { .. } => {
                     unreachable!()
@@ -1922,6 +1926,10 @@ fn annotation(group: &Proposal, section: &Section) -> Annotation {
 // Resolve against source ranges, never translated block indices. Bilingual
 // companion paragraphs have no source and stay attached to their original.
 fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
+    if let Annotation::ImageTable { href, table } = annotation {
+        image_tables::compose(blocks, href, table);
+        return;
+    }
     if let Annotation::ImageText { href, text } = annotation {
         formulas::compose_text(blocks, href, text);
         return;
@@ -1979,7 +1987,7 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
-        | Annotation::ImageText { .. }
+        | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
                 | Annotation::ImageFormula { .. }
         | Annotation::UnreadableFormula { .. } => unreachable!(),
     };
@@ -2066,7 +2074,7 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
-        | Annotation::ImageText { .. }
+        | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
                 | Annotation::ImageFormula { .. }
         | Annotation::UnreadableFormula { .. } => unreachable!(),
     };
@@ -2189,6 +2197,11 @@ mod local_perf_tests;
 mod attribution_tests;
 
 pub(crate) fn apply_translation_citations(section: &mut Section, result: &Recognition) {
+    image_tables::prepare(section, result);
+    apply_text_translation_citations(section, result);
+}
+
+fn apply_text_translation_citations(section: &mut Section, result: &Recognition) {
     for annotation in &result.annotations {
         if let Annotation::InlineCitations { source, spans } = annotation {
             citations::compose(&mut section.blocks, source, spans);

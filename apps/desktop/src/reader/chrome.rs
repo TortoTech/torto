@@ -156,14 +156,14 @@ pub(crate) fn toc_row(
 }
 
 pub(crate) fn sidebar_frame(floating: bool) -> egui::Frame {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let margin = egui::Margin {
         top: ((super::egui_view::TOOLBAR_HEIGHT - super::egui_view::TOOLBAR_CONTROL_SIZE) / 2.0)
             as i8
             - i8::from(floating),
         ..egui::Margin::same(8)
     };
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let margin = if floating {
         egui::Margin {
             top: ((super::egui_view::TOOLBAR_HEIGHT - super::egui_view::TOOLBAR_CONTROL_SIZE) / 2.0)
@@ -200,6 +200,8 @@ pub(crate) fn sidebar_toolbar(
     use crate::ui::{Icon, icon_button, selectable_icon_button};
     let mut action = None;
     ui.horizontal(|ui| {
+        #[cfg(target_os = "macos")]
+        ui.add_space((crate::app::window_chrome::left_edge(ui.ctx()) - ui.max_rect().left()).max(0.0));
         if !reader_ready {
             dim_loading_controls(ui);
         }
