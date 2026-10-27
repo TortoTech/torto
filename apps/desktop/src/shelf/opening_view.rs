@@ -329,6 +329,7 @@ impl OpeningShell {
                             self.sidebar.pinned,
                             crate::reader::SidebarTab::Toc,
                             false,
+                            1.0,
                         )
                     {
                         self.sidebar.pinned = !self.sidebar.pinned;
