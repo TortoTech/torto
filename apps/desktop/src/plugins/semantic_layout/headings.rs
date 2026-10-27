@@ -42,14 +42,9 @@ pub(super) fn candidate(block: &Block) -> Option<()> {
         return None;
     }
     // A 120-character Latin title is already long; the same limit in Chinese
-    // admits entire prose paragraphs. Dates at the start of a sentence are
-    // also not chapter ordinals.
+    // admits entire prose paragraphs.
     let cjk = value.chars().any(|ch| matches!(ch as u32, 0x3400..=0x9fff));
-    if cjk && value.chars().count() > 48
-        || value.split_whitespace().count() > 20
-        || value.as_bytes().get(..4).is_some_and(|year| year.iter().all(u8::is_ascii_digit))
-            && value.get(4..).is_some_and(|rest| rest.starts_with('年'))
-    {
+    if cjk && value.chars().count() > 48 || value.split_whitespace().count() > 20 {
         return None;
     }
     if block.content.iter().any(|inline| match inline {
