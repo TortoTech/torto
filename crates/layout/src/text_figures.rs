@@ -48,9 +48,9 @@ impl LayoutEngine {
         };
         let before = captions(&figure.body[..start]);
         let after = captions(&figure.body[end..]);
-        let before =
+        let mut before =
             self.shape_figure_captions(source, &before, reader_style, paginator.width, true)?;
-        let after =
+        let mut after =
             self.shape_figure_captions(source, &after, reader_style, paginator.width, true)?;
         let gap = reader_style.typography.font_size * reader_style.typesetting.caption_gap_em;
         let caption_height = |texts: &[(PreparedText, Cow<'_, TextBlock>)]| {
@@ -111,6 +111,8 @@ impl LayoutEngine {
         })();
         self.raster_target = target;
         let (layout, width) = result?;
+        self.align_media_sources(source, &mut before, reader_style, paginator.width, width)?;
+        self.align_media_sources(source, &mut after, reader_style, paginator.width, width)?;
         let outer_gap = reader_style.typography.font_size * reader_style.typesetting.media_gap_em;
         let pages: Vec<_> = layout
             .pages

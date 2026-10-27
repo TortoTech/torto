@@ -479,11 +479,11 @@ fn panel_resize_pointer(
         })
         .fixed_pos(Pos2::new(
             edge_x - PANEL_RESIZE_HANDLE_WIDTH / 2.0,
-            viewport.top(),
+            viewport.top() + TOOLBAR_HEIGHT,
         ))
         .show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(
-                Vec2::new(PANEL_RESIZE_HANDLE_WIDTH, viewport.height()),
+                Vec2::new(PANEL_RESIZE_HANDLE_WIDTH, (viewport.height() - TOOLBAR_HEIGHT).max(1.0)),
                 if covered_by_drawer { egui::Sense::hover() } else { egui::Sense::drag() },
             );
             let response = if covered_by_drawer {
@@ -492,11 +492,11 @@ fn panel_resize_pointer(
                 response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
             };
             let stroke = if !covered_by_drawer && response.dragged() {
-                egui::Stroke::new(2.0, palette().accent)
+                egui::Stroke::new(1.5, palette().accent)
             } else if !covered_by_drawer && response.hovered() {
-                egui::Stroke::new(1.0, palette().muted)
+                egui::Stroke::new(1.0, palette().accent.gamma_multiply(0.65))
             } else {
-                egui::Stroke::new(1.0, palette().border)
+                egui::Stroke::new(1.0, palette().border.gamma_multiply(0.45))
             };
             ui.painter()
                 .vline(rect.center().x, rect.top()..=rect.bottom(), stroke);
@@ -1160,14 +1160,16 @@ impl DesktopReader {
             && focus_assistant_sidebar_width(viewport_width, self.ui.assistant_width).is_none()
         {
             self.close_assistant_panel();
+            // There is no room to paint the closing panel in this viewport.
+            self.ui.assistant_motion = super::Motion::settled(0.0);
+            self.ui.assistant_panel = None;
         }
         let sidebar_progress = self.ui.sidebar_motion.value.clamp(0.0, 1.0);
         let assistant_progress = self.ui.assistant_motion.value.clamp(0.0, 1.0);
         let sidebar_consumes_width =
             !self.is_focus_mode() && self.ui.sidebar_pinned && sidebar_progress > 0.001;
-        let assistant_consumes_width = self.assistant_is_docked()
-            && self.ui.assistant_panel.is_some()
-            && assistant_progress > 0.001;
+        let assistant_consumes_width =
+            self.assistant_is_docked() && self.ui.assistant_panel.is_some();
         let (sidebar_width, mut assistant_width) = constrained_panel_widths(
             viewport_width,
             self.ui.sidebar_width,
@@ -1192,7 +1194,7 @@ impl DesktopReader {
         }
         if assistant_consumes_width {
             egui::Panel::right("reader-assistant")
-                .exact_size(assistant_width * assistant_progress)
+                .exact_size(assistant_width)
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(
@@ -1201,6 +1203,19 @@ impl DesktopReader {
                         .inner_margin(egui::Margin::symmetric(ASSISTANT_SIDE_PADDING, 0)),
                 )
                 .show(root_ui, |ui| {
+                    // Reserve the final reader width once. Animate only the panel's
+                    // paint and input bounds, so text is not repaginated each frame.
+                    let clip = ui.max_rect();
+                    let rect = clip
+                        .translate(Vec2::new(assistant_width * (1.0 - assistant_progress), 0.0));
+                    ui.expand_to_include_rect(clip);
+                    let mut content = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                    let ui = &mut content;
+                    ui.set_clip_rect(clip.intersect(ui.clip_rect()));
+                    ui.set_opacity(assistant_progress);
+                    if self.ui.assistant_motion.target < 0.5 {
+                        ui.disable();
+                    }
                     let header = Rect::from_min_size(
                         Pos2::new(
                             ui.max_rect().left() - f32::from(ASSISTANT_SIDE_PADDING),
@@ -1211,11 +1226,8 @@ impl DesktopReader {
                             TOOLBAR_HEIGHT,
                         ),
                     );
-                    ui.painter().rect_filled(
-                        header,
-                        0.0,
-                        color32(self.reader.style().background),
-                    );
+                    ui.painter()
+                        .rect_filled(header, 0.0, color32(self.reader.style().background));
                     if ui.rect_contains_pointer(ui.max_rect())
                         && ui.input(|input| input.pointer.any_pressed())
                     {
@@ -1851,7 +1863,7 @@ impl DesktopReader {
             focus_chat_shortcut_action(
                 input,
                 &self.shortcuts.focus_chat,
-                self.ui.assistant_panel.is_some(),
+                self.ui.assistant_panel.is_some() && self.ui.assistant_motion.target > 0.5,
                 suggestions_active,
             )
         }) else {
@@ -1863,7 +1875,7 @@ impl DesktopReader {
         if action != FocusChatShortcutAction::IgnoreRepeat {
             self.ui.focus_navigation_repeat.held = None;
             self.ui.focus_actions_visible = false;
-            if self.assistant_is_docked() && self.ui.assistant_panel.is_some() {
+            if self.assistant_is_docked() && self.ui.assistant_panel.is_some() && self.ui.assistant_motion.target > 0.5 {
                 if input_focused {
                     self.ui.assistant_keyboard_focus = false;
                     self.chat.move_cursor_to_end = false;
@@ -5139,6 +5151,7 @@ impl DesktopReader {
             }
             return true;
         }
+        if self.open_associated_image_preview(ctx, &image) { return true; }
         if let Some(origin) = &image.origin {
             match self.reader.original_image(origin) {
                 Ok(original) => {
@@ -10371,6 +10384,7 @@ mod reference_suggestion_label_tests {
     #[test]
     fn selected_reader_image_keeps_original_pixels_and_display_bounds() {
         let image = ReaderImage {
+            source: None,
             origin: None,
             formula: None,
             position: rebook_reader::ReaderPosition {

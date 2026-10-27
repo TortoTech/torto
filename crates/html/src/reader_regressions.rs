@@ -1,6 +1,87 @@
 use super::*;
 
 #[test]
+fn transparent_content_uses_css_cascade_and_preserves_following_source_ids() {
+    for hidden in [
+        "<p style='opacity:0'>Hidden</p>",
+        "<div style='opacity:0'><p style='opacity:1'>Hidden</p></div>",
+        "<style>.transparent {opacity:0 !important}</style><p class='transparent' style='opacity:1'>Hidden</p>",
+    ] {
+        let body = format!("{hidden}<p id='after'>Visible</p>");
+        let section = parse(&body);
+        assert_eq!(
+            section
+                .blocks
+                .iter()
+                .flat_map(Block::text_blocks)
+                .map(text_block_text)
+                .collect::<String>(),
+            "Visible"
+        );
+        let visible = parse(&body.replace("opacity:0", "opacity:1"));
+        assert_eq!(
+            section.anchors.iter().find(|a| a.fragment == "after"),
+            visible.anchors.iter().find(|a| a.fragment == "after")
+        );
+    }
+    let notes = parse(
+        "<p>Body<a epub:type='noteref' href='#note'>1</a></p><aside id='note' epub:type='footnote' style='opacity:0'><p>Note content.</p></aside>",
+    );
+    assert!(
+        notes
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Note(_)))
+    );
+}
+
+#[test]
+fn aria_hidden_ornaments_preserve_authored_text_as_semantic_separators() {
+    let section = parse(
+        "<p>Before.</p><div aria-hidden='true'>—</div><p>Between.</p><p aria-hidden='true'>• • •</p><div aria-hidden='true' style='border-top:1px solid black'/><p>After.</p>",
+    );
+    let separators: Vec<_> = section
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            if let Block::Separator(s) = block {
+                Some(s)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(separators.len(), 3);
+    assert_eq!(text_block_text(separators[0].text.as_ref().unwrap()), "—");
+    let source = parse(
+        "<p aria-hidden='true'>Meaningful alternative text.</p><p id='release_identifier_line'>pid_example_123_c0_r0</p>",
+    );
+    assert_eq!(source.blocks.iter().flat_map(Block::text_blocks).count(), 2);
+}
+
+#[test]
+fn linked_stylesheet_can_hide_a_publisher_identifier() {
+    let descriptor = SpineItem {
+        id: SpineItemId::new("chapter").unwrap(),
+        href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+        media_type: "application/xhtml+xml".into(),
+        linear: true,
+        properties: vec![],
+    };
+    let section = parse_section("<html><head><link rel='stylesheet' href='style.css'/></head><body><p class='identifier'>Hidden identifier</p><p>Visible.</p></body></html>", &descriptor,
+        |href| (href.path()=="style.css").then(|| ".identifier {opacity:0}".into())).unwrap();
+    assert_eq!(
+        section
+            .blocks
+            .iter()
+            .flat_map(Block::text_blocks)
+            .map(text_block_text)
+            .collect::<String>(),
+        "Visible."
+    );
+}
+
+#[test]
 fn promoting_a_caption_raster_preserves_following_source_anchors() {
     let body = "<p><img src='diagram.png' alt='Figure'/>Fig 4.14: Example</p><p id='next'>Following prose.</p>";
     let promoted = parse(body);

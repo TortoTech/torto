@@ -1,3 +1,6 @@
+mod history;
+use history::{ReleaseNote, display_notes};
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -9,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::async_task::{TaskResult, TaskSlot};
 use crate::persistence::write_bytes_atomic;
+#[cfg(target_os = "windows")]
 use crate::platform::UserEvent;
 use crate::preferences::AppLanguage;
 use crate::ui::{dialog_action_button, palette};
@@ -79,6 +83,7 @@ pub(crate) struct InstallRequest {
 pub(crate) enum UpdateTaskMessage {
     Check(TaskResult<Option<UpdateRelease>>),
     Download(TaskResult<DownloadedUpdate>),
+    History(TaskResult<Vec<ReleaseNote>>),
 }
 
 pub(crate) enum ManualUpdateCheckResult {
@@ -90,6 +95,8 @@ pub(crate) enum ManualUpdateCheckResult {
 pub(crate) struct WindowsUpdater {
     check_task: TaskSlot<()>,
     download_task: TaskSlot<UpdateRelease>,
+    history_task: TaskSlot<UpdateRelease>,
+    history: Option<(String, Result<Vec<ReleaseNote>, String>)>,
     state: UpdateState,
     install_request: Option<InstallRequest>,
     manual_check: bool,
@@ -106,6 +113,8 @@ impl WindowsUpdater {
         Self {
             check_task,
             download_task: TaskSlot::default(),
+            history_task: TaskSlot::default(),
+            history: None,
             state: UpdateState::Idle,
             install_request: None,
             manual_check: false,
@@ -114,6 +123,7 @@ impl WindowsUpdater {
         }
     }
 
+    #[cfg(target_os = "windows")]
     pub(crate) fn spawn_pending_tasks(
         &mut self,
         runtime: &tokio::runtime::Runtime,
@@ -128,6 +138,18 @@ impl WindowsUpdater {
                     result,
                 })));
             });
+        }
+        if let Some(request) = self.history_task.take_pending() {
+            let proxy = proxy.clone();
+            let worker = runtime.spawn(async move {
+                let result = history::fetch(env!("CARGO_PKG_VERSION"), &request.payload).await;
+                let _ =
+                    proxy.send_event(UserEvent::Update(UpdateTaskMessage::History(TaskResult {
+                        id: request.id,
+                        result,
+                    })));
+            });
+            self.history_task.attach_worker(worker);
         }
         if let Some(request) = self.download_task.take_pending() {
             let proxy = proxy.clone();
@@ -180,22 +202,31 @@ impl WindowsUpdater {
                 match message.result {
                     Ok(Some(release)) => {
                         let result = ManualUpdateCheckResult::Available(release.version.clone());
+                        self.begin_history(&release);
                         self.state = UpdateState::Available(release);
                         self.dialog_visible = !manual;
                         return manual.then_some(result);
                     }
                     Ok(None) => {
+                        self.history_task.cancel();
+                        self.history = None;
                         self.state = UpdateState::Idle;
                         self.dialog_visible = false;
                         return manual.then_some(ManualUpdateCheckResult::UpToDate);
                     }
                     Err(error) => {
                         tracing::warn!(%error, "automatic update check failed");
+                        self.history_task.cancel();
+                        self.history = None;
                         self.state = UpdateState::Idle;
                         self.dialog_visible = false;
                         return manual.then_some(ManualUpdateCheckResult::Failed(error));
                     }
                 }
+            }
+            UpdateTaskMessage::History(message) => {
+                let release = self.history_task.complete(message.id)?;
+                self.history = Some((release.version, message.result));
             }
             UpdateTaskMessage::Download(message) => {
                 let release = self.download_task.complete(message.id)?;
@@ -210,6 +241,23 @@ impl WindowsUpdater {
         None
     }
 
+    fn begin_history(&mut self, release: &UpdateRelease) {
+        if self
+            .history
+            .as_ref()
+            .is_some_and(|(version, _)| version == &release.version)
+            || self
+                .history_task
+                .active()
+                .is_some_and(|active| active.version == release.version)
+        {
+            return;
+        }
+        self.history_task.cancel();
+        self.history = None;
+        self.history_task.begin(release.clone());
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the update modal keeps its state-specific actions in one auditable flow"
@@ -221,6 +269,8 @@ impl WindowsUpdater {
         let Some(view) = UpdateDialogView::from_state(&self.state) else {
             return;
         };
+        self.begin_history(view.release());
+        let mut retry_history = false;
         let mut action = None;
         let modal = crate::ui::modal(ctx, egui::Id::new("windows-update-modal"), 0.42)
             .frame(
@@ -254,8 +304,41 @@ impl WindowsUpdater {
                     .max_height(220.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        let notes = localized_release_notes(&view.release().notes, language);
-                        show_release_notes(ui, &mut self.release_notes_cache, notes);
+                        if let Some((version, Ok(releases))) = &self.history
+                            && version == &view.release().version
+                        {
+                            for release in releases {
+                                ui.strong(format!("v{}", release.version));
+                                let notes = display_notes(&release.notes, language);
+                                show_release_notes(ui, &mut self.release_notes_cache, &notes);
+                                ui.add_space(12.0);
+                            }
+                        } else {
+                            ui.strong(format!("v{}", view.release().version));
+                            let notes = display_notes(&view.release().notes, language);
+                            show_release_notes(ui, &mut self.release_notes_cache, &notes);
+                        }
+                        if self.history_task.is_pending() {
+                            ui.horizontal(|ui| {
+                                ui.add(crate::ui::LoadingSpinner::new().size(14.0));
+                                ui.label(language.text(
+                                    "正在加载其他版本的更新内容…",
+                                    "Loading changes from other versions…",
+                                ));
+                            });
+                        } else if self
+                            .history
+                            .as_ref()
+                            .is_some_and(|(_, result)| result.is_err())
+                        {
+                            ui.label(language.text(
+                                "其他版本的更新内容暂时无法加载，仍可更新。",
+                                "Other release notes are unavailable. You can still update.",
+                            ));
+                            retry_history = ui
+                                .small_button(language.text("重新加载", "Reload notes"))
+                                .clicked();
+                        }
                     });
                 if let Some(message) = view.message() {
                     ui.add_space(10.0);
@@ -300,6 +383,10 @@ impl WindowsUpdater {
         if modal.should_close() && !matches!(view, UpdateDialogView::Downloading(_)) {
             action = Some(UpdateAction::Dismiss);
         }
+        if retry_history {
+            self.history = None;
+            self.begin_history(view.release());
+        }
         match action {
             Some(UpdateAction::Dismiss) => self.dialog_visible = false,
             Some(UpdateAction::Download) => {
@@ -335,6 +422,7 @@ impl WindowsUpdater {
     }
 }
 
+#[cfg(target_os = "windows")]
 pub(crate) fn launch_installer_after_exit(request: &InstallRequest) -> Result<(), String> {
     use std::os::windows::process::CommandExt as _;
     use std::process::Command;
@@ -983,6 +1071,36 @@ mod tests {
     }
 
     #[test]
+    fn history_failure_does_not_block_download_and_stale_history_is_rejected() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let release = release_from_github(github_release("v0.9.0", Some(&digest)), "0.8.3")
+            .unwrap()
+            .unwrap();
+        let mut updater = WindowsUpdater::new();
+        updater.check_task.cancel();
+        updater.state = UpdateState::Available(release.clone());
+        updater.begin_history(&release);
+        let old = updater.history_task.take_pending().unwrap();
+        updater.history_task.cancel();
+        updater.begin_history(&release);
+        let current = updater.history_task.take_pending().unwrap();
+        updater.complete(UpdateTaskMessage::History(TaskResult {
+            id: old.id,
+            result: Ok(vec![]),
+        }));
+        assert!(updater.history.is_none());
+        assert!(updater.history_task.is_pending());
+        updater.complete(UpdateTaskMessage::History(TaskResult {
+            id: current.id,
+            result: Err("unreachable".into()),
+        }));
+        assert!(updater.history.as_ref().unwrap().1.is_err());
+        updater.request_update();
+        assert!(matches!(updater.state, UpdateState::Downloading(_)));
+        assert!(updater.download_task.is_pending());
+    }
+
+    #[test]
     fn latest_release_requires_a_newer_version_and_verified_msi() {
         let digest = format!("sha256:{}", "a".repeat(64));
         let update = release_from_github(github_release("v0.2.12", Some(&digest)), "0.2.11")
@@ -1204,6 +1322,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn update_dialog_dims_caption_controls_including_over_settings() {
         use crate::app::window_chrome;
 

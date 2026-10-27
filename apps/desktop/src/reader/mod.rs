@@ -1721,6 +1721,7 @@ fn merge_inferred_caption_focus_unit(image: &mut FocusUnit, caption: FocusUnit) 
         (Some(rect), None) | (None, Some(rect)) => Some(rect),
         (None, None) => None,
     };
+    image.media_key = image.media_key.take().or(caption.media_key);
     image.is_table |= caption.is_table;
     image.rectangular_activation |= caption.rectangular_activation;
     image.structured_activation |= caption.structured_activation;
@@ -3180,10 +3181,12 @@ impl DesktopReader {
                 None
             };
             let media_key = if let Block::Figure(figure) = block {
-                (!figure.body.is_empty()).then(|| figure.caption_blocks().find_map(|t| rebook_publication::media_references::caption_label(&text_block_focus_text(t)).map(|label| label.key))).flatten()
+                figure.caption_blocks().find_map(|t| rebook_publication::media_references::caption_label(&text_block_focus_text(t)).map(|label| label.key))
             } else if let Block::Table(table) = block {
                 table.before.iter().chain(&table.after).find_map(|t| rebook_publication::media_references::caption_label(&text_block_focus_text(t))
                     .filter(|label| label.key.kind == rebook_publication::media_references::MediaKind::Table).map(|label| label.key))
+            } else if let Block::Text(text) = block {
+                (text.kind == rebook_publication::TextBlockKind::Caption).then(|| rebook_publication::media_references::caption_label(&text_block_focus_text(text)).map(|label| label.key)).flatten()
             } else { None };
             let unit = FocusUnit {
                 media_key,

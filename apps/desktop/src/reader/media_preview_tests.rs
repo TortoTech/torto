@@ -615,6 +615,141 @@ fn structured_figures_preview_text_and_tables_with_caption_and_source() {
     assert!(result.image.pixels.iter().any(|p|p.r()<100));
     assert_eq!(source.resources.load(Ordering::Relaxed),0);
 }
+
+#[test]
+fn direct_image_preview_keeps_unnumbered_caption_and_source_without_index_guessing() {
+    let source = source(&[
+        "<html><body><p>Introduction.</p><figure><img src='photo.png'/><figcaption>An unnumbered photograph.</figcaption><p>Source: The photographer.</p></figure><p>Unrelated prose.</p></body></html>",
+    ]);
+    let section = &source.sections[0];
+    let target = image_target(section, 0, &PublicationUrl::parse("photo.png").unwrap(), None).unwrap();
+    assert!(target.key.number.is_empty());
+    let origin = super::super::block_source_range(&section.blocks[target.block])
+        .unwrap()
+        .clone();
+    let request = Job {
+        generation: 1,
+        source: source.clone(),
+        catalog: None,
+        destination: Some((0, origin.start.node.clone())),
+        origin,
+        key: target.key.clone(),
+        cursor: Cursor::default(),
+        style: ReaderStyle::default(),
+        ctx: egui::Context::default(),
+    };
+    let resolved = Index::default().resolve(&request, &|| true).unwrap();
+    assert_eq!(resolved.block, target.block);
+    let Block::Figure(figure) = &section.blocks[resolved.block] else {
+        panic!()
+    };
+    assert_eq!(
+        figure
+            .caption_blocks()
+            .map(caption_text)
+            .collect::<Vec<_>>(),
+        ["An unnumbered photograph.", "Source: The photographer."]
+    );
+    assert_eq!(source.resources.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn clicking_an_unnumbered_image_routes_to_the_caption_worker() {
+    let (base, _, _) = crate::reader::semantic_layout::tests::fixture();
+    let section = rebook_html::parse_section(
+        "<html><body><p>Intro.</p><figure><img src='image.png'/><figcaption>Photograph</figcaption><p>Source: Author.</p></figure></body></html>",
+        &base.source.book().sections[0], |_| None).unwrap();
+    let (mut reader, _, _) =
+        crate::reader::semantic_layout::tests::fixture_with_blocks(section.blocks);
+    assert!(reader.reader.cached_reading_unit_content().is_some());
+    let (tx, _) = mpsc::sync_channel(1);
+    reader.media_preview.worker = Some(Worker {
+        tx,
+        pending: Default::default(),
+        result: Default::default(),
+        generation: Arc::new(AtomicU64::new(0)),
+    });
+    let image = rebook_reader::ReaderImage {
+        source: None,
+        origin: Some(rebook_layout::RasterOrigin {
+            href: PublicationUrl::parse("image.png").unwrap(),
+            width: 1,
+            height: 1,
+        }),
+        formula: None,
+        position: rebook_reader::ReaderPosition {
+            section_index: 0,
+            segment_index: 0,
+            page_index: 0,
+        },
+        x: 0.0,
+        y: 0.0,
+        display_width: 1.0,
+        display_height: 1.0,
+        width: 1,
+        height: 1,
+        pixels: vec![255; 4].into(),
+    };
+    assert!(reader.open_associated_image_preview(&egui::Context::default(), &image));
+    assert!(reader.media_preview.active.is_some());
+    let pending = reader
+        .media_preview
+        .worker
+        .as_ref()
+        .unwrap()
+        .pending
+        .load_full()
+        .unwrap();
+    assert!(pending.destination.is_some());
+    assert!(pending.key.number.is_empty());
+}
+
+#[test]
+fn promoted_table_titles_and_sources_appear_once_outside_preview_grid() {
+    let source = source(&[
+        "<html><body><p>See Table 2.</p><table><caption>Table 2</caption><tr><td colspan='2' class='table-title'>Survey results</td></tr><tr><td>A</td><td>B</td></tr><tr><td colspan='2'>Source: Author.</td></tr></table></body></html>",
+    ]);
+    let request = job(source.clone(), 0, "Table 2");
+    let selected = Index::default().resolve(&request, &|| true).unwrap();
+    let result = render(&request, selected, &|| true).unwrap();
+    assert_eq!(
+        result.captions,
+        ["Table 2", "Survey results", "Source: Author."]
+    );
+    assert!(
+        result
+            .caption_images
+            .iter()
+            .all(|image| image.size[0] == result.size[0])
+    );
+}
+
+#[test]
+#[ignore = "requires TORTO_PREVIEW_BOOK pointing to the local BOOKS without barriers EPUB"]
+fn local_reported_media_chapters_render_captions_and_sources() {
+    let path = std::env::var_os("TORTO_PREVIEW_BOOK").unwrap();
+    let opened = rebook_formats::open_file(std::path::Path::new(&path)).unwrap();
+    let source = opened.source().clone();
+    let mut count = 0;
+    for path in ["EPUB/xhtml/chapter-3.xhtml", "EPUB/xhtml/chapter-10.xhtml"] {
+        let index = source.book().sections.iter().position(|section| section.href.path() == path).unwrap();
+        let section = source.parse_section(index).unwrap();
+        for target in targets(&section, index) {
+            let origin = super::super::block_source_range(&section.blocks[target.block]).unwrap().clone();
+            let request = Job { generation: 1, source: source.clone(), catalog: None,
+                destination: Some((index, origin.start.node.clone())), origin, key: target.key.clone(),
+                cursor: Cursor::default(), style: ReaderStyle::default(), ctx: egui::Context::default() };
+            let preview = render(&request, target, &|| true).unwrap();
+            assert!(!preview.captions.is_empty());
+            assert!(!preview.caption_images.is_empty());
+            assert!(preview.caption_images.iter().all(|image| image.size[0] == preview.size[0]));
+            count += 1;
+        }
+    }
+    assert!(count >= 2);
+    println!("Rendered {count} media previews from the two reported chapters");
+}
+
 #[test]
 fn short_text_figure_preview_fits_its_padded_body() {
     let source = source(&["<html><body><p>See Figure 2.1.</p><figure><div><p>Short diagram</p><p style='text-align:right'>Right aligned</p></div><figcaption>Figure 2.1 Text example</figcaption></figure></body></html>"]);

@@ -247,6 +247,8 @@ pub struct ReaderSelection {
 /// `origin` permits loading full resolution pixels for preview/copy on demand.
 #[derive(Clone)]
 pub struct ReaderImage {
+    /// Authored identity distinguishes repeated uses of the same image resource.
+    pub source: Option<SourceRange>,
     pub origin: Option<rebook_layout::RasterOrigin>,
     pub formula: Option<String>,
     pub position: ReaderPosition,
@@ -1343,6 +1345,16 @@ impl ReaderSession {
     /// Content from the same prepared snapshot as the active unit's pages.
     /// Copies only its fragments and never reparses the publication source.
     pub fn current_reading_unit_content(&self) -> Result<Vec<(usize, Section)>, ReaderError> {
+        self.reading_unit_content(true)
+    }
+
+    /// Read a prepared snapshot without waiting for a section worker or parsing.
+    /// UI preview routing may defer when the snapshot is not ready yet.
+    pub fn cached_reading_unit_content(&self) -> Option<Vec<(usize, Section)>> {
+        self.reading_unit_content(false).ok()
+    }
+
+    fn reading_unit_content(&self, allow_load: bool) -> Result<Vec<(usize, Section)>, ReaderError> {
         if let Some(unit) = self.current_continuous_unit() {
             return Ok(unit
                 .parts
@@ -1369,7 +1381,9 @@ impl ReaderSession {
         let grouped = group.len() > 1;
         group
             .map(|index| {
-                let prepared = self.repository.load(index)?;
+                let prepared = if allow_load { self.repository.load(index)? } else {
+                    self.repository.get(index).ok_or(ReaderError::SectionOutOfBounds(index))?
+                };
                 let unit_index = if grouped {
                     0
                 } else {
@@ -5235,6 +5249,7 @@ fn build_reader_selection(
 )]
 fn reader_image(position: ReaderPosition, hit: PageImageHit, offset_x: f32) -> ReaderImage {
     ReaderImage {
+        source: hit.source,
         origin: hit.origin,
         formula: hit.formula,
         position,

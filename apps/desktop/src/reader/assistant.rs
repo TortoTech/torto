@@ -1527,11 +1527,7 @@ impl DesktopReader {
         self.ui.assistant_panel = Some(panel);
         self.ui.assistant_keyboard_focus = true;
         self.chat.move_cursor_to_end = true;
-        if self.is_focus_mode() && self.assistant_is_docked() {
-            // A single resize preserves the reading anchor and avoids laying
-            // out the entire reading unit at every intermediate animation width.
-            self.ui.assistant_motion = super::Motion::settled(1.0);
-        } else if self.ui.assistant_motion.animate_to(1.0) {
+        if self.ui.assistant_motion.animate_to(1.0) {
             self.ui.last_motion_tick = Some(std::time::Instant::now());
         }
     }
@@ -1539,10 +1535,7 @@ impl DesktopReader {
     pub(super) fn close_assistant_panel(&mut self) {
         self.log_diagnostic_snapshot("assistant.close.before", None);
         self.ui.assistant_keyboard_focus = false;
-        if self.is_focus_mode() && self.assistant_is_docked() {
-            self.ui.assistant_motion = super::Motion::settled(0.0);
-            self.ui.assistant_panel = None;
-        } else if self.ui.assistant_motion.animate_to(0.0) {
+        if self.ui.assistant_motion.animate_to(0.0) {
             self.ui.last_motion_tick = Some(std::time::Instant::now());
         }
         self.log_diagnostic_snapshot("assistant.close.after", None);

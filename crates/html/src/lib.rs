@@ -1286,6 +1286,21 @@ impl<'a> ReadingIrParser<'a> {
             .take(33)
             .collect::<String>();
         let chars = compact.chars().collect::<Vec<_>>();
+        let decorative_hidden = node.ancestors().filter(Node::is_element).any(|ancestor|
+            attribute_local(ancestor, "aria-hidden").is_some_and(|value| value.trim().eq_ignore_ascii_case("true")));
+        let edge_rule = ["border-top", "border-bottom"].iter().any(|name| {
+            self.styles.cascaded_properties(node).get(*name).is_some_and(|value| {
+                let value = value.trim();
+                !value.is_empty() && !matches!(value, "none" | "0" | "0px")
+                    && !value.split_whitespace().any(|part| matches!(part, "none" | "hidden" | "transparent"))
+            })
+        });
+        if chars.is_empty() && decorative_hidden && (edge_rule || self.styles.has_visual_boundary(node)) {
+            let mut separator = SeparatorBlock::rule();
+            separator.style = self.styles.block_style(node, BlockStyle::default());
+            self.blocks.push(Block::Separator(separator));
+            return Ok(true);
+        }
         if chars.is_empty() || chars.len() > 32 {
             return Ok(false);
         }
@@ -1302,11 +1317,12 @@ impl<'a> ReadingIrParser<'a> {
                 && chars[..chars.len() - 1]
                     .iter()
                     .all(|c| matches!(c, '-' | '—' | '─')));
-        if !repeated && !weak {
+        let aria_separator = decorative_hidden && !chars.iter().any(|ch| ch.is_alphanumeric());
+        if !repeated && !weak && !aria_separator {
             return Ok(false);
         }
         let style = self.styles.block_style(node, BlockStyle::default());
-        if weak {
+        if weak && !aria_separator {
             let centered = style.align == TextAlignment::Center
                 || node.children().filter(Node::is_element).any(|child| {
                     self.styles.block_style(child, BlockStyle::default()).align
@@ -3626,6 +3642,9 @@ impl StyleSheet {
         let hidden = node.attribute("hidden").is_some()
             || self.cascaded_properties(node).get("display")
                 .is_some_and(|display| display.trim().eq_ignore_ascii_case("none"))
+            || self.cascaded_properties(node).get("opacity").is_some_and(|value|
+                value.trim().trim_end_matches('%').parse::<f32>()
+                    .is_ok_and(|opacity| opacity.is_finite() && opacity <= 0.0))
             || node.ancestors().skip(1).find(Node::is_element).is_some_and(|parent| self.visually_hidden(parent));
         self.visibility_cache.borrow_mut().insert(node.id(), hidden);
         hidden

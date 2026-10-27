@@ -55,6 +55,7 @@ pub struct PageSelectionFragment {
 /// Downsampled display rasters retain their original resource in `origin`.
 #[derive(Clone)]
 pub struct PageImageHit {
+    pub source: Option<SourceRange>,
     pub origin: Option<rebook_layout::RasterOrigin>,
     pub formula: Option<String>,
     pub bounds: Rect,
@@ -507,6 +508,7 @@ impl PageDisplayList {
                         .as_ref()
                         .and_then(|request| request.ready());
                     Some(PageImageHit {
+                        source: command.source.clone(),
                         origin: ready
                             .as_ref()
                             .map_or_else(|| command.origin.clone(), |r| r.origin.clone()),
