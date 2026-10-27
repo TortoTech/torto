@@ -50,7 +50,7 @@ pub(crate) fn state(ctx: &egui::Context) -> WindowState {
 pub(crate) fn begin_frame(ctx: &egui::Context) {
     #[cfg(target_os = "macos")]
     {
-        if let Some(inset) = rebook_macos_open_file::titlebar_inset() {
+        if let Some(inset) = rebook_macos_open_file::layout_titlebar_buttons(HEIGHT) {
             ctx.data_mut(|data| data.insert_temp(egui::Id::new("mac-titlebar-inset"), inset));
         }
         let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));

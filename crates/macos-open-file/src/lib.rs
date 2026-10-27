@@ -5,28 +5,64 @@
 mod macos {
     use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
     use objc2::sel;
-    use objc2_app_kit::NSApplication;
-    use objc2_foundation::{MainThreadMarker, NSArray, NSURL};
+    use objc2_app_kit::{NSApplication, NSWindowStyleMask};
+    use objc2_foundation::{MainThreadMarker, NSArray, NSPoint, NSRect, NSURL};
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    /// Native traffic-light bounds in logical content coordinates, read on AppKit's main thread.
-    pub fn titlebar_inset() -> Option<f32> {
+    /// Align the existing traffic lights with the custom header and return the
+    /// horizontal inset in logical content coordinates. AppKit owns fullscreen
+    /// layout; only windowed full-size content windows are adjusted.
+    pub fn layout_titlebar_buttons(header_height: f32) -> Option<f32> {
+        if !header_height.is_finite() || header_height <= 0.0 {
+            return None;
+        }
         let marker = MainThreadMarker::new()?;
         let application = NSApplication::sharedApplication(marker);
-        // SAFETY: AppKit owns these objects for the duration of this synchronous,
-        // main-thread query; no raw reference is retained or mutated.
+        // SAFETY: AppKit owns all queried objects for this synchronous main-thread
+        // operation. Only public NSWindow/NSView methods are used, with no retained
+        // raw references, delegate changes, replacement buttons or reparenting.
         unsafe {
-            let window: *mut AnyObject = objc2::msg_send![&application, keyWindow];
+            let mut window: *mut AnyObject = objc2::msg_send![&application, mainWindow];
+            if window.is_null() {
+                window = objc2::msg_send![&application, keyWindow];
+            }
             if window.is_null() { return None; }
+            let style: NSWindowStyleMask = objc2::msg_send![window, styleMask];
+            if !style.contains(NSWindowStyleMask::FullSizeContentView)
+                || style.contains(NSWindowStyleMask::FullScreen) {
+                return None;
+            }
+            let content: *mut AnyObject = objc2::msg_send![window, contentView];
+            if content.is_null() { return None; }
+            let bounds: NSRect = objc2::msg_send![content, bounds];
+            if bounds.size.height < f64::from(header_height) { return None; }
+            let flipped: Bool = objc2::msg_send![content, isFlipped];
+            let center_y = bounds.origin.y + if flipped.as_bool() {
+                f64::from(header_height) * 0.5
+            } else {
+                bounds.size.height - f64::from(header_height) * 0.5
+            };
             let mut right = 0.0_f64;
             for kind in 0_usize..3 {
                 let button: *mut AnyObject = objc2::msg_send![window, standardWindowButton: kind];
-                if !button.is_null() {
-                    let frame: objc2_foundation::NSRect = objc2::msg_send![button, frame];
-                    right = right.max(frame.origin.x + frame.size.width);
+                if button.is_null() { continue; }
+                let parent: *mut AnyObject = objc2::msg_send![button, superview];
+                if parent.is_null() { continue; }
+                let frame: NSRect = objc2::msg_send![button, frame];
+                let rect: NSRect = objc2::msg_send![parent, convertRect: frame toView: content];
+                if (rect.origin.y + rect.size.height * 0.5 - center_y).abs() > 0.25 {
+                    let target = NSPoint::new(rect.origin.x + rect.size.width * 0.5, center_y);
+                    let target: NSPoint = objc2::msg_send![parent, convertPoint: target fromView: content];
+                    let origin = NSPoint::new(frame.origin.x, target.y - frame.size.height * 0.5);
+                    let _: () = objc2::msg_send![button, setFrameOrigin: origin];
                 }
+                // Measure in content coordinates rather than assuming the native
+                // title bar container shares winit's origin or flipped orientation.
+                let frame: NSRect = objc2::msg_send![button, frame];
+                let rect: NSRect = objc2::msg_send![parent, convertRect: frame toView: content];
+                right = right.max(rect.origin.x + rect.size.width - bounds.origin.x);
             }
             (right > 0.0).then_some((right + 16.0) as f32)
         }
@@ -135,4 +171,4 @@ mod macos {
 pub use macos::{OpenFileHandler, install};
 
 #[cfg(target_os = "macos")]
-pub use macos::titlebar_inset;
+pub use macos::layout_titlebar_buttons;
