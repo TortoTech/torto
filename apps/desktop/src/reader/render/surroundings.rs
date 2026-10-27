@@ -1,4 +1,4 @@
-use kurbo::{Affine, BezPath, Rect, Shape};
+use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape};
 use peniko::{Color, Fill};
 use vello::Scene;
 
@@ -60,14 +60,6 @@ impl DesktopReader {
         self.is_focus_mode() && self.focus_style == FocusStyle::BackgroundHighlight
     }
 
-    pub(in crate::reader) fn focus_background_visible(&self) -> bool {
-        self.focus_background_highlight()
-            || self.is_focus_mode()
-                && self.focus_units.get(self.focus_unit_index).is_some_and(|unit| {
-                    unit.list_group.as_ref().is_some_and(|group| group.share_notes)
-                })
-    }
-
     pub(super) fn paint_focus_surroundings(
         &self,
         scene: &mut Scene,
@@ -126,18 +118,29 @@ impl DesktopReader {
         // Mixing the already-composited page with its own paper is equivalent
         // to 45% content opacity, including images, formulas and annotations.
         // Keep this single interaction layer independent of retained page tiles.
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            Color::from_rgba8(
-                paper.red,
-                paper.green,
-                paper.blue,
-                ((1.0 - INACTIVE_OPACITY) * 255.0).round() as u8,
-            ),
-            None,
-            &path,
-        );
+        let opacity = ((1.0 - INACTIVE_OPACITY) * 255.0).round() as u8;
+        let paper_color = Color::from_rgba8(paper.red, paper.green, paper.blue, opacity);
+        if let Some((rect, color)) = self.focus_list_backdrop() {
+            // Fade inactive ink toward its actual backdrop. Mixing it with
+            // plain paper would lighten only the inactive part of the card,
+            // leaving an apparent extra background on the focused list item.
+            let card = RoundedRect::from_rect(translate(rect), 7.0);
+            let mut outside = bounds.to_path(0.1);
+            outside.extend(card.path_elements(0.1));
+            scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &path);
+            scene.fill(Fill::EvenOdd, Affine::IDENTITY, paper_color, None, &outside);
+            let color = color.to_rgba8();
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::from_rgba8(color.r, color.g, color.b, opacity),
+                None,
+                &card,
+            );
+            scene.pop_layer();
+        } else {
+            scene.fill(Fill::NonZero, Affine::IDENTITY, paper_color, None, &path);
+        }
     }
 }
 
@@ -177,18 +180,29 @@ mod tests {
     }
 
     #[test]
-    fn surrounding_dim_adds_background_only_to_real_list_groups() {
+    fn surrounding_dim_only_adds_a_backdrop_to_oversized_lists() {
         let (mut reader, _) = html_fixture("<html><body><p>Before.</p><ul><li>First.</li><li>Second.</li></ul><p>After.</p></body></html>");
         reader.focus_style = FocusStyle::SurroundingDim;
         let layout = reader.current_scroll_layout().unwrap();
         reader.rebuild_focus_units(&layout);
         let list = reader.focus_units.iter().position(|unit| unit.list_group.as_ref().is_some_and(|group| group.share_notes)).unwrap();
         reader.focus_unit_index = list;
-        assert!(reader.focus_background_visible());
+        assert!(reader.focus_list_backdrop().is_none());
+        assert!(reader.resize_focus_lists(1.0));
+        let list = reader.focus_units.iter().position(|unit| unit.list_group.as_ref().is_some_and(|group| group.share_notes && group.split)).unwrap();
+        reader.focus_unit_index = list;
+        assert!(reader.focus_list_backdrop().is_some());
+        assert!(!reader.focus_background_highlight());
+        assert!(reader.resize_focus_lists(2000.0));
+        assert!(reader.focus_list_backdrop().is_none());
+        assert!(reader.resize_focus_lists(1.0));
+        let list = reader.focus_units.iter().position(|unit| unit.list_group.as_ref().is_some_and(|group| group.share_notes && group.split)).unwrap();
+        reader.focus_unit_index = list;
         std::sync::Arc::make_mut(reader.focus_units[list].list_group.as_mut().unwrap()).share_notes = false;
-        assert!(!reader.focus_background_visible());
+        assert!(reader.focus_list_backdrop().is_none());
         reader.focus_style = FocusStyle::BackgroundHighlight;
-        assert!(reader.focus_background_visible());
+        assert!(reader.focus_background_highlight());
+        assert!(reader.focus_list_backdrop().is_none());
     }
 
     #[test]
@@ -706,6 +720,101 @@ mod tests {
                 "SURROUNDING_DIM theme={theme:?} active_ink={clear_ink} inactive_ink={dim_ink} retained_layers={}",
                 identities.len()
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU; verifies uniform list backgrounds and inactive ink"]
+    fn surrounding_dim_list_background_stays_uniform_when_focus_moves() {
+        use crate::reader::ReaderFramePlan;
+        let mut audit = crate::platform::LayerAudit::new([800, 600]);
+        let items = (0..12).map(|i| format!(
+            "<li>Item {i}. This list item contains enough text to wrap onto several lines and make the whole list taller than the reading viewport.</li>"
+        )).collect::<String>();
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let (mut reader, _) = html_fixture(&format!("<html><body><p>Before.</p><ul>{items}</ul><p>After.</p></body></html>"));
+            reader.focus_style = FocusStyle::SurroundingDim;
+            let mut style = reader.reader.style();
+            crate::reader::apply_theme_colors(&mut style, theme);
+            reader.reader.set_style(style).unwrap();
+            reader.invalidate_page_scenes();
+            reader.scroll_viewport = Some(ScrollViewportState {
+                size: egui::vec2(800.0, 600.0), offset_y: 0.0,
+            });
+            let layout = reader.current_scroll_layout().unwrap();
+            reader.rebuild_focus_units(&layout);
+            let indices = reader.focus_units.iter().enumerate().filter_map(|(i, unit)| {
+                unit.list_group.as_ref().filter(|group| group.share_notes && group.split).map(|_| i)
+            }).take(2).collect::<Vec<_>>();
+            assert_eq!(indices.len(), 2, "must exercise a split list");
+            reader.focus_unit_index = indices[0];
+            let (rect, color) = reader.focus_list_backdrop().unwrap();
+            let padding = reader.scroll_content_padding(600.0);
+            let offset_y = rect.top() + padding - 60.0;
+            reader.scroll_viewport.as_mut().unwrap().offset_y = offset_y;
+            let paper = reader.reader.style().background;
+            // Compare with the actual highlight-mode group backdrop, sampled
+            // away from its active item so the item tint cannot enter the color.
+            reader.focus_style = FocusStyle::BackgroundHighlight;
+            let reference_plan = ReaderFramePlan {
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
+                scene_id: reader.scene_id, scene_revision: reader.scene_revision,
+                background: Color::from_rgb8(paper.red, paper.green, paper.blue),
+                content_left: 0.0, preview_left: 0.0, reflow_pending: false, live_resize_preview: false,
+            };
+            audit.direct(&reader.page_scene(), reference_plan, 1.0);
+            let reference = audit.pixels();
+            let reference_y = (reader.focus_units[indices[1]].rect.center().y + padding - offset_y) as usize;
+            let reference_x = (rect.right() - 3.0) as usize;
+            let reference_color = reference[(reference_y * 800 + reference_x) * 4..][..3].to_vec();
+            reader.focus_style = FocusStyle::SurroundingDim;
+            let mut frames = Vec::new();
+            for &index in &indices {
+                reader.focus_unit_index = index;
+                reader.bump_scene_revision();
+                assert_eq!(reader.focus_list_backdrop(), Some((rect, color)));
+                let plan = ReaderFramePlan {
+                    rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
+                    scene_id: reader.scene_id, scene_revision: reader.scene_revision,
+                    background: Color::from_rgb8(paper.red, paper.green, paper.blue),
+                    content_left: 0.0, preview_left: 0.0, reflow_pending: false, live_resize_preview: false,
+                };
+                audit.direct(&reader.page_scene(), plan, 1.0);
+                let pixels = audit.pixels();
+                let expected = color.to_rgba8();
+                for &item in &indices {
+                    let y = (reader.focus_units[item].rect.center().y + padding - offset_y) as usize;
+                    let x = (rect.right() - 3.0) as usize;
+                    assert!(x < 800 && y < 600);
+                    let pixel = &pixels[(y * 800 + x) * 4..][..3];
+                    assert!(pixel.iter().zip([expected.r, expected.g, expected.b]).all(|(a,b)| a.abs_diff(b) <= 2),
+                        "list background changed for item {item}: {pixel:?}, theme={theme:?}");
+                    assert!(pixel.iter().zip(&reference_color).all(|(a,b)| a.abs_diff(*b) <= 2),
+                        "list backdrop differs from highlight mode: {pixel:?} vs {reference_color:?}");
+                }
+                let layers = reader.layered_scene().unwrap();
+                let mut ready = false;
+                for _ in 0..64 {
+                    if !audit.layered(&layers, plan, 1.0).0.pending { ready = true; break; }
+                }
+                assert!(ready);
+                audit.parity(&pixels, "uniform-list-background");
+                frames.push(pixels);
+            }
+            let bg = color.to_rgba8();
+            let contrast = |pixels: &[u8], index: usize| -> u64 {
+                let rect = reader.focus_units[index].rect.translate(egui::vec2(0.0, padding - offset_y));
+                let mut sum = 0;
+                for y in (rect.top().ceil().max(0.0) as usize)..(rect.bottom().floor().min(600.0) as usize) {
+                    for x in (rect.left().ceil().max(0.0) as usize)..(rect.right().floor().min(800.0) as usize) {
+                        sum += pixels[(y * 800 + x) * 4..][..3].iter()
+                            .zip([bg.r,bg.g,bg.b]).map(|(a,b)| u64::from(a.abs_diff(b))).sum::<u64>();
+                    }
+                }
+                sum
+            };
+            assert!(contrast(&frames[0], indices[0]) > contrast(&frames[1], indices[0]) * 3 / 2);
+            assert!(contrast(&frames[1], indices[1]) > contrast(&frames[0], indices[1]) * 3 / 2);
         }
     }
 }
