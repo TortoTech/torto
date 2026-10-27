@@ -466,10 +466,7 @@ fn panel_resize_pointer(
     edge_x: f32,
     covered_by_drawer: bool,
 ) -> Option<f32> {
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let viewport = ctx.content_rect();
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    let viewport = crate::app::window_chrome::body_rect(ctx);
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let top = viewport.top();
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -510,6 +507,10 @@ fn panel_resize_pointer(
     if covered_by_drawer {
         return None;
     }
+    // The divider owns its strip through the integrated title bar as well.
+    // Resizing there must not also start a native window drag.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    crate::app::window_chrome::exclude(ctx, response.rect);
     response
         .dragged()
         .then(|| response.interact_pointer_pos().map(|position| position.x))
@@ -1209,6 +1210,8 @@ impl DesktopReader {
                 .show(root_ui, |ui| {
                     // Reserve the final reader width once. Animate only the panel's
                     // paint and input bounds, so text is not repaginated each frame.
+                    let mut header_painter = ui.painter().clone();
+                    header_painter.set_opacity(assistant_progress);
                     let clip = ui.max_rect();
                     let rect = clip
                         .translate(Vec2::new(assistant_width * (1.0 - assistant_progress), 0.0));
@@ -1230,8 +1233,9 @@ impl DesktopReader {
                             TOOLBAR_HEIGHT,
                         ),
                     );
-                    ui.painter()
-                        .rect_filled(header, 0.0, color32(self.reader.style().background));
+                    // The header spans the panel frame, including both padding
+                    // strips; only transcript/input content uses the inset clip.
+                    header_painter.rect_filled(header, 0.0, color32(self.reader.style().background));
                     if ui.rect_contains_pointer(ui.max_rect())
                         && ui.input(|input| input.pointer.any_pressed())
                     {
@@ -7787,6 +7791,82 @@ mod reference_suggestion_label_tests {
                             output.textures_delta.clear();
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn dragging_a_divider_in_the_header_does_not_drag_the_window() {
+        use crate::app::window_chrome;
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+        let mut resized = None;
+        for frame in 0..5 {
+            let point = Pos2::new(if frame < 3 { 240.0 } else { 280.0 }, 20.0);
+            let mut events = vec![egui::Event::PointerMoved(point)];
+            if frame == 2 || frame == 4 {
+                events.push(egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: frame == 2, modifiers: egui::Modifiers::NONE });
+            }
+            let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), events, ..Default::default() }, |_| {
+                window_chrome::begin_frame(&ctx);
+                window_chrome::header(&ctx, Rect::from_min_size(screen.min, Vec2::new(screen.width(), TOOLBAR_HEIGHT)));
+                resized = panel_resize_pointer(&ctx, "header-divider-test", 240.0, false).or(resized);
+                window_chrome::paint_controls(&ctx);
+            });
+            output.textures_delta.clear();
+            assert!(output.viewport_output.values().all(|viewport| viewport.commands.iter().all(|command| !matches!(command, egui::ViewportCommand::StartDrag))));
+        }
+        assert_eq!(resized, Some(280.0));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn side_panel_headers_and_dividers_cover_the_title_bar_in_both_modes() {
+        use crate::app::window_chrome;
+        use crate::preferences::ReadingMode;
+        for (mode, pinned) in [(ReadingMode::Classic, true), (ReadingMode::Classic, false), (ReadingMode::Focus, false)] {
+            let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+            reader.reading_mode = mode;
+            reader.ui.sidebar_pinned = pinned;
+            reader.ui.sidebar_open = true;
+            reader.ui.sidebar_motion = super::super::Motion::settled(1.0);
+            reader.ui.toolbar_motion = super::super::Motion::settled(1.0);
+            reader.ui.assistant_presentation = super::super::AssistantPresentation::Sidebar;
+            reader.ui.assistant_panel = Some(AssistantPanel::Chat);
+            reader.ui.assistant_motion = super::super::Motion::settled(1.0);
+            let ctx = egui::Context::default();
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+            for frame in 0..3 {
+                let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |root| {
+                    window_chrome::begin_frame(&ctx);
+                    reader.ui(root, None, false);
+                    window_chrome::paint_controls(&ctx);
+                });
+                output.textures_delta.clear();
+                if frame == 0 { continue; }
+                let panel = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("reader-assistant")).unwrap().outer_rect;
+                let header = Rect::from_min_max(panel.min, Pos2::new(panel.right(), panel.top() + TOOLBAR_HEIGHT));
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect)
+                    if rect.rect.height() == TOOLBAR_HEIGHT
+                        && rect.fill == color32(reader.reader.style().background)
+                        && rect.rect.intersect(shape.clip_rect).contains_rect(header))),
+                    "assistant header must paint through both frame padding strips: {mode:?}, pinned={pinned}");
+                let left_header = Rect::from_min_max(screen.min, Pos2::new(reader.ui.sidebar_display_width, TOOLBAR_HEIGHT));
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect)
+                    if rect.fill == palette().surface && rect.rect.intersect(shape.clip_rect).contains_rect(left_header))),
+                    "left sidebar frame must cover its complete header: {mode:?}, pinned={pinned}");
+                for edge in [reader.ui.sidebar_display_width, panel.left()] {
+                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::LineSegment { points, .. }
+                        if (points[0].x - edge).abs() < 0.1 && points[0].y == screen.top() && points[1].y == screen.bottom()
+                            && shape.clip_rect.contains(points[0]) && shape.clip_rect.contains(points[1]))),
+                        "divider must span header and body: {mode:?}, pinned={pinned}, edge={edge}");
+                }
+                let exclusions = window_chrome::geometry(&ctx).excluded;
+                assert!(exclusions.iter().any(|rect| rect.contains(Pos2::new(reader.ui.sidebar_display_width, 20.0))), "left divider must exclude native window dragging");
+                if pinned {
+                    assert!(exclusions.iter().any(|rect| rect.contains(Pos2::new(panel.left(), 20.0))), "right divider must exclude native window dragging");
                 }
             }
         }
