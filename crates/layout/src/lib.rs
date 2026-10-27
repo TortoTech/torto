@@ -1,6 +1,8 @@
 //! Renderer-independent pagination for normalized reading IR.
 #[cfg(test)]
 mod ruby_tests;
+#[cfg(test)]
+mod reader_regressions;
 
 #[cfg(test)]
 mod deferred_tests;
@@ -129,11 +131,10 @@ fn number_semantic_footnotes_from(block: &mut Block, next: &mut ReferenceNumbers
     visit(block, next);
 }
 
-/// Lists and authored paragraph groups share footnote and citation display scopes.
+/// List items share footnote and citation display scopes; ordinary paragraphs restart.
 pub fn number_list_footnotes(blocks: &mut [Block]) {
     let refs: Vec<_> = blocks.iter().collect();
-    let mut groups = semantic_list_groups(&refs);
-    groups.extend(semantic_paragraph_groups(&refs));
+    let groups = semantic_list_groups(&refs);
     for group in groups {
         let mut next = ReferenceNumbers { number_citations: true, ..Default::default() };
         let mut previous_start = next;
@@ -1856,8 +1857,10 @@ impl LayoutEngine {
                 Block::Table(table) => {
                     let captions = table_captions::presentation(table, unified_reflow);
                     let width = (content_width - media_start_offset).max(1.0);
-                    let mut prepared = if captions.skip_title {
-                        self.shape_table_rows(source, &table.rows[1..], reader_style, width)?
+                    let mut prepared = if captions.skip_title || captions.skip_sources > 0 {
+                        self.shape_table_rows(source,
+                            &table.rows[usize::from(captions.skip_title)..table.rows.len() - captions.skip_sources],
+                            reader_style, width)?
                     } else {
                         self.shape_table(source, table, reader_style, width)?
                     };
@@ -3928,6 +3931,17 @@ fn resolve_text_block_with_caption_emphasis<'a>(
     let preserve_caption_bold = block.kind == TextBlockKind::Caption
         && preserve_caption_bold
             .unwrap_or_else(|| caption_labels::preserve_single_bold(&block.content));
+    let body_runs: Vec<_> = block.content.iter().flat_map(Inline::text_runs)
+        .filter(|run| !run.text.trim().is_empty()
+            && run.style.inline_role == InlineRole::Normal
+            && run.style.link_role == LinkRole::Normal).collect();
+    let body_paragraph = context == TextContext::Flow && block.kind == TextBlockKind::Paragraph;
+    let uniform_bold = body_paragraph && !body_runs.is_empty()
+        && body_runs.iter().all(|run| run.style.bold);
+    let uniform_italic = body_paragraph && !body_runs.is_empty()
+        && body_runs.iter().all(|run| run.style.italic
+            && run.link.is_none()
+            && !run.style.emphasis && !run.style.alternate_voice && !run.style.citation);
     let mut resolved = block.clone();
     headings::normalize_internal(&mut resolved);
     let generated_display = matches!(block.content.as_slice(),[Inline::Math(run)] if run.original.is_some() && run.display);
@@ -3987,7 +4001,15 @@ fn resolve_text_block_with_caption_emphasis<'a>(
             block.kind,
             TextBlockKind::Paragraph | TextBlockKind::Blockquote
         );
-        resolved.style.align = if block.style.paragraph_group.is_some()
+        let copyright_heading = block.kind.is_heading()
+            && block.style.authored_alignment == Some(TextAlignment::Center)
+            && matches!(block.content.iter().flat_map(Inline::text_runs)
+                .flat_map(|run| run.text.chars()).filter(|ch| !ch.is_whitespace())
+                .flat_map(char::to_lowercase).collect::<String>().as_str(),
+                "版权信息" | "copyright" | "copyrightinformation");
+        resolved.style.align = if copyright_heading {
+            TextAlignment::Center
+        } else if block.style.paragraph_group.is_some()
             && let Some(alignment @ (TextAlignment::Center | TextAlignment::End)) = block.style.authored_alignment
         {
             alignment
@@ -4047,7 +4069,10 @@ fn resolve_text_block_with_caption_emphasis<'a>(
             }
             TextBlockKind::ListItem { depth, .. } => {
                 resolved.style.margin_start =
-                    base_size * profile.list_indent_em * (f32::from(depth) + 1.0);
+                    base_size * (profile.list_indent_em * (f32::from(depth) + 1.0)
+                        + if display_system == WritingSystem::Cjk {
+                            paragraph_indent_em(profile, display_system)
+                        } else { 0.0 });
                 resolved.style.margin_start_fraction = 0.0;
             }
             TextBlockKind::DefinitionTerm { depth } => {
@@ -4081,6 +4106,13 @@ fn resolve_text_block_with_caption_emphasis<'a>(
     for inline in &mut resolved.content {
         match inline {
             Inline::Text(run) => {
+                if uniform_bold { run.style.bold = false; }
+                if uniform_italic {
+                    run.style.italic = false;
+                    run.style.emphasis = false;
+                    run.style.alternate_voice = false;
+                    run.style.citation = false;
+                }
                 run.style.color = Rgba::BLACK;
                 // Unified typesetting owns automatic word breaking too. A
                 // book-wide CSS `hyphens: none` must not disable the reader's

@@ -6099,13 +6099,36 @@ enum AnnotationEditorAction {
     Cancel,
 }
 
+fn annotation_submit_requested(ui: &egui::Ui, id: egui::Id, note: &str) -> bool {
+    if note.trim().is_empty() || !ui.memory(|memory| memory.has_focus(id)) {
+        return false;
+    }
+    let composing = egui::TextEdit::load_state(ui.ctx(), id)
+        .is_some_and(|state| state.is_ime_composing());
+    if composing || ui.input(|input| input.events.iter().any(|event| {
+        matches!(event, egui::Event::Ime(egui::ImeEvent::Preedit { .. } | egui::ImeEvent::Commit(_)))
+    })) {
+        return false;
+    }
+    ui.input_mut(|input| {
+        let plain_enter = input.events.iter().any(|event| matches!(event,
+            egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. }
+                if modifiers.matches_exact(egui::Modifiers::NONE)));
+        plain_enter && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+    })
+}
+
 fn focus_annotation_editor(
     ui: &mut egui::Ui,
     draft: &mut AnnotationDraft,
     language: crate::preferences::AppLanguage,
 ) -> AnnotationEditorAction {
     let input_id = ui.make_persistent_id("focus-annotation-input");
-    let mut action = AnnotationEditorAction::None;
+    let mut action = if annotation_submit_requested(ui, input_id, &draft.note) {
+        AnnotationEditorAction::Save
+    } else {
+        AnnotationEditorAction::None
+    };
     let mut input_response = None;
     ui.spacing_mut().item_spacing.x = 4.0;
     ui.horizontal(|ui| {
@@ -6180,11 +6203,8 @@ fn annotation_editor(
     draft: &mut AnnotationDraft,
     language: crate::preferences::AppLanguage,
 ) -> AnnotationEditorAction {
-    let mut action = AnnotationEditorAction::None;
     ui.set_width(312.0);
-    if annotation_text_editor(ui, draft, language) {
-        action = AnnotationEditorAction::Cancel;
-    }
+    let mut action = annotation_text_editor(ui, draft, language);
     ui.add_space(10.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if annotation_action_button(
@@ -6205,8 +6225,9 @@ fn annotation_text_editor(
     ui: &mut egui::Ui,
     draft: &mut AnnotationDraft,
     language: crate::preferences::AppLanguage,
-) -> bool {
+) -> AnnotationEditorAction {
     let input_id = ui.make_persistent_id("selection-annotation-input");
+    let submitted = annotation_submit_requested(ui, input_id, &draft.note);
     let mut close_clicked = false;
     let input = egui::Frame::new()
         .fill(palette().surface)
@@ -6239,7 +6260,13 @@ fn annotation_text_editor(
         input.request_focus();
         draft.focus_pending = false;
     }
-    close_clicked
+    if close_clicked {
+        AnnotationEditorAction::Cancel
+    } else if submitted {
+        AnnotationEditorAction::Save
+    } else {
+        AnnotationEditorAction::None
+    }
 }
 
 fn annotation_action_button(
@@ -8252,6 +8279,9 @@ mod reference_suggestion_label_tests {
             assert!((fitted.x - available.x).abs() < 0.01 || (fitted.y - available.y).abs() < 0.01);
         }
         assert_eq!(preview_fit_scale(Vec2::new(320.0, 200.0), available), 3.0);
+        let source = Vec2::new(1600.0, 1000.0);
+        let fitted = source * preview_fit_scale(source, Vec2::new(4000.0, 2500.0));
+        assert!(fitted.x <= 1200.0 && fitted.y <= 900.0);
     }
 
     #[test]
@@ -9274,6 +9304,45 @@ mod reference_suggestion_label_tests {
             });
 
             assert!(response.response.rect.height() < 72.0);
+        });
+    }
+
+    #[test]
+    fn annotation_enter_submits_but_shift_enter_empty_notes_and_ime_do_not() {
+        for (note, modifiers, ime, expected) in [
+            ("Note", egui::Modifiers::NONE, false, true),
+            ("Note", egui::Modifiers::SHIFT, false, false),
+            (" ", egui::Modifiers::NONE, false, false),
+            ("Note", egui::Modifiers::NONE, true, false),
+        ] {
+            egui::__run_test_ui(|ui| {
+                let id = ui.id().with("annotation-test");
+                ui.memory_mut(|memory| memory.request_focus(id));
+                ui.input_mut(|input| {
+                    input.events.clear();
+                    input.events.push(egui::Event::Key { key: egui::Key::Enter,
+                        physical_key: None, pressed: true, repeat: false, modifiers });
+                    if ime { input.events.push(egui::Event::Ime(egui::ImeEvent::Commit("文".into()))); }
+                });
+                assert_eq!(annotation_submit_requested(ui, id, note), expected);
+            });
+        }
+    }
+
+    #[test]
+    fn windows_ctrl_h_keeps_text_fields_unchanged() {
+        egui::__run_test_ui(|ui| {
+            ui.ctx().set_os(egui::os::OperatingSystem::Windows);
+            let id = ui.id().with("ctrl-h-test");
+            ui.memory_mut(|memory| memory.request_focus(id));
+            ui.input_mut(|input| {
+                input.events.clear();
+                input.events.push(egui::Event::Key { key: egui::Key::H,
+                    physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL });
+            });
+            let mut value = "Keep these characters".to_owned();
+            ui.add(egui::TextEdit::singleline(&mut value).id(id));
+            assert_eq!(value, "Keep these characters");
         });
     }
 

@@ -275,6 +275,8 @@ pub(crate) fn show_image_preview_area(
 }
 
 pub(crate) fn preview_fit_scale(source: Vec2, available: Vec2) -> f32 {
+    // Bound the initial preview on large monitors; manual zoom is unaffected.
+    let available = available.min(Vec2::new(1200.0, 900.0));
     (available.x / source.x.max(1.0)).min(available.y / source.y.max(1.0))
 }
 

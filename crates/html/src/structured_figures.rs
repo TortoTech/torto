@@ -194,6 +194,36 @@ pub(super) fn attach_sources(blocks: &mut Vec<Block>) {
             Block::Note(note) => attach_sources(&mut note.blocks),
             _ => {}
         }
+        block = promote_caption_rasters(block);
+        // Some publishers put the numbered caption before a separate figure,
+        // or put a hidden note definition between an image and its caption.
+        // Only cross note definitions; ordinary prose is a hard boundary.
+        let previous = result.iter().rposition(|block| {
+            !matches!(block,
+            Block::Note(note) if note.kind == NoteBlockKind::Definition)
+        });
+        if matches!(&block, Block::Figure(_))
+            && accepts_caption(&block)
+            && previous == result.len().checked_sub(1)
+            && matches!(result.last(), Some(Block::Text(text)) if numbered_caption(text))
+        {
+            let Block::Text(mut caption) = result.pop().unwrap() else {
+                unreachable!()
+            };
+            caption.kind = TextBlockKind::Caption;
+            block = with_caption(block, caption, true);
+        } else if let Block::Text(text) = &block
+            && numbered_caption(text)
+            && let Some(index) = previous
+            && index + 1 < result.len()
+            && accepts_caption(&result[index])
+        {
+            let mut caption = text.clone();
+            caption.kind = TextBlockKind::Caption;
+            let media = result.remove(index);
+            result.insert(index, with_caption(media, caption, false));
+            continue;
+        }
         if let Block::Text(mut text) = block {
             if annotation_kind(&text) == TextBlockKind::QuoteAttribution {
                 if matches!(result.last(), Some(Block::Text(t)) if t.kind == TextBlockKind::Caption)
@@ -232,6 +262,138 @@ pub(super) fn attach_sources(blocks: &mut Vec<Block>) {
         }
     }
     *blocks = result;
+}
+
+fn promote_caption_rasters(block: Block) -> Block {
+    let Block::Text(mut caption) = block else {
+        return block;
+    };
+    if !numbered_caption(&caption) {
+        return Block::Text(caption);
+    }
+    let mut images = Vec::new();
+    let mut offset = 0;
+    for inline in &mut caption.content {
+        if let Inline::Image(run) = inline
+            && run.intrinsic_sizing
+            && matches!(
+                run.image.alt.trim().to_ascii_lowercase().as_str(),
+                "figure" | "图" | "圖" | "插图"
+            )
+        {
+            let mut image = run.image.clone();
+            image.source = caption.source.as_ref().map(|source| {
+                let mut start = source.start.clone();
+                start.text_offset += offset;
+                SourceRange {
+                    start: start.clone(),
+                    end: start,
+                }
+            });
+            images.push(image);
+            // Keep the original inline slot and all following text offsets.
+            *inline = Inline::Text(TextRun {
+                text: String::new(),
+                style: Default::default(),
+                link: None,
+            });
+        }
+        offset += inline
+            .text_runs()
+            .iter()
+            .map(|run| run.text.chars().count() as u64)
+            .sum::<u64>();
+    }
+    if images.is_empty() {
+        return Block::Text(caption);
+    }
+    caption.kind = TextBlockKind::Caption;
+    Block::Figure(FigureBlock {
+        source: caption.source.clone(),
+        images,
+        captions: vec![caption],
+        body: vec![],
+        caption_position: CaptionPosition::After,
+        style: BlockStyle::default(),
+    })
+}
+
+fn numbered_caption(text: &TextBlock) -> bool {
+    if !matches!(text.kind, TextBlockKind::Paragraph | TextBlockKind::Caption) {
+        return false;
+    }
+    let initial = text
+        .content
+        .iter()
+        .flat_map(Inline::text_runs)
+        .flat_map(|run| run.text.chars())
+        .find(|ch| !ch.is_whitespace());
+    if !matches!(
+        initial,
+        Some('f' | 'F' | '图' | '圖' | '插' | '▲' | '△' | '◆' | '◇')
+    ) {
+        return false;
+    }
+    let value: String = text
+        .content
+        .iter()
+        .flat_map(Inline::text_runs)
+        .filter(|run| run.style.link_role != LinkRole::FootnoteReference)
+        .map(|run| run.text.as_str())
+        .collect();
+    let lower = value.to_lowercase();
+    media_references::caption_label(&value).is_some_and(|label| label.key.kind == MediaKind::Figure)
+        && ![" shows ", " illustrates ", " depicts ", "所示", "展示了"]
+            .iter()
+            .any(|cue| lower.contains(cue))
+}
+
+fn accepts_caption(block: &Block) -> bool {
+    match block {
+        Block::Image(_) => true,
+        Block::Figure(figure) => figure.caption_blocks().next().is_none(),
+        _ => false,
+    }
+}
+
+fn with_caption(block: Block, caption: TextBlock, before: bool) -> Block {
+    let mut figure = match block {
+        Block::Figure(figure) => figure,
+        Block::Image(image) => FigureBlock {
+            source: image.source.clone(),
+            images: vec![image],
+            body: vec![],
+            captions: vec![],
+            caption_position: CaptionPosition::After,
+            style: BlockStyle::default(),
+        },
+        _ => unreachable!(),
+    };
+    if let (Some(outer), Some(source)) = (&mut figure.source, &caption.source) {
+        if before {
+            outer.start = source.start.clone();
+        } else {
+            outer.end = source.end.clone();
+        }
+    }
+    if before {
+        if figure.body.is_empty() {
+            figure.caption_position = if figure.captions.is_empty() {
+                CaptionPosition::Before
+            } else {
+                CaptionPosition::Split(1)
+            };
+            figure.captions.insert(0, caption);
+        } else {
+            figure.body.insert(0, Block::Text(caption));
+            figure.caption_position = CaptionPosition::Before;
+        }
+    } else if figure.body.is_empty() {
+        figure.captions.push(caption);
+    } else {
+        figure.body.push(Block::Text(caption));
+    }
+    Block::Figure(figure)
 }
 
 #[cfg(test)]

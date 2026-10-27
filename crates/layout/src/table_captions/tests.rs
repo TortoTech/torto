@@ -1,4 +1,22 @@
 use super::*;
+
+#[test]
+fn unified_table_moves_trailing_sources_outside_grid_and_preserves_authored_rows() {
+    let mut table = table();
+    let mut source = table.rows[0].clone();
+    source.cells[0].text = text("Source: Example survey.", TextBlockKind::Paragraph);
+    table.rows.push(source);
+    let authored = table.clone();
+    let view = presentation(&table, true);
+    assert!(view.skip_title);
+    assert_eq!(view.skip_sources, 1);
+    assert_eq!(view.after[0].kind, TextBlockKind::QuoteAttribution);
+    assert_eq!(table, authored);
+    let original = presentation(&table, false);
+    assert_eq!(original.skip_sources, 0);
+    assert!(!original.skip_title);
+    assert!(original.after.is_empty());
+}
 use crate::{BookSource, LayoutEngine, LayoutViewport, PageItem, ReaderStyle, ReaderTypesetting};
 use rebook_publication::{
     Block, BlockStyle, Book, Metadata, PublicationError, PublicationId, PublicationUrl, Resource,

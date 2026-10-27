@@ -59,6 +59,11 @@ pub struct TextEditState {
 }
 
 impl TextEditState {
+    /// Whether the input currently contains an uncommitted IME composition.
+    pub fn is_ime_composing(&self) -> bool {
+        self.cursor_purpose.is_ime_composition()
+    }
+
     pub fn load(ctx: &Context, id: Id) -> Option<Self> {
         ctx.data_mut(|d| d.get_persisted(id))
     }

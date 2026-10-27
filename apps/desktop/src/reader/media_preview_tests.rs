@@ -453,7 +453,7 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
     assert!((1..255).contains(&alpha(image_id)), "async media content fades in when ready");
     let normal = geometry(normal_shapes);
     let fitted = normal.0.union(normal.1).size();
-    let available = crate::ui::overlay_rect(&ctx).shrink(32.0).size();
+    let available = crate::ui::overlay_rect(&ctx).shrink(32.0).size().min(egui::vec2(1200.0, 900.0));
     assert!(normal.0.width() > 320.0, "small media should expand to the window");
     assert!(fitted.x <= available.x + 0.01 && fitted.y <= available.y + 0.01);
     assert!((fitted.x - available.x).abs() < 0.01 || (fitted.y - available.y).abs() < 0.01);
@@ -471,7 +471,7 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
     viewport.set(egui::vec2(1200.0, 1000.0));
     let resized = geometry(frame(&mut reader, vec![]));
     let fitted = resized.0.union(resized.1).size();
-    let available = crate::ui::overlay_rect(&ctx).shrink(32.0).size();
+    let available = crate::ui::overlay_rect(&ctx).shrink(32.0).size().min(egui::vec2(1200.0, 900.0));
     assert!(resized.0.width() > normal.0.width());
     assert!(fitted.x <= available.x + 0.01 && fitted.y <= available.y + 0.01);
     assert!((fitted.x - available.x).abs() < 0.01 || (fitted.y - available.y).abs() < 0.01);

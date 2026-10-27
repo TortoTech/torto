@@ -1488,13 +1488,26 @@ fn normalize_resolved_footnote_text(text: &str, marker: &str) -> Option<String> 
 }
 
 fn text_block_focus_text(block: &TextBlock) -> String {
+    let mut leading_backlink = false;
+    let mut started = false;
     block
         .content
         .iter()
         .filter_map(|inline| match inline {
             Inline::Ruby(run) => Some(run.base_text()),
             Inline::Text(run) if run.style.inline_role == InlineRole::Footnote => None,
-            Inline::Text(run) => Some(run.text.clone()),
+            Inline::Text(run) if run.style.link_role == LinkRole::FootnoteBacklink => {
+                leading_backlink |= !started;
+                None
+            }
+            Inline::Text(run) => {
+                let text = if leading_backlink && !started {
+                    run.text.trim_start_matches(|ch: char| ch.is_whitespace()
+                        || matches!(ch, '.' | '．' | ')' | '）' | ']' | '】' | '、'))
+                } else { run.text.as_str() };
+                started |= !text.trim().is_empty();
+                Some(text.to_owned())
+            }
             Inline::Math(run) => Some(run.latex.clone()),
             Inline::Image(run) => run.image.ocr_text.as_ref()
                 .map(|text| text.display_text().to_owned())
@@ -2031,7 +2044,9 @@ fn image_caption_scroll_bounds(unit: &FocusUnit, viewport_height: f32) -> Option
 
 impl FocusUnit {
     fn popup_footnotes(&self) -> &[FocusFootnote] {
-        self.list_group.as_ref().map_or(&self.footnotes, |group| &group.footnotes)
+        self.list_group.as_ref()
+            .filter(|group| group.share_notes || !group.split)
+            .map_or(&self.footnotes, |group| &group.footnotes)
     }
 
     fn fitting_caption(&self, height: f32) -> Option<egui::Rect> {
@@ -2775,8 +2790,7 @@ impl DesktopReader {
             return self.resolve_focus_footnotes(block);
         }
         let refs: Vec<_> = blocks.iter().collect();
-        let mut groups = rebook_layout::semantic_list_groups(&refs);
-        groups.extend(rebook_layout::semantic_paragraph_groups(&refs));
+        let groups = rebook_layout::semantic_list_groups(&refs);
         let Some(group) = groups.into_iter().find(|group| group.contains(&index)) else {
             return self.resolve_focus_footnotes(block);
         };
@@ -5947,6 +5961,20 @@ mod tests {
             text_block_focus_footnotes(&block).as_slice(),
             [FocusFootnoteSource::Inline(note, 1)] if note == "Inline note"
         ));
+    }
+
+    #[test]
+    fn footnote_plain_text_excludes_return_links_and_original_reference_numbers() {
+        for backlink in ["*1", "BACK TO NOTE REFERENCE1"] {
+            let block = TextBlock { kind: TextBlockKind::FootnoteDefinition,
+                content: vec![
+                    Inline::Text(TextRun { text: backlink.into(), style: TextStyle {
+                        link_role: LinkRole::FootnoteBacklink, ..Default::default()
+                    }, link: Some(PublicationUrl::parse("chapter.xhtml#ref1").unwrap()) }),
+                    Inline::Text(TextRun { text: "Actual note content.".into(), style: Default::default(), link: None }),
+                ], style: Default::default(), source: None };
+            assert_eq!(text_block_focus_text(&block), "Actual note content.");
+        }
     }
 
     #[test]

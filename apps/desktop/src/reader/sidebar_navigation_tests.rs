@@ -19,6 +19,21 @@ const CHAPTERS: usize = 15;
 const PARAGRAPHS_PER_CHAPTER: usize = 20;
 const CHAPTER: &str = "chapter";
 
+#[test]
+fn search_jump_clears_a_previous_toc_override_and_pending_navigation() {
+    let (mut reader, section) = chapter_book(ReadingMode::Focus);
+    toc_jump(&mut reader, "Chapter 1");
+    let range = range_at(&section, "p100");
+    reader.go_to_search_result(&crate::plugins::BookSearchResult {
+        section_index: 0, section_title: "Chapter 5".into(), excerpt: "Paragraph".into(),
+        excerpt_match: 0..9, matched_text: "Paragraph".into(), block_kind: "Paragraph".into(), range: range.clone(),
+    });
+    assert!(reader.focus_toc_override.is_none());
+    assert!(reader.pending_toc_navigation.is_none());
+    assert_eq!(reader.focus_anchor, Some(range.start));
+    assert_eq!(reader.current_chapter_title(), "Chapter 5");
+}
+
 struct EmptyHighlights;
 
 impl crate::highlights::HighlightRepository for EmptyHighlights {

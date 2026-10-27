@@ -4,6 +4,15 @@ use crate::plugins::{BlockTranslation, TranslationBookSource, TranslationMode};
 use rebook_publication::{TextRun, TextStyle};
 
 #[test]
+fn dates_and_long_cjk_prose_are_never_heading_candidates_even_from_cache() {
+    for value in [format!("1. {}", "这是一个完整的普通段落。".repeat(6)), "1996年发生了变化。".into()] {
+        let block = text("candidate", &value);
+        assert!(candidate(&block).is_none());
+    }
+    assert!(candidate(&text("candidate", "1. 小节标题")).is_some());
+}
+
+#[test]
 fn descriptive_style_numbers_do_not_expose_binary_float_tails() {
     let block = TextBlock {
         kind: TextBlockKind::Paragraph,
