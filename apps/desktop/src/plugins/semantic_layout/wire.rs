@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 const KEYS: &[(&str, &str)] = &[
+    ("container_runs", "cg"),
+    ("sources", "so"),
     ("classify_code_or_quote", "cqk"),
     ("presentation", "pr"),
     ("language", "lg"),
@@ -69,6 +71,7 @@ const KEYS: &[(&str, &str)] = &[
 ];
 
 const ENUMS: &[(&str, &str)] = &[
+    ("code", "cd"),
     ("code_or_quote", "cqk"),
     ("authored_quote", "aq"),
     ("authored_preformatted", "ap"),
@@ -105,7 +108,7 @@ fn enum_key(name: &str, decode: bool) -> &str {
 }
 
 fn enum_field(name: &str) -> bool {
-    matches!(name, "kind" | "type" | "status")
+    matches!(name, "kind" | "type" | "status" | "presentation")
 }
 
 fn key(name: &str, decode: bool) -> &str {

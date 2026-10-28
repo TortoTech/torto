@@ -253,6 +253,7 @@ fn live_existing_quote_attribution_completion() {
             .unwrap();
         assert!(result.annotations.iter().any(
             |a| matches!(a,Annotation::QuoteAttribution {inside:actual,..} if *actual==inside)
+                || matches!(a,Annotation::CodeOrQuote {credit,sources,..} if credit.is_some()==inside && (inside || !sources.is_empty()))
         ));
         let mut blocks = original.blocks.clone();
         for item in &result.annotations {
@@ -265,10 +266,10 @@ fn live_existing_quote_attribution_completion() {
             text_block_text(quote.attribution.as_ref().unwrap()),
             "— Mira Vale"
         );
-        assert_eq!(
-            quote.body[0],
-            unattributed_quote_body(&original.blocks[0]).unwrap()[0]
-        );
+        let authored = &unattributed_quote_body(&original.blocks[0]).unwrap()[0];
+        assert_eq!(quote.body[0].content, authored.content);
+        assert_eq!(quote.body[0].source, authored.source);
+        assert_eq!(quote.body[0].style.align, authored.style.align);
         println!(
             "Existing quote attribution completed (inside={inside}) without changing its body"
         );

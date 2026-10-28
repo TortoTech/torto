@@ -20,13 +20,18 @@ fn chars(block: &Block) -> usize {
 // runs together too, even when the parser represented them as separate blocks.
 pub(crate) fn semantic_units(section: &Section, range: Range<usize>) -> Vec<Range<usize>> {
     let media = |b: &Block| matches!(b, Block::Image(_) | Block::Table(_) | Block::Figure(_));
-    let caption = |b: &Block| matches!(b, Block::Text(t) if t.kind == TextBlockKind::Caption);
+    let caption = |b: &Block| matches!(b, Block::Text(t) if matches!(t.kind,TextBlockKind::Caption | TextBlockKind::QuoteAttribution));
     let refs: Vec<_> = section.blocks.iter().collect();
     let mut group_ends = vec![0; section.blocks.len()];
     for group in rebook_layout::semantic_paragraph_groups(&refs) {
         if group.start >= range.start && group.end <= range.end {
             group_ends[group.start] = group.end;
         }
+    }
+    // This only packs candidates into one request; the model still determines
+    // whether they form one example or several independent groups.
+    for run in code_blocks::runs(section, range.clone()) {
+        group_ends[run.start] = group_ends[run.start].max(run.end);
     }
     let mut units = Vec::new();
     let mut start = range.start;
@@ -35,12 +40,14 @@ pub(crate) fn semantic_units(section: &Section, range: Range<usize>) -> Vec<Rang
         while end < range.end {
             let a = &section.blocks[end - 1];
             let b = &section.blocks[end];
-            if (media(a) && (media(b) || caption(b)))
+            if (code_blocks::body(a).is_some() && caption(b))
+                || (caption(a) && code_blocks::body(b).is_some())
+                || (media(a) && (media(b) || caption(b)))
                 || (caption(a) && (media(b) || caption(b)))
                 || (matches!(a, Block::Quote(_))
                     && matches!(b, Block::Text(t) if t.kind == TextBlockKind::QuoteAttribution))
             {
-                end += 1;
+                end = group_ends[end].max(end+1);
             } else {
                 break;
             }

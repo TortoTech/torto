@@ -27,10 +27,11 @@ fn quote(lines: &[&str]) -> Block {
 
 fn proposal(presentation: Presentation, captions: Vec<usize>, language: Option<&str>) -> Proposal {
     Proposal::CodeOrQuote {
-        block: 0,
+        body: vec![0],
         presentation,
         language: language.map(str::to_owned),
         captions,
+        sources: vec![],
         body_index: None,
     }
 }
@@ -153,10 +154,11 @@ fn authored_label_before_and_source_after_stay_outside_the_body() {
         }
     }
     let p = Proposal::CodeOrQuote {
-        block: 1,
+        body: vec![1],
         presentation: Presentation::Code,
         language: Some("xml".into()),
         captions: vec![0, 2],
+        sources: vec![],
         body_index: None,
     };
     let input = unified_window_input(&s, &RecognitionRoles::default(), 0..3, 0..3, &[]);
@@ -220,24 +222,27 @@ fn rejects_partial_overlapping_remote_or_invalid_classification() {
         proposal(Presentation::Code, vec![2], Some("xml")),
         proposal(Presentation::Quote, vec![], Some("xml")),
         Proposal::CodeOrQuote {
-            block: 1,
+            body: vec![1],
             presentation: Presentation::Code,
             language: None,
             captions: vec![],
+            sources: vec![],
             body_index: None,
         },
         Proposal::CodeOrQuote {
-            block: 0,
+            body: vec![0],
             presentation: Presentation::Code,
             language: Some("xml".into()),
             captions: vec![],
+            sources: vec![],
             body_index: Some(2),
         },
         Proposal::CodeOrQuote {
-            block: 0,
+            body: vec![0],
             presentation: Presentation::Quote,
             language: None,
             captions: vec![],
+            sources: vec![],
             body_index: Some(usize::MAX),
         },
     ] {
