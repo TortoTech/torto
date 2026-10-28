@@ -3,6 +3,9 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 const KEYS: &[(&str, &str)] = &[
+    ("table_html", "th"),
+    ("replacement_safe", "rs"),
+    ("literal", "lt"),
     ("container_runs", "cg"),
     ("sources", "so"),
     ("classify_code_or_quote", "cqk"),
@@ -87,6 +90,9 @@ const ENUMS: &[(&str, &str)] = &[
     ("protected_boundary", "pb"),
     ("quote_missing_attribution", "qm"),
     ("attribution_candidate", "ac"),
+    ("recognized_table", "tb"),
+    ("recognized_text", "tx"),
+    ("unreadable_text", "ut"),
     ("recognized", "ok"),
     ("not_formula", "no"),
     ("unreadable", "u"),

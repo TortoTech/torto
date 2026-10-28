@@ -4176,17 +4176,16 @@ impl StyleSheet {
             ..ImageStyle::default()
         };
         let properties = self.cascaded_properties(node);
-        if let Some(value) = properties
-            .get("width")
-            .and_then(|value| image_length(value))
-        {
-            style.width = Some(value);
-        }
-        if let Some(value) = properties
-            .get("height")
-            .and_then(|value| image_length(value))
-        {
-            style.height = Some(value);
+        // HTML dimensions are presentational hints. CSS auto explicitly clears
+        // that hint so the missing axis can use the image's intrinsic ratio.
+        for (name, dimension) in [("width", &mut style.width), ("height", &mut style.height)] {
+            if let Some(value) = properties.get(name) {
+                if value.trim().eq_ignore_ascii_case("auto") {
+                    *dimension = None;
+                } else if let Some(value) = image_length(value) {
+                    *dimension = Some(value);
+                }
+            }
         }
         if let Some(value) = properties
             .get("max-width")

@@ -142,12 +142,10 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
             assert!(!instructions.contains("g=groups") && !instructions.contains("pr=proposal"));
             let status = &body["response_format"]["json_schema"]["schema"]["properties"]["r"]["items"]
                 ["properties"]["ss"];
-            assert!(
-                status["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains("ok=recognized, no=not_formula, u=unreadable")
-            );
+            assert_eq!(status["enum"],json!(["ok","tx","no","u","ut","tb"]));
+            for meaning in ["ok=recognized", "tx=recognized_text", "no=not_formula", "u=unreadable", "ut=unreadable_text", "tb=recognized_table"] {
+                assert!(status["description"].as_str().unwrap().contains(meaning));
+            }
             let item = |id, latex: Option<&str>| json!({"image_id":id,"status":if latex.is_some(){"recognized"}else{"not_formula"},"latex":latex,"equation_number":null});
             let results = match turn {
                 0 => vec![item(2, None), item(0, Some("x=1"))],
