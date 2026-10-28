@@ -1,8 +1,9 @@
+mod branding;
+
 use std::fs;
 use std::path::PathBuf;
 
 use image::codecs::png::PngEncoder;
-use image::imageops::FilterType;
 use image::{ColorType, ImageEncoder};
 
 // cargo-bundle maps each source PNG to an icns entry by exact pixel size and
@@ -11,18 +12,13 @@ const ICON_SIZES: [u32; 7] = [16, 32, 64, 128, 256, 512, 1024];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let source_path = root.join("assets/logo.png");
     let output_dir = root.join("assets/macos");
     fs::create_dir_all(&output_dir)?;
 
-    let source = image::open(&source_path)?.into_rgba8();
-    let (width, height) = source.dimensions();
-    if width != height {
-        return Err(format!("logo must be square, got {width}x{height}").into());
-    }
+    let source = branding::Source::load(&root)?;
 
     for size in ICON_SIZES {
-        let resized = image::imageops::resize(&source, size, size, FilterType::Lanczos3);
+        let resized = source.render(size)?;
         let mut png = Vec::new();
         PngEncoder::new(&mut png).write_image(
             resized.as_raw(),
@@ -42,10 +38,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "generated {} macOS icon sizes from {}x{} source",
-        ICON_SIZES.len(),
-        width,
-        height
+        "generated {} macOS icon sizes from assets/logo.svg",
+        ICON_SIZES.len()
     );
     Ok(())
 }

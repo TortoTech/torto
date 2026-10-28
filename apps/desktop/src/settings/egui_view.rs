@@ -952,23 +952,28 @@ fn semantic_layout_rows(
     settings_row_label(ui, language.text("AI排版", "AI layout"));
     settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
         toggle_switch(ui, &mut settings.enabled);
-        ui.add(icon(Icon::CircleHelp).size(16.0).color(palette().muted))
-            .on_hover_text(language.text(
-                "补充未识别的引用、文内文献引用、公式图片、图注和小节标题",
-                "Recognize missing quotes, inline citations, formula images, captions and section headings",
-            ));
+        settings_help_icon(ui, language.text(
+            "补充未识别的引用、文内文献引用、公式图片、图注和小节标题",
+            "Recognize missing quotes, inline citations, formula images, captions and section headings",
+        ));
     });
     ui.end_row();
     if settings.enabled {
         settings_row_label(ui, language.text("排版模型", "Layout model"));
-        configured_model_selector(
-            ui,
-            "semantic-layout-model",
-            model_options,
-            &mut settings.provider,
-            &mut settings.model,
-            language,
-        );
+        settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+            configured_model_selector(
+                ui,
+                "semantic-layout-model",
+                model_options,
+                &mut settings.provider,
+                &mut settings.model,
+                language,
+            );
+            settings_help_icon(ui, language.text(
+                "建议使用支持识图、速度快的模型，如 Gemini Flash，或 DeepSeek、Qwen 中符合这些要求的模型。\n思考等级建议设为“不思考”。",
+                "Use a fast, vision-capable model, such as Gemini Flash or a suitable model from DeepSeek or Qwen.\nSet reasoning effort to None.",
+            ));
+        });
         ui.end_row();
         settings_row_label(ui, language.text("思考等级", "Reasoning effort"));
         settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
@@ -1352,6 +1357,10 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         &mut settings.chat_model,
                         language,
                     );
+                    settings_help_icon(ui, language.text(
+                        "建议使用支持识图的模型。",
+                        "Use a vision-capable model.",
+                    ));
                 });
                 ui.end_row();
 
@@ -1656,6 +1665,10 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         &mut settings.translation_model,
                         language,
                     );
+                    settings_help_icon(ui, language.text(
+                        "建议使用文字能力强、速度快的模型，如 Gemini Flash 系列。\n思考等级建议设为“低”或“不思考”。",
+                        "Use a fast model with strong language capabilities, such as Gemini Flash.\nSet reasoning effort to Low or None.",
+                    ));
                 });
                 ui.end_row();
 
@@ -2507,6 +2520,11 @@ fn settings_subgroup_row_label(ui: &mut egui::Ui, text: &str) {
 
 fn settings_row_label(ui: &mut egui::Ui, text: &str) {
     settings_row_control(ui, |ui| field_label(ui, text));
+}
+
+fn settings_help_icon(ui: &mut egui::Ui, text: &str) {
+    ui.add(icon(Icon::CircleHelp).size(16.0).color(palette().muted))
+        .on_hover_text(text);
 }
 
 fn settings_row_control(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
