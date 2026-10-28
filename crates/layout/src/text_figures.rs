@@ -1,11 +1,11 @@
-//! Structured figure bodies retain live text inside a centered white surface.
+//! Structured figure bodies retain live content and its semantic presentation.
 use super::*;
 use rebook_publication::FigureBlock;
 
-fn contains_table(block: &Block) -> bool {
+fn has_independent_presentation(block: &Block) -> bool {
     match block {
-        Block::Table(_) => true,
-        Block::Figure(figure) => figure.body.iter().any(contains_table),
+        Block::Table(_) | Block::Quote(_) => true,
+        Block::Figure(figure) => figure.body.iter().any(has_independent_presentation),
         _ => false,
     }
 }
@@ -120,7 +120,9 @@ impl LayoutEngine {
         style.minimum_content_width = 0.0;
         style.top_margin = 0.0;
         style.bottom_margin = 0.0;
-        let paint_background = !figure.body.iter().any(contains_table);
+        // Quotes follow the reading theme; tables own their grid background.
+        // Neither inherits a diagram's forced white surface and black text.
+        let paint_background = !figure.body.iter().any(has_independent_presentation);
         if paint_background { style.foreground = Rgba::BLACK; }
         // Diagram paragraphs use container padding, not the running prose's
         // automatic first-line indent (which also displaces centered lines).

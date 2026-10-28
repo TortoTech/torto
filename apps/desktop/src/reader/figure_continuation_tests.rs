@@ -1,5 +1,6 @@
 //! Actual scrolling composition, including nested figures and quote accents.
 use super::*;
+use anyrender::ImageRenderer;
 use rebook_layout::{LayoutEngine, PageItem, ReaderTypesetting, SectionLayout};
 use rebook_renderer::DisplayListCompiler;
 
@@ -241,5 +242,100 @@ fn figure_paragraph_spacing_survives_page_boundaries() {
             }
         }
         assert!(joins > 0);
+    }
+}
+
+#[test]
+fn quotes_keep_their_inset_and_theme_inside_figures_with_zero_paragraph_indent() {
+    let (reader, _, _) = semantic_layout::tests::fixture();
+    let words = "Quoted text has its own space after the accent. ".repeat(75);
+    for depth in [0, 1, 2] {
+        for dark in [false, true] {
+            let (_, section, mut style) = layout(
+                reader.source.as_ref(),
+                &format!("<blockquote><p>{words}</p></blockquote>"),
+                depth,
+                800,
+                400,
+                dark,
+            );
+            style.typesetting.paragraph_indent_mode = rebook_layout::ParagraphIndentMode::Custom;
+            style.typesetting.paragraph_indent_em = 0.0;
+            style.background = if dark {
+                Rgba::BLACK
+            } else {
+                Rgba {
+                    red: 245,
+                    green: 242,
+                    blue: 235,
+                    alpha: 255,
+                }
+            };
+            let layout =
+                LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned())
+                    .layout_blocks(
+                        reader.source.as_ref(),
+                        &section.blocks,
+                        LayoutViewport::new(800, 400).unwrap(),
+                        &style,
+                    )
+                    .unwrap();
+            let mut quotes = 0;
+            for page in &layout.pages {
+                let display = DisplayListCompiler.compile(page);
+                for item in &page.items {
+                    match item {
+                        PageItem::Quote(quote) => {
+                            quotes += 1;
+                            // The rendered accent ends at x + 10; leave at least
+                            // six pixels between that edge and selectable text.
+                            for rect in display.source_rects(&quote.sources) {
+                                assert!(
+                                    rect.x0 >= f64::from(quote.x + 16.0) - 0.1,
+                                    "depth={depth}: quote text overlaps its accent: {rect:?}"
+                                );
+                            }
+                        }
+                        PageItem::FigureBody(body) => assert!(
+                            !body.paint_background,
+                            "a semantic quote must retain the reading theme"
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+            assert!(
+                quotes > 1,
+                "check every continuation as well as the first slice"
+            );
+            if depth > 0 {
+                let page = &layout.pages[0];
+                let body = page
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        PageItem::FigureBody(body) => Some(body),
+                        _ => None,
+                    })
+                    .unwrap();
+                let mut renderer = anyrender_vello_cpu::VelloCpuImageRenderer::new(800, 400);
+                let mut pixels = Vec::new();
+                renderer.render_to_vec(
+                    |scene| DisplayListCompiler.compile(page).paint(scene),
+                    &mut pixels,
+                );
+                let at = (((body.y + 2.0) as usize) * 800 + (body.x + 2.0) as usize) * 4;
+                assert_eq!(
+                    &pixels[at..at + 4],
+                    &[
+                        style.background.red,
+                        style.background.green,
+                        style.background.blue,
+                        style.background.alpha
+                    ],
+                    "no forced white panel"
+                );
+            }
+        }
     }
 }
