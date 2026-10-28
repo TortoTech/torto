@@ -970,8 +970,8 @@ fn semantic_layout_rows(
                 language,
             );
             settings_help_icon(ui, language.text(
-                "建议使用支持识图、速度快的模型，如 Gemini Flash，或 DeepSeek、Qwen 中符合这些要求的模型。\n思考等级建议设为“不思考”。",
-                "Use a fast, vision-capable model, such as Gemini Flash or a suitable model from DeepSeek or Qwen.\nSet reasoning effort to None.",
+                "使用能识图、速度快的模型（gemini/deepseek/qwen的flash系列）\n思考等级设置“不思考”",
+                "Use a fast, vision-capable model (Flash series from Gemini/DeepSeek/Qwen)\nSet reasoning effort to “None”",
             ));
         });
         ui.end_row();
@@ -1358,8 +1358,8 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         language,
                     );
                     settings_help_icon(ui, language.text(
-                        "建议使用支持识图的模型。",
-                        "Use a vision-capable model.",
+                        "使用能识图的模型",
+                        "Use a vision-capable model",
                     ));
                 });
                 ui.end_row();
@@ -1666,8 +1666,8 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         language,
                     );
                     settings_help_icon(ui, language.text(
-                        "建议使用文字能力强、速度快的模型，如 Gemini Flash 系列。\n思考等级建议设为“低”或“不思考”。",
-                        "Use a fast model with strong language capabilities, such as Gemini Flash.\nSet reasoning effort to Low or None.",
+                        "使用文字能力强、速度快模型（gemini的flash系列）\n思考等级设置“低”或“不思考”",
+                        "Use a fast model with strong language capabilities (Gemini Flash series)\nSet reasoning effort to “Low” or “None”",
                     ));
                 });
                 ui.end_row();

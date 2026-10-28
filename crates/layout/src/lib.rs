@@ -235,6 +235,7 @@ thread_local! {
 }
 
 const QUOTE_VERTICAL_PADDING: f32 = 12.0;
+const QUOTE_MINIMUM_HORIZONTAL_PADDING: f32 = 16.0;
 const LITERATA_FAMILY: &str = "Literata";
 const LEGACY_YSABEAU_FAMILY: &str = "Ysabeau Office";
 const OPTICAL_SIZE_TAG: Tag = Tag::new(b"opsz");
@@ -935,6 +936,8 @@ pub enum PageItem {
 }
 
 pub struct FigureBodyPlacement {
+    /// Table groups retain geometry without painting a surface behind their prose.
+    pub paint_background: bool,
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -1747,11 +1750,15 @@ impl LayoutEngine {
                 }
                 Block::Quote(quote) => {
                     let quote_horizontal_padding = if unified_reflow {
-                        reader_style.typography.font_size
+                        // The accent occupies its own horizontal space even when
+                        // the reader or a containing figure disables prose indentation.
+                        (reader_style.typography.font_size
                             * paragraph_indent_em(
                                 &reader_style.typesetting,
                                 reader_style.writing_system,
-                            )
+                            ))
+                            .max(reader_style.typography.font_size)
+                            .max(QUOTE_MINIMUM_HORIZONTAL_PADDING)
                     } else {
                         0.0
                     };

@@ -1,6 +1,47 @@
-//! Structured figure bodies retain live text inside a centered white surface.
+//! Structured figure bodies retain live content and its semantic presentation.
 use super::*;
 use rebook_publication::FigureBlock;
+
+fn has_independent_presentation(block: &Block) -> bool {
+    match block {
+        Block::Table(_) | Block::Quote(_) => true,
+        Block::Figure(figure) => figure.body.iter().any(has_independent_presentation),
+        _ => false,
+    }
+}
+
+// Decorations extend to a printed page edge, but are not content. Trim
+// continuation-only quote padding before nesting slices in another container.
+fn slice_bounds(page: &PageLayout) -> (f32, f32) {
+    let top = page.items.iter().filter_map(|item| match item {
+        PageItem::Text(text) => text.layout.get(text.lines.start)
+            .map(|line| text.origin_y + line.metrics().block_min_coord),
+        PageItem::Quote(quote) => (!quote.continued_before).then_some(quote.y),
+        PageItem::FigureBody(body) => Some(body.y),
+        PageItem::Image(image) => Some(image.y),
+        PageItem::Table(table) => Some(table.y),
+        PageItem::Separator(line) => Some(line.y),
+    }).reduce(f32::min).unwrap_or(0.0);
+    let bottom = page.items.iter().filter_map(|item| match item {
+        PageItem::Quote(quote) if quote.continued_after => None,
+        _ => Some(page_item_bottom(item)),
+    }).reduce(f32::max).unwrap_or(top);
+    (top, bottom.max(top))
+}
+
+fn trim_quote_continuations(page: &mut PageLayout, top: f32, bottom: f32, leading_gap: f32) {
+    for item in &mut page.items {
+        if let PageItem::Quote(quote) = item {
+            let end = if quote.continued_after { bottom } else { quote.y + quote.height };
+            if quote.continued_before {
+                // Extend the accent through a real paragraph gap restored at
+                // this boundary, while keeping glyphs after that gap.
+                quote.y = top - leading_gap;
+            }
+            quote.height = (end - quote.y).max(0.0);
+        }
+    }
+}
 
 fn caption(block: &Block) -> bool {
     matches!(block, Block::Text(t) if matches!(t.kind,
@@ -79,7 +120,10 @@ impl LayoutEngine {
         style.minimum_content_width = 0.0;
         style.top_margin = 0.0;
         style.bottom_margin = 0.0;
-        style.foreground = Rgba::BLACK;
+        // Quotes follow the reading theme; tables own their grid background.
+        // Neither inherits a diagram's forced white surface and black text.
+        let paint_background = !figure.body.iter().any(has_independent_presentation);
+        if paint_background { style.foreground = Rgba::BLACK; }
         // Diagram paragraphs use container padding, not the running prose's
         // automatic first-line indent (which also displaces centered lines).
         style.typesetting.paragraph_indent_mode = ParagraphIndentMode::Custom;
@@ -121,7 +165,10 @@ impl LayoutEngine {
             .collect();
         let first_height = pages
             .first()
-            .map_or(0.0, |page| page_bottom(page) + padding * 2.0);
+            .map_or(0.0, |page| {
+                let (_, bottom) = slice_bounds(page);
+                bottom + padding + if pages.len() == 1 { padding } else { 0.0 }
+            });
         paginator.prepare_group(
             before_height + first_height + if pages.len() == 1 { after_height } else { 0.0 },
             outer_gap,
@@ -137,7 +184,13 @@ impl LayoutEngine {
             if index > 0 {
                 paginator.force_page();
             }
-            let height = page_bottom(&page) + padding * 2.0;
+            let (content_top, content_bottom) = slice_bounds(&page);
+            let content_top = if index == 0 { 0.0 } else { content_top };
+            let top_padding = if index == 0 { padding } else { 0.0 };
+            let bottom_padding = if index + 1 == page_count { padding } else { 0.0 };
+            let leading_gap = if index == 0 { 0.0 } else { page.leading_gap.max(0.0) };
+            trim_quote_continuations(&mut page, content_top, content_bottom, leading_gap);
+            let height = content_bottom - content_top + leading_gap + top_padding + bottom_padding;
             paginator.keep_together_if_fits(
                 height
                     + if index + 1 == page_count {
@@ -151,6 +204,7 @@ impl LayoutEngine {
             paginator
                 .items
                 .push(PageItem::FigureBody(FigureBodyPlacement {
+                    paint_background,
                     x,
                     y,
                     width,
@@ -158,7 +212,7 @@ impl LayoutEngine {
                     sources: body_sources(&page),
                 }));
             for item in &mut page.items {
-                translate(item, x + padding, y + padding);
+                translate(item, x + padding, y + top_padding + leading_gap - content_top);
             }
             paginator.items.extend(page.items);
             paginator.cursor_y = y + height;
@@ -274,6 +328,7 @@ mod tests {
             let panel = page.items.iter().find_map(|item| match item {
                 PageItem::FigureBody(panel) => Some(panel), _ => None,
             }).unwrap();
+            assert!(!panel.paint_background, "white background belongs to the grid only");
             let table = page.items.iter().find_map(|item| match item {
                 PageItem::Table(table) => Some(table), _ => None,
             }).unwrap();
@@ -391,6 +446,51 @@ mod tests {
     }
 
     #[test]
+    fn table_figure_continuations_do_not_repeat_panel_padding_between_rows() {
+        let rows = (0..15).map(|row| TableRow {
+            cells: (0..9).map(|column| {
+                let Block::Text(text) = text(&format!("Cell {row}:{column}"), TextAlignment::Center,
+                    TextBlockKind::Paragraph) else { unreachable!() };
+                TableCell { text, column_span: 1, row_span: 1, header: row == 0,
+                    authored_alignment: None }
+            }).collect(),
+        }).collect();
+        let blocks = [figure(vec![
+            text("Figure 5.2 Complex table", TextAlignment::Center, TextBlockKind::Caption),
+            Block::Table(TableBlock { before: vec![], after: vec![], rows, source: None }),
+            text("Source: Example", TextAlignment::Start, TextBlockKind::QuoteAttribution),
+        ])];
+        let style = ReaderStyle { spread: SpreadMode::Single,
+            typesetting: ReaderTypesetting::unified(), ..Default::default() };
+        for (width, height) in [(700, 350), (1100, 500)] {
+            let layout = engine().layout_blocks(&source(), &blocks,
+                LayoutViewport::new(width, height).unwrap(), &style).unwrap();
+            let mut fragments = 0;
+            let mut cell_sources = Vec::new();
+            for page in &layout.pages {
+                let Some(panel) = page.items.iter().find_map(|item| if let PageItem::FigureBody(p) = item {Some(p)} else {None}) else {continue};
+                for item in &page.items {
+                    let PageItem::Table(table) = item else {continue};
+                    fragments += 1;
+                    if table.continued_before {
+                        assert!((table.y - panel.y).abs() < 0.1, "continuation has top padding: {}", table.y - panel.y);
+                    }
+                    if table.continued_after {
+                        assert!((panel.y + panel.height - table.y - table.height).abs() < 0.1,
+                            "continuation has bottom padding: {}", panel.y + panel.height - table.y - table.height);
+                    }
+                    cell_sources.extend(table.cells.iter().filter_map(|c| c.text.as_ref()?.source.as_ref().map(|s| s.start.node.clone())));
+                }
+            }
+            assert!(fragments > 1);
+            assert_eq!(cell_sources.len(), 15 * 9);
+            cell_sources.sort();
+            cell_sources.dedup();
+            assert_eq!(cell_sources.len(), 15 * 9, "each source cell is retained once");
+        }
+    }
+
+    #[test]
     fn long_text_figures_paginate_without_losing_or_duplicating_children() {
         let mut children: Vec<_> = (0..35)
             .map(|i| {
@@ -487,29 +587,19 @@ fn body_sources(page: &PageLayout) -> Vec<SourceRange> {
     sources
 }
 
-fn page_bottom(page: &PageLayout) -> f32 {
-    page.items
-        .iter()
-        .filter_map(|item| match item {
-            PageItem::Text(text) => text
-                .lines
-                .end
-                .checked_sub(1)
-                .and_then(|i| text.layout.get(i))
-                .map(|line| {
-                    text.origin_y
-                        + line
-                            .metrics()
-                            .block_max_coord
-                            .max(line.metrics().block_min_coord + line.metrics().line_height)
-                }),
-            PageItem::FigureBody(body) => Some(body.y + body.height),
-            PageItem::Quote(quote) => Some(quote.y + quote.height),
-            PageItem::Image(image) => Some(image.y + image.height),
-            PageItem::Table(table) => Some(table.y + table.height),
-            PageItem::Separator(line) => Some(line.y + 1.0),
-        })
-        .fold(0.0, f32::max)
+fn page_item_bottom(item: &PageItem) -> f32 {
+    match item {
+        PageItem::Text(text) => text.lines.end.checked_sub(1)
+            .and_then(|i| text.layout.get(i)).map_or(text.origin_y, |line| {
+                text.origin_y + line.metrics().block_max_coord
+                    .max(line.metrics().block_min_coord + line.metrics().line_height)
+            }),
+        PageItem::FigureBody(body) => body.y + body.height,
+        PageItem::Quote(quote) => quote.y + quote.height,
+        PageItem::Image(image) => image.y + image.height,
+        PageItem::Table(table) => table.y + table.height,
+        PageItem::Separator(line) => line.y + 1.0,
+    }
 }
 
 fn translate(item: &mut PageItem, x: f32, y: f32) {

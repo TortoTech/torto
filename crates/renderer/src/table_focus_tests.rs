@@ -364,3 +364,19 @@ fn table_focus_highlights_caption_and_note_like_figure_captions_without_filling_
         }
     }
 }
+
+#[test]
+fn saved_table_marks_outline_whole_grid_and_keep_partial_cell_marks() {
+    let (page, ranges) = table_page(false, false);
+    assert_eq!(page.source_mark_text_ranges(&ranges), [ranges[0].clone(), ranges[2].clone()]);
+    let mut scene = anyrender::Scene::new();
+    page.paint_source_mark_table_borders(&mut scene, &ranges, Color::BLACK, 0.0);
+    assert_eq!(scene.commands.len(), 4);
+    assert!(scene.commands.iter().all(|c| matches!(c, RenderCommand::Stroke(_))));
+    let mut partial = ranges[1].clone();
+    partial.end.text_offset -= 1;
+    assert_eq!(page.source_mark_text_ranges(&[partial.clone()]), [partial.clone()]);
+    let mut scene = anyrender::Scene::new();
+    page.paint_source_mark_table_borders(&mut scene, &[partial], Color::BLACK, 0.0);
+    assert!(scene.commands.is_empty());
+}

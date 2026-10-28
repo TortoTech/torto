@@ -423,6 +423,32 @@ mod tests {
     }
 
     #[test]
+    fn numbered_heading_beside_figure_image_is_a_caption_not_a_heading() {
+        let section = parse("<style>div.figure h6 {font-weight:normal; font-style:italic}</style><figure><div class='figure'><img src='chart.png'/><h6 id='caption'><span>Figure 2-1. </span>Binary search</h6></div></figure><h6 id='heading'>A real subsection</h6>");
+        let Block::Figure(figure) = &section.blocks[0] else { panic!("figure"); };
+        assert_eq!(figure.images.len(), 1);
+        assert!(figure.body.is_empty());
+        let caption = &figure.captions[0];
+        assert_eq!(caption.kind, TextBlockKind::Caption);
+        assert!(caption.content.iter().flat_map(Inline::text_runs).all(|r| !r.style.bold && r.style.italic));
+        assert_eq!(caption.source.as_ref().unwrap().start.node, "n1");
+        assert!(section.anchors.iter().any(|a| a.fragment == "caption" && a.source.node == "n1"));
+        assert!(matches!(&section.blocks[1], Block::Text(text) if text.kind == TextBlockKind::Heading(6)));
+    }
+
+    #[test]
+    fn table_descendant_weight_override_keeps_headers_and_inline_emphasis() {
+        let section = parse("<style>figure {font-weight:bold} table p {font-weight:normal}</style><figure><figcaption>Figure 5.1 Example</figcaption><p>Explanation</p><table><tr><th><p>Header</p></th><td><p><em>x</em> + <strong>important</strong></p></td></tr></table></figure>");
+        let Block::Figure(figure) = &section.blocks[0] else { panic!(); };
+        let table = figure.body.iter().find_map(|b| if let Block::Table(t) = b {Some(t)} else {None}).unwrap();
+        assert!(table.rows[0].cells[0].header);
+        assert!(table.rows[0].cells[0].text.content.iter().flat_map(Inline::text_runs).all(|r| !r.style.bold));
+        let runs: Vec<_> = table.rows[0].cells[1].text.content.iter().flat_map(Inline::text_runs).collect();
+        assert!(runs.iter().any(|r| r.text == "x" && r.style.emphasis && !r.style.bold));
+        assert!(runs.iter().any(|r| r.text == "important" && r.style.bold));
+    }
+
+    #[test]
     fn consecutive_preceding_captions_belong_to_the_following_body() {
         let chinese = parse("<p>插图 1 示例</p><div><p>示例正文。</p></div>");
         assert!(matches!(chinese.blocks.as_slice(), [Block::Figure(_)]));

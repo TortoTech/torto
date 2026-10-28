@@ -34,6 +34,8 @@ mod paragraph_lists;
 mod definition_lists;
 mod paragraph_groups;
 mod style_query;
+mod css_selectors;
+use css_selectors::Selector;
 mod table_captions;
 mod structured_figures;
 use font_size::FontSize;
@@ -1957,6 +1959,10 @@ impl<'a> ReadingIrParser<'a> {
         // figure. Its structure already establishes the caption relationship.
         let caption_container = |node: Node<'_, '_>| {
             node.has_tag_name("figcaption")
+                || (matches!(node.tag_name().name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+                    && !self.heading_fragments.contains(node_fragment(node).unwrap_or(""))
+                    && starts_with_numbered_caption_label(&node_text(node))
+                    && has_descendant_image(figure))
                 || (matches!(node.tag_name().name(), "p" | "div")
                     && node_has_visible_text(node)
                     && !has_descendant_image(node)
@@ -3668,7 +3674,7 @@ impl QuoteLayoutMetrics {
 #[derive(Default)]
 struct StyleSheet {
     rules: Vec<StyleRule>,
-    marker_rules: Vec<(SimpleSelector, Option<rebook_publication::ListMarkerFormat>)>,
+    marker_rules: Vec<(Selector, Option<rebook_publication::ListMarkerFormat>)>,
     rule_index: RuleIndex,
     // A sheet belongs to one parsed document. Never retain node IDs across
     // section parses, where roxmltree starts numbering nodes again.
@@ -3682,7 +3688,7 @@ struct StyleSheet {
 }
 
 struct StyleRule {
-    selector: SimpleSelector,
+    selector: Selector,
     specificity: u16,
     order: usize,
     declarations: Vec<(String, String)>,
@@ -3813,14 +3819,14 @@ impl StyleSheet {
                     if let Some(parent) = raw_selector.trim().strip_suffix("::before")
                         .and_then(|s| s.trim_end().strip_suffix("li"))
                         .map(|s| s.trim_end().trim_end_matches('>').trim_end())
-                        .and_then(SimpleSelector::parse)
+                        .and_then(Selector::parse)
                     {
                         let format = declarations.iter().chain(&important_declarations)
                             .find(|(name, _)| name == "content")
                             .and_then(|(_, value)| if value.contains("lower-alpha") { Some(rebook_publication::ListMarkerFormat::LowerAlpha) } else if value.contains("upper-alpha") { Some(rebook_publication::ListMarkerFormat::UpperAlpha) } else { None });
                         self.marker_rules.push((parent, format));
                     }
-                    let Some(selector) = SimpleSelector::parse(raw_selector) else {
+                    let Some(selector) = Selector::parse(raw_selector) else {
                         continue;
                     };
                     self.rule_index.insert(self.rules.len(), &selector);

@@ -1628,7 +1628,13 @@ impl DesktopReader {
         ctx: &egui::Context,
         interaction_blocked: bool,
     ) -> bool {
-        if !self.focus_body_accepts_actions(interaction_blocked)
+        if !self.is_focus_mode()
+            || interaction_blocked
+            || self.ui.overlay_visible()
+            || self.preview_is_open()
+            || self.focus_assistant_popup_visible()
+            || (self.ui.assistant_panel.is_some() && self.ui.assistant_keyboard_focus)
+            || self.annotation_note_draft.is_some()
             || ctx.text_edit_focused()
             || !supports_image_preview(self.format, self.pdf_ocr.mode)
         {
@@ -1637,6 +1643,7 @@ impl DesktopReader {
         if !ctx.input_mut(|input| input.consume_shortcut(&self.shortcuts.focus_image_preview)) {
             return false;
         }
+        if self.open_current_media_preview(ctx) { return true; }
         if self.open_focus_reference_preview(ctx) { return true; }
         if !(self.current_focus_unit_is_image() || self.focus_units.get(self.focus_unit_index).is_some_and(|unit| unit.media_key.is_some())) {
             return true;
@@ -8248,7 +8255,7 @@ mod reference_suggestion_label_tests {
 
     #[test]
     fn image_preview_shortcuts_respect_typing_and_keep_zoom_in_the_modal() {
-        for typing in [false, true] {
+        for (typing, sidebar) in [(false, false), (false, true), (true, false), (true, true)] {
             let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
             let layout = reader.current_scroll_layout().unwrap();
             reader.rebuild_focus_units(&layout);
@@ -8258,7 +8265,7 @@ mod reference_suggestion_label_tests {
                 .position(|unit| unit.is_image)
                 .unwrap();
             reader.select_focus_unit(index);
-            reader.ui.sidebar_open = false;
+            reader.ui.sidebar_open = sidebar;
             reader.ui.focus_footnotes_visible = true;
             let ctx = egui::Context::default();
             let mut draft = String::new();
