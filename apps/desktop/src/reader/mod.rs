@@ -1687,19 +1687,12 @@ fn focus_block_paint_ranges(block: &Block, range: &SourceRange) -> Vec<SourceRan
         }
     }
     if let Block::Figure(figure) = block {
-        let figure_ranges = figure
-            .images
-            .iter()
-            .filter_map(|image| image.source.clone())
-            .chain(
-                figure.text_blocks()
-                    .filter_map(|caption| caption.source.clone()),
-            )
-            .chain(figure.body.iter().flat_map(|child| focus_block_paint_ranges(child, block_source_range(child).unwrap_or(range))))
+        let figure_ranges = figure.images.iter().filter_map(|image| image.source.clone())
+            .chain(figure.captions.iter().filter_map(|caption| caption.source.clone()))
+            .chain(figure.body.iter().flat_map(|child|
+                focus_block_paint_ranges(child, block_source_range(child).unwrap_or(range))))
             .collect::<Vec<_>>();
-        if !figure_ranges.is_empty() {
-            return figure_ranges;
-        }
+        if !figure_ranges.is_empty() { return figure_ranges; }
     }
     vec![range.clone()]
 }
@@ -3097,7 +3090,17 @@ impl DesktopReader {
                         } else {
                             text
                         };
-                        (range, paint_ranges, text, figure.body.is_empty(), false, !figure.body.is_empty(), None)
+                        {
+                            fn has_table(block: &Block) -> bool {
+                                match block {
+                                    Block::Table(_) => true,
+                                    Block::Figure(figure) => figure.body.iter().any(has_table),
+                                    _ => false,
+                                }
+                            }
+                            let is_table = figure.body.iter().any(has_table);
+                            (range, paint_ranges, text, figure.body.is_empty(), is_table, !figure.body.is_empty() && !is_table, None)
+                        }
                     }
                     Block::Note(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => {
                         active_list_root = None;
@@ -3119,7 +3122,7 @@ impl DesktopReader {
                             node: range.start.node.clone(),
                         })
                 });
-            let rectangular_activation = rectangular_activation || structured_activation;
+            let rectangular_activation = (rectangular_activation || structured_activation) && !is_table;
             if text.trim().is_empty() {
                 if list_depth.is_none_or(|depth| depth == 0) {
                     active_list_root = None;

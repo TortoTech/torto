@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use roxmltree::{Node, NodeId};
 
-use super::{SimpleSelector, StyleRule, attribute_local};
+use super::{Selector, StyleRule, attribute_local};
 
 #[derive(Default)]
 pub(super) struct RuleIndex {
@@ -17,9 +17,10 @@ pub(super) struct RuleIndex {
 }
 
 impl RuleIndex {
-    pub(super) fn insert(&mut self, index: usize, selector: &SimpleSelector) {
+    pub(super) fn insert(&mut self, index: usize, selector: &Selector) {
         // Every selector has exactly one bucket. Compound selectors are still
         // checked in full, including all classes, the tag, and the ID.
+        let selector = selector.target();
         let bucket = if let Some(id) = &selector.id {
             self.ids.entry(id.clone()).or_default()
         } else if let Some(class) = selector.classes.first() {

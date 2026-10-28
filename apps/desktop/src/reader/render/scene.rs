@@ -277,7 +277,8 @@ impl DesktopReader {
         let mut paint = |ranges: &[rebook_publication::SourceRange],
                          color: Color,
                          exclude_tables: bool,
-                         exclude_images: bool| {
+                         exclude_images: bool,
+                         semantic_mark: bool| {
             let mut path = BezPath::new();
             for index in layout.geometry_pages(ranges) {
                 let top = layout.page_tops[index] + padding;
@@ -287,6 +288,11 @@ impl DesktopReader {
                     continue;
                 }
                 let page = &layout.pages[index].page;
+                let mark_ranges;
+                let ranges = if semantic_mark {
+                    mark_ranges = page.source_mark_text_ranges(ranges);
+                    mark_ranges.as_slice()
+                } else { ranges };
                 let selected;
                 let ranges = if exclude_tables || exclude_images {
                     selected = ranges
@@ -328,13 +334,13 @@ impl DesktopReader {
             }
         };
         for highlight in &self.highlights {
-            paint(&highlight.ranges, ANNOTATION_MARK_COLOR, false, false);
+            paint(&highlight.ranges, ANNOTATION_MARK_COLOR, false, false, true);
         }
         if let Some(mark) = &self.focused_mark {
-            paint(&mark.ranges, mark.color(), false, false);
+            paint(&mark.ranges, mark.color(), false, false, true);
         }
         if let Some(selection) = &self.selection {
-            paint(&selection.ranges, TEXT_SELECTION_COLOR, false, false);
+            paint(&selection.ranges, TEXT_SELECTION_COLOR, false, false, false);
         }
         if self.focus_background_highlight()
             && focus_unit_activation_visible(
@@ -349,6 +355,7 @@ impl DesktopReader {
                 TEXT_SELECTION_COLOR,
                 unit.is_table,
                 unit.is_image,
+                false,
             );
         }
         bounds.unwrap_or(Rect::ZERO)
@@ -635,10 +642,10 @@ impl DesktopReader {
             );
         }
         for highlight in &self.highlights {
-            page.paint_source_ranges(scene, &highlight.ranges, ANNOTATION_MARK_COLOR, offset_x);
+            page.paint_source_ranges(scene, &page.source_mark_text_ranges(&highlight.ranges), ANNOTATION_MARK_COLOR, offset_x);
         }
         if let Some(mark) = &self.focused_mark {
-            page.paint_source_ranges(scene, &mark.ranges, mark.color(), offset_x);
+            page.paint_source_ranges(scene, &page.source_mark_text_ranges(&mark.ranges), mark.color(), offset_x);
         }
         if let Some(selection) = &self.selection {
             page.paint_source_ranges(scene, &selection.ranges, TEXT_SELECTION_COLOR, offset_x);
@@ -728,6 +735,14 @@ impl DesktopReader {
                 focus_block_border_color(),
                 offset_x,
             );
+        }
+        // Saved marks stay visible while this grid also has green focus activation.
+        for highlight in &self.highlights {
+            page.paint_source_mark_table_borders(scene, &highlight.ranges,
+                Color::from_rgba8(96, 165, 250, 255), offset_x);
+        }
+        if let Some(mark) = &self.focused_mark {
+            page.paint_source_mark_table_borders(scene, &mark.ranges, mark.color().with_alpha(1.0), offset_x);
         }
     }
 

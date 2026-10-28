@@ -935,6 +935,8 @@ pub enum PageItem {
 }
 
 pub struct FigureBodyPlacement {
+    /// Table groups retain geometry without painting a surface behind their prose.
+    pub paint_background: bool,
     pub x: f32,
     pub y: f32,
     pub width: f32,

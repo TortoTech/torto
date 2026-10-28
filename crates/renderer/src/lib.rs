@@ -1102,6 +1102,25 @@ impl PageDisplayList {
         }
     }
 
+    /// Full-grid marks use an outline; partial cell selections remain text marks.
+    /// Match source offsets, rather than rendered/translated text lengths.
+    pub fn source_mark_text_ranges(&self, ranges: &[SourceRange]) -> Vec<SourceRange> {
+        let full_tables: Vec<_> = self.table_regions.iter()
+            .filter(|table| table_fully_marked(table, ranges)).collect();
+        ranges.iter().filter(|range| !full_tables.iter().any(|table|
+            table.sources.iter().any(|source| source.start.spine == range.start.spine
+                && source.start.node == range.start.node)))
+            .cloned().collect()
+    }
+
+    pub fn paint_source_mark_table_borders(&self, scene: &mut impl PaintScene,
+        ranges: &[SourceRange], color: Color, offset_x: f32) {
+        let sources: Vec<_> = self.table_regions.iter()
+            .filter(|table| table_fully_marked(table, ranges))
+            .flat_map(|table| table.sources.iter().cloned()).collect();
+        self.paint_source_table_borders(scene, &sources, color, offset_x);
+    }
+
     /// Highlights a table's surrounding captions and notes, leaving its cells
     /// to the block-level activation outline.
     pub fn paint_source_table_annotations(
@@ -2281,6 +2300,13 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
+fn table_fully_marked(table: &TableRegion, ranges: &[SourceRange]) -> bool {
+    !table.sources.is_empty() && table.sources.iter().all(|source| ranges.iter().any(|range|
+        range.start.spine == source.start.spine && range.start.node == source.start.node
+        && range.start.text_offset <= source.start.text_offset
+        && range.end.text_offset >= source.end.text_offset))
+}
+
 fn source_range_contains(range: &SourceRange, anchor: &SourceAnchor) -> bool {
     range.start.spine == anchor.spine
         && range.start.node == anchor.node
@@ -2464,11 +2490,11 @@ impl DisplayListCompiler {
                             (body.x + body.width).into(), (body.y + body.height).into()),
                         sources: body.sources.clone(),
                     });
-                    commands.push(DisplayCommand::FillRect(FillRectCommand {
+                    if body.paint_background { commands.push(DisplayCommand::FillRect(FillRectCommand {
                         rect: Rect::new(body.x.into(), body.y.into(),
                             (body.x + body.width).into(), (body.y + body.height).into()),
                         color: Color::WHITE,
-                    }));
+                    })); }
                 }
                 PageItem::Text(text) => {
                     let starts = (
@@ -3588,9 +3614,11 @@ mod tests {
             leading_gap: 0.0,
             items: vec![
                 PageItem::FigureBody(rebook_layout::FigureBodyPlacement {
+                    paint_background: true,
                     x: 40.0, y: 60.0, width: 300.0, height: 100.0, sources: vec![source.clone()],
                 }),
                 PageItem::FigureBody(rebook_layout::FigureBodyPlacement {
+                    paint_background: true,
                     x: 40.0, y: 200.0, width: 300.0, height: 100.0, sources: vec![other.clone()],
                 }),
             ],

@@ -485,7 +485,7 @@ impl Index {
             if !needed() { return Err("Cancelled".into()); }
             let section = source.parse_section(index).map_err(|e| e.to_string())?;
             if job.key.number.is_empty() {
-                if let Some((at, block)) = section.blocks.iter().enumerate().find(|(_, block)| matches!(block, Block::Figure(_) | Block::Image(_)) && super::block_source_range(block).is_some_and(|source| source.start.node == node)) {
+                if let Some((at, block)) = section.blocks.iter().enumerate().find(|(_, block)| matches!(block, Block::Figure(_) | Block::Image(_) | Block::Table(_)) && super::block_source_range(block).is_some_and(|source| source.start.node == node)) {
                     return Ok(Target { section: index, block: at,
                         images: if matches!(block, Block::Image(_)) { vec![at] } else { vec![] },
                         captions: adjacent_captions(&section, at), group: None, key: job.key.clone() });
@@ -665,7 +665,12 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     }
     // Sources without a revision can still receive semantic/translation updates
     // between lookup and rendering. Never reuse a shifted block ordinal.
-    if !targets(&section, target.section).contains(&target) {
+    let direct = job.key.number.is_empty() && job.destination.as_ref().is_some_and(|(index, node)| {
+        *index == target.section && section.blocks.get(target.block).is_some_and(|block|
+            matches!(block, Block::Figure(_) | Block::Image(_) | Block::Table(_))
+            && super::block_source_range(block).is_some_and(|source| &source.start.node == node))
+    });
+    if !direct && !targets(&section, target.section).contains(&target) {
         return Err("The figure/table changed. Please reopen the preview.".into());
     }
     let block = section
@@ -1109,6 +1114,25 @@ impl super::DesktopReader {
             }
         };
         self.open_media_items(ctx, items, index);
+    }
+
+    /// Use already loaded IR and stable source identity. Parsing and raster work
+    /// stay on the preview worker, including unnumbered tables and figures.
+    pub(super) fn open_current_media_preview(&mut self, ctx: &egui::Context) -> bool {
+        let Some(unit) = self.focus_units.get(self.focus_unit_index) else { return false; };
+        let Some(sections) = self.reader.cached_reading_unit_content() else { return false; };
+        let found = sections.iter().find_map(|(index, section)| section.blocks.iter().find_map(|block| {
+            if !matches!(block, Block::Figure(_) | Block::Table(_)) { return None; }
+            let origin = super::block_source_range(block)?;
+            if origin.start.spine != unit.range.start.spine || origin.start.node != unit.range.start.node { return None; }
+            let kind = if matches!(block, Block::Table(_)) { MediaKind::Table } else { MediaKind::Figure };
+            Some((*index, origin.clone(), kind))
+        }));
+        let Some((index, origin, kind)) = found else { return false; };
+        let destination = Some((index, origin.start.node.clone()));
+        let key = unit.media_key.clone().unwrap_or(MediaKey { kind, number: String::new() });
+        self.open_media_items(ctx, vec![PreviewItem { origin, key, destination }], 0);
+        true
     }
 
     pub(super) fn open_associated_image_preview(

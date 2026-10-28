@@ -1085,3 +1085,44 @@ fn local_book_media_preview() {
         );
     }
 }
+
+#[test]
+fn unnumbered_table_and_text_figure_preview_use_source_identity_with_sidebar_open() {
+    for body in [
+        "<table><tr><td>Unnumbered data</td><td>42</td></tr></table>",
+        "<figure><div><p>Unnumbered diagram</p></div></figure>",
+    ] {
+        let mut reader = reference_reader(&format!("<p>See the example below.</p>{body}"));
+        let index = reader.focus_units.iter().position(|u| u.text.contains("Unnumbered")).unwrap();
+        reader.select_focus_unit(index);
+        reader.ui.sidebar_open = true;
+        let ctx = egui::Context::default();
+        preview_key(&mut reader, &ctx, egui::Key::Num0);
+        let active = reader.media_preview.active.as_ref().unwrap();
+        assert!(active.items[0].key.number.is_empty());
+        assert!(active.items[0].destination.is_some());
+        assert_eq!(reader.focus_unit_index, index);
+        assert!(reader.ui.sidebar_open);
+    }
+}
+
+#[test]
+fn direct_unnumbered_table_resolves_and_renders_without_caption_or_image_guessing() {
+    let source = source(&["<html><body><p>Intro.</p><table><tr><td>Alpha</td><td>42</td></tr></table></body></html>"]);
+    let (at, block) = source.sections[0].blocks.iter().enumerate().find(|(_, b)| matches!(b, Block::Table(_))).unwrap();
+    let origin = super::super::block_source_range(block).unwrap().clone();
+    let mut job = Job { generation: 1, source: source.clone(), catalog: None,
+        destination: Some((0, origin.start.node.clone())), origin,
+        key: MediaKey { kind: MediaKind::Table, number: String::new() },
+        cursor: Cursor::default(), style: ReaderStyle::default(), ctx: egui::Context::default() };
+    let target = Index::default().resolve(&job, &|| true).unwrap();
+    assert_eq!(target.block, at);
+    let ready = render(&job, target.clone(), &|| true).unwrap();
+    assert!(ready.captions.is_empty());
+    assert!(ready.image.pixels.iter().any(|p| p.r() < 100));
+    assert!(ready.image.pixels.len() * 4 <= PIXEL_BUDGET);
+    assert_eq!(source.resources.load(Ordering::Relaxed), 0);
+    job.destination.as_mut().unwrap().1 = "missing-source".into();
+    assert!(Index::default().resolve(&job, &|| true).is_err());
+    assert!(render(&job, target, &|| true).is_err());
+}

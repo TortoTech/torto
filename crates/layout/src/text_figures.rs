@@ -2,6 +2,14 @@
 use super::*;
 use rebook_publication::FigureBlock;
 
+fn contains_table(block: &Block) -> bool {
+    match block {
+        Block::Table(_) => true,
+        Block::Figure(figure) => figure.body.iter().any(contains_table),
+        _ => false,
+    }
+}
+
 fn caption(block: &Block) -> bool {
     matches!(block, Block::Text(t) if matches!(t.kind,
         TextBlockKind::Caption | TextBlockKind::QuoteAttribution))
@@ -79,7 +87,8 @@ impl LayoutEngine {
         style.minimum_content_width = 0.0;
         style.top_margin = 0.0;
         style.bottom_margin = 0.0;
-        style.foreground = Rgba::BLACK;
+        let paint_background = !figure.body.iter().any(contains_table);
+        if paint_background { style.foreground = Rgba::BLACK; }
         // Diagram paragraphs use container padding, not the running prose's
         // automatic first-line indent (which also displaces centered lines).
         style.typesetting.paragraph_indent_mode = ParagraphIndentMode::Custom;
@@ -151,6 +160,7 @@ impl LayoutEngine {
             paginator
                 .items
                 .push(PageItem::FigureBody(FigureBodyPlacement {
+                    paint_background,
                     x,
                     y,
                     width,
@@ -274,6 +284,7 @@ mod tests {
             let panel = page.items.iter().find_map(|item| match item {
                 PageItem::FigureBody(panel) => Some(panel), _ => None,
             }).unwrap();
+            assert!(!panel.paint_background, "white background belongs to the grid only");
             let table = page.items.iter().find_map(|item| match item {
                 PageItem::Table(table) => Some(table), _ => None,
             }).unwrap();
