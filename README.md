@@ -143,6 +143,17 @@ cargo test --workspace
 
 The core reading path is `parser → Reading IR → layout → renderer`. See the [native rendering architecture decision](docs/adr-0001-native-epub-renderer.md), [AI layout batching](docs/ai-layout-batching.md), [AI layout and translation scheduling](docs/ai-layout-scheduling.md), [WebDAV sync protocol](docs/webdav-sync-v1.md), and [known upstream issues](docs/known-upstream-issues.md) for details.
 
+### Brand assets
+
+`assets/logo.svg` is the shared vector master. Regenerate the master PNG,
+Windows installer artwork, and Windows / macOS icons after editing it:
+
+```powershell
+cargo run --locked -p rebook-desktop --example generate_branding
+cargo run --locked -p rebook-desktop --example generate_windows_icons
+cargo run --locked -p rebook-desktop --example generate_macos_icons
+```
+
 ### macOS credentials and release signing
 
 Unit tests use an in-memory credential store for WebDAV, AI, OCR and search keys;

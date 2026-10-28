@@ -183,11 +183,12 @@ macOS 安装包工作流已预留三个仓库 Secret：
 
 ### 开发工具
 
-重新生成 Windows / macOS 多尺寸图标：
+品牌母版为 `assets/logo.svg`。重新生成主 PNG、Windows 安装向导图片及 Windows / macOS 多尺寸图标：
 
 ```powershell
-cargo run -p rebook-desktop --example generate_windows_icons
-cargo run -p rebook-desktop --example generate_macos_icons
+cargo run --locked -p rebook-desktop --example generate_branding
+cargo run --locked -p rebook-desktop --example generate_windows_icons
+cargo run --locked -p rebook-desktop --example generate_macos_icons
 ```
 
 核心架构采用 `parser → Reading IR → layout → renderer`，正文由 Parley、Vello 和 wgpu 完成原生排版与渲染。

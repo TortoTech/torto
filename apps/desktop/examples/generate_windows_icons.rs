@@ -1,9 +1,10 @@
+mod branding;
+
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 use image::codecs::png::PngEncoder;
-use image::imageops::FilterType;
 use image::{ColorType, ImageEncoder};
 
 const ICON_SIZES: [u32; 9] = [16, 20, 24, 32, 40, 48, 64, 128, 256];
@@ -15,21 +16,16 @@ const STORE_ASSETS: [(&str, u32); 3] = [
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let source_path = root.join("assets/logo.png");
     let output_dir = root.join("assets/windows");
     let store_output_dir = output_dir.join("store");
     fs::create_dir_all(&output_dir)?;
     fs::create_dir_all(&store_output_dir)?;
 
-    let source = image::open(&source_path)?.into_rgba8();
-    let (width, height) = source.dimensions();
-    if width != height {
-        return Err(format!("logo must be square, got {width}x{height}").into());
-    }
+    let source = branding::Source::load(&root)?;
 
     let mut frames = Vec::with_capacity(ICON_SIZES.len());
     for size in ICON_SIZES {
-        let resized = image::imageops::resize(&source, size, size, FilterType::Lanczos3);
+        let resized = source.render(size)?;
         let mut png = Vec::new();
         PngEncoder::new(&mut png).write_image(
             resized.as_raw(),
@@ -42,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for (name, size) in STORE_ASSETS {
-        let resized = image::imageops::resize(&source, size, size, FilterType::Lanczos3);
+        let resized = source.render(size)?;
         let mut png = Vec::new();
         PngEncoder::new(&mut png).write_image(
             resized.as_raw(),
@@ -55,10 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     write_ico(&output_dir.join("torto.ico"), &frames)?;
     println!(
-        "generated {} Windows icon sizes from {}x{} source",
-        frames.len(),
-        width,
-        height
+        "generated {} Windows icon sizes from assets/logo.svg",
+        frames.len()
     );
     Ok(())
 }
