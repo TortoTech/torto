@@ -10,6 +10,20 @@ fn contains_table(block: &Block) -> bool {
     }
 }
 
+// A continued grid owns the page edge. Repeating the figure's padding here
+// creates a visible seam when paginated slices are stitched for scrolling.
+fn slice_padding(page: &PageLayout, padding: f32) -> (f32, f32) {
+    let mut content = page.items.iter().filter(|item| !matches!(item, PageItem::FigureBody(_)));
+    let top = if matches!(content.next(), Some(PageItem::Table(table)) if table.continued_before) {
+        0.0
+    } else { padding };
+    let bottom = if matches!(page.items.iter().rev().find(|item| !matches!(item, PageItem::FigureBody(_))),
+        Some(PageItem::Table(table)) if table.continued_after) {
+        0.0
+    } else { padding };
+    (top, bottom)
+}
+
 fn caption(block: &Block) -> bool {
     matches!(block, Block::Text(t) if matches!(t.kind,
         TextBlockKind::Caption | TextBlockKind::QuoteAttribution))
@@ -130,7 +144,10 @@ impl LayoutEngine {
             .collect();
         let first_height = pages
             .first()
-            .map_or(0.0, |page| page_bottom(page) + padding * 2.0);
+            .map_or(0.0, |page| {
+                let (top, bottom) = slice_padding(page, padding);
+                page_bottom(page) + top + bottom
+            });
         paginator.prepare_group(
             before_height + first_height + if pages.len() == 1 { after_height } else { 0.0 },
             outer_gap,
@@ -146,7 +163,8 @@ impl LayoutEngine {
             if index > 0 {
                 paginator.force_page();
             }
-            let height = page_bottom(&page) + padding * 2.0;
+            let (top_padding, bottom_padding) = slice_padding(&page, padding);
+            let height = page_bottom(&page) + top_padding + bottom_padding;
             paginator.keep_together_if_fits(
                 height
                     + if index + 1 == page_count {
@@ -168,7 +186,7 @@ impl LayoutEngine {
                     sources: body_sources(&page),
                 }));
             for item in &mut page.items {
-                translate(item, x + padding, y + padding);
+                translate(item, x + padding, y + top_padding);
             }
             paginator.items.extend(page.items);
             paginator.cursor_y = y + height;
@@ -399,6 +417,51 @@ mod tests {
                 .flat_map(|p| &p.items)
                 .any(|i| matches!(i, PageItem::FigureBody(_)))
         );
+    }
+
+    #[test]
+    fn table_figure_continuations_do_not_repeat_panel_padding_between_rows() {
+        let rows = (0..15).map(|row| TableRow {
+            cells: (0..9).map(|column| {
+                let Block::Text(text) = text(&format!("Cell {row}:{column}"), TextAlignment::Center,
+                    TextBlockKind::Paragraph) else { unreachable!() };
+                TableCell { text, column_span: 1, row_span: 1, header: row == 0,
+                    authored_alignment: None }
+            }).collect(),
+        }).collect();
+        let blocks = [figure(vec![
+            text("Figure 5.2 Complex table", TextAlignment::Center, TextBlockKind::Caption),
+            Block::Table(TableBlock { before: vec![], after: vec![], rows, source: None }),
+            text("Source: Example", TextAlignment::Start, TextBlockKind::QuoteAttribution),
+        ])];
+        let style = ReaderStyle { spread: SpreadMode::Single,
+            typesetting: ReaderTypesetting::unified(), ..Default::default() };
+        for (width, height) in [(700, 350), (1100, 500)] {
+            let layout = engine().layout_blocks(&source(), &blocks,
+                LayoutViewport::new(width, height).unwrap(), &style).unwrap();
+            let mut fragments = 0;
+            let mut cell_sources = Vec::new();
+            for page in &layout.pages {
+                let Some(panel) = page.items.iter().find_map(|item| if let PageItem::FigureBody(p) = item {Some(p)} else {None}) else {continue};
+                for item in &page.items {
+                    let PageItem::Table(table) = item else {continue};
+                    fragments += 1;
+                    if table.continued_before {
+                        assert!((table.y - panel.y).abs() < 0.1, "continuation has top padding: {}", table.y - panel.y);
+                    }
+                    if table.continued_after {
+                        assert!((panel.y + panel.height - table.y - table.height).abs() < 0.1,
+                            "continuation has bottom padding: {}", panel.y + panel.height - table.y - table.height);
+                    }
+                    cell_sources.extend(table.cells.iter().filter_map(|c| c.text.as_ref()?.source.as_ref().map(|s| s.start.node.clone())));
+                }
+            }
+            assert!(fragments > 1);
+            assert_eq!(cell_sources.len(), 15 * 9);
+            cell_sources.sort();
+            cell_sources.dedup();
+            assert_eq!(cell_sources.len(), 15 * 9, "each source cell is retained once");
+        }
     }
 
     #[test]

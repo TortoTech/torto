@@ -1126,3 +1126,58 @@ fn direct_unnumbered_table_resolves_and_renders_without_caption_or_image_guessin
     assert!(Index::default().resolve(&job, &|| true).is_err());
     assert!(render(&job, target, &|| true).is_err());
 }
+
+#[test]
+#[ignore = "requires TORTO_MEDIA_BOOK pointing to BOOKS without barriers"]
+fn local_book_complex_table_has_no_gap_between_continuations() {
+    let publication = rebook_formats::open_file(std::env::var("TORTO_MEDIA_BOOK").unwrap()).unwrap();
+    let source = publication.source();
+    let key = media_references::references("Figure 5.2")[0].key.clone();
+    let (section, target) = (0..source.book().sections.len()).find_map(|index| {
+        let section = source.parse_section(index).unwrap();
+        targets(&section, index).into_iter().find(|t| t.key == key).map(|t| (section, t))
+    }).unwrap();
+    let block = &section.blocks[target.block];
+    let mut expected: Vec<_> = block.text_blocks().filter(|t| !plain(t).is_empty()).filter_map(|t| t.source.clone()).collect();
+    expected.sort_by_key(|s| s.start.node.clone());
+    let mut continued_cases = 0;
+    for mode in [rebook_layout::TypesettingMode::Unified, rebook_layout::TypesettingMode::Book] {
+        for (width, height) in [(900, 500), (1200, 800), (1500, 900)] {
+            let mut style = ReaderStyle::default();
+            style.typesetting.mode = mode;
+            style.spread = SpreadMode::Single;
+            let layout = LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned())
+                .layout_blocks(source.as_ref(), std::slice::from_ref(block),
+                    LayoutViewport::new(width, height).unwrap(), &style).unwrap();
+            let mut chunks = Vec::new();
+            let mut actual = Vec::new();
+            let pages = layout.pages.iter().enumerate().map(|(index, page)| {
+                for item in &page.items {
+                    if let rebook_layout::PageItem::Table(table) = item {
+                        let left = table.cells.iter().map(|c| c.x).reduce(f32::min).unwrap();
+                        chunks.push((index, table.y, table.y + table.height, left,
+                            table.continued_before, table.continued_after));
+                    }
+                }
+                let display = rebook_renderer::DisplayListCompiler.compile(page);
+                actual.extend(display.geometry_sources().cloned());
+                super::super::ReaderSectionPage { position: rebook_reader::ReaderPosition {
+                    section_index: target.section, segment_index: 0, page_index: index },
+                    page: Arc::new(display), placeholder: false, visible_top: None, visible_bottom: None }
+            }).collect();
+            let scroll = super::super::ScrollSectionLayout::new(target.section, 0, pages, false);
+            for pair in chunks.windows(2) {
+                if !pair[0].5 || !pair[1].4 { continue; }
+                let bottom = scroll.content_y(pair[0].0, pair[0].2);
+                let top = scroll.content_y(pair[1].0, pair[1].1);
+                assert!((top - bottom).abs() < 0.1, "{mode:?}, {width}x{height}: continuation gap {}", top-bottom);
+                assert!((pair[0].3 - pair[1].3).abs() < 0.1);
+            }
+            assert!(!chunks.is_empty());
+            continued_cases += usize::from(chunks.len() > 1);
+            for range in &expected { assert!(actual.contains(range), "lost source {}", range.start.node); }
+            println!("{mode:?}, {width}x{height}: {} connected table slices", chunks.len());
+        }
+    }
+    assert!(continued_cases >= 2, "exercise actual page boundaries in both modes");
+}
