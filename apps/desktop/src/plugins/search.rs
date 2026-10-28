@@ -656,3 +656,6 @@ mod tests {
         assert_eq!(&preview[matched], "keyword");
     }
 }
+
+#[cfg(test)]
+mod library_regressions;

@@ -3,6 +3,9 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 const KEYS: &[(&str, &str)] = &[
+    ("classify_code_or_quote", "cqk"),
+    ("presentation", "pr"),
+    ("language", "lg"),
     ("groups", "g"),
     ("paragraph_groups", "pg"),
     ("citations", "c"),
@@ -66,6 +69,9 @@ const KEYS: &[(&str, &str)] = &[
 ];
 
 const ENUMS: &[(&str, &str)] = &[
+    ("code_or_quote", "cqk"),
+    ("authored_quote", "aq"),
+    ("authored_preformatted", "ap"),
     ("quote", "q"),
     ("quote_before", "qb"),
     ("quote_inline", "qi"),

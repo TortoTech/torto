@@ -389,6 +389,15 @@ struct PreparedSection {
     segments: Vec<LayoutSegment>,
     anchor_segments: HashMap<String, usize>,
     reading_units: Vec<ReadingUnit>,
+    source_fragments: HashMap<String, Vec<(Range<u64>, usize)>>,
+}
+
+impl PreparedSection {
+    fn fragment_for_source(&self, anchor: &SourceAnchor) -> Option<usize> {
+        self.source_fragments.get(&anchor.node)?.iter().find_map(|(range, fragment)|
+            (range.contains(&anchor.text_offset)
+                || (range.is_empty() && anchor.text_offset == range.start)).then_some(*fragment))
+    }
 }
 
 struct ContentFragment {
@@ -3494,17 +3503,11 @@ impl ReaderSession {
             self.current_reading_unit = 0;
             return;
         };
-        self.current_reading_unit = section
-            .reading_units
-            .iter()
-            .position(|unit| {
-                section.fragments[unit.fragment_range.clone()]
-                    .iter()
-                    .flat_map(|fragment| &fragment.blocks)
-                    .filter_map(block_source)
-                    .any(|range| source_range_contains(range, anchor))
-            })
-            .unwrap_or(0);
+        if let Some(fragment) = section.fragment_for_source(anchor)
+            && let Some(unit) = section.reading_units.iter()
+                .position(|unit| unit.fragment_range.contains(&fragment)) {
+            self.current_reading_unit = unit;
+        }
     }
 
     fn position_for_source_anchor(
@@ -3519,15 +3522,8 @@ impl ReaderSession {
             .position(|section| section.id == anchor.spine)
             .ok_or_else(|| ReaderError::NavigationTargetNotFound(anchor.node.clone()))?;
         let section = self.repository.load(section_index)?;
-        let fragment_index = section
-            .fragments
-            .iter()
-            .position(|fragment| {
-                fragment.blocks.iter().any(|block| {
-                    block_source(block).is_some_and(|range| source_range_contains(range, anchor))
-                })
-            })
-            .unwrap_or(0);
+        let fragment_index = section.fragment_for_source(anchor)
+            .ok_or_else(|| ReaderError::NavigationTargetNotFound(anchor.node.clone()))?;
         let segment_index = section
             .segments
             .iter()
@@ -3598,24 +3594,9 @@ impl ReaderSession {
             .reading_units
             .get(unit_index)
             .ok_or(ReaderError::SectionOutOfBounds(section_index))?;
-        let segment_index = unit
-            .start
-            .as_ref()
-            .and_then(|anchor| {
-                section.fragments.iter().position(|fragment| {
-                    fragment.blocks.iter().any(|block| {
-                        block_source(block)
-                            .is_some_and(|range| source_range_contains(range, anchor))
-                    })
-                })
-            })
-            .and_then(|fragment_index| {
-                section
-                    .segments
-                    .iter()
-                    .position(|segment| segment.fragment_range.contains(&fragment_index))
-            })
-            .unwrap_or(0);
+        let segment_index = section.segments.iter()
+            .position(|segment| segment.fragment_range.contains(&unit.fragment_range.start))
+            .ok_or(ReaderError::SegmentOutOfBounds { section: section_index, segment: unit_index })?;
         Ok(SegmentKey {
             section_index,
             segment_index,
@@ -4279,8 +4260,25 @@ fn prepare_section(
         fragments.len(),
     );
 
+    // Build once on the section worker. Navigation then looks up the exact
+    // child node without walking whole figures/tables on every search click.
+    let mut source_fragments: HashMap<String, Vec<(Range<u64>, usize)>> = HashMap::new();
+    for (index, fragment) in fragments.iter().enumerate() {
+        let mut ranges = Vec::new();
+        for block in &fragment.blocks { append_block_geometry_sources(block, &mut ranges); }
+        for range in ranges {
+            let end = if range.start.node == range.end.node { range.end.text_offset }
+                else { range.start.text_offset.saturating_add(1) };
+            let entry = (range.start.text_offset..end, index);
+            let entries = source_fragments.entry(range.start.node).or_default();
+            if !entries.contains(&entry) { entries.push(entry); }
+        }
+    }
+    let index_bytes = source_fragments.capacity() * std::mem::size_of::<(String, Vec<(Range<u64>, usize)>)>()
+        + source_fragments.iter().map(|(node, entries)| node.capacity()
+            + entries.capacity() * std::mem::size_of::<(Range<u64>, usize)>()).sum::<usize>();
     PreparedSection {
-        estimated_bytes: section_text.saturating_mul(4)
+        estimated_bytes: index_bytes + section_text.saturating_mul(4)
             + fragments
                 .iter()
                 .map(|fragment| fragment.blocks.len() * std::mem::size_of::<Block>())
@@ -4291,6 +4289,7 @@ fn prepare_section(
         segments,
         anchor_segments,
         reading_units,
+        source_fragments,
     }
 }
 
@@ -4415,11 +4414,7 @@ fn fragment_section_blocks(
         // layout can compose it and focus reading cannot leave the ordinal behind.
         let starts_layout_segment = !current.is_empty()
             && pieces.iter().any(|piece| {
-                block_source(piece).is_some_and(|range| {
-                    boundary_sources
-                        .iter()
-                        .any(|anchor| source_range_contains(range, anchor))
-                })
+                boundary_sources.iter().any(|anchor| block_contains_source_anchor(piece, anchor))
             });
         let text_len = pieces.iter().map(block_text_len).sum::<usize>();
         if starts_layout_segment
@@ -4481,8 +4476,7 @@ fn resolve_fragment_anchors(
             .iter()
             .position(|fragment| {
                 fragment.blocks.iter().any(|block| {
-                    block_source(block)
-                        .is_some_and(|range| source_range_contains(range, &anchor.source))
+                    block_contains_source_anchor(block, &anchor.source)
                 })
             })
             .unwrap_or(0);
@@ -4846,10 +4840,7 @@ fn append_block_geometry_sources(block: &Block, ranges: &mut Vec<SourceRange>) {
                     .iter()
                     .filter_map(|image| image.source.clone()),
             );
-            ranges.extend(
-                figure.text_blocks()
-                    .filter_map(|caption| caption.source.clone()),
-            );
+            ranges.extend(figure.captions.iter().filter_map(|caption| caption.source.clone()));
         }
         Block::Note(note) => {
             for child in &note.blocks {
@@ -4869,6 +4860,26 @@ fn block_source(block: &Block) -> Option<&SourceRange> {
         Block::Figure(block) => block.source.as_ref(),
         Block::Note(block) => block.source.as_ref(),
         Block::Separator(_) | Block::LineBreak | Block::PageBreak => None,
+    }
+}
+
+// A composite's outer range only records its first and last node. Search,
+// saved locations and reading units must also resolve each retained child.
+fn block_contains_source_anchor(block: &Block, anchor: &SourceAnchor) -> bool {
+    if block_source(block).is_some_and(|range| source_range_contains(range, anchor)) {
+        return true;
+    }
+    let text_contains = |text: &TextBlock| text.source.as_ref()
+        .is_some_and(|range| source_range_contains(range, anchor));
+    match block {
+        Block::Quote(quote) => quote.body.iter().chain(quote.attribution.iter()).any(text_contains),
+        Block::Table(table) => table.text_blocks().any(text_contains),
+        Block::Figure(figure) => figure.body.iter().any(|child| block_contains_source_anchor(child, anchor))
+            || figure.images.iter().any(|image| image.source.as_ref()
+                .is_some_and(|range| source_range_contains(range, anchor)))
+            || figure.captions.iter().any(text_contains),
+        Block::Note(note) => note.blocks.iter().any(|child| block_contains_source_anchor(child, anchor)),
+        _ => false,
     }
 }
 
@@ -6921,6 +6932,58 @@ mod tests {
         reader.go_to_source(&anchor).unwrap();
         assert!(reader.location().page_index > 0);
         assert!(reader.current_page().contains_source_anchor(&anchor));
+    }
+
+    #[test]
+    fn nested_sources_navigate_to_their_segment_page_and_reading_unit() {
+        use rebook_publication::{CaptionPosition, FigureBlock, QuoteBlock, TableBlock, TableCell, TableRow};
+        let mut source = CountingSource::new(&["Introduction. ".repeat(3200)]);
+        let section = &mut Arc::get_mut(&mut source).unwrap().sections[0];
+        let text = |node: &str, value: &str, kind| TextBlock {
+            kind, style: BlockStyle::default(),
+            content: vec![Inline::Text(TextRun { text: value.into(), style: TextStyle::default(), link: None })],
+            source: Some(SourceRange {
+                start: SourceAnchor { spine: section.id.clone(), node: node.into(), text_offset: 0 },
+                end: SourceAnchor { spine: section.id.clone(), node: node.into(), text_offset: value.chars().count() as u64 },
+            }),
+        };
+        let caption = text("caption", "Source: a photograph.", TextBlockKind::Caption);
+        let alt = text("alt", "Alt text: a mural.", TextBlockKind::Caption);
+        let cell = text("cell", "Value: 42", TextBlockKind::Paragraph);
+        let quote = text("quote", "Quoted text: retained.", TextBlockKind::Blockquote);
+        let targets = [&caption, &alt, &cell, &quote].map(|t| {
+            let mut a = t.source.as_ref().unwrap().start.clone(); a.text_offset = 6; a
+        });
+        let heading = text("heading", "Figures and sources", TextBlockKind::Heading(1));
+        let outer = Some(SourceRange { start: caption.source.as_ref().unwrap().start.clone(), end: alt.source.as_ref().unwrap().end.clone() });
+        section.anchors.push(SectionAnchor { fragment: "details".into(), source: heading.source.as_ref().unwrap().start.clone(), page_label: None });
+        section.blocks.extend([
+            Block::Text(heading),
+            Block::Figure(FigureBlock { body: vec![], images: vec![], captions: vec![caption, alt], caption_position: CaptionPosition::After, style: BlockStyle::default(), source: outer }),
+            Block::Table(TableBlock { before: vec![], after: vec![], rows: vec![TableRow { cells: vec![TableCell { text: cell, authored_alignment: None, column_span: 1, row_span: 1, header: false }] }], source: None }),
+            Block::Quote(QuoteBlock { body: vec![quote], attribution: None, source: None }),
+        ]);
+        let data = Arc::get_mut(&mut source).unwrap();
+        data.book.table_of_contents = vec![
+            TocEntry { label: "Intro".into(), href: Some(data.book.sections[0].href.clone()), children: vec![] },
+            TocEntry { label: "Details".into(), href: Some(data.book.sections[0].href.resolve("#details").unwrap()), children: vec![] },
+        ];
+        let mut reader = ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        for anchor in targets {
+            reader.go_to_source(&anchor).unwrap();
+            assert!(reader.location().segment_index > 0, "{}", anchor.node);
+            assert!(reader.current_page().contains_source_anchor(&anchor), "{}", anchor.node);
+            let prepared = reader.repository.load(0).unwrap();
+            assert!(prepared.reading_units[reader.current_reading_unit].fragment_range.clone().any(|i|
+                prepared.fragments[i].blocks.iter().any(|b| block_contains_source_anchor(b, &anchor))));
+            let locator = reader.current_locator();
+            reader.go_to_section(0).unwrap();
+            reader.restore_locator(&locator).unwrap();
+            assert!(reader.location().segment_index > 0);
+        }
+        let before = reader.location();
+        assert!(reader.go_to_source(&SourceAnchor { spine: SpineItemId::new("section-0").unwrap(), node: "missing".into(), text_offset: 0 }).is_err());
+        assert_eq!(reader.location(), before);
     }
 
     #[test]
@@ -9315,6 +9378,7 @@ mod tests {
             segments: Vec::new(),
             anchor_segments: HashMap::new(),
             reading_units: Vec::new(),
+            source_fragments: HashMap::new(),
         });
         let old = SegmentKey {
             section_index: 1,

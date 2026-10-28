@@ -5,6 +5,7 @@ use rebook_publication::FigureBlock;
 fn has_independent_presentation(block: &Block) -> bool {
     match block {
         Block::Table(_) | Block::Quote(_) => true,
+        Block::Text(text) if text.kind == TextBlockKind::Preformatted => true,
         Block::Figure(figure) => figure.body.iter().any(has_independent_presentation),
         _ => false,
     }

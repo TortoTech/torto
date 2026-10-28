@@ -24,6 +24,7 @@ pub(crate) fn block_ranges(block: &Block) -> Vec<SourceRange> {
 
 fn annotation_blocks(section: &Section, annotation: &Annotation) -> Vec<usize> {
     let ranges = match annotation {
+        Annotation::CodeOrQuote { source, captions, credit, .. } => std::iter::once(source).chain(captions.iter()).chain(credit.iter()).collect(),
         Annotation::InlineCitations { source, .. }
         | Annotation::TextFormulas { source, .. }
         | Annotation::SectionHeading { source } => {
@@ -167,6 +168,7 @@ pub(crate) fn needs_recognition(section: &Section, target: Range<usize>) -> bool
         if !text_formulas::input(block).is_empty()
             || paragraph(block).is_some()
             || unattributed_quote_body(block).is_some()
+            || code_blocks::body(block).is_some()
             || headings::candidate(block).is_some()
         {
             return true;

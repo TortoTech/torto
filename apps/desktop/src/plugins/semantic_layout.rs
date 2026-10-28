@@ -34,6 +34,7 @@ pub(crate) use log::local_translation_event;
 pub(crate) use log::translation_event;
 pub(crate) use log::{event as diagnostic_event, with_job};
 mod quote_sources;
+mod code_blocks;
 
 // This is the on-disk data format, not an application release or prompt revision.
 const CACHE_FORMAT_VERSION: u32 = 1;
@@ -79,6 +80,15 @@ impl Default for RecognitionRoles {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Proposal {
+    CodeOrQuote {
+        block: usize,
+        presentation: code_blocks::Presentation,
+        language: Option<String>,
+        #[serde(default)]
+        captions: Vec<usize>,
+        #[serde(default)]
+        body_index: Option<usize>,
+    },
     QuoteBefore {
         body: Vec<usize>,
         attribution: usize,
@@ -121,6 +131,13 @@ struct Response {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum Annotation {
+    CodeOrQuote {
+        source: SourceRange,
+        presentation: code_blocks::Presentation,
+        language: Option<String>,
+        captions: Vec<SourceRange>,
+        credit: Option<SourceRange>,
+    },
     ImageTable { href: PublicationUrl, table: rebook_publication::TableBlock },
     ImageText {
         href: PublicationUrl,
@@ -774,7 +791,12 @@ fn image_needs_caption(section: &Section, index: usize) -> bool {
 }
 
 fn section_input_block(section: &Section, index: usize) -> Value {
-    if let Some(body) = unattributed_quote_body(&section.blocks[index]) {
+    if let Some(input) = code_blocks::input(index, &section.blocks[index]) {
+        input
+    } else if matches!(&section.blocks[index], Block::Text(t) if matches!(t.kind, TextBlockKind::Caption | TextBlockKind::QuoteAttribution) && t.source.is_some()) {
+        let Block::Text(text) = &section.blocks[index] else { unreachable!() };
+        json!({"id":index,"type":"attribution_candidate","text":text_block_text(text)})
+    } else if let Some(body) = unattributed_quote_body(&section.blocks[index]) {
         json!({"id":index,"type":"quote_missing_attribution","body":body.iter().enumerate().map(|(i,text)|
             json!({"index":i,"text":text_block_text(text),"attribution_eligible":i>0 && i+1==body.len() && text.source.is_some()})).collect::<Vec<_>>()})
     } else if matches!(section.blocks[index],Block::Text(ref text) if text.kind==TextBlockKind::QuoteAttribution)
@@ -809,6 +831,7 @@ fn window_roles(
             && target.clone().any(|i| {
                 paragraph(&section.blocks[i]).is_some()
                     || unattributed_quote_body(&section.blocks[i]).is_some()
+                    || code_blocks::body(&section.blocks[i]).is_some()
             }),
         captions: roles.captions && context.clone().any(|i| image_needs_caption(section, i)),
     }
@@ -841,6 +864,10 @@ fn window_prompt(
             out.push_str(part);
         }
     }
+    if roles.quotes && target.clone().any(|i| code_blocks::body(&section.blocks[i]).is_some()) {
+        out.push_str("\n");
+        out.push_str(code_blocks::PROMPT);
+    }
     out
 }
 
@@ -850,6 +877,7 @@ fn request_contract_fingerprint() -> &'static str {
             &serde_json::to_vec(&json!([
                 "compact-wire-v1",
                 PROMPT,
+                code_blocks::PROMPT,
                 citations::PROMPT,
                 formulas::CHAPTER_PROMPT,
                 formulas::TRANSCRIBE_PROMPT,
@@ -933,7 +961,7 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
             .remove("attribution");
         inline["properties"]["credit"] = json!({"type":"string","description":"Exact nonempty suffix of the last body paragraph, including its credit delimiter (dash, opening parenthesis or line break). Copy the explicitly written author/work credit; never invent it."});
         inline["required"] = json!(["kind", "body", "credit", "alignment"]);
-        items.extend([quote, before, inline, attribution]);
+        items.extend([quote, before, inline, attribution, code_blocks::schema()]);
     }
     if roles.captions {
         items.push(figure);
@@ -1070,6 +1098,13 @@ fn load_recognition_inner(section: &Section, identity: &Value, hash: &str, curre
                 | Annotation::ImageFormula { .. }
                 | Annotation::UnreadableFormula { .. } => {
                     unreachable!()
+                }
+                Annotation::CodeOrQuote { source, presentation, language, captions, credit } => {
+                    let block = section.blocks.iter().position(|b| code_blocks::anchor(b) == Some(source))?;
+                    Proposal::CodeOrQuote { block, presentation: *presentation, language: language.clone(),
+                        captions: captions.iter().map(locate).collect::<Option<Vec<_>>>()?,
+                        body_index: match credit { Some(range) => Some(code_blocks::body(&section.blocks[block])?.iter().position(|t| t.source.as_ref() == Some(range))?), None => None },
+                    }
                 }
                 Annotation::QuoteBefore {
                     body,
@@ -1393,6 +1428,8 @@ async fn recognize_inner(
                 }
                 groups
             };
+            let mut window = window;
+            code_blocks::protect(&mut window, &citation_candidates);
             skipped_groups += window.skipped_groups;
             validate_window(&window.groups, section, config, start..end, lo..hi)?;
             annotations.extend(citations::window_annotations(
@@ -1460,7 +1497,13 @@ fn unified_window_input(
         .map(|index| {
             let mut block = section_input_block(section, index);
             if target.contains(&index) {
-                text_formulas::attach_input(&mut block, &section.blocks[index]);
+                if code_blocks::body(&section.blocks[index]).is_some() {
+                    // Code classification needs the authored literal lines, not
+                    // escaped formula markup in place of its body text.
+                    block["math_texts"] = json!(text_formulas::input(&section.blocks[index]));
+                } else {
+                    text_formulas::attach_input(&mut block, &section.blocks[index]);
+                }
             }
             if headings::candidate(&section.blocks[index]).is_some()
                 && let Some(text) = paragraph(&section.blocks[index])
@@ -1498,6 +1541,7 @@ fn unified_window_input(
         "quotes_enabled":config.quotes,"captions_enabled":config.captions,"headings_enabled":config.headings,
         "blocks":blocks,
         "targets":{"classify_headings":target.clone().filter(|i|headings::candidate(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),"classify_blocks":target.clone().filter(|i|paragraph(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
+            "classify_code_or_quote":target.clone().filter(|i|code_blocks::body(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
             "complete_quote_sources":target.clone().filter(|i|unattributed_quote_body(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
             "classify_citations":candidates.iter().map(|c|&c.id).collect::<Vec<_>>()}});
     if !paragraph_groups.is_empty() {
@@ -1696,6 +1740,7 @@ fn retain_valid_groups(
 
 fn proposal_ids(group: &Proposal) -> Vec<usize> {
     let mut ids = match group {
+        Proposal::CodeOrQuote { block, captions, .. } => std::iter::once(*block).chain(captions.iter().copied()).collect(),
         Proposal::QuoteBefore {
             body, attribution, ..
         } => body.iter().copied().chain([*attribution]).collect(),
@@ -1754,6 +1799,8 @@ fn validate_window(
                 .all(|id| paragraph(&section.blocks[*id]).is_some())
         };
         let valid = match group {
+            Proposal::CodeOrQuote { block, presentation, language, captions, body_index } =>
+                config.quotes && code_blocks::valid(section, *block, *presentation, language.as_deref(), captions, *body_index),
             Proposal::QuoteBefore {
                 body, attribution, ..
             } => {
@@ -1858,6 +1905,11 @@ fn annotation(group: &Proposal, section: &Section) -> Annotation {
             .clone()
     };
     match group {
+        Proposal::CodeOrQuote { block, presentation, language, captions, body_index } => Annotation::CodeOrQuote {
+            source: code_blocks::anchor(&section.blocks[*block]).expect("validated authored block").clone(),
+            presentation: *presentation, language: language.clone(), captions: captions.iter().map(range).collect(),
+            credit: body_index.map(|i| code_blocks::body(&section.blocks[*block]).unwrap()[i].source.clone().unwrap()),
+        },
         Proposal::QuoteBefore {
             body,
             attribution,
@@ -1926,6 +1978,10 @@ fn annotation(group: &Proposal, section: &Section) -> Annotation {
 // Resolve against source ranges, never translated block indices. Bilingual
 // companion paragraphs have no source and stay attached to their original.
 fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
+    if let Annotation::CodeOrQuote { source, presentation, language, captions, credit } = annotation {
+        code_blocks::compose(blocks, source, *presentation, language.as_deref(), captions, credit.as_ref());
+        return;
+    }
     if let Annotation::ImageTable { href, table } = annotation {
         image_tables::compose(blocks, href, table);
         return;
@@ -1981,7 +2037,8 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
                 images.iter().chain(captions).collect()
             }
         }
-        Annotation::QuoteAttribution { .. }
+        Annotation::CodeOrQuote { .. }
+        | Annotation::QuoteAttribution { .. }
         | Annotation::SectionHeading { .. }
         | Annotation::QuoteBefore { .. }
         | Annotation::QuoteInline { .. }
@@ -2068,7 +2125,8 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
             })
         }
         Annotation::Figure { before, .. } => compose_figure(selected, *before, spanning),
-        Annotation::QuoteAttribution { .. }
+        Annotation::CodeOrQuote { .. }
+        | Annotation::QuoteAttribution { .. }
         | Annotation::SectionHeading { .. }
         | Annotation::QuoteBefore { .. }
         | Annotation::QuoteInline { .. }

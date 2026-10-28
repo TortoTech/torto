@@ -80,6 +80,24 @@ fn hidden_footnote_definitions_remain_available_to_the_popup() {
 }
 
 #[test]
+fn offscreen_alternatives_are_filtered_without_losing_sources_or_visible_positioned_text() {
+    let body = "<style>.alternative{position:absolute;left:-9999em;width:1px;height:1px;overflow:hidden}.frame p{position:absolute;top:50%;left:50%;width:70%;transform:translate(-50%,-50%)}</style><div class='alternative' id='table-desc'><p>Screen reader table description.</p></div><div class='frame'><p>Visible text in decorative border.</p></div><p id='after'>After.</p>";
+    let hidden = parse(body);
+    let visible = parse(&body.replace("left:-9999em", "left:0"));
+    assert!(!text(&hidden.blocks).contains("Screen reader"));
+    assert!(text(&hidden.blocks).contains("Visible text in decorative border."));
+    assert_eq!(hidden.anchors.iter().find(|a| a.fragment == "after"),
+        visible.anchors.iter().find(|a| a.fragment == "after"));
+    let clipped = parse("<p style='position:absolute;width:1px;height:1px;clip:rect(0,0,0,0)'>Hidden</p><p style='position:absolute;width:1px;height:1px'>Visible tiny box</p><p style='position:relative;left:-2000px;width:1px'>Visible relative text</p>");
+    assert!(!text(&clipped.blocks).contains("Hidden"));
+    assert!(text(&clipped.blocks).contains("Visible tiny box"));
+    assert!(text(&clipped.blocks).contains("Visible relative text"));
+    let shifted = parse("<p style='position:absolute;left:-2000px;width:1px;height:1px;overflow:hidden;transform:translateX(2000px)'>Visible transformed text</p><p style='position:absolute;left:-2000px;width:1px'>Potentially overflowing text</p>");
+    assert!(text(&shifted.blocks).contains("Visible transformed text"));
+    assert!(text(&shifted.blocks).contains("Potentially overflowing text"));
+}
+
+#[test]
 fn hidden_inline_text_keeps_later_source_offsets_without_displaying_the_text() {
     let section = parse("<p>A<span hidden='hidden'>Hidden</span>B</p>");
     let visible = parse("<p>A<span>Hidden</span>B</p>");

@@ -17,6 +17,7 @@ use thiserror::Error;
 
 mod font_size;
 mod page_markers;
+mod offscreen;
 mod recognized_tables;
 pub use recognized_tables::{parse_recognized_table, validate_recognized_table};
 mod font_faces;
@@ -3721,6 +3722,7 @@ impl StyleSheet {
             || self.cascaded_properties(node).get("opacity").is_some_and(|value|
                 value.trim().trim_end_matches('%').parse::<f32>()
                     .is_ok_and(|opacity| opacity.is_finite() && opacity <= 0.0))
+            || offscreen::hidden(&self.cascaded_properties(node))
             || node.ancestors().skip(1).find(Node::is_element).is_some_and(|parent| self.visually_hidden(parent));
         self.visibility_cache.borrow_mut().insert(node.id(), hidden);
         hidden

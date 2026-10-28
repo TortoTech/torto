@@ -25,7 +25,7 @@ use image_dimensions::ImageDimensions;
 
 // Bump when source parsing, structural heuristics, or the stored model changes.
 // Release versions additionally isolate caches from older executables.
-const REVISION: u32 = 12;
+const REVISION: u32 = 13;
 const MAGIC: &[u8; 8] = b"TRDIR\x02\0\0";
 const HEADER_BYTES: usize = 84;
 const MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;

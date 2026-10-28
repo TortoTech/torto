@@ -56,11 +56,11 @@ fn validate(group: &Proposal, section: &Section) -> Result<(), String> {
 }
 
 #[test]
-fn only_quotes_missing_credit_are_offered_for_completion() {
+fn authored_quotes_are_classified_but_only_missing_credits_can_be_completed() {
     let mut original = fixture(false);
     assert_eq!(
         section_input_block(&original, 0)["type"],
-        "quote_missing_attribution"
+        "authored_quote"
     );
     validate(&proposal(false), &original).unwrap();
     assert!(
@@ -83,7 +83,7 @@ fn only_quotes_missing_credit_are_offered_for_completion() {
     quote.attribution = Some(credit);
     assert_eq!(
         section_input_block(&original, 0)["type"],
-        "protected_boundary"
+        "authored_quote"
     );
     assert!(validate(&proposal(false), &original).is_err());
 }
