@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn empty_page_marker_wrappers_do_not_add_lines_to_list_items_or_table_cells() {
+    let section = parse("<ol><li><p>First item.</p><div><span role='doc-pagebreak' id='page48' title='48'/></div></li><li><p>Second item.</p></li></ol><table><tr><td><p>Cell.</p><div><span epub:type='pagebreak' id='page49' title='49'/></div></td></tr></table>");
+    let first = section.blocks[0].text_blocks().next().unwrap();
+    assert!(!first.content.iter().any(|inline| matches!(inline, Inline::Break)), "{:?}", first.content);
+    assert_eq!(section.anchors.iter().find(|a| a.fragment == "page48").unwrap().source.text_offset, 11);
+    let Block::Table(table) = &section.blocks[2] else { panic!() };
+    assert!(!table.rows[0].cells[0].text.content.iter().any(|inline| matches!(inline, Inline::Break)));
+}
+
+#[test]
+fn marker_wrappers_are_transparent_but_authored_content_and_breaks_remain() {
+    let section = parse("<p>Before.</p><div style='margin:0;padding:0;width:0;height:0'><span><span role='doc-pagebreak' id='page2' title='2'/></span></div><p id='after'>After.</p>");
+    assert_eq!(section.blocks.len(), 2);
+    assert_eq!(section.anchors.iter().find(|a| a.fragment == "page2").unwrap().source,
+        section.anchors.iter().find(|a| a.fragment == "after").unwrap().source);
+    let list = parse("<ol><li><p>First paragraph.</p><div><span role='doc-pagebreak' id='p3' title='3'/></div><p>Second paragraph.</p><div><br/></div></li></ol>");
+    let text = list.blocks[0].text_blocks().next().unwrap();
+    assert_eq!(text.content.iter().filter(|inline| matches!(inline, Inline::Break)).count(), 3);
+    let visible = parse("<div><span role='doc-pagebreak'>42</span></div><p>Body.</p>");
+    assert!(visible.blocks.iter().flat_map(Block::text_blocks).any(|t| text_block_text(t).contains("42")));
+    let spaced = parse("<div style='height:24px'><span role='doc-pagebreak' title='4'/></div><p>Body.</p>");
+    assert!(spaced.blocks.iter().any(|block| matches!(block, Block::Separator(s) if s.kind == rebook_publication::SeparatorKind::AuthoredSpacing)));
+}
+
+#[test]
 fn printed_pages_are_semantic_locations_without_artificial_line_breaks() {
     let section = parse("<p id='start'>Before <span epub:type='pagebreak' role='doc-pagebreak' id='p42' title='42'/>after.</p><div role='doc-pagebreak' id='p43' aria-label='43'/><p id='next'>Next.</p>");
     assert_eq!(section.blocks.len(), 2);

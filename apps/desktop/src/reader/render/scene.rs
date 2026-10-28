@@ -21,6 +21,14 @@ const PAGE_SCENE_CACHE_BUDGET: usize = 32 * 1024 * 1024;
 const ANNOTATION_MARK_COLOR: Color = Color::from_rgba8(96, 165, 250, 72);
 const TEXT_SELECTION_COLOR: Color = Color::from_rgba8(68, 137, 103, 72);
 
+fn focus_list_group_color() -> Color {
+    if crate::ui::palette().dark {
+        Color::from_rgba8(180, 180, 180, 24)
+    } else {
+        Color::from_rgba8(90, 90, 90, 20)
+    }
+}
+
 fn focus_block_border_color() -> Color {
     let accent = crate::ui::palette().accent;
     Color::from_rgba8(accent.r(), accent.g(), accent.b(), accent.a())
@@ -328,7 +336,7 @@ impl DesktopReader {
         if let Some(selection) = &self.selection {
             paint(&selection.ranges, TEXT_SELECTION_COLOR, false, false);
         }
-        if self.focus_background_visible()
+        if self.focus_background_highlight()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
@@ -353,7 +361,20 @@ impl DesktopReader {
         content_padding: f32,
     ) -> Rect {
         let mut bounds: Option<Rect> = None;
-        if self.focus_background_visible()
+        if let Some((rect, color)) = self.focus_list_backdrop() {
+            let background = RoundedRect::from_rect(
+                Rect::new(
+                    f64::from(rect.left()),
+                    f64::from(rect.top() + content_padding - viewport.offset_y),
+                    f64::from(rect.right()),
+                    f64::from(rect.bottom() + content_padding - viewport.offset_y),
+                ),
+                7.0,
+            );
+            bounds = Some(background.bounding_box());
+            scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &background);
+        }
+        if self.focus_background_highlight()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
@@ -374,16 +395,12 @@ impl DesktopReader {
                 ),
                 7.0,
             );
-            let neutral = if crate::ui::palette().dark {
-                Color::from_rgba8(180, 180, 180, 24)
-            } else {
-                Color::from_rgba8(90, 90, 90, 20)
-            };
+            let neutral = focus_list_group_color();
             let rect = background.bounding_box();
             bounds = Some(bounds.map_or(rect, |previous| previous.union(rect)));
             scene.fill(Fill::NonZero, Affine::IDENTITY, neutral, None, &background);
         }
-        if self.focus_background_visible()
+        if self.focus_background_highlight()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
@@ -413,6 +430,29 @@ impl DesktopReader {
             scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &background);
         }
         bounds.unwrap_or(Rect::ZERO)
+    }
+
+    pub(super) fn focus_list_backdrop(&self) -> Option<(egui::Rect, Color)> {
+        if !self.is_focus_mode()
+            || self.focus_style != crate::preferences::FocusStyle::SurroundingDim
+        {
+            return None;
+        }
+        let group = self.focus_units.get(self.focus_unit_index)?.list_group.as_ref()?;
+        if !group.share_notes || !group.split {
+            return None;
+        }
+        // Reuse the highlight mode's oversized-list backdrop, rather than the
+        // active item's green tint. Preserve this backdrop when dimming ink.
+        let paper = self.reader.style().background;
+        let tint = focus_list_group_color().to_rgba8();
+        let mix = |paper: u8, tint_channel: u8| {
+            ((u32::from(paper) * (255 - u32::from(tint.a))
+                + u32::from(tint_channel) * u32::from(tint.a) + 127) / 255) as u8
+        };
+        Some((group.rect, Color::from_rgb8(
+            mix(paper.red, tint.r), mix(paper.green, tint.g), mix(paper.blue, tint.b),
+        )))
     }
 
     pub(super) fn paint_scroll_bridges(
@@ -579,7 +619,7 @@ impl DesktopReader {
             .is_focus_mode()
             .then(|| self.focus_units.get(self.focus_unit_index))
             .flatten();
-        let activation_visible = self.focus_background_visible()
+        let activation_visible = self.focus_background_highlight()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),
@@ -672,7 +712,7 @@ impl DesktopReader {
         } else if !self.is_focus_mode() {
             page.paint_all_footnote_icons(scene, focus_footnote_icon_color(), offset_x);
         }
-        if self.focus_background_visible()
+        if self.focus_background_highlight()
             && focus_unit_activation_visible(
                 self.selection.is_some(),
                 self.focus_selection_anchor.is_some(),

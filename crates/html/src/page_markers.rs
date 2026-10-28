@@ -9,6 +9,25 @@ pub(super) fn is_marker(node: Node<'_, '_>) -> bool {
         .any(|role| matches!(role, "pagebreak" | "doc-pagebreak"))
 }
 
+// Publishers wrap empty print locations in ordinary flow containers. The
+// wrapper must be transparent too, including when a list/table is collected
+// inline rather than through Parser::parse_node. Keep visiting its children so
+// the location survives without introducing a paragraph break.
+pub(super) fn is_empty_wrapper(node: Node<'_, '_>) -> bool {
+    node.is_element()
+        && matches!(node.tag_name().name(), "p" | "div" | "span")
+        && node.descendants().skip(1).any(is_marker)
+        && node.descendants().all(|child| {
+            if child.is_text() {
+                child.text().is_none_or(|text| text.trim().is_empty())
+            } else {
+                !child.is_element()
+                    || matches!(child.tag_name().name(), "p" | "div" | "span" | "a")
+                    || is_marker(child)
+            }
+        })
+}
+
 pub(super) fn label(node: Node<'_, '_>) -> String {
     attribute_local(node, "aria-label")
         .or_else(|| attribute_local(node, "title"))
