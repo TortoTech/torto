@@ -68,6 +68,8 @@ mod assistant;
 mod title_translations;
 #[cfg(test)]
 mod blank_lines_tests;
+#[cfg(test)]
+mod figure_continuation_tests;
 mod chat_autocomplete;
 mod chat_footnotes;
 mod chat_markdown;

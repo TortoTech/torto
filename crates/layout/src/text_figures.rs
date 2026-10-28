@@ -10,18 +10,37 @@ fn contains_table(block: &Block) -> bool {
     }
 }
 
-// A continued grid owns the page edge. Repeating the figure's padding here
-// creates a visible seam when paginated slices are stitched for scrolling.
-fn slice_padding(page: &PageLayout, padding: f32) -> (f32, f32) {
-    let mut content = page.items.iter().filter(|item| !matches!(item, PageItem::FigureBody(_)));
-    let top = if matches!(content.next(), Some(PageItem::Table(table)) if table.continued_before) {
-        0.0
-    } else { padding };
-    let bottom = if matches!(page.items.iter().rev().find(|item| !matches!(item, PageItem::FigureBody(_))),
-        Some(PageItem::Table(table)) if table.continued_after) {
-        0.0
-    } else { padding };
-    (top, bottom)
+// Decorations extend to a printed page edge, but are not content. Trim
+// continuation-only quote padding before nesting slices in another container.
+fn slice_bounds(page: &PageLayout) -> (f32, f32) {
+    let top = page.items.iter().filter_map(|item| match item {
+        PageItem::Text(text) => text.layout.get(text.lines.start)
+            .map(|line| text.origin_y + line.metrics().block_min_coord),
+        PageItem::Quote(quote) => (!quote.continued_before).then_some(quote.y),
+        PageItem::FigureBody(body) => Some(body.y),
+        PageItem::Image(image) => Some(image.y),
+        PageItem::Table(table) => Some(table.y),
+        PageItem::Separator(line) => Some(line.y),
+    }).reduce(f32::min).unwrap_or(0.0);
+    let bottom = page.items.iter().filter_map(|item| match item {
+        PageItem::Quote(quote) if quote.continued_after => None,
+        _ => Some(page_item_bottom(item)),
+    }).reduce(f32::max).unwrap_or(top);
+    (top, bottom.max(top))
+}
+
+fn trim_quote_continuations(page: &mut PageLayout, top: f32, bottom: f32, leading_gap: f32) {
+    for item in &mut page.items {
+        if let PageItem::Quote(quote) = item {
+            let end = if quote.continued_after { bottom } else { quote.y + quote.height };
+            if quote.continued_before {
+                // Extend the accent through a real paragraph gap restored at
+                // this boundary, while keeping glyphs after that gap.
+                quote.y = top - leading_gap;
+            }
+            quote.height = (end - quote.y).max(0.0);
+        }
+    }
 }
 
 fn caption(block: &Block) -> bool {
@@ -145,8 +164,8 @@ impl LayoutEngine {
         let first_height = pages
             .first()
             .map_or(0.0, |page| {
-                let (top, bottom) = slice_padding(page, padding);
-                page_bottom(page) + top + bottom
+                let (_, bottom) = slice_bounds(page);
+                bottom + padding + if pages.len() == 1 { padding } else { 0.0 }
             });
         paginator.prepare_group(
             before_height + first_height + if pages.len() == 1 { after_height } else { 0.0 },
@@ -163,8 +182,13 @@ impl LayoutEngine {
             if index > 0 {
                 paginator.force_page();
             }
-            let (top_padding, bottom_padding) = slice_padding(&page, padding);
-            let height = page_bottom(&page) + top_padding + bottom_padding;
+            let (content_top, content_bottom) = slice_bounds(&page);
+            let content_top = if index == 0 { 0.0 } else { content_top };
+            let top_padding = if index == 0 { padding } else { 0.0 };
+            let bottom_padding = if index + 1 == page_count { padding } else { 0.0 };
+            let leading_gap = if index == 0 { 0.0 } else { page.leading_gap.max(0.0) };
+            trim_quote_continuations(&mut page, content_top, content_bottom, leading_gap);
+            let height = content_bottom - content_top + leading_gap + top_padding + bottom_padding;
             paginator.keep_together_if_fits(
                 height
                     + if index + 1 == page_count {
@@ -186,7 +210,7 @@ impl LayoutEngine {
                     sources: body_sources(&page),
                 }));
             for item in &mut page.items {
-                translate(item, x + padding, y + top_padding);
+                translate(item, x + padding, y + top_padding + leading_gap - content_top);
             }
             paginator.items.extend(page.items);
             paginator.cursor_y = y + height;
@@ -561,29 +585,19 @@ fn body_sources(page: &PageLayout) -> Vec<SourceRange> {
     sources
 }
 
-fn page_bottom(page: &PageLayout) -> f32 {
-    page.items
-        .iter()
-        .filter_map(|item| match item {
-            PageItem::Text(text) => text
-                .lines
-                .end
-                .checked_sub(1)
-                .and_then(|i| text.layout.get(i))
-                .map(|line| {
-                    text.origin_y
-                        + line
-                            .metrics()
-                            .block_max_coord
-                            .max(line.metrics().block_min_coord + line.metrics().line_height)
-                }),
-            PageItem::FigureBody(body) => Some(body.y + body.height),
-            PageItem::Quote(quote) => Some(quote.y + quote.height),
-            PageItem::Image(image) => Some(image.y + image.height),
-            PageItem::Table(table) => Some(table.y + table.height),
-            PageItem::Separator(line) => Some(line.y + 1.0),
-        })
-        .fold(0.0, f32::max)
+fn page_item_bottom(item: &PageItem) -> f32 {
+    match item {
+        PageItem::Text(text) => text.lines.end.checked_sub(1)
+            .and_then(|i| text.layout.get(i)).map_or(text.origin_y, |line| {
+                text.origin_y + line.metrics().block_max_coord
+                    .max(line.metrics().block_min_coord + line.metrics().line_height)
+            }),
+        PageItem::FigureBody(body) => body.y + body.height,
+        PageItem::Quote(quote) => quote.y + quote.height,
+        PageItem::Image(image) => image.y + image.height,
+        PageItem::Table(table) => table.y + table.height,
+        PageItem::Separator(line) => line.y + 1.0,
+    }
 }
 
 fn translate(item: &mut PageItem, x: f32, y: f32) {
