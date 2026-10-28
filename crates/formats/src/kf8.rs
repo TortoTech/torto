@@ -8,6 +8,8 @@ use crate::{BookFormat, FormatError, conversion_error};
 const MAX_UNCOMPRESSED_TEXT: usize = 512 * 1024 * 1024;
 const INVALID_INDEX: u32 = u32::MAX;
 
+mod mobi6_toc;
+
 pub(crate) struct Kf8Book {
     pub sections: Vec<Kf8Section>,
     pub table_of_contents: Vec<SourceTocEntry>,
@@ -29,6 +31,7 @@ pub(crate) struct MobiMetadata {
 
 pub(crate) struct Mobi6Book {
     pub sections: Vec<Mobi6Section>,
+    pub table_of_contents: Vec<SourceTocEntry>,
     pub resources: Vec<SourceResource>,
     pub image_sources: HashMap<usize, String>,
 }
@@ -160,9 +163,20 @@ fn parse_mobi6_inner(bytes: &[u8]) -> Result<Mobi6Book, String> {
         return Err("MOBI container contains KF8 content".to_owned());
     }
     let raw = context.load_text()?;
-    let file_positions = find_numeric_attributes(&raw, b"filepos");
+    let toc_index = valid_index(context.header.ncx)
+        .and_then(|index| parse_index(&context, index))
+        .ok();
+    let mut file_positions = find_numeric_attributes(&raw, b"filepos");
+    if let Some(index) = &toc_index {
+        file_positions.extend(index.entries.iter().filter_map(|entry| {
+            entry.tags.get(&1)?.first().copied().filter(|position| *position < raw.len())
+        }));
+        file_positions.sort_unstable();
+        file_positions.dedup();
+    }
     let ranges = split_mobi6_sections(&raw);
     let mut sections = Vec::with_capacity(ranges.len());
+    let mut section_ranges = Vec::with_capacity(ranges.len());
     for range in ranges {
         let section_raw = raw
             .get(range.clone())
@@ -181,6 +195,7 @@ fn parse_mobi6_inner(bytes: &[u8]) -> Result<Mobi6Book, String> {
         let title = extract_document_title(&html)
             .unwrap_or_else(|| format!("Chapter {}", sections.len() + 1));
         sections.push(Mobi6Section { title, html });
+        section_ranges.push(range);
     }
     if sections.is_empty() {
         return Err("MOBI6 book has no readable content sections".to_owned());
@@ -208,6 +223,10 @@ fn parse_mobi6_inner(bytes: &[u8]) -> Result<Mobi6Book, String> {
     }
     Ok(Mobi6Book {
         sections,
+        table_of_contents: toc_index
+            .as_ref()
+            .and_then(|index| mobi6_toc::resolve(index, &section_ranges).ok())
+            .unwrap_or_default(),
         resources,
         image_sources,
     })
@@ -618,14 +637,22 @@ fn insert_filepos_anchors(data: &[u8], anchors: &[(usize, usize)]) -> Result<Vec
 }
 
 fn decode_html_entities(value: &str) -> String {
-    value
-        .replace("&nbsp;", " ")
-        .replace("&#160;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+    // Decode each reference once. A raw ampersand or unknown entity must not
+    // prevent valid references elsewhere in a Kindle metadata/NCX string.
+    let mut output = String::with_capacity(value.len());
+    for part in value.split_inclusive(';') {
+        if let Some(start) = part.rfind('&') {
+            output.push_str(&part[..start]);
+            let entity = &part[start..];
+            match quick_xml::escape::unescape(entity) {
+                Ok(decoded) => output.push_str(&decoded),
+                Err(_) => output.push_str(entity),
+            }
+        } else {
+            output.push_str(part);
+        }
+    }
+    output
 }
 
 fn hybrid_boundary(record: &[u8]) -> Result<Option<usize>, String> {
@@ -971,6 +998,14 @@ fn parse_toc(
 ) -> Result<ParsedToc, String> {
     let ncx = valid_index(context.header.ncx)?;
     let index = parse_index(context, ncx)?;
+    resolve_toc_index(index, skeletons, fragments)
+}
+
+fn resolve_toc_index(
+    index: IndexData,
+    skeletons: &[Skeleton],
+    fragments: &[Fragment],
+) -> Result<ParsedToc, String> {
     let mut ranges = Vec::with_capacity(skeletons.len());
     let mut start = 0usize;
     for skeleton in skeletons {
@@ -998,7 +1033,8 @@ fn parse_toc(
         let Some(label) = index.cncx.get(&label_offset) else {
             continue;
         };
-        if label.trim().is_empty() {
+        let label = decode_html_entities(label).split_whitespace().collect::<Vec<_>>().join(" ");
+        if label.is_empty() {
             continue;
         }
         let Some(section) = ranges.iter().position(|range| {
@@ -1008,7 +1044,6 @@ fn parse_toc(
         }) else {
             continue;
         };
-        let label = label.trim().to_owned();
         let anchor_id = format!("kf8-{fragment_id:x}-{fragment_offset:x}");
         titles.entry(section).or_insert_with(|| label.clone());
         let anchors = fragment_anchors.entry(fragment_id).or_default();
@@ -1115,6 +1150,13 @@ fn parse_index(context: &Context<'_>, index: usize) -> Result<IndexData, String>
         let record = context.relative_record(index + header.index_records + cncx_index + 1)?;
         let mut position = 0usize;
         while position < record.len() {
+            // CNCX strings may be followed by up to three zero alignment
+            // bytes. These are padding, not an unterminated string length.
+            if record.len() - position <= 3
+                && record[position..].iter().all(|byte| *byte == 0)
+            {
+                break;
+            }
             let entry_offset = position;
             let (length, consumed) = variable_length(record, position)?;
             position += consumed;
@@ -1702,20 +1744,23 @@ fn extract_document_title(html: &str) -> Option<String> {
 fn strip_tags(value: &str) -> String {
     let mut output = String::new();
     let mut in_tag = false;
+    let mut tag = String::new();
     for character in value.chars() {
         match character {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
+            '<' => { in_tag = true; tag.clear(); }
+            '>' => {
+                in_tag = false;
+                if tag.split_ascii_whitespace().next()
+                    .is_some_and(|name| name.trim_end_matches('/').eq_ignore_ascii_case("br"))
+                {
+                    output.push(' ');
+                }
+            }
             _ if !in_tag => output.push(character),
-            _ => {}
+            _ => tag.push(character),
         }
     }
-    output
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+    decode_html_entities(&output).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn image_type(data: &[u8]) -> Option<(&'static str, &'static str)> {
@@ -1784,6 +1829,40 @@ fn uint_from_bytes(data: &[u8]) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kindle_metadata_entities_decode_once_even_with_raw_ampersands() {
+        assert_eq!(decode_html_entities("Don&#8217;t &#x2014; &copy; &amp;"), "Don’t — © &");
+        assert_eq!(decode_html_entities("Rock & Roll &#8217; &unknown; &amp;#8217;"), "Rock & Roll ’ &unknown; &#8217;");
+    }
+
+    #[test]
+    fn kf8_directory_labels_decode_entities_without_changing_navigation_targets() {
+        let index = IndexData {
+            entries: vec![
+                IndexEntry {
+                    name: "0".into(),
+                    tags: HashMap::from([(6, vec![7, 12]), (3, vec![0]), (4, vec![0])]),
+                },
+                IndexEntry {
+                    name: "1".into(),
+                    tags: HashMap::from([(6, vec![7, 20]), (3, vec![1]), (4, vec![0])]),
+                },
+            ],
+            cncx: HashMap::from([
+                (0, "Rock & Roll: Don&#8217;t &#x2014; &copy; &amp;#8217;".into()),
+                (1, "&nbsp; &#160;".into()),
+            ]),
+        };
+        let skeletons = [Skeleton { fragment_count: 1, offset: 0, length: 1 }];
+        let fragments = [Fragment { index: 7, insert_offset: 0, offset: 0, length: 100 }];
+        let toc = resolve_toc_index(index, &skeletons, &fragments).unwrap();
+        assert_eq!(toc.entries.len(), 1);
+        assert_eq!(toc.entries[0].label, "Rock & Roll: Don’t — © &#8217;");
+        assert_eq!(toc.titles[&0], toc.entries[0].label);
+        assert_eq!(toc.entries[0].href, "Text/section-1.xhtml#kf8-7-c");
+        assert_eq!(toc.fragment_anchors[&7][0].offset, 12);
+    }
 
     #[test]
     fn css_flows_are_loaded_and_references_keep_publication_relative_paths() {

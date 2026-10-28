@@ -39,7 +39,7 @@ fn convert(
     } = kf8::metadata(bytes, format)?;
 
     let mut sections = Vec::new();
-    let mut table_of_contents = Vec::new();
+    let table_of_contents;
     let resources;
     if kf8::is_kf8(bytes) {
         let parsed = kf8::parse(bytes, format)?;
@@ -62,9 +62,11 @@ fn convert(
     } else {
         let kf8::Mobi6Book {
             sections: legacy_sections,
+            table_of_contents: legacy_toc,
             resources: legacy_resources,
             image_sources,
         } = kf8::parse_mobi6(bytes, format)?;
+        table_of_contents = legacy_toc;
         resources = legacy_resources;
         for (index, chapter) in legacy_sections.into_iter().enumerate() {
             let title = if chapter.title.trim().is_empty() {
@@ -388,6 +390,8 @@ mod tests {
     use super::*;
     use rebook_publication::BookSource as _;
 
+    mod toc_tests;
+
     #[test]
     fn cover_only_mobi_fragment_recovers_undeclared_svg_prefixes() {
         let body = normalize_chapter(
@@ -473,8 +477,12 @@ mod tests {
     }
 
     fn mobi6_fixture() -> Vec<u8> {
-        let title = b"Native MOBI";
         let text = b"<html><body><h1>One</h1><p>Hello &amp; world.</p><img recindex=00001></body></html><mbp:pagebreak/><html><body><h1>Two</h1><p>Second.</p></body></html>";
+        mobi6_fixture_with_index(text, &[])
+    }
+
+    fn mobi6_fixture_with_index(text: &[u8], index_records: &[Vec<u8>]) -> Vec<u8> {
+        let title = b"Native MOBI";
         let exth = exth(&[
             (100, b"Test Author".as_slice()),
             (524, b"en".as_slice()),
@@ -501,15 +509,17 @@ mod tests {
         put_u32(&mut record_zero, 84, u32::try_from(title_offset).unwrap());
         put_u32(&mut record_zero, 88, u32::try_from(title.len()).unwrap());
         record_zero[95] = 9;
-        put_u32(&mut record_zero, 108, 2);
+        put_u32(&mut record_zero, 108, u32::try_from(2 + index_records.len()).unwrap());
         put_u32(&mut record_zero, 112, u32::MAX);
         put_u32(&mut record_zero, 128, 0x40);
-        put_u32(&mut record_zero, 244, u32::MAX);
+        put_u32(&mut record_zero, 244, if index_records.is_empty() { u32::MAX } else { 2 });
         record_zero[exth_offset..title_offset].copy_from_slice(&exth);
         record_zero[title_offset..title_offset + title.len()].copy_from_slice(title);
 
         let cover = b"\x89PNG\r\n\x1a\n";
-        let records = [record_zero.as_slice(), text.as_slice(), cover.as_slice()];
+        let mut records = vec![record_zero.as_slice(), text];
+        records.extend(index_records.iter().map(Vec::as_slice));
+        records.push(cover.as_slice());
         let header_length = 78 + records.len() * 8;
         let mut output = vec![0; header_length];
         output[..11].copy_from_slice(title);
