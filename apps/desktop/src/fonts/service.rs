@@ -71,7 +71,14 @@ impl FontService {
         self.initialized && !self.running && !self.requested
     }
     pub(crate) fn retry(&mut self) {
-        if !self.running {
+        if !self.running
+            || self
+                .statuses
+                .iter()
+                .any(|status| matches!(status, Status::Failed(_)))
+        {
+            // Coalesce manual retries behind the active batch. A failed font
+            // must not lose a retry click while another font is downloading.
             self.requested = true;
         }
     }
@@ -285,6 +292,30 @@ pub(crate) fn take_request(ctx: &egui::Context) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_font_retry_waits_for_the_active_batch_without_losing_the_request() {
+        let mut service = FontService::default();
+        service.requested = false;
+        service.running = true;
+        service.generation = 2;
+        service.statuses = [
+            Status::Downloading(50),
+            Status::Failed("offline".into()),
+            Status::Ready,
+        ];
+        service.retry();
+        service.retry();
+        assert!(service.requested);
+        assert!(service.running);
+        assert_eq!(service.generation, 2);
+        service.complete(Message {
+            generation: 2,
+            update: Update::Stopped,
+        });
+        assert!(!service.running);
+        assert!(service.requested);
+        assert!(!service.settled());
+    }
     #[test]
     fn retries_coalesce_and_old_completions_cannot_replace_current_fonts() {
         let mut service = FontService::default();
