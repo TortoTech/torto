@@ -987,7 +987,8 @@ impl ReaderSession {
         if let Some(generation) = raster_generation {
             layout_engine.set_raster_cache_generation(generation);
         }
-        let available_fonts = layout_engine.available_reader_font_families();
+        let mut available_fonts = layout_engine.available_reader_font_families();
+        available_fonts.include_downloadable_defaults();
         available_fonts.repair_typography(&mut style.typography);
         let prefetch_worker = PrefetchWorker::spawn(
             Arc::clone(&source),
@@ -1038,6 +1039,12 @@ impl ReaderSession {
 
     pub fn available_font_families(&mut self) -> Vec<String> {
         self.layout_engine.available_font_families()
+    }
+
+    /// Compare immutable registrations without doing discovery or reading files.
+    pub fn uses_fonts(&self, fonts: &[ReaderFontBlob]) -> bool {
+        self.fonts.len() == fonts.len()
+            && self.fonts.iter().zip(fonts).all(|(a, b)| a.id() == b.id())
     }
 
     pub fn toc_items(&self) -> &[TocViewItem] {

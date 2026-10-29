@@ -4394,6 +4394,7 @@ dependencies = [
  "crc32fast",
  "encoding_rs",
  "flate2",
+ "fontdb 0.24.0",
  "hayro",
  "image",
  "kurbo",
@@ -4409,6 +4410,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "skrifa 0.48.0",
  "thiserror 2.0.19",
  "zip",
 ]

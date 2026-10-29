@@ -38,7 +38,7 @@ use thiserror::Error;
 use self::epub::{EpubError, EpubPublication};
 
 pub use self::html_context::HtmlContext;
-pub use self::pdf::cjk_fallback_font_bytes;
+pub use self::pdf::set_pdf_cjk_fallback_font;
 pub use self::pdf::reflow as pdf_reflow;
 pub use self::pdf::{PdfTimingSink, set_pdf_timing_sink};
 

@@ -593,7 +593,9 @@ impl ReaderTypography {
                     "Noto Serif SC",
                     "Source Han Serif SC",
                     "Songti SC",
-                    "SimSun",
+                    "PingFang SC",
+                    "Microsoft YaHei",
+                    "Noto Sans CJK SC",
                     "Georgia",
                     "Times New Roman",
                 ],
@@ -1164,6 +1166,21 @@ pub struct ReaderFontFamilies {
 }
 
 impl ReaderFontFamilies {
+    /// Default downloadable families remain valid preferences while offline.
+    /// Missing resources resolve through the normal platform fallback stack.
+    pub fn include_downloadable_defaults(&mut self) {
+        for (family, category) in [
+            ("Literata", &mut self.serif),
+            ("LXGW WenKai GB Screen", &mut self.chinese),
+        ] {
+            if !self.all.iter().any(|candidate| candidate == family) {
+                self.all.push(family.into());
+            }
+            if !category.iter().any(|candidate| candidate == family) {
+                category.push(family.into());
+            }
+        }
+    }
     pub fn include_configured(&mut self, typography: &ReaderTypography) {
         include_available_family(&self.all, &mut self.serif, &typography.serif_font);
         include_available_family(&self.all, &mut self.sans_serif, &typography.sans_serif_font);
@@ -8774,7 +8791,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_typography_uses_bundled_language_defaults_and_builds_cjk_stacks() {
+    fn reader_typography_uses_downloadable_defaults_and_safe_system_fallbacks() {
         let typography = ReaderTypography::default();
         assert_eq!(typography.default_font, ReaderDefaultFont::Serif);
         assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
@@ -8794,7 +8811,9 @@ mod tests {
         assert!((typography.minimum_font_size - 12.0).abs() < f32::EPSILON);
         assert_eq!(typography.font_weight, 400);
         assert!(typography.serif_stack().starts_with("\"Literata\""));
-        assert!(typography.serif_stack().contains("\"SimSun\""));
+        assert!(typography.serif_stack().contains("\"Microsoft YaHei\""));
+        assert!(typography.serif_stack().contains("\"PingFang SC\""));
+        assert!(!typography.serif_stack().contains("\"SimSun\""));
         assert!(typography.serif_stack().ends_with("serif"));
         assert!(
             typography

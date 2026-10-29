@@ -452,7 +452,7 @@ impl FootnoteRenderer {
             }
         }
         let engine = self.engine.get_or_insert_with(|| {
-            LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned())
+            LayoutEngine::with_fonts(crate::fonts::reader_fonts().iter().cloned())
         });
         let layout = engine
             .layout_blocks(

@@ -816,7 +816,7 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
         1400
     };
     let mut engine =
-        LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned());
+        LayoutEngine::with_fonts(crate::fonts::reader_fonts().iter().cloned());
     engine.set_deferred_images(true);
     let layout = engine
         .layout_blocks(

@@ -16,6 +16,7 @@ use crate::{async_task::TaskSlot, platform::UserEvent};
 
 mod egui_view;
 mod provider_models;
+mod font_downloads;
 
 pub(crate) use egui_view::{choice_button, settings_overlay};
 pub(crate) use provider_models::ProviderModelsMessage;
@@ -48,6 +49,10 @@ pub(crate) enum ReaderSettingsChange {
 }
 
 pub(crate) struct SettingsFeature {
+    pub(crate) font_statuses: [crate::fonts::Status; 3],
+    pub(crate) font_retry_requested: bool,
+    pub(crate) font_apply_requested: bool,
+    pub(crate) font_apply_available: bool,
     settings_tab: SettingsTab,
     draft_spread: SpreadMode,
     draft_reading_mode: ReadingMode,
@@ -101,6 +106,7 @@ impl SettingsFeature {
         });
         let mut available_reader_font_families =
             LayoutEngine::with_fonts(reader_fonts.iter().cloned()).available_reader_font_families();
+        available_reader_font_families.include_downloadable_defaults();
         available_reader_font_families.include_configured(&preferences.typography);
         if available_reader_font_families.repair_typography(&mut preferences.typography) {
             tracing::warn!(
@@ -141,6 +147,10 @@ impl SettingsFeature {
         available_interface_font_families: Vec<String>,
     ) -> Self {
         Self {
+            font_statuses: Default::default(),
+            font_retry_requested: false,
+            font_apply_requested: false,
+            font_apply_available: false,
             settings_tab: SettingsTab::System,
             draft_spread: applied.spread,
             draft_reading_mode: applied.reading_mode,

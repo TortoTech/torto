@@ -124,7 +124,16 @@ struct Extractor {
     opaque_groups: Vec<bool>,
 }
 
+pub(super) fn publication_page(publication: &PdfPublication, index: usize, tags: &StructureTags) -> NativePage {
+    page_with_settings(&publication.pdf, index, tags, publication.interpreter.clone())
+}
+
+#[cfg(test)]
 pub(super) fn page(pdf: &Pdf, index: usize, tags: &StructureTags) -> NativePage {
+    page_with_settings(pdf, index, tags, interpreter_settings())
+}
+
+fn page_with_settings(pdf: &Pdf, index: usize, tags: &StructureTags, settings: InterpreterSettings) -> NativePage {
     let page = &pdf.pages()[index];
     let (width, height) = page.render_dimensions();
     let cache = InterpreterCache::new();
@@ -133,7 +142,7 @@ pub(super) fn page(pdf: &Pdf, index: usize, tags: &StructureTags) -> NativePage 
         Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
         &cache,
         page.xref(),
-        interpreter_settings(),
+        settings,
     );
     let mut extractor = Extractor::default();
     extractor.rectangular_clips.push(true);

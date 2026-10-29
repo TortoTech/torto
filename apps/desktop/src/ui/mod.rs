@@ -2,6 +2,7 @@ mod http_loader;
 pub(crate) mod image_preview;
 mod icons;
 mod interface_fonts;
+pub(crate) use interface_fonts::resources_changed as font_resources_changed;
 mod loading_spinner;
 mod svg_loader;
 
@@ -424,6 +425,38 @@ pub(crate) fn show_toast(
     anchor_offset: Vec2,
     dismissible: bool,
 ) -> bool {
+    show_toast_content(ctx, id, message, kind,
+        ToastPresentation { anchor_offset, dismissible, show_icon: true }, None::<fn(&mut Ui)>)
+}
+
+/// Actionable notifications share the existing reader notification shell.
+pub(crate) fn show_toast_with_actions(
+    ctx: &egui::Context,
+    id: &'static str,
+    message: &str,
+    kind: ToastKind,
+    anchor_offset: Vec2,
+    actions: impl FnOnce(&mut Ui),
+) -> bool {
+    show_toast_content(ctx, id, message, kind,
+        ToastPresentation { anchor_offset, dismissible: true, show_icon: false }, Some(actions))
+}
+
+struct ToastPresentation {
+    anchor_offset: Vec2,
+    dismissible: bool,
+    show_icon: bool,
+}
+
+fn show_toast_content(
+    ctx: &egui::Context,
+    id: &'static str,
+    message: &str,
+    kind: ToastKind,
+    presentation: ToastPresentation,
+    mut actions: Option<impl FnOnce(&mut Ui)>,
+) -> bool {
+    let ToastPresentation { anchor_offset, dismissible, show_icon } = presentation;
     let palette = palette();
     let (icon_kind, fill, border, foreground) = match kind {
         ToastKind::Success => (
@@ -455,10 +488,11 @@ pub(crate) fn show_toast(
     } else {
         0.0
     };
-    let fixed_content_width = TOAST_ICON_SIZE + TOAST_ITEM_SPACING + close_width;
+    let icon_width = if show_icon { TOAST_ICON_SIZE + TOAST_ITEM_SPACING } else { 0.0 };
+    let fixed_content_width = icon_width + close_width;
     let available_width = (ctx.content_rect().width() - TOAST_SCREEN_MARGIN).max(1.0);
     let max_width = TOAST_MAX_WIDTH.min(available_width);
-    let min_width = TOAST_MIN_WIDTH.min(max_width);
+    let min_width = if actions.is_some() { 220.0_f32 } else { TOAST_MIN_WIDTH }.min(max_width);
     let width =
         (TOAST_HORIZONTAL_PADDING + fixed_content_width + text_width).clamp(min_width, max_width);
     let label_width = (width - TOAST_HORIZONTAL_PADDING - fixed_content_width).max(1.0);
@@ -477,7 +511,9 @@ pub(crate) fn show_toast(
                     ui.set_width((width - TOAST_HORIZONTAL_PADDING).max(1.0));
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = TOAST_ITEM_SPACING;
-                        ui.add(icon(icon_kind).size(TOAST_ICON_SIZE).color(foreground));
+                        if show_icon {
+                            ui.add(icon(icon_kind).size(TOAST_ICON_SIZE).color(foreground));
+                        }
                         ui.vertical(|ui| {
                             ui.set_width(label_width);
                             ui.add(
@@ -486,6 +522,10 @@ pub(crate) fn show_toast(
                                 )
                                 .wrap(),
                             );
+                            if let Some(actions) = actions.take() {
+                                ui.add_space(7.0);
+                                actions(ui);
+                            }
                         });
                         if dismissible && small_icon_button(ui, Icon::X).clicked() {
                             dismissed = true;

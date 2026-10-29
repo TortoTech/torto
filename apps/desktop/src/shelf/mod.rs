@@ -196,6 +196,15 @@ struct ShelfRemoveConfirmation {
 }
 
 impl ShelfFeature {
+    pub(crate) fn set_reader_fonts(&mut self, fonts: Arc<[Blob<u8>]>) {
+        self.reader_fonts = fonts;
+        // A cover omitted because its PDF lacked a CJK fallback can now retry.
+        self.cover_attempts.clear();
+    }
+
+    pub(crate) fn restore_open_locator(&mut self, locator: rebook_publication::LocatorV1) {
+        self.opening.restore_locator(locator);
+    }
     pub(crate) fn reader_cover_cache(&mut self) -> &mut covers::CoverCache {
         &mut self.cover_textures
     }

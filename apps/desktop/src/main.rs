@@ -83,7 +83,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ],
         );
     });
-    let reader_fonts = fonts::embedded_reader_fonts();
+    let reader_fonts = fonts::reader_fonts();
 
     let library =
         LocalLibrary::load_default().map_err(|error| io::Error::other(error.to_string()))?;

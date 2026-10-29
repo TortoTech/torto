@@ -700,6 +700,7 @@ fn source_range_nodes_overlap(source: &SourceRange, visible: &SourceRange) -> bo
 }
 
 impl BookSource for TranslationBookSource {
+    fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
     fn book(&self) -> &Book {
         self.inner.book()
     }

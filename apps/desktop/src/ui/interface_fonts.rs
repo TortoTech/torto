@@ -190,8 +190,10 @@ impl InterfaceFonts {
                 break;
             }
         }
-        if !missing.is_empty() && !self.definitions.font_data.contains_key("reader-cjk") {
-            let data = FontData::from_static(crate::fonts::cjk_font_bytes());
+        if !missing.is_empty() && !self.definitions.font_data.contains_key("reader-cjk")
+            && let Some(face) = crate::fonts::cjk_face() {
+            let mut data = FontData::from_owned(face.data.as_ref().to_vec());
+            data.index = face.index;
             if let Ok(font) = skrifa::FontRef::from_index(&data.font, data.index)
                 && missing.iter().any(|character| {
                     font.charmap()
@@ -279,6 +281,13 @@ pub(crate) fn resolve(ctx: &egui::Context, shapes: &[egui::epaint::ClippedShape]
     ctx.set_fonts(state.definitions.clone());
     ctx.request_repaint();
     true
+}
+
+pub(crate) fn resources_changed(ctx: &egui::Context) {
+    if let Some(state) = ctx.data(|data| data.get_temp::<Arc<Mutex<InterfaceFonts>>>(state_id())) {
+        // Recheck characters that lacked coverage before the download completed.
+        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).checked.clear();
+    }
 }
 
 #[cfg(all(test, target_os = "windows"))]

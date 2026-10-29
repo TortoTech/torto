@@ -828,6 +828,7 @@ fn typography_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         &mut state.draft_typography,
         &state.available_reader_font_families,
     );
+    super::font_downloads::show(ui, state);
 }
 
 fn reader_layout_settings(
@@ -1877,7 +1878,7 @@ fn default_font_selector(
         ),
         ReaderDefaultFont::Other => (language.text("其他", "Other"), &typography.other_font),
     };
-    let selected_text = format!("{category} · {family}");
+    let selected_text = format!("{category} · {}", crate::fonts::family_label(ui.ctx(), family));
     let arrow_id = ui.make_persistent_id("settings-default-font-arrow");
     let arrow_size = 14.0;
     let button = egui::Button::new((
@@ -1968,7 +1969,7 @@ fn default_font_submenu(
                     let row_width = ui.available_width();
                     if ui
                         .add(
-                            egui::Button::selectable(selected, family)
+                            egui::Button::selectable(selected, crate::fonts::family_label(ui.ctx(), family))
                                 .min_size(Vec2::new(row_width, 0.0))
                                 .truncate(),
                         )
@@ -1976,6 +1977,7 @@ fn default_font_submenu(
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
                     {
+                        crate::fonts::request_family(ui.ctx(), family);
                         typography.default_font = category;
                         match category {
                             ReaderDefaultFont::Serif => typography.serif_font.clone_from(family),
@@ -2006,7 +2008,7 @@ fn inherited_western_font_selector(
                 ReaderDefaultFont::SansSerif => language.text("无衬线", "Sans serif"),
                 ReaderDefaultFont::Other => language.text("其他", "Other"),
             };
-            format!("{category} · {}", choice.family)
+            format!("{category} · {}", crate::fonts::family_label(ui.ctx(), &choice.family))
         },
     );
     let arrow_id = ui.make_persistent_id("settings-cjk-default-font-arrow");
@@ -2108,7 +2110,7 @@ fn inherited_western_font_submenu(
                     let row_width = ui.available_width();
                     if ui
                         .add(
-                            egui::Button::selectable(selected.as_ref() == Some(&value), family)
+                            egui::Button::selectable(selected.as_ref() == Some(&value), crate::fonts::family_label(ui.ctx(), family))
                                 .min_size(Vec2::new(row_width, 0.0))
                                 .truncate(),
                         )
@@ -2116,6 +2118,7 @@ fn inherited_western_font_submenu(
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
                     {
+                        crate::fonts::request_family(ui.ctx(), family);
                         *selected = Some(value);
                         ui.close();
                     }
@@ -2134,7 +2137,7 @@ fn inherited_cjk_font_selector(
     egui::ComboBox::from_id_salt("settings-latin-cjk-font")
         .width(SETTINGS_FONT_SELECT_WIDTH)
         .truncate()
-        .selected_text(selected.as_deref().unwrap_or(inherited))
+        .selected_text(selected.as_ref().map_or_else(|| inherited.into(), |family| crate::fonts::family_label(ui.ctx(), family)))
         .show_ui(ui, |ui| {
             if ui.selectable_label(selected.is_none(), inherited).clicked() {
                 *selected = None;
@@ -2143,10 +2146,11 @@ fn inherited_cjk_font_selector(
             ui.separator();
             for family in font_families {
                 if ui
-                    .selectable_label(selected.as_ref() == Some(family), family)
+                    .selectable_label(selected.as_ref() == Some(family), crate::fonts::family_label(ui.ctx(), family))
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
+                    crate::fonts::request_family(ui.ctx(), family);
                     *selected = Some(family.clone());
                     ui.close();
                 }
@@ -2165,7 +2169,7 @@ fn font_family_selector(
     let was_open = ui
         .ctx()
         .data(|data| data.get_temp::<bool>(popup_state_id).unwrap_or(false));
-    let selected_text = font_family_label(selected, language);
+    let selected_text = crate::fonts::family_label(ui.ctx(), &font_family_label(selected, language));
     let response = egui::ComboBox::from_id_salt(id_salt)
         .width(SETTINGS_FONT_SELECT_WIDTH)
         .truncate()
@@ -2176,8 +2180,9 @@ fn font_family_selector(
                 let response = ui.selectable_value(
                     selected,
                     family.clone(),
-                    font_family_label(family, language),
+                    crate::fonts::family_label(ui.ctx(), &font_family_label(family, language)),
                 );
+                if response.clicked() { crate::fonts::request_family(ui.ctx(), family); }
                 if !was_open && is_selected {
                     response.scroll_to_me(Some(egui::Align::Center));
                 }

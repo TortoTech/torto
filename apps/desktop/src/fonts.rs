@@ -1,73 +1,70 @@
-use std::sync::Arc;
-
+//! Downloaded reading fonts. Production builds contain no reading font binaries.
+//! Workers own discovery, I/O and validation; UI adopts immutable snapshots.
+use arc_swap::ArcSwap;
 use peniko::Blob;
+use std::sync::{Arc, OnceLock};
 
-const LITERATA_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf");
-const LITERATA_ITALIC: &[u8] =
-    include_bytes!("../../../assets/fonts/Literata-Italic-opsz-wght.ttf");
-pub(crate) fn cjk_font_bytes() -> &'static [u8] {
-    rebook_formats::cjk_fallback_font_bytes()
+mod catalog;
+mod download;
+mod service;
+mod store;
+pub(crate) use service::{FontService, Message, Status};
+pub(crate) use service::{family_label, publish_labels, request_family, take_request};
+
+#[derive(Clone)]
+pub(crate) struct Face {
+    pub(crate) data: Blob<u8>,
+    pub(crate) index: u32,
 }
 
-pub fn embedded_reader_fonts() -> Arc<[Blob<u8>]> {
+#[derive(Clone, Default)]
+pub(crate) struct FontSet {
+    pub(crate) faces: [Option<Face>; 3],
+}
+
+impl FontSet {
+    pub(crate) fn reader_fonts(&self) -> Arc<[Blob<u8>]> {
+        let mut blobs: Vec<Blob<u8>> = Vec::new();
+        for face in self.faces.iter().flatten() {
+            if !blobs.iter().any(|blob| blob.id() == face.data.id()) {
+                blobs.push(face.data.clone());
+            }
+        }
+        blobs.into()
+    }
+    pub(crate) fn cjk(&self) -> Option<Face> {
+        self.faces[0].clone()
+    }
+}
+
+fn current() -> &'static ArcSwap<FontSet> {
+    static CURRENT: OnceLock<ArcSwap<FontSet>> = OnceLock::new();
+    CURRENT.get_or_init(|| ArcSwap::from_pointee(FontSet::default()))
+}
+
+pub(crate) fn install(fonts: Arc<FontSet>) {
+    rebook_formats::set_pdf_cjk_fallback_font(fonts.cjk().map(|face| (face.data, face.index)));
+    current().store(fonts);
+}
+
+pub(crate) fn reader_fonts() -> Arc<[Blob<u8>]> {
+    current().load().reader_fonts()
+}
+pub(crate) fn cjk_face() -> Option<Face> {
+    current().load().cjk()
+}
+
+// Deterministic, offline regression fixtures, linked only into the test binary.
+#[cfg(test)]
+pub(crate) fn embedded_reader_fonts() -> Arc<[Blob<u8>]> {
     [
-        font_blob(LITERATA_REGULAR),
-        font_blob(LITERATA_ITALIC),
-        font_blob(cjk_font_bytes()),
+        include_bytes!("../../../assets/fonts/LXGWWenKaiGBScreen.ttf").as_slice(),
+        include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice(),
+        include_bytes!("../../../assets/fonts/Literata-Italic-opsz-wght.ttf").as_slice(),
     ]
+    .map(|data| Blob::new(Arc::new(data)))
     .into()
 }
 
-fn font_blob(bytes: &'static [u8]) -> Blob<u8> {
-    Blob::new(Arc::new(bytes))
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rebook_layout::LayoutEngine;
-
-    #[test]
-    fn embedded_font_assets_are_non_empty() {
-        let fonts = embedded_reader_fonts();
-        assert_eq!(fonts.len(), 3);
-        assert!(fonts.iter().all(|font| !font.is_empty()));
-    }
-
-    #[test]
-    fn embedded_fonts_register_with_reader_family_names() {
-        let fonts = embedded_reader_fonts();
-        let mut engine = LayoutEngine::with_fonts(fonts.iter().cloned());
-        #[cfg(target_os = "windows")]
-        let discovered = engine.available_font_families();
-        let mut families = engine.available_reader_font_families();
-        families.include_configured(&rebook_layout::ReaderTypography::default());
-
-        for expected in ["Literata", "LXGW WenKai GB Screen"] {
-            assert!(
-                families.all.iter().any(|family| family == expected),
-                "missing embedded font family {expected:?}; registered: {:?}",
-                families.all
-            );
-        }
-        assert!(families.serif.iter().any(|family| family == "Literata"));
-        assert!(
-            families
-                .chinese
-                .iter()
-                .any(|family| family == "LXGW WenKai GB Screen")
-        );
-        #[cfg(target_os = "windows")]
-        {
-            assert!(families.monospace.iter().any(|family| family == "Consolas"));
-            for simsun_alias in ["SimSun", "宋体", "NSimSun", "新宋体"] {
-                if discovered.iter().any(|family| family == simsun_alias) {
-                    assert!(
-                        !families.all.iter().any(|family| family == simsun_alias),
-                        "Vello-incompatible embedded-bitmap font leaked into reader options"
-                    );
-                }
-            }
-        }
-    }
-}
+mod tests;
