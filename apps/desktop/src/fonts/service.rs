@@ -238,7 +238,7 @@ struct Labels {
 pub(crate) fn publish_labels(ctx: &egui::Context, statuses: &[Status; 3], language: AppLanguage) {
     ctx.data_mut(|data| {
         data.insert_temp(
-            egui::Id::new("downloaded-font-labels"),
+            egui::Id::unique("downloaded-font-labels"),
             Labels {
                 statuses: statuses.clone(),
                 language,
@@ -248,7 +248,7 @@ pub(crate) fn publish_labels(ctx: &egui::Context, statuses: &[Status; 3], langua
 }
 pub(crate) fn family_label(ctx: &egui::Context, family: &str) -> String {
     let Some(labels) =
-        ctx.data(|data| data.get_temp::<Labels>(egui::Id::new("downloaded-font-labels")))
+        ctx.data(|data| data.get_temp::<Labels>(egui::Id::unique("downloaded-font-labels")))
     else {
         return family.into();
     };
@@ -274,18 +274,18 @@ pub(crate) fn request_family(ctx: &egui::Context, family: &str) {
         _ => return,
     };
     let ready = ctx
-        .data(|data| data.get_temp::<Labels>(egui::Id::new("downloaded-font-labels")))
+        .data(|data| data.get_temp::<Labels>(egui::Id::unique("downloaded-font-labels")))
         .is_some_and(|labels| {
             indices
                 .iter()
                 .all(|index| labels.statuses[*index] == Status::Ready)
         });
     if !ready {
-        ctx.data_mut(|data| data.insert_temp(egui::Id::new("font-download-requested"), true));
+        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("font-download-requested"), true));
     }
 }
 pub(crate) fn take_request(ctx: &egui::Context) -> bool {
-    ctx.data_mut(|data| data.remove_temp::<bool>(egui::Id::new("font-download-requested")))
+    ctx.data_mut(|data| data.remove_temp::<bool>(egui::Id::unique("font-download-requested")))
         .unwrap_or(false)
 }
 

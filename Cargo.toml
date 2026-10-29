@@ -21,6 +21,7 @@ exclude = [
     "third_party/egui-wgpu",
     "third_party/egui_commonmark",
     "third_party/egui_commonmark_backend",
+    "third_party/egui_system_font_provider",
 ]
 resolver = "3"
 
@@ -42,12 +43,15 @@ bytemuck = "1.25.2"
 bytes = "1.12.1"
 crc32fast = "1.5.0"
 directories = "6.0.0"
-egui = "0.36.2"
-egui_commonmark = { version = "0.25.0", features = ["embedded_image"] }
-egui_commonmark_backend = "0.25.0"
-egui_extras = { version = "0.36.2", features = ["image"] }
-egui-wgpu = { version = "0.36.2", default-features = false }
-egui-winit = { version = "0.36.2", default-features = false, features = ["clipboard", "links"] }
+egui = { version = "0.37.0", default-features = false }
+# Keep Markdown parsing and image loading; Torto does not use the optional
+# regex search/highlight API enabled by the upstream defaults.
+egui_commonmark = { version = "0.26.0", default-features = false, features = ["pulldown_cmark", "load-images", "embedded_image"] }
+egui_commonmark_backend = "0.26.0"
+egui_system_font_provider = "0.37.0"
+egui_extras = { version = "0.37.0", default-features = false, features = ["image"] }
+egui-wgpu = { version = "0.37.0", default-features = false }
+egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard", "links"] }
 encoding_rs = "0.8.35"
 fast_image_resize = { version = "=6.1.0", default-features = false, features = ["std", "image"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
@@ -131,9 +135,9 @@ strip = "none"
 
 [patch.crates-io]
 egui = { path = "third_party/egui" }
-egui_extras = { path = "third_party/egui_extras" }
 epaint = { path = "third_party/epaint" }
-egui_commonmark = { path = "third_party/egui_commonmark" }
 egui_commonmark_backend = { path = "third_party/egui_commonmark_backend" }
+# Share Fontique 0.12 with Parley; only the provider's dependency manifest differs.
+egui_system_font_provider = { path = "third_party/egui_system_font_provider" }
 
 hayro = { path = "third_party/hayro" }

@@ -667,11 +667,23 @@ impl Default for ReaderTypography {
                 family: LITERATA_FAMILY.into(),
             }),
             latin_cjk_font: None,
-            monospace_font: "Consolas".into(),
+            monospace_font: default_monospace_font().into(),
             font_size: 20.0,
             minimum_font_size: 12.0,
             font_weight: 400,
         }
+    }
+}
+
+/// Platform default shared by reader code and interface code displays.
+#[must_use]
+pub const fn default_monospace_font() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Menlo"
+    } else if cfg!(target_os = "windows") {
+        "Consolas"
+    } else {
+        "DejaVu Sans Mono"
     }
 }
 
@@ -8806,7 +8818,7 @@ mod tests {
             })
         );
         assert!(typography.latin_cjk_font.is_none());
-        assert_eq!(typography.monospace_font, "Consolas");
+        assert_eq!(typography.monospace_font, default_monospace_font());
         assert!((typography.font_size - 20.0).abs() < f32::EPSILON);
         assert!((typography.minimum_font_size - 12.0).abs() < f32::EPSILON);
         assert_eq!(typography.font_weight, 400);
@@ -8823,7 +8835,10 @@ mod tests {
         assert!(typography.sans_serif_stack().ends_with("sans-serif"));
         assert_eq!(
             typography.monospace_stack(),
-            "\"Consolas\", \"LXGW WenKai GB Screen\", monospace"
+            format!(
+                "\"{}\", \"LXGW WenKai GB Screen\", monospace",
+                default_monospace_font()
+            )
         );
         assert!(!typography.monospace_stack().contains("Fira Code"));
     }
@@ -9058,7 +9073,7 @@ mod tests {
         assert_eq!(typography.sans_serif_font, "Arial");
         assert!(typography.cjk_default_font.is_none());
         assert!(typography.latin_cjk_font.is_none());
-        assert_eq!(typography.monospace_font, "Consolas");
+        assert_eq!(typography.monospace_font, default_monospace_font());
         assert!((typography.font_size - 20.0).abs() < f32::EPSILON);
         assert!((typography.minimum_font_size - 1.0).abs() < f32::EPSILON);
         assert_eq!(typography.font_weight, 455);

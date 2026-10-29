@@ -1272,6 +1272,7 @@ mod resize_presentation_tests {
         );
         let mut shapes = vec![
             egui::epaint::ClippedShape {
+                transform_after_tessellation: egui::emath::TSTransform::IDENTITY,
                 clip_rect: plan.rect,
                 shape: egui::Shape::image(
                     previous,
@@ -1281,6 +1282,7 @@ mod resize_presentation_tests {
                 ),
             },
             egui::epaint::ClippedShape {
+                transform_after_tessellation: egui::emath::TSTransform::IDENTITY,
                 clip_rect: egui::Rect::EVERYTHING,
                 shape: chrome.clone(),
             },

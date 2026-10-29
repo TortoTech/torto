@@ -134,6 +134,8 @@ After installation, import one or more books from the bookshelf and open a book 
 
 Torto uses Rust `1.97.1`. The workspace package remains named `rebook-desktop`, while the shipped application is `Torto` (`torto.exe` on Windows).
 
+Run Cargo commands from the repository root so they use `.cargo/config.toml`, which omits SQLite extensions unused by Torto.
+
 ```powershell
 cargo run --locked -p rebook-desktop
 cargo fmt --all --check

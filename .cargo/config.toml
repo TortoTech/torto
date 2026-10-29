@@ -1,0 +1,6 @@
+[env]
+# libsqlite3-sys enables these optional extensions in its bundled build. Torto's
+# sync and statistics databases use ordinary tables and indexes, so omit them.
+# Keep WAL, transactions, foreign keys, locking, JSON and the database format.
+# -U overrides the bundled build script's earlier -D flags on supported compilers.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_DBSTAT_VTAB"

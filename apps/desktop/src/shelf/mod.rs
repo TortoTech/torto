@@ -1450,7 +1450,7 @@ impl ShelfFeature {
             let mut remove = false;
             let screen_width = crate::ui::overlay_rect(ctx).width();
             let modal_width = (screen_width - 48.0).clamp(280.0, 380.0).min(screen_width);
-            let modal = crate::ui::modal(ctx, egui::Id::new("shelf-remove-book-modal"), 0.42)
+            let modal = crate::ui::modal(ctx, egui::Id::unique("shelf-remove-book-modal"), 0.42)
                 .frame(
                     egui::Frame::new()
                         .fill(palette().surface)
@@ -1738,7 +1738,7 @@ fn shelf_search_field(ui: &mut egui::Ui, query: &mut String, hint: &str) -> egui
                     .desired_width(ui.available_width())
                     .margin(egui::Margin::ZERO)
                     .frame(egui::Frame::NONE)
-                    .vertical_align(egui::Align::Center),
+                    .align(egui::Align2::LEFT_CENTER),
             )
         },
     )

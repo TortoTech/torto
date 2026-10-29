@@ -1392,6 +1392,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bundled_sqlite_keeps_persistent_wal_transactions_without_unused_extensions() {
+        let store = test_store("sqlite-build");
+        {
+            let mut connection = store.connection().unwrap();
+            for option in [
+                "ENABLE_FTS3",
+                "ENABLE_FTS4",
+                "ENABLE_FTS5",
+                "ENABLE_RTREE",
+                "ENABLE_DBSTAT_VTAB",
+            ] {
+                let enabled: bool = connection
+                    .query_row("SELECT sqlite_compileoption_used(?1)", [option], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert!(!enabled, "unused SQLite extension is enabled: {option}");
+            }
+            let journal: String = connection
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal, "wal");
+            assert!(
+                connection
+                    .pragma_query_value::<bool, _>(None, "foreign_keys", |row| row.get(0))
+                    .unwrap()
+            );
+            connection
+                .execute_batch(
+                    "CREATE TABLE build_parent(id TEXT PRIMARY KEY);
+                 CREATE TABLE build_child(parent TEXT REFERENCES build_parent(id));",
+                )
+                .unwrap();
+            assert!(
+                connection
+                    .execute("INSERT INTO build_child VALUES ('missing')", [])
+                    .is_err()
+            );
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute("INSERT INTO build_parent VALUES ('committed')", [])
+                .unwrap();
+            transaction.commit().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute("INSERT INTO build_parent VALUES ('rolled-back')", [])
+                .unwrap();
+            transaction.rollback().unwrap();
+        }
+        {
+            let connection = store.connection().unwrap();
+            let values: Vec<String> = connection
+                .prepare("SELECT id FROM build_parent ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(values, ["committed"]);
+            let integrity: String = connection
+                .pragma_query_value(None, "integrity_check", |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+        }
+        cleanup(&store);
+    }
+
     fn test_store(name: &str) -> SyncStore {
         let path = std::env::temp_dir().join(format!(
             "rebook-sync-{name}-{}-{}.sqlite3",

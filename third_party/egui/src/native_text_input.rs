@@ -34,7 +34,7 @@ struct Bridge {
     composition: Option<(Id, core::ops::Range<usize>)>,
 }
 fn key() -> Id {
-    Id::new("egui-native-text-input")
+    Id::unique("egui-native-text-input")
 }
 pub fn begin_frame(ctx: &Context, enabled: bool, owner: Option<Id>, edit: Option<Edit>) {
     ctx.data_mut(|d| {

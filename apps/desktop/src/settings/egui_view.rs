@@ -32,7 +32,7 @@ struct ConfiguredModel {
 
 pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature) {
     let visible = ctx.animate_bool_with_time(
-        egui::Id::new("settings-overlay-motion"),
+        egui::Id::unique("settings-overlay-motion"),
         state.is_open(),
         0.18,
     );
@@ -52,7 +52,7 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
             .min(screen.height()),
     );
     let offset = Vec2::new(0.0, (1.0 - visible) * 12.0);
-    let modal_id = egui::Id::new("settings-modal");
+    let modal_id = egui::Id::unique("settings-modal");
     let modal_area = crate::ui::modal_area(ctx, modal_id).anchor(
         Align2::CENTER_CENTER,
         screen.center() - ctx.content_rect().center() + offset,
@@ -1130,7 +1130,7 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                             .width(SETTINGS_SELECT_WIDTH)
                             .selected_text(ai_provider_kind_label(language, selected_kind))
                             .show_ui(ui, |ui| {
-                                let search_id = ui.id().with("provider-search");
+                                let search_id = ui.scope_id().with("provider-search");
                                 let mut search = ui
                                     .data_mut(|data| data.get_temp::<String>(search_id))
                                     .unwrap_or_default();
@@ -1879,7 +1879,7 @@ fn default_font_selector(
         ReaderDefaultFont::Other => (language.text("其他", "Other"), &typography.other_font),
     };
     let selected_text = format!("{category} · {}", crate::fonts::family_label(ui.ctx(), family));
-    let arrow_id = ui.make_persistent_id("settings-default-font-arrow");
+    let arrow_id = egui::IdSalt::new("settings-default-font-arrow");
     let arrow_size = 14.0;
     let button = egui::Button::new((
         selected_text,
@@ -2011,7 +2011,7 @@ fn inherited_western_font_selector(
             format!("{category} · {}", crate::fonts::family_label(ui.ctx(), &choice.family))
         },
     );
-    let arrow_id = ui.make_persistent_id("settings-cjk-default-font-arrow");
+    let arrow_id = egui::IdSalt::new("settings-cjk-default-font-arrow");
     let arrow_size = 14.0;
     let button = egui::Button::new((
         selected_text,
@@ -2696,7 +2696,7 @@ fn text_field_sized_with_hint(
         egui::TextEdit::singleline(value)
             .hint_text(hint)
             .password(password)
-            .vertical_align(egui::Align::Center)
+            .align(egui::Align2::LEFT_CENTER)
             .margin(egui::Margin::symmetric(10, 0)),
     )
 }
@@ -2857,7 +2857,7 @@ mod tests {
                 .selected_text("Serif · Bitter")
                 .show_ui(ui, |_| {})
                 .response;
-            let arrow_id = ui.make_persistent_id("test-default-font-arrow");
+            let arrow_id = egui::IdSalt::new("test-default-font-arrow");
             let button = egui::Button::new((
                 "Serif · Bitter",
                 egui::Atom::grow(),

@@ -36,7 +36,7 @@ fn fixture(text: &str) -> (ITextStoreACP, Rc<RefCell<Data>>) {
     data.active = true;
     data.text = text.encode_utf16().collect();
     data.snapshot = Some(Snapshot {
-        id: egui::Id::new("test"),
+        id: egui::Id::unique("test"),
         text: text.into(),
         selection: CCursorRange::default(),
         rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 200.0)),

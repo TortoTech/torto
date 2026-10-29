@@ -2812,7 +2812,7 @@ impl DesktopReader {
                     display_number,
                 } => Some(FocusFootnote {
                     owner: None,
-                    stable_id: Some(egui::Id::new((
+                    stable_id: Some(egui::Id::unique((
                         "citation",
                         &source.start.spine,
                         &source.start.node,
@@ -2824,7 +2824,7 @@ impl DesktopReader {
                 }),
                 FocusFootnoteSource::Inline(text, number) => Some(FocusFootnote {
                     owner: None,
-                    stable_id: Some(egui::Id::new(("inline-note-slot", block_identity, slot))),
+                    stable_id: Some(egui::Id::unique(("inline-note-slot", block_identity, slot))),
                     text,
                     number,
                     citation: None,
@@ -2834,7 +2834,7 @@ impl DesktopReader {
                     target,
                     number,
                 } => {
-                    let id = egui::Id::new((
+                    let id = egui::Id::unique((
                         "linked-note-slot",
                         block_identity,
                         target.path(),

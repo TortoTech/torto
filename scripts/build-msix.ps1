@@ -29,7 +29,17 @@ if ($msixBuild -gt 65535 -or $major -ge 65535) {
 $msixVersion = "1.$major.$msixBuild.0"
 
 if (-not $SkipBuild) {
-    cargo build --locked --release --package rebook-desktop --manifest-path (Join-Path $repoRoot "Cargo.toml")
+    # Cargo discovers .cargo/config.toml from the working directory, including
+    # the bundled SQLite configuration. Also honor it when called from elsewhere.
+    Push-Location $repoRoot
+    try {
+        cargo build --locked --release --package rebook-desktop
+        if ($LASTEXITCODE -ne 0) {
+            throw "Cargo build failed with exit code $LASTEXITCODE."
+        }
+    } finally {
+        Pop-Location
+    }
 }
 
 $executable = Join-Path $repoRoot "target\release\torto.exe"

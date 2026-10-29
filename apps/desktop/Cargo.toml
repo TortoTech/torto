@@ -50,6 +50,7 @@ egui = { workspace = true, features = ["serde"] }
 egui_commonmark.workspace = true
 egui_commonmark_backend.workspace = true
 egui_extras.workspace = true
+egui_system_font_provider.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true
 fontdb.workspace = true
@@ -116,5 +117,7 @@ rebook-macos-open-file = { path = "../../crates/macos-open-file" }
 wgpu = { workspace = true, features = ["vulkan", "gles"] }
 
 [dev-dependencies]
+# Framework fixtures may use default Latin fonts; release builds use system fonts only.
+egui = { workspace = true, features = ["default_fonts"] }
 keyring-core = "1.0.0"
 rcgen = "0.14.10"

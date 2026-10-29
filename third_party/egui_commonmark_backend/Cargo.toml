@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.95"
 name = "egui_commonmark_backend"
-version = "0.25.0"
+version = "0.26.0"
 authors = ["Erlend Walstad"]
 build = false
 include = [
@@ -41,22 +41,34 @@ repository = "https://github.com/lampsitter/egui_commonmark"
 [features]
 better_syntax_highlighting = ["dep:syntect"]
 embedded_image = ["dep:data-url"]
+regex = [
+    "dep:fancy-regex",
+    "dep:bitflags",
+]
 
 [lib]
 name = "egui_commonmark_backend"
 path = "src/lib.rs"
+
+[dependencies.bitflags]
+version = "2"
+optional = true
 
 [dependencies.data-url]
 version = "0.3.1"
 optional = true
 
 [dependencies.egui]
-version = "0.36.0"
+version = "0.37.0"
 default-features = false
 
 [dependencies.egui_extras]
-version = "0.36.0"
+version = "0.37.0"
 default-features = false
+
+[dependencies.fancy-regex]
+version = "0.16"
+optional = true
 
 [dependencies.pulldown-cmark]
 version = "0.13"

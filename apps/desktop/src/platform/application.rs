@@ -319,6 +319,7 @@ impl Application {
         crate::ui::configure(
             &egui_ctx,
             app.interface_typography(),
+            app.monospace_font(),
             app.interface_language(),
             runtime.handle(),
         );

@@ -133,6 +133,9 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           ARCH: ${{ matrix.arch }}
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+          CARGO_PROFILE_RELEASE_STRIP: "none"
+          CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "packed"
         shell: bash
         run: |
           set -euo pipefail
@@ -153,10 +156,20 @@ jobs:
 
           file "$executable" | grep -F "$ARCH"
           plutil -lint "$app_bundle/Contents/Info.plist"
+          bash scripts/prepare-macos-symbols.sh "$executable" "dist/symbols/macos-$ARCH" "target/$TARGET/release/torto.dSYM"
           bash scripts/macos-signing.sh sign "$app_bundle"
           minimum_os=$(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' "$app_bundle/Contents/Info.plist")
           test "$minimum_os" = "15.0"
           otool -L "$executable"
+
+      - name: Upload debug symbols
+        if: ${{ !cancelled() && hashFiles('dist/symbols/**/torto.dSYM.tar.gz') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Torto-debug-macos-${{ matrix.arch }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: dist/symbols/macos-${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Check application startup
         if: "!startsWith(github.ref, 'refs/tags/') && inputs.release_tag == ''"

@@ -139,6 +139,8 @@ Torto 仍在持续开发中。当前不支持带 DRM 的电子书；PDF 在原�
 
 项目使用 Rust `1.97.1`，桌面端包名仍为 `rebook-desktop`，运行产物为 `torto.exe`。
 
+请在仓库根目录运行 Cargo 命令，以应用 `.cargo/config.toml` 中的 SQLite 裁剪配置。
+
 ```powershell
 # Windows 可选：安装 sccache 以复用编译缓存。
 winget install --id Mozilla.sccache --exact

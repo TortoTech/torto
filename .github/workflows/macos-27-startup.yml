@@ -59,6 +59,10 @@ jobs:
         run: cargo install cargo-bundle --version "$CARGO_BUNDLE_VERSION" --locked
 
       - name: Build and verify app
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+          CARGO_PROFILE_RELEASE_STRIP: "none"
+          CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "packed"
         shell: bash
         run: |
           set -euo pipefail
@@ -69,12 +73,22 @@ jobs:
           file "$app/Contents/MacOS/torto" | grep -F arm64
           plutil -lint "$app/Contents/Info.plist"
           test "$(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' "$app/Contents/Info.plist")" = "15.0"
+          bash scripts/prepare-macos-symbols.sh "$app/Contents/MacOS/torto" "dist/symbols/macos-arm64" "target/$TARGET/release/torto.dSYM"
           codesign --force --deep --sign - "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
           mkdir -p dist
           # Preserve executable modes and bundle symlinks between runners.
           tar -czf dist/Torto-arm64.tar.gz -C "$(dirname "$app")" Torto.app
           (cd dist && shasum -a 256 Torto-arm64.tar.gz > Torto-arm64.tar.gz.sha256)
+
+      - name: Upload debug symbols
+        if: ${{ !cancelled() && hashFiles('dist/symbols/**/torto.dSYM.tar.gz') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Torto-debug-macos-27-arm64-${{ github.sha }}-${{ github.run_attempt }}
+          path: dist/symbols/macos-arm64/
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Upload app for compatibility test
         uses: actions/upload-artifact@v7

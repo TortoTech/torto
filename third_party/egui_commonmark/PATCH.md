@@ -1,3 +1,9 @@
+# Retired local patch
+
+As of the egui 0.37 upgrade, this directory is historical source only and is
+not referenced by `[patch.crates-io]`. Production uses the official crates.io
+egui_commonmark 0.26.0, paired with Torto’s patched backend 0.26.0.
+
 # Local egui_commonmark compatibility patch
 
 This directory vendors `egui_commonmark 0.25.0` from crates.io. Upstream 0.25 now supports egui

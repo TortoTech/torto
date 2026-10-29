@@ -33,6 +33,7 @@ impl Navigation {
                 delta,
                 phase,
                 modifiers,
+                ..
             } = event
             else {
                 continue;
@@ -108,6 +109,7 @@ mod tests {
 
     fn event(unit: MouseWheelUnit, delta: f32, phase: TouchPhase) -> Event {
         Event::MouseWheel {
+            source: egui::MouseWheelSource::Unknown,
             unit,
             delta: Vec2::new(0.0, delta),
             phase,
@@ -235,12 +237,14 @@ mod tests {
         let now = Instant::now();
         let events = [
             Event::MouseWheel {
+                source: egui::MouseWheelSource::Unknown,
                 unit: MouseWheelUnit::Point,
                 delta: Vec2::new(0.0, -50.0),
                 phase: TouchPhase::Move,
                 modifiers: Modifiers::CTRL,
             },
             Event::MouseWheel {
+                source: egui::MouseWheelSource::Unknown,
                 unit: MouseWheelUnit::Point,
                 delta: Vec2::new(50.0, 0.0),
                 phase: TouchPhase::Move,

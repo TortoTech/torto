@@ -638,6 +638,7 @@ impl DesktopApp {
             crate::ui::apply_interface_typography(
                 ctx,
                 &applied.interface_typography,
+                &applied.typography.monospace_font,
                 applied.language,
             );
             crate::ui::set_theme(ctx, applied.theme);
@@ -661,6 +662,10 @@ impl DesktopApp {
 
     pub(crate) fn interface_typography(&self) -> &InterfaceTypography {
         &self.settings.applied().interface_typography
+    }
+
+    pub(crate) fn monospace_font(&self) -> &str {
+        &self.settings.applied().typography.monospace_font
     }
 
     pub(crate) fn interface_language(&self) -> crate::preferences::AppLanguage {

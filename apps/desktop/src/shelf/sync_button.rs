@@ -85,7 +85,7 @@ impl SyncButtonState {
                         .paint_at(ui, rect.shrink(7.0));
                     response.widget_info(|| {
                         egui::WidgetInfo::labeled(
-                            egui::WidgetType::ProgressIndicator,
+                            egui::Role::ProgressIndicator,
                             false,
                             language.text("云同步", "Cloud sync"),
                         )
