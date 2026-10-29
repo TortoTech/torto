@@ -1,6 +1,9 @@
 name: Build Windows installer
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
@@ -12,7 +15,7 @@ permissions:
 
 concurrency:
   group: windows-installer-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-windows-installer:
@@ -80,12 +83,18 @@ jobs:
         if: steps.cargo-wix-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-wix --version $env:CARGO_WIX_VERSION --locked
 
-      - name: Warm release build cache
-        if: github.ref == 'refs/heads/main'
+      - name: Build release executable
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+          CARGO_PROFILE_RELEASE_STRIP: "none"
         run: cargo build --locked --release --package rebook-desktop
 
       - name: Build MSI installer
         if: startsWith(github.ref, 'refs/tags/')
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+          CARGO_PROFILE_RELEASE_STRIP: "none"
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -93,6 +102,19 @@ jobs:
             --package rebook-desktop `
             --nocapture `
             --output "dist\Torto-$env:TORTO_VERSION-x86_64.msi"
+
+      - name: Collect debug symbols
+        shell: pwsh
+        run: .\scripts\collect-windows-symbols.ps1
+
+      - name: Upload debug symbols
+        if: ${{ !cancelled() && hashFiles('dist/symbols/**/*.pdb') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Torto-debug-windows-x86_64-${{ github.sha }}-${{ github.run_attempt }}
+          path: dist/symbols/windows-x86_64/
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Build Microsoft Store MSIX package
         if: startsWith(github.ref, 'refs/tags/')

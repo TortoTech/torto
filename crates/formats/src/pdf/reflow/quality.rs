@@ -37,7 +37,10 @@ pub fn assess(path: &Path, book_id: &str, cancelled: &AtomicBool) -> Result<Asse
     let tags = HashMap::new();
     for index in sample_pages(publication.page_count) {
         check_cancelled(cancelled)?;
-        let page = extract::page(&publication.pdf, index, &tags);
+        let page = extract::publication_page(&publication, index, &tags);
+        if publication.missing_font_resources() {
+            return Err("PDF 缺少中文回退字体，请下载默认字体后重试 / Download the default CJK font before converting this PDF".into());
+        }
         result.sampled_pages += 1;
         match page_kind(&page) {
             PageKind::Native => result.native_pages += 1,

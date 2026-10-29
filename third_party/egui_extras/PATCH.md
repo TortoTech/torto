@@ -1,3 +1,9 @@
+# Retired local patch
+
+As of the egui 0.37 upgrade, this directory is historical source only and is
+not referenced by `[patch.crates-io]`. Production uses the official crates.io
+egui_extras 0.37.0, which includes the stable table/virtual-row ID fixes.
+
 # Local egui_extras patch
 
 Based on the crates.io 0.36.2 release, licensed under MIT OR Apache-2.0.

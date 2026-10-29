@@ -91,6 +91,10 @@ impl PdfModeSource {
 }
 
 impl BookSource for PdfModeSource {
+    fn missing_font_resources(&self) -> bool {
+        self.generation.load().source.get().and_then(|result| result.as_ref().ok())
+            .is_some_and(|source| source.missing_font_resources())
+    }
     fn book(&self) -> &Book {
         &self.book
     }

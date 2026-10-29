@@ -1,4 +1,4 @@
-use egui::{Color32, Rect, Response, Sense, Ui, Vec2, Widget, WidgetInfo, WidgetType};
+use egui::{Color32, Rect, Response, Sense, Ui, Vec2, Widget, WidgetInfo, Role};
 
 macro_rules! asset {
     ($name:literal) => {{
@@ -202,7 +202,7 @@ impl Widget for IconWidget {
             );
         }
         response.widget_info(|| {
-            WidgetInfo::labeled(WidgetType::Image, ui.is_enabled(), self.glyph.name())
+            WidgetInfo::labeled(Role::Image, ui.is_enabled(), self.glyph.name())
         });
         response
     }

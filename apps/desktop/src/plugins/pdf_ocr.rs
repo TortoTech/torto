@@ -248,6 +248,7 @@ impl PdfOcrSourceController {
 }
 
 impl BookSource for PdfOcrSourceController {
+    fn missing_font_resources(&self) -> bool { self.active().missing_font_resources() }
     fn book(&self) -> &Book {
         self.active().book()
     }

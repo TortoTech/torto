@@ -28,16 +28,16 @@ pub(crate) struct Geometry {
 }
 
 fn state_id() -> egui::Id {
-    egui::Id::new("native-window-state")
+    egui::Id::unique("native-window-state")
 }
 fn geometry_id() -> egui::Id {
-    egui::Id::new("native-window-geometry")
+    egui::Id::unique("native-window-geometry")
 }
 
 fn controls_layer() -> egui::LayerId {
     // Native caption controls must stay above app overlays, including Tooltip
     // image previews. Sharing their order lets a newly opened preview dim them twice.
-    egui::LayerId::new(egui::Order::Debug, egui::Id::new("window-caption-buttons"))
+    egui::LayerId::new(egui::Order::Debug, egui::Id::unique("window-caption-buttons"))
 }
 
 pub(crate) fn set_state(ctx: &egui::Context, state: WindowState) {
@@ -51,7 +51,7 @@ pub(crate) fn begin_frame(ctx: &egui::Context) {
     #[cfg(target_os = "macos")]
     {
         if let Some(inset) = rebook_macos_open_file::layout_titlebar_buttons(HEIGHT) {
-            ctx.data_mut(|data| data.insert_temp(egui::Id::new("mac-titlebar-inset"), inset));
+            ctx.data_mut(|data| data.insert_temp(egui::Id::unique("mac-titlebar-inset"), inset));
         }
         let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
         let header_bottom = ctx.content_rect().top() + HEIGHT;
@@ -297,7 +297,7 @@ pub(crate) fn paint_controls(ctx: &egui::Context) {
                                 !state.maximized,
                             )),
                             _ => ctx.data_mut(|data| {
-                                data.insert_temp(egui::Id::new("window-close-requested"), true);
+                                data.insert_temp(egui::Id::unique("window-close-requested"), true);
                             }),
                         }
                     }
@@ -316,7 +316,7 @@ pub(crate) fn paint_controls(ctx: &egui::Context) {
 }
 
 pub(crate) fn take_close_request(ctx: &egui::Context) -> bool {
-    ctx.data_mut(|data| data.remove_temp::<bool>(egui::Id::new("window-close-requested")))
+    ctx.data_mut(|data| data.remove_temp::<bool>(egui::Id::unique("window-close-requested")))
         .unwrap_or(false)
 }
 
@@ -517,7 +517,7 @@ mod tests {
 #[cfg(target_os = "macos")]
 pub(crate) fn left_edge(ctx: &egui::Context) -> f32 {
     ctx.content_rect().left() + if state(ctx).fullscreen { 0.0 } else {
-        ctx.data(|data| data.get_temp::<f32>(egui::Id::new("mac-titlebar-inset"))).unwrap_or(86.0)
+        ctx.data(|data| data.get_temp::<f32>(egui::Id::unique("mac-titlebar-inset"))).unwrap_or(86.0)
     }
 }
 
@@ -558,7 +558,7 @@ mod mac_tests {
         let ctx = egui::Context::default();
         let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 600.0))), ..Default::default() }, |ui| {
             let ctx = ui.ctx();
-            ctx.data_mut(|data| data.insert_temp(egui::Id::new("mac-titlebar-inset"), 88.0_f32));
+            ctx.data_mut(|data| data.insert_temp(egui::Id::unique("mac-titlebar-inset"), 88.0_f32));
             header(ctx, Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, HEIGHT)));
             assert_eq!(left_edge(ctx), 88.0);
             assert_eq!(reserve_width(ctx), 0.0);

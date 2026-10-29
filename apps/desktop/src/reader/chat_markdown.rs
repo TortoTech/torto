@@ -945,10 +945,10 @@ fn preview_mode_control(ui: &mut egui::Ui, mode: &mut PreviewMode, language: App
     let code_rect = egui::Rect::from_min_max(egui::pos2(rect.center().x, rect.min.y), rect.max);
     let preview_response = ui.interact(
         preview_rect,
-        ui.id().with("preview-mode-preview"),
+        ui.scope_id().with("preview-mode-preview"),
         Sense::click(),
     );
-    let code_response = ui.interact(code_rect, ui.id().with("preview-mode-code"), Sense::click());
+    let code_response = ui.interact(code_rect, ui.scope_id().with("preview-mode-code"), Sense::click());
     if preview_response.clicked() {
         *mode = PreviewMode::Preview;
     }

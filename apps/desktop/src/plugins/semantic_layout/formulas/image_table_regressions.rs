@@ -51,10 +51,87 @@ fn synthetic(with_inline: bool) -> (Arc<dyn BookSource>, Section) {
     (Arc::new(source), section)
 }
 
+fn model_request(socket: &mut std::net::TcpStream) -> Value {
+    use std::io::{BufRead, Read};
+    use std::time::Duration;
+    // Accepted sockets inherit O_NONBLOCK on macOS/BSD. A read timeout does
+    // not restore blocking mode: a split request would fail with WouldBlock.
+    socket.set_nonblocking(false).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = std::io::BufReader::new(socket);
+    let mut len = 0;
+    loop {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).expect("mock request headers") > 0,
+            "mock client closed before the headers were complete"
+        );
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            len = n.trim().parse().unwrap();
+        }
+    }
+    assert!(
+        len > 0 && len <= 16 * 1024 * 1024,
+        "invalid mock request length: {len}"
+    );
+    let mut bytes = vec![0; len];
+    reader
+        .read_exact(&mut bytes)
+        .expect("complete mock request body");
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[test]
+fn mock_model_reads_fragmented_requests_on_an_initially_nonblocking_socket() {
+    use std::{
+        io::Write,
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+        time::Duration,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (ready, reading) = mpsc::channel();
+    let client = std::thread::spawn(move || {
+        let mut socket = TcpStream::connect(address).unwrap();
+        reading.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Nothing is readable at the server's first read, then both the header
+        // and JSON body arrive in pieces as they can under hosted-runner load.
+        std::thread::sleep(Duration::from_millis(30));
+        let body = json!({"message":"中文", "r":[{"ss":"tb"}]}).to_string();
+        socket
+            .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nContent-Len")
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        write!(socket, "gth: {}\r\n\r\n", body.len()).unwrap();
+        for part in body.as_bytes().chunks(4) {
+            socket.write_all(part).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    let (mut socket, _) = listener.accept().unwrap();
+    // Force the macOS inheritance behavior on every platform running this test.
+    socket.set_nonblocking(true).unwrap();
+    ready.send(()).unwrap();
+    assert_eq!(
+        model_request(&mut socket),
+        json!({"message":"中文", "r":[{"ss":"tb"}]})
+    );
+    client.join().unwrap();
+}
+
 /// Exercise the real recognizer entry, not only table parsing or record(). A
 /// preexisting current-generation negative chapter result must be rechecked.
 fn check(source: Arc<dyn BookSource>, original: Section, expected_images: usize) -> Section {
-    use std::io::{BufRead, Read, Write};
+    use std::io::Write;
     use std::time::{Duration, Instant};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -70,24 +147,7 @@ fn check(source: Arc<dyn BookSource>, original: Section, expected_images: usize)
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
             };
-            socket
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
-            let mut reader = std::io::BufReader::new(&mut socket);
-            let mut len = 0;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    len = n.trim().parse().unwrap();
-                }
-            }
-            let mut bytes = vec![0; len];
-            reader.read_exact(&mut bytes).unwrap();
-            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            let request = model_request(&mut socket);
             let content = request["messages"][1]["content"].as_array().unwrap();
             let schema = &request["response_format"]["json_schema"]["schema"];
             let properties = &schema["properties"]["r"]["items"]["properties"];

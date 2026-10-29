@@ -556,6 +556,7 @@ fn sidebar_reserves_text_width_and_margins_and_remembers_preferred_width() {
     reader.toggle_assistant_panel(AssistantPanel::Chat);
     reader.ui.assistant_width = 560.0;
     let ctx = egui::Context::default();
+    let mut panel_id = egui::Id::NULL;
     for (width, expected_sidebar) in [(1_200.0, 560.0), (748.0, 300.0), (1_200.0, 560.0)] {
         let mut remaining = 0.0;
         let mut output = ctx.run_ui(
@@ -564,6 +565,7 @@ fn sidebar_reserves_text_width_and_margins_and_remembers_preferred_width() {
                 ..Default::default()
             },
             |ui| {
+                panel_id = ui.make_persistent_id("reader-assistant");
                 reader.show_side_panels(ui);
                 remaining = ui.available_rect_before_wrap().width();
             },
@@ -571,7 +573,7 @@ fn sidebar_reserves_text_width_and_margins_and_remembers_preferred_width() {
         output.shapes.clear();
         output.textures_delta.clear();
         let panel =
-            egui::containers::panel::PanelState::load(&ctx, egui::Id::new("reader-assistant"))
+            egui::containers::panel::PanelState::load(&ctx, panel_id)
                 .unwrap();
         assert!(
             (panel.size().x - expected_sidebar).abs() < 1.0,
@@ -589,7 +591,8 @@ fn sidebar_reserves_text_width_and_margins_and_remembers_preferred_width() {
             ..Default::default()
         },
         |ui| {
-            reader.show_side_panels(ui);
+            panel_id = ui.make_persistent_id("reader-assistant");
+                reader.show_side_panels(ui);
         },
     );
     output.shapes.clear();
@@ -637,7 +640,7 @@ fn sidebar_wheel_does_not_steal_body_or_footnote_scroll() {
     ] {
         reader.ui.focus_footnotes_visible = footnotes;
         ctx.data_mut(|data| {
-            data.insert_temp(egui::Id::new("reader-footnote-popup-rect"), footnote_rect)
+            data.insert_temp(egui::Id::unique("reader-footnote-popup-rect"), footnote_rect)
         });
         let mut routed = 0.0;
         let mut untouched = 0.0;

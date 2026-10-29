@@ -96,7 +96,7 @@ pub(super) fn save_regions<'a>(
     let pixmap = render_page_region(
         page,
         cache,
-        &interpreter_settings(),
+        &publication.interpreter,
         &PageRasterSettings {
             x_scale: scale,
             y_scale: scale,
@@ -155,7 +155,7 @@ fn export_simple_images(
         Rect::new(0.0, 0.0, native.width, native.height),
         &cache,
         page.xref(),
-        interpreter_settings(),
+        publication.interpreter.clone(),
     );
     let mut exporter = Exporter {
         page: native,

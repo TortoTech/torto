@@ -49,7 +49,7 @@ fn opening_waits_for_context_and_restored_images_before_painting_a_stable_form()
                 matches!(shape.shape, egui::Shape::Text(_))
             });
             output.textures_delta.clear();
-            let rect = ctx.memory(|memory| memory.area_rect(egui::Id::new("feedback-modal"))).unwrap();
+            let rect = ctx.memory(|memory| memory.area_rect(egui::Id::unique("feedback-modal"))).unwrap();
             (has_text, rect)
         };
         for _ in 0..5 {
@@ -105,7 +105,7 @@ fn feedback_motion_preserves_size_and_blocks_input_until_the_exit_finishes() {
         let painted = !output.shapes.is_empty();
         let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
         output.textures_delta.clear();
-        (painted, delay, ctx.memory(|memory| memory.area_rect(egui::Id::new("feedback-modal"))))
+        (painted, delay, ctx.memory(|memory| memory.area_rect(egui::Id::unique("feedback-modal"))))
     };
     assert!(!render(&mut feature, 0.0, vec![]).0);
     feature.visible = true;
@@ -176,7 +176,7 @@ fn submitted_dialog_shrinks_and_recenters_after_a_tall_form() {
                 );
                 output.textures_delta.clear();
             }
-            ctx.memory(|memory| memory.area_rect(egui::Id::new("feedback-modal")))
+            ctx.memory(|memory| memory.area_rect(egui::Id::unique("feedback-modal")))
                 .unwrap()
         };
         let form = render(&mut feature);

@@ -275,6 +275,8 @@ fn compact_multi_container_response_is_recognized_and_committed_in_one_request()
             assert!(started.elapsed() < Duration::from_secs(10));
             std::thread::sleep(Duration::from_millis(5));
         };
+        // macOS/BSD can inherit the listener's nonblocking flag on accept.
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();

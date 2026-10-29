@@ -1435,6 +1435,9 @@ fn default_logical_alignment() -> bool {
 
 /// Lazy source boundary: parsers produce stable reading IR one section at a time.
 pub trait BookSource: Send + Sync {
+    /// Memory-only status: a render encountered an unavailable font resource.
+    /// Wrappers forward this without forcing their lazy source to load.
+    fn missing_font_resources(&self) -> bool { false }
     /// Apply an already prepared, memory-only media catalog to popup content.
     /// Implementations must never parse sections or load resources here.
     fn prepare_media_references(&self, _content: &mut Vec<Inline>, _origin: Option<&SourceRange>) {}

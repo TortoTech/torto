@@ -213,6 +213,7 @@ pub(crate) fn open_reader_in_viewport(
         local_store,
         viewport,
         None,
+        None,
         |_, _, _, _, viewport| Some(viewport),
     )
 }
@@ -226,6 +227,7 @@ pub(crate) fn open_reader_staged(
     local_store: SyncStore,
     viewport: LayoutViewport,
     initial_href: Option<&rebook_publication::PublicationUrl>,
+    initial_locator: Option<&rebook_publication::LocatorV1>,
     mut publish_toc: impl FnMut(
         Arc<[rebook_publication::TocEntry]>,
         ReadingMode,
@@ -481,7 +483,7 @@ pub(crate) fn open_reader_staged(
             rebook_publication::LocatorV1::at_start(source.book().id.clone(), href.clone());
         locator.progression = None;
         locator
-    });
+    }).or_else(|| initial_locator.cloned());
     let mut restored_source_range = stored_progress
         .as_ref()
         .and_then(|progress| progress.locator.source.clone());
@@ -494,7 +496,7 @@ pub(crate) fn open_reader_staged(
         .as_ref()
         .or_else(|| stored_progress.as_ref().map(|progress| &progress.locator));
     if explicit_locator.is_some() {
-        restored_source_range = None;
+        restored_source_range = initial_locator.and_then(|locator| locator.source.clone());
     }
     let mut reader = if let Some(locator) = open_locator {
         match ReaderSession::open_deferred_with_fonts(
@@ -672,7 +674,7 @@ pub(crate) fn probe_memory(path: &Path) -> Result<(), Box<dyn std::error::Error 
     let book = library.books().iter().find(|book| book.path == path);
     let settings = SyncSettings::load_default()?;
     let store = SyncStore::open_default(settings.device_id)?;
-    let fonts = crate::fonts::embedded_reader_fonts();
+    let fonts = crate::fonts::reader_fonts();
     memory_checkpoint("library_loaded");
     for cycle in 0..3 {
         println!("cycle={cycle}");
@@ -991,6 +993,7 @@ pub(super) struct DesktopReader {
     error_timer: TransientMessageTimer,
     source_path: PathBuf,
     reopen_requested: Option<PathBuf>,
+    reopen_font_locator: Option<rebook_publication::LocatorV1>,
     reopen_notice: Option<String>,
     reopen_error: Option<String>,
     pub(super) exit_requested: bool,
@@ -2809,7 +2812,7 @@ impl DesktopReader {
                     display_number,
                 } => Some(FocusFootnote {
                     owner: None,
-                    stable_id: Some(egui::Id::new((
+                    stable_id: Some(egui::Id::unique((
                         "citation",
                         &source.start.spine,
                         &source.start.node,
@@ -2821,7 +2824,7 @@ impl DesktopReader {
                 }),
                 FocusFootnoteSource::Inline(text, number) => Some(FocusFootnote {
                     owner: None,
-                    stable_id: Some(egui::Id::new(("inline-note-slot", block_identity, slot))),
+                    stable_id: Some(egui::Id::unique(("inline-note-slot", block_identity, slot))),
                     text,
                     number,
                     citation: None,
@@ -2831,7 +2834,7 @@ impl DesktopReader {
                     target,
                     number,
                 } => {
-                    let id = egui::Id::new((
+                    let id = egui::Id::unique((
                         "linked-note-slot",
                         block_identity,
                         target.path(),
@@ -3751,6 +3754,27 @@ impl DesktopReader {
 
     pub(crate) fn prepare_for_shutdown(&self) {
         self.persist_progress();
+    }
+
+    pub(crate) fn uses_fonts(&self, fonts: &[Blob<u8>]) -> bool {
+        self.reader.uses_fonts(fonts)
+    }
+
+    pub(crate) fn missing_font_resources(&self) -> bool { self.source.missing_font_resources() }
+
+    pub(crate) fn has_status_notice(&self) -> bool {
+        self.error.is_some() || self.notice.is_some() || self.translation.error.is_some()
+    }
+
+    pub(crate) fn apply_downloaded_fonts(&mut self) {
+        // Reopening uses the existing worker, source locator and cancellation
+        // protocol, including fresh PDF/font/raster caches. No UI-thread reflow.
+        self.reopen_font_locator = Some(self.progress_locator());
+        self.reopen_requested = Some(self.source_path.clone());
+    }
+
+    pub(crate) fn take_font_reopen_locator(&mut self) -> Option<rebook_publication::LocatorV1> {
+        self.reopen_font_locator.take()
     }
 
     pub(crate) fn take_reopen_request(&mut self) -> Option<PathBuf> {
@@ -4834,6 +4858,7 @@ impl DesktopReader {
             error_timer: TransientMessageTimer::default(),
             source_path,
             reopen_requested: None,
+            reopen_font_locator: None,
             reopen_notice: None,
             reopen_error: None,
             exit_requested: false,
@@ -5223,6 +5248,7 @@ mod tests {
             None,
             store,
             LayoutViewport::new(1000, 700).unwrap(),
+            None,
             None,
             |_, _, title, _, viewport| {
                 titles.push(title);

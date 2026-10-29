@@ -2,6 +2,7 @@ mod http_loader;
 pub(crate) mod image_preview;
 mod icons;
 mod interface_fonts;
+pub(crate) use interface_fonts::resources_changed as font_resources_changed;
 mod loading_spinner;
 mod svg_loader;
 
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use egui::emath::GuiRounding;
 use egui::{
     Align2, Color32, ColorImage, CornerRadius, Rect, Response, RichText, Sense, Stroke, TextStyle,
-    Ui, Vec2, WidgetInfo, WidgetType,
+    Ui, Vec2, WidgetInfo, Role,
 };
 
 pub(crate) use interface_fonts::resolve as resolve_interface_font_fallbacks;
@@ -234,6 +235,7 @@ pub(crate) fn footnote_link_color() -> Color32 {
 pub(crate) fn configure(
     ctx: &egui::Context,
     interface_typography: &InterfaceTypography,
+    monospace_family: &str,
     language: AppLanguage,
     runtime: &tokio::runtime::Handle,
 ) {
@@ -251,7 +253,7 @@ pub(crate) fn configure(
         options.reduce_texture_memory = true;
     });
     configure_tessellation(ctx);
-    apply_interface_typography(ctx, interface_typography, language);
+    apply_interface_typography(ctx, interface_typography, monospace_family, language);
 
     apply_visuals(ctx, &Palette::light());
     ctx.all_styles_mut(|style| {
@@ -296,6 +298,7 @@ fn configure_tessellation(ctx: &egui::Context) {
 pub(crate) fn apply_interface_typography(
     ctx: &egui::Context,
     interface_typography: &InterfaceTypography,
+    monospace_family: &str,
     language: AppLanguage,
 ) {
     let mut interface_typography = interface_typography.clone();
@@ -303,7 +306,7 @@ pub(crate) fn apply_interface_typography(
     INTERFACE_FONT_SIZE_BITS.store(interface_typography.font_size.to_bits(), Ordering::Relaxed);
     let extra_text_line_spacing = interface_extra_text_line_spacing(interface_typography.font_size);
 
-    interface_fonts::configure(ctx, &interface_typography, language);
+    interface_fonts::configure(ctx, &interface_typography, monospace_family, language);
 
     ctx.all_styles_mut(|style| {
         style.text_styles = egui::style::default_text_styles();
@@ -424,6 +427,38 @@ pub(crate) fn show_toast(
     anchor_offset: Vec2,
     dismissible: bool,
 ) -> bool {
+    show_toast_content(ctx, id, message, kind,
+        ToastPresentation { anchor_offset, dismissible, show_icon: true }, None::<fn(&mut Ui)>)
+}
+
+/// Actionable notifications share the existing reader notification shell.
+pub(crate) fn show_toast_with_actions(
+    ctx: &egui::Context,
+    id: &'static str,
+    message: &str,
+    kind: ToastKind,
+    anchor_offset: Vec2,
+    actions: impl FnOnce(&mut Ui),
+) -> bool {
+    show_toast_content(ctx, id, message, kind,
+        ToastPresentation { anchor_offset, dismissible: true, show_icon: false }, Some(actions))
+}
+
+struct ToastPresentation {
+    anchor_offset: Vec2,
+    dismissible: bool,
+    show_icon: bool,
+}
+
+fn show_toast_content(
+    ctx: &egui::Context,
+    id: &'static str,
+    message: &str,
+    kind: ToastKind,
+    presentation: ToastPresentation,
+    mut actions: Option<impl FnOnce(&mut Ui)>,
+) -> bool {
+    let ToastPresentation { anchor_offset, dismissible, show_icon } = presentation;
     let palette = palette();
     let (icon_kind, fill, border, foreground) = match kind {
         ToastKind::Success => (
@@ -455,16 +490,17 @@ pub(crate) fn show_toast(
     } else {
         0.0
     };
-    let fixed_content_width = TOAST_ICON_SIZE + TOAST_ITEM_SPACING + close_width;
+    let icon_width = if show_icon { TOAST_ICON_SIZE + TOAST_ITEM_SPACING } else { 0.0 };
+    let fixed_content_width = icon_width + close_width;
     let available_width = (ctx.content_rect().width() - TOAST_SCREEN_MARGIN).max(1.0);
     let max_width = TOAST_MAX_WIDTH.min(available_width);
-    let min_width = TOAST_MIN_WIDTH.min(max_width);
+    let min_width = if actions.is_some() { 220.0_f32 } else { TOAST_MIN_WIDTH }.min(max_width);
     let width =
         (TOAST_HORIZONTAL_PADDING + fixed_content_width + text_width).clamp(min_width, max_width);
     let label_width = (width - TOAST_HORIZONTAL_PADDING - fixed_content_width).max(1.0);
     let mut dismissed = false;
 
-    egui::Area::new(id.into())
+    egui::Area::new(egui::Id::unique(id))
         .order(egui::Order::Tooltip)
         .anchor(Align2::RIGHT_TOP, anchor_offset)
         .show(ctx, |ui| {
@@ -477,7 +513,9 @@ pub(crate) fn show_toast(
                     ui.set_width((width - TOAST_HORIZONTAL_PADDING).max(1.0));
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = TOAST_ITEM_SPACING;
-                        ui.add(icon(icon_kind).size(TOAST_ICON_SIZE).color(foreground));
+                        if show_icon {
+                            ui.add(icon(icon_kind).size(TOAST_ICON_SIZE).color(foreground));
+                        }
                         ui.vertical(|ui| {
                             ui.set_width(label_width);
                             ui.add(
@@ -486,6 +524,10 @@ pub(crate) fn show_toast(
                                 )
                                 .wrap(),
                             );
+                            if let Some(actions) = actions.take() {
+                                ui.add_space(7.0);
+                                actions(ui);
+                            }
                         });
                         if dismissible && small_icon_button(ui, Icon::X).clicked() {
                             dismissed = true;
@@ -561,7 +603,7 @@ fn painted_icon_button_sized(
             foreground,
         );
     }
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), label));
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), label));
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -645,7 +687,7 @@ pub(crate) fn navigation_button(ui: &mut Ui, glyph: Icon, label: &str, selected:
         ui.painter()
             .galley(egui::pos2(rect.left() + 38.0, text_y), galley, foreground);
     }
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), label));
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), label));
     response
 }
 
@@ -679,7 +721,7 @@ pub(crate) fn navigation_text_button(ui: &mut Ui, label: &str, selected: bool) -
             foreground,
         );
     }
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), label));
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), label));
     response
 }
 
@@ -763,7 +805,7 @@ mod tests {
                                 ),
                             );
                             let response =
-                                modal(&ctx, egui::Id::new("caption-modal-test"), 0.46 * progress)
+                                modal(&ctx, egui::Id::unique("caption-modal-test"), 0.46 * progress)
                                     .frame(egui::Frame::new().fill(Color32::WHITE))
                                     .show(&ctx, |ui| {
                                         ui.set_width(400.0);
@@ -909,7 +951,13 @@ mod tests {
     fn chinese_system_ui_keeps_latin_and_cjk_on_the_same_font_baseline() {
         for language in [AppLanguage::English, AppLanguage::SimplifiedChinese] {
             let ctx = egui::Context::default();
-            apply_interface_typography(&ctx, &InterfaceTypography::default(), language);
+            apply_interface_typography(
+                &ctx,
+                &InterfaceTypography::default(),
+                rebook_layout::default_monospace_font(),
+                language,
+            );
+            interface_fonts::wait_for_monospace(&ctx);
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 for size in [12.0, 14.0, 18.0] {
                     let galley = ui.painter().layout_no_wrap(

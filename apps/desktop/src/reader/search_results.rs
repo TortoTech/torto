@@ -81,7 +81,7 @@ impl SearchResults {
                         continue;
                     }
                     let response = ui
-                        .interact(card_rect, ui.id().with(index), egui::Sense::click())
+                        .interact(card_rect, ui.scope_id().with(index), egui::Sense::click())
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
                     let colors = palette();
                     let fill = if response.hovered() || response.is_pointer_button_down_on() {
@@ -513,7 +513,7 @@ mod tests {
         });
         output.drop_without_applying_deltas();
         let mut state = egui::scroll_area::State::load(&ctx, scroll_id).unwrap();
-        state.offset.y = cache.cards[100].top;
+        state.set_offset(egui::vec2(state.unclamped_offset().x, cache.cards[100].top));
         state.store(&ctx, scroll_id);
         // Publish the scrolled widget positions before hit testing the next click.
         let output = ctx.run_ui(input.clone(), |ui| {

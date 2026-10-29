@@ -290,8 +290,8 @@ mod tests {
             ui_thread: std::thread::current().id(),
         });
         let mut loader = FootnoteLoader::default();
-        let first = egui::Id::new("one");
-        let second = egui::Id::new("two");
+        let first = egui::Id::unique("one");
+        let second = egui::Id::unique("two");
         loader.register(first, target1, "1".into());
         loader.register(second, target2, "2".into());
         assert_eq!(parses.load(Ordering::Relaxed), 0);
@@ -299,7 +299,7 @@ mod tests {
         // Direct citation/inline text can precede a linked note in the popup.
         // These rows must not consume the linked-reference loading budget.
         let ids = (0..CACHE_ENTRIES)
-            .map(|index| egui::Id::new(("citation", index)))
+            .map(|index| egui::Id::unique(("citation", index)))
             .chain([first, first]);
         loader.prepare(ids, source.clone(), &ctx);
         let finished = loader
@@ -343,23 +343,23 @@ mod tests {
         loader.reset();
         loader.accept(Finished {
             generation: 0,
-            notes: vec![(egui::Id::new(0), Some("old".into()))],
+            notes: vec![(egui::Id::unique(0), Some("old".into()))],
         });
         assert!(loader.cache.is_empty());
         for i in 0..CACHE_ENTRIES + 10 {
             loader.accept(Finished {
                 generation: loader.generation,
-                notes: vec![(egui::Id::new(i), Some("note".into()))],
+                notes: vec![(egui::Id::unique(i), Some("note".into()))],
             });
         }
         assert_eq!(loader.cache.len(), CACHE_ENTRIES);
         assert_eq!(loader.bytes, CACHE_ENTRIES * 4);
         loader.accept(Finished {
             generation: loader.generation,
-            notes: vec![(egui::Id::new("large"), Some("x".repeat(CACHE_BYTES + 1)))],
+            notes: vec![(egui::Id::unique("large"), Some("x".repeat(CACHE_BYTES + 1)))],
         });
         assert_eq!(
-            loader.cache[&egui::Id::new("large")]
+            loader.cache[&egui::Id::unique("large")]
                 .as_ref()
                 .unwrap()
                 .len(),
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn interested_notes_are_not_evicted_into_a_reload_repaint_loop() {
         let mut loader = FootnoteLoader::default();
-        let ids: Vec<_> = (0..BATCH_SIZE).map(egui::Id::new).collect();
+        let ids: Vec<_> = (0..BATCH_SIZE).map(egui::Id::unique).collect();
         loader.interests = ids.iter().copied().collect();
         loader.accept(Finished {
             generation: 0,
@@ -389,7 +389,7 @@ mod tests {
         loader.interests.clear();
         loader.accept(Finished {
             generation: 0,
-            notes: vec![(egui::Id::new("new"), Some("new".into()))],
+            notes: vec![(egui::Id::unique("new"), Some("new".into()))],
         });
         assert!(loader.bytes <= CACHE_BYTES);
     }

@@ -1336,7 +1336,7 @@ fn reading_history_row(
         }
         response.widget_info(|| {
             egui::WidgetInfo::labeled(
-                egui::WidgetType::Label,
+                egui::Role::Label,
                 ui.is_enabled(),
                 description.as_str(),
             )
@@ -1447,7 +1447,7 @@ fn period_range_label(ui: &mut egui::Ui, parts: &[String]) -> egui::Response {
         x += advance;
     }
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), parts.join(" "))
+        egui::WidgetInfo::labeled(egui::Role::Label, ui.is_enabled(), parts.join(" "))
     });
     response
 }
@@ -1510,7 +1510,10 @@ fn fitted_statistic_text(
     }
     // Bottom alignment aligns line boxes, not font baselines. Give every
     // section the same descent so mixed font sizes share one baseline.
+    // egui 0.37 centers glyphs within explicit line heights, so the
+    // additional descent must be doubled to keep bottom-aligned baselines.
     let mut ascents = vec![0.0_f32; job.sections.len()];
+    let mut heights = vec![0.0_f32; job.sections.len()];
     let mut descent = 0.0_f32;
     for (glyph, (byte_index, _)) in galley
         .rows
@@ -1523,11 +1526,12 @@ fn fitted_statistic_text(
             section.byte_range.start.0 <= byte_index && byte_index < section.byte_range.end.0
         }) {
             ascents[index] = ascent;
+            heights[index] = glyph.font_height;
         }
         descent = descent.max(glyph.font_height - ascent);
     }
-    for (section, ascent) in job.sections.iter_mut().zip(ascents) {
-        section.format.line_height = Some(ascent + descent);
+    for ((section, ascent), height) in job.sections.iter_mut().zip(ascents).zip(heights) {
+        section.format.line_height = Some(2.0 * ascent - height + 2.0 * descent);
     }
     ui.painter().layout_job(job)
 }
@@ -1832,7 +1836,7 @@ fn draw_reading_distribution(
                             egui::pos2(x - slot / 2.0, rect.top()),
                             egui::pos2(x + slot / 2.0, rect.bottom()),
                         ),
-                        ui.id().with(month),
+                        ui.scope_id().with(month),
                         egui::Sense::hover(),
                     );
                     let mut tooltip = egui::Tooltip::for_enabled(&response);

@@ -14,7 +14,7 @@ pub struct Alert {
     pub identifier_rendered: String,
 }
 
-// Seperate function to not leak into the public API
+// Separate function to not leak into the public API
 pub fn alert_ui(alert: &Alert, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
     blockquote(ui, alert.accent_color, |ui| {
         newline(ui);
@@ -31,6 +31,12 @@ pub fn alert_ui(alert: &Alert, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) 
 pub struct AlertBundle {
     /// the key is `[!identifier]`
     alerts: HashMap<String, Alert>,
+}
+
+impl Default for AlertBundle {
+    fn default() -> Self {
+        Self::gfm()
+    }
 }
 
 impl AlertBundle {

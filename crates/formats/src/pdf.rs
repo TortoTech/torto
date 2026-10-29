@@ -1,4 +1,6 @@
 mod catalog;
+mod fonts;
+pub use fonts::set_pdf_cjk_fallback_font;
 pub mod reflow;
 
 use std::collections::{HashMap, VecDeque};
@@ -16,7 +18,7 @@ pub fn set_pdf_timing_sink(sink: PdfTimingSink) {
 }
 
 use hayro::RenderCache;
-use hayro::hayro_interpret::font::{FontData, FontQuery, Glyph, GlyphRun};
+use hayro::hayro_interpret::font::{Glyph, GlyphRun};
 use hayro::hayro_interpret::hayro_cmap::BfString;
 use hayro::hayro_interpret::util::TransformExt as _;
 use hayro::hayro_interpret::{
@@ -126,16 +128,12 @@ const PAGE_CACHE_CAPACITY: usize = 6;
 const PAGE_MAX_DIMENSION: f32 = 2_048.0;
 const COVER_MAX_DIMENSION: f32 = 384.0;
 const MAX_RENDER_SCALE: f32 = 2.0;
-static CJK_FALLBACK_FONT: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKaiGBScreen.ttf");
-
-pub fn cjk_fallback_font_bytes() -> &'static [u8] {
-    CJK_FALLBACK_FONT
-}
-
 pub(crate) struct PdfPublication {
     descriptor: DirectBookSource,
     pdf: Arc<Pdf>,
     page_count: usize,
+    interpreter: InterpreterSettings,
+    missing_fonts: Arc<std::sync::atomic::AtomicBool>,
     cache: Mutex<PdfResourceCache>,
 }
 
@@ -238,15 +236,21 @@ fn open_data(
         BookFormat::Pdf,
     )?;
 
+    let (interpreter, missing_fonts) = fonts::snapshot();
     Ok(PdfPublication {
         descriptor,
         pdf,
         page_count,
+        interpreter,
+        missing_fonts,
         cache: Mutex::new(PdfResourceCache::default()),
     })
 }
 
 impl BookSource for PdfPublication {
+    fn missing_font_resources(&self) -> bool {
+        self.missing_fonts.load(std::sync::atomic::Ordering::Acquire)
+    }
     fn book(&self) -> &Book {
         self.descriptor.book()
     }
@@ -375,7 +379,7 @@ impl PdfPublication {
             Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
             &cache,
             page.xref(),
-            interpreter_settings(),
+            self.interpreter.clone(),
         );
         let mut extractor = PdfTextExtractor::default();
         interpret_page(page, &mut context, &mut extractor);
@@ -388,6 +392,9 @@ impl PdfPublication {
             return Ok(cover);
         }
         let cover: Arc<[u8]> = self.render_page_png(0, COVER_MAX_DIMENSION)?.into();
+        if self.missing_font_resources() {
+            return Err(PublicationError::ResourceNotFound("PDF CJK fallback font is unavailable".into()));
+        }
         let mut cache = self.lock_cache()?;
         if let Some(cached) = &cache.cover {
             return Ok(Arc::clone(cached));
@@ -476,11 +483,11 @@ impl PdfPublication {
         let (width, height) = page.render_dimensions();
         let scale = (max_dimension / width.max(height).max(1.0)).min(MAX_RENDER_SCALE);
         let cache = RenderCache::new();
-        let interpreter_settings = interpreter_settings();
+        let interpreter_settings = &self.interpreter;
         Ok(render_page(
             page,
             &cache,
-            &interpreter_settings,
+            interpreter_settings,
             &PageRasterSettings {
                 x_scale: scale,
                 y_scale: scale,
@@ -716,17 +723,9 @@ fn append_glyph_spans(spans: &mut Vec<FixedPageTextSpan>, rect: Rect, start: u64
     }
 }
 
+#[cfg(test)]
 fn interpreter_settings() -> InterpreterSettings {
-    let mut settings = InterpreterSettings::default();
-    let default_resolver = Arc::clone(&settings.font_resolver);
-    let cjk_fallback: FontData = Arc::new(cjk_fallback_font_bytes());
-    settings.font_resolver = Arc::new(move |query| match query {
-        FontQuery::Fallback(fallback) if fallback.character_collection.is_some() => {
-            Some((Arc::clone(&cjk_fallback), 0))
-        }
-        FontQuery::Fallback(_) | FontQuery::Standard(_) => default_resolver(query),
-    });
-    settings
+    fonts::snapshot().0
 }
 
 #[cfg(test)]

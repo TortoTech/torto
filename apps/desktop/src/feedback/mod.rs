@@ -298,7 +298,7 @@ impl FeedbackFeature {
         // its final dimensions. A compact success state is not a new opening.
         self.presented |= self.visible && self.layout_ready;
         let visibility = ctx.animate_bool_with_time(
-            egui::Id::new("feedback-overlay-motion"),
+            egui::Id::unique("feedback-overlay-motion"),
             self.visible && self.presented,
             0.18,
         );
@@ -361,7 +361,7 @@ impl FeedbackFeature {
         let measuring = !self.layout_ready;
         let mut preview_index = None;
         let screen = crate::ui::overlay_rect(ctx);
-        let modal_id = egui::Id::new("feedback-modal");
+        let modal_id = egui::Id::unique("feedback-modal");
         let modal_area = crate::ui::modal_area(ctx, modal_id).anchor(
             egui::Align2::CENTER_CENTER,
             screen.center() - ctx.content_rect().center() + egui::vec2(0.0, (1.0 - visibility) * 12.0),
@@ -569,7 +569,7 @@ fn screenshot_thumbnail(ui: &mut egui::Ui, texture: &egui::TextureHandle, remova
         crate::ui::paint_icon(ui, egui::Rect::from_center_size(close_rect.center(), egui::Vec2::splat(14.0)), Icon::X, egui::Color32::WHITE);
     }
     let label = language.text("移除截图", "Remove screenshot");
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled() && removable, label));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled() && removable, label));
     (preview.on_hover_text(language.text("预览截图", "Preview screenshot")).on_hover_cursor(egui::CursorIcon::PointingHand),
      response.on_hover_text(label).on_hover_cursor(egui::CursorIcon::PointingHand))
 }
@@ -588,7 +588,7 @@ fn screenshot_add_button(ui: &mut egui::Ui, busy: bool, label: &str) -> egui::Re
             ui.painter().line_segment([center - egui::vec2(0.0, 12.0), center + egui::vec2(0.0, 12.0)], stroke);
         }
     }
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), label));
     response.on_hover_text(label).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 

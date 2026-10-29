@@ -309,7 +309,7 @@ fn preview_motion_reverses_continuously_and_stops_scheduling_when_idle_or_unfocu
 fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
     let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
     reader.ui.focus_footnotes_visible = true;
-    let scroll_key = egui::Id::new("saved-footnote-scroll");
+    let scroll_key = egui::Id::unique("saved-footnote-scroll");
     reader
         .ui
         .focus_footnote_scroll_positions

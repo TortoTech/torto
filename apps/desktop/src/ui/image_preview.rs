@@ -23,7 +23,7 @@ impl ImagePreview {
             image,
             zoom: 1.0,
             pan: Vec2::ZERO,
-            id: egui::Id::new(("image-preview", namespace)),
+            id: egui::Id::unique(("image-preview", namespace)),
         }
     }
 
@@ -247,7 +247,7 @@ pub(crate) fn show_image_preview_area(
             let image_response = ui
                 .interact(
                     image_rect,
-                    ui.id().with("preview-image"),
+                    ui.scope_id().with("preview-image"),
                     egui::Sense::click_and_drag(),
                 )
                 .on_hover_cursor(egui::CursorIcon::Grab);

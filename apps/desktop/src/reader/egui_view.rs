@@ -414,7 +414,7 @@ fn resize_preview_left(width: f32, layout_width: f32, style: &rebook_layout::Rea
 fn selected_image_layer_id() -> egui::LayerId {
     // This is a reader-content decoration, not a global overlay. Keeping it in
     // the middle order lets foreground modals and their backdrops cover it.
-    egui::LayerId::new(egui::Order::Middle, egui::Id::new("reader-selected-image"))
+    egui::LayerId::new(egui::Order::Middle, egui::Id::unique("reader-selected-image"))
 }
 
 fn constrained_panel_widths(
@@ -471,7 +471,7 @@ fn panel_resize_pointer(
     let top = viewport.top();
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let top = viewport.top() + TOOLBAR_HEIGHT;
-    let response = egui::Area::new(id.into())
+    let response = egui::Area::new(egui::Id::unique(id))
         .fade_in(false)
         .order(if covered_by_drawer {
             egui::Order::Background
@@ -574,7 +574,7 @@ fn pdf_toc_editor_table(
                     ui.add_sized(
                         [title_width, 30.0],
                         egui::TextEdit::singleline(&mut entry.title)
-                            .vertical_align(egui::Align::Center),
+                            .align(egui::Align2::LEFT_CENTER),
                     );
                     ui.add_sized(
                         [page_width, 30.0],
@@ -968,7 +968,7 @@ impl DesktopReader {
             #[cfg(debug_assertions)]
             if restored.is_some() {
                 ui.ctx().data_mut(|data| {
-                    data.insert_temp(egui::Id::new("reader-reflow-trace-frames"), 8_u8)
+                    data.insert_temp(egui::Id::unique("reader-reflow-trace-frames"), 8_u8)
                 });
             }
             self.focus_target_offset = restored.or_else(|| self.focus_unit_target_offset(size.y));
@@ -1049,7 +1049,7 @@ impl DesktopReader {
             }
             let response = ui.interact(
                 visible_rect,
-                ui.id().with("scroll-reader-viewport"),
+                ui.scope_id().with("scroll-reader-viewport"),
                 egui::Sense::click_and_drag(),
             );
             self.update_scroll_viewport(
@@ -1062,7 +1062,7 @@ impl DesktopReader {
             #[cfg(debug_assertions)]
             {
                 let remaining = ui.ctx().data_mut(|data| {
-                    let id = egui::Id::new("reader-reflow-trace-frames");
+                    let id = egui::Id::unique("reader-reflow-trace-frames");
                     let remaining = data.get_temp::<u8>(id).unwrap_or(0);
                     data.insert_temp(id, remaining.saturating_sub(1));
                     remaining
@@ -1118,7 +1118,7 @@ impl DesktopReader {
         if manipulating
             && let Some(index) = focus_unit_index_for_scroll_offset(
                 self.focus_units.iter().map(|unit| unit.rect),
-                output.state.offset.y,
+                output.state.unclamped_offset().y,
                 viewport_height,
             )
             && let Some(target_offset) = self
@@ -1130,7 +1130,7 @@ impl DesktopReader {
             // state to the nearest focus unit so dragging the handle previews
             // whole paragraphs instead of leaving the reader between them.
             let mut state = output.state;
-            state.offset.y = target_offset;
+            state.set_offset(Vec2::new(state.unclamped_offset().x, target_offset));
             state.store(ctx, output.id);
             self.ui.focus_scroll_motion = None;
             self.focus_target_offset = None;
@@ -2327,7 +2327,7 @@ impl DesktopReader {
                 - 12.0,
             screen.top() + (TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) * 0.5,
         );
-        egui::Area::new(egui::Id::new("reader-window-menu"))
+        egui::Area::new(egui::Id::unique("reader-window-menu"))
             .fade_in(false)
             .order(egui::Order::Foreground)
             .fixed_pos(origin)
@@ -2379,7 +2379,7 @@ impl DesktopReader {
             chrome::header_opacity((sidebar_progress * 2.0 - 1.0).abs())
         } * if self.ui.sidebar_open || floating { 1.0 } else { self.ui.toolbar_motion.value.clamp(0.0, 1.0) };
         if (hovered || self.ui.sidebar_open || floating) && left_opacity > 0.02 {
-            egui::Area::new(egui::Id::new("reader-left-sidebar-toggle"))
+            egui::Area::new(egui::Id::unique("reader-left-sidebar-toggle"))
                 .fade_in(false)
                 .order(egui::Order::Foreground)
                 .fixed_pos(Pos2::new(left + f32::from(SIDEBAR_PADDING), y))
@@ -2403,7 +2403,7 @@ impl DesktopReader {
                 });
         }
         if hovered || self.ui.assistant_panel.is_some() {
-            egui::Area::new(egui::Id::new("reader-right-sidebar-toggle"))
+            egui::Area::new(egui::Id::unique("reader-right-sidebar-toggle"))
                 .fade_in(false)
                 .order(egui::Order::Foreground)
                 .fixed_pos(Pos2::new(
@@ -2575,7 +2575,7 @@ impl DesktopReader {
                             .paint_at(ui, rect.shrink(7.0));
                         response.widget_info(|| {
                             egui::WidgetInfo::labeled(
-                                egui::WidgetType::ProgressIndicator,
+                                egui::Role::ProgressIndicator,
                                 ui.is_enabled(),
                                 self.language.text("PDF 文字", "PDF text"),
                             )
@@ -2728,7 +2728,7 @@ impl DesktopReader {
             0.31 * progress,
             screen.left() + self.ui.sidebar_display_width * progress,
         );
-        egui::Area::new("reader-sidebar-scrim".into())
+        egui::Area::new(egui::Id::unique("reader-sidebar-scrim"))
             .fade_in(false)
             .order(egui::Order::Middle)
             .fixed_pos(scrim_rect.min)
@@ -2754,7 +2754,7 @@ impl DesktopReader {
                     self.set_sidebar_open(false);
                 }
             });
-        egui::Area::new("reader-sidebar-floating".into())
+        egui::Area::new(egui::Id::unique("reader-sidebar-floating"))
             .fade_in(false)
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(
@@ -2820,7 +2820,7 @@ impl DesktopReader {
             viewport.top() + 16.0,
             (viewport.bottom() - height - 16.0).max(viewport.top() + 16.0),
         );
-        let dialog = egui::Area::new("focus-assistant".into())
+        let dialog = egui::Area::new(egui::Id::unique("focus-assistant"))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))
             .show(ctx, |ui| {
@@ -2849,7 +2849,7 @@ impl DesktopReader {
         let pointer = ctx.pointer_hover_pos();
         self.ui.focus_footnotes_visible
             && ctx.data(|data| {
-                data.get_temp::<Rect>(egui::Id::new("reader-footnote-popup-rect"))
+                data.get_temp::<Rect>(egui::Id::unique("reader-footnote-popup-rect"))
                     .is_none_or(|rect| pointer.is_some_and(|point| rect.contains(point)))
             })
     }
@@ -2859,7 +2859,7 @@ impl DesktopReader {
             && let Some(unit) = self.focus_units.get(self.focus_unit_index)
         {
             // Source identity survives translation, sentence splitting and reflow.
-            return egui::Id::new((
+            return egui::Id::unique((
                 "focus-footnotes",
                 &self.book_id,
                 &unit
@@ -2876,7 +2876,7 @@ impl DesktopReader {
                     .node,
             ));
         }
-        egui::Id::new((
+        egui::Id::unique((
             "classic-footnotes",
             &self.book_id,
             self.classic_footnotes
@@ -3072,9 +3072,8 @@ impl DesktopReader {
         // Each additional item has one separator plus the vertical spacing on
         // both sides. The small safety inset covers fractional glyph metrics.
         let item_spacing = 9.0;
-        let separator_spacing = style
-            .separator_style(&Default::default(), Default::default())
-            .spacing;
+        // Match the default separator spacing used below.
+        let separator_spacing = 6.0;
         let separator_height =
             footnotes.len().saturating_sub(1) as f32 * (item_spacing * 2.0 + separator_spacing);
         let measured_body_height = (measured_text_height + separator_height + 2.0)
@@ -3150,7 +3149,7 @@ impl DesktopReader {
         let mut media_click = None;
         let return_to_marker_text = self.language.text("??????", "Return to reference");
 
-        let overlay = egui::Area::new("focus-footnotes".into())
+        let overlay = egui::Area::new(egui::Id::unique("focus-footnotes"))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))
             // Area's viewport constraint may otherwise shift a cached, wider
@@ -3285,7 +3284,7 @@ impl DesktopReader {
                                         }
                                     }
                                 });
-                            next_scroll_offset = scroll.state.offset.y;
+                            next_scroll_offset = scroll.state.unclamped_offset().y;
                             if let Some(navigation) = &mut block_navigation {
                                 if ctx.input(|input| input.pointer.any_down()) {
                                     navigation.accept_manual_scroll(next_scroll_offset);
@@ -3299,7 +3298,7 @@ impl DesktopReader {
             });
         ctx.data_mut(|data| {
             data.insert_temp(
-                egui::Id::new("reader-footnote-popup-rect"),
+                egui::Id::unique("reader-footnote-popup-rect"),
                 overlay.response.rect,
             )
         });
@@ -3398,7 +3397,7 @@ impl DesktopReader {
             let mut y = anchor_y - group_height / 2.0;
             if has_chat {
                 let hover_text = self.language.text("打开段落对话", "Open paragraph chat");
-                let clicked = egui::Area::new(egui::Id::new(("focus-chat-indicator", index)))
+                let clicked = egui::Area::new(egui::Id::unique(("focus-chat-indicator", index)))
                     .order(egui::Order::Foreground)
                     .fixed_pos(Pos2::new(x, y))
                     .show(ctx, |ui| {
@@ -3412,7 +3411,7 @@ impl DesktopReader {
             }
             if let Some(note) = note {
                 let hover_text = self.language.text("查看段落批注", "Open paragraph note");
-                let clicked = egui::Area::new(egui::Id::new(("focus-note-indicator", index)))
+                let clicked = egui::Area::new(egui::Id::unique(("focus-note-indicator", index)))
                     .order(egui::Order::Foreground)
                     .fixed_pos(Pos2::new(x, y))
                     .show(ctx, |ui| {
@@ -3509,7 +3508,7 @@ impl DesktopReader {
             },
             &ctx.format_shortcut(&self.shortcuts.focus_structure),
         );
-        let area = egui::Area::new("focus-actions".into())
+        let area = egui::Area::new(egui::Id::unique("focus-actions"))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))
             .show(ctx, |ui| {
@@ -3881,7 +3880,7 @@ impl DesktopReader {
         let mut apply = false;
         let mut cancel = false;
         let mut remove = None;
-        let modal = crate::ui::modal(ctx, egui::Id::new("pdf-toc-review-modal"), 0.42)
+        let modal = crate::ui::modal(ctx, egui::Id::unique("pdf-toc-review-modal"), 0.42)
             .frame(
                 egui::Frame::new()
                     .fill(palette().surface)
@@ -4022,7 +4021,7 @@ impl DesktopReader {
                         egui::TextEdit::singleline(&mut self.search.query)
                             .hint_text(self.language.text("搜索正文", "Search book"))
                             .frame(egui::Frame::NONE)
-                            .vertical_align(egui::Align::Center)
+                            .align(egui::Align2::LEFT_CENTER)
                             .margin(egui::Margin::symmetric(2, 0)),
                     );
                     response
@@ -4612,7 +4611,7 @@ impl DesktopReader {
         };
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let assistant_inset = crate::app::window_chrome::reserve_width(ctx);
-        let menu = egui::Area::new("reader-menu".into())
+        let menu = egui::Area::new(egui::Id::unique("reader-menu"))
             .order(egui::Order::Tooltip)
             .anchor(
                 egui::Align2::RIGHT_TOP,
@@ -4832,7 +4831,7 @@ impl DesktopReader {
         let mut save_note = false;
         let mut cancel_note = false;
         let mut explain = false;
-        egui::Area::new("selection-actions".into())
+        egui::Area::new(egui::Id::unique("selection-actions"))
             .order(egui::Order::Tooltip)
             .pivot(egui::Align2::CENTER_TOP)
             .fixed_pos(position)
@@ -5631,7 +5630,7 @@ fn footnote_row_key(scroll_key: egui::Id, note: &super::FocusFootnote) -> egui::
         .map(|(source, _)| rebook_publication::source_block_identity(&source));
     let slot = note
         .stable_id
-        .unwrap_or_else(|| egui::Id::new((note.number, note.citation.is_some())));
+        .unwrap_or_else(|| egui::Id::unique((note.number, note.citation.is_some())));
     scroll_key.with(("footnote-entry", owner, slot))
 }
 
@@ -5710,7 +5709,7 @@ pub(super) fn toc_toggle_button(
 ) -> bool {
     let rect = Rect::from_center_size(center, Vec2::splat(26.0));
     let response = ui
-        .interact(rect, ui.id().with(("toc-toggle", id)), egui::Sense::click())
+        .interact(rect, ui.scope_id().with(("toc-toggle", id)), egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(if expanded { collapse_text } else { expand_text });
     if response.hovered() {
@@ -5969,7 +5968,7 @@ fn assistant_suggestion_popup(
     let mut picked_command = None;
     let mut hovered_index = None;
     let context = ui.ctx().clone();
-    egui::Area::new("assistant-chat-suggestions".into())
+    egui::Area::new(egui::Id::unique("assistant-chat-suggestions"))
         .order(egui::Order::Tooltip)
         .pivot(egui::Align2::LEFT_BOTTOM)
         .fixed_pos(Pos2::new(anchor.left(), anchor.top() - 7.0))
@@ -6049,7 +6048,7 @@ fn centered_assistant_text_edit(
                 .id(input_id)
                 .desired_width(width)
                 .frame(egui::Frame::NONE)
-                .vertical_align(egui::Align::Center)
+                .align(egui::Align2::LEFT_CENTER)
                 .hint_text(hint_text)
                 .show(ui)
         },
@@ -6415,11 +6414,11 @@ fn auto_scroll_assistant_selection(
 
     let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
     let mut state = output.state;
-    let next_offset = (state.offset.y + delta).clamp(0.0, max_offset);
-    if (next_offset - state.offset.y).abs() <= f32::EPSILON {
+    let next_offset = (state.unclamped_offset().y + delta).clamp(0.0, max_offset);
+    if (next_offset - state.unclamped_offset().y).abs() <= f32::EPSILON {
         return;
     }
-    state.offset.y = next_offset;
+    state.set_offset(Vec2::new(state.unclamped_offset().x, next_offset));
     state.store(ctx, output.id);
     ctx.request_repaint();
 }
@@ -7116,7 +7115,7 @@ mod reference_suggestion_label_tests {
                                 let id = ui.make_persistent_id(egui::IdSalt::new("scroll_area"));
                                 reader.assistant_conversation(ui, 200.0, expanded);
                                 offsets.push(
-                                    egui::scroll_area::State::load(&ctx, id).unwrap().offset.y,
+                                    egui::scroll_area::State::load(&ctx, id).unwrap().unclamped_offset().y,
                                 );
                             });
                         },
@@ -7442,6 +7441,7 @@ mod reference_suggestion_label_tests {
             crate::ui::configure(
                 &ctx,
                 &Default::default(),
+                rebook_layout::default_monospace_font(),
                 AppLanguage::English,
                 runtime.handle(),
             );
@@ -7794,13 +7794,13 @@ mod reference_suggestion_label_tests {
                                 let geometry = window_chrome::geometry(&ctx);
                                 let menu = ctx
                                     .memory(|memory| {
-                                        memory.area_rect(egui::Id::new("reader-window-menu"))
+                                        memory.area_rect(egui::Id::unique("reader-window-menu"))
                                     })
                                     .unwrap();
                                 let right = ctx
                                     .memory(|memory| {
                                         memory
-                                            .area_rect(egui::Id::new("reader-right-sidebar-toggle"))
+                                            .area_rect(egui::Id::unique("reader-right-sidebar-toggle"))
                                     })
                                     .unwrap();
                                 assert!(
@@ -7829,7 +7829,13 @@ mod reference_suggestion_label_tests {
     fn sidebar_header_icons_fade_on_reversal_and_respect_native_button_space() {
         let ctx = egui::Context::default();
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        crate::ui::configure(&ctx, &Default::default(), crate::preferences::AppLanguage::English, runtime.handle());
+        crate::ui::configure(
+            &ctx,
+            &Default::default(),
+            rebook_layout::default_monospace_font(),
+            crate::preferences::AppLanguage::English,
+            runtime.handle(),
+        );
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
         let mut samples = Vec::new();
         for progress in [0.25_f32, 0.5, 0.75, 1.0, 0.75, 0.5, 0.25] {
@@ -7875,7 +7881,13 @@ mod reference_suggestion_label_tests {
             reader.ui.toolbar_motion = super::super::Motion::settled(1.0);
             let ctx = egui::Context::default();
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            crate::ui::configure(&ctx, &Default::default(), crate::preferences::AppLanguage::English, runtime.handle());
+            crate::ui::configure(
+                &ctx,
+                &Default::default(),
+                rebook_layout::default_monospace_font(),
+                crate::preferences::AppLanguage::English,
+                runtime.handle(),
+            );
             let mut samples = Vec::new();
             for progress in [0.0_f32, 0.25, 0.5, 0.75, 1.0, 0.75, 0.5, 0.25, 0.0] {
                 reader.ui.sidebar_motion = super::super::Motion::settled(progress);
@@ -7937,16 +7949,18 @@ mod reference_suggestion_label_tests {
             reader.ui.assistant_panel = Some(AssistantPanel::Chat);
             reader.ui.assistant_motion = super::super::Motion::settled(1.0);
             let ctx = egui::Context::default();
+            let mut panel_id = egui::Id::NULL;
             let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
             for frame in 0..3 {
                 let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |root| {
+                    panel_id = root.make_persistent_id("reader-assistant");
                     window_chrome::begin_frame(&ctx);
                     reader.ui(root, None, false);
                     window_chrome::paint_controls(&ctx);
                 });
                 output.textures_delta.clear();
                 if frame == 0 { continue; }
-                let panel = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("reader-assistant")).unwrap().outer_rect;
+                let panel = egui::containers::panel::PanelState::load(&ctx, panel_id).unwrap().outer_rect;
                 let header = Rect::from_min_max(panel.min, Pos2::new(panel.right(), panel.top() + TOOLBAR_HEIGHT));
                 assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect)
                     if rect.rect.height() == TOOLBAR_HEIGHT
@@ -7993,6 +8007,7 @@ mod reference_suggestion_label_tests {
                         reader.ui.assistant_motion.target = 1.0;
                     }
                     let ctx = egui::Context::default();
+                    let mut panel_id = egui::Id::NULL;
                     window_chrome::set_state(
                         &ctx,
                         window_chrome::WindowState {
@@ -8011,6 +8026,7 @@ mod reference_suggestion_label_tests {
                                 ..Default::default()
                             },
                             |root| {
+                                panel_id = root.make_persistent_id("reader-assistant");
                                 window_chrome::begin_frame(&ctx);
                                 let plan = reader.ui(root, None, false);
                                 assert!(plan.rect.left() > 100.0);
@@ -8022,7 +8038,7 @@ mod reference_suggestion_label_tests {
                         if assistant {
                             let panel = egui::containers::panel::PanelState::load(
                                 &ctx,
-                                egui::Id::new("reader-assistant"),
+                                panel_id,
                             )
                             .unwrap()
                             .outer_rect;
@@ -8058,12 +8074,12 @@ mod reference_suggestion_label_tests {
                     );
                     let left_toggle = ctx
                         .memory(|memory| {
-                            memory.area_rect(egui::Id::new("reader-left-sidebar-toggle"))
+                            memory.area_rect(egui::Id::unique("reader-left-sidebar-toggle"))
                         })
                         .unwrap();
                     let right_toggle = ctx
                         .memory(|memory| {
-                            memory.area_rect(egui::Id::new("reader-right-sidebar-toggle"))
+                            memory.area_rect(egui::Id::unique("reader-right-sidebar-toggle"))
                         })
                         .unwrap();
                     assert!(
@@ -8081,7 +8097,7 @@ mod reference_suggestion_label_tests {
                     if assistant {
                         let assistant_left = egui::containers::panel::PanelState::load(
                             &ctx,
-                            egui::Id::new("reader-assistant"),
+                            panel_id,
                         )
                         .unwrap()
                         .outer_rect
@@ -8157,10 +8173,10 @@ mod reference_suggestion_label_tests {
                 assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == screen && rect.fill == opacity)), "body scrim uses shared opacity while opening and closing");
                 assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect.top() == screen.top() && rect.rect.bottom() == TOOLBAR_HEIGHT && rect.fill == opacity)), "header scrim uses shared opacity while opening and closing");
                 let drawer = ctx
-                    .memory(|memory| memory.area_rect(egui::Id::new("reader-sidebar-floating")))
+                    .memory(|memory| memory.area_rect(egui::Id::unique("reader-sidebar-floating")))
                     .unwrap();
                 let scrim = ctx
-                    .memory(|memory| memory.area_rect(egui::Id::new("reader-sidebar-scrim")))
+                    .memory(|memory| memory.area_rect(egui::Id::unique("reader-sidebar-scrim")))
                     .unwrap();
                 assert_eq!(drawer.top(), screen.top());
                 assert!((drawer.bottom() - screen.bottom()).abs() < 0.01);
@@ -8168,7 +8184,7 @@ mod reference_suggestion_label_tests {
                 assert_eq!(scrim.top(), screen.top());
                 assert_eq!(scrim.bottom(), screen.bottom());
                 assert_eq!(scrim.width(), screen.width());
-                let toggle_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("reader-left-sidebar-toggle"));
+                let toggle_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("reader-left-sidebar-toggle"));
                 assert_eq!(ctx.memory(|memory| memory.areas().is_visible(&toggle_layer)), progress < 0.999,
                     "external expansion button fades during the transition and is hidden at the fully open endpoint");
                 assert!(!window_chrome::geometry(&ctx).drag_enabled);
@@ -8356,7 +8372,7 @@ mod reference_suggestion_label_tests {
                         );
                         if preview_open {
                             show_image_preview_area(
-                                &ctx, egui::Id::new("reader-image-preview"),
+                                &ctx, egui::Id::unique("reader-image-preview"),
                                 crate::ui::overlay_rect(&ctx),
                                 Rect::from_min_size(
                                     Pos2::new(200.0, 150.0),
@@ -9364,7 +9380,7 @@ mod reference_suggestion_label_tests {
             for _ in 0..3 {
                 let mut sizes = None;
                 let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    egui::Area::new("footnote-height-regression".into())
+                    egui::Area::new(egui::Id::unique("footnote-height-regression"))
                         .fixed_pos(egui::pos2(10.0, 10.0))
                         .default_size(egui::vec2(300.0, 40.0))
                         .show(ui.ctx(), |ui| {
@@ -9448,7 +9464,7 @@ mod reference_suggestion_label_tests {
                         if open {
                             ui.add(
                                 egui::TextEdit::singleline(&mut draft)
-                                    .id(egui::Id::new("chat-shortcut-test")),
+                                    .id(egui::Id::unique("chat-shortcut-test")),
                             )
                             .request_focus();
                         }
@@ -9511,7 +9527,7 @@ mod reference_suggestion_label_tests {
             ("Note", egui::Modifiers::NONE, true, false),
         ] {
             egui::__run_test_ui(|ui| {
-                let id = ui.id().with("annotation-test");
+                let id = ui.scope_id().with("annotation-test");
                 ui.memory_mut(|memory| memory.request_focus(id));
                 ui.input_mut(|input| {
                     input.events.clear();
@@ -9528,7 +9544,7 @@ mod reference_suggestion_label_tests {
     fn windows_ctrl_h_keeps_text_fields_unchanged() {
         egui::__run_test_ui(|ui| {
             ui.ctx().set_os(egui::os::OperatingSystem::Windows);
-            let id = ui.id().with("ctrl-h-test");
+            let id = ui.scope_id().with("ctrl-h-test");
             ui.memory_mut(|memory| memory.request_focus(id));
             ui.input_mut(|input| {
                 input.events.clear();
@@ -10374,7 +10390,7 @@ mod reference_suggestion_label_tests {
         navigation.synchronize(
             (0..4)
                 .map(|i| super::super::footnote_navigation::Row {
-                    key: egui::Id::new(i),
+                    key: egui::Id::unique(i),
                     top: i as f32 * 50.0,
                     height: 40.0,
                 })
@@ -10386,6 +10402,7 @@ mod reference_suggestion_label_tests {
         for frame in 0..60 {
             let events = if frame == 0 || frame == 40 {
                 vec![egui::Event::MouseWheel {
+                    source: egui::MouseWheelSource::Unknown,
                     unit: egui::MouseWheelUnit::Line,
                     delta: Vec2::new(0.0, -3.0),
                     modifiers: egui::Modifiers::NONE,
@@ -10432,14 +10449,14 @@ mod reference_suggestion_label_tests {
         // clipboard routing must retain that same order.
         reader.focus_units[0].footnotes = vec![
             super::super::FocusFootnote {
-                stable_id: Some(egui::Id::new("citation")),
+                stable_id: Some(egui::Id::unique("citation")),
                 owner: None,
                 number: 2,
                 citation: Some((owner.clone(), 2)),
                 text: "(Citation text)".into(),
             },
             super::super::FocusFootnote {
-                stable_id: Some(egui::Id::new("note")),
+                stable_id: Some(egui::Id::unique("note")),
                 owner: Some(owner.clone()),
                 number: 1,
                 citation: None,

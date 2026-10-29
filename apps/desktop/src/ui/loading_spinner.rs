@@ -1,13 +1,11 @@
 use std::time::Duration;
 
-use egui::{Color32, Rect, Response, Sense, Ui, Widget, WidgetInfo, WidgetType};
+use egui::{Color32, Rect, Response, Sense, Ui, Widget, WidgetInfo, Role};
 
-/// Schedule a timer without egui shortening it by the predicted frame time.
+/// Schedule a timer; egui 0.37 keeps the requested delay unchanged.
 #[track_caller]
 pub(crate) fn request_repaint_in(ctx: &egui::Context, interval: Duration) {
-    let predicted = ctx.input(|input| input.predicted_dt);
-    let predicted = Duration::try_from_secs_f32(predicted).unwrap_or_default();
-    ctx.request_repaint_after(interval.saturating_add(predicted));
+    ctx.request_repaint_after(interval);
 }
 
 /// Loading animation paced at 30 FPS, or 10 FPS when the window is unfocused.
@@ -66,7 +64,7 @@ impl Widget for LoadingSpinner {
     fn ui(self, ui: &mut Ui) -> Response {
         let size = self.size.unwrap_or(ui.spacing().interact_size.y);
         let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(size), Sense::hover());
-        response.widget_info(|| WidgetInfo::new(WidgetType::ProgressIndicator));
+        response.widget_info(|| WidgetInfo::new(Role::ProgressIndicator));
         self.paint_at(ui, rect);
         response
     }

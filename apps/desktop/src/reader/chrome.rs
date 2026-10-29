@@ -144,7 +144,7 @@ pub(crate) fn toc_row(
         response = response.on_hover_text(row.label);
     }
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), row.label)
+        egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), row.label)
     });
     if toggle {
         Some(TocRowAction::Toggle)

@@ -2,12 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use egui::{FontData, FontDefinitions, FontFamily};
-use skrifa::MetadataProvider as _;
 
 use crate::preferences::{AppLanguage, InterfaceTypography, SYSTEM_INTERFACE_FONT};
 
 fn state_id() -> egui::Id {
-    egui::Id::new("interface-font-fallbacks")
+    egui::Id::unique("interface-font-fallbacks")
 }
 
 struct Face {
@@ -32,40 +31,77 @@ impl Face {
         Some(Self { source, index })
     }
 
-    fn data(&self) -> Option<FontData> {
+    fn data(&self, files: &mut HashMap<std::path::PathBuf, Arc<Vec<u8>>>) -> Option<FontData> {
         let bytes = match &self.source {
             fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
-                std::fs::read(path).ok()?
+                if let Some(bytes) = files.get(path) {
+                    bytes.clone()
+                } else {
+                    let bytes = Arc::new(std::fs::read(path).ok()?);
+                    files.insert(path.clone(), bytes.clone());
+                    bytes
+                }
             }
-            fontdb::Source::Binary(bytes) => bytes.as_ref().as_ref().to_vec(),
+            fontdb::Source::Binary(bytes) => Arc::new(bytes.as_ref().as_ref().to_vec()),
         };
         skrifa::FontRef::from_index(&bytes, self.index).ok()?;
-        let mut data = FontData::from_owned(bytes);
-        data.index = self.index;
-        Some(data)
+        Some(FontData::from_blob(bytes, self.index))
     }
 }
 
-struct Candidate {
-    family: String,
-    regular: Face,
-    bold: Option<Face>,
-}
+mod system;
+use system::SystemFonts;
 
 struct InterfaceFonts {
-    configuration: (String, AppLanguage),
+    needs_apply: bool,
     definitions: FontDefinitions,
-    candidates: Vec<Candidate>,
-    loaded: HashSet<String>,
-    regular: Vec<String>,
-    bold: Vec<String>,
-    checked: HashMap<FontFamily, HashSet<char>>,
+}
+
+struct FontState {
+    configuration: (String, String, AppLanguage),
+    ready: Mutex<Option<InterfaceFonts>>,
+    provider: Arc<SystemFonts>,
+    #[cfg(test)]
+    completed: std::sync::Condvar,
 }
 
 impl InterfaceFonts {
-    fn new(typography: &InterfaceTypography, language: AppLanguage) -> Self {
+    fn new(
+        typography: &InterfaceTypography,
+        monospace_family: &str,
+        language: AppLanguage,
+    ) -> Self {
         let mut database = fontdb::Database::new();
         database.load_system_fonts();
+        let mut mono_families = vec![
+            monospace_family.to_owned(),
+            rebook_layout::default_monospace_font().to_owned(),
+            "Consolas".into(),
+            "Menlo".into(),
+            "Courier New".into(),
+            "DejaVu Sans Mono".into(),
+            "Liberation Mono".into(),
+        ];
+        mono_families.extend(
+            database
+                .faces()
+                .filter(|face| face.monospaced)
+                .filter_map(|face| face.families.first().map(|(name, _)| name.clone())),
+        );
+        // Configured system faces only. No built-in Latin, mono or emoji fonts.
+        let mut definitions = FontDefinitions::empty();
+        let mut files = HashMap::new();
+        let mut unique = HashSet::new();
+        let mono = mono_families
+            .into_iter()
+            .filter(|family| unique.insert(family.clone()))
+            .find_map(|family| {
+                let data =
+                    Face::query(&database, &family, fontdb::Weight::NORMAL)?.data(&mut files)?;
+                let name = format!("system-ui-monospace-{family}");
+                definitions.font_data.insert(name.clone(), Arc::new(data));
+                Some(name)
+            });
         let mut families = Vec::new();
         if typography.font_family != SYSTEM_INTERFACE_FONT {
             families.push(typography.font_family.clone());
@@ -75,369 +111,340 @@ impl InterfaceFonts {
                 .iter()
                 .map(ToString::to_string),
         );
-        let mut unique = HashSet::new();
-        let candidates = families
-            .into_iter()
-            .filter(|family| unique.insert(family.clone()))
-            .filter_map(|family| {
-                Some(Candidate {
-                    regular: Face::query(&database, &family, fontdb::Weight::NORMAL)?,
-                    bold: Face::query(&database, &family, fontdb::Weight::BOLD),
-                    family,
-                })
-            })
-            .collect();
-        let mut state = Self {
-            configuration: (typography.font_family.clone(), language.resolved()),
-            definitions: FontDefinitions::default(),
-            candidates,
-            loaded: HashSet::new(),
-            regular: Vec::new(),
-            bold: Vec::new(),
-            checked: HashMap::new(),
-        };
-        for index in 0..state.candidates.len() {
-            if let Some(data) = state.candidates[index].regular.data() {
-                state.add_candidate(index, data);
-                break;
+        let selected = families.into_iter().find_map(|family| {
+            let data = Face::query(&database, &family, fontdb::Weight::NORMAL)?.data(&mut files)?;
+            Some((family, data))
+        });
+        let mut regular = Vec::new();
+        let mut bold = Vec::new();
+        if let Some((family, data)) = selected {
+            let name = format!("system-ui-regular-{family}");
+            definitions.font_data.insert(name.clone(), Arc::new(data));
+            regular.push(name);
+            if let Some(data) = Face::query(&database, &family, fontdb::Weight::BOLD)
+                .and_then(|face| face.data(&mut files))
+            {
+                let name = format!("system-ui-bold-{family}");
+                definitions.font_data.insert(name.clone(), Arc::new(data));
+                bold.push(name);
             }
         }
-        state.rebuild_families();
-        state
-    }
-
-    fn add_candidate(&mut self, index: usize, data: FontData) {
-        let candidate = &self.candidates[index];
-        let regular = format!("system-ui-regular-{}", candidate.family);
-        self.definitions
-            .font_data
-            .insert(regular.clone(), Arc::new(data));
-        self.regular.push(regular);
-        if let Some(data) = candidate.bold.as_ref().and_then(Face::data) {
-            let bold = format!("system-ui-bold-{}", candidate.family);
-            self.definitions
-                .font_data
-                .insert(bold.clone(), Arc::new(data));
-            self.bold.push(bold);
-        }
-        self.loaded.insert(candidate.family.clone());
-    }
-
-    fn rebuild_families(&mut self) {
-        let defaults = FontDefinitions::default();
-        let mut proportional = self.regular.clone();
-        proportional.extend(defaults.families[&FontFamily::Proportional].clone());
-        if self.definitions.font_data.contains_key("reader-cjk") {
-            proportional.push("reader-cjk".into());
-        }
-        let mut bold = self.bold.clone();
-        bold.extend(proportional.clone());
-        self.definitions
+        bold.extend(regular.clone());
+        let mut monospace = mono.into_iter().collect::<Vec<_>>();
+        monospace.extend(regular.clone());
+        definitions
             .families
-            .insert(FontFamily::Proportional, proportional);
-        self.definitions.families.insert(
+            .insert(FontFamily::Proportional, regular);
+        definitions
+            .families
+            .insert(FontFamily::Monospace, monospace);
+        definitions.families.insert(
             FontFamily::Name(egui_commonmark_backend::STRONG_FONT_FAMILY.into()),
             bold,
         );
-        let mut monospace = defaults.families[&FontFamily::Monospace].clone();
-        monospace.extend(self.regular.clone());
-        if self.definitions.font_data.contains_key("reader-cjk") {
-            monospace.push("reader-cjk".into());
+        Self {
+            needs_apply: true,
+            definitions,
         }
-        self.definitions
-            .families
-            .insert(FontFamily::Monospace, monospace);
-    }
-
-    fn resolve(&mut self, ctx: &egui::Context, shapes: &[egui::epaint::ClippedShape]) -> bool {
-        let mut missing = HashSet::new();
-        ctx.fonts_mut(|fonts| {
-            // Settings can queue a new font configuration during a pass. Wait
-            // until egui applies it rather than probing the previous fonts and
-            // needlessly adding fallbacks to the new configuration.
-            if fonts.definitions().families != self.definitions.families {
-                return;
-            }
-            for shape in shapes {
-                collect_missing(&shape.shape, &mut self.checked, &mut missing, fonts);
-            }
-        });
-        if missing.is_empty() {
-            return false;
-        }
-        let mut changed = false;
-        for index in 0..self.candidates.len() {
-            if self.loaded.contains(&self.candidates[index].family) {
-                continue;
-            }
-            let Some(data) = self.candidates[index].regular.data() else {
-                continue;
-            };
-            let font = skrifa::FontRef::from_index(&data.font, data.index).unwrap();
-            let charmap = font.charmap();
-            let supports = |character: &char| {
-                charmap
-                    .map(*character)
-                    .is_some_and(|glyph| glyph != skrifa::GlyphId::NOTDEF)
-            };
-            if !missing.iter().any(supports) {
-                continue;
-            }
-            missing.retain(|character| !supports(character));
-            self.add_candidate(index, data);
-            changed = true;
-            if missing.is_empty() {
-                break;
-            }
-        }
-        if !missing.is_empty() && !self.definitions.font_data.contains_key("reader-cjk") {
-            let data = FontData::from_static(crate::fonts::cjk_font_bytes());
-            if let Ok(font) = skrifa::FontRef::from_index(&data.font, data.index)
-                && missing.iter().any(|character| {
-                    font.charmap()
-                        .map(*character)
-                        .is_some_and(|glyph| glyph != skrifa::GlyphId::NOTDEF)
-                })
-            {
-                self.definitions
-                    .font_data
-                    .insert("reader-cjk".into(), Arc::new(data));
-                changed = true;
-            }
-        }
-        if changed {
-            self.rebuild_families();
-        }
-        changed
     }
 }
 
-fn collect_missing(
-    shape: &egui::Shape,
-    checked: &mut HashMap<FontFamily, HashSet<char>>,
-    missing: &mut HashSet<char>,
-    fonts: &mut egui::epaint::text::FontsView<'_>,
-) {
-    match shape {
-        egui::Shape::Vec(shapes) => {
-            for shape in shapes {
-                collect_missing(shape, checked, missing, fonts);
-            }
-        }
-        egui::Shape::Text(text) => {
-            for section in &text.galley.job.sections {
-                let font = &section.format.font_id;
-                let seen = checked.entry(font.family.clone()).or_default();
-                for character in text.galley.job.text
-                    [section.byte_range.start.0..section.byte_range.end.0]
-                    .chars()
-                {
-                    if !character.is_control()
-                        && seen.insert(character)
-                        && !fonts.has_glyph(font, character)
-                    {
-                        missing.insert(character);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
+fn state(ctx: &egui::Context) -> Option<Arc<FontState>> {
+    ctx.data(|data| data.get_temp::<Arc<FontState>>(state_id()))
 }
 
 pub(super) fn configure(
     ctx: &egui::Context,
     typography: &InterfaceTypography,
+    monospace_family: &str,
     language: AppLanguage,
 ) {
-    let current = ctx.data_mut(|data| data.get_temp::<Arc<Mutex<InterfaceFonts>>>(state_id()));
-    if let Some(current) = current
-        && current
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .configuration
-            == (typography.font_family.clone(), language.resolved())
+    let configuration = (
+        typography.font_family.clone(),
+        monospace_family.into(),
+        language.resolved(),
+    );
+    let current = state(ctx);
+    if current
+        .as_ref()
+        .is_some_and(|current| current.configuration == configuration)
     {
         return;
     }
-    let state = InterfaceFonts::new(typography, language);
-    ctx.set_fonts(state.definitions.clone());
-    ctx.data_mut(|data| data.insert_temp(state_id(), Arc::new(Mutex::new(state))));
+    if current.is_none() {
+        // Until system faces arrive, egui 0.37 draws its missing-glyph marker.
+        // Binding the Markdown family also makes first-frame headings safe.
+        let mut bootstrap = FontDefinitions::empty();
+        bootstrap.families.insert(
+            FontFamily::Name(egui_commonmark_backend::STRONG_FONT_FAMILY.into()),
+            vec![],
+        );
+        ctx.set_fonts(bootstrap);
+    }
+    let provider = SystemFonts::new(language);
+    let state = Arc::new(FontState {
+        configuration,
+        ready: Mutex::new(None),
+        provider: provider.clone(),
+        #[cfg(test)]
+        completed: std::sync::Condvar::new(),
+    });
+    ctx.data_mut(|data| data.insert_temp(state_id(), state.clone()));
+    ctx.set_font_providers(vec![provider]);
+    let wake = ctx.clone();
+    let typography = typography.clone();
+    let monospace_family = monospace_family.to_owned();
+    std::thread::spawn(move || {
+        let fonts = InterfaceFonts::new(&typography, &monospace_family, language);
+        *state
+            .ready
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fonts);
+        #[cfg(test)]
+        state.completed.notify_all();
+        wake.request_repaint();
+    });
 }
 
-pub(crate) fn resolve(ctx: &egui::Context, shapes: &[egui::epaint::ClippedShape]) -> bool {
-    let state = ctx.data_mut(|data| data.get_temp::<Arc<Mutex<InterfaceFonts>>>(state_id()));
-    let Some(state) = state else {
+pub(crate) fn resolve(ctx: &egui::Context, _shapes: &[egui::epaint::ClippedShape]) -> bool {
+    let Some(state) = state(ctx) else {
         return false;
     };
-    let mut state = state
+    let mut changed = state.provider.advance(ctx);
+    let mut ready = state
+        .ready
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !state.resolve(ctx, shapes) {
-        return false;
+    if let Some(fonts) = ready.as_mut()
+        && fonts.needs_apply
+    {
+        fonts.needs_apply = false;
+        ctx.set_fonts(fonts.definitions.clone());
+        ctx.request_repaint();
+        changed = true;
     }
-    ctx.set_fonts(state.definitions.clone());
-    ctx.request_repaint();
-    true
+    changed
 }
 
-#[cfg(all(test, target_os = "windows"))]
-mod tests {
+pub(crate) fn resources_changed(ctx: &egui::Context) {
+    if let Some(state) = state(ctx) {
+        state.provider.resources_changed();
+        ctx.request_repaint();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn wait_for_monospace(ctx: &egui::Context) {
+    let slot = state(ctx).unwrap();
+    let (mut ready, _) = slot
+        .completed
+        .wait_timeout_while(
+            slot.ready.lock().unwrap(),
+            std::time::Duration::from_secs(10),
+            |ready| ready.is_none(),
+        )
+        .unwrap();
+    let fonts = ready.as_mut().expect("interface font discovery completed");
+    fonts.needs_apply = false;
+    ctx.set_fonts(fonts.definitions.clone());
+}
+
+#[cfg(test)]
+mod monospace_tests {
     use super::*;
 
-    fn draw(ctx: &egui::Context, text: &str) -> egui::FullOutput {
+    fn selected(ctx: &egui::Context) -> String {
+        ctx.data(|data| data.get_temp::<Arc<FontState>>(state_id()))
+            .unwrap()
+            .ready
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .definitions
+            .families[&FontFamily::Monospace][0]
+            .clone()
+    }
+
+    #[test]
+    fn interface_uses_reader_monospace_and_reloads_after_selection_changes() {
+        let ctx = egui::Context::default();
+        let typography = InterfaceTypography::default();
+        let default = rebook_layout::default_monospace_font();
+        configure(&ctx, &typography, default, AppLanguage::English);
+        wait_for_monospace(&ctx);
+        assert_eq!(selected(&ctx), format!("system-ui-monospace-{default}"));
+
+        let mut database = fontdb::Database::new();
+        database.load_system_fonts();
+        let other = database
+            .faces()
+            .filter(|face| face.monospaced)
+            .flat_map(|face| &face.families)
+            .map(|(name, _)| name)
+            .find(|name| name.as_str() != default)
+            .expect("another system monospace family");
+        configure(&ctx, &typography, other, AppLanguage::English);
+        wait_for_monospace(&ctx);
+        assert_eq!(selected(&ctx), format!("system-ui-monospace-{other}"));
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            ui.label(text);
-            ui.label(egui::RichText::new(text).family(FontFamily::Name(
-                egui_commonmark_backend::STRONG_FONT_FAMILY.into(),
-            )));
-            ui.label(egui::RichText::new(text).monospace());
+            ui.label(egui::RichText::new("let value = 123;").monospace());
+        });
+        ctx.fonts_mut(|fonts| {
+            assert!(!fonts.definitions().font_data.contains_key("Hack"));
+            assert!(fonts.has_glyphs(&egui::FontId::monospace(14.0), "let value = 123;"));
+            assert!(
+                !fonts
+                    .definitions()
+                    .font_data
+                    .contains_key(&format!("system-ui-monospace-{default}"))
+            );
         });
         output.textures_delta.clear();
-        output
-    }
-
-    fn loaded(ctx: &egui::Context) -> Vec<String> {
-        ctx.fonts_mut(|fonts| fonts.definitions().font_data.keys().cloned().collect())
     }
 
     #[test]
-    fn unsupported_characters_do_not_load_fonts_that_cannot_display_them() {
-        let ctx = egui::Context::default();
-        configure(&ctx, &InterfaceTypography::default(), AppLanguage::English);
-        let output = draw(&ctx, "A?\u{10ffff}");
-        ctx.fonts_mut(|fonts| {
-            let font = egui::FontId::proportional(14.0);
-            assert!(fonts.has_glyphs(&font, "A?"));
-            assert!(!fonts.has_glyph(&font, '\u{10ffff}'));
-        });
-        assert!(!resolve(&ctx, &output.shapes));
-        assert!(
-            !loaded(&ctx)
-                .iter()
-                .any(|name| name.contains("YaHei") || name == "reader-cjk")
-        );
-        output.drop_without_applying_deltas();
-    }
-
-    #[test]
-    fn chinese_system_ui_does_not_load_redundant_latin_or_embedded_cjk_fonts() {
+    fn unavailable_reader_monospace_uses_system_fallback() {
         let ctx = egui::Context::default();
         configure(
             &ctx,
             &InterfaceTypography::default(),
-            AppLanguage::SimplifiedChinese,
+            "Missing Torto Test Mono",
+            AppLanguage::English,
         );
-        let output = draw(&ctx, "AI排版 Settings");
-        assert!(!resolve(&ctx, &output.shapes));
-        let names = loaded(&ctx);
-        assert!(
-            names
-                .iter()
-                .any(|name| name == "system-ui-regular-Microsoft YaHei UI")
+        wait_for_monospace(&ctx);
+        assert_eq!(
+            selected(&ctx),
+            format!(
+                "system-ui-monospace-{}",
+                rebook_layout::default_monospace_font()
+            )
         );
-        assert!(
-            !names
-                .iter()
-                .any(|name| name.contains("Segoe UI") || name == "reader-cjk")
-        );
-        output.drop_without_applying_deltas();
     }
+}
+
+#[cfg(test)]
+mod system_tests {
+    use super::*;
 
     #[test]
-    fn english_ui_loads_chinese_fallback_only_after_chinese_text_is_displayed() {
+    fn system_fallback_renders_cjk_and_color_emoji_without_embedded_fonts() {
         let ctx = egui::Context::default();
-        configure(&ctx, &InterfaceTypography::default(), AppLanguage::English);
-        let output = draw(&ctx, "Library Settings");
-        assert!(!resolve(&ctx, &output.shapes));
-        assert!(
-            !loaded(&ctx)
-                .iter()
-                .any(|name| name.contains("YaHei") || name == "reader-cjk")
-        );
-        output.drop_without_applying_deltas();
-        let output = draw(&ctx, "中文书名");
-        assert!(resolve(&ctx, &output.shapes));
-        output.drop_without_applying_deltas();
-        let output = draw(&ctx, "中文书名");
-        ctx.fonts_mut(|fonts| {
-            for family in [
-                FontFamily::Proportional,
-                FontFamily::Monospace,
-                FontFamily::Name(egui_commonmark_backend::STRONG_FONT_FAMILY.into()),
-            ] {
-                assert!(fonts.has_glyphs(&egui::FontId::new(14.0, family), "中文书名"));
+        let typography = InterfaceTypography {
+            font_family: if cfg!(target_os = "macos") {
+                "Arial"
+            } else if cfg!(target_os = "windows") {
+                "Segoe UI"
+            } else {
+                "DejaVu Sans"
             }
-        });
-        assert!(!resolve(&ctx, &output.shapes));
-        assert!(
-            loaded(&ctx)
-                .iter()
-                .any(|name| name == "system-ui-regular-Microsoft YaHei UI")
+            .into(),
+            ..Default::default()
+        };
+        configure(
+            &ctx,
+            &typography,
+            rebook_layout::default_monospace_font(),
+            AppLanguage::English,
         );
-        assert!(!loaded(&ctx).contains(&"reader-cjk".into()));
-        output.drop_without_applying_deltas();
-        // Changing language/settings must release the previously loaded fallback.
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            configure(
-                &ctx,
-                &InterfaceTypography::default(),
-                AppLanguage::SimplifiedChinese,
-            );
-            ui.label("设置");
-        });
-        output.textures_delta.clear();
-        assert!(!resolve(&ctx, &output.shapes));
-        output.drop_without_applying_deltas();
-        let output = draw(&ctx, "设置");
-        assert!(
-            !loaded(&ctx)
-                .iter()
-                .any(|name| name.contains("Segoe") || name == "reader-cjk")
-        );
-        output.drop_without_applying_deltas();
-        configure(&ctx, &InterfaceTypography::default(), AppLanguage::English);
-        let output = draw(&ctx, "Settings");
-        assert!(!loaded(&ctx).iter().any(|name| name.contains("YaHei")));
-        output.drop_without_applying_deltas();
+        // The first pass must also be safe while discovery is still pending.
+        ctx.run_ui(Default::default(), |ui| {
+            ui.label(egui::RichText::new("Starting").family(FontFamily::Name(
+                egui_commonmark_backend::STRONG_FONT_FAMILY.into(),
+            )));
+        })
+        .drop_without_applying_deltas();
+        wait_for_monospace(&ctx);
+        let provider = state(&ctx).unwrap().provider.clone();
+        let mut colored = false;
+        let mut covered = false;
+        for _ in 0..12 {
+            let output = ctx.run_ui(Default::default(), |ui| {
+                ui.label("English 中文 😀 🐢");
+            });
+            for delta in output.textures_delta.set.values().flatten() {
+                let egui::ImageData::Color(image) = &delta.image;
+                colored |= image
+                    .pixels
+                    .iter()
+                    .any(|pixel| pixel.r() != pixel.g() || pixel.g() != pixel.b());
+            }
+            ctx.fonts_mut(|fonts| {
+                covered = fonts.has_glyphs(&egui::FontId::proportional(14.0), "English 中文 😀 🐢");
+                let definitions = fonts.definitions();
+                assert!(definitions.font_data.keys().all(|name| {
+                    ![
+                        "Ubuntu-Light",
+                        "Hack",
+                        "NotoEmoji-Regular",
+                        "emoji-icon-font",
+                    ]
+                    .contains(&name.as_str())
+                }));
+                assert_eq!(
+                    definitions.families[&FontFamily::Proportional][0],
+                    format!("system-ui-regular-{}", typography.font_family)
+                );
+            });
+            output.drop_without_applying_deltas();
+            resolve(&ctx, &[]);
+            provider.wait();
+            resolve(&ctx, &[]);
+            if covered && colored {
+                break;
+            }
+        }
+        assert!(covered, "system fonts cover Latin, CJK and Emoji");
+        assert!(colored, "native color Emoji reach the egui texture atlas");
+        // Once those fonts are loaded, repeated frames must not restart discovery.
+        for _ in 0..3 {
+            ctx.run_ui(Default::default(), |ui| {
+                ui.label("English 中文 😀 🐢");
+            })
+            .drop_without_applying_deltas();
+            assert!(!resolve(&ctx, &[]));
+        }
     }
 
     #[test]
-    fn custom_font_takes_priority_and_missing_font_uses_language_default() {
-        let ctx = egui::Context::default();
-        let mut typography = InterfaceTypography::default();
-        typography.font_family = "Consolas".into();
-        configure(&ctx, &typography, AppLanguage::SimplifiedChinese);
-        let output = draw(&ctx, "Settings");
-        ctx.fonts_mut(|fonts| {
-            assert_eq!(
-                fonts.definitions().families[&FontFamily::Proportional][0],
-                "system-ui-regular-Consolas"
-            )
-        });
-        assert!(!resolve(&ctx, &output.shapes));
-        output.drop_without_applying_deltas();
-        let output = draw(&ctx, "字体设置");
-        assert!(resolve(&ctx, &output.shapes));
-        output.drop_without_applying_deltas();
-        let output = draw(&ctx, "字体设置");
-        ctx.fonts_mut(|fonts| {
-            assert_eq!(
-                fonts.definitions().families[&FontFamily::Proportional][0],
-                "system-ui-regular-Consolas"
-            )
-        });
-        assert!(!resolve(&ctx, &output.shapes));
-        output.drop_without_applying_deltas();
-        typography.font_family = "Torto nonexistent test font".into();
-        configure(&ctx, &typography, AppLanguage::SimplifiedChinese);
-        let output = draw(&ctx, "设置");
-        ctx.fonts_mut(|fonts| {
-            assert_eq!(
-                fonts.definitions().families[&FontFamily::Proportional][0],
-                "system-ui-regular-Microsoft YaHei UI"
-            )
-        });
-        output.drop_without_applying_deltas();
+    fn file_backed_faces_share_font_bytes() {
+        let mut database = fontdb::Database::new();
+        database.load_system_fonts();
+        let (source, index) = database
+            .faces()
+            .find_map(|face| {
+                let (source, index) = database.face_source(face.id)?;
+                matches!(
+                    source,
+                    fontdb::Source::File(_) | fontdb::Source::SharedFile(_, _)
+                )
+                .then_some((source, index))
+            })
+            .expect("a system font file");
+        let regular = Face {
+            source: source.clone(),
+            index,
+        };
+        let other_index = database
+            .faces()
+            .find_map(|face| {
+                let (other, index) = database.face_source(face.id)?;
+                match (&source, other) {
+                    (fontdb::Source::File(a), fontdb::Source::File(b)) if *a == b => Some(index),
+                    _ => None,
+                }
+            })
+            .unwrap_or(index);
+        let other = Face {
+            source,
+            index: other_index,
+        };
+        let mut files = HashMap::new();
+        let a = regular.data(&mut files).unwrap();
+        let b = other.data(&mut files).unwrap();
+        assert!(Arc::ptr_eq(&a.font, &b.font));
+        assert_eq!(files.len(), 1);
+        assert_eq!(a.index, index);
+        assert_eq!(b.index, other_index);
     }
 }

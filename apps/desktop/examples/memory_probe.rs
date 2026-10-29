@@ -281,7 +281,9 @@ fn main() {
                 peniko::Blob::new(Arc::new(include_bytes!(
                     "../../../assets/fonts/Literata-Italic-opsz-wght.ttf"
                 ) as &'static [u8])),
-                peniko::Blob::new(Arc::new(rebook_formats::cjk_fallback_font_bytes())),
+                peniko::Blob::new(Arc::new(include_bytes!(
+                    "../../../assets/fonts/LXGWWenKaiGBScreen.ttf"
+                ) as &'static [u8])),
             ];
             let mut first = rebook_layout::LayoutEngine::with_fonts(fonts.iter().cloned());
             sample("foreground engine");

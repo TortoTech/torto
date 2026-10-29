@@ -16,6 +16,7 @@ pub(crate) use clipboard::images_without_text;
 pub(crate) use clipboard::feedback_images;
 
 pub(crate) enum UserEvent {
+    Fonts(crate::fonts::Message),
     Feedback(crate::feedback::Message),
     RepaintAfter(std::time::Duration),
     EguiRepaint {

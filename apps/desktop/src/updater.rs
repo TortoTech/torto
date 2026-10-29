@@ -272,7 +272,7 @@ impl WindowsUpdater {
         self.begin_history(view.release());
         let mut retry_history = false;
         let mut action = None;
-        let modal = crate::ui::modal(ctx, egui::Id::new("windows-update-modal"), 0.42)
+        let modal = crate::ui::modal(ctx, egui::Id::unique("windows-update-modal"), 0.42)
             .frame(
                 egui::Frame::new()
                     .fill(palette().surface)
@@ -1336,6 +1336,7 @@ mod tests {
         crate::ui::apply_interface_typography(
             &ctx,
             &crate::preferences::InterfaceTypography::default(),
+            rebook_layout::default_monospace_font(),
             AppLanguage::English,
         );
         for (visible, settings_opacity) in [(false, 0.0), (true, 0.0), (true, 0.46)] {
@@ -1348,7 +1349,7 @@ mod tests {
                 );
                 if settings_opacity > 0.0 {
                     let _ =
-                        crate::ui::modal(&ctx, egui::Id::new("test-settings"), settings_opacity)
+                        crate::ui::modal(&ctx, egui::Id::unique("test-settings"), settings_opacity)
                             .show(&ctx, |ui| {
                                 ui.label("Settings");
                             });
@@ -1404,6 +1405,7 @@ mod tests {
         crate::ui::apply_interface_typography(
             &ctx,
             &crate::preferences::InterfaceTypography::default(),
+            rebook_layout::default_monospace_font(),
             crate::preferences::AppLanguage::English,
         );
         let mut cache = CommonMarkCache::default();

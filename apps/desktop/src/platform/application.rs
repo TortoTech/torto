@@ -319,6 +319,7 @@ impl Application {
         crate::ui::configure(
             &egui_ctx,
             app.interface_typography(),
+            app.monospace_font(),
             app.interface_language(),
             runtime.handle(),
         );
@@ -535,6 +536,7 @@ impl ApplicationHandler<UserEvent> for Application {
         };
         let callback_started = Instant::now();
         match event {
+            UserEvent::Fonts(message) => self.app.complete_fonts(message, &self.egui_ctx),
             UserEvent::RepaintAfter(delay) => {
                 if let Some(when) = Instant::now().checked_add(delay) {
                     self.repaint.external(when);

@@ -299,7 +299,10 @@ pub fn convert(
     for index in 0..count {
         check_cancelled(cancelled)?;
         let extracting_page = Instant::now();
-        let mut page = extract::page(&publication.pdf, index, &structure_tags);
+        let mut page = extract::publication_page(&publication, index, &structure_tags);
+        if publication.missing_font_resources() {
+            return Err("PDF 缺少中文回退字体，请下载默认字体后重试 / Download the default CJK font before converting this PDF".into());
+        }
         stats.timings.text_extract_ms += elapsed_ms(extracting_page);
         if let Some(labels) = outline_labels.get(&index) {
             layout::mark_outline_headings(&mut page, labels);

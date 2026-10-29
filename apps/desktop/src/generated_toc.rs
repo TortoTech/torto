@@ -276,6 +276,7 @@ impl GeneratedTocBookSource {
 }
 
 impl BookSource for GeneratedTocBookSource {
+    fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
     fn book(&self) -> &Book {
         &self.book
     }

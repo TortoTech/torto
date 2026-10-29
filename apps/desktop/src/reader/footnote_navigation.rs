@@ -191,17 +191,17 @@ mod tests {
     fn rows() -> Vec<Row> {
         vec![
             Row {
-                key: egui::Id::new(0),
+                key: egui::Id::unique(0),
                 top: 0.0,
                 height: 90.0,
             },
             Row {
-                key: egui::Id::new(1),
+                key: egui::Id::unique(1),
                 top: 110.0,
                 height: 700.0,
             },
             Row {
-                key: egui::Id::new(2),
+                key: egui::Id::unique(2),
                 top: 830.0,
                 height: 100.0,
             },
@@ -249,7 +249,7 @@ mod tests {
         nav.synchronize(resized, 300.0, 1330.0);
         assert_eq!(nav.index(), 1);
         assert_eq!(nav.offset, 510.0);
-        nav.select(egui::Id::new(2));
+        nav.select(egui::Id::unique(2));
         assert_eq!(nav.index(), 2);
         assert_eq!(nav.logical_offset(), 1030.0);
     }
@@ -259,12 +259,12 @@ mod tests {
         nav.synchronize(
             vec![
                 Row {
-                    key: egui::Id::new(0),
+                    key: egui::Id::unique(0),
                     top: 0.0,
                     height: 40.0,
                 },
                 Row {
-                    key: egui::Id::new(1),
+                    key: egui::Id::unique(1),
                     top: 50.0,
                     height: 40.0,
                 },

@@ -10,6 +10,7 @@ struct OpenRequest {
     settings: Option<AppliedSettings>,
     started: std::time::Instant,
     initial_href: Option<rebook_publication::PublicationUrl>,
+    initial_locator: Option<rebook_publication::LocatorV1>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -112,6 +113,7 @@ impl Opening {
         self.failed_request = None;
         self.task.begin(OpenRequest {
             initial_href: None,
+            initial_locator: None,
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             book,
             store,
@@ -121,6 +123,13 @@ impl Opening {
             settings: self.settings.clone(),
             started,
         });
+    }
+
+    pub(super) fn restore_locator(&mut self, locator: rebook_publication::LocatorV1) {
+        if let Some(mut request) = self.task.active().cloned() {
+            request.initial_locator = Some(locator);
+            self.queue_replacement(request);
+        }
     }
 
     fn cancel_task(&mut self) {
@@ -150,6 +159,7 @@ impl Opening {
                 return;
             }
             request.initial_href = Some(href.clone());
+            request.initial_locator = None;
             self.queue_replacement(request);
             if let Some(shell) = &mut self.shell {
                 shell.header_title = shell
@@ -323,6 +333,7 @@ impl Opening {
                     request.store,
                     request.viewport,
                     request.initial_href.as_ref(),
+                    request.initial_locator.as_ref(),
                     move |toc, mode, title, pdf_toolbar, viewport| {
                         if cancelled.load(std::sync::atomic::Ordering::Acquire) {
                             return None;
@@ -735,6 +746,27 @@ mod tests {
             opening.take_pending().unwrap().payload.initial_href,
             Some(href)
         );
+    }
+
+    #[test]
+    fn font_reopen_locator_survives_retry_and_explicit_navigation_supersedes_it() {
+        let store = store();
+        let mut opening = Opening::default();
+        request(&mut opening, "book", &store);
+        let locator = rebook_publication::LocatorV1::at_start(
+            rebook_publication::PublicationId::new("book").unwrap(),
+            rebook_publication::PublicationUrl::parse("chapter.xhtml#current").unwrap(),
+        );
+        opening.restore_locator(locator.clone());
+        let failed = opening.take_pending().unwrap();
+        assert_eq!(failed.payload.initial_locator, Some(locator.clone()));
+        opening.failed_request = opening.complete(failed.id);
+        opening.retry();
+        assert_eq!(opening.task.active().unwrap().initial_locator, Some(locator));
+        opening.navigate(rebook_publication::PublicationUrl::parse("other.xhtml#target").unwrap());
+        let latest = opening.take_pending().unwrap();
+        assert!(latest.payload.initial_locator.is_none());
+        assert_eq!(latest.payload.initial_href.unwrap().to_string(), "other.xhtml#target");
     }
 
     #[test]

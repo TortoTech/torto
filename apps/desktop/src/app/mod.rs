@@ -1,5 +1,6 @@
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) mod window_chrome;
+mod fonts;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -18,6 +19,8 @@ use crate::settings::{SettingsFeature, settings_overlay};
 use crate::shelf::{ShelfFeature, ShelfImportTaskMessage, SyncProgressMessage, SyncTaskMessage};
 
 pub(crate) struct DesktopApp {
+    fonts: crate::fonts::FontService,
+    font_notice_dismissed: Option<u64>,
     shelf: ShelfFeature,
     reader: Option<DesktopReader>,
     settings: SettingsFeature,
@@ -58,6 +61,8 @@ impl DesktopApp {
         let mut shelf = ShelfFeature::new(library, reader_fonts);
         shelf.apply_global_settings(settings.applied());
         Self {
+            fonts: crate::fonts::FontService::default(),
+            font_notice_dismissed: None,
             shelf,
             reader: None,
             settings,
@@ -209,9 +214,21 @@ impl DesktopApp {
                 window_chrome::block_drag(ui.ctx());
             }
         }
+        crate::fonts::publish_labels(ui.ctx(), &self.fonts.statuses, self.settings.applied().language);
+        self.settings.font_apply_available = self.reader.as_ref().is_some_and(|reader|
+            !reader.uses_fonts(&self.fonts.reader_fonts)
+                && (!reader.missing_font_resources() || self.fonts.statuses[0] == crate::fonts::Status::Ready));
         settings_overlay(ui.ctx(), &mut self.settings);
+        if std::mem::take(&mut self.settings.font_retry_requested) || crate::fonts::take_request(ui.ctx()) {
+            self.fonts.retry();
+        }
+        if std::mem::take(&mut self.settings.font_apply_requested)
+            && let Some(reader) = self.reader.as_mut() {
+            reader.apply_downloaded_fonts();
+        }
         self.feedback
             .overlay(ui.ctx(), self.settings.applied().language);
+        self.font_notice(ui.ctx());
         if ui.ctx().input_mut(|input| {
             input.consume_shortcut(&self.settings.applied().shortcuts.fullscreen)
         }) {
@@ -356,7 +373,10 @@ impl DesktopApp {
         proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     ) {
         let started = std::time::Instant::now();
-        self.shelf.spawn_pending_tasks(runtime, proxy);
+        self.fonts.spawn(runtime, proxy);
+        // A pending open waits only for local discovery, never for a download.
+        // Cached fonts therefore apply on the first open after a restart.
+        if self.fonts.initialized { self.shelf.spawn_pending_tasks(runtime, proxy); }
         let shelf_finished = started.elapsed();
         self.settings.spawn_pending_tasks(runtime, proxy);
         self.feedback.spawn_pending_tasks(runtime, proxy);
@@ -384,6 +404,15 @@ impl DesktopApp {
 
     pub(crate) fn complete_feedback(&mut self, message: crate::feedback::Message) {
         self.feedback.complete(message);
+    }
+
+    pub(crate) fn complete_fonts(&mut self, message: crate::fonts::Message, ctx: &egui::Context) {
+        if self.fonts.complete(message) {
+            crate::fonts::install(self.fonts.fonts.clone());
+            self.shelf.set_reader_fonts(self.fonts.reader_fonts.clone());
+            crate::ui::font_resources_changed(ctx);
+        }
+        self.settings.font_statuses = self.fonts.statuses.clone();
     }
 
     pub(crate) fn complete_shelf_sync_check(
@@ -545,15 +574,17 @@ impl DesktopApp {
                     path,
                     reader.take_reopen_notice(),
                     reader.take_reopen_error(),
+                    reader.take_font_reopen_locator(),
                 )
             })
         });
-        if let Some((path, notice, error)) = reopen {
+        if let Some((path, notice, error, locator)) = reopen {
             self.pending_reader_notice = notice;
             self.pending_reader_error = error;
             self.reader = None;
             rebook_layout::clear_raster_cache();
             self.shelf.open_book(&path);
+            if let Some(locator) = locator { self.shelf.restore_open_locator(locator); }
         }
         if self
             .reader
@@ -573,6 +604,7 @@ impl DesktopApp {
 
     fn promote_opened_reader(&mut self) {
         if let Some(mut next_reader) = self.shelf.take_opened_reader() {
+            self.font_notice_dismissed = None;
             if let Some(current) = &self.reader {
                 current.prepare_for_shutdown();
             }
@@ -606,6 +638,7 @@ impl DesktopApp {
             crate::ui::apply_interface_typography(
                 ctx,
                 &applied.interface_typography,
+                &applied.typography.monospace_font,
                 applied.language,
             );
             crate::ui::set_theme(ctx, applied.theme);
@@ -629,6 +662,10 @@ impl DesktopApp {
 
     pub(crate) fn interface_typography(&self) -> &InterfaceTypography {
         &self.settings.applied().interface_typography
+    }
+
+    pub(crate) fn monospace_font(&self) -> &str {
+        &self.settings.applied().typography.monospace_font
     }
 
     pub(crate) fn interface_language(&self) -> crate::preferences::AppLanguage {

@@ -149,14 +149,14 @@ impl FootnoteLayout {
             .paint_at(ui, rect);
         let mut clicked = None;
         for (index, (bounds, key)) in self.media.iter().enumerate() {
-            let response = ui.interact(bounds.translate(rect.min.to_vec2()), ui.id().with(("media", index)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            let response = ui.interact(bounds.translate(rect.min.to_vec2()), ui.scope_id().with(("media", index)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
             if response.clicked() { clicked = Some(key.clone()); }
         }
         for (index, (bounds, url)) in self.websites.iter().enumerate() {
             let response = ui
                 .interact(
                     bounds.translate(rect.min.to_vec2()),
-                    ui.id().with(("website", index)),
+                    ui.scope_id().with(("website", index)),
                     egui::Sense::click(),
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -452,7 +452,7 @@ impl FootnoteRenderer {
             }
         }
         let engine = self.engine.get_or_insert_with(|| {
-            LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned())
+            LayoutEngine::with_fonts(crate::fonts::reader_fonts().iter().cloned())
         });
         let layout = engine
             .layout_blocks(

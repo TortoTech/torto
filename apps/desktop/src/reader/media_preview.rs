@@ -816,7 +816,7 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
         1400
     };
     let mut engine =
-        LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned());
+        LayoutEngine::with_fonts(crate::fonts::reader_fonts().iter().cloned());
     engine.set_deferred_images(true);
     let layout = engine
         .layout_blocks(
@@ -1427,7 +1427,7 @@ impl super::DesktopReader {
         let mut item_direction = 0;
         #[cfg(target_os = "windows")]
         crate::app::window_chrome::dim_controls(ctx, 190.0 / 255.0 * opacity);
-        egui::Area::new("reader-media-preview".into())
+        egui::Area::new(egui::Id::unique("reader-media-preview"))
             .order(egui::Order::Tooltip)
             .fade_in(false)
             .fixed_pos(ctx.content_rect().min)
@@ -1490,7 +1490,7 @@ impl super::DesktopReader {
                     let response = ui
                         .interact(
                             visible,
-                            ui.id().with("paper"),
+                            ui.scope_id().with("paper"),
                             egui::Sense::click_and_drag(),
                         )
                         .on_hover_cursor(egui::CursorIcon::Grab);
@@ -1542,7 +1542,7 @@ impl super::DesktopReader {
                     ] {
                         if active.item_index.checked_add_signed(direction).is_none_or(|i| i >= active.items.len()) { continue; }
                         let rect = egui::Rect::from_center_size(egui::pos2(x, screen.center().y), egui::vec2(40.0, 56.0));
-                        let response = ui.interact(rect, ui.id().with(("reference", direction)), egui::Sense::click())
+                        let response = ui.interact(rect, ui.scope_id().with(("reference", direction)), egui::Sense::click())
                             .on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint);
                         ui.painter().rect_filled(rect, 20.0, egui::Color32::from_black_alpha(if response.hovered() { 110 } else { 55 }));
                         crate::ui::paint_icon(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(26.0, 26.0)), glyph,
@@ -1575,7 +1575,7 @@ impl super::DesktopReader {
                     ] {
                         let Some(cursor) = cursor.filter(|_| !active.loading) else { continue };
                         let rect = egui::Rect::from_center_size(egui::pos2(x, y), egui::vec2(32.0, 24.0));
-                        let response = ui.interact(rect, ui.id().with(("part", x.to_bits())), egui::Sense::click())
+                        let response = ui.interact(rect, ui.scope_id().with(("part", x.to_bits())), egui::Sense::click())
                             .on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint);
                         crate::ui::paint_icon(ui, rect.shrink2(egui::vec2(6.0, 2.0)), glyph, egui::Color32::WHITE);
                         over_navigation |= response.hovered() || response.clicked();
