@@ -71,12 +71,44 @@ fn hidden_format_fallbacks_keep_only_visible_images_and_stable_following_sources
 }
 
 #[test]
+fn css_auto_clears_html_image_dimensions_with_cascade_priority() {
+    let section = parse("<style>.responsive {height: auto !important} .wide {width:auto} .fixed{height:240px}</style><img class='responsive' src='a.png' width='800' height='600' style='height:500px;display:block'/><img class='wide' src='b.png' width='800' height='600' style='display:block'/><img class='fixed' src='c.png' width='800' height='600' style='display:block'/><img src='d.png' width='800' height='600' style='width: AUTO; height:auto;display:block'/>");
+    let images: Vec<_> = section.blocks.iter().filter_map(|b| match b {Block::Image(i)=>Some(i),_=>None}).collect();
+    assert_eq!(images.len(),4);
+    assert_eq!(images[0].style.width,Some(ImageLength::Pixels(800.0)));
+    assert_eq!(images[0].style.height,None);
+    assert_eq!(images[1].style.width,None);
+    assert_eq!(images[1].style.height,Some(ImageLength::Pixels(600.0)));
+    assert_eq!(images[2].style.height,Some(ImageLength::Pixels(240.0)));
+    assert_eq!(images[3].style.width,None);
+    assert_eq!(images[3].style.height,None);
+}
+
+#[test]
 fn hidden_footnote_definitions_remain_available_to_the_popup() {
     let section = parse(
         "<p>Body<a href='#n1' role='doc-noteref'>1</a></p><aside hidden='hidden' id='n1' role='doc-footnote'><p>Hidden note body.</p></aside>",
     );
     assert!(text(&section.blocks).contains("Hidden note body."));
     assert!(section.blocks.iter().any(|b| matches!(b, Block::Note(_))));
+}
+
+#[test]
+fn offscreen_alternatives_are_filtered_without_losing_sources_or_visible_positioned_text() {
+    let body = "<style>.alternative{position:absolute;left:-9999em;width:1px;height:1px;overflow:hidden}.frame p{position:absolute;top:50%;left:50%;width:70%;transform:translate(-50%,-50%)}</style><div class='alternative' id='table-desc'><p>Screen reader table description.</p></div><div class='frame'><p>Visible text in decorative border.</p></div><p id='after'>After.</p>";
+    let hidden = parse(body);
+    let visible = parse(&body.replace("left:-9999em", "left:0"));
+    assert!(!text(&hidden.blocks).contains("Screen reader"));
+    assert!(text(&hidden.blocks).contains("Visible text in decorative border."));
+    assert_eq!(hidden.anchors.iter().find(|a| a.fragment == "after"),
+        visible.anchors.iter().find(|a| a.fragment == "after"));
+    let clipped = parse("<p style='position:absolute;width:1px;height:1px;clip:rect(0,0,0,0)'>Hidden</p><p style='position:absolute;width:1px;height:1px'>Visible tiny box</p><p style='position:relative;left:-2000px;width:1px'>Visible relative text</p>");
+    assert!(!text(&clipped.blocks).contains("Hidden"));
+    assert!(text(&clipped.blocks).contains("Visible tiny box"));
+    assert!(text(&clipped.blocks).contains("Visible relative text"));
+    let shifted = parse("<p style='position:absolute;left:-2000px;width:1px;height:1px;overflow:hidden;transform:translateX(2000px)'>Visible transformed text</p><p style='position:absolute;left:-2000px;width:1px'>Potentially overflowing text</p>");
+    assert!(text(&shifted.blocks).contains("Visible transformed text"));
+    assert!(text(&shifted.blocks).contains("Potentially overflowing text"));
 }
 
 #[test]

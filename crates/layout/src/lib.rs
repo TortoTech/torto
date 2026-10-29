@@ -4250,6 +4250,24 @@ fn resolve_text_block_with_caption_emphasis<'a>(
     );
     }
     web_links::detect(&mut resolved.content);
+    if block.kind == TextBlockKind::Preformatted {
+        for inline in &mut resolved.content {
+            if let Inline::Text(run) = inline {
+                if let Some(colors) = run.style.syntax_colors {
+                    run.style.color = if reader_style.foreground.red > 128 { colors.dark } else { colors.light };
+                }
+            }
+        }
+        // AI code containers retain line indentation and deliberate blank
+        // lines, without changing the paragraph profile of other native pre's.
+        if block.style.literal_links {
+            resolved.style.margin_start = block.style.margin_start.max(0.0);
+            resolved.style.indent = block.style.indent.max(0.0);
+            resolved.style.margin_before = block.style.margin_before;
+            resolved.style.margin_after = block.style.margin_after
+                + if block.style.hard_break_after { base_size * line_height } else { 0.0 };
+        }
+    }
     if matches!(
         block.kind,
         TextBlockKind::Blockquote | TextBlockKind::QuoteAttribution
@@ -5069,6 +5087,8 @@ fn prepare_inline_content(
                     continue;
                 }
                 let website = website_icons
+                    && !block.style.literal_links
+                    && !matches!(block.kind, TextBlockKind::Preformatted | TextBlockKind::Blockquote | TextBlockKind::QuoteAttribution)
                     && run.style.inline_citation == 0
                     && run.style.inline_role == InlineRole::Normal
                     && run.style.link_role == LinkRole::Normal
@@ -6390,6 +6410,52 @@ pub enum LayoutError {
 #[cfg(test)]
 mod tests {
     include!("shaping_reuse_tests.rs");
+
+    #[test]
+    fn code_and_quote_urls_keep_their_visible_text_and_click_targets() {
+        let url = "https://example.com/source";
+        let mut engine = LayoutEngine::new();
+        for kind in [TextBlockKind::Preformatted, TextBlockKind::Blockquote, TextBlockKind::QuoteAttribution, TextBlockKind::Caption] {
+            let block = TextBlock {
+                kind, style: rebook_publication::BlockStyle { literal_links: true, ..Default::default() },
+                content: vec![Inline::Text(TextRun { text: url.into(), link: Some(PublicationUrl::website(url).unwrap()), style: TextStyle::default() })],
+                source: None,
+            };
+            for unified in [false, true] {
+                let style = ReaderStyle { website_icons: true,
+                    typesetting: if unified { ReaderTypesetting::unified() } else { ReaderTypesetting::default() }, ..Default::default() };
+                let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+                let shaped = engine.shape_text(&resolved, &style, 600.0);
+                assert_eq!(shaped.text.as_ref(), url, "{kind:?} unified={unified}");
+                assert!(shaped.citations.is_empty());
+                assert!(matches!(&resolved.content[0],Inline::Text(run) if run.link.is_some()));
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_colors_follow_theme_while_code_spacing_and_sources_are_unchanged() {
+        let colors = rebook_publication::SyntaxColors {
+            light: Rgba { red: 180, green: 20, blue: 90, alpha: 255 },
+            dark: Rgba { red: 230, green: 150, blue: 210, alpha: 255 },
+        };
+        let block = TextBlock {
+            kind: TextBlockKind::Preformatted,
+            content: vec![Inline::Text(TextRun { text: "  let x = 1;\n".into(), link: None, style: TextStyle { syntax_colors: Some(colors), ..Default::default() } })],
+            style: rebook_publication::BlockStyle { literal_links: true, margin_start: 16.0, margin_after: 0.0, ..Default::default() }, source: None,
+        };
+        for (foreground, expected) in [(Rgba::BLACK, colors.light), (Rgba { red: 255, green: 255, blue: 255, alpha: 255 }, colors.dark)] {
+            let style = ReaderStyle { foreground, typesetting: ReaderTypesetting::unified(), ..Default::default() };
+            let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+            assert_eq!(resolved.style.margin_start, 16.0);
+            assert_eq!(resolved.style.margin_after, 0.0);
+            assert!(matches!(&resolved.content[0], Inline::Text(run) if run.text == "  let x = 1;\n" && run.style.color == expected));
+            let mut separated = block.clone();
+            separated.style.hard_break_after = true;
+            let separated = resolve_text_block(&separated, &style, TextContext::Flow);
+            assert!(separated.style.margin_after >= style.typography.font_size);
+        }
+    }
 
     #[test]
     fn rtl_website_icons_keep_paragraph_direction_and_physical_alignment() {

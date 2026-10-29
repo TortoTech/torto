@@ -56,11 +56,11 @@ fn validate(group: &Proposal, section: &Section) -> Result<(), String> {
 }
 
 #[test]
-fn only_quotes_missing_credit_are_offered_for_completion() {
+fn authored_quotes_are_classified_but_only_missing_credits_can_be_completed() {
     let mut original = fixture(false);
     assert_eq!(
         section_input_block(&original, 0)["type"],
-        "quote_missing_attribution"
+        "authored_quote"
     );
     validate(&proposal(false), &original).unwrap();
     assert!(
@@ -83,7 +83,7 @@ fn only_quotes_missing_credit_are_offered_for_completion() {
     quote.attribution = Some(credit);
     assert_eq!(
         section_input_block(&original, 0)["type"],
-        "protected_boundary"
+        "authored_quote"
     );
     assert!(validate(&proposal(false), &original).is_err());
 }
@@ -253,6 +253,7 @@ fn live_existing_quote_attribution_completion() {
             .unwrap();
         assert!(result.annotations.iter().any(
             |a| matches!(a,Annotation::QuoteAttribution {inside:actual,..} if *actual==inside)
+                || matches!(a,Annotation::CodeOrQuote {credit,sources,..} if credit.is_some()==inside && (inside || !sources.is_empty()))
         ));
         let mut blocks = original.blocks.clone();
         for item in &result.annotations {
@@ -265,10 +266,10 @@ fn live_existing_quote_attribution_completion() {
             text_block_text(quote.attribution.as_ref().unwrap()),
             "— Mira Vale"
         );
-        assert_eq!(
-            quote.body[0],
-            unattributed_quote_body(&original.blocks[0]).unwrap()[0]
-        );
+        let authored = &unattributed_quote_body(&original.blocks[0]).unwrap()[0];
+        assert_eq!(quote.body[0].content, authored.content);
+        assert_eq!(quote.body[0].source, authored.source);
+        assert_eq!(quote.body[0].style.align, authored.style.align);
         println!(
             "Existing quote attribution completed (inside={inside}) without changing its body"
         );

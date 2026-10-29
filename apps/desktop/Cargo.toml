@@ -84,6 +84,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sys-locale.workspace = true
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 tracing.workspace = true
 tokio.workspace = true
 uuid.workspace = true

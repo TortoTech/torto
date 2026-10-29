@@ -9,7 +9,7 @@ pub(super) const PROMPT: &str = include_str!("formulas/prompt.md");
 pub(super) const TRANSCRIBE_PROMPT: &str = include_str!("formulas/transcribe.md");
 const SYMBOL_PROMPT: &str = include_str!("formulas/symbols.md");
 const REPLACEMENT_PROMPT: &str = include_str!("formulas/replacement.md");
-pub(super) const TEXT_REVISION: u32 = 6;
+pub(super) const TEXT_REVISION: u32 = 7;
 mod batch;
 
 // Keep the chapter/group identity stable. Image policy has its own revision and
@@ -409,7 +409,7 @@ pub(super) async fn recognize(
     let mut pending: Vec<batch::Pending> = Vec::new();
     let mut bytes = 0;
     for candidate in candidates(section) {
-        if !seen.insert(candidate.image.href.clone()) {
+        if !seen.insert((candidate.image.href.clone(), candidate.inline)) {
             continue;
         }
         let resource = match source.resource(&candidate.image.href) {
@@ -420,6 +420,7 @@ pub(super) async fn recognize(
             }
         };
         if resource.bytes.len() > 12 * 1024 * 1024 {
+            log::event(provider, model, "image.skipped", json!({"href":candidate.image.href,"reason":"resource_byte_budget","bytes":resource.bytes.len()}));
             continue;
         }
         // The wire contract participates in the fingerprint, not the cache format.
@@ -435,6 +436,7 @@ pub(super) async fn recognize(
                 provider.base_url,
                 model,
                 reasoning_effort,
+                candidate.inline,
                 digest(&resource.bytes)
             ]))
             .unwrap(),
@@ -470,14 +472,13 @@ pub(super) async fn recognize(
         }
         let image = match decode(&resource.bytes) {
             Ok(i) => i,
-            Err(_) => continue,
+            Err(error) => {
+                log::event(provider, model, "image.skipped", json!({"href":candidate.image.href,"reason":"decode_or_pixel_budget","error":error}));
+                continue;
+            }
         };
-        let hint = candidate.image.href.path().to_lowercase().contains("math")
-            || candidate.image.alt.to_lowercase().contains("equation")
-            || candidate.context.to_lowercase().contains("equation");
-        if !candidate.inline && !hint && (image.height() > 240 || image.width() > 1600) {
-            continue;
-        }
+        // Tables and other standalone content can be taller than a formula.
+        // Decode/payload budgets bound the work; the model judges its content.
         let url = match image_url(image) {
             Ok(url) => url,
             Err(_) => {
@@ -487,6 +488,7 @@ pub(super) async fn recognize(
         };
         let size = url.len() + candidate.context.len() + 512;
         if size > batch::MAX_BYTES {
+            log::event(provider, model, "image.skipped", json!({"href":candidate.image.href,"reason":"request_byte_budget","bytes":size}));
             failed += 1;
             continue;
         }
@@ -617,3 +619,6 @@ pub(super) fn compose_text(blocks: &mut [Block], href: &PublicationUrl, text: &I
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod image_table_regressions;

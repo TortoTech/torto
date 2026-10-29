@@ -1128,9 +1128,19 @@ impl Default for Rgba {
     }
 }
 
+/// Theme-aware colors produced by worker-owned syntax recognition.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SyntaxColors {
+    pub light: Rgba,
+    pub dark: Rgba,
+}
+
 /// Renderer-independent inline presentation and semantic subset.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
+    /// Derived syntax colors; never change authored text or durable offsets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syntax_colors: Option<SyntaxColors>,
     /// Derived, explicit media-link semantics; color alone never makes text clickable.
     #[serde(skip)]
     pub media_reference: Option<media_references::MediaKind>,
@@ -1197,6 +1207,7 @@ pub struct TextStyle {
 impl Default for TextStyle {
     fn default() -> Self {
         Self {
+            syntax_colors: None,
             suppress_media_references: false,
             media_reference: None,
             inline_citation: 0,
@@ -1330,6 +1341,9 @@ pub enum ListMarkerFormat { LowerAlpha, UpperAlpha }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BlockStyle {
+    /// Keep authored URL text visible inside technical/quotation groups.
+    #[serde(default)]
+    pub literal_links: bool,
     /// Ephemeral marker association for a bilingual companion without a source range.
     #[serde(skip)]
     pub reference_owner: Option<u64>,
@@ -1391,6 +1405,7 @@ pub struct BlockStyle {
 impl Default for BlockStyle {
     fn default() -> Self {
         Self {
+            literal_links: false,
             reference_owner: None,
             paragraph_group: None,
             direction: TextDirection::Auto,

@@ -43,7 +43,8 @@ Use `end` only for clear trailing-edge intent. Use `null` to leave alignment uns
 For existing `quote_missing_attribution` blocks, add only the source credit:
 - `quote_attribution`: select the following top-level `attribution` or the final eligible nested `body_index`. Set the other field to null.
 - For a terminal inline credit, use `quote_inline` with only the existing quote ID and `alignment: null`.
-Do not extend, reclassify or restyle the existing body. The whole quote cannot be its own source.
+The whole quote cannot be its own source.
+
 
 ## Captions
 Use `figure` for text that labels or describes immediately adjacent images, above or below.
