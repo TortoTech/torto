@@ -40,10 +40,9 @@ impl Source {
 pub(super) fn sources(asset: &Asset) -> Vec<Source> {
     // IDs pin immutable font resources independently of application releases.
     // A mirror is added only after its anonymous download has been verified.
-    let mut sources = vec![Source::GitHubAsset(format!(
-        "https://api.github.com/repos/TortoTech/lab/releases/assets/{}",
-        asset.github_asset_id
-    ))];
+    let mut sources = vec![Source::GitHubAsset(
+        crate::http::github::LAB.asset_url(asset.github_asset_id),
+    )];
     if let Some(url) = &asset.mirror_url {
         sources.push(Source::Mirror(url.clone()));
     }

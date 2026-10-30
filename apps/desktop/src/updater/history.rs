@@ -55,16 +55,20 @@ fn select(
     Ok(versions.into_values().rev().collect())
 }
 
-async fn fetch_entries(client: &reqwest::Client, url: &str) -> Result<Vec<Entry>, String> {
+async fn fetch_entries(client: &reqwest::Client, url: String) -> Result<Vec<Entry>, String> {
     const BUDGET: usize = 4 * 1024 * 1024;
     let mut retained = 0;
     let mut entries = Vec::new();
     for page in 1..=10 {
-        let mut response = client
-            .get(url)
+        let request = if reqwest::Url::parse(&url).is_ok_and(|url| github::is_api_url(&url)) {
+            github::json_request(client, &url)
+        } else {
+            client.get(&url)
+                .header(USER_AGENT, concat!("Torto/", env!("CARGO_PKG_VERSION")))
+                .header(ACCEPT, "application/json")
+        };
+        let mut response = request
             .query(&[("page", page), ("per_page", 50)])
-            .header(USER_AGENT, format!("Torto/{}", env!("CARGO_PKG_VERSION")))
-            .header(ACCEPT, "application/json")
             .send()
             .await
             .map_err(|e| e.to_string())?
@@ -90,12 +94,12 @@ async fn fetch_entries(client: &reqwest::Client, url: &str) -> Result<Vec<Entry>
 
 async fn with_fallback<F, Fut>(mut fetch: F) -> Result<Vec<Entry>, String>
 where
-    F: FnMut(&'static str) -> Fut,
+    F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Entry>, String>>,
 {
-    match fetch("https://api.github.com/repos/TortoTech/torto/releases").await {
+    match fetch(github::TORTO.releases_url()).await {
         Ok(entries) => Ok(entries),
-        Err(github) => fetch("https://gitee.com/api/v5/repos/TortoTech/torto/releases")
+        Err(github) => fetch("https://gitee.com/api/v5/repos/TortoTech/torto/releases".into())
             .await
             .map_err(|gitee| format!("{github}\n{gitee}")),
     }
@@ -161,6 +165,7 @@ mod tests {
             version: "0.10.0".into(),
             notes: "authoritative".into(),
             asset: UpdateAsset {
+                github_asset_id: None,
                 name: String::new(),
                 url: String::new(),
                 sha256: String::new(),
@@ -197,7 +202,7 @@ mod tests {
         let mut calls = Vec::new();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let result = runtime.block_on(with_fallback(|url| {
-            calls.push(url);
+            calls.push(url.clone());
             std::future::ready(if url.contains("github") {
                 Err("unreachable".into())
             } else {

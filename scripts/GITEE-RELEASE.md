@@ -28,6 +28,15 @@ as the completion marker with the Windows installer's version, size and SHA-256.
 Clients reject mirrors without this marker or whose marker does not match the
 release tag and installer name. The manifest contains no credentials.
 
+The Windows updater downloads GitHub installers through the Release Asset API
+using the numeric asset ID from the existing update-check response and
+`Accept: application/octet-stream`. No extra metadata lookup or client token is
+needed. Failed or invalid downloads fall back to the ordinary GitHub release
+URL, then to the same version and filename on Gitee. Every source must match
+the selected installer's size and SHA-256. If only Gitee's release check
+succeeds, its verified attachment remains the primary source, with the ordinary
+GitHub release URL as fallback; no GitHub asset ID is guessed.
+
 To retry or backfill, use Actions → Sync releases to Gitee → Run workflow and
 enter `v0.7.0` or `latest`. This requires no installer rebuild.
 

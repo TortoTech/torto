@@ -6,10 +6,7 @@ use super::{
 use std::{path::PathBuf, time::Duration};
 
 pub(super) fn client() -> Result<reqwest::Client, String> {
-    crate::http::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .read_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(180))
+    crate::http::download_builder()
         .user_agent("Torto-fonts/1")
         .build()
         .map_err(|error| error.to_string())
@@ -60,19 +57,12 @@ pub(super) async fn fetch_url(
     size: usize,
     progress: &mut impl FnMut(u8),
 ) -> Result<Vec<u8>, String> {
-    let mut request = client.get(source.url());
-    if matches!(source, Source::GitHubAsset(_)) {
+    let request = if matches!(source, Source::GitHubAsset(_)) {
         // Without this Accept header the asset API returns JSON metadata, not
         // font bytes. reqwest follows its 302 response to the binary CDN too.
-        request = request
-            .header(reqwest::header::ACCEPT, "application/octet-stream")
-            .header("X-GitHub-Api-Version", "2026-03-10");
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
-    crate::http::read_sized_body(response, size as u64, 40 * 1024 * 1024, progress).await
+        crate::http::github::asset_request(client, source.url())
+    } else {
+        client.get(source.url())
+    };
+    crate::http::fetch_sized_body(request, size as u64, 40 * 1024 * 1024, progress).await
 }

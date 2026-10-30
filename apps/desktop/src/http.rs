@@ -1,6 +1,7 @@
 //! One HTTP stack and TLS backend for both Rig and application requests.
 mod download;
-pub(crate) use download::{read_sized_body, verify_sized_sha256};
+pub(crate) mod github;
+pub(crate) use download::{download_builder, fetch_sized_body, verify_sized_sha256};
 use std::sync::Once;
 
 pub(crate) fn builder() -> reqwest::ClientBuilder {

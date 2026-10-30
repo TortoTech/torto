@@ -1,6 +1,28 @@
 //! Bounded binary transport shared by fonts and application updates.
 use sha2::{Digest, Sha256};
 
+pub(crate) fn download_builder() -> reqwest::ClientBuilder {
+    super::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .read_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(180))
+}
+
+pub(crate) async fn fetch_sized_body(
+    request: reqwest::RequestBuilder,
+    expected: u64,
+    limit: u64,
+    progress: impl FnMut(u8),
+) -> Result<Vec<u8>, String> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    read_sized_body(response, expected, limit, progress).await
+}
+
 pub(crate) async fn read_sized_body(
     mut response: reqwest::Response,
     expected: u64,
