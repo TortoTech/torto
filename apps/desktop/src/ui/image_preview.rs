@@ -5,7 +5,9 @@ pub(crate) struct ImagePreview {
     pub(crate) motion: PreviewMotion,
     /// Optional text copied in place of pixels (for example a reader formula).
     pub(crate) copy_text: Option<String>,
-    pub(crate) formula_notes: Vec<String>,
+    pub(crate) formula_source: Option<rebook_publication::SourceRange>,
+    pub(crate) formula_notes: Vec<crate::plugins::semantic_layout::enhancements::SymbolNote>,
+    formula_notes_view: super::formula_notes::FormulaNotesView,
     pub(crate) notes_open: bool,
     pub(crate) texture: egui::TextureHandle,
     pub(crate) image: egui::ColorImage,
@@ -20,7 +22,9 @@ impl ImagePreview {
         Self {
             motion: PreviewMotion::new(ctx),
             copy_text: None,
+            formula_source: None,
             formula_notes: Vec::new(),
+            formula_notes_view: Default::default(),
             notes_open: false,
             source_size: Vec2::new(image.size[0] as f32, image.size[1] as f32),
             texture: ctx.load_texture(namespace, image.clone(), egui::TextureOptions::LINEAR),
@@ -38,13 +42,13 @@ impl ImagePreview {
             return true;
         }
         let screen = crate::ui::overlay_rect(ctx);
-        let mut image_screen = screen;
-        if self.notes_open && !self.formula_notes.is_empty() {
-            image_screen.max.y -= notes_height(screen);
-        }
+        let image_screen = screen;
+        let annotated = self.copy_text.as_deref().filter(|_| self.notes_open && !self.formula_notes.is_empty())
+            .and_then(|latex| self.formula_notes_view.image(ctx, latex, &self.formula_notes));
+        let (texture, source_size) = annotated.as_ref().map_or((self.texture.id(), self.source_size), |(texture, size)| (texture.id(), *size));
         let available =
             (image_screen.size() - Vec2::splat(IMAGE_PREVIEW_MARGIN * 2.0)).max(Vec2::splat(1.0));
-        let fit_scale = preview_fit_scale(self.source_size, available);
+        let fit_scale = preview_fit_scale(source_size, available);
         let wheel_delta = ctx.input(preview_wheel_delta);
         if wheel_delta != 0.0
             && !self.motion.is_closing()
@@ -61,7 +65,7 @@ impl ImagePreview {
             update_preview_zoom(self, factor, pointer, image_screen.center());
             ctx.request_repaint();
         }
-        let display_size = self.source_size * fit_scale * self.zoom;
+        let display_size = source_size * fit_scale * self.zoom;
         self.pan = clamp_preview_pan(self.pan, display_size, available);
         let image_rect = Rect::from_center_size(image_screen.center() + self.pan, display_size);
         let interaction = show_image_preview_area(
@@ -69,7 +73,7 @@ impl ImagePreview {
             self.id,
             screen,
             image_rect,
-            self.texture.id(),
+            texture,
             fit_scale * self.zoom * 100.0,
             opacity,
             !self.motion.is_closing(),
@@ -85,9 +89,6 @@ impl ImagePreview {
         }
         if interaction.close {
             self.motion.close(ctx);
-        }
-        if self.notes_open && !self.formula_notes.is_empty() {
-            show_formula_notes(ctx, self.id.with("notes"), &self.formula_notes, opacity);
         }
         false
     }
@@ -127,43 +128,6 @@ impl ImagePreview {
             ctx.copy_image(self.image.clone());
         }
     }
-}
-
-pub(crate) fn notes_height(screen: Rect) -> f32 {
-    (screen.height() * 0.32).clamp(100.0, 260.0)
-}
-
-pub(crate) fn show_formula_notes(
-    ctx: &egui::Context,
-    id: egui::Id,
-    notes: &[String],
-    opacity: f32,
-) {
-    let screen = crate::ui::overlay_rect(ctx);
-    let width = (screen.width() - 48.0).clamp(1.0, 760.0);
-    egui::Area::new(id)
-        .order(egui::Order::Tooltip)
-        .fixed_pos(egui::pos2(
-            screen.center().x - width / 2.0,
-            screen.bottom() - notes_height(screen) + 8.0,
-        ))
-        .show(ctx, |ui| {
-            ui.set_width(width);
-            ui.set_opacity(opacity);
-            egui::Frame::new()
-                .fill(crate::ui::palette().surface)
-                .corner_radius(10.0)
-                .inner_margin(16.0)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(notes_height(screen) - 55.0)
-                        .show(ui, |ui| {
-                            for note in notes {
-                                ui.add(egui::Label::new(note).selectable(true).wrap());
-                            }
-                        });
-                });
-        });
 }
 
 pub(crate) const IMAGE_PREVIEW_MARGIN: f32 = 48.0;

@@ -587,6 +587,7 @@ enum ShortcutAction {
     FocusHighlight,
     FocusNote,
     FocusStructure,
+    FocusTableChart,
     FocusFootnotes,
     FocusImagePreview,
     FocusExtendSelectionPrevious,
@@ -618,6 +619,7 @@ impl ShortcutAction {
             Self::FocusHighlight => shortcuts.focus_highlight,
             Self::FocusNote => shortcuts.focus_note,
             Self::FocusStructure => shortcuts.focus_structure,
+            Self::FocusTableChart => shortcuts.focus_table_chart,
             Self::FocusFootnotes => shortcuts.focus_footnotes,
             Self::FocusImagePreview => shortcuts.focus_image_preview,
             Self::FocusExtendSelectionPrevious => shortcuts.focus_extend_selection_previous,
@@ -649,6 +651,7 @@ impl ShortcutAction {
             Self::FocusHighlight => shortcuts.focus_highlight = binding,
             Self::FocusNote => shortcuts.focus_note = binding,
             Self::FocusStructure => shortcuts.focus_structure = binding,
+            Self::FocusTableChart => shortcuts.focus_table_chart = binding,
             Self::FocusFootnotes => shortcuts.focus_footnotes = binding,
             Self::FocusImagePreview => shortcuts.focus_image_preview = binding,
             Self::FocusExtendSelectionPrevious => {
@@ -673,6 +676,23 @@ enum UpdateCheckStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_chart_shortcut_defaults_migrates_and_detects_conflicts() {
+        let mut shortcuts = ShortcutPreferences::default();
+        assert_eq!(ShortcutAction::FocusTableChart.binding(&shortcuts),
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num4));
+        let mut legacy = serde_json::to_value(&shortcuts).unwrap();
+        legacy.as_object_mut().unwrap().remove("focus_table_chart");
+        assert_eq!(serde_json::from_value::<ShortcutPreferences>(legacy).unwrap(), shortcuts);
+        let custom = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Num4);
+        ShortcutAction::FocusTableChart.set_binding(&mut shortcuts, custom);
+        assert_eq!(ShortcutAction::FocusTableChart.binding(&shortcuts), custom);
+        assert!(!shortcuts.has_conflicts());
+        let conflict = shortcuts.focus_image_preview;
+        ShortcutAction::FocusTableChart.set_binding(&mut shortcuts, conflict);
+        assert!(shortcuts.has_conflicts());
+    }
 
     #[test]
     fn feedback_shortcut_can_be_customized_and_checked_for_conflicts() {

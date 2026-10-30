@@ -1445,8 +1445,20 @@ fn default_logical_alignment() -> bool {
     true
 }
 
+/// A validated symbol definition attached to a displayed formula.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FormulaNote {
+    pub symbol: String,
+    pub meaning: String,
+    pub unit: String,
+}
+
 /// Lazy source boundary: parsers produce stable reading IR one section at a time.
 pub trait BookSource: Send + Sync {
+    /// Memory-only, already validated notes currently visible for this formula.
+    fn visible_formula_notes(&self, _source: &SourceRange, _latex: &str) -> Vec<FormulaNote> {
+        Vec::new()
+    }
     /// Memory-only status: a render encountered an unavailable font resource.
     /// Wrappers forward this without forcing their lazy source to load.
     fn missing_font_resources(&self) -> bool { false }

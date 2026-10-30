@@ -105,6 +105,15 @@ fn same(a: &SourceRange, b: &SourceRange) -> bool {
 }
 
 impl SemanticLayoutSource {
+    pub(crate) fn toggle_formula_notes(&self, sources: &[SourceRange]) -> bool {
+        if self.formula_notes_for_sources(sources).is_empty() { return false; }
+        let Ok(mut views) = self.formula_note_views.try_write() else { return false; };
+        let keys = sources.iter().map(|source| format!("{:?}#{}", source.start.spine, source.start.node)).collect::<Vec<_>>();
+        let visible = keys.iter().any(|key| views.contains(key));
+        if !visible && views.len() + keys.len() > 128 { views.clear(); }
+        for key in keys { if visible { views.remove(&key); } else { views.insert(key); } }
+        true
+    }
     fn with_derived<T>(&self, mut f: impl FnMut(&Annotation) -> Option<T>) -> Option<T> {
         if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
             return None;
@@ -159,6 +168,34 @@ impl SemanticLayoutSource {
             .contains(&format!("{:?}#{}", root.start.spine, root.start.node));
         Some((root, active))
     }
+
+    pub(crate) fn formula_notes_for_sources(&self, sources: &[SourceRange]) -> Vec<SymbolNote> {
+        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) { return Vec::new(); }
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        let mut collect = |annotation: &Annotation| {
+            if let Annotation::FormulaNotes { source, notes, .. } = annotation
+                && sources.iter().any(|candidate| same(source, candidate)) {
+                for note in notes {
+                    if seen.insert((note.symbol.clone(), note.meaning.clone(), note.unit.clone())) {
+                        result.push(note.clone());
+                    }
+                }
+            }
+        };
+        if let Ok(state) = self.state.try_read() {
+            for recognition in state.values() {
+                for annotation in &recognition.annotations { collect(annotation); }
+            }
+        }
+        if let Ok(partial) = self.partial.try_read() {
+            for recognition in partial.values().flat_map(|groups| groups.values()) {
+                for annotation in &recognition.annotations { collect(annotation); }
+            }
+        }
+        result
+    }
+
     pub(crate) fn chart_anchor(&self, origin: &SourceRange) -> Option<SourceRange> {
         let (root, active) = self.chart_control(origin)?;
         if active {
@@ -235,6 +272,11 @@ pub(crate) struct SymbolNote {
     pub unit: String,
     pub evidence: String,
     pub known: bool,
+}
+impl SymbolNote {
+    pub(crate) fn render_note(&self) -> rebook_publication::FormulaNote {
+        rebook_publication::FormulaNote { symbol: self.symbol.clone(), meaning: self.meaning.clone(), unit: self.unit.clone() }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

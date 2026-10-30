@@ -189,6 +189,8 @@ pub(crate) struct ShortcutPreferences {
     pub(crate) focus_note: egui::KeyboardShortcut,
     #[serde(default = "default_focus_structure_shortcut")]
     pub(crate) focus_structure: egui::KeyboardShortcut,
+    #[serde(default = "default_focus_table_chart_shortcut")]
+    pub(crate) focus_table_chart: egui::KeyboardShortcut,
     #[serde(default = "default_focus_footnotes_shortcut")]
     pub(crate) focus_footnotes: egui::KeyboardShortcut,
     #[serde(default = "default_focus_image_preview_shortcut")]
@@ -218,7 +220,7 @@ impl ShortcutPreferences {
             .any(|binding| shortcut_chord_key_count(binding.modifiers) > MAX_SHORTCUT_KEYS)
     }
 
-    fn bindings(&self) -> [egui::KeyboardShortcut; 26] {
+    fn bindings(&self) -> [egui::KeyboardShortcut; 27] {
         [
             self.fullscreen,
             self.toggle_left_sidebar,
@@ -240,6 +242,7 @@ impl ShortcutPreferences {
             self.focus_highlight,
             self.focus_note,
             self.focus_structure,
+            self.focus_table_chart,
             self.focus_footnotes,
             self.focus_image_preview,
             self.focus_extend_selection_previous,
@@ -289,6 +292,7 @@ impl Default for ShortcutPreferences {
             focus_highlight: default_focus_highlight_shortcut(),
             focus_note: default_focus_note_shortcut(),
             focus_structure: default_focus_structure_shortcut(),
+            focus_table_chart: default_focus_table_chart_shortcut(),
             focus_footnotes: default_focus_footnotes_shortcut(),
             focus_image_preview: default_focus_image_preview_shortcut(),
             focus_extend_selection_previous: default_focus_extend_selection_previous_shortcut(),
@@ -381,6 +385,10 @@ const fn default_focus_structure_shortcut() -> egui::KeyboardShortcut {
 
 const fn default_focus_image_preview_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num0)
+}
+
+const fn default_focus_table_chart_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num4)
 }
 
 const fn default_focus_footnotes_shortcut() -> egui::KeyboardShortcut {

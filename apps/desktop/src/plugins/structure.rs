@@ -102,6 +102,9 @@ impl ParagraphStructureSource {
 }
 
 impl BookSource for ParagraphStructureSource {
+    fn visible_formula_notes(&self, source: &rebook_publication::SourceRange, latex: &str) -> Vec<rebook_publication::FormulaNote> {
+        self.inner.visible_formula_notes(source, latex)
+    }
     fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
     fn book(&self) -> &Book {
         self.inner.book()

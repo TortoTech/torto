@@ -15,6 +15,81 @@ fn table() -> Section {
     }
     section(vec![Block::Table(table)])
 }
+
+#[test]
+fn base_visible_recognition_does_not_wait_for_chart_metadata() {
+    use std::io::{BufRead, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (requested_tx, requested_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        loop {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = std::io::BufReader::new(&mut socket);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" { break; }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes).unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        let content = request["messages"][1]["content"].as_str().map(str::to_owned)
+            .unwrap_or_else(|| request["messages"][1]["content"].as_array().unwrap()
+                .iter().filter_map(|value| value["text"].as_str()).collect());
+        let input: Value = serde_json::from_str(&content).unwrap();
+        let chart_request = input.get("tb").is_some();
+        let result = if chart_request {
+        requested_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        serde_json::to_value(Output { charts: vec![chart()], notes: vec![] }).unwrap()
+        } else {
+            // Basic table-cell structure is a prerequisite; only chart metadata is delayed.
+            json!({"groups":[],"citations":[],"formulas":[]})
+        };
+        let body = json!({"choices":[{"index":0,"finish_reason":"stop","message":{
+            "role":"assistant", "content":wire::encode(&result).to_string()
+        }}]}).to_string();
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        if chart_request { break; }
+        }
+    });
+    let provider = crate::plugins::AiProvider {
+        kind: crate::plugins::AiProviderKind::OpenAi,
+        base_url: format!("http://{address}/v1"), api_key: "fixture".into(),
+        models: vec![crate::plugins::AiModelConfig::language("layout-test")], ..Default::default()
+    };
+    let mut settings = PluginSettings::default();
+    settings.semantic_layout.enabled = true;
+    settings.semantic_layout.provider = provider.id.clone();
+    settings.semantic_layout.model = "layout-test".into();
+    settings.providers = vec![provider];
+    let raw = table();
+    let original = original_source(raw.clone());
+    let book = format!("split-enhancements-{}", uuid::Uuid::new_v4());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let base = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), super::super::recognize_visible(
+            &raw, 0..1, &book, &settings, original.as_ref(),
+        )).await.expect("base readiness must not depend on the enhancement endpoint").unwrap()
+    });
+    assert!(requested_rx.try_recv().is_err(), "base recognition must not request chart metadata");
+    let task = runtime.spawn(async move {
+        super::super::enhance_visible(&raw, 0..1, &book, &settings, base).await
+    });
+    requested_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    assert!(!task.is_finished(), "simulate a chart response that has not arrived yet");
+    release_tx.send(()).unwrap();
+    let result = runtime.block_on(task).unwrap().unwrap().unwrap();
+    assert!(result.annotations.iter().any(|a| matches!(a, Annotation::TableChart { .. })));
+    server.join().unwrap();
+}
 fn chart() -> Chart {
     serde_json::from_value(json!({"tables":[0],"kind":"bar","title":"行业比较","panels":[{"title":"增长率","unit":"%","categories":["甲","乙","丙"],"series":[{"name":"增长率","cells":[[0,1,1],[0,2,1],[0,3,1]]}]}]})).unwrap()
 }

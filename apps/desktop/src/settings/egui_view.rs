@@ -384,6 +384,10 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
                 language.text("按句分段", "Split by sentence"),
             ),
             (
+                ShortcutAction::FocusTableChart,
+                language.text("可视化表格", "Visualize table"),
+            ),
+            (
                 ShortcutAction::FocusImagePreview,
                 language.text("预览图表", "Preview figure or table"),
             ),

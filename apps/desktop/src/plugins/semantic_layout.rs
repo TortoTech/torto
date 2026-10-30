@@ -261,6 +261,7 @@ struct WindowCache {
 }
 
 pub(crate) struct SemanticLayoutSource {
+    formula_note_views: RwLock<HashSet<String>>,
     chart_views: RwLock<HashSet<String>>,
     unified_citations: std::sync::atomic::AtomicBool,
     heuristic_cache: RwLock<HashMap<usize, (String, Vec<Annotation>)>>,
@@ -296,6 +297,7 @@ fn cache_section<T>(cache: &mut HashMap<usize, T>, index: usize, value: T) {
 impl SemanticLayoutSource {
     pub(crate) fn new(inner: Arc<dyn BookSource>, original: Arc<dyn BookSource>) -> Self {
         Self {
+            formula_note_views: RwLock::new(HashSet::new()),
             chart_views: RwLock::new(HashSet::new()),
             unified_citations: std::sync::atomic::AtomicBool::new(false),
             heuristic_cache: RwLock::new(HashMap::new()),
@@ -430,6 +432,7 @@ impl SemanticLayoutSource {
     }
 
     pub(crate) fn clear(&self) {
+        if let Ok(mut views) = self.formula_note_views.write() { views.clear(); }
         if let Ok(mut views) = self.chart_views.write() {
             views.clear();
         }
@@ -560,6 +563,12 @@ impl SemanticLayoutSource {
 }
 
 impl BookSource for SemanticLayoutSource {
+    fn visible_formula_notes(&self, source: &SourceRange, latex: &str) -> Vec<rebook_publication::FormulaNote> {
+        let visible = self.formula_note_views.try_read().ok().is_some_and(|views|
+            views.contains(&format!("{:?}#{}", source.start.spine, source.start.node)));
+        if !visible { return Vec::new(); }
+        self.formula_notes(source, latex).iter().map(enhancements::SymbolNote::render_note).collect()
+    }
     fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
     fn book(&self) -> &Book {
         self.inner.book()
@@ -1263,7 +1272,7 @@ pub(crate) async fn recognize(
     book_id: &str,
     settings: &PluginSettings,
 ) -> Result<Recognition, String> {
-    recognize_impl(section, book_id, settings, None, None).await
+    recognize_impl(section, book_id, settings, None, None, true).await
 }
 
 #[cfg(test)]
@@ -1273,7 +1282,7 @@ pub(crate) async fn recognize_with_source(
     settings: &PluginSettings,
     source: &dyn BookSource,
 ) -> Result<Recognition, String> {
-    recognize_impl(section, book_id, settings, Some(source), None).await
+    recognize_impl(section, book_id, settings, Some(source), None, true).await
 }
 
 pub(crate) async fn recognize_visible(
@@ -1283,7 +1292,38 @@ pub(crate) async fn recognize_visible(
     settings: &PluginSettings,
     source: &dyn BookSource,
 ) -> Result<Recognition, String> {
-    recognize_impl(section, book_id, settings, Some(source), Some(target)).await
+    recognize_impl(
+        section, book_id, settings, Some(source), Some(target), false,
+    ).await
+}
+
+/// Optional presentation metadata must never gate translation readiness.
+pub(crate) async fn enhance_visible(
+    section: &Section,
+    target: std::ops::Range<usize>,
+    book_id: &str,
+    settings: &PluginSettings,
+    mut base: Recognition,
+) -> Result<Option<Recognition>, String> {
+    let client = crate::http::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut enhanced = section.clone();
+    for annotation in &base.annotations {
+        compose(&mut enhanced.blocks, annotation);
+    }
+    let targets = section.blocks[target]
+        .iter()
+        .flat_map(block_ranges)
+        .collect::<Vec<_>>();
+    let (extra, _) = enhancements::recognize(&client, settings, &enhanced, &targets, book_id).await;
+    if extra.is_empty() {
+        return Ok(None);
+    }
+    // Retain the base annotations when the late result replaces its scope.
+    base.annotations.extend(extra);
+    Ok(Some(base))
 }
 
 async fn recognize_impl(
@@ -1292,6 +1332,7 @@ async fn recognize_impl(
     settings: &PluginSettings,
     source: Option<&dyn BookSource>,
     target: Option<std::ops::Range<usize>>,
+    include_enhancements: bool,
 ) -> Result<Recognition, String> {
     let (provider, model) = settings.semantic_layout_endpoint()?;
     let started = std::time::Instant::now();
@@ -1301,7 +1342,9 @@ async fn recognize_impl(
         "chapter.start",
         json!({"book":book_id,"section":section.id,"href":section.href,"blocks":section.blocks.len()}),
     );
-    let result = recognize_inner(section, book_id, settings, source, target).await;
+    let result = recognize_inner(
+        section, book_id, settings, source, target, include_enhancements,
+    ).await;
     let mut details = json!({"book":book_id,"section":section.id,"href":section.href,"elapsed_ms":started.elapsed().as_millis()});
     match &result {
         Ok(recognition) => {
@@ -1331,11 +1374,15 @@ async fn recognize_inner(
     settings: &PluginSettings,
     book_source: Option<&dyn BookSource>,
     target: Option<std::ops::Range<usize>>,
+    include_enhancements: bool,
 ) -> Result<Recognition, String> {
     let (provider, model) = settings.semantic_layout_endpoint()?;
     let config = &RecognitionRoles::default();
     let fingerprint = fingerprint(section);
     let mut identity = recognition_identity(book_id, settings);
+    if !include_enhancements {
+        identity = identity.map(|identity| json!([identity, "base-recognition-v1"]));
+    }
     if let Some(target) = &target {
         identity = identity
             .map(|identity| json!([identity, "visible-target-v1", target.start, target.end]));
@@ -1512,22 +1559,21 @@ async fn recognize_inner(
         }
         start = end;
     }
-    let mut enhanced = working.clone();
-    for annotation in &annotations {
-        compose(&mut enhanced.blocks, annotation);
-    }
-    let (extra, enhancements_ok) = enhancements::recognize(
-        &client,
-        settings,
-        &enhanced,
-        &target_section
-            .blocks
-            .iter()
-            .flat_map(block_ranges)
-            .collect::<Vec<_>>(),
-        book_id,
-    )
-    .await;
+    let (extra, enhancements_ok) = if include_enhancements {
+        let mut enhanced = working.clone();
+        for annotation in &annotations {
+            compose(&mut enhanced.blocks, annotation);
+        }
+        enhancements::recognize(
+            &client,
+            settings,
+            &enhanced,
+            &target_section.blocks.iter().flat_map(block_ranges).collect::<Vec<_>>(),
+            book_id,
+        ).await
+    } else {
+        (Vec::new(), true)
+    };
     annotations.extend(extra);
     let result = Recognition {
         formulas_checked,

@@ -13,6 +13,61 @@ fn reader() -> DesktopReader {
     reader
 }
 
+#[test]
+fn table_chart_action_tracks_focused_table_and_shortcut_ignores_repeats() {
+    let (_, original, range) = crate::reader::semantic_layout::tests::fixture();
+    let mut table = rebook_html::parse_recognized_table(
+        "<table><tr><th>Category</th><th>Value</th></tr><tr><td>A</td><td>1</td></tr><tr><td>B</td><td>2</td></tr></table>",
+    ).unwrap();
+    table.source = Some(range.clone());
+    let (mut reader, original, _) = crate::reader::semantic_layout::tests::fixture_with_blocks(
+        vec![original.blocks[0].clone(), rebook_publication::Block::Table(table)],
+    );
+    reader.plugin_settings.semantic_layout.enabled = true;
+    reader.semantic_source.configure("chart-toolbar-test", &reader.plugin_settings);
+    let recognition = serde_json::from_value(serde_json::json!({
+        "fingerprint":crate::plugins::semantic_layout::fingerprint(&original),
+        "formulas_checked":true,"annotations":[{"TableChart":{
+            "source":range,"members":[range],"language":"English",
+            "svg":"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='60'><path d='M0 60L100 0'/></svg>"
+        }}]
+    })).unwrap();
+    assert!(reader.semantic_source.install(0, recognition));
+    reader.reader = reader.reader.prepare_refresh_request(None).prepare().unwrap();
+    reader.reading_mode = crate::preferences::ReadingMode::Focus;
+    let layout = reader.current_scroll_layout().unwrap();
+    reader.rebuild_focus_units(&layout);
+    reader.select_focus_unit(0);
+    assert!(reader.current_focus_chart_control().is_none());
+    reader.select_focus_unit(reader.focus_units.iter().position(|u| u.range.start.node == range.start.node).unwrap());
+    assert_eq!(reader.current_focus_chart_control().unwrap().1, false);
+    let ctx = egui::Context::default();
+    let binding = reader.shortcuts.focus_table_chart;
+    let press = |repeat| egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: binding.logical_key, physical_key: None, pressed: true, repeat,
+            modifiers: binding.modifiers,
+        }], ..Default::default()
+    };
+    let mut output = ctx.run_ui(press(false), |_| reader.keyboard_shortcuts(&ctx, false));
+    output.textures_delta.clear();
+    assert!(reader.current_focus_chart_control().unwrap().1);
+    output = ctx.run_ui(press(true), |_| reader.keyboard_shortcuts(&ctx, false));
+    output.textures_delta.clear();
+    assert!(reader.current_focus_chart_control().unwrap().1);
+    output = ctx.run_ui(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: binding.logical_key, physical_key: None, pressed: false, repeat: false,
+            modifiers: binding.modifiers,
+        }], ..Default::default()
+    }, |_| {});
+    output.textures_delta.clear();
+    shortcut(&mut reader, &ctx, binding);
+    assert!(!reader.current_focus_chart_control().unwrap().1);
+    reader.focus_units_ready = false;
+    assert!(reader.current_focus_chart_control().is_none());
+}
+
 fn shortcut(reader: &mut DesktopReader, ctx: &egui::Context, binding: egui::KeyboardShortcut) {
     let mut output = ctx.run_ui(
         egui::RawInput {

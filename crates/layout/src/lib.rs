@@ -19,6 +19,7 @@ mod list_markers;
 #[cfg(test)]
 mod figure_typesetting_tests;
 mod formula_raster;
+pub mod formula_notes;
 mod headings;
 mod text_figures;
 mod hyphen_cache;
@@ -1130,6 +1131,7 @@ pub struct LayoutEngine {
     layout_context: LayoutContext<TextBrush>,
     hyphen_glyphs: hyphen_cache::HyphenGlyphCache,
     svg_options: resvg::usvg::Options<'static>,
+    formula_notes_visible: bool,
     publication_languages: Vec<String>,
     raster_target: [u32; 2],
     raster_generation: u64,
@@ -1365,6 +1367,7 @@ impl LayoutEngine {
             layout_context: LayoutContext::new(),
             hyphen_glyphs: hyphen_cache::HyphenGlyphCache::default(),
             svg_options,
+            formula_notes_visible: true,
             publication_languages: Vec::new(),
             raster_target: [2048, 2048],
             raster_generation: raster_cache::generation(),
@@ -1389,6 +1392,12 @@ impl LayoutEngine {
 
     pub fn set_raster_cache_generation(&mut self, generation: u64) {
         self.raster_generation = generation;
+    }
+
+    /// Preview owners switch their own combined texture instead of inheriting
+    /// notes embedded by the reading body's presentation state.
+    pub fn set_formula_notes_visible(&mut self, visible: bool) {
+        self.formula_notes_visible = visible;
     }
 
     pub fn set_deferred_images(&mut self, enabled: bool) {
@@ -1722,6 +1731,10 @@ impl LayoutEngine {
             let block = layout_blocks[block_index];
             match block {
                 Block::Text(block) => {
+                    if unified_reflow && self.push_noted_formula(&mut paginator, source, block, reader_style, content_width)? {
+                        block_index += 1;
+                        continue;
+                    }
                     if unified_reflow
                         && let Some((run, number)) = formula_images::only_formula(block)
                         && self.push_formula_image(

@@ -338,6 +338,7 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
         formula: None,
         table: None,
         notes: vec![],
+        notes_view: Default::default(),
         notes_open: false,
         motion: PreviewMotion {
             opened_at: 0.0,
