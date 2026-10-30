@@ -33,80 +33,53 @@
 
 ## About
 
-Torto is an open-source desktop reader designed around **Focus Mode**. Instead of treating a book as a stack of pages, Focus Mode turns its structure into meaningful reading units—paragraphs, nested lists, quotations, code blocks, tables, and images—and keeps the current unit in a stable reading position. Navigation, highlights, notes, footnotes, translation, and AI conversation all follow that context.
+Torto is an open-source desktop ebook reader designed around **Focus Mode**. Instead of treating a book as a static stack of pages, Focus Mode parses its structure into meaningful reading units—paragraphs, nested lists, quotations, code blocks, tables, and figures—and anchors the active unit at a steady reading line. Navigation, highlights, notes, footnotes, formula notes, table charts, translation, and AI conversations all stay attached to that context.
 
-Classic single-column, two-column, and vertical-scroll layouts remain available when you want a conventional page or chapter view. The local bookshelf, full-book search, translation, optional AI assistant, PDF OCR, and direct WebDAV sync are built around the same native reading model.
-
-Unlike browser-based readers, Torto parses, lays out, paginates, and renders book content through a native Rust pipeline built on egui, Parley, Vello, and wgpu.
+Classic single-column, two-column, and vertical-scroll layouts remain available whenever you want a traditional page or chapter view. Unlike browser-based readers, Torto parses, lays out, paginates, and renders content through a native Rust pipeline built on `egui`, `Parley`, `Vello`, and `wgpu`, downloading default reading fonts on demand in the background to keep the installer lightweight.
 
 ## Focus Mode
 
-Focus Mode is Torto's default and flagship reading experience—and the feature that most clearly sets it apart from conventional ebook readers.
+Focus Mode is Torto's default close-reading experience:
 
-- **Read by meaning, not by page.** One semantic unit is active at a time. Images are valid reading units, nested list descendants stay with their parent item, and large tables or media remain scrollable instead of being skipped.
-- **Browse lists with their context.** A list includes its immediately preceding ordinary paragraph. A fitting group gets one green rounded activation; a taller group has a subtle gray background and green activation for its introduction or current top-level item. Oversized items scroll internally before navigation advances, and list footnotes share one numbering scope.
-- **Keep your place visually.** Short units begin at a stable position inside a centered reading stage; taller content expands only when it needs more room. Moving between units avoids the constant vertical jump caused by paragraphs of different lengths.
-- **Navigate consistently.** The mouse wheel, arrow keys, and the reader scrollbar move through reading units. When a table of contents, chat, footnote panel, or text editor owns input, scrolling stays inside that surface.
-- **Act on the current passage.** Open the action toolbar with `Space`, chat with `Tab`, highlight with `1`, add a note with `2`, use **Split by sentence** with `3`, and toggle contextual footnotes with `Left Alt`. Shortcuts are configurable.
-- **Keep context attached.** Focus chat sessions are scoped to their reading unit for the current book session, while highlights and notes persist at stable source locations. Footnotes are reduced to compact icons on the active unit and expanded only on demand.
-- **Bring scanned PDFs into the same workflow.** Original-layout PDFs use Classic Mode. After PDF OCR creates a reflowable text layer, Focus Mode becomes available with the same unit navigation and reading tools.
+- **Read by meaning, not by page.** One semantic unit is active at a time. Lists stay grouped with their introductory paragraph, and oversized tables or media scroll internally instead of being skipped.
+- **Steady reading line.** Short units start at a fixed centered baseline and expand only when needed, eliminating vertical eye jumps between paragraphs of different lengths. Choose between **Background highlight** and **Dim surroundings** for the focus style.
+- **Keyboard-first passage actions.** Press `Space` to open the action toolbar, `Tab` to open the chat panel, `1` to highlight the paragraph, `2` to open the note panel, `3` to **Split by sentence**, `4` to **Visualize table** (switch between a table and its AI chart), `0` to preview a figure or table, and `Left Alt` to **Toggle footnotes / formula notes**. All shortcuts are configurable.
+- **Attached context & reference previews.** Each passage has its own chat session while highlights and notes persist at durable source locations. Preview referenced figures, tables, and equations in place and cycle through multiple references in reading order.
+- **PDFs in the same workflow.** Text-based PDFs reflow locally right away; scanned PDFs enter Focus Mode once cloud OCR generates a reflowable layer.
 
 ## Features
 
-<div align="left">✅ Implemented</div>
-
 | **Feature** | **Description** | **Status** |
 | --- | --- | --- |
-| **Focus Mode** | Read one semantic unit at a stable position, navigate by unit, and keep actions, conversations, notes, and footnotes attached to the current context. | ✅ Core |
-| **Multi-format support** | Read DRM-free EPUB, MOBI, AZW, AZW3/KF8, FB2, FBZ, CBZ, CHM, and PDF files. | ✅ |
-| **Native rendering** | Parse, lay out, paginate, and render books with Rust instead of embedding a browser or WebView. | ✅ |
-| **Classic layouts** | Switch between single-column, two-column, and section-based vertical scrolling layouts, with unified typography or the book's authored styles. | ✅ |
-| **Cover-first library** | Import books in bulk, browse cover cards, search by title or author, resume recent reading first, and detect duplicates. | ✅ |
-| **Navigation and search** | Use a hierarchical table of contents, chapter tracking, full-book search, keyboard navigation, mouse-wheel paging, and `F11` fullscreen. | ✅ |
-| **Typography and themes** | Configure default, CJK, code, and interface fonts; choose unified or book-authored typography; and follow the system, Light, or Dark theme. | ✅ |
-| **Selection and annotations** | Select freely or by word, sentence, or paragraph; copy text, create highlights and notes, and return to durable source locations. | ✅ |
-| **Image preview** | Press `0` on an active image in Focus Mode, or open it with the pointer. Images initially fit the window, including enlargement of small images; zoom with `-` / `=` or the wheel, pan when enlarged, and copy images to the clipboard. Recognized formulas preview their rendered LaTeX. | ✅ |
-| **Translation** | Translate book content in replacement or bilingual mode and translate the table of contents. | ✅ |
-| **AI layout** | Recover missing headings, attributed quotations and captions; turn inline citations into popup references; recognize text and image formulas and render them as mathematics. | ✅ Optional |
-| **References and links** | Read footnotes and inline citations in a shared popup; open website icons in your browser in unified typesetting. | ✅ |
-| **AI reading assistant** | Stream answers with source-backed citations and render Markdown, tables, math, SVG, and Mermaid, including enlarged visual previews. | ✅ Optional |
-| **PDF OCR and metadata recognition** | Recognize title, author, table of contents, page roles, and body content; switch between the original PDF and a reflowable OCR layout. | ✅ Optional |
-| **WebDAV sync** | Sync books, reading progress, highlights, and notes directly through your own WebDAV provider. | ✅ Optional |
-| **Windows updates** | Check GitHub Releases automatically, verify the MSI with SHA-256, and install updates after confirmation. | ✅ Windows |
+| **Focus Mode** | Read one semantic unit at a stable centered baseline with sentence splitting (`3`), dimmed surroundings, and context-bound actions. | ✅ Core |
+| **Multi-format & library** | Read DRM-free EPUB, MOBI, AZW, AZW3/KF8, FB2, FBZ, CBZ, CHM, and PDF files; browse covers, track reading statistics, and detect duplicates. | ✅ |
+| **Native Rust rendering** | Parse, typeset, paginate, and render natively without a browser or WebView; download default reading fonts in the background. | ✅ |
+| **Classic layouts & themes** | Switch between single-column, two-column, and vertical-scroll views with unified or book-authored styles and Light, Dark, or system themes. | ✅ |
+| **Media & reference previews** | Inspect zoomable images, tables, and rendered LaTeX formulas (`0` or click); preview figures/tables/equations from inline references; copy tables as Markdown. | ✅ |
+| **AI layout, formulas & charts** | Recover headings, quotes, code blocks, captions, and image-based tables; explain display-formula symbols (`Left Alt`); generate charts for suitable tables (`4`). | ✅ Optional |
+| **AI reading assistant** | Chat per passage (`Tab`) or in a resizable book-chat sidebar with source citations, image Q&A (including pasted images), `/` skills, and `@` references. | ✅ Optional |
+| **Translation & glossary** | Read in replacement or bilingual mode (including TOC), with optional **Expert translation** that maintains a per-book terminology glossary. | ✅ Optional |
+| **PDF local reflow & OCR** | Reflow text-based PDFs locally; discover metadata/TOC with an AI agent or convert scanned PDFs via PaddleOCR and MinerU. | ✅ |
+| **WebDAV sync** | Sync books, progress, highlights, notes, reading statistics, and prepared PDF reflow layouts directly through your own WebDAV storage. | ✅ Optional |
+| **Feedback & updates** | Send bug reports or feature requests with screenshots and reading context in-app; verify and install MSI updates with SHA-256 on Windows. | ✅ |
 
-### AI layout and reading tools
+### AI & PDF workflow highlights
 
-Select an AI layout model and reasoning effort in **Settings → Typesetting → Layout**. AI layout supplements the book parser: it can identify headings stored as ordinary paragraphs, quotations with explicit sources, missing attribution for existing quotations, and figure or table captions. Tables represented by images are supported too.
-
-Inline citations appear as numbered markers, restarting within each paragraph. In Focus Mode, their popup lists footnotes first, then inline citations. Formula recognition handles both images and formulas written as text, and copying a recognized formula yields its LaTeX text. Unified typesetting also turns website addresses, including common bare domains, into clickable internet icons.
-
-Recognition prioritizes the current reading area and processes the active subsection in stable batches. When translation is enabled, AI layout follows its reading range and prepares semantic markup before translation; related results are applied together to reduce layout jumps. Recognition can be imperfect, and rejected formula conversions retain the original content.
-
-In chat, type `/` for reading skills or `@` to attach references. Use the arrow keys to select a suggestion and `Tab` to insert it; when suggestions are open, `Tab` keeps the conversation open.
-
-### PDF recognition
-
-PDF contents, book metadata, and special pages are discovered by a shared tool-using agent. It chooses which page overviews, full pages, crops, and existing text to inspect, saves an incremental draft, and submits results after local checks. Printed labels and physical page numbers are stored separately; no single book-wide page offset is assumed. Interrupted drafts and rendered page images are cached locally for reuse. Only confirmed navigation targets are applied; partial completion is reported explicitly. This feature uses the configured recognition model and requires both vision and tool calling. Each run is bounded to 20 model turns and ten minutes, with at most five full pages per read and bounded context history.
-
-### AI providers
-
-Expert translation is an optional switch in Settings → Translation, off by default. It collects up to eight useful new terms alongside each translation, keeping the existing paragraph-keyed response and adding a compact `g` array of `s` (source) / `t` (translation) pairs. Terminology is saved locally per book and target language; subsequent requests receive only matching terms, within a bounded prompt budget. Extraction excludes ordinary phrases and widely established names such as Steve Jobs and McDonald's. Conflicting suggestions never overwrite established terms, and invalid glossary metadata does not discard valid translations. Enabling the switch affects future requests without automatically retranslating existing text; disabling it retains the glossary for later use.
-
-The searchable provider selector includes OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, SiliconFlow, xAI, Groq, Mistral, Moonshot, MiniMax, Z.ai, Ollama, llama.cpp, and custom OpenAI-compatible endpoints. Requests use Rig adapters behind a shared transport layer. Existing provider IDs, credentials, model selections, and custom gateway URLs are preserved. Model lists use the provider's protocol; model IDs can also be entered manually.
-
-For structured tasks, callers supply one JSON Schema. Automatic output selection tries native JSON Schema, then schema-based tool calling, JSON object mode with a schema prompt, and finally prompt-only JSON. Unsupported strategies are skipped or remembered temporarily for the matching endpoint, model, schema, and request capabilities. Authentication, rate-limit, and server errors do not trigger format fallback. Every result is parsed with the existing JSON repair fallback and validated locally before use. Output selection is automatic and requires no provider configuration; custom providers use prompt-only JSON by default. Structured tasks share a four-request budget across format fallback and existing correction attempts.
+- **Supported AI providers:** OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, SiliconFlow, xAI, Groq, Mistral, Moonshot, MiniMax, Z.ai, Ollama, llama.cpp, and custom OpenAI-compatible endpoints.
+- **Smart scheduling:** AI layout and translation prioritize the active reading area in stable subsection batches and apply related updates together to avoid layout jumps. Chart labels and formula notes follow your translation target language even when body translation is off.
+- **PDF intelligence:** Text PDFs reflow locally with automatic quality checks, running-header removal, and hyphenation joining. When configured, a tool-using vision model discovers book metadata, printed vs. physical page numbers, and the table of contents.
 
 ## Screenshots
 
 ### Local bookshelf
 
-Import books, browse covers, search by title or author, and continue where you left off.
+Import books, browse covers, search by title or author, review reading statistics, and continue where you left off.
 
 ![Torto local ebook library](assets/screenshots/library.png)
 
 ### Classic two-column layout
 
-Focus Mode is the default experience described above. Torto also keeps a conventional two-column layout for readers who prefer a page-like view.
+Focus Mode is the default experience described above. Torto also provides a conventional two-column layout for readers who prefer a page-like spread.
 
 ![Torto classic two-column reader](assets/screenshots/reader.png)
 
@@ -120,35 +93,44 @@ Download the latest build from [GitHub Releases](https://github.com/TortoTech/to
 | macOS, Apple silicon | `Torto-*-macos-arm64.dmg` | macOS 15 or later |
 | macOS, Intel | `Torto-*-macos-x86_64.dmg` | macOS 15 or later |
 
-After installation, import one or more books from the bookshelf and open a book in Focus Mode. Use `↑` / `↓`, the mouse wheel, or the reader scrollbar to move between reading units; press `Space` for passage actions and `Tab` for passage-scoped chat. Use `Ctrl + F` to search the current book and the reader menu to change layout, typography, theme, translation, AI, OCR, shortcuts, and sync settings.
+After installing, import books from the shelf and open any book in Focus Mode:
+- Move between reading units with `↑` / `↓`, the mouse wheel, or the scrollbar.
+- Press `Space` for actions, `Tab` for passage chat, `1` / `2` for highlights and notes, `3` to split sentences, `4` to toggle table charts, and `Left Alt` for footnotes and formula symbol notes.
+- Press `Ctrl + F` to search the book and `Ctrl + ,` to configure layout, typography, translation, AI, OCR, shortcuts, and WebDAV sync.
 
 ## Privacy
 
-- Imported books and reading data remain in Torto's local application-data directory.
-- WebDAV passwords and AI API keys are stored in the operating system's secure credential store rather than ordinary configuration files.
-- AI layout, translation, chat, and OCR use your configured providers. Once enabled, AI layout and translation can automatically send relevant book text or images as you read, including subsection context or upcoming content within their scheduling range.
-- WebDAV traffic goes directly from Torto to the service you choose; there is no Torto-operated relay.
-- Submitting feedback publishes your description and the information shown in the feedback dialog to a public GitHub Issue through TortoTech's feedback service. Reader reports include original book metadata and reading context. See the [privacy policy](PRIVACY.md).
+- Imported books, annotations, statistics, and cached OCR/reflow data stay in Torto's local application-data directory.
+- WebDAV passwords and API keys are stored in the operating system's secure credential store rather than plain configuration files.
+- AI layout, translation, chat, and cloud OCR connect directly to the providers you configure. When enabled, AI layout and translation automatically send relevant text or images within the active scheduling range.
+- WebDAV sync connects directly from Torto to your chosen server with no Torto-operated relay.
+- Submitting in-app feedback publishes your description, optional screenshots, and the reading context shown in the dialog to a public GitHub Issue via TortoTech's feedback service. See the [privacy policy](PRIVACY.md).
 
 ## Development
 
-Torto uses Rust `1.97.1`. The workspace package remains named `rebook-desktop`, while the shipped application is `Torto` (`torto.exe` on Windows).
+Torto uses Rust `1.97.1`. The workspace package is `rebook-desktop`, producing the `Torto` application (`torto.exe` on Windows).
 
-Run Cargo commands from the repository root so they use `.cargo/config.toml`, which omits SQLite extensions unused by Torto.
+Run Cargo commands from the repository root so `.cargo/config.toml` applies:
 
 ```powershell
 cargo run --locked -p rebook-desktop
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+cargo test --locked --workspace
 ```
 
-The core reading path is `parser → Reading IR → layout → renderer`. See the [native rendering architecture decision](docs/adr-0001-native-epub-renderer.md), [AI layout batching](docs/ai-layout-batching.md), [AI layout and translation scheduling](docs/ai-layout-scheduling.md), [WebDAV sync protocol](docs/webdav-sync-v1.md), and [known upstream issues](docs/known-upstream-issues.md) for details.
+The core reading pipeline is `parser → Reading IR → layout → renderer`. Architecture notes live in `docs/`:
+- [Native rendering ADR](docs/adr-0001-native-epub-renderer.md) & [Parley evaluation](docs/parley-engine-evaluation.md)
+- [AI semantic layout](docs/ai-semantic-layout.md), [batching](docs/ai-layout-batching.md), and [scheduling](docs/ai-layout-scheduling.md)
+- [Native PDF reflow](docs/pdf-native-reflow.md) & [Reading statistics](docs/reading-statistics.md)
+- [WebDAV sync protocol v1](docs/webdav-sync-v1.md) & [Known upstream issues](docs/known-upstream-issues.md)
+
+<details>
+<summary>Brand assets, macOS signing & feedback service</summary>
 
 ### Brand assets
 
-`assets/logo.svg` is the shared vector master. Regenerate the master PNG,
-Windows installer artwork, and Windows / macOS icons after editing it:
+`assets/logo.svg` is the shared vector master. Regenerate the master PNG, Windows installer artwork, and platform icons after editing it:
 
 ```powershell
 cargo run --locked -p rebook-desktop --example generate_branding
@@ -158,33 +140,21 @@ cargo run --locked -p rebook-desktop --example generate_macos_icons
 
 ### macOS credentials and release signing
 
-Unit tests use an in-memory credential store for WebDAV, AI, OCR and search keys;
-they never read or change the system Keychain. Normal app builds still use the OS
-credential store.
+Unit tests use an in-memory credential store and never touch the system Keychain. Production builds use the OS credential store.
 
-The macOS installer workflow supports these repository secrets:
-
-- `MACOS_SIGNING_IDENTITY`: the full `Developer ID Application: Name (TEAMID)` identity.
-- `MACOS_CERTIFICATE_P12_BASE64`: a base64-encoded `.p12` containing that certificate and private key.
-- `MACOS_CERTIFICATE_PASSWORD`: the `.p12` export password.
-
-Keep the signing team, distribution type and bundle identifier
-`io.github.l-chris.torto` consistent between releases. The workflow imports the
-certificate into a temporary keychain and deletes it after the job. With no
-signing secrets, builds retain ad-hoc signing and updates may ask for Keychain
-access again. Moving existing credentials from ad-hoc builds to Developer ID can
-also require one authorization. Developer ID signing is prepared here;
-notarization requires separate Apple credentials.
+The macOS installer workflow supports `MACOS_SIGNING_IDENTITY`, `MACOS_CERTIFICATE_P12_BASE64`, and `MACOS_CERTIFICATE_PASSWORD` with bundle identifier `io.github.l-chris.torto`.
 
 ### Desktop feedback service
 
-The shelf toolbar and reader menu open the same feedback dialog. The current development endpoint is `http://100.109.172.125:8083/api/feedback` on the Pi and requires Tailscale connectivity. For a public distribution, set `TORTO_FEEDBACK_URL` to the deployed HTTPS feedback endpoint when building. The same environment variable can override the endpoint at runtime; a saved pending report retains its original endpoint and exact payload for safe retries. The URL must end in `/api/feedback` with no credentials, query or fragment. HTTP is accepted only for private, loopback or Tailscale IP addresses. GitHub App credentials stay on the service and are never bundled with the desktop app.
+Set `TORTO_FEEDBACK_URL` (ending in `/api/feedback`) at build time or runtime to point the feedback dialog at the deployed HTTPS endpoint. GitHub App credentials stay on the service and are never bundled with the desktop app.
+
+</details>
 
 ## Project status
 
-Torto is under active development. DRM-protected books are not supported. Focus Mode is unavailable for an original-layout PDF until reflowable OCR content exists. The native renderer intentionally does not aim for full browser-level HTML/CSS compatibility, so complex fixed layouts, vertical writing, Ruby annotations, and some interactive book content may not render completely yet.
+Torto is under active development. DRM-protected books are not supported. Original-layout PDFs use Classic Mode until local reflow or OCR content is available. The native renderer does not aim for full browser HTML/CSS compatibility, so complex fixed layouts, vertical writing, Ruby annotations, and interactive scripts may not render completely yet.
 
-Please report reproducible problems in [Issues](https://github.com/TortoTech/torto/issues). Include the book format, screenshots, and reproduction steps, but do not upload complete copyrighted books.
+Report reproducible issues in [GitHub Issues](https://github.com/TortoTech/torto/issues) with the book format, screenshots, and steps (please do not upload complete copyrighted books).
 
 ## License
 
