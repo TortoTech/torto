@@ -70,7 +70,18 @@ jobs:
           "version=$($package.version)" >> $env:GITHUB_OUTPUT
 
       - name: Run tests
+        env:
+          TORTO_FEATURE_ARTIFACTS: ${{ runner.temp }}/torto-render-checks
         run: cargo test --locked --workspace
+
+      - name: Upload failed render diagnostics
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-render-diagnostics-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/torto-render-checks/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Restore cargo-wix
         id: cargo-wix-cache

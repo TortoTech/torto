@@ -318,18 +318,12 @@ fn chart_toggle_keeps_table_cells_source_identity_and_immutable_resource() {
         pixels.pixels.len(),
         pixels.width as usize * pixels.height as usize * 4
     );
-    assert!(
-        pixels
-            .pixels
-            .chunks_exact(4)
-            .filter(|p| p[0] < 90 && p[1] < 120 && p[2] < 100 && p[3] > 200)
-            .count()
-            > 300,
-        "chart text and axes must materialize through the production resource path"
-    );
+    let dark_pixels = pixels.pixels.chunks_exact(4)
+        .filter(|p|p[0]<90 && p[1]<120 && p[2]<100 && p[3]>200).count();
     if let Some(dir) = std::env::var_os("TORTO_FEATURE_ARTIFACTS") {
         let dir = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("table-chart.svg"), &source.resource(href).unwrap().bytes).unwrap();
         image::save_buffer(
             dir.join("table-chart.png"),
             &pixels.pixels,
@@ -339,6 +333,8 @@ fn chart_toggle_keeps_table_cells_source_identity_and_immutable_resource() {
         )
         .unwrap();
     }
+    assert!(dark_pixels > 300,
+        "chart text and axes must materialize through the production resource path: {dark_pixels} dark pixels; {} reader fonts", source.chart_fonts.len());
     assert!(source.toggle_chart(origin));
     let anchor = source.chart_anchor(origin).unwrap();
     session = session

@@ -270,22 +270,24 @@ fn reading_font_database(fonts: &[peniko::Blob<u8>]) -> std::sync::Arc<fontdb::D
     db
 }
 fn with_reading_fonts(mut db: fontdb::Database, fonts: &[peniko::Blob<u8>]) -> fontdb::Database {
+    let mut preferred = None;
     for font in fonts {
-        db.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(font.clone())));
+        let ids = db.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(font.clone())));
+        if preferred.is_none() {
+            preferred = ids.iter().find_map(|id| {
+                db.face(*id)
+                    .and_then(|face| face.families.first())
+                    .map(|family| family.0.clone())
+            });
+        }
     }
-    // Minimal systems may have no default Arial family. Give SVG generic sans
-    // a concrete available face before the glyph-level fallback can run.
-    let fallback_family = db
-        .faces()
-        .find_map(|f| f.families.first().map(|f| f.0.clone()));
-    if db
-        .query(&fontdb::Query {
-            families: &[fontdb::Family::SansSerif],
-            ..Default::default()
-        })
-        .is_none()
-        && let Some(name) = fallback_family
-    {
+    // Use the active reader's first available face for chart labels. Otherwise
+    // generic sans and glyph fallback depend on the runner's installed fonts.
+    let fallback = preferred.or_else(|| {
+        db.faces()
+            .find_map(|f| f.families.first().map(|f| f.0.clone()))
+    });
+    if let Some(name) = fallback {
         db.set_sans_serif_family(name);
     }
 
@@ -351,7 +353,19 @@ mod font_tests {
             0
         );
         let fonts = crate::fonts::embedded_reader_fonts();
-        let db = with_reading_fonts(fontdb::Database::new(), &fonts);
+        let latin = with_reading_fonts(fontdb::Database::new(), &fonts[1..]);
+        let db = with_reading_fonts(latin, &fonts[..1]);
+        let face = db
+            .query(&fontdb::Query {
+                families: &[fontdb::Family::SansSerif],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            db.with_face_data(face, |data, _| data == fonts[0].as_ref())
+                .unwrap(),
+            "downloaded reading face takes priority over existing Latin defaults"
+        );
         assert!(dark(raster_with_database(svg.as_bytes(), std::sync::Arc::new(db)).unwrap()) > 500);
     }
 }
