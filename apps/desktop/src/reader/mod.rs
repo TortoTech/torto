@@ -395,9 +395,10 @@ pub(crate) fn open_reader_staged(
     } else {
         TranslationBookSource::new(rewrite_source.clone(), plugin_settings.translation_mode)
     });
-    let semantic_source = Arc::new(SemanticLayoutSource::new(
+    let semantic_source = Arc::new(SemanticLayoutSource::with_fonts(
         translation_source.clone(),
         rewrite_source.clone(),
+        reader_fonts.clone(),
     ));
     if !fixed_page {
         semantic_source.configure(

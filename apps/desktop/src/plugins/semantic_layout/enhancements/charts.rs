@@ -243,13 +243,69 @@ fn pie(svg: &mut String, panel: &Panel, top: f64) {
     }
 }
 
+// Reuse downloaded reading fonts without copying their bytes or doing file I/O.
+// One retained generation bounds the derived font database; workers own this lock.
+fn reading_font_database(fonts: &[peniko::Blob<u8>]) -> std::sync::Arc<fontdb::Database> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cached = Option<(Vec<u64>, Arc<fontdb::Database>)>;
+    static CACHE: OnceLock<Mutex<Cached>> = OnceLock::new();
+    if fonts.is_empty() {
+        return rebook_layout::svg_font_database();
+    }
+    let key = fonts.iter().map(peniko::Blob::id).collect::<Vec<_>>();
+    let mut cached = CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((previous, db)) = &*cached
+        && *previous == key
+    {
+        return db.clone();
+    }
+    let db = Arc::new(with_reading_fonts(
+        (*rebook_layout::svg_font_database()).clone(),
+        fonts,
+    ));
+    *cached = Some((key, db.clone()));
+    db
+}
+fn with_reading_fonts(mut db: fontdb::Database, fonts: &[peniko::Blob<u8>]) -> fontdb::Database {
+    for font in fonts {
+        db.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(font.clone())));
+    }
+    // Minimal systems may have no default Arial family. Give SVG generic sans
+    // a concrete available face before the glyph-level fallback can run.
+    let fallback_family = db
+        .faces()
+        .find_map(|f| f.families.first().map(|f| f.0.clone()));
+    if db
+        .query(&fontdb::Query {
+            families: &[fontdb::Family::SansSerif],
+            ..Default::default()
+        })
+        .is_none()
+        && let Some(name) = fallback_family
+    {
+        db.set_sans_serif_family(name);
+    }
+
+    db
+}
+
 // The reader requests dimensions first and materializes this on its existing
 // background raster worker. The shared reader raster cache owns the pixels.
 pub(super) fn raster(
     svg: &[u8],
+    fonts: &[peniko::Blob<u8>],
+) -> Result<rebook_publication::RasterResource, rebook_publication::PublicationError> {
+    raster_with_database(svg, reading_font_database(fonts))
+}
+fn raster_with_database(
+    svg: &[u8],
+    fonts: std::sync::Arc<fontdb::Database>,
 ) -> Result<rebook_publication::RasterResource, rebook_publication::PublicationError> {
     let options = resvg::usvg::Options {
-        fontdb: rebook_layout::svg_font_database(),
+        fontdb: fonts,
         ..Default::default()
     };
     let error = |e: String| rebook_publication::PublicationError::InvalidPublication(e);
@@ -273,4 +329,29 @@ pub(super) fn raster(
         height,
         pixels: pixels.take().into(),
     })
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+    #[test]
+    fn downloaded_fonts_render_chinese_chart_text_without_any_system_fonts() {
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='60'><rect width='300' height='60' fill='white'/><text x='10' y='42' font-family='sans-serif' font-size='32'>行业增长率</text></svg>";
+        let dark = |r: rebook_publication::RasterResource| {
+            r.pixels
+                .chunks_exact(4)
+                .filter(|p| p[0] < 100 && p[1] < 100 && p[2] < 100 && p[3] > 200)
+                .count()
+        };
+        assert_eq!(
+            dark(
+                raster_with_database(svg.as_bytes(), std::sync::Arc::new(fontdb::Database::new()))
+                    .unwrap()
+            ),
+            0
+        );
+        let fonts = crate::fonts::embedded_reader_fonts();
+        let db = with_reading_fonts(fontdb::Database::new(), &fonts);
+        assert!(dark(raster_with_database(svg.as_bytes(), std::sync::Arc::new(db)).unwrap()) > 500);
+    }
 }

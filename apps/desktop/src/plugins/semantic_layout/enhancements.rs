@@ -242,7 +242,7 @@ impl SemanticLayoutSource {
         href: &PublicationUrl,
     ) -> Option<Result<RasterResource, PublicationError>> {
         self.chart_resource(href)
-            .map(|resource| charts::raster(&resource.bytes))
+            .map(|resource| charts::raster(&resource.bytes, &self.chart_fonts))
     }
     pub(super) fn apply_chart_views(&self, blocks: &mut [Block]) {
         fn visit(source: &SemanticLayoutSource, blocks: &mut [Block]) {

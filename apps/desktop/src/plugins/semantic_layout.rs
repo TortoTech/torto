@@ -261,6 +261,7 @@ struct WindowCache {
 }
 
 pub(crate) struct SemanticLayoutSource {
+    chart_fonts: Arc<[peniko::Blob<u8>]>,
     formula_note_views: RwLock<HashSet<String>>,
     chart_views: RwLock<HashSet<String>>,
     unified_citations: std::sync::atomic::AtomicBool,
@@ -295,8 +296,18 @@ fn cache_section<T>(cache: &mut HashMap<usize, T>, index: usize, value: T) {
 }
 
 impl SemanticLayoutSource {
+    #[cfg(test)]
     pub(crate) fn new(inner: Arc<dyn BookSource>, original: Arc<dyn BookSource>) -> Self {
+        Self::with_fonts(inner, original, crate::fonts::reader_fonts())
+    }
+
+    pub(crate) fn with_fonts(
+        inner: Arc<dyn BookSource>,
+        original: Arc<dyn BookSource>,
+        fonts: Arc<[peniko::Blob<u8>]>,
+    ) -> Self {
         Self {
+            chart_fonts: fonts,
             formula_note_views: RwLock::new(HashSet::new()),
             chart_views: RwLock::new(HashSet::new()),
             unified_citations: std::sync::atomic::AtomicBool::new(false),

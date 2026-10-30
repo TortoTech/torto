@@ -260,7 +260,9 @@ fn chart_toggle_keeps_table_cells_source_identity_and_immutable_resource() {
     let mut result = empty_recognition(&raw);
     result.annotations = annotations;
     let original = original_source(raw.clone());
-    let source = Arc::new(SemanticLayoutSource::new(original.clone(), original));
+    let source = Arc::new(SemanticLayoutSource::with_fonts(
+        original.clone(), original, crate::fonts::embedded_reader_fonts(),
+    ));
     source.state.write().unwrap().insert(0, result);
     let Block::Table(raw_table) = &raw.blocks[0] else {
         panic!()
