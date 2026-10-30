@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use rebook_publication::{
-    Block, Book, BookSource, Inline, PublicationError, PublicationUrl, RasterResource, Resource,
+    Block, Book, BookSource, Inline, PublicationError, PublicationUrl, Resource,
     Section, TextRun, TextStyle,
 };
 
@@ -143,17 +143,15 @@ impl RewriteBookSource {
 }
 
 impl BookSource for RewriteBookSource {
-    fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
+    fn inner_source(&self) -> Option<&dyn BookSource> {
+        Some(self.inner.as_ref())
+    }
     fn book(&self) -> &Book {
         self.inner.book()
     }
 
     fn content_revision(&self) -> Option<u64> {
         Some(self.revision())
-    }
-
-    fn table_of_contents_origin(&self) -> rebook_publication::TableOfContentsOrigin {
-        self.inner.table_of_contents_origin()
     }
 
     fn cached_section_fingerprint(&self, index: usize) -> Option<[u8; 32]> {
@@ -238,30 +236,6 @@ impl BookSource for RewriteBookSource {
         self.inner.resource(href)
     }
 
-    fn raster_resource(
-        &self,
-        href: &PublicationUrl,
-    ) -> Result<Option<RasterResource>, PublicationError> {
-        self.inner.raster_resource(href)
-    }
-
-    fn raster_resource_dimensions(
-        &self,
-        href: &rebook_publication::PublicationUrl,
-    ) -> Result<Option<[u32; 2]>, rebook_publication::PublicationError> {
-        self.inner.raster_resource_dimensions(href)
-    }
-
-    fn image_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
-        self.inner.image_resource_dimensions(href)
-    }
-
-    fn fixed_page_dimensions(
-        &self,
-        section_index: usize,
-    ) -> Result<Option<rebook_publication::FixedPageDimensions>, PublicationError> {
-        self.inner.fixed_page_dimensions(section_index)
-    }
 }
 
 fn replacement_content(text: &str, style: TextStyle) -> Vec<Inline> {

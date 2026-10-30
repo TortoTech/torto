@@ -47,6 +47,9 @@ desktop -> reader -> layout -> publication <- formats
 ## 架构不变量
 
 - `BookSource::parse_section` 保持章节懒加载。
+- 包装层通过 `BookSource::inner_source` 复用图片尺寸、目录来源、字体状态、公式备注等能力的默认转发；该查询只读内存，懒加载源不能借此初始化。内容版本和章节指纹由变换层显式实现，不能沿用输入的缓存身份。
+- Reading IR 的文本遍历统一使用 `Block::text_blocks` / `text_blocks_mut`，涵盖图块正文、引用、表格和脚注；AI 的候选筛选与内容遍历分开，识别、应用和还原必须覆盖同一内容树。
+- 目录标题通过 `publication::toc_entry_for_href` 查找，精确锚点优先于文档级条目；只有章节标签允许回退到文档内的首个锚点条目，恢复阅读位置时不借用其他小节的标题。
 - 缓存页面翻页不再次调用 parser。
 - 章节窗口预取只能向 worker 投递任务，不能在 winit/UI 线程执行 parser、layout 或 display-list 编译。
 - resize/样式失效通过 generation 隔离旧预取结果，过期结果不得回填当前缓存。

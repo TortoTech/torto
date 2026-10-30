@@ -331,25 +331,8 @@ pub(crate) fn toc_label_for_href<'a>(
     entries: &'a [rebook_publication::TocEntry],
     href: &rebook_publication::PublicationUrl,
 ) -> Option<&'a str> {
-    fn find<'a>(
-        entries: &'a [rebook_publication::TocEntry],
-        matches: &impl Fn(&rebook_publication::PublicationUrl) -> bool,
-    ) -> Option<&'a str> {
-        entries.iter().find_map(|entry| {
-            find(&entry.children, matches).or_else(|| {
-                entry
-                    .href
-                    .as_ref()
-                    .filter(|target| matches(target))
-                    .map(|_| entry.label.as_str())
-            })
-        })
-    }
-    find(entries, &|target| target == href).or_else(|| {
-        find(entries, &|target| {
-            target.path() == href.path() && target.fragment().is_none()
-        })
-    })
+    rebook_publication::toc_entry_for_href(entries, href, rebook_publication::TocMatch::ExactOrChapter)
+        .map(|entry| entry.label.as_str())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

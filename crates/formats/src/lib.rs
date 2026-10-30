@@ -18,6 +18,7 @@ mod html_context;
 mod kf8;
 mod markup;
 mod mobi;
+mod numeric_attributes;
 mod pdf;
 pub mod reflow;
 #[cfg(test)]

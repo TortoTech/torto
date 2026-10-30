@@ -1,8 +1,11 @@
 //! Format-neutral publication, resource, and locator contracts.
 
+mod book_source;
 mod headings;
+mod toc;
 pub mod media_references;
 pub use headings::heading_ordinal_key;
+pub use toc::{TocMatch, toc_entry_for_href};
 
 use std::fmt;
 use std::sync::Arc;
@@ -1453,82 +1456,7 @@ pub struct FormulaNote {
     pub unit: String,
 }
 
-/// Lazy source boundary: parsers produce stable reading IR one section at a time.
-pub trait BookSource: Send + Sync {
-    /// Memory-only, already validated notes currently visible for this formula.
-    fn visible_formula_notes(&self, _source: &SourceRange, _latex: &str) -> Vec<FormulaNote> {
-        Vec::new()
-    }
-    /// Memory-only status: a render encountered an unavailable font resource.
-    /// Wrappers forward this without forcing their lazy source to load.
-    fn missing_font_resources(&self) -> bool { false }
-    /// Apply an already prepared, memory-only media catalog to popup content.
-    /// Implementations must never parse sections or load resources here.
-    fn prepare_media_references(&self, _content: &mut Vec<Inline>, _origin: Option<&SourceRange>) {}
-    fn media_reference_revision(&self) -> u64 { 0 }
-    /// Lightweight descriptor available immediately after opening.
-    fn book(&self) -> &Book;
-    /// Optional generation for the parsed content. A source returning `Some`
-    /// must advance it whenever its section output changes; `None` requires
-    /// consumers to validate derived caches against the content itself.
-    fn content_revision(&self) -> Option<u64> {
-        None
-    }
-    /// Reports whether navigation is authored, mechanical, or generated.
-    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
-        TableOfContentsOrigin::Embedded
-    }
-    /// Parses one section into the normalized reading IR.
-    fn parse_section(&self, index: usize) -> Result<Section, PublicationError>;
-    /// Optional SHA-256 of `serde_json::to_vec()` for the last parsed section.
-    /// This is a cached lookup, never I/O. Derived sources must return `None`
-    /// when their output differs; consumers also validate `content_revision`.
-    fn cached_section_fingerprint(&self, _index: usize) -> Option<[u8; 32]> {
-        None
-    }
-    /// Loads a referenced resource subject to format-specific budgets.
-    fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError>;
-    /// An authored cover page used when no usable standalone cover image exists.
-    fn cover_section(&self) -> Result<Option<Section>, PublicationError> {
-        Ok(None)
-    }
-    /// Returns an already decoded image when the format can provide one cheaply.
-    fn raster_resource(
-        &self,
-        _href: &PublicationUrl,
-    ) -> Result<Option<RasterResource>, PublicationError> {
-        Ok(None)
-    }
-    /// Returns the eventual fixed-page raster dimensions without materializing
-    /// its pixels. Sources that cannot provide this cheaply return `None`.
-    fn fixed_page_dimensions(
-        &self,
-        _section_index: usize,
-    ) -> Result<Option<FixedPageDimensions>, PublicationError> {
-        Ok(None)
-    }
-
-    /// Dimensions of a source-owned raster, without generating its pixels.
-    /// Such resources must be immutable for the publication ID and revision;
-    /// this lets interactive readers schedule materialization after layout.
-    fn raster_resource_dimensions(
-        &self,
-        _href: &PublicationUrl,
-    ) -> Result<Option<[u32; 2]>, PublicationError> {
-        Ok(None)
-    }
-
-    /// Intrinsic pixel dimensions of an encoded image, without decoding pixels.
-    /// A source returning `Some` guarantees the encoded bytes are immutable for
-    /// this publication ID and content revision. Unlike source-owned rasters,
-    /// these images still use `resource()` and the renderer's display resizer.
-    fn image_resource_dimensions(
-        &self,
-        _href: &PublicationUrl,
-    ) -> Result<Option<[u32; 2]>, PublicationError> {
-        Ok(None)
-    }
-}
+pub use book_source::BookSource;
 
 /// Source position shared by DOM, semantic blocks, and layout fragments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

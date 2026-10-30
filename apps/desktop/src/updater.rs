@@ -8,20 +8,24 @@ use egui::RichText;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Deserialize;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use crate::async_task::{TaskResult, TaskSlot};
+use crate::http::github;
 use crate::persistence::write_bytes_atomic;
 #[cfg(target_os = "windows")]
 use crate::platform::UserEvent;
 use crate::preferences::AppLanguage;
 use crate::ui::{dialog_action_button, palette};
 
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/TortoTech/torto/releases/latest";
 const GITEE_RELEASE_URL: &str = "https://gitee.com/api/v5/repos/TortoTech/torto/releases/latest";
 const RELEASE_DOWNLOAD_PREFIX: &str = "/TortoTech/torto/releases/download/";
 const CHINESE_RELEASE_NOTES_SUMMARY: &str = "中文更新说明";
 const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(test)]
+#[path = "updater/asset_download_tests.rs"]
+mod asset_download_tests;
 const WINDOWS_INSTALL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $targetProcess = Get-Process -Id ([int]$env:TORTO_UPDATE_PARENT_PID) -ErrorAction SilentlyContinue
@@ -47,6 +51,8 @@ pub(crate) struct UpdateRelease {
 struct UpdateAsset {
     name: String,
     url: String,
+    /// Supplied by GitHub's release metadata; a Gitee-only check has no ID.
+    github_asset_id: Option<u64>,
     sha256: String,
     size: u64,
 }
@@ -588,11 +594,7 @@ async fn check_github(
     client: &reqwest::Client,
     current: &str,
 ) -> Result<Option<UpdateRelease>, String> {
-    let response = client
-        .get(LATEST_RELEASE_URL)
-        .header(USER_AGENT, format!("Torto/{}", env!("CARGO_PKG_VERSION")))
-        .header(ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
+    let response = github::json_request(client, &github::TORTO.latest_release_url())
         .send()
         .await
         .map_err(|error| error.to_string())?
@@ -686,19 +688,7 @@ fn select_update(
 
 async fn download_update(release: UpdateRelease) -> Result<DownloadedUpdate, String> {
     validate_asset(&release.asset)?;
-    let client = crate::http::builder()
-        .timeout(Duration::from_mins(3))
-        .connect_timeout(Duration::from_secs(5))
-        .read_timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 8 || !trusted_download_redirect(attempt.url()) {
-                attempt.error("Untrusted installer redirect")
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = installer_client()?;
     let bytes = download_with_fallback(&release.asset, |url| {
         download_installer_bytes(&client, url, &release.asset)
     })
@@ -717,20 +707,35 @@ async fn download_update(release: UpdateRelease) -> Result<DownloadedUpdate, Str
     })
 }
 
+fn installer_client() -> Result<reqwest::Client, String> {
+    crate::http::download_builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 8 || !trusted_download_redirect(attempt.url()) {
+                attempt.error("Untrusted installer redirect")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|error| error.to_string())
+}
+
 fn trusted_download_redirect(url: &reqwest::Url) -> bool {
     url.scheme() == "https"
         && url.username().is_empty()
         && url.password().is_none()
-        && matches!(
-            url.host_str(),
-            Some(
-                "github.com"
-                    | "release-assets.githubusercontent.com"
-                    | "objects.githubusercontent.com"
-                    | "gitee.com"
-                    | "foruda.gitee.com"
-            )
-        )
+        && url.port_or_known_default() == Some(443)
+        && (github::TORTO.is_asset_url(url)
+            || matches!(
+                url.host_str(),
+                Some(
+                    "github.com"
+                        | "release-assets.githubusercontent.com"
+                        | "objects.githubusercontent.com"
+                        | "gitee.com"
+                        | "foruda.gitee.com"
+                )
+            ))
 }
 
 async fn download_with_fallback<F, Fut>(
@@ -752,7 +757,12 @@ where
         .set_host(Some(host))
         .map_err(|error| error.to_string())?;
     let mut errors = Vec::new();
-    for url in [asset.url.clone(), alternative.to_string()] {
+    let mut urls = Vec::with_capacity(3);
+    if let Some(id) = asset.github_asset_id {
+        urls.push(github::TORTO.asset_url(id));
+    }
+    urls.extend([asset.url.clone(), alternative.to_string()]);
+    for url in urls {
         let result = fetch(url).await.and_then(|bytes| {
             verify_installer_bytes(asset, &bytes)?;
             Ok(bytes)
@@ -770,29 +780,17 @@ async fn download_installer_bytes(
     url: String,
     asset: &UpdateAsset,
 ) -> Result<Vec<u8>, String> {
-    let mut response = client
-        .get(url)
-        .header(USER_AGENT, format!("Torto/{}", env!("CARGO_PKG_VERSION")))
-        .header(ACCEPT, "application/octet-stream")
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_INSTALLER_BYTES || length != asset.size)
-    {
-        return Err("The installer response has an unexpected file size".into());
+    crate::http::fetch_sized_body(installer_request(client, &url), asset.size, MAX_INSTALLER_BYTES, |_| {}).await
+}
+
+fn installer_request(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+    if reqwest::Url::parse(url).is_ok_and(|url| github::TORTO.is_asset_url(&url)) {
+        github::asset_request(client, url)
+    } else {
+        client.get(url)
+            .header(USER_AGENT, concat!("Torto/", env!("CARGO_PKG_VERSION")))
+            .header(ACCEPT, "application/octet-stream")
     }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
-        if bytes.len() as u64 + chunk.len() as u64 > asset.size {
-            return Err("The installer response exceeds its declared size".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
 }
 
 fn verify_installer_file(update: &DownloadedUpdate) -> Result<(), String> {
@@ -802,18 +800,7 @@ fn verify_installer_file(update: &DownloadedUpdate) -> Result<(), String> {
 }
 
 fn verify_installer_bytes(asset: &UpdateAsset, bytes: &[u8]) -> Result<(), String> {
-    let actual_size = u64::try_from(bytes.len()).map_err(|error| error.to_string())?;
-    if actual_size != asset.size || actual_size > MAX_INSTALLER_BYTES {
-        return Err(format!(
-            "Downloaded installer size mismatch: expected {}, received {actual_size}",
-            asset.size
-        ));
-    }
-    let actual_digest = format!("{:x}", Sha256::digest(bytes));
-    if actual_digest != asset.sha256 {
-        return Err("Downloaded installer failed SHA-256 verification".into());
-    }
-    Ok(())
+    crate::http::verify_sized_sha256(bytes, asset.size, MAX_INSTALLER_BYTES, &asset.sha256)
 }
 
 fn release_from_github(
@@ -853,6 +840,7 @@ fn release_from_github(
         asset: UpdateAsset {
             name: asset.name,
             url: asset.browser_download_url,
+            github_asset_id: Some(asset.id),
             sha256: digest,
             size: asset.size,
         },
@@ -893,6 +881,7 @@ fn release_from_gitee(
     let asset = UpdateAsset {
         name: manifest.asset.name,
         url: attachment.browser_download_url.clone(),
+        github_asset_id: None,
         sha256: manifest.asset.sha256,
         size: manifest.asset.size,
     };
@@ -934,6 +923,12 @@ fn validate_asset(asset: &UpdateAsset) -> Result<(), String> {
         return Err("The Windows installer has an invalid SHA-256 digest".into());
     }
     let url = reqwest::Url::parse(&asset.url).map_err(|error| error.to_string())?;
+    if asset
+        .github_asset_id
+        .is_some_and(|id| id == 0 || url.host_str() != Some("github.com"))
+    {
+        return Err("The GitHub installer asset ID is invalid".into());
+    }
     if !matches!(url.host_str(), Some("github.com" | "gitee.com")) {
         return Err("The Windows installer download URL is not trusted".into());
     }
@@ -995,6 +990,7 @@ struct GitHubRelease {
 
 #[derive(Deserialize)]
 struct GitHubAsset {
+    id: u64,
     name: String,
     browser_download_url: String,
     digest: Option<String>,
@@ -1044,13 +1040,14 @@ fn parse_version_part(part: Option<&str>, full: &str) -> Result<u64, String> {
 mod tests {
     use super::*;
 
-    fn github_release(tag: &str, digest: Option<&str>) -> GitHubRelease {
+    pub(super) fn github_release(tag: &str, digest: Option<&str>) -> GitHubRelease {
         GitHubRelease {
             tag_name: tag.into(),
             body: Some("## Feature\n\n- Update support".into()),
             draft: false,
             prerelease: false,
             assets: vec![GitHubAsset {
+                id: 42,
                 name: format!("Torto-{}-x86_64.msi", tag.trim_start_matches('v')),
                 browser_download_url: format!(
                     "https://github.com/TortoTech/torto/releases/download/{tag}/Torto-{}-x86_64.msi",
@@ -1122,6 +1119,7 @@ mod tests {
         let asset = UpdateAsset {
             name: "Torto-0.2.12-x86_64.msi".into(),
             url: "https://example.com/Torto-0.2.12-x86_64.msi".into(),
+            github_asset_id: None,
             sha256: "a".repeat(64),
             size: 1,
         };
@@ -1132,7 +1130,7 @@ mod tests {
     #[test]
     fn updater_uses_the_current_github_organization() {
         assert_eq!(
-            LATEST_RELEASE_URL,
+            github::TORTO.latest_release_url(),
             "https://api.github.com/repos/TortoTech/torto/releases/latest"
         );
         assert_eq!(
@@ -1146,6 +1144,7 @@ mod tests {
         let bytes = b"verified installer";
         let asset = UpdateAsset {
             name: "Torto-0.2.12-x86_64.msi".into(),
+            github_asset_id: Some(42),
             url:
                 "https://github.com/TortoTech/torto/releases/download/v0.2.12/Torto-0.2.12-x86_64.msi"
                     .into(),
@@ -1157,7 +1156,7 @@ mod tests {
         assert!(verify_installer_bytes(&asset, b"tampered installer").is_err());
     }
 
-    fn gitee_fixture() -> (GiteeRelease, GiteeManifest) {
+    pub(super) fn gitee_fixture() -> (GiteeRelease, GiteeManifest) {
         let release = GiteeRelease {
             tag_name: "v0.2.12".into(), body: Some("中文说明".into()), prerelease: false,
             assets: vec![GiteeAsset { name: "Torto-0.2.12-x86_64.msi".into(),

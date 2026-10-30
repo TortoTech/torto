@@ -106,7 +106,7 @@ fn download_validates_and_reuses_disk_without_a_server_after_restart() {
     let bytes = runtime
         .block_on(download::fetch_url(
             &client,
-            &url,
+            &catalog::Source::Mirror(url),
             asset.size,
             &mut |percent| progress.push(percent),
         ))
@@ -129,10 +129,159 @@ fn truncated_and_oversized_http_responses_are_rejected() {
         let (url, server) = server(body, declared);
         assert!(
             runtime
-                .block_on(download::fetch_url(&client, &url, 20, &mut |_| {}))
+                .block_on(download::fetch_url(
+                    &client,
+                    &catalog::Source::Mirror(url),
+                    20,
+                    &mut |_| {},
+                ))
                 .is_err()
         );
         server.join().unwrap();
+    }
+}
+
+fn http_server(
+    status: &str,
+    body: Vec<u8>,
+    headers: &[(&str, &str)],
+) -> (String, thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        response.push_str(&format!("{name}: {value}\r\n"));
+    }
+    response.push_str("\r\n");
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut chunk = [0; 1024];
+            let length = stream.read(&mut chunk).unwrap();
+            assert!(length > 0 && request.len() + length <= 8192);
+            request.extend_from_slice(&chunk[..length]);
+        }
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(&body);
+        String::from_utf8(request).unwrap().to_ascii_lowercase()
+    });
+    (format!("http://{address}/font"), handle)
+}
+
+#[test]
+fn github_asset_requests_download_binary_without_credentials() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let client = download::client().unwrap();
+    let asset = &catalog::catalog().fonts[1];
+    let (url, server) = http_server("200 OK", fixture(1), &[]);
+    let bytes = runtime
+        .block_on(download::fetch_url(
+            &client,
+            &catalog::Source::GitHubAsset(url),
+            asset.size,
+            &mut |_| {},
+        ))
+        .unwrap();
+    store::validate(asset, bytes, true).unwrap();
+    let request = server.join().unwrap();
+    assert!(request.contains("accept: application/octet-stream\r\n"));
+    assert!(request.contains("x-github-api-version: 2026-03-10\r\n"));
+    assert!(!request.contains("authorization:"));
+}
+
+#[test]
+fn github_asset_redirects_download_and_validate_the_binary() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let client = download::client().unwrap();
+    let asset = &catalog::catalog().fonts[1];
+    let (cdn_url, cdn) = http_server("200 OK", fixture(1), &[]);
+    let (api_url, api) = http_server("302 Found", Vec::new(), &[("Location", &cdn_url)]);
+    let bytes = runtime
+        .block_on(download::fetch_url(
+            &client,
+            &catalog::Source::GitHubAsset(api_url),
+            asset.size,
+            &mut |_| {},
+        ))
+        .unwrap();
+    store::validate(asset, bytes, true).unwrap();
+    assert!(
+        api.join()
+            .unwrap()
+            .contains("accept: application/octet-stream")
+    );
+    assert!(cdn.join().unwrap().starts_with("get /font http/1.1"));
+}
+
+#[test]
+fn unavailable_or_invalid_github_assets_fall_back_to_the_mirror() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let client = download::client().unwrap();
+    let asset = &catalog::catalog().fonts[1];
+    for (status, body) in [
+        ("403 Forbidden", Vec::new()),
+        ("429 Too Many Requests", Vec::new()),
+        ("404 Not Found", Vec::new()),
+        (
+            "200 OK",
+            br#"{"message":"metadata instead of binary"}"#.to_vec(),
+        ),
+        // Correct size but invalid content must also reach the mirror.
+        ("200 OK", vec![b'<'; asset.size]),
+    ] {
+        let root = root();
+        let (api_url, api) = http_server(status, body, &[]);
+        let (mirror_url, mirror) = http_server("200 OK", fixture(1), &[]);
+        let face = runtime
+            .block_on(download::fetch_sources(
+                &client,
+                root.clone(),
+                asset.clone(),
+                &[
+                    catalog::Source::GitHubAsset(api_url),
+                    catalog::Source::Mirror(mirror_url),
+                ],
+                |_| {},
+            ))
+            .unwrap();
+        assert_eq!(face.data.as_ref(), fixture(1));
+        assert!(store::load_cached(&root, asset).is_some());
+        api.join().unwrap();
+        let request = mirror.join().unwrap();
+        assert!(!request.contains("x-github-api-version:"));
+        assert!(!request.contains("authorization:"));
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn lab_sources_keep_the_existing_font_cache_identity() {
+    assert_eq!(catalog::catalog().version, "1");
+    for asset in &catalog::catalog().fonts {
+        assert!(asset.github_asset_id > 0);
+        let sources = catalog::sources(asset);
+        assert!(matches!(&sources[0], catalog::Source::GitHubAsset(_)));
+        assert_eq!(
+            sources[0].url(),
+            format!(
+                "https://api.github.com/repos/TortoTech/lab/releases/assets/{}",
+                asset.github_asset_id
+            )
+        );
+        assert_eq!(
+            store::path(std::path::Path::new("fonts"), asset),
+            PathBuf::from("fonts")
+                .join("1")
+                .join(format!("{}-{}.ttf", asset.id, asset.sha256))
+        );
+        assert_eq!(sources.len(), 1 + usize::from(asset.mirror_url.is_some()));
     }
 }
 
@@ -142,10 +291,15 @@ fn public_font_sources_match_pinned_content() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let client = download::client().unwrap();
     for asset in &catalog::catalog().fonts {
-        for url in catalog::urls(asset) {
+        for source in catalog::sources(asset) {
             let bytes = runtime
-                .block_on(download::fetch_url(&client, &url, asset.size, &mut |_| {}))
-                .unwrap_or_else(|error| panic!("{url}: {error}"));
+                .block_on(download::fetch_url(
+                    &client,
+                    &source,
+                    asset.size,
+                    &mut |_| {},
+                ))
+                .unwrap_or_else(|error| panic!("{}: {error}", source.url()));
             store::validate(asset, bytes, true).unwrap();
         }
     }

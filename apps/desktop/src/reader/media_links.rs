@@ -493,10 +493,9 @@ impl Source {
 }
 
 impl BookSource for Source {
-    fn visible_formula_notes(&self, source: &SourceRange, latex: &str) -> Vec<rebook_publication::FormulaNote> {
-        self.inner.visible_formula_notes(source, latex)
+    fn inner_source(&self) -> Option<&dyn BookSource> {
+        Some(self.inner.as_ref())
     }
-    fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
     fn book(&self) -> &Book {
         self.inner.book()
     }
@@ -509,9 +508,6 @@ impl BookSource for Source {
     fn prepare_media_references(&self, content: &mut Vec<Inline>, origin: Option<&SourceRange>) {
         self.apply(content, origin);
     }
-    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
-        self.inner.table_of_contents_origin()
-    }
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
         let mut section = self.inner.parse_section(index)?;
         for text in section.blocks.iter_mut().flat_map(Block::text_blocks_mut) {
@@ -521,32 +517,5 @@ impl BookSource for Source {
     }
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
         self.inner.resource(href)
-    }
-    fn cover_section(&self) -> Result<Option<Section>, PublicationError> {
-        self.inner.cover_section()
-    }
-    fn raster_resource(
-        &self,
-        href: &PublicationUrl,
-    ) -> Result<Option<RasterResource>, PublicationError> {
-        self.inner.raster_resource(href)
-    }
-    fn fixed_page_dimensions(
-        &self,
-        index: usize,
-    ) -> Result<Option<FixedPageDimensions>, PublicationError> {
-        self.inner.fixed_page_dimensions(index)
-    }
-    fn raster_resource_dimensions(
-        &self,
-        href: &PublicationUrl,
-    ) -> Result<Option<[u32; 2]>, PublicationError> {
-        self.inner.raster_resource_dimensions(href)
-    }
-    fn image_resource_dimensions(
-        &self,
-        href: &PublicationUrl,
-    ) -> Result<Option<[u32; 2]>, PublicationError> {
-        self.inner.image_resource_dimensions(href)
     }
 }

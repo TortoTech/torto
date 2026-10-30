@@ -574,18 +574,17 @@ impl SemanticLayoutSource {
 }
 
 impl BookSource for SemanticLayoutSource {
+    fn inner_source(&self) -> Option<&dyn BookSource> {
+        Some(self.inner.as_ref())
+    }
     fn visible_formula_notes(&self, source: &SourceRange, latex: &str) -> Vec<rebook_publication::FormulaNote> {
         let visible = self.formula_note_views.try_read().ok().is_some_and(|views|
             views.contains(&format!("{:?}#{}", source.start.spine, source.start.node)));
         if !visible { return Vec::new(); }
         self.formula_notes(source, latex).iter().map(enhancements::SymbolNote::render_note).collect()
     }
-    fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
     fn book(&self) -> &Book {
         self.inner.book()
-    }
-    fn table_of_contents_origin(&self) -> rebook_publication::TableOfContentsOrigin {
-        self.inner.table_of_contents_origin()
     }
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
         let _transaction = self.transaction.read().map_err(|_| {
@@ -715,12 +714,6 @@ impl BookSource for SemanticLayoutSource {
         self.inner.image_resource_dimensions(href)
     }
 
-    fn fixed_page_dimensions(
-        &self,
-        index: usize,
-    ) -> Result<Option<rebook_publication::FixedPageDimensions>, PublicationError> {
-        self.inner.fixed_page_dimensions(index)
-    }
 }
 
 pub(crate) fn fingerprint(section: &Section) -> String {

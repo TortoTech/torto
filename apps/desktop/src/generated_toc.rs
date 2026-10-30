@@ -1,16 +1,14 @@
-use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use rebook_publication::{
-    Book, BookSource, PublicationError, PublicationUrl, RasterResource, Resource, Section,
-    TableOfContentsOrigin, TocEntry,
+    Book, BookSource, PublicationError, PublicationUrl, Resource, Section, TableOfContentsOrigin,
+    TocEntry,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::persistence::{write_bytes_atomic, write_json_atomic};
+use crate::persistence::{self, BookRecord, write_json_atomic};
 
 const GENERATED_TOC_VERSION: u8 = 1;
 const PAGE_MAPPING_REVISION: u8 = 2;
@@ -48,6 +46,14 @@ struct StoredGeneratedToc {
     page_mapping_revision: u8,
 }
 
+impl BookRecord for StoredGeneratedToc {
+    const VERSION: u8 = GENERATED_TOC_VERSION;
+    const KIND: &'static str = "generated TOC";
+    fn identity(&self) -> (u8, &str) {
+        (self.version, &self.book_id)
+    }
+}
+
 impl StoredGeneratedToc {
     fn from_draft(book_id: &str, draft: &GeneratedTocDraft) -> Self {
         Self {
@@ -65,59 +71,35 @@ impl StoredGeneratedToc {
 
 pub(crate) fn save(book_id: &str, draft: &GeneratedTocDraft) -> io::Result<()> {
     let path = generated_toc_path(book_id)?;
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "generated TOC path does not have a parent directory",
-        )
-    })?;
-    fs::create_dir_all(parent)?;
     write_json_atomic(&path, &StoredGeneratedToc::from_draft(book_id, draft))?;
     crate::sync::mark_derived_dirty(book_id, crate::sync::DerivedDataKind::Metadata)
 }
 
 pub(crate) fn export_sync_bytes(book_id: &str) -> io::Result<Option<Vec<u8>>> {
-    match fs::read(generated_toc_path(book_id)?) {
-        Ok(bytes) => {
-            validate_sync_bytes(book_id, &bytes)?;
-            Ok(Some(bytes))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
+    persistence::export_book_record::<StoredGeneratedToc>(&generated_toc_path(book_id)?, book_id)
 }
 
 pub(crate) fn import_sync_bytes(book_id: &str, bytes: &[u8]) -> io::Result<()> {
-    validate_sync_bytes(book_id, bytes)?;
-    write_bytes_atomic(&generated_toc_path(book_id)?, bytes)
+    persistence::import_book_record::<StoredGeneratedToc>(
+        &generated_toc_path(book_id)?,
+        book_id,
+        bytes,
+    )
 }
 
 pub(crate) fn validate_sync_bytes(book_id: &str, bytes: &[u8]) -> io::Result<()> {
-    let stored: StoredGeneratedToc = serde_json::from_slice(bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if stored.version != GENERATED_TOC_VERSION || stored.book_id != book_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "generated TOC does not match the synced book",
-        ));
-    }
-    Ok(())
+    persistence::validate_book_record::<StoredGeneratedToc>(book_id, bytes)
 }
 
 pub(crate) fn load(book_id: &str) -> io::Result<Option<GeneratedTocDraft>> {
-    let path = generated_toc_path(book_id)?;
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(stored) = persistence::load_book_record::<StoredGeneratedToc>(
+        &generated_toc_path(book_id)?,
+        book_id,
+    )?
+    else {
+        return Ok(None);
     };
-    let stored: StoredGeneratedToc = serde_json::from_slice(&bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if stored.version != GENERATED_TOC_VERSION
-        || stored.book_id != book_id
-        || !stored.verified_pages
-        || stored.page_mapping_revision != PAGE_MAPPING_REVISION
-    {
+    if !stored.verified_pages || stored.page_mapping_revision != PAGE_MAPPING_REVISION {
         return Ok(None);
     }
     Ok(Some(GeneratedTocDraft {
@@ -148,24 +130,7 @@ pub(crate) fn load_source(source: Arc<dyn BookSource>) -> io::Result<Arc<dyn Boo
 }
 
 fn generated_toc_path(book_id: &str) -> io::Result<PathBuf> {
-    let project = crate::smoke::project_dirs().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "application data directory is unavailable",
-        )
-    })?;
-    let safe_id = if book_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        book_id.to_owned()
-    } else {
-        format!("{:x}", Sha256::digest(book_id.as_bytes()))
-    };
-    Ok(project
-        .data_local_dir()
-        .join(GENERATED_TOC_DIRECTORY)
-        .join(format!("{safe_id}.json")))
+    persistence::book_data_path(GENERATED_TOC_DIRECTORY, book_id, "json")
 }
 
 fn normalize_entries(mut entries: Vec<GeneratedTocEntry>) -> Vec<GeneratedTocEntry> {
@@ -276,7 +241,9 @@ impl GeneratedTocBookSource {
 }
 
 impl BookSource for GeneratedTocBookSource {
-    fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
+    fn inner_source(&self) -> Option<&dyn BookSource> {
+        Some(self.inner.as_ref())
+    }
     fn book(&self) -> &Book {
         &self.book
     }
@@ -291,27 +258,6 @@ impl BookSource for GeneratedTocBookSource {
 
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
         self.inner.resource(href)
-    }
-
-    fn raster_resource(
-        &self,
-        href: &PublicationUrl,
-    ) -> Result<Option<RasterResource>, PublicationError> {
-        self.inner.raster_resource(href)
-    }
-
-    fn raster_resource_dimensions(
-        &self,
-        href: &rebook_publication::PublicationUrl,
-    ) -> Result<Option<[u32; 2]>, rebook_publication::PublicationError> {
-        self.inner.raster_resource_dimensions(href)
-    }
-
-    fn fixed_page_dimensions(
-        &self,
-        section_index: usize,
-    ) -> Result<Option<rebook_publication::FixedPageDimensions>, PublicationError> {
-        self.inner.fixed_page_dimensions(section_index)
     }
 }
 

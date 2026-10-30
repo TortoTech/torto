@@ -910,25 +910,7 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 fn dirty_marker_path(book_id: &str, kind: DerivedDataKind) -> io::Result<PathBuf> {
-    let project = crate::smoke::project_dirs().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "application data directory is unavailable",
-        )
-    })?;
-    let safe_id = if book_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        book_id.to_owned()
-    } else {
-        sha256(book_id.as_bytes())
-    };
-    Ok(project
-        .data_local_dir()
-        .join(DERIVED_SYNC_DIRECTORY)
-        .join("dirty")
-        .join(format!("{safe_id}.{}", kind.marker_name())))
+    crate::persistence::book_data_path(Path::new(DERIVED_SYNC_DIRECTORY).join("dirty"), book_id, kind.marker_name())
 }
 
 fn read_dirty_revision(book_id: &str, kind: DerivedDataKind) -> io::Result<Option<Vec<u8>>> {

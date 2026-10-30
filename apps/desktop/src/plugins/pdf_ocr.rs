@@ -248,13 +248,11 @@ impl PdfOcrSourceController {
 }
 
 impl BookSource for PdfOcrSourceController {
-    fn missing_font_resources(&self) -> bool { self.active().missing_font_resources() }
+    fn inner_source(&self) -> Option<&dyn BookSource> {
+        Some(self.active().as_ref())
+    }
     fn book(&self) -> &Book {
         self.active().book()
-    }
-
-    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
-        self.active().table_of_contents_origin()
     }
 
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
@@ -265,26 +263,6 @@ impl BookSource for PdfOcrSourceController {
         self.active().resource(href)
     }
 
-    fn raster_resource(
-        &self,
-        href: &PublicationUrl,
-    ) -> Result<Option<RasterResource>, PublicationError> {
-        self.active().raster_resource(href)
-    }
-
-    fn raster_resource_dimensions(
-        &self,
-        href: &rebook_publication::PublicationUrl,
-    ) -> Result<Option<[u32; 2]>, rebook_publication::PublicationError> {
-        self.active().raster_resource_dimensions(href)
-    }
-
-    fn fixed_page_dimensions(
-        &self,
-        section_index: usize,
-    ) -> Result<Option<rebook_publication::FixedPageDimensions>, PublicationError> {
-        self.active().fixed_page_dimensions(section_index)
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
