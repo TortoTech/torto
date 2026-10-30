@@ -3,6 +3,33 @@ use crate::plugins::semantic_layout::tests::{original_source, section, text};
 use crate::plugins::{BlockTranslation, TranslationBookSource, TranslationMode};
 
 #[test]
+fn formulas_inside_nested_figure_bodies_are_recognized_applied_and_restored() {
+    let original = formula_section();
+    let figure = Block::Figure(rebook_publication::FigureBlock {
+        body: vec![Block::Note(rebook_publication::NoteBlock {
+            kind: rebook_publication::NoteBlockKind::Definition,
+            blocks: original.blocks.clone(),
+            source: None,
+        })],
+        images: vec![], captions: vec![],
+        caption_position: rebook_publication::CaptionPosition::After,
+        style: Default::default(), source: None,
+    });
+    let original = section(vec![figure]);
+    let (annotations, skipped) = resolve(&original, 0..1, &[proposal()]);
+    assert_eq!(skipped, 0);
+    assert_eq!(annotations.len(), 1);
+    assert!(validate_annotations(&original, &annotations));
+    let Annotation::TextFormulas { source, spans } = &annotations[0] else { panic!() };
+    let mut displayed = original.clone();
+    compose(&mut displayed.blocks, source, spans);
+    let texts: Vec<_> = displayed.blocks.iter().flat_map(Block::text_blocks).collect();
+    assert!(texts[0].content.iter().any(|item| matches!(item, Inline::Math(_))));
+    restore_originals(&mut displayed.blocks);
+    assert_eq!(displayed, original);
+}
+
+#[test]
 fn hmm_book_formula_quotes_become_display_formulas_and_restore_when_disabled() {
     let descriptor = rebook_publication::SpineItem {
         id: rebook_publication::SpineItemId::new("chapter").unwrap(),

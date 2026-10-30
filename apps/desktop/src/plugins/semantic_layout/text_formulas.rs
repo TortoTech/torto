@@ -22,22 +22,11 @@ pub(super) struct Span {
 }
 
 pub(super) fn texts<'a>(blocks: &'a [Block], out: &mut Vec<&'a TextBlock>) {
-    for block in blocks {
-        match block {
-            Block::Text(t)
-                if !t.kind.is_heading()
-                    && t.kind != TextBlockKind::QuoteAttribution
-                    && t.source.is_some() =>
-            {
-                out.push(t)
-            }
-            Block::Quote(q) => out.extend(q.body.iter().filter(|t| t.source.is_some())),
-            Block::Figure(f) => out.extend(f.text_blocks().filter(|t| t.source.is_some())),
-            Block::Table(t) => out.extend(t.text_blocks().filter(|t| t.source.is_some())),
-            Block::Note(n) => texts(&n.blocks, out),
-            _ => {}
-        }
-    }
+    out.extend(blocks.iter().flat_map(Block::text_blocks).filter(|text| {
+        !text.kind.is_heading()
+            && text.kind != TextBlockKind::QuoteAttribution
+            && text.source.is_some()
+    }));
 }
 
 struct Encoded {
@@ -524,27 +513,8 @@ fn formula_paragraph(text: &TextBlock) -> Option<TextBlock> {
 }
 
 pub(super) fn visit(blocks: &mut [Block], f: &mut impl FnMut(&mut TextBlock)) {
-    for block in blocks {
-        match block {
-            Block::Text(t) => f(t),
-            Block::Quote(q) => {
-                for t in &mut q.body {
-                    f(t);
-                }
-            }
-            Block::Figure(g) => {
-                for t in &mut g.captions {
-                    f(t);
-                }
-            }
-            Block::Table(t) => {
-                for text in t.text_blocks_mut() {
-                    f(text);
-                }
-            }
-            Block::Note(n) => visit(&mut n.blocks, f),
-            _ => {}
-        }
+    for text in blocks.iter_mut().flat_map(Block::text_blocks_mut) {
+        f(text);
     }
 }
 pub(super) fn restore_originals(blocks: &mut [Block]) {

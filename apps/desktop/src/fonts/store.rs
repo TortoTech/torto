@@ -4,7 +4,6 @@ use super::{
 };
 use fontdb::{Database, Family, Query, Style, Weight};
 use peniko::Blob;
-use sha2::{Digest, Sha256};
 use skrifa::raw::TableProvider;
 use std::{
     fs,
@@ -25,10 +24,9 @@ pub(super) fn validate(asset: &Asset, bytes: Vec<u8>, pinned: bool) -> Result<Fa
     if bytes.is_empty() || bytes.len() > 40 * 1024 * 1024 {
         return Err("字体文件大小无效 / Invalid font size".into());
     }
-    if pinned
-        && (bytes.len() != asset.size || format!("{:x}", Sha256::digest(&bytes)) != asset.sha256)
-    {
-        return Err("字体校验失败 / Font checksum mismatch".into());
+    if pinned {
+        crate::http::verify_sized_sha256(&bytes, asset.size as u64, 40 * 1024 * 1024, &asset.sha256)
+            .map_err(|_| "字体校验失败 / Font checksum mismatch".to_owned())?;
     }
     let mut db = Database::new();
     db.load_font_data(bytes);

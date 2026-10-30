@@ -233,19 +233,8 @@ fn toc_label_for_href(
     entries: &[TocEntry],
     href: &rebook_publication::PublicationUrl,
 ) -> Option<String> {
-    for entry in entries {
-        if entry
-            .href
-            .as_ref()
-            .is_some_and(|target| target.resource_url() == href.resource_url())
-        {
-            return Some(entry.label.clone());
-        }
-        if let Some(label) = toc_label_for_href(&entry.children, href) {
-            return Some(label);
-        }
-    }
-    None
+    rebook_publication::toc_entry_for_href(entries, href, rebook_publication::TocMatch::Section)
+        .map(|entry| entry.label.clone())
 }
 
 fn source_range_for_match(

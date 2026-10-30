@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use rebook_publication::{
     Block, BlockStyle, Book, BookSource, FigureBlock, FixedPageTextLayer, FixedPageTextRect,
     FixedPageTextReplacement, FixedPageTextReplacementSegment, Inline, InlineRole, LinkRole,
-    NoteBlock, PublicationError, PublicationUrl, RasterResource, RenditionLayout, Resource,
+    NoteBlock, PublicationError, PublicationUrl, RenditionLayout, Resource,
     Section, SourceRange, TextBaseline, TextBlock, TextBlockKind, TextLanguage, TextRun, TextStyle,
 };
 
@@ -700,13 +700,11 @@ fn source_range_nodes_overlap(source: &SourceRange, visible: &SourceRange) -> bo
 }
 
 impl BookSource for TranslationBookSource {
-    fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
+    fn inner_source(&self) -> Option<&dyn BookSource> {
+        Some(self.inner.as_ref())
+    }
     fn book(&self) -> &Book {
         self.inner.book()
-    }
-
-    fn table_of_contents_origin(&self) -> rebook_publication::TableOfContentsOrigin {
-        self.inner.table_of_contents_origin()
     }
 
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
@@ -872,30 +870,6 @@ impl BookSource for TranslationBookSource {
         self.inner.resource(href)
     }
 
-    fn raster_resource(
-        &self,
-        href: &PublicationUrl,
-    ) -> Result<Option<RasterResource>, PublicationError> {
-        self.inner.raster_resource(href)
-    }
-
-    fn raster_resource_dimensions(
-        &self,
-        href: &rebook_publication::PublicationUrl,
-    ) -> Result<Option<[u32; 2]>, rebook_publication::PublicationError> {
-        self.inner.raster_resource_dimensions(href)
-    }
-
-    fn image_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
-        self.inner.image_resource_dimensions(href)
-    }
-
-    fn fixed_page_dimensions(
-        &self,
-        section_index: usize,
-    ) -> Result<Option<rebook_publication::FixedPageDimensions>, PublicationError> {
-        self.inner.fixed_page_dimensions(section_index)
-    }
 }
 
 fn apply_note_translation(

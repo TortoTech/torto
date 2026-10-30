@@ -1,14 +1,14 @@
 {
   "version": "1",
-  "source_revision": "e08072feffaaa5d603b533bf15f94cb34f2c2e72",
-  "mirror_revision": "b534868991612d7abdf7ee617acd117fd32644bb",
+  "release": "https://github.com/TortoTech/lab/releases/tag/reader-fonts-v1",
   "fonts": [
     {
       "id": "lxgw-wenkai-gb-screen",
       "file": "LXGWWenKaiGBScreen.ttf",
       "family": "LXGW WenKai GB Screen",
       "italic": false,
-      "fallback_url": "https://github.com/lxgw/LxgwWenKai-Screen/releases/download/v1.522/LXGWWenKaiGBScreen.ttf",
+      "github_asset_id": 693575108,
+      "mirror_url": "https://gitee.com/TortoTech/lab/releases/download/reader-fonts-v1/LXGWWenKaiGBScreen.ttf",
       "size": 26037854,
       "sha256": "23ec023913e1851925eb94462c4b0ccd1d78bb89533745aaa8cc682ccd339dc0"
     },
@@ -17,6 +17,8 @@
       "file": "Literata-opsz-wght.ttf",
       "family": "Literata",
       "italic": false,
+      "github_asset_id": 693575112,
+      "mirror_url": "https://gitee.com/TortoTech/lab/releases/download/reader-fonts-v1/Literata-opsz-wght.ttf",
       "size": 955132,
       "sha256": "b41138c9373112f32abb589cc22e8674b06ed4048b0c513be922bdd26f274440"
     },
@@ -25,6 +27,8 @@
       "file": "Literata-Italic-opsz-wght.ttf",
       "family": "Literata",
       "italic": true,
+      "github_asset_id": 693575114,
+      "mirror_url": "https://gitee.com/TortoTech/lab/releases/download/reader-fonts-v1/Literata-Italic-opsz-wght.ttf",
       "size": 902728,
       "sha256": "d483dfaeba9cbf4ce71d32a52ee65df82f7e35b15fff8d1011cdb242d1fcd465"
     }

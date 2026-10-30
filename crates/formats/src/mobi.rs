@@ -1,3 +1,4 @@
+use crate::numeric_attributes::rewrite as rewrite_numeric_attributes;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
@@ -315,75 +316,7 @@ fn normalized_tag(name: &[u8]) -> String {
         _ => name.into_owned(),
     }
 }
-fn rewrite_numeric_attributes(
-    source: &str,
-    name: &str,
-    mut replacement: impl FnMut(usize) -> Option<String>,
-) -> String {
-    let bytes = source.as_bytes();
-    let lower = bytes.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
-    let needle = name.as_bytes();
-    let mut output = String::with_capacity(source.len());
-    let mut copied = 0usize;
-    let mut search = 0usize;
-    while search + needle.len() <= lower.len() {
-        let Some(relative) = lower[search..]
-            .windows(needle.len())
-            .position(|window| window == needle)
-        else {
-            break;
-        };
-        let start = search + relative;
-        search = start + needle.len();
-        let within_tag = lower[..start].iter().rposition(|byte| *byte == b'<')
-            > lower[..start].iter().rposition(|byte| *byte == b'>');
-        if !within_tag || start > 0 && lower[start - 1].is_ascii_alphanumeric() {
-            continue;
-        }
-        let mut position = search;
-        while lower.get(position).is_some_and(u8::is_ascii_whitespace) {
-            position += 1;
-        }
-        if lower.get(position) != Some(&b'=') {
-            continue;
-        }
-        position += 1;
-        while lower.get(position).is_some_and(u8::is_ascii_whitespace) {
-            position += 1;
-        }
-        let quote = lower
-            .get(position)
-            .copied()
-            .filter(|byte| matches!(byte, b'\'' | b'"'));
-        if quote.is_some() {
-            position += 1;
-        }
-        let value_start = position;
-        while lower.get(position).is_some_and(u8::is_ascii_digit) {
-            position += 1;
-        }
-        if position == value_start || quote.is_some_and(|quote| lower.get(position) != Some(&quote))
-        {
-            continue;
-        }
-        let end = position + usize::from(quote.is_some());
-        let Ok(value) = source[value_start..position].parse::<usize>() else {
-            continue;
-        };
-        let replacement = replacement(value)
-            .unwrap_or_else(|| format!("{name}=\"{}\"", &source[value_start..position]));
-        output.push_str(&source[copied..start]);
-        output.push_str(&replacement);
-        copied = end;
-        search = end;
-    }
-    if copied == 0 {
-        source.to_owned()
-    } else {
-        output.push_str(&source[copied..]);
-        output
-    }
-}
+
 
 #[cfg(test)]
 mod tests {

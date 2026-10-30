@@ -4,17 +4,17 @@ use std::sync::OnceLock;
 #[derive(Deserialize)]
 pub(super) struct Catalog {
     pub(super) version: String,
-    source_revision: String,
-    mirror_revision: String,
     pub(super) fonts: [Asset; 3],
 }
 #[derive(Clone, Deserialize)]
 pub(super) struct Asset {
     pub(super) id: String,
+    #[cfg(test)]
     pub(super) file: String,
     pub(super) family: String,
     pub(super) italic: bool,
-    fallback_url: Option<String>,
+    pub(super) github_asset_id: u64,
+    pub(super) mirror_url: Option<String>,
     pub(super) size: usize,
     pub(super) sha256: String,
 }
@@ -25,20 +25,27 @@ pub(super) fn catalog() -> &'static Catalog {
             .expect("checked-in font manifest")
     })
 }
-pub(super) fn urls(asset: &Asset) -> [String; 2] {
-    // Immutable, already-published Torto resources, independent of app releases.
-    let revision = &catalog().source_revision;
-    [
-        format!(
-            "https://raw.githubusercontent.com/TortoTech/torto/{revision}/assets/fonts/{}",
-            asset.file
-        ),
-        asset.fallback_url.clone().unwrap_or_else(|| {
-            format!(
-                "https://gitee.com/TortoTech/torto/raw/{}/assets/fonts/{}",
-                catalog().mirror_revision,
-                asset.file
-            )
-        }),
-    ]
+#[derive(Debug)]
+pub(super) enum Source {
+    GitHubAsset(String),
+    Mirror(String),
+}
+impl Source {
+    pub(super) fn url(&self) -> &str {
+        match self {
+            Self::GitHubAsset(url) | Self::Mirror(url) => url,
+        }
+    }
+}
+pub(super) fn sources(asset: &Asset) -> Vec<Source> {
+    // IDs pin immutable font resources independently of application releases.
+    // A mirror is added only after its anonymous download has been verified.
+    let mut sources = vec![Source::GitHubAsset(format!(
+        "https://api.github.com/repos/TortoTech/lab/releases/assets/{}",
+        asset.github_asset_id
+    ))];
+    if let Some(url) = &asset.mirror_url {
+        sources.push(Source::Mirror(url.clone()));
+    }
+    sources
 }

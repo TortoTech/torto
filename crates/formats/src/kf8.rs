@@ -1,3 +1,4 @@
+use crate::numeric_attributes::values as find_numeric_attributes;
 use std::collections::{HashMap, HashSet};
 
 use encoding_rs::WINDOWS_1252;
@@ -534,57 +535,7 @@ fn resource_path(context: &Context<'_>, id: usize) -> Result<Option<String>, Str
     Ok(image_type(record).map(|(extension, _)| format!("Images/kindle-{id}.{extension}")))
 }
 
-fn find_numeric_attributes(data: &[u8], name: &[u8]) -> Vec<usize> {
-    let lower = data.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
-    let mut values = Vec::new();
-    let mut search = 0usize;
-    while search + name.len() <= lower.len() {
-        let Some(relative) = lower[search..]
-            .windows(name.len())
-            .position(|window| window == name)
-        else {
-            break;
-        };
-        let start = search + relative;
-        search = start + name.len();
-        if start > 0 && lower[start - 1].is_ascii_alphanumeric() {
-            continue;
-        }
-        let mut position = search;
-        while lower.get(position).is_some_and(u8::is_ascii_whitespace) {
-            position += 1;
-        }
-        if lower.get(position) != Some(&b'=') {
-            continue;
-        }
-        position += 1;
-        while lower.get(position).is_some_and(u8::is_ascii_whitespace) {
-            position += 1;
-        }
-        let quote = lower
-            .get(position)
-            .copied()
-            .filter(|byte| matches!(byte, b'\'' | b'"'));
-        if quote.is_some() {
-            position += 1;
-        }
-        let value_start = position;
-        while lower.get(position).is_some_and(u8::is_ascii_digit) {
-            position += 1;
-        }
-        if position > value_start
-            && quote.is_none_or(|quote| lower.get(position) == Some(&quote))
-            && let Ok(value) = std::str::from_utf8(&lower[value_start..position])
-                .unwrap_or_default()
-                .parse()
-        {
-            values.push(value);
-        }
-    }
-    values.sort_unstable();
-    values.dedup();
-    values
-}
+
 
 fn split_mobi6_sections(data: &[u8]) -> Vec<std::ops::Range<usize>> {
     let lower = data.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();

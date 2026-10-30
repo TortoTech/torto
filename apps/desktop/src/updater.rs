@@ -8,6 +8,7 @@ use egui::RichText;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Deserialize;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use crate::async_task::{TaskResult, TaskSlot};
@@ -770,7 +771,7 @@ async fn download_installer_bytes(
     url: String,
     asset: &UpdateAsset,
 ) -> Result<Vec<u8>, String> {
-    let mut response = client
+    let response = client
         .get(url)
         .header(USER_AGENT, format!("Torto/{}", env!("CARGO_PKG_VERSION")))
         .header(ACCEPT, "application/octet-stream")
@@ -779,20 +780,7 @@ async fn download_installer_bytes(
         .map_err(|error| error.to_string())?
         .error_for_status()
         .map_err(|error| error.to_string())?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_INSTALLER_BYTES || length != asset.size)
-    {
-        return Err("The installer response has an unexpected file size".into());
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
-        if bytes.len() as u64 + chunk.len() as u64 > asset.size {
-            return Err("The installer response exceeds its declared size".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
+    crate::http::read_sized_body(response, asset.size, MAX_INSTALLER_BYTES, |_| {}).await
 }
 
 fn verify_installer_file(update: &DownloadedUpdate) -> Result<(), String> {
@@ -802,18 +790,7 @@ fn verify_installer_file(update: &DownloadedUpdate) -> Result<(), String> {
 }
 
 fn verify_installer_bytes(asset: &UpdateAsset, bytes: &[u8]) -> Result<(), String> {
-    let actual_size = u64::try_from(bytes.len()).map_err(|error| error.to_string())?;
-    if actual_size != asset.size || actual_size > MAX_INSTALLER_BYTES {
-        return Err(format!(
-            "Downloaded installer size mismatch: expected {}, received {actual_size}",
-            asset.size
-        ));
-    }
-    let actual_digest = format!("{:x}", Sha256::digest(bytes));
-    if actual_digest != asset.sha256 {
-        return Err("Downloaded installer failed SHA-256 verification".into());
-    }
-    Ok(())
+    crate::http::verify_sized_sha256(bytes, asset.size, MAX_INSTALLER_BYTES, &asset.sha256)
 }
 
 fn release_from_github(

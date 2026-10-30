@@ -1,9 +1,8 @@
 use super::{
     Face,
-    catalog::{Asset, urls},
+    catalog::{Asset, Source, sources},
     store,
 };
-use futures_util::StreamExt;
 use std::{path::PathBuf, time::Duration};
 
 pub(super) fn client() -> Result<reqwest::Client, String> {
@@ -19,6 +18,16 @@ pub(super) async fn fetch(
     client: &reqwest::Client,
     root: PathBuf,
     asset: Asset,
+    progress: impl FnMut(u8),
+) -> Result<Face, String> {
+    let sources = sources(&asset);
+    fetch_sources(client, root, asset, &sources, progress).await
+}
+pub(super) async fn fetch_sources(
+    client: &reqwest::Client,
+    root: PathBuf,
+    asset: Asset,
+    sources: &[Source],
     mut progress: impl FnMut(u8),
 ) -> Result<Face, String> {
     let mut last_error = String::new();
@@ -26,8 +35,8 @@ pub(super) async fn fetch(
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        for url in urls(&asset) {
-            match fetch_url(client, &url, asset.size, &mut progress).await {
+        for source in sources {
+            match fetch_url(client, source, asset.size, &mut progress).await {
                 Ok(bytes) => {
                     let root = root.clone();
                     let asset = asset.clone();
@@ -47,41 +56,23 @@ pub(super) async fn fetch(
 }
 pub(super) async fn fetch_url(
     client: &reqwest::Client,
-    url: &str,
+    source: &Source,
     size: usize,
     progress: &mut impl FnMut(u8),
 ) -> Result<Vec<u8>, String> {
-    let response = client
-        .get(url)
+    let mut request = client.get(source.url());
+    if matches!(source, Source::GitHubAsset(_)) {
+        // Without this Accept header the asset API returns JSON metadata, not
+        // font bytes. reqwest follows its 302 response to the binary CDN too.
+        request = request
+            .header(reqwest::header::ACCEPT, "application/octet-stream")
+            .header("X-GitHub-Api-Version", "2026-03-10");
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| error.to_string())?
         .error_for_status()
         .map_err(|error| error.to_string())?;
-    if response
-        .content_length()
-        .is_some_and(|length| length != size as u64)
-    {
-        return Err("字体下载大小不符 / Unexpected download size".into());
-    }
-    let mut bytes = Vec::with_capacity(size);
-    let mut stream = response.bytes_stream();
-    let mut previous = 0;
-    progress(0);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| error.to_string())?;
-        if chunk.len() > size.saturating_sub(bytes.len()) {
-            return Err("字体下载超出大小限制 / Font download exceeds size limit".into());
-        }
-        bytes.extend_from_slice(&chunk);
-        let percent = (bytes.len() * 100 / size.max(1)).min(99) as u8;
-        if percent >= previous + 5 {
-            previous = percent;
-            progress(percent);
-        }
-    }
-    if bytes.len() != size {
-        return Err("字体下载不完整 / Incomplete font download".into());
-    }
-    Ok(bytes)
+    crate::http::read_sized_body(response, size as u64, 40 * 1024 * 1024, progress).await
 }

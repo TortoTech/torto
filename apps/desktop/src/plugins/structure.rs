@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use rebook_publication::{
     Block, Book, BookSource, Inline, InlineRole, LinkRole, PublicationError, PublicationUrl,
-    RasterResource, Resource, Section, TextBaseline, TextBlock, TextBlockKind, TextRun,
+    Resource, Section, TextBaseline, TextBlock, TextBlockKind, TextRun,
 };
 use rebook_reader::sentence_char_ranges;
 
@@ -102,16 +102,11 @@ impl ParagraphStructureSource {
 }
 
 impl BookSource for ParagraphStructureSource {
-    fn visible_formula_notes(&self, source: &rebook_publication::SourceRange, latex: &str) -> Vec<rebook_publication::FormulaNote> {
-        self.inner.visible_formula_notes(source, latex)
+    fn inner_source(&self) -> Option<&dyn BookSource> {
+        Some(self.inner.as_ref())
     }
-    fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
     fn book(&self) -> &Book {
         self.inner.book()
-    }
-
-    fn table_of_contents_origin(&self) -> rebook_publication::TableOfContentsOrigin {
-        self.inner.table_of_contents_origin()
     }
 
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
@@ -179,30 +174,6 @@ impl BookSource for ParagraphStructureSource {
         self.inner.resource(href)
     }
 
-    fn raster_resource(
-        &self,
-        href: &PublicationUrl,
-    ) -> Result<Option<RasterResource>, PublicationError> {
-        self.inner.raster_resource(href)
-    }
-
-    fn raster_resource_dimensions(
-        &self,
-        href: &rebook_publication::PublicationUrl,
-    ) -> Result<Option<[u32; 2]>, rebook_publication::PublicationError> {
-        self.inner.raster_resource_dimensions(href)
-    }
-
-    fn image_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
-        self.inner.image_resource_dimensions(href)
-    }
-
-    fn fixed_page_dimensions(
-        &self,
-        section_index: usize,
-    ) -> Result<Option<rebook_publication::FixedPageDimensions>, PublicationError> {
-        self.inner.fixed_page_dimensions(section_index)
-    }
 }
 
 #[cfg(test)]
