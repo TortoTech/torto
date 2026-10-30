@@ -1334,12 +1334,21 @@ impl Default for LayoutEngine {
     }
 }
 
+/// Shared system-font discovery for formula and derived SVG raster workers.
+/// Call on a worker when initializing the rendering stack, never per frame.
+pub fn svg_font_database() -> Arc<resvg::usvg::fontdb::Database> {
+    static FONTS: std::sync::OnceLock<Arc<resvg::usvg::fontdb::Database>> = std::sync::OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut fonts = resvg::usvg::fontdb::Database::new();
+        fonts.load_system_fonts();
+        Arc::new(fonts)
+    }).clone()
+}
+
 impl LayoutEngine {
     pub fn new() -> Self {
         let _timing = timing::stage(timing::TimingStage::Fonts);
         static FONT_CONTEXT: std::sync::OnceLock<FontContext> = std::sync::OnceLock::new();
-        static SVG_FONTS: std::sync::OnceLock<Arc<resvg::usvg::fontdb::Database>> =
-            std::sync::OnceLock::new();
         let font_context = FONT_CONTEXT
             .get_or_init(|| {
                 // Keep mutable registrations and byte-cache locks private to
@@ -1348,13 +1357,7 @@ impl LayoutEngine {
             })
             .clone();
         let svg_options = resvg::usvg::Options {
-            fontdb: SVG_FONTS
-                .get_or_init(|| {
-                    let mut fonts = resvg::usvg::fontdb::Database::new();
-                    fonts.load_system_fonts();
-                    Arc::new(fonts)
-                })
-                .clone(),
+            fontdb: svg_font_database(),
             ..Default::default()
         };
         Self {
@@ -1894,6 +1897,52 @@ impl LayoutEngine {
                 }
                 Block::Table(table) => {
                     let captions = table_captions::presentation(table, unified_reflow);
+                    if unified_reflow && let Some(view) = &table.visualization {
+                        if view.active {
+                            if let Some(href) = &view.href {
+                                for (prepared, text) in self.shape_captions_with_join(
+                                    source,
+                                    &captions.before,
+                                    reader_style,
+                                    content_width,
+                                    true,
+                                    None,
+                                )? {
+                                    paginator.push_text(&prepared, text.as_ref())?;
+                                }
+                                paginator.add_semantic_spacing(32.0);
+                                let image = rebook_publication::ImageBlock {
+                                    ocr_text: None,
+                                    formula_image: false,
+                                    formula: None,
+                                    href: href.clone(),
+                                    alt: String::new(),
+                                    style: Default::default(),
+                                    source: table.source.clone(),
+                                    text_layer: None,
+                                };
+                                let raster = self.load_raster(source, &image)?;
+                                paginator.push_image(raster, image.style, image.source, None);
+                                for (prepared, text) in self.shape_captions_with_join(
+                                    source,
+                                    &captions.after,
+                                    reader_style,
+                                    content_width,
+                                    true,
+                                    None,
+                                )? {
+                                    paginator.push_text(&prepared, text.as_ref())?;
+                                }
+                            }
+                            block_index += 1;
+                            continue;
+                        }
+                    }
+                    let chart_gap = if unified_reflow && table.visualization.is_some() {
+                        32.0
+                    } else {
+                        0.0
+                    };
                     let width = (content_width - media_start_offset).max(1.0);
                     let mut prepared = if captions.skip_title || captions.skip_sources > 0 {
                         self.shape_table_rows(source,
@@ -1905,6 +1954,7 @@ impl LayoutEngine {
                     if captions.before.is_empty() && captions.after.is_empty()
                         || prepared.row_heights.is_empty()
                     {
+                        paginator.add_semantic_spacing(chart_gap);
                         paginator.push_table(&prepared, 0.0);
                         block_index += 1;
                         continue;
@@ -1948,7 +1998,12 @@ impl LayoutEngine {
                         self.align_media_sources(source, &mut before, reader_style, width, media_width)?;
                         self.align_media_sources(source, &mut after, reader_style, width, media_width)?;
                     }
-                    let before_height = height(&before) + if before.is_empty() { 0.0 } else { gap };
+                    let before_gap = if before.is_empty() {
+                        chart_gap
+                    } else {
+                        gap.max(chart_gap)
+                    };
+                    let before_height = height(&before) + before_gap;
                     let after_height = height(&after) + if after.is_empty() { 0.0 } else { gap };
                     let outer_gap = prepared.block_gap;
                     paginator.prepare_group(
@@ -1964,9 +2019,7 @@ impl LayoutEngine {
                     for (text, block) in &before {
                         paginator.push_text(text, block.as_ref())?;
                     }
-                    if !before.is_empty() {
-                        paginator.add_semantic_spacing(gap);
-                    }
+                    paginator.add_semantic_spacing(before_gap);
                     prepared.block_gap = 0.0;
                     paginator.push_table(&prepared, after_height);
                     if !after.is_empty() {
@@ -8080,6 +8133,7 @@ mod tests {
                 header: false,
             };
             let table = TableBlock {
+                visualization: None,
                 before: Vec::new(),
                 after: Vec::new(),
                 rows: vec![TableRow { cells: vec![cell] }],
@@ -8135,6 +8189,7 @@ mod tests {
             header: false,
         };
         let table = TableBlock {
+            visualization: None,
             before: Vec::new(),
             after: Vec::new(),
             rows: vec![TableRow {
@@ -8194,6 +8249,7 @@ mod tests {
             header: false,
         };
         let table = TableBlock {
+            visualization: None,
             before: Vec::new(),
             after: Vec::new(),
             rows: vec![
@@ -8264,6 +8320,7 @@ mod tests {
             header,
         };
         let table = TableBlock {
+            visualization: None,
             before: Vec::new(),
             after: Vec::new(),
             source: None,
@@ -10170,6 +10227,7 @@ mod tests {
                     blocks: vec![
                         Block::Text(text("Preceding prose. ", TextBlockKind::Paragraph)),
                         Block::Table(TableBlock {
+                            visualization: None,
                             before: vec![text("Table 1. Results", TextBlockKind::Caption)],
                             after: vec![text("NOTE: Rounded values.", TextBlockKind::Paragraph)],
                             rows: (0..rows)
@@ -10284,6 +10342,7 @@ mod tests {
             id: SpineItemId::new("chapter").unwrap(),
             href: PublicationUrl::parse("chapter.xhtml").unwrap(),
             blocks: vec![Block::Table(TableBlock {
+                visualization: None,
                 before: Vec::new(),
                 after: Vec::new(),
                 rows: vec![TableRow {
@@ -10406,6 +10465,7 @@ mod tests {
             id: SpineItemId::new("chapter").unwrap(),
             href: PublicationUrl::parse("chapter.xhtml").unwrap(),
             blocks: vec![Block::Table(TableBlock {
+                visualization: None,
                 before: Vec::new(),
                 after: Vec::new(),
                 rows,
@@ -10490,6 +10550,7 @@ mod tests {
             blocks: vec![
                 Block::Text(text_block("Body paragraph")),
                 Block::Table(TableBlock {
+                    visualization: None,
                     before: Vec::new(),
                     after: Vec::new(),
                     rows: vec![TableRow {

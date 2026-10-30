@@ -1943,7 +1943,7 @@ impl<'a> ReadingIrParser<'a> {
         }
         if !rows.is_empty() {
             self.mark_table_title_row(table, &mut rows);
-            self.blocks.push(Block::Table(TableBlock {
+            self.blocks.push(Block::Table(TableBlock { visualization: None,
                 before,
                 after,
                 rows,

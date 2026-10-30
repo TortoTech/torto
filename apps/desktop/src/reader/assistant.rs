@@ -1280,6 +1280,20 @@ impl DesktopReader {
     }
 
     pub(crate) fn go_to_search_result(&mut self, result: &BookSearchResult) {
+        // Reveal authored cells before locating a hit that is currently represented by a chart.
+        if self
+            .semantic_source
+            .chart_control(&result.range)
+            .is_some_and(|(_, active)| active)
+            && self.semantic_source.toggle_chart(&result.range)
+        {
+            self.focus_toc_override = None;
+            self.pending_toc_navigation = None;
+            self.focused_mark = Some(FocusedMark::search(result.range.clone()));
+            self.semantic_layout.presentation_anchor = Some(result.range.clone());
+            self.refresh_semantic_layout();
+            return;
+        }
         let navigation = self.reader.go_to_source(&result.range.start);
         match navigation {
             Ok(navigation) => {

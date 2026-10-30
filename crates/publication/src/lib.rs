@@ -716,6 +716,9 @@ pub struct TextBlock {
 /// A structured table kept independent from HTML and renderer details.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableBlock {
+    /// Optional derived chart presentation. Authored cells always remain intact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visualization: Option<TableVisualization>,
     /// Captions and explicit notes before the grid, in authored order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub before: Vec<TextBlock>,
@@ -726,6 +729,15 @@ pub struct TableBlock {
     pub rows: Vec<TableRow>,
     /// Stable source anchor for block-level navigation.
     pub source: Option<SourceRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableVisualization {
+    /// First table in this logical group, including when this is a continuation.
+    pub root: SourceRange,
+    /// Immutable generated SVG; None for later members of a continued table.
+    pub href: Option<PublicationUrl>,
+    pub active: bool,
 }
 
 /// One authored table row.

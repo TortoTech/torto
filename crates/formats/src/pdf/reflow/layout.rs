@@ -707,7 +707,7 @@ pub(super) fn build_with_words(
             stats.tables += 1;
             objects.push((
                 rect,
-                Block::Table(TableBlock {
+                Block::Table(TableBlock { visualization: None,
                     before: Vec::new(),
                     after: Vec::new(),
                     rows,

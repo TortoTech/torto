@@ -1683,10 +1683,13 @@ fn focus_block_paint_ranges(block: &Block, range: &SourceRange) -> Vec<SourceRan
         }
     }
     if let Block::Table(table) = block {
-        let cell_ranges = table
+        let mut cell_ranges = table
             .text_blocks()
             .filter_map(|text| text.source.clone())
             .collect::<Vec<_>>();
+        if table.visualization.as_ref().is_some_and(|v| v.active) {
+            cell_ranges.push(range.clone());
+        }
         if !cell_ranges.is_empty() {
             return cell_ranges;
         }
@@ -3039,6 +3042,15 @@ impl DesktopReader {
                         (range, paint_ranges, text, false, false, true, None)
                     }
                     Block::Table(table) => {
+                        if self.reader.style().typesetting.mode
+                            == rebook_layout::TypesettingMode::Unified
+                            && table
+                                .visualization
+                                .as_ref()
+                                .is_some_and(|v| v.active && v.href.is_none())
+                        {
+                            continue;
+                        }
                         let Some(range) = table.source.clone() else {
                             continue;
                         };
@@ -3048,7 +3060,17 @@ impl DesktopReader {
                             .map(text_block_focus_text)
                             .collect::<Vec<_>>()
                             .join(" ");
-                        (range, paint_ranges, text, false, true, false, None)
+                        (
+                            range,
+                            paint_ranges,
+                            text,
+                            self.reader.style().typesetting.mode
+                                == rebook_layout::TypesettingMode::Unified
+                                && table.visualization.as_ref().is_some_and(|v| v.active),
+                            true,
+                            false,
+                            None,
+                        )
                     }
                     Block::Image(image) => {
                         // Fixed-layout PDF pages are represented as images with a text
@@ -6517,6 +6539,7 @@ mod tests {
             header: false,
         };
         let block = Block::Table(TableBlock {
+            visualization: None,
             before: Vec::new(),
             after: Vec::new(),
             rows: vec![TableRow {
@@ -6879,6 +6902,7 @@ mod tests {
             header,
         };
         let table = TableBlock {
+            visualization: None,
             before: Vec::new(),
             after: Vec::new(),
             rows: vec![
@@ -6920,6 +6944,7 @@ mod tests {
             header: false,
         };
         let table = TableBlock {
+            visualization: None,
             before: Vec::new(),
             after: Vec::new(),
             rows: vec![

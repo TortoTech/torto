@@ -22,9 +22,10 @@ pub(crate) use visible::{
 
 mod batching;
 mod citations;
+pub(crate) mod enhancements;
 mod formulas;
-mod image_tables;
 mod headings;
+mod image_tables;
 mod log;
 mod normalize;
 mod text_formulas;
@@ -133,6 +134,18 @@ struct Response {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum Annotation {
+    TableChart {
+        source: SourceRange,
+        members: Vec<SourceRange>,
+        svg: String,
+        language: String,
+    },
+    FormulaNotes {
+        source: SourceRange,
+        latex: String,
+        notes: Vec<enhancements::SymbolNote>,
+        language: String,
+    },
     CodeOrQuote {
         body: Vec<SourceRange>,
         presentation: code_blocks::Presentation,
@@ -248,6 +261,7 @@ struct WindowCache {
 }
 
 pub(crate) struct SemanticLayoutSource {
+    chart_views: RwLock<HashSet<String>>,
     unified_citations: std::sync::atomic::AtomicBool,
     heuristic_cache: RwLock<HashMap<usize, (String, Vec<Annotation>)>>,
     fingerprints: RwLock<HashMap<usize, (u64, String)>>,
@@ -282,6 +296,7 @@ fn cache_section<T>(cache: &mut HashMap<usize, T>, index: usize, value: T) {
 impl SemanticLayoutSource {
     pub(crate) fn new(inner: Arc<dyn BookSource>, original: Arc<dyn BookSource>) -> Self {
         Self {
+            chart_views: RwLock::new(HashSet::new()),
             unified_citations: std::sync::atomic::AtomicBool::new(false),
             heuristic_cache: RwLock::new(HashMap::new()),
             fingerprints: RwLock::new(HashMap::new()),
@@ -415,6 +430,9 @@ impl SemanticLayoutSource {
     }
 
     pub(crate) fn clear(&self) {
+        if let Ok(mut views) = self.chart_views.write() {
+            views.clear();
+        }
         if let Ok(mut state) = self.state.write() {
             state.clear();
         }
@@ -628,6 +646,7 @@ impl BookSource for SemanticLayoutSource {
                 }
             }
         }
+        self.apply_chart_views(&mut section.blocks);
         text_formulas::normalize_formula_quotes(&mut section.blocks);
         if unified_citations && let Some((original, hash)) = snapshot.as_ref() {
             citations::compose_many(&mut section.blocks, &self.cached_heuristics(index, original, hash));
@@ -636,22 +655,43 @@ impl BookSource for SemanticLayoutSource {
         Ok(section)
     }
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+        if let Some(resource) = self.chart_resource(href) {
+            return Ok(resource);
+        }
         self.inner.resource(href)
     }
     fn raster_resource(
         &self,
         href: &PublicationUrl,
     ) -> Result<Option<RasterResource>, PublicationError> {
+        if let Some(result) = self.chart_raster(href) {
+            return result.map(Some);
+        }
         self.inner.raster_resource(href)
     }
     fn raster_resource_dimensions(
         &self,
         href: &rebook_publication::PublicationUrl,
     ) -> Result<Option<[u32; 2]>, rebook_publication::PublicationError> {
+        if self.chart_resource(href).is_some() {
+            return self.image_resource_dimensions(href);
+        }
         self.inner.raster_resource_dimensions(href)
     }
 
-    fn image_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
+    fn image_resource_dimensions(
+        &self,
+        href: &PublicationUrl,
+    ) -> Result<Option<[u32; 2]>, PublicationError> {
+        if let Some(resource) = self.chart_resource(href) {
+            let options = resvg::usvg::Options::default();
+            let tree = resvg::usvg::Tree::from_data(&resource.bytes, &options)
+                .map_err(|e| PublicationError::InvalidPublication(e.to_string()))?;
+            return Ok(Some([
+                tree.size().width().ceil() as u32,
+                tree.size().height().ceil() as u32,
+            ]));
+        }
         self.inner.image_resource_dimensions(href)
     }
 
@@ -1030,6 +1070,9 @@ fn recognition_identity(book_id: &str, settings: &PluginSettings) -> Option<Valu
         provider.base_url,
         model,
         config.reasoning_effort,
+        enhancements::contract(),
+        settings
+            .resolved_target_language(crate::preferences::AppLanguage::system_translation_target()),
         true,
         true
     ]))
@@ -1095,7 +1138,9 @@ fn load_recognition_inner(section: &Section, identity: &Value, hash: &str, curre
         .filter(|a| {
             !matches!(
                 a,
-                Annotation::InlineCitations { .. }
+                Annotation::TableChart { .. }
+                    | Annotation::FormulaNotes { .. }
+                    | Annotation::InlineCitations { .. }
                     | Annotation::TextFormulas { .. }
                     | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
                 | Annotation::ImageFormula { .. }
@@ -1104,7 +1149,9 @@ fn load_recognition_inner(section: &Section, identity: &Value, hash: &str, curre
         })
         .map(|a| {
             Some(match a {
-                Annotation::InlineCitations { .. }
+                Annotation::TableChart { .. }
+                | Annotation::FormulaNotes { .. }
+                | Annotation::InlineCitations { .. }
                 | Annotation::TextFormulas { .. }
                 | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
                 | Annotation::ImageFormula { .. }
@@ -1465,6 +1512,23 @@ async fn recognize_inner(
         }
         start = end;
     }
+    let mut enhanced = working.clone();
+    for annotation in &annotations {
+        compose(&mut enhanced.blocks, annotation);
+    }
+    let (extra, enhancements_ok) = enhancements::recognize(
+        &client,
+        settings,
+        &enhanced,
+        &target_section
+            .blocks
+            .iter()
+            .flat_map(block_ranges)
+            .collect::<Vec<_>>(),
+        book_id,
+    )
+    .await;
+    annotations.extend(extra);
     let result = Recognition {
         formulas_checked,
         image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
@@ -1475,6 +1539,7 @@ async fn recognize_inner(
     if let Some(path) = identity
         .as_ref()
         .and_then(|identity| recognition_path(identity, &result.fingerprint))
+        && enhancements_ok
         && result.skipped_groups == 0
         && result.formulas_checked
         && let Err(error) = crate::persistence::write_json_atomic(&path, &result)
@@ -2000,8 +2065,37 @@ fn annotation(group: &Proposal, section: &Section) -> Annotation {
 // Resolve against source ranges, never translated block indices. Bilingual
 // companion paragraphs have no source and stay attached to their original.
 fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
-    if let Annotation::CodeOrQuote { body, presentation, language, captions, sources, credit } = annotation {
-        code_blocks::compose(blocks, body, *presentation, language.as_deref(), captions, sources, credit.as_ref());
+    if let Annotation::TableChart {
+        source,
+        members,
+        svg,
+        ..
+    } = annotation
+    {
+        enhancements::apply_chart(blocks, source, members, svg);
+        return;
+    }
+    if matches!(annotation, Annotation::FormulaNotes { .. }) {
+        return;
+    }
+    if let Annotation::CodeOrQuote {
+        body,
+        presentation,
+        language,
+        captions,
+        sources,
+        credit,
+    } = annotation
+    {
+        code_blocks::compose(
+            blocks,
+            body,
+            *presentation,
+            language.as_deref(),
+            captions,
+            sources,
+            credit.as_ref(),
+        );
         return;
     }
     if let Annotation::ImageTable { href, table } = annotation {
@@ -2066,8 +2160,11 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
-        | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
-                | Annotation::ImageFormula { .. }
+        | Annotation::ImageTable { .. }
+        | Annotation::ImageText { .. }
+        | Annotation::ImageFormula { .. }
+        | Annotation::TableChart { .. }
+        | Annotation::FormulaNotes { .. }
         | Annotation::UnreadableFormula { .. } => unreachable!(),
     };
     let positions: Option<Vec<_>> = ranges
@@ -2154,8 +2251,11 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
-        | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
-                | Annotation::ImageFormula { .. }
+        | Annotation::ImageTable { .. }
+        | Annotation::ImageText { .. }
+        | Annotation::ImageFormula { .. }
+        | Annotation::TableChart { .. }
+        | Annotation::FormulaNotes { .. }
         | Annotation::UnreadableFormula { .. } => unreachable!(),
     };
     blocks.splice(start..end, [replacement]);

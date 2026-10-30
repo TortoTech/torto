@@ -77,7 +77,7 @@ fn joined_table_caption_preserves_fragment_copy_hits_and_source_highlights() {
                 header: false,
                 authored_alignment: None,
             };
-            let mut table = TableBlock {
+            let mut table = TableBlock { visualization: None,
                 source: None,
                 before: vec![],
                 after: vec![],
