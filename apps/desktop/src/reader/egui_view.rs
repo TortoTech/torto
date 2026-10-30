@@ -1,4 +1,5 @@
 use crate::ui::image_preview::update_preview_zoom;
+use rebook_publication::BookSource as _;
 #[cfg(test)]
 use crate::ui::image_preview::{
     IMAGE_PREVIEW_MAX_ZOOM, IMAGE_PREVIEW_MIN_ZOOM, clamp_preview_pan,
@@ -209,7 +210,7 @@ const fn toc_keyboard_navigation_enabled(is_focus_mode: bool, sidebar_pinned: bo
     is_focus_mode || !sidebar_pinned
 }
 
-fn shortcut_has_fresh_press(input: &egui::InputState, shortcut: &egui::KeyboardShortcut) -> bool {
+pub(super) fn shortcut_has_fresh_press(input: &egui::InputState, shortcut: &egui::KeyboardShortcut) -> bool {
     input.raw.events.iter().any(|event| {
         matches!(
             event,
@@ -834,6 +835,7 @@ impl DesktopReader {
             self.focus_actions_overlay(&ctx, page_rect);
             self.focus_assistant_overlay(&ctx, page_rect);
         }
+        self.table_chart_controls(&ctx, page_rect, interaction_blocked);
         self.focus_footnote_overlay(&ctx, page_rect);
         self.resize_side_panels(
             &ctx,
@@ -1324,6 +1326,18 @@ impl DesktopReader {
             if self.image_preview.as_ref().is_some_and(|preview| preview.motion.is_closing()) {
                 return;
             }
+            if self
+                .image_preview
+                .as_ref()
+                .is_some_and(|p| p.copy_text.is_some())
+                && self.formula_notes_shortcut_requested(ctx)
+            {
+                if let Some(preview) = &mut self.image_preview {
+                    preview.notes_open = !preview.notes_open;
+                }
+                ctx.request_repaint();
+                return;
+            }
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
                 || (!ctx.text_edit_focused()
                     && ctx.input_mut(|input| {
@@ -1678,6 +1692,25 @@ impl DesktopReader {
         true
     }
 
+    pub(super) fn formula_notes_shortcut_requested(&mut self, ctx: &egui::Context) -> bool {
+        if ctx.text_edit_focused() || !ctx.input(|i| i.focused) {
+            self.ui.focus_footnote_modifier_tap = ModifierTapState::Idle;
+            return false;
+        }
+        let shortcut = self.shortcuts.focus_footnotes;
+        if is_bare_left_alt_shortcut(shortcut) {
+            ctx.input(|i| {
+                modifier_tap_triggered(
+                    &mut self.ui.focus_footnote_modifier_tap,
+                    &i.raw.events,
+                    shortcut.logical_key,
+                )
+            })
+        } else {
+            ctx.input_mut(|i| i.consume_shortcut(&shortcut))
+        }
+    }
+
     fn focus_footnote_shortcut_requested(
         &mut self,
         ctx: &egui::Context,
@@ -1719,9 +1752,8 @@ impl DesktopReader {
             self.close_focus_footnotes();
             return true;
         }
-        let can_open = self
-            .focus_units
-            .get(self.focus_unit_index)
+        if self.toggle_focused_formula_notes(ctx) { return true; }
+        let can_open = self.focus_units.get(self.focus_unit_index)
             .is_some_and(|unit| !unit.popup_footnotes().is_empty());
         if can_open {
             self.ui.focus_footnotes_visible = true;
@@ -2091,7 +2123,12 @@ impl DesktopReader {
             } else if input.consume_shortcut(&self.shortcuts.focus_structure) {
                 Some(2)
             } else {
-                None
+                let fresh = shortcut_has_fresh_press(input, &self.shortcuts.focus_table_chart);
+                if input.consume_shortcut(&self.shortcuts.focus_table_chart) {
+                    Some(if fresh { 4 } else { 3 })
+                } else {
+                    None
+                }
             }
         });
         match action {
@@ -2110,6 +2147,11 @@ impl DesktopReader {
             Some(2) if self.focus_has_structurable_units() => {
                 self.ui.focus_actions_visible = false;
                 self.toggle_current_focus_structure();
+            }
+            Some(4) => {
+                if let Some((source, _)) = self.current_focus_chart_control() {
+                    self.toggle_table_chart(ctx, &source);
+                }
             }
             Some(_) => {}
             None => return false,
@@ -2948,6 +2990,18 @@ impl DesktopReader {
             .filter(|text| !text.is_empty())
     }
 
+    fn toggle_focused_formula_notes(&mut self, ctx: &egui::Context) -> bool {
+        if !self.is_focus_mode() || !self.focus_units_ready { return false; }
+        let Some(unit) = self.focus_units.get(self.focus_unit_index) else { return false; };
+        let ranges = std::iter::once(unit.range.clone()).chain(unit.paint_ranges.iter().cloned()).collect::<Vec<_>>();
+        if !self.semantic_source.toggle_formula_notes(&ranges) { return false; }
+        self.semantic_layout.presentation_anchor = Some(unit.range.clone());
+        self.ui.focus_actions_visible = false;
+        self.refresh_semantic_layout();
+        ctx.request_repaint();
+        true
+    }
+
     pub(super) fn focus_footnote_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
         if self.media_preview_is_open() || !self.ui.focus_footnotes_visible {
             return;
@@ -3466,11 +3520,16 @@ impl DesktopReader {
         } else {
             40.0
         };
-        let y = focus_actions_overlay_y(note_open, anchor_y, viewport);
+        let chart_control = self.current_focus_chart_control();
+        let mut y = focus_actions_overlay_y(note_open, anchor_y, viewport);
+        if !note_open && chart_control.is_some() {
+            y = y.min((viewport.bottom() - 190.0).max(viewport.top() + 12.0));
+        }
         let mut chat = false;
         let mut highlight = false;
         let mut open_note = false;
         let mut structure = false;
+        let mut switch_chart = false;
         let mut save_note = false;
         let mut cancel_note = false;
         let can_annotate = self.focus_has_annotatable_units();
@@ -3542,6 +3601,11 @@ impl DesktopReader {
                             .inner
                             .on_hover_text(&structure_hover)
                             .clicked();
+                        if let Some((_, active)) = &chart_control {
+                            switch_chart = table_chart_toggle_button(
+                                ui, self.language, *active, Some(&self.shortcuts.focus_table_chart),
+                            ).clicked();
+                        }
                     });
                 }
             });
@@ -3561,6 +3625,10 @@ impl DesktopReader {
         } else if structure {
             self.ui.focus_actions_visible = false;
             self.toggle_current_focus_structure();
+        } else if switch_chart {
+            if let Some((source, _)) = chart_control {
+                self.toggle_table_chart(ctx, &source);
+            }
         } else if save_note {
             let note = self
                 .annotation_note_draft
@@ -5178,11 +5246,19 @@ impl DesktopReader {
 
     fn open_reader_image_preview(&mut self, ctx: &egui::Context, mut image: ReaderImage) -> bool {
         if let Some(latex) = image.formula.as_deref() {
+            let image_source = image.source.clone();
             match formula_preview_image(latex) {
                 Ok(image) => {
                     self.open_color_image_preview(ctx, image, "reader-formula-preview");
                     if let Some(preview) = &mut self.image_preview {
                         preview.copy_text = Some(latex.to_owned());
+                        preview.formula_source = image_source.clone();
+                        preview.formula_notes = image_source
+                            .as_ref()
+                            .map(|source| self.semantic_source.formula_notes(source, latex))
+                            .unwrap_or_default();
+                        preview.notes_open = image_source.as_ref().is_some_and(|source|
+                            !self.semantic_source.visible_formula_notes(source, latex).is_empty());
                     }
                 }
                 Err(error) => self.error = Some(format!("Formula preview failed: {error}")),
@@ -5240,13 +5316,29 @@ impl DesktopReader {
         self.close_focus_footnotes();
         self.selected_image = None;
         self.image_pointer_state = ImagePointerState::Idle;
-        self.image_preview = Some(super::ImagePreview::new(ctx, color_image, texture_namespace));
+        self.ui.focus_footnote_modifier_tap = ModifierTapState::Idle;
+        ctx.plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .clear_selection();
+        self.image_preview = Some(super::ImagePreview::new(
+            ctx,
+            color_image,
+            texture_namespace,
+        ));
         ctx.request_repaint();
     }
 
     pub(super) fn copy_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
-        if self.media_preview_copy(ctx) { return; }
-        if self.image_preview.as_ref().is_some_and(|preview| preview.motion.is_closing()) { return; }
+        if self.media_preview_copy(ctx) {
+            return;
+        }
+        if self
+            .image_preview
+            .as_ref()
+            .is_some_and(|preview| preview.motion.is_closing())
+        {
+            return;
+        }
         let text_edit_focused = ctx.text_edit_focused();
         let preview = self.preview_is_open();
         if !preview && (text_edit_focused || interaction_blocked) {
@@ -5434,6 +5526,7 @@ impl DesktopReader {
     }
 
     fn close_image_preview(&mut self, ctx: &egui::Context) {
+        self.ui.focus_footnote_modifier_tap = ModifierTapState::Idle;
         if let Some(preview) = &mut self.image_preview {
             preview.motion.close(ctx);
         }
@@ -5445,6 +5538,117 @@ impl DesktopReader {
         // Restore it from the current focus unit without moving the reader.
         if self.is_focus_mode() {
             self.sync_focus_selected_image();
+        }
+    }
+
+    pub(super) fn toggle_table_chart(
+        &mut self,
+        ctx: &egui::Context,
+        source: &rebook_publication::SourceRange,
+    ) -> bool {
+        if !self.semantic_source.toggle_chart(source) {
+            return false;
+        }
+        self.semantic_layout.presentation_anchor = self.semantic_source.chart_anchor(source);
+        self.refresh_semantic_layout();
+        ctx.request_repaint();
+        true
+    }
+
+    fn current_focus_chart_control(&self) -> Option<(rebook_publication::SourceRange, bool)> {
+        if !self.is_focus_mode() || !self.focus_units_ready
+            || self.reader.style().typesetting.mode != rebook_layout::TypesettingMode::Unified {
+            return None;
+        }
+        let unit = self.focus_units.get(self.focus_unit_index)?;
+        std::iter::once(&unit.range).chain(unit.paint_ranges.iter())
+            .find_map(|range| self.semantic_source.chart_control(range))
+    }
+
+    fn table_chart_controls(&mut self, ctx: &egui::Context, page_rect: Rect, blocked: bool) {
+        if blocked
+            || self.is_focus_mode()
+            || self.preview_is_open()
+            || self.ui.overlay_visible()
+            || self.reader.style().typesetting.mode != rebook_layout::TypesettingMode::Unified
+        {
+            return;
+        }
+        let offset = self.preview_offset_x(page_rect.width());
+        let mut pages = Vec::new();
+        if let (Some(layout), Some(viewport)) = (&self.scroll_section, self.scroll_viewport) {
+            for (i, entry) in layout.pages.iter().enumerate() {
+                if layout.page_tops[i] + layout.page_heights[i] <= viewport.offset_y
+                    || layout.page_tops[i] >= viewport.offset_y + viewport.size.y
+                {
+                    continue;
+                }
+                let top = layout
+                    .content_y_for_position(entry.position, 0.0)
+                    .unwrap_or(0.0)
+                    + self.scroll_content_padding(viewport.size.y)
+                    - viewport.offset_y;
+                pages.push((entry.page.clone(), egui::vec2(offset, top)));
+            }
+        } else if let Ok(spread) = self.reader.current_spread() {
+            pages.push((spread.primary, egui::vec2(offset, 0.0)));
+            if let Some(page) = spread.secondary {
+                pages.push((page, egui::vec2(offset + spread.secondary_offset_x, 0.0)));
+            }
+        }
+        let mut controls = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (page, offset) in pages {
+            for item in page.geometry_sources() {
+                let Some((source, active)) = self.semantic_source.chart_control(item) else {
+                    continue;
+                };
+                let bounds = page
+                    .source_table_bounds(std::slice::from_ref(item))
+                    .into_iter()
+                    .next()
+                    .or_else(|| {
+                        page.image_source_rects(std::slice::from_ref(item))
+                            .into_iter()
+                            .next()
+                    });
+                if let Some(bounds) = bounds {
+                    let y = bounds.y0 as f32;
+                    let right = bounds.x1 as f32;
+                    let position = egui::pos2(
+                        (page_rect.left() + offset.x + right - 32.0).clamp(
+                            page_rect.left() + 4.0,
+                            (page_rect.right() - 36.0).max(page_rect.left() + 4.0),
+                        ),
+                        page_rect.top() + offset.y + y - 36.0,
+                    );
+                    if position.y >= page_rect.top() - 1.0
+                        && position.y < page_rect.bottom() - 32.0
+                        && seen.insert((source.start.spine.clone(), source.start.node.clone()))
+                    {
+                        controls.push((source, active, position));
+                    }
+                }
+            }
+        }
+        for (source, active, position) in controls {
+            let mut change = false;
+            egui::Area::new(egui::Id::unique((
+                "table-chart",
+                &source.start.spine,
+                &source.start.node,
+            )))
+            .order(egui::Order::Foreground)
+            .fixed_pos(position)
+            .show(ctx, |ui| {
+                ui.set_clip_rect(page_rect);
+                change = table_chart_toggle_button(
+                    ui, self.language, active, None,
+                ).clicked();
+            });
+            if change {
+                self.toggle_table_chart(ctx, &source);
+            }
         }
     }
 
@@ -6116,6 +6320,25 @@ fn focus_unit_index_for_scroll_offset(
         })
         .min_by(|left, right| left.1.total_cmp(&right.1))
         .map(|(index, _)| index)
+}
+
+pub(super) fn table_chart_toggle_button(
+    ui: &mut egui::Ui,
+    language: AppLanguage,
+    active: bool,
+    shortcut: Option<&egui::KeyboardShortcut>,
+) -> egui::Response {
+    let label = if active {
+        language.text("还原表格", "Restore table")
+    } else {
+        language.text("可视化表格", "Visualize table")
+    };
+    let tooltip = shortcut.map_or_else(|| label.to_owned(), |shortcut|
+        format!("{} · {}", label, ui.ctx().format_shortcut(shortcut)));
+    let response = icon_button(ui, if active { Icon::Table } else { Icon::Chart })
+        .on_hover_text(tooltip);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), label));
+    response
 }
 
 fn focus_actions_overlay_y(note_open: bool, anchor_y: f32, viewport: Rect) -> f32 {
@@ -10719,5 +10942,148 @@ mod scroll_boundary_tests {
                 max_offset - offset
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod formula_note_shortcut_tests {
+    #[test]
+    fn body_alt_embeds_cached_notes_in_zero_length_formula_image() {
+        assert_body_notes(false);
+        assert_body_notes(true);
+    }
+
+    fn assert_body_notes(inline: bool) {
+        use rebook_publication::{Block, ImageFormula};
+        let (_, initial, _) = crate::reader::semantic_layout::tests::fixture();
+        let mut blocks = initial.blocks;
+        let latex = r"\mathrm{GPC}=\frac{|I S_{\varnothing}|}{|T|}.";
+        let Block::Image(image) = &mut blocks[2] else { panic!() };
+        image.formula = Some(ImageFormula { latex: latex.into(), equation_number: Some("3.7".into()) });
+        image.formula_image = true;
+        let mut origin = image.source.clone().unwrap();
+        assert_eq!(origin.start, origin.end);
+        if inline {
+            let image = image.clone();
+            origin.start.node = "equation-parent".into();
+            origin.end.node = "equation-parent".into();
+            let Block::Text(mut text) = blocks[1].clone() else { panic!() };
+            text.source = Some(origin.clone());
+            text.content = vec![rebook_publication::Inline::Image(Box::new(rebook_publication::InlineImageRun {
+                image, size_scale:1.0, intrinsic_sizing:false, presentation:false,
+                vertical_align:rebook_publication::InlineImageAlignment::Middle,
+            })), rebook_publication::Inline::Text(rebook_publication::TextRun {
+                text:" (3.7)".into(), style:Default::default(), link:None,
+            })];
+            blocks[2] = Block::Text(text);
+        }
+        let (mut reader, original, _) = crate::reader::semantic_layout::tests::fixture_with_blocks(blocks);
+        let recognition = serde_json::from_value(serde_json::json!({
+            "fingerprint":crate::plugins::semantic_layout::fingerprint(&original),
+            "annotations":[{"FormulaNotes":{"source":origin,"latex":latex,"language":"简体中文",
+                "notes":[{"symbol":"\\mathrm{GPC}","meaning":"每字符手势数","unit":"","evidence":"","known":false},
+                {"symbol":"|I S_{\\varnothing}|","meaning":"输入流长度/手势数","unit":"","evidence":"","known":false},
+                {"symbol":"|T|","meaning":"转录字符串中的字符数","unit":"","evidence":"","known":false}]}}],"skipped_groups":0
+        })).unwrap();
+        assert!(reader.semantic_source.install(0, recognition));
+        let layout = reader.current_scroll_layout().unwrap();
+        reader.rebuild_focus_units(&layout);
+        let index = reader.focus_units.iter().position(|unit| unit.range.start.node == origin.start.node
+            || unit.paint_ranges.iter().any(|range| range.start.node == origin.start.node)).unwrap();
+        reader.select_focus_unit(index);
+        let ctx = egui::Context::default();
+        let tap = || vec![
+            egui::Event::Key { key:egui::Key::AltLeft, physical_key:None, pressed:true, repeat:false, modifiers:egui::Modifiers::ALT },
+            egui::Event::Key { key:egui::Key::AltLeft, physical_key:None, pressed:false, repeat:false, modifiers:egui::Modifiers::NONE }];
+        let mut heights = Vec::new();
+        for expected in [3, 0] {
+            ctx.run_ui(egui::RawInput { events:tap(), ..Default::default() }, |_| reader.keyboard_shortcuts(&ctx, false))
+                .drop_without_applying_deltas();
+            assert_eq!(reader.source.visible_formula_notes(&origin, latex).len(), expected);
+            assert!(!reader.ui.focus_footnotes_visible, "formula notes belong inside the image");
+            assert!(reader.image_preview.is_none());
+            let section = reader.source.parse_section(0).unwrap();
+            let mut style = reader.reader.style();
+            style.typesetting.mode = rebook_layout::TypesettingMode::Unified;
+            style.spread = rebook_layout::SpreadMode::Single;
+            let mut after = section.blocks[1].clone();
+            if let Block::Text(text) = &mut after { text.content = vec![rebook_publication::Inline::Text(rebook_publication::TextRun {
+                text:"Following paragraph".into(), style:Default::default(), link:None })]; }
+            let layout = rebook_layout::LayoutEngine::new().layout_blocks(reader.source.as_ref(),
+                &[section.blocks[2].clone(), after], rebook_layout::LayoutViewport::new(800, 1600).unwrap(), &style).unwrap();
+            let page = &layout.pages[0];
+            let image = page.items.iter().find_map(|item| if let rebook_layout::PageItem::Image(image) = item { Some(image) } else { None }).unwrap();
+            heights.push(image.height);
+            let after = page.items.iter().find_map(|item| if let rebook_layout::PageItem::Text(text) = item { Some(text) } else { None }).unwrap();
+            assert!(after.origin_y + after.layout.get(after.lines.start).unwrap().metrics().block_min_coord >= image.y + image.height,
+                "embedded notes must reserve space before the next paragraph");
+        }
+        assert!(heights[0] > heights[1] + 60.0, "the actual formula image must expand and collapse");
+    }
+
+    #[test]
+    fn formula_preview_reuses_footnote_binding_without_toggling_underlying_popup() {
+        let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+        let ctx = egui::Context::default();
+        let mut preview = crate::ui::image_preview::ImagePreview::new(
+            &ctx,
+            egui::ColorImage::filled([4, 4], egui::Color32::WHITE),
+            "notes-shortcut",
+        );
+        preview.copy_text = Some("T/S".into());
+        preview.formula_notes = vec![serde_json::from_value(serde_json::json!({
+            "symbol":"T", "meaning":"最终字符串", "unit":"", "evidence":"", "known":false,
+        })).unwrap()];
+        assert!(!preview.notes_open);
+        reader.image_preview = Some(preview);
+        reader.ui.focus_footnotes_visible = true;
+        let event = |key, pressed, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let mut frame = |events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |_| reader.keyboard_shortcuts(&ctx, false),
+            )
+            .drop_without_applying_deltas();
+            assert!(
+                reader.ui.focus_footnotes_visible,
+                "preview action must not close its parent footnote popup"
+            );
+            reader.image_preview.as_ref().unwrap().notes_open
+        };
+        let tap = || {
+            vec![
+                event(egui::Key::AltLeft, true, egui::Modifiers::ALT),
+                event(egui::Key::AltLeft, false, egui::Modifiers::NONE),
+            ]
+        };
+        assert!(frame(tap()));
+        assert!(frame(vec![]));
+        assert!(!frame(tap()));
+        assert!(!frame(vec![
+            event(egui::Key::AltLeft, true, egui::Modifiers::ALT),
+            event(egui::Key::A, true, egui::Modifiers::ALT),
+            event(egui::Key::AltLeft, false, egui::Modifiers::NONE)
+        ]));
+        reader.shortcuts.focus_footnotes =
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::F8);
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![event(egui::Key::F8, true, egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |_| reader.keyboard_shortcuts(&ctx, false),
+        )
+        .drop_without_applying_deltas();
+        assert!(reader.image_preview.as_ref().unwrap().notes_open);
+        assert!(reader.ui.focus_footnotes_visible);
     }
 }

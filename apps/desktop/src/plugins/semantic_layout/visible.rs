@@ -24,6 +24,8 @@ pub(crate) fn block_ranges(block: &Block) -> Vec<SourceRange> {
 
 fn annotation_blocks(section: &Section, annotation: &Annotation) -> Vec<usize> {
     let ranges = match annotation {
+        Annotation::TableChart { members, .. } => members.iter().collect(),
+        Annotation::FormulaNotes { source, .. } => vec![source],
         Annotation::CodeOrQuote { body, captions, sources, credit, .. } => body.iter().chain(captions).chain(sources).chain(credit.iter()).collect(),
         Annotation::InlineCitations { source, .. }
         | Annotation::TextFormulas { source, .. }
@@ -157,6 +159,9 @@ pub(crate) fn recognition_groups(
 
 pub(crate) fn needs_recognition(section: &Section, target: Range<usize>) -> bool {
     let target = scope_section(section, target);
+    if enhancements::has_candidates(&target) {
+        return true;
+    }
     if matches!(target.blocks.as_slice(), [Block::Note(note)] if note.kind == rebook_publication::NoteBlockKind::Section)
     {
         return false;

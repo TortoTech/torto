@@ -6131,7 +6131,7 @@ mod tests {
             row_span: 1,
             header: false,
         };
-        let table = TableBlock {
+        let table = TableBlock { visualization: None,
             source: None,
             before: vec![label],
             after: vec![],
@@ -6967,7 +6967,7 @@ mod tests {
         section.blocks.extend([
             Block::Text(heading),
             Block::Figure(FigureBlock { body: vec![], images: vec![], captions: vec![caption, alt], caption_position: CaptionPosition::After, style: BlockStyle::default(), source: outer }),
-            Block::Table(TableBlock { before: vec![], after: vec![], rows: vec![TableRow { cells: vec![TableCell { text: cell, authored_alignment: None, column_span: 1, row_span: 1, header: false }] }], source: None }),
+            Block::Table(TableBlock { visualization: None, before: vec![], after: vec![], rows: vec![TableRow { cells: vec![TableCell { text: cell, authored_alignment: None, column_span: 1, row_span: 1, header: false }] }], source: None }),
             Block::Quote(QuoteBlock { body: vec![quote], attribution: None, source: None }),
         ]);
         let data = Arc::get_mut(&mut source).unwrap();

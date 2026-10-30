@@ -55,7 +55,7 @@ fn table() -> TableBlock {
         row_span: 1,
         header: false,
     };
-    TableBlock {
+    TableBlock { visualization: None,
         before: vec![],
         after: vec![],
         source: None,
@@ -429,7 +429,7 @@ fn unified_table_cells_trim_edge_lines_without_changing_geometry_or_source_offse
                 } else {
                     "First line\n\n第二行"
                 };
-                let mut table = TableBlock {
+                let mut table = TableBlock { visualization: None,
                     source: None,
                     before: vec![],
                     after: vec![],

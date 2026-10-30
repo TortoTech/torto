@@ -11,6 +11,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 mod batching;
+mod enhancements;
 mod preparation;
 
 const SETTLE: Duration = Duration::from_millis(200);
@@ -62,10 +63,12 @@ pub(super) struct SemanticLayoutState {
     pub(super) pending_viewport: Option<rebook_layout::LayoutViewport>,
     pub(super) viewport_reflow_at: Option<Instant>,
     pub(super) viewport_anchor: Option<super::FocusReflowAnchor>,
+    pub(super) presentation_anchor: Option<SourceRange>,
     expert_translation: bool,
     semantic_config: Option<(
         crate::plugins::semantic_layout::SemanticLayoutSettings,
         Option<crate::plugins::AiProvider>,
+        String,
     )>,
     translation_config: Option<(
         String,
@@ -79,6 +82,7 @@ pub(super) struct SemanticLayoutState {
     worker: Option<tokio::task::JoinHandle<()>>,
     active: Option<Job>,
     receiver: Option<mpsc::Receiver<(Job, Result<Recognition, String>)>>,
+    enhancements: enhancements::State,
     done: HashMap<(usize, usize), String>,
     groups: Vec<Group>,
     translations: HashMap<Key, BlockTranslation>,
@@ -255,6 +259,7 @@ impl DesktopReader {
     }
     pub(super) fn invalidate_semantic_plan(&mut self, reason: &str) {
         self.cancel_semantic_request(reason);
+        self.semantic_layout.enhancements = Default::default();
         self.cancel_translation_request(reason);
         self.translation.toc_task.cancel();
         self.translation.canonical_titles.clear();
@@ -327,6 +332,9 @@ impl DesktopReader {
         let semantic = (
             self.plugin_settings.semantic_layout.clone(),
             provider(&self.plugin_settings.semantic_layout.provider).cloned(),
+            self.plugin_settings.resolved_target_language(
+                crate::preferences::AppLanguage::system_translation_target(),
+            ),
         );
         let target = self
             .plugin_settings
@@ -340,6 +348,7 @@ impl DesktopReader {
         if self.semantic_layout.semantic_config.as_ref() != Some(&semantic) {
             let had_config = self.semantic_layout.semantic_config.is_some();
             self.cancel_semantic_request("semantic_config_changed");
+            self.semantic_layout.enhancements = Default::default();
             self.cancel_translation_request("semantic_config_changed");
             self.semantic_layout.translations.clear();
             self.semantic_layout.failed.clear();
@@ -403,6 +412,7 @@ impl DesktopReader {
         }
         if !semantic {
             self.cancel_semantic_request("semantic_disabled");
+            self.semantic_layout.enhancements = Default::default();
         }
         if !semantic && !self.translation.enabled {
             return;
@@ -439,6 +449,9 @@ impl DesktopReader {
             self.semantic_layout.worker = None;
             self.semantic_layout.active = None;
             self.semantic_layout.receiver = None;
+            if let Ok(base) = &result {
+                self.queue_semantic_enhancements(job.clone(), base.clone());
+            }
             let result = result.unwrap_or_else(|error| {
                 tracing::warn!(%error, "AI layout batch failed; releasing successful translations");
                 self.notice_timer.show(
@@ -453,25 +466,7 @@ impl DesktopReader {
                 );
                 empty_recognition(&job.section)
             });
-            for (range, result) in recognition_groups(&job.section, job.target.clone(), result) {
-                let sources = job.section.blocks[range.clone()]
-                    .iter()
-                    .flat_map(block_ranges)
-                    .collect();
-                let range = range.start + job.offset..range.end + job.offset;
-                for block in range.clone() {
-                    self.semantic_layout
-                        .done
-                        .insert((job.index, block), job.hash.clone());
-                }
-                self.stage_semantic_group(Group {
-                    index: job.index,
-                    range,
-                    hash: job.hash.clone(),
-                    sources,
-                    result: Some(result),
-                });
-            }
+            self.stage_semantic_result(&job, result, true);
         }
         if let Some(deadline) = self.semantic_layout.settled
             && Instant::now() < deadline
@@ -756,6 +751,9 @@ impl DesktopReader {
                 }
             }
         }
+        if semantic {
+            self.tick_semantic_enhancements(runtime, proxy, &demand);
+        }
         let content_changed = self.commit_ready_content(&demand, semantic);
         let snapshots_changed = self.refresh_changed_translation_inputs(content_changed);
         if content_changed || snapshots_changed {
@@ -1001,7 +999,8 @@ impl DesktopReader {
         }
         false
     }
-    fn refresh_semantic_layout(&mut self) {
+    pub(super) fn refresh_semantic_layout(&mut self) {
+        self.refresh_preview_formula_notes();
         self.semantic_layout.reflow_version += 1;
         self.semantic_layout.reflow_dirty = true;
     }
@@ -1058,7 +1057,10 @@ impl DesktopReader {
                 self.semantic_layout
                     .pending_viewport
                     .unwrap_or(self.reader.viewport()),
-                self.progress_source_range(),
+                self.semantic_layout
+                    .presentation_anchor
+                    .clone()
+                    .or_else(|| self.progress_source_range()),
             );
             let proxy = proxy.clone();
             let (tx, rx) = mpsc::channel();
@@ -1099,7 +1101,10 @@ impl DesktopReader {
                             .unwrap_or(self.reader.viewport()) =>
             {
                 let scroll_source = self
-                    .progress_source_range()
+                    .semantic_layout
+                    .presentation_anchor
+                    .clone()
+                    .or_else(|| self.progress_source_range())
                     .or_else(|| self.reader.current_locator().source);
                 if scroll_source
                     .as_ref()
@@ -1108,6 +1113,7 @@ impl DesktopReader {
                     runtime.spawn_blocking(move || drop(prepared));
                     self.semantic_layout.reflow_dirty = true;
                 } else {
+                    let presentation_anchor = self.semantic_layout.presentation_anchor.take();
                     let viewport_changed = self.semantic_layout.pending_viewport.take().is_some();
                     self.semantic_layout.viewport_reflow_at = None;
                     let anchor = self.semantic_layout.viewport_anchor.take().or_else(|| {
@@ -1123,7 +1129,13 @@ impl DesktopReader {
                             SnapshotEffects::static_content_change()
                         },
                     );
-                    self.focus_reflow_anchor = anchor;
+                    if let Some(source) = presentation_anchor {
+                        self.focus_anchor = Some(source.start);
+                        self.focus_reflow_anchor = None;
+                        self.invalidate_focus_units();
+                    } else {
+                        self.focus_reflow_anchor = anchor;
+                    }
                     if self.is_scroll_mode() && !self.is_focus_mode() {
                         self.scroll_target_source = scroll_source;
                     }

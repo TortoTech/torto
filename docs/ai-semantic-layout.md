@@ -1,8 +1,8 @@
 # AI layout
 
 Settings → Typography → Layout contains a global, opt-in switch and a configured
-provider/model selection. Quotes, inline citations, formula images, captions and section headings are always enabled. The help
-icon next to the switch shows “补充未识别的引用、文内文献引用、公式图片、图注和小节标题” on hover.
+provider/model selection. Quotes, inline citations, formula images, captions, section headings, table charts and formula symbol notes are always enabled. The help
+icon next to the switch shows “补充未识别的引用、文内文献引用、公式图片、图注、小节标题、表格图表和公式符号备注” on hover.
 Credentials remain in the existing provider configuration. A missing or deleted
 model pauses recognition; it is never silently replaced. There are no per-book
 switches or manual chapter recognition commands.
@@ -185,3 +185,32 @@ than applying original offsets to translated text. Prompt/schema fingerprints
 invalidate all earlier AI results automatically, including old body-only quotes.
 The seven-chapter Ramachandran benchmark now treats the unattributed letter as
 out of scope, and still requires the sourced chapter epigraphs and caption.
+
+## Table charts and formula notes
+
+AI layout also produces optional source-backed table charts and notes for display
+formulas. Both always use the configured translation target language, including
+when body translation is disabled. A target-language change invalidates these
+results and rejects older in-flight jobs. Preview UI never starts model requests.
+
+For native tables and recognized image tables the model chooses one suitable
+bar, line or pie presentation, with separate panels where units differ. It
+references source cells; local validation reads all numeric values from the
+original table and rejects missing/ambiguous numbers or invalid references.
+Explicit adjacent continuations can share a chart. Reading and media previews
+provide Table/Chart buttons, initially showing the table. The original cells,
+source identities, translation inputs and text remain intact. Chart SVG generation
+runs on the layout worker and correctly uses zero as the baseline of signed bars.
+
+Display-formula notes are generated during the same AI layout job, from nearby
+original text. A known meaning needs an exact evidence excerpt; undefined symbols
+remain explicitly undefined. Inline expressions do not receive notes. Notes are
+collapsed on each preview opening and formula change. The existing footnote
+shortcut (bare left Alt by default) toggles notes in an active formula preview;
+otherwise it keeps its normal footnote behavior. Bare-Alt combinations are not
+taps, and a custom footnote binding is automatically shared. Notes are selectable
+text outside the formula image; copying the formula still copies LaTeX.
+
+The extra request and cache retain the compact wire-key convention. Their cache
+key includes book, original context, target language, endpoint/model and policy
+revision. Existing image transcription and semantic-window caches can be reused.

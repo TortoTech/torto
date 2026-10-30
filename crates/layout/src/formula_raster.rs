@@ -290,3 +290,47 @@ pub(super) fn prepare(
         geometry,
     })
 }
+
+pub(super) fn prepare_svg(
+    svg: String,
+    width: f32,
+    height: f32,
+    options: &resvg::usvg::Options<'_>,
+    deferred: Option<(&dyn BookSource, u64)>,
+) -> Result<RasterImage, String> {
+    let dimensions = [
+        (width * SCALE).ceil().max(1.0) as u32,
+        (height * SCALE).ceil().max(1.0) as u32,
+    ];
+    if dimensions[0] > 8192 || dimensions[1] > 16384 {
+        return Err("Formula notes are too large".into());
+    }
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    svg.hash(&mut hash);
+    options.font_family.hash(&mut hash);
+    (Arc::as_ptr(&options.fontdb) as usize).hash(&mut hash);
+    let task = Arc::new(FormulaTask {
+        geometry: Arc::new(Geometry {
+            svg: svg.into(),
+            width,
+            height,
+            descent: 0.0,
+            size: 0.0,
+        }),
+        dimensions,
+        fonts: options.fontdb.clone(),
+        family: options.font_family.clone(),
+    });
+    if let Some((source, generation)) = deferred {
+        Ok(raster_cache::prepare_generated(
+            source,
+            hash.finish(),
+            dimensions,
+            task,
+            generation,
+        ))
+    } else {
+        use raster_cache::RasterTask as _;
+        task.render().map_err(|e| e.to_string())
+    }
+}

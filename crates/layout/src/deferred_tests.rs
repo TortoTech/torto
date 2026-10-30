@@ -274,7 +274,7 @@ fn figure_caption_inline_and_table_geometry_does_not_depend_on_pixels() {
             style: BlockStyle::default(),
         }),
         Block::Text(text(TextBlockKind::Paragraph, vec![inline("inline.png")])),
-        Block::Table(TableBlock {
+        Block::Table(TableBlock { visualization: None,
             before: Vec::new(),
             after: Vec::new(),
             source: None,

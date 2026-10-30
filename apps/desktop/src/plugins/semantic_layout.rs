@@ -22,9 +22,10 @@ pub(crate) use visible::{
 
 mod batching;
 mod citations;
+pub(crate) mod enhancements;
 mod formulas;
-mod image_tables;
 mod headings;
+mod image_tables;
 mod log;
 mod normalize;
 mod text_formulas;
@@ -133,6 +134,18 @@ struct Response {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum Annotation {
+    TableChart {
+        source: SourceRange,
+        members: Vec<SourceRange>,
+        svg: String,
+        language: String,
+    },
+    FormulaNotes {
+        source: SourceRange,
+        latex: String,
+        notes: Vec<enhancements::SymbolNote>,
+        language: String,
+    },
     CodeOrQuote {
         body: Vec<SourceRange>,
         presentation: code_blocks::Presentation,
@@ -248,6 +261,8 @@ struct WindowCache {
 }
 
 pub(crate) struct SemanticLayoutSource {
+    formula_note_views: RwLock<HashSet<String>>,
+    chart_views: RwLock<HashSet<String>>,
     unified_citations: std::sync::atomic::AtomicBool,
     heuristic_cache: RwLock<HashMap<usize, (String, Vec<Annotation>)>>,
     fingerprints: RwLock<HashMap<usize, (u64, String)>>,
@@ -282,6 +297,8 @@ fn cache_section<T>(cache: &mut HashMap<usize, T>, index: usize, value: T) {
 impl SemanticLayoutSource {
     pub(crate) fn new(inner: Arc<dyn BookSource>, original: Arc<dyn BookSource>) -> Self {
         Self {
+            formula_note_views: RwLock::new(HashSet::new()),
+            chart_views: RwLock::new(HashSet::new()),
             unified_citations: std::sync::atomic::AtomicBool::new(false),
             heuristic_cache: RwLock::new(HashMap::new()),
             fingerprints: RwLock::new(HashMap::new()),
@@ -415,6 +432,10 @@ impl SemanticLayoutSource {
     }
 
     pub(crate) fn clear(&self) {
+        if let Ok(mut views) = self.formula_note_views.write() { views.clear(); }
+        if let Ok(mut views) = self.chart_views.write() {
+            views.clear();
+        }
         if let Ok(mut state) = self.state.write() {
             state.clear();
         }
@@ -542,6 +563,12 @@ impl SemanticLayoutSource {
 }
 
 impl BookSource for SemanticLayoutSource {
+    fn visible_formula_notes(&self, source: &SourceRange, latex: &str) -> Vec<rebook_publication::FormulaNote> {
+        let visible = self.formula_note_views.try_read().ok().is_some_and(|views|
+            views.contains(&format!("{:?}#{}", source.start.spine, source.start.node)));
+        if !visible { return Vec::new(); }
+        self.formula_notes(source, latex).iter().map(enhancements::SymbolNote::render_note).collect()
+    }
     fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
     fn book(&self) -> &Book {
         self.inner.book()
@@ -628,6 +655,7 @@ impl BookSource for SemanticLayoutSource {
                 }
             }
         }
+        self.apply_chart_views(&mut section.blocks);
         text_formulas::normalize_formula_quotes(&mut section.blocks);
         if unified_citations && let Some((original, hash)) = snapshot.as_ref() {
             citations::compose_many(&mut section.blocks, &self.cached_heuristics(index, original, hash));
@@ -636,22 +664,43 @@ impl BookSource for SemanticLayoutSource {
         Ok(section)
     }
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+        if let Some(resource) = self.chart_resource(href) {
+            return Ok(resource);
+        }
         self.inner.resource(href)
     }
     fn raster_resource(
         &self,
         href: &PublicationUrl,
     ) -> Result<Option<RasterResource>, PublicationError> {
+        if let Some(result) = self.chart_raster(href) {
+            return result.map(Some);
+        }
         self.inner.raster_resource(href)
     }
     fn raster_resource_dimensions(
         &self,
         href: &rebook_publication::PublicationUrl,
     ) -> Result<Option<[u32; 2]>, rebook_publication::PublicationError> {
+        if self.chart_resource(href).is_some() {
+            return self.image_resource_dimensions(href);
+        }
         self.inner.raster_resource_dimensions(href)
     }
 
-    fn image_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
+    fn image_resource_dimensions(
+        &self,
+        href: &PublicationUrl,
+    ) -> Result<Option<[u32; 2]>, PublicationError> {
+        if let Some(resource) = self.chart_resource(href) {
+            let options = resvg::usvg::Options::default();
+            let tree = resvg::usvg::Tree::from_data(&resource.bytes, &options)
+                .map_err(|e| PublicationError::InvalidPublication(e.to_string()))?;
+            return Ok(Some([
+                tree.size().width().ceil() as u32,
+                tree.size().height().ceil() as u32,
+            ]));
+        }
         self.inner.image_resource_dimensions(href)
     }
 
@@ -1030,6 +1079,9 @@ fn recognition_identity(book_id: &str, settings: &PluginSettings) -> Option<Valu
         provider.base_url,
         model,
         config.reasoning_effort,
+        enhancements::contract(),
+        settings
+            .resolved_target_language(crate::preferences::AppLanguage::system_translation_target()),
         true,
         true
     ]))
@@ -1095,7 +1147,9 @@ fn load_recognition_inner(section: &Section, identity: &Value, hash: &str, curre
         .filter(|a| {
             !matches!(
                 a,
-                Annotation::InlineCitations { .. }
+                Annotation::TableChart { .. }
+                    | Annotation::FormulaNotes { .. }
+                    | Annotation::InlineCitations { .. }
                     | Annotation::TextFormulas { .. }
                     | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
                 | Annotation::ImageFormula { .. }
@@ -1104,7 +1158,9 @@ fn load_recognition_inner(section: &Section, identity: &Value, hash: &str, curre
         })
         .map(|a| {
             Some(match a {
-                Annotation::InlineCitations { .. }
+                Annotation::TableChart { .. }
+                | Annotation::FormulaNotes { .. }
+                | Annotation::InlineCitations { .. }
                 | Annotation::TextFormulas { .. }
                 | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
                 | Annotation::ImageFormula { .. }
@@ -1216,7 +1272,7 @@ pub(crate) async fn recognize(
     book_id: &str,
     settings: &PluginSettings,
 ) -> Result<Recognition, String> {
-    recognize_impl(section, book_id, settings, None, None).await
+    recognize_impl(section, book_id, settings, None, None, true).await
 }
 
 #[cfg(test)]
@@ -1226,7 +1282,7 @@ pub(crate) async fn recognize_with_source(
     settings: &PluginSettings,
     source: &dyn BookSource,
 ) -> Result<Recognition, String> {
-    recognize_impl(section, book_id, settings, Some(source), None).await
+    recognize_impl(section, book_id, settings, Some(source), None, true).await
 }
 
 pub(crate) async fn recognize_visible(
@@ -1236,7 +1292,38 @@ pub(crate) async fn recognize_visible(
     settings: &PluginSettings,
     source: &dyn BookSource,
 ) -> Result<Recognition, String> {
-    recognize_impl(section, book_id, settings, Some(source), Some(target)).await
+    recognize_impl(
+        section, book_id, settings, Some(source), Some(target), false,
+    ).await
+}
+
+/// Optional presentation metadata must never gate translation readiness.
+pub(crate) async fn enhance_visible(
+    section: &Section,
+    target: std::ops::Range<usize>,
+    book_id: &str,
+    settings: &PluginSettings,
+    mut base: Recognition,
+) -> Result<Option<Recognition>, String> {
+    let client = crate::http::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut enhanced = section.clone();
+    for annotation in &base.annotations {
+        compose(&mut enhanced.blocks, annotation);
+    }
+    let targets = section.blocks[target]
+        .iter()
+        .flat_map(block_ranges)
+        .collect::<Vec<_>>();
+    let (extra, _) = enhancements::recognize(&client, settings, &enhanced, &targets, book_id).await;
+    if extra.is_empty() {
+        return Ok(None);
+    }
+    // Retain the base annotations when the late result replaces its scope.
+    base.annotations.extend(extra);
+    Ok(Some(base))
 }
 
 async fn recognize_impl(
@@ -1245,6 +1332,7 @@ async fn recognize_impl(
     settings: &PluginSettings,
     source: Option<&dyn BookSource>,
     target: Option<std::ops::Range<usize>>,
+    include_enhancements: bool,
 ) -> Result<Recognition, String> {
     let (provider, model) = settings.semantic_layout_endpoint()?;
     let started = std::time::Instant::now();
@@ -1254,7 +1342,9 @@ async fn recognize_impl(
         "chapter.start",
         json!({"book":book_id,"section":section.id,"href":section.href,"blocks":section.blocks.len()}),
     );
-    let result = recognize_inner(section, book_id, settings, source, target).await;
+    let result = recognize_inner(
+        section, book_id, settings, source, target, include_enhancements,
+    ).await;
     let mut details = json!({"book":book_id,"section":section.id,"href":section.href,"elapsed_ms":started.elapsed().as_millis()});
     match &result {
         Ok(recognition) => {
@@ -1284,11 +1374,15 @@ async fn recognize_inner(
     settings: &PluginSettings,
     book_source: Option<&dyn BookSource>,
     target: Option<std::ops::Range<usize>>,
+    include_enhancements: bool,
 ) -> Result<Recognition, String> {
     let (provider, model) = settings.semantic_layout_endpoint()?;
     let config = &RecognitionRoles::default();
     let fingerprint = fingerprint(section);
     let mut identity = recognition_identity(book_id, settings);
+    if !include_enhancements {
+        identity = identity.map(|identity| json!([identity, "base-recognition-v1"]));
+    }
     if let Some(target) = &target {
         identity = identity
             .map(|identity| json!([identity, "visible-target-v1", target.start, target.end]));
@@ -1465,6 +1559,22 @@ async fn recognize_inner(
         }
         start = end;
     }
+    let (extra, enhancements_ok) = if include_enhancements {
+        let mut enhanced = working.clone();
+        for annotation in &annotations {
+            compose(&mut enhanced.blocks, annotation);
+        }
+        enhancements::recognize(
+            &client,
+            settings,
+            &enhanced,
+            &target_section.blocks.iter().flat_map(block_ranges).collect::<Vec<_>>(),
+            book_id,
+        ).await
+    } else {
+        (Vec::new(), true)
+    };
+    annotations.extend(extra);
     let result = Recognition {
         formulas_checked,
         image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
@@ -1475,6 +1585,7 @@ async fn recognize_inner(
     if let Some(path) = identity
         .as_ref()
         .and_then(|identity| recognition_path(identity, &result.fingerprint))
+        && enhancements_ok
         && result.skipped_groups == 0
         && result.formulas_checked
         && let Err(error) = crate::persistence::write_json_atomic(&path, &result)
@@ -2000,8 +2111,37 @@ fn annotation(group: &Proposal, section: &Section) -> Annotation {
 // Resolve against source ranges, never translated block indices. Bilingual
 // companion paragraphs have no source and stay attached to their original.
 fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
-    if let Annotation::CodeOrQuote { body, presentation, language, captions, sources, credit } = annotation {
-        code_blocks::compose(blocks, body, *presentation, language.as_deref(), captions, sources, credit.as_ref());
+    if let Annotation::TableChart {
+        source,
+        members,
+        svg,
+        ..
+    } = annotation
+    {
+        enhancements::apply_chart(blocks, source, members, svg);
+        return;
+    }
+    if matches!(annotation, Annotation::FormulaNotes { .. }) {
+        return;
+    }
+    if let Annotation::CodeOrQuote {
+        body,
+        presentation,
+        language,
+        captions,
+        sources,
+        credit,
+    } = annotation
+    {
+        code_blocks::compose(
+            blocks,
+            body,
+            *presentation,
+            language.as_deref(),
+            captions,
+            sources,
+            credit.as_ref(),
+        );
         return;
     }
     if let Annotation::ImageTable { href, table } = annotation {
@@ -2066,8 +2206,11 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
-        | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
-                | Annotation::ImageFormula { .. }
+        | Annotation::ImageTable { .. }
+        | Annotation::ImageText { .. }
+        | Annotation::ImageFormula { .. }
+        | Annotation::TableChart { .. }
+        | Annotation::FormulaNotes { .. }
         | Annotation::UnreadableFormula { .. } => unreachable!(),
     };
     let positions: Option<Vec<_>> = ranges
@@ -2154,8 +2297,11 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
-        | Annotation::ImageTable { .. } | Annotation::ImageText { .. }
-                | Annotation::ImageFormula { .. }
+        | Annotation::ImageTable { .. }
+        | Annotation::ImageText { .. }
+        | Annotation::ImageFormula { .. }
+        | Annotation::TableChart { .. }
+        | Annotation::FormulaNotes { .. }
         | Annotation::UnreadableFormula { .. } => unreachable!(),
     };
     blocks.splice(start..end, [replacement]);

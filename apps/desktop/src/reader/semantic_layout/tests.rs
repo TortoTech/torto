@@ -2419,6 +2419,7 @@ fn composite_footnotes_share_numbers_across_captions_and_cells() {
         },
     })];
     let table = Block::Table(rebook_publication::TableBlock {
+        visualization: None,
         before: vec![text.clone()],
         after: vec![text.clone()],
         source: None,
@@ -2709,4 +2710,62 @@ fn recognized_image_table_schedules_new_cell_translation_inputs() {
     assert!(matches!(&translated.blocks[2], Block::Table(_)));
     assert!(super::super::block_focus_text(&translated.blocks[2]).contains("年份"));
     assert!(reader.missing_prepared(0, &[source]).unwrap().is_empty());
+}
+
+#[test]
+fn chart_switch_and_search_reflow_restore_the_right_source_anchor() {
+    let (base, _, _) = fixture();
+    let parsed = rebook_html::parse_section(
+        "<html><body><p>Intro</p><table><tr><th>Category</th><th>Value</th></tr><tr><td>Target</td><td>12</td></tr><tr><td>Other</td><td>18</td></tr></table></body></html>",
+        &base.source.book().sections[0], |_| None).unwrap();
+    let (mut reader, raw, _) = fixture_with_blocks(parsed.blocks);
+    let Block::Table(table) = &raw.blocks[1] else {
+        panic!()
+    };
+    let root = table.source.clone().unwrap();
+    let hit = table.rows[1].cells[0].text.source.clone().unwrap();
+    let mut members = vec![root.clone()];
+    members.extend(table.text_blocks().filter_map(|t| t.source.clone()));
+    let result = serde_json::from_value(serde_json::json!({
+        "fingerprint":crate::plugins::semantic_layout::fingerprint(&raw),"annotations":[{"TableChart":{
+            "source":root,"members":members,
+            "svg":"<svg xmlns='http://www.w3.org/2000/svg' width='400' height='220'><rect width='400' height='220' fill='#fcfbf7'/><rect x='30' y='30' width='100' height='150' fill='#39886b'/></svg>",
+            "language":"English"
+        }}]
+    })).unwrap();
+    assert!(reader.semantic_source.install(0, result));
+    let ctx = egui::Context::default();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let adopt = |reader: &mut DesktopReader| {
+        let prepared = reader.reader.prepare_refresh_request(reader.semantic_layout.presentation_anchor.clone()).prepare();
+        let unit = reader.reader.reading_unit_location().index;
+        let style = reader.reader.style();
+        let version = reader.semantic_layout.reflow_version;
+        assert!(reader.adopt_semantic_reflow(&runtime,version,unit,style,prepared));
+    };
+    assert!(reader.toggle_table_chart(&ctx, &root));
+    adopt(&mut reader);
+    assert_eq!(reader.focus_anchor.as_ref().unwrap().node, root.start.node);
+    assert!(reader.semantic_source.chart_control(&root).unwrap().1);
+    reader.go_to_search_result(&BookSearchResult {
+        section_index: 0,
+        section_title: "Chapter".into(),
+        excerpt: "Target".into(),
+        excerpt_match: 0..6,
+        matched_text: "Target".into(),
+        block_kind: "table-cell".into(),
+        range: hit.clone(),
+    });
+    assert!(!reader.semantic_source.chart_control(&root).unwrap().1);
+    assert_eq!(
+        reader.semantic_layout.presentation_anchor.as_ref(),
+        Some(&hit)
+    );
+    adopt(&mut reader);
+    assert_eq!(reader.focus_anchor.as_ref().unwrap().node, hit.start.node);
+    assert!(reader.reader.restore_cached_anchor(&hit.start));
+    assert!(
+        reader.focused_mark.is_some(),
+        "search highlight survives the background reflow"
+    );
 }

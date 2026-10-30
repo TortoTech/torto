@@ -492,7 +492,7 @@ mod tests {
         ];
         let objects = [(
             Rect::new(203.0, 150.0, 217.0, 180.0),
-            Block::Table(TableBlock {
+            Block::Table(TableBlock { visualization: None,
                 before: vec![],
                 after: vec![],
                 rows: vec![],

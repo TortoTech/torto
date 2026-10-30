@@ -629,6 +629,8 @@ struct Job {
     ctx: egui::Context,
 }
 struct Ready {
+    formula: Option<(SourceRange, String)>,
+    table: Option<SourceRange>,
     image: egui::ColorImage,
     size: [usize; 2],
     captions: Vec<String>,
@@ -677,6 +679,31 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
         .blocks
         .get(target.block)
         .ok_or("The figure/table changed. Please reopen the preview.")?;
+    // A continuation has no duplicate chart surface. Preview its group's first table.
+    fn chart_root<'a>(blocks: &'a [Block], root: &SourceRange) -> Option<&'a Block> {
+        blocks.iter().find_map(|b| match b {
+            Block::Table(t)
+                if t.source.as_ref().is_some_and(|s| {
+                    s.start.spine == root.start.spine && s.start.node == root.start.node
+                }) =>
+            {
+                Some(b)
+            }
+            Block::Figure(f) => chart_root(&f.body, root),
+            Block::Note(n) => chart_root(&n.blocks, root),
+            _ => None,
+        })
+    }
+    let block = if let Block::Table(table) = block
+        && let Some(view) = &table.visualization
+        && view.active
+        && view.href.is_none()
+    {
+        chart_root(&section.blocks, &view.root)
+            .ok_or("The continued table changed. Reopen the preview.")?
+    } else {
+        block
+    };
     let mut caption_blocks: Vec<TextBlock> = Vec::new();
     if matches!(block, Block::Figure(_) | Block::Table(_)) {
         caption_blocks.extend(target.captions.iter().filter(|i| **i < target.block).filter_map(|i| match &section.blocks[*i] {
@@ -720,6 +747,9 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
                 )
             }
         }
+        Block::Table(table) if table.visualization.as_ref().is_some_and(|v| v.active) => {
+            (0, 1, vec![block.clone()])
+        }
         Block::Table(table) => {
             let presentation = rebook_layout::table_presentation(table, true);
             caption_blocks.extend(presentation.before.iter().chain(presentation.after.iter()).cloned());
@@ -728,6 +758,7 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
             let at = job.cursor.chunk.min(ranges.len().saturating_sub(1));
             let range = ranges.get(at).ok_or("The table is empty.")?.clone();
             let mut part = TableBlock {
+                visualization: None,
                 before: vec![],
                 after: vec![],
                 rows: rows[range].to_vec(),
@@ -818,6 +849,7 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     let mut engine =
         LayoutEngine::with_fonts(crate::fonts::reader_fonts().iter().cloned());
     engine.set_deferred_images(true);
+    engine.set_formula_notes_visible(false);
     let layout = engine
         .layout_blocks(
             job.source.as_ref(),
@@ -952,6 +984,10 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
         None
     };
     Ok(Ready {
+        formula: crate::plugins::semantic_layout::enhancements::display_formula(block),
+        table: matches!(block, Block::Table(_))
+            .then(|| super::block_source_range(block).cloned())
+            .flatten(),
         image,
         size: [width, height],
         captions,
@@ -1032,6 +1068,11 @@ struct PreviewItem {
 }
 
 struct Preview {
+    formula: Option<(SourceRange, String)>,
+    table: Option<SourceRange>,
+    notes: Vec<crate::plugins::semantic_layout::enhancements::SymbolNote>,
+    notes_view: crate::ui::formula_notes::FormulaNotesView,
+    notes_open: bool,
     motion: PreviewMotion,
     content_motion: Option<PreviewMotion>,
     origin: SourceRange,
@@ -1085,9 +1126,17 @@ impl super::DesktopReader {
         let Some(active) = &self.media_preview.active else {
             return false;
         };
-        if active.motion.is_closing() { return true; }
+        if active.motion.is_closing() {
+            return true;
+        }
         if ctx.input_mut(|i| i.consume_shortcut(&self.shortcuts.copy)) {
-            ctx.copy_text(active.captions.join("\n"));
+            ctx.copy_text(
+                active
+                    .formula
+                    .as_ref()
+                    .map(|(_, latex)| latex.clone())
+                    .unwrap_or_else(|| active.captions.join("\n")),
+            );
         }
         true
     }
@@ -1211,8 +1260,15 @@ impl super::DesktopReader {
         self.ui.focus_navigation_repeat = Default::default();
         self.ui.focus_wheel.reset();
         self.ui.wheel_accumulator = 0.0;
+        self.ui.focus_footnote_modifier_tap = super::egui_view::ModifierTapState::Idle;
+        ctx.plugin::<egui::text_selection::LabelSelectionState>().lock().clear_selection();
         self.media_preview.restore_parent = self.ui.focus_footnotes_visible;
         self.media_preview.active = Some(Preview {
+            formula: None,
+            table: None,
+            notes: vec![],
+            notes_view: Default::default(),
+            notes_open: false,
             motion: PreviewMotion::new(ctx),
             content_motion: None,
             origin: item.origin.clone(),
@@ -1243,6 +1299,11 @@ impl super::DesktopReader {
             return;
         };
         active.loading = true;
+        active.notes_open = false;
+        active.notes.clear();
+        active.formula = None;
+        self.ui.focus_footnote_modifier_tap = super::egui_view::ModifierTapState::Idle;
+        ctx.plugin::<egui::text_selection::LabelSelectionState>().lock().clear_selection();
         active.error = None;
         active.previous = None;
         active.next = None;
@@ -1273,6 +1334,7 @@ impl super::DesktopReader {
     pub(super) fn close_media_preview(&mut self, ctx: &egui::Context) {
         let Some(active) = &mut self.media_preview.active else { return };
         if active.motion.is_closing() { return; }
+        self.ui.focus_footnote_modifier_tap = super::egui_view::ModifierTapState::Idle;
         active.motion.close(ctx);
         if let Some(motion) = &mut active.content_motion { motion.close(ctx); }
         if let Some(worker) = &self.media_preview.worker {
@@ -1283,6 +1345,19 @@ impl super::DesktopReader {
         ctx.request_repaint();
     }
     pub(super) fn media_preview_keyboard(&mut self, ctx: &egui::Context) -> bool {
+        if self
+            .media_preview
+            .active
+            .as_ref()
+            .is_some_and(|a| a.formula.is_some() && !a.motion.is_closing())
+            && self.formula_notes_shortcut_requested(ctx)
+        {
+            if let Some(active) = &mut self.media_preview.active {
+                active.notes_open = !active.notes_open;
+            }
+            ctx.request_repaint();
+            return true;
+        }
         if self.media_preview.active.is_none() {
             return false;
         }
@@ -1364,7 +1439,19 @@ impl super::DesktopReader {
                 }
                 match completion.result {
                     Ok(ready) => {
-                        active.content_motion = active.texture.is_none().then(|| PreviewMotion::new(ctx));
+                        active.notes = ready
+                            .formula
+                            .as_ref()
+                            .map(|(source, latex)| {
+                                self.semantic_source.formula_notes(source, latex)
+                            })
+                            .unwrap_or_default();
+                        active.notes_open = ready.formula.as_ref().is_some_and(|(source, latex)|
+                            !self.semantic_source.visible_formula_notes(source, latex).is_empty());
+                        active.formula = ready.formula;
+                        active.table = ready.table;
+                        active.content_motion =
+                            active.texture.is_none().then(|| PreviewMotion::new(ctx));
                         active.displayed_index = active.item_index;
                         active.position = ready.position;
                         active.multipart = ready.previous.is_some() || ready.next.is_some();
@@ -1405,6 +1492,17 @@ impl super::DesktopReader {
     }
 
     pub(super) fn media_preview_overlay(&mut self, ctx: &egui::Context) {
+        let chart = self
+            .media_preview
+            .active
+            .as_ref()
+            .and_then(|a| a.table.as_ref())
+            .and_then(|s| self.semantic_source.chart_control(s));
+        let chart_shortcut = self.shortcuts.focus_table_chart;
+        let mut switch_chart = chart.is_some() && !ctx.text_edit_focused() && ctx.input_mut(|input| {
+            let fresh = super::egui_view::shortcut_has_fresh_press(input, &chart_shortcut);
+            input.consume_shortcut(&chart_shortcut) && fresh
+        });
         self.accept_media_preview_completion(ctx);
         let language = self.language;
         let Some(active) = &mut self.media_preview.active else {
@@ -1421,7 +1519,11 @@ impl super::DesktopReader {
         let screen = crate::ui::overlay_rect(ctx);
         let available = if active.items.len() > 1 {
             screen.shrink2(egui::vec2(64.0, 48.0))
-        } else { screen.shrink(32.0) };
+        } else {
+            screen.shrink(32.0)
+        };
+        let annotated = active.formula.as_ref().filter(|_| active.notes_open && !active.notes.is_empty())
+            .and_then(|(_, latex)| active.notes_view.image(ctx, latex, &active.notes));
         let mut close = false;
         let mut navigate = None;
         let mut item_direction = 0;
@@ -1440,13 +1542,14 @@ impl super::DesktopReader {
                     ui.allocate_exact_size(ctx.content_rect().size(), egui::Sense::click());
                 ui.painter()
                     .rect_filled(bounds, 0.0, egui::Color32::from_black_alpha(190));
-                if let Some(texture) = &active.texture {
+                if let Some(texture) = annotated.as_ref().map(|(texture, _)| texture).or(active.texture.as_ref()) {
+                    let image_size = annotated.as_ref().map_or(active.size, |(_, size)| *size);
                     let captions: Vec<_> = active
                         .caption_textures
                         .iter()
                         .map(egui::TextureHandle::size_vec2)
                         .collect();
-                    let natural = media_paper_size(active.size, &captions);
+                    let natural = media_paper_size(image_size, &captions);
                     let fit = crate::ui::image_preview::preview_fit_scale(
                         natural,
                         available.size().max(egui::Vec2::splat(1.0)),
@@ -1469,7 +1572,7 @@ impl super::DesktopReader {
                     painter.rect_filled(paper, 0.0, egui::Color32::WHITE);
                     let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
                     let mut top = paper.top();
-                    for (texture, natural_size) in std::iter::once((texture, active.size))
+                    for (texture, natural_size) in std::iter::once((texture, image_size))
                         .chain(active.caption_textures.iter().zip(captions.iter().copied()))
                     {
                         let size = natural_size * scale;
@@ -1586,14 +1689,49 @@ impl super::DesktopReader {
                     ui.painter().text(egui::pos2(screen.center().x, screen.top() + 18.0), egui::Align2::CENTER_CENTER,
                         language.text("正在加载…", "Loading…"), egui::FontId::proportional(13.0), egui::Color32::WHITE);
                 }
+                if let Some((_, selected)) = &chart {
+                    ui.scope_builder(
+                        egui::UiBuilder::new().max_rect(egui::Rect::from_center_size(
+                            egui::pos2(screen.right() - 36.0, screen.top() + 28.0),
+                            egui::vec2(32.0, 32.0),
+                        )),
+                        |ui| {
+                            let toggle = super::egui_view::table_chart_toggle_button(
+                                ui, language, *selected, Some(&chart_shortcut),
+                            );
+                            switch_chart |= toggle.clicked();
+                            over_navigation |= toggle.hovered() || switch_chart;
+                        },
+                    );
+                }
                 if over_navigation { close = false; }
             });
+        if switch_chart
+            && let Some((source, _)) = chart
+            && self.toggle_table_chart(ctx, &source)
+        {
+            self.request_media_page(ctx, Cursor::default());
+            return;
+        }
         if close {
             self.close_media_preview(ctx);
         } else if item_direction != 0 {
             self.step_media_item(ctx, item_direction);
         } else if let Some(cursor) = navigate {
             self.request_media_page(ctx, cursor);
+        }
+    }
+
+    /// An open preview can precede the optional background metadata response.
+    pub(super) fn refresh_preview_formula_notes(&mut self) {
+        let semantic = &self.semantic_source;
+        if let Some(preview) = &mut self.image_preview
+            && let (Some(source), Some(latex)) = (&preview.formula_source, &preview.copy_text) {
+            preview.formula_notes = semantic.formula_notes(source, latex);
+        }
+        if let Some(preview) = &mut self.media_preview.active
+            && let Some((source, latex)) = &preview.formula {
+            preview.notes = semantic.formula_notes(source, latex);
         }
     }
 }

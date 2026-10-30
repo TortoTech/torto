@@ -317,7 +317,7 @@ mod tests {
                     TableCell { text, authored_alignment: None, column_span: 1, row_span: 1, header: row == 0 }
                 }).collect(),
             }).collect();
-        let blocks = [figure(vec![Block::Table(TableBlock {
+        let blocks = [figure(vec![Block::Table(TableBlock { visualization: None,
             before: vec![], after: vec![], rows, source: None,
         })])];
         let style = ReaderStyle { spread: SpreadMode::Single,
@@ -458,7 +458,7 @@ mod tests {
         }).collect();
         let blocks = [figure(vec![
             text("Figure 5.2 Complex table", TextAlignment::Center, TextBlockKind::Caption),
-            Block::Table(TableBlock { before: vec![], after: vec![], rows, source: None }),
+            Block::Table(TableBlock { visualization: None, before: vec![], after: vec![], rows, source: None }),
             text("Source: Example", TextAlignment::Start, TextBlockKind::QuoteAttribution),
         ])];
         let style = ReaderStyle { spread: SpreadMode::Single,

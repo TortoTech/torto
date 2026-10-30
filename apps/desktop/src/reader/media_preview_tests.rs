@@ -59,8 +59,15 @@ fn focus_reference_shortcut_orders_deduplicates_and_keeps_navigation_inside_the_
     assert_eq!(pending.key.number, "3");
     let stale_generation = pending.generation;
     let ready = || Ready {
-        image: egui::ColorImage::filled([10,10],egui::Color32::WHITE), size:[10,10], captions:vec!["Third".into()], caption_images:vec![],
-        previous:None, next:Some(Cursor {chunk:1,page:0}), position:"1 / 2 · 1 / 1".into(),
+        formula: None,
+        table: None,
+        image: egui::ColorImage::filled([10, 10], egui::Color32::WHITE),
+        size: [10, 10],
+        captions: vec!["Third".into()],
+        caption_images: vec![],
+        previous: None,
+        next: Some(Cursor { chunk: 1, page: 0 }),
+        position: "1 / 2 · 1 / 1".into(),
     };
     worker.result.store(Some(Arc::new(Completion { generation:stale_generation, revision:reader.source.content_revision(),result:Ok(ready()) })));
     reader.accept_media_preview_completion(&ctx);
@@ -328,7 +335,15 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
     };
     let key = media_references::references("Figure 4.4")[0].key.clone();
     reader.media_preview.active = Some(Preview {
-        motion: PreviewMotion { opened_at: 0.0, closing: None },
+        formula: None,
+        table: None,
+        notes: vec![],
+        notes_view: Default::default(),
+        notes_open: false,
+        motion: PreviewMotion {
+            opened_at: 0.0,
+            closing: None,
+        },
         content_motion: None,
         origin,
         key,
@@ -357,6 +372,8 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
         generation,
         revision: reader.source.content_revision(),
         result: Ok(Ready {
+            formula: None,
+            table: None,
             image: egui::ColorImage::filled([320, 200], egui::Color32::WHITE),
             size: [320, 200],
             captions: vec!["Figure 4.4 Caption".into()],

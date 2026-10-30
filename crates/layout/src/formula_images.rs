@@ -890,6 +890,16 @@ impl LayoutEngine {
         ) else {
             return Ok(false);
         };
+        // Inline equation images are annotated on their owning paragraph;
+        // standalone images use their own (possibly zero-length) source anchor.
+        let notes = formula.filter(|_| self.formula_notes_visible).and_then(|f|
+            owner.iter().chain(image.source.iter()).map(|origin| source.visible_formula_notes(origin, &f.latex))
+                .find(|notes| !notes.is_empty())).unwrap_or_default();
+        let bare = (raster, w, h);
+        let (raster, w, h) = formula_notes::append(bare.clone(), &notes, width,
+            &style.typography, style.foreground, &self.svg_options,
+            self.deferred_images.then_some((source, self.raster_generation)))
+            .unwrap_or(bare);
         let gap = style.typography.font_size * style.typesetting.media_gap_em;
         paginator.push_image(
             raster,

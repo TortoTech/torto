@@ -562,6 +562,12 @@ pub(super) fn compose(blocks: &mut [Block], href: &PublicationUrl, formula: Opti
             }
             Block::Note(n) => compose(&mut n.blocks, href, formula),
             Block::Figure(figure) => {
+                for image in &mut figure.images {
+                    if &image.href == href {
+                        image.formula_image = true;
+                        image.formula = formula.cloned();
+                    }
+                }
                 compose(&mut figure.body, href, formula);
                 for caption in &mut figure.captions { text(caption, href, formula); }
             }

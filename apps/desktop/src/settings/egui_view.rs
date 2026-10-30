@@ -384,12 +384,16 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
                 language.text("按句分段", "Split by sentence"),
             ),
             (
+                ShortcutAction::FocusTableChart,
+                language.text("可视化表格", "Visualize table"),
+            ),
+            (
                 ShortcutAction::FocusImagePreview,
                 language.text("预览图表", "Preview figure or table"),
             ),
             (
                 ShortcutAction::FocusFootnotes,
-                language.text("脚注开关", "Toggle footnotes"),
+                language.text("脚注／公式备注开关", "Toggle footnotes / formula notes"),
             ),
             (
                 ShortcutAction::FocusExtendSelectionPrevious,
@@ -954,8 +958,8 @@ fn semantic_layout_rows(
     settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
         toggle_switch(ui, &mut settings.enabled);
         settings_help_icon(ui, language.text(
-            "补充未识别的引用、文内文献引用、公式图片、图注和小节标题",
-            "Recognize missing quotes, inline citations, formula images, captions and section headings",
+            "补充未识别的引用、文内文献引用、公式图片、图注和小节标题，生成表格图表及公式符号说明",
+            "Recognize missing quotes, inline citations, formula images, captions and section headings; generate table charts and formula symbol notes",
         ));
     });
     ui.end_row();

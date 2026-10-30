@@ -493,6 +493,9 @@ impl Source {
 }
 
 impl BookSource for Source {
+    fn visible_formula_notes(&self, source: &SourceRange, latex: &str) -> Vec<rebook_publication::FormulaNote> {
+        self.inner.visible_formula_notes(source, latex)
+    }
     fn missing_font_resources(&self) -> bool { self.inner.missing_font_resources() }
     fn book(&self) -> &Book {
         self.inner.book()
