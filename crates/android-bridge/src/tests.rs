@@ -291,7 +291,15 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
         advanced_reading(&core, &books[0].id).await;
         long_focus_continuation(&core,&root).await;
         drop(core);
-        std::fs::remove_dir_all(root).unwrap();
+        // The process-wide statistics worker can still own its SQLite handle
+        // after MobileCore is dropped. Windows cannot unlink that open file;
+        // this is expected teardown behavior, not a reader shutdown failure.
+        if let Err(error) = std::fs::remove_dir_all(root) {
+            assert!(
+                cfg!(windows) && error.raw_os_error() == Some(32),
+                "could not clean up test profile: {error}"
+            );
+        }
     });
 }
 #[test]
