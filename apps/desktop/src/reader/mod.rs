@@ -1,3 +1,4 @@
+use rebook_app_core::reading_text::{FocusFootnoteSource, block_source_range, text_block_focus_footnotes, block_focus_footnotes, focus_footnote_text_in_section, find_block_containing_anchor, note_definition_containing_anchor, normalize_resolved_footnote_text, text_block_focus_text, block_focus_text, focus_block_paint_ranges, source_range_contains_anchor};
 use crate::plugins::semantic_layout::SemanticLayoutSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -386,27 +387,11 @@ pub(crate) fn open_reader_staged(
     };
     let fixed_page = canonical_source.book().metadata.layout == RenditionLayout::PrePaginated;
     let media_original = canonical_source.clone();
-    let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
-    let translation_source = Arc::new(if fixed_page {
-        TranslationBookSource::new_fixed_page(
-            rewrite_source.clone(),
-            plugin_settings.translation_mode,
-        )
-    } else {
-        TranslationBookSource::new(rewrite_source.clone(), plugin_settings.translation_mode)
-    });
-    let semantic_source = Arc::new(SemanticLayoutSource::with_fonts(
-        translation_source.clone(),
-        rewrite_source.clone(),
-        reader_fonts.clone(),
-    ));
-    if !fixed_page {
-        semantic_source.configure(
-            &crate::plugins::pdf_native::cache_identity(&book_id, rewrite_source.as_ref()),
-            &plugin_settings,
-        );
-    }
-    let structure_source = Arc::new(ParagraphStructureSource::new(semantic_source.clone()));
+    let pipeline = rebook_app_core::reading::ReadingPipeline::new(canonical_source, &book_id, &plugin_settings, reader_fonts.clone());
+    let rewrite_source = pipeline.rewrite;
+    let translation_source = pipeline.translation;
+    let semantic_source = pipeline.semantic;
+    let structure_source = pipeline.structure;
     let media_source = Arc::new(media_links::Source::new(structure_source.clone(), media_original));
     let source: Arc<dyn BookSource> = media_source.clone();
     let highlights_started = Instant::now();
@@ -671,7 +656,7 @@ pub(crate) fn open_reader_staged(
 pub(crate) fn probe_memory(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::diagnostics::memory_checkpoint;
     memory_checkpoint("headless_baseline");
-    let library = crate::library::LocalLibrary::load_default()?;
+    let library = crate::library::load_default()?;
     let book = library.books().iter().find(|book| book.path == path);
     let settings = SyncSettings::load_default()?;
     let store = SyncStore::open_default(settings.device_id)?;
@@ -1107,20 +1092,7 @@ impl FocusFootnote {
     }
 }
 
-enum FocusFootnoteSource {
-    Citation {
-        text: String,
-        source: SourceRange,
-        number: u32,
-        display_number: u32,
-    },
-    Inline(String, u32),
-    Reference {
-        number: u32,
-        marker: String,
-        target: PublicationUrl,
-    },
-}
+
 
 fn merge_focus_list_descendant(root: &mut FocusUnit, descendant: FocusUnit) {
     root.range.end = descendant.range.end;
@@ -1164,17 +1136,7 @@ fn focus_unit_contains_source_range(unit: &FocusUnit, range: &SourceRange) -> bo
     })
 }
 
-fn block_source_range(block: &Block) -> Option<&SourceRange> {
-    match block {
-        Block::Text(block) => block.source.as_ref(),
-        Block::Quote(quote) => quote.source.as_ref(),
-        Block::Table(table) => table.source.as_ref(),
-        Block::Image(image) => image.source.as_ref(),
-        Block::Figure(figure) => figure.source.as_ref(),
-        Block::Note(note) => note.source.as_ref(),
-        Block::Separator(_) | Block::LineBreak | Block::PageBreak => None,
-    }
-}
+
 
 #[cfg(test)]
 fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, PublicationUrl)> {
@@ -1197,73 +1159,7 @@ fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, Publication
         .collect()
 }
 
-fn text_block_focus_footnotes(block: &TextBlock) -> Vec<FocusFootnoteSource> {
-    let mut notes = Vec::new();
-    let mut footnotes = rebook_layout::paragraph_footnotes(block)
-        .into_iter()
-        .enumerate()
-        .peekable();
-    let mut index = 0;
-    // Walk the inlines once so references, inline notes and citations stay
-    // interleaved in their authored order, independently of their numbering.
-    while index < block.content.len() {
-        if footnotes
-            .peek()
-            .is_some_and(|(_, range)| range.start == index)
-        {
-            let (ordinal, range) = footnotes.next().unwrap();
-            let Inline::Text(first) = &block.content[range.start] else {
-                unreachable!()
-            };
-            index = range.end;
-            let text = block.content[range]
-                .iter()
-                .flat_map(Inline::text_runs)
-                .map(|run| run.text.as_str())
-                .collect::<String>();
-            let number = if first.style.footnote_number == 0 {
-                ordinal as u32 + 1
-            } else {
-                first.style.footnote_number
-            };
-            if first.style.inline_role == InlineRole::Footnote {
-                notes.push(FocusFootnoteSource::Inline(text.trim().to_owned(), number));
-            } else if let Some(target) = &first.link {
-                notes.push(FocusFootnoteSource::Reference {
-                    marker: text.trim().to_owned(),
-                    target: target.clone(),
-                    number,
-                });
-            }
-            continue;
-        }
-        let Inline::Text(run) = &block.content[index] else {
-            index += 1;
-            continue;
-        };
-        let number = run.style.inline_citation;
-        let display_number = if run.style.citation_number == 0 { number } else { run.style.citation_number };
-        let Some(source) = block.source.as_ref().filter(|_| number != 0) else {
-            index += 1;
-            continue;
-        };
-        let mut text = String::new();
-        while let Some(Inline::Text(run)) = block.content.get(index) {
-            if run.style.inline_citation != number {
-                break;
-            }
-            text.push_str(&run.text);
-            index += 1;
-        }
-        notes.push(FocusFootnoteSource::Citation {
-            text,
-            source: source.clone(),
-            number,
-            display_number,
-        });
-    }
-    notes
-}
+
 
 fn text_block_has_link_role(block: &TextBlock, role: LinkRole) -> bool {
     block.content.iter().any(|inline| {
@@ -1292,30 +1188,7 @@ fn block_is_footnote_definition(block: &Block) -> bool {
     }
 }
 
-fn block_focus_footnotes(block: &Block) -> Vec<FocusFootnoteSource> {
-    if let Block::Text(text) = block {
-        return text_block_focus_footnotes(text);
-    }
-    let numbered = rebook_layout::numbered_semantic_footnotes(block);
-    match numbered.as_ref() {
-        Block::Text(block) => text_block_focus_footnotes(block),
-        Block::Quote(quote) => quote
-            .body
-            .iter()
-            .chain(quote.attribution.iter())
-            .flat_map(text_block_focus_footnotes)
-            .collect(),
-        Block::Table(table) => table
-            .text_blocks()
-            .flat_map(text_block_focus_footnotes)
-            .collect(),
-        Block::Figure(figure) => figure.text_blocks()
-            .flat_map(text_block_focus_footnotes)
-            .collect(),
-        Block::Note(_) => Vec::new(),
-        Block::Image(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => Vec::new(),
-    }
-}
+
 
 fn focus_footnote_text(
     source: &dyn BookSource,
@@ -1342,31 +1215,7 @@ fn focus_footnote_text(
     focus_footnote_text_in_section(section, target, marker)
 }
 
-fn focus_footnote_text_in_section(
-    section: &Section,
-    target: &PublicationUrl,
-    marker: &str,
-) -> Option<String> {
-    let fragment = target.fragment()?;
-    let anchor = section
-        .anchors
-        .iter()
-        .find(|anchor| anchor.fragment == fragment)?
-        .source
-        .clone();
-    if let Some(note) = section
-        .blocks
-        .iter()
-        .find_map(|block| note_definition_containing_anchor(block, &anchor))
-    {
-        return normalize_resolved_footnote_text(&block_focus_text(note), marker);
-    }
-    let block = section
-        .blocks
-        .iter()
-        .find_map(|block| find_block_containing_anchor(block, &anchor))?;
-    normalize_resolved_footnote_text(&block_focus_text(block), marker)
-}
+
 
 fn focus_footnote_translation_ranges_in_section(
     section: &Section,
@@ -1442,86 +1291,13 @@ fn collect_focus_footnote_translation_ranges(block: &Block, ranges: &mut Vec<Sou
     }
 }
 
-fn find_block_containing_anchor<'a>(block: &'a Block, anchor: &SourceAnchor) -> Option<&'a Block> {
-    if let Block::Note(note) = block {
-        return note
-            .blocks
-            .iter()
-            .find_map(|child| find_block_containing_anchor(child, anchor));
-    }
-    (block_source_range(block).is_some_and(|range| source_range_contains_anchor(range, anchor))
-        || block_source_range(block).is_some_and(|range| {
-            focus_block_paint_ranges(block, range)
-                .iter()
-                .any(|range| source_range_contains_anchor(range, anchor))
-        }))
-    .then_some(block)
-}
 
-fn note_definition_containing_anchor<'a>(
-    block: &'a Block,
-    anchor: &SourceAnchor,
-) -> Option<&'a Block> {
-    let Block::Note(note) = block else {
-        return None;
-    };
-    for child in &note.blocks {
-        if let Some(definition) = note_definition_containing_anchor(child, anchor) {
-            return Some(definition);
-        }
-    }
-    note.blocks
-        .iter()
-        .any(|child| find_block_containing_anchor(child, anchor).is_some())
-        .then_some(block)
-}
 
-fn normalize_resolved_footnote_text(text: &str, marker: &str) -> Option<String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let without_marker = text.strip_prefix(marker.trim()).map_or(text, |rest| {
-        rest.trim_start_matches(|character: char| {
-            character.is_whitespace()
-                || matches!(
-                    character,
-                    '.' | '．' | '，' | '、' | ')' | '）' | ']' | '】'
-                )
-        })
-    });
-    Some(without_marker.to_owned())
-}
 
-fn text_block_focus_text(block: &TextBlock) -> String {
-    let mut leading_backlink = false;
-    let mut started = false;
-    block
-        .content
-        .iter()
-        .filter_map(|inline| match inline {
-            Inline::Ruby(run) => Some(run.base_text()),
-            Inline::Text(run) if matches!(run.style.inline_role, InlineRole::Footnote | InlineRole::PageMarker) => None,
-            Inline::Text(run) if run.style.link_role == LinkRole::FootnoteBacklink => {
-                leading_backlink |= !started;
-                None
-            }
-            Inline::Text(run) => {
-                let text = if leading_backlink && !started {
-                    run.text.trim_start_matches(|ch: char| ch.is_whitespace()
-                        || matches!(ch, '.' | '．' | ')' | '）' | ']' | '】' | '、'))
-                } else { run.text.as_str() };
-                started |= !text.trim().is_empty();
-                Some(text.to_owned())
-            }
-            Inline::Math(run) => Some(run.latex.clone()),
-            Inline::Image(run) => run.image.ocr_text.as_ref()
-                .map(|text| text.display_text().to_owned())
-                .or_else(|| run.image.formula.as_ref().map(|f| format!(r"\({}\)", f.latex))),
-            Inline::Break => Some("\n".to_owned()),
-        })
-        .collect()
-}
+
+
+
+
 
 fn markdown_table_cell(text: &str) -> String {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -1631,80 +1407,9 @@ fn table_block_markdown(table: &TableBlock) -> String {
         .join("\n\n")
 }
 
-fn block_focus_text(block: &Block) -> String {
-    match block {
-        Block::Text(block) => text_block_focus_text(block),
-        Block::Quote(quote) => quote
-            .body
-            .iter()
-            .chain(quote.attribution.iter())
-            .map(text_block_focus_text)
-            .filter(|text| !text.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join(" "),
-        Block::Table(table) => table
-            .text_blocks()
-            .map(text_block_focus_text)
-            .collect::<Vec<_>>()
-            .join(" "),
-        Block::Image(image) => image
-            .formula
-            .as_ref()
-            .map_or_else(|| image.alt.clone(), |f| format!(r"\({}\)", f.latex)),
-        Block::Figure(figure) => figure.text_blocks()
-            .map(text_block_focus_text)
-            .collect::<Vec<_>>()
-            .join(" "),
-        Block::Note(note) => note
-            .blocks
-            .iter()
-            .map(block_focus_text)
-            .filter(|text| !text.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        Block::Separator(_) | Block::LineBreak | Block::PageBreak => String::new(),
-    }
-}
 
-fn focus_block_paint_ranges(block: &Block, range: &SourceRange) -> Vec<SourceRange> {
-    if let Block::Quote(quote) = block {
-        let ranges = quote
-            .body
-            .iter()
-            .filter_map(|block| block.source.clone())
-            .chain(
-                quote
-                    .attribution
-                    .iter()
-                    .filter_map(|block| block.source.clone()),
-            )
-            .collect::<Vec<_>>();
-        if !ranges.is_empty() {
-            return ranges;
-        }
-    }
-    if let Block::Table(table) = block {
-        let mut cell_ranges = table
-            .text_blocks()
-            .filter_map(|text| text.source.clone())
-            .collect::<Vec<_>>();
-        if table.visualization.as_ref().is_some_and(|v| v.active) {
-            cell_ranges.push(range.clone());
-        }
-        if !cell_ranges.is_empty() {
-            return cell_ranges;
-        }
-    }
-    if let Block::Figure(figure) = block {
-        let figure_ranges = figure.images.iter().filter_map(|image| image.source.clone())
-            .chain(figure.captions.iter().filter_map(|caption| caption.source.clone()))
-            .chain(figure.body.iter().flat_map(|child|
-                focus_block_paint_ranges(child, block_source_range(child).unwrap_or(range))))
-            .collect::<Vec<_>>();
-        if !figure_ranges.is_empty() { return figure_ranges; }
-    }
-    vec![range.clone()]
-}
+
+
 
 fn merge_inferred_caption_focus_unit(image: &mut FocusUnit, caption: FocusUnit) {
     image.caption_rect = Some(
@@ -1973,18 +1678,7 @@ fn snapshot_position(snapshot: &ReaderSnapshot) -> ReaderPosition {
     }
 }
 
-fn source_range_contains_anchor(range: &SourceRange, anchor: &SourceAnchor) -> bool {
-    if range.start.spine != anchor.spine || range.start.node != anchor.node {
-        return false;
-    }
-    if range.start.spine != range.end.spine || range.start.node != range.end.node {
-        return range.start == *anchor;
-    }
-    anchor.text_offset >= range.start.text_offset
-        && (anchor.text_offset < range.end.text_offset
-            || (range.start.text_offset == range.end.text_offset
-                && anchor.text_offset == range.start.text_offset))
-}
+
 
 fn focus_unit_container_center_y(rect: egui::Rect) -> f32 {
     rect.top() + rect.height().max(FOCUS_UNIT_MIN_HEIGHT) / 2.0
@@ -5364,7 +5058,7 @@ mod tests {
     #[ignore = "requires TORTO_TEST_HEADER_BOOK with a local library book"]
     fn local_staged_header_matches_restored_reading_position() {
         let path = std::path::PathBuf::from(std::env::var("TORTO_TEST_HEADER_BOOK").unwrap());
-        let library = crate::library::LocalLibrary::load_default().unwrap();
+        let library = crate::library::load_default().unwrap();
         let book = library
             .books()
             .iter()

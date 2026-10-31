@@ -35,6 +35,7 @@ pub(crate) enum UserEvent {
     ShelfSyncProgress(crate::shelf::SyncProgressMessage),
     ShelfSync(crate::shelf::SyncTaskMessage),
     ShelfSyncCheck(crate::shelf::SyncCheckMessage),
+    SettingsCredentials(crate::settings::CredentialsMessage),
     SettingsProviderModels(crate::settings::ProviderModelsMessage),
     ReaderSearch(crate::reader::SearchTaskMessage),
     ReaderChatStream(crate::reader::ChatStreamMessage),

@@ -35,15 +35,14 @@ osx_minimum_system_version = "15.0"
 osx_info_plist_exts = ["assets/macos/document-types.plist"]
 
 [dependencies]
+rebook-app-core = { path = "../../crates/app-core" }
 anyrender.workspace = true
 anyrender_vello_cpu = { version = "0.18.0", default-features = false }
 arboard.workspace = true
 parley.workspace = true
 skrifa = "0.48.0"
-atomicwrites.workspace = true
 base64.workspace = true
 bytemuck.workspace = true
-bytes.workspace = true
 chrono = "0.4"
 directories.workspace = true
 egui = { workspace = true, features = ["serde"] }
@@ -56,11 +55,6 @@ egui-winit.workspace = true
 fontdb.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 image.workspace = true
-jsonrepair-rs.workspace = true
-jsonschema = { version = "0.46", default-features = false }
-rig-core = { version = "=0.44.0", default-features = false }
-rig-reqwest = { version = "=0.44.0", default-features = false }
-rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 keyring.workspace = true
 kurbo.workspace = true
 mermaid-rs-renderer.workspace = true
@@ -68,7 +62,6 @@ peniko.workspace = true
 percent-encoding.workspace = true
 pollster.workspace = true
 pulldown-cmark.workspace = true
-quick-xml.workspace = true
 regex.workspace = true
 rebook-formats = { path = "../../crates/formats" }
 rebook-html = { path = "../../crates/html" }
@@ -84,8 +77,6 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sys-locale.workspace = true
-syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 tracing.workspace = true
 tokio.workspace = true
 uuid.workspace = true
@@ -117,7 +108,7 @@ rebook-macos-open-file = { path = "../../crates/macos-open-file" }
 wgpu = { workspace = true, features = ["vulkan", "gles"] }
 
 [dev-dependencies]
+rebook-app-core = { path = "../../crates/app-core", features = ["test-support"] }
 # Framework fixtures may use default Latin fonts; release builds use system fonts only.
 egui = { workspace = true, features = ["default_fonts"] }
 keyring-core = "1.0.0"
-rcgen = "0.14.10"

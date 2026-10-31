@@ -30,6 +30,20 @@ const FRAGMENT_TEXT_BUDGET: usize = 4_096;
 const LARGE_SECTION_TEXT_BUDGET: usize = FRAGMENT_TEXT_BUDGET * 8;
 const FRAGMENT_BLOCK_BUDGET: usize = 64;
 
+/// Per-session soft budgets. A visible segment may exceed these limits; it is
+/// never discarded while the user is reading it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReaderCachePolicy {
+    pub layout_bytes: usize,
+    pub raster_bytes: usize,
+    pub prefetch_distance: usize,
+}
+impl Default for ReaderCachePolicy {
+    fn default() -> Self {
+        Self { layout_bytes: LAYOUT_CACHE_BUDGET, raster_bytes: RASTER_CACHE_BUDGET, prefetch_distance: PREFETCH_DISTANCE }
+    }
+}
+
 /// Direction requested by keyboard, pointer, or command navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageDirection {
@@ -221,6 +235,12 @@ pub struct ReaderTextHit {
     byte_index: usize,
     cluster_start: usize,
     cluster_end: usize,
+}
+
+impl ReaderTextHit {
+    pub fn ordering_key(&self) -> (usize,usize,usize,usize,usize) {
+        (self.position.section_index,self.position.segment_index,self.position.page_index,self.region_index,self.byte_index)
+    }
 }
 
 /// Page-coordinate rectangle used to paint a native selection and anchor its
@@ -748,6 +768,7 @@ pub struct ReaderSession {
     section_indices_by_path: HashMap<String, usize>,
     hidden_sections: HashSet<usize>,
     cache_capacity: usize,
+    cache_policy: ReaderCachePolicy,
     cache: HashMap<SegmentKey, Arc<CachedSegment>>,
     lru: VecDeque<SegmentKey>,
     prefetch_worker: PrefetchWorker,
@@ -776,6 +797,7 @@ pub struct ReaderRefreshRequest {
     locator: LocatorV1,
     raster_generation: u64,
     deferred_images: bool,
+    cache_policy: ReaderCachePolicy,
 }
 
 impl ReaderRefreshRequest {
@@ -788,6 +810,7 @@ impl ReaderRefreshRequest {
             Some(self.raster_generation),
             self.deferred_images,
         )?;
+        reader.set_cache_policy(self.cache_policy);
         reader.restore_locator(&self.locator)?;
         reader.cache_capacity = usize::MAX;
         // Scroll/focus mode must not compile additional pages on the UI thread
@@ -833,6 +856,7 @@ impl ReaderSession {
             locator,
             raster_generation: self.layout_engine.raster_cache_generation(),
             deferred_images: self.layout_engine.deferred_images(),
+            cache_policy: self.cache_policy,
         }
     }
 
@@ -1012,6 +1036,7 @@ impl ReaderSession {
             section_indices_by_path,
             hidden_sections,
             cache_capacity: DEFAULT_SEGMENT_CACHE_CAPACITY,
+            cache_policy: ReaderCachePolicy::default(),
             cache: HashMap::new(),
             lru: VecDeque::new(),
             prefetch_worker,
@@ -1249,6 +1274,11 @@ impl ReaderSession {
     ///
     /// Panics if the reader's internal invariant is broken and the current
     /// section or page is missing from the cache.
+    /// Retain the immutable current display list while a mobile scroll window advances.
+    pub fn current_page_arc(&self) -> Arc<PageDisplayList> {
+        self.cache.get(&self.current_key()).expect("current segment remains cached").pages[self.current_page].clone()
+    }
+
     pub fn current_page(&self) -> &PageDisplayList {
         self.cache
             .get(&self.current_key())
@@ -2699,8 +2729,8 @@ impl ReaderSession {
         self.poll_prefetch()?;
         self.evict();
         let memory = self.cache_stats();
-        if memory.layout_bytes >= LAYOUT_CACHE_BUDGET * 4 / 5
-            || memory.raster_bytes >= RASTER_CACHE_BUDGET * 4 / 5
+        if memory.layout_bytes >= self.cache_policy.layout_bytes * 4 / 5
+            || memory.raster_bytes >= self.cache_policy.raster_bytes * 4 / 5
         {
             return Ok(());
         }
@@ -2709,7 +2739,7 @@ impl ReaderSession {
         // A double spread advances by two logical pages. Queue the whole next
         // spread plus the normal lookahead so a turn never leaves its second
         // page for synchronous layout on the UI thread.
-        let forward_distance = PREFETCH_DISTANCE + self.current_visible_pages().saturating_sub(1);
+        let forward_distance = self.cache_policy.prefetch_distance + self.current_visible_pages().saturating_sub(1);
         for distance in 1..=forward_distance {
             if let Some(segment_index) = self.current_segment.checked_add(distance)
                 && segment_index < segment_count
@@ -2729,7 +2759,7 @@ impl ReaderSession {
                 }
             }
         }
-        for distance in 1..=PREFETCH_DISTANCE {
+        for distance in 1..=self.cache_policy.prefetch_distance {
             if let Some(segment_index) = self.current_segment.checked_sub(distance) {
                 self.queue_prefetch(SegmentKey {
                     section_index: self.current_section,
@@ -3866,8 +3896,8 @@ impl ReaderSession {
         for _ in 0..self.lru.len() {
             let memory = self.cache_stats();
             if self.cache.len() <= self.cache_capacity
-                && memory.layout_bytes <= LAYOUT_CACHE_BUDGET
-                && memory.raster_bytes <= RASTER_CACHE_BUDGET
+                && memory.layout_bytes <= self.cache_policy.layout_bytes
+                && memory.raster_bytes <= self.cache_policy.raster_bytes
             {
                 break;
             }
@@ -3888,6 +3918,16 @@ impl ReaderSession {
             }
             self.cache.remove(&candidate);
         }
+    }
+
+    /// Applied by the host when device memory or foreground state changes.
+    pub fn set_cache_policy(&mut self, policy: ReaderCachePolicy) {
+        self.cache_policy = ReaderCachePolicy {
+            layout_bytes: policy.layout_bytes.max(1024 * 1024),
+            raster_bytes: policy.raster_bytes.max(1024 * 1024),
+            prefetch_distance: policy.prefetch_distance.min(PREFETCH_DISTANCE),
+        };
+        self.evict();
     }
 
     pub fn cache_stats(&self) -> ReaderCacheStats {
@@ -9312,6 +9352,21 @@ mod tests {
 
         assert_eq!(active.id, current_section.to_string());
         assert_eq!(resolve_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn mobile_cache_limits_survive_refresh_and_preserve_current_page() {
+        let source = CountingSource::new(&["reader cache ".repeat(600)]);
+        let mut reader = ReaderSession::open(source, viewport(360, 640), ReaderStyle::default()).unwrap();
+        reader.turn_page(PageDirection::Next).unwrap();
+        let locator = reader.current_locator();
+        reader.set_cache_policy(ReaderCachePolicy { layout_bytes: 1, raster_bytes: 1, prefetch_distance: 0 });
+        assert_eq!(reader.cache_policy.layout_bytes, 1024 * 1024);
+        assert!(!reader.current_visible_text_fragments().unwrap().is_empty());
+        let refreshed = reader.prepare_refresh_request(None).prepare().unwrap();
+        assert_eq!(refreshed.cache_policy.prefetch_distance, 0);
+        assert_eq!(refreshed.cache_policy.raster_bytes, 1024 * 1024);
+        assert_eq!(refreshed.current_locator().source, locator.source);
     }
 
     #[test]

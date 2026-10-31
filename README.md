@@ -121,6 +121,8 @@ cargo test --locked --workspace
 ```
 
 The core reading pipeline is `parser → Reading IR → layout → renderer`. Architecture notes live in `docs/`:
+
+- [Android preview: Rust core + Kotlin, build and migration status](docs/android.md)
 - [Native rendering ADR](docs/adr-0001-native-epub-renderer.md) & [Parley evaluation](docs/parley-engine-evaluation.md)
 - [AI semantic layout](docs/ai-semantic-layout.md), [batching](docs/ai-layout-batching.md), and [scheduling](docs/ai-layout-scheduling.md)
 - [Native PDF reflow](docs/pdf-native-reflow.md) & [Reading statistics](docs/reading-statistics.md)

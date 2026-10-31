@@ -2,7 +2,7 @@
 
 AI layout includes a separate, schema-constrained classification pass for inline
 literature references. Its Markdown prompt lives in
-`apps/desktop/src/plugins/semantic_layout/citations/prompt.md`. It reuses the
+`crates/app-core/src/plugins/semantic_layout/citations/prompt.md`. It reuses the
 existing AI layout model selection and chapter cache, with both prompt and schema
 included in the request fingerprint. No additional setting is required.
 

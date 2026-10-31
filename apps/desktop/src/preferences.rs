@@ -1,7 +1,6 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
 use rebook_layout::{
     LineBreakStrategy, ReaderTypesetting, ReaderTypography, SpreadMode, TypesettingMode,
@@ -20,63 +19,9 @@ pub(crate) const DEFAULT_INTERFACE_FONT_SIZE: f32 = 14.0;
 
 pub type PreferencesResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum AppLanguage {
-    #[default]
-    #[serde(rename = "system")]
-    System,
-    #[serde(rename = "zh-CN")]
-    SimplifiedChinese,
-    #[serde(rename = "en")]
-    English,
-}
-
-impl AppLanguage {
-    pub(crate) fn text(
-        self,
-        simplified_chinese: &'static str,
-        english: &'static str,
-    ) -> &'static str {
-        match self.resolved() {
-            Self::System => unreachable!("resolved language cannot be system"),
-            Self::SimplifiedChinese => simplified_chinese,
-            Self::English => english,
-        }
-    }
-
-    pub(crate) fn translation_target(self) -> &'static str {
-        match self.resolved() {
-            Self::System => unreachable!("resolved language cannot be system"),
-            Self::SimplifiedChinese => "简体中文",
-            Self::English => "English",
-        }
-    }
-
-    pub(crate) fn system_translation_target() -> &'static str {
-        SYSTEM_LANGUAGE.translation_target()
-    }
-
-    pub(crate) fn resolved(self) -> Self {
-        match self {
-            Self::System => *SYSTEM_LANGUAGE,
-            language => language,
-        }
-    }
-}
-
-static SYSTEM_LANGUAGE: LazyLock<AppLanguage> = LazyLock::new(|| {
-    sys_locale::get_locale()
-        .as_deref()
-        .map_or(AppLanguage::English, language_from_system_locale)
-});
-
-fn language_from_system_locale(locale: &str) -> AppLanguage {
-    if locale.trim().to_ascii_lowercase().starts_with("zh") {
-        AppLanguage::SimplifiedChinese
-    } else {
-        AppLanguage::English
-    }
-}
+pub(crate) use rebook_app_core::preferences::AppLanguage;
+#[cfg(test)]
+use rebook_app_core::preferences::language_from_system_locale;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum AppTheme {

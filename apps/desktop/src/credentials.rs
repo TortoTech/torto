@@ -54,3 +54,52 @@ mod tests {
         ));
     }
 }
+
+struct CoreSecrets;
+impl rebook_app_core::credentials::SecretStore for CoreSecrets {
+    fn read(&self, s: &str, a: &str) -> rebook_app_core::credentials::Result<String> {
+        entry(s, a)
+            .and_then(|e| e.get_password())
+            .map_err(core_error)
+    }
+    fn write(&self, s: &str, a: &str, v: &str) -> rebook_app_core::credentials::Result<()> {
+        entry(s, a)
+            .and_then(|e| e.set_password(v))
+            .map_err(core_error)
+    }
+    fn delete(&self, s: &str, a: &str) -> rebook_app_core::credentials::Result<()> {
+        entry(s, a)
+            .and_then(|e| e.delete_credential())
+            .map_err(core_error)
+    }
+}
+fn core_error(e: keyring::Error) -> rebook_app_core::credentials::Error {
+    match e {
+        keyring::Error::NoEntry => rebook_app_core::credentials::Error::NoEntry,
+        e => rebook_app_core::credentials::Error::Store(e.to_string()),
+    }
+}
+pub fn initialize_core() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(dirs) = crate::smoke::project_dirs() {
+        rebook_app_core::environment::initialize(rebook_app_core::environment::AppPaths {
+            data: dirs.data_local_dir().into(),
+            roaming: dirs.data_dir().into(),
+            config: dirs.config_dir().into(),
+            cache: dirs.cache_dir().into(),
+        })?;
+    }
+    let secrets: std::sync::Arc<dyn rebook_app_core::credentials::SecretStore> =
+        if crate::smoke::enabled() {
+            std::sync::Arc::new(rebook_app_core::credentials::MemoryStore::default())
+        } else {
+            std::sync::Arc::new(rebook_app_core::credentials::VaultStore::new(
+                rebook_app_core::environment::paths()
+                    .ok_or("Core environment unavailable")?
+                    .config
+                    .join("credentials.v1.vault"),
+                std::sync::Arc::new(CoreSecrets),
+            ))
+        };
+    rebook_app_core::credentials::install(secrets)?;
+    Ok(())
+}

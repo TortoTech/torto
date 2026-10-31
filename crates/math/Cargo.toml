@@ -15,5 +15,10 @@ ratex-parser.workspace = true
 ratex-svg.workspace = true
 ratex-types.workspace = true
 
+[target.'cfg(target_os = "android")'.dependencies]
+# RaTeX uses rust-embed for its KaTeX glyphs. Debug APKs must embed them too:
+# the build host's registry/font paths do not exist on the device.
+rust-embed = { version = "8.12.0", features = ["debug-embed"] }
+
 [lints]
 workspace = true

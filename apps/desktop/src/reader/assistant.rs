@@ -1,8 +1,11 @@
+use rebook_app_core::reading_text::{block_source_range, source_range_for_node};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rebook_publication::{Block, BookSource, RenditionLayout, SourceRange};
+use rebook_publication::{BookSource, RenditionLayout, SourceRange};
+#[cfg(test)]
+use rebook_publication::Block;
 use rebook_reader::ReaderVisibleTextFragment;
 use crate::async_task::TaskResult;
 
@@ -2850,34 +2853,6 @@ fn focus_structure_activation(
     candidates: &[(crate::plugins::ParagraphStructureKey, bool)],
 ) -> Option<bool> {
     (!candidates.is_empty()).then(|| !candidates.iter().all(|(_, active)| *active))
-}
-
-fn source_range_for_node(
-    source: &dyn BookSource,
-    section_index: usize,
-    node: &str,
-) -> Option<SourceRange> {
-    source
-        .parse_section(section_index)
-        .ok()?
-        .blocks
-        .iter()
-        .find_map(|block| {
-            let range = block_source_range(block)?;
-            (range.start.node == node).then(|| range.clone())
-        })
-}
-
-fn block_source_range(block: &Block) -> Option<&SourceRange> {
-    match block {
-        Block::Text(block) => block.source.as_ref(),
-        Block::Quote(block) => block.source.as_ref(),
-        Block::Table(block) => block.source.as_ref(),
-        Block::Image(block) => block.source.as_ref(),
-        Block::Figure(block) => block.source.as_ref(),
-        Block::Note(block) => block.source.as_ref(),
-        Block::Separator(_) | Block::LineBreak | Block::PageBreak => None,
-    }
 }
 
 type VisibleChatParagraph = (usize, String, usize, String);

@@ -246,6 +246,21 @@ mod tests {
     }
 
     #[test]
+    fn fraction_glyphs_are_embedded_without_system_fonts() {
+        let rendered = render_math(r"\frac{1}{2}", 72.0, "#262624", true).unwrap();
+        assert!(
+            !rendered.svg_fragment.contains("<text"),
+            "{}",
+            rendered.svg_fragment
+        );
+        assert!(
+            rendered.svg_fragment.matches("<path").count() >= 2,
+            "{}",
+            rendered.svg_fragment
+        );
+    }
+
+    #[test]
     fn common_paddleocr_formulas_render_through_ratex() {
         let samples = [
             r"^{2}",

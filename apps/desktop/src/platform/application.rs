@@ -582,6 +582,7 @@ impl ApplicationHandler<UserEvent> for Application {
             }
             UserEvent::ShelfSyncProgress(message) => self.app.update_shelf_sync_progress(message),
             UserEvent::ShelfSync(message) => self.app.complete_shelf_sync(message),
+            UserEvent::SettingsCredentials(message) => self.app.complete_settings_credentials(message),
             UserEvent::SettingsProviderModels(message) => {
                 self.app.complete_settings_provider_models(message);
             }

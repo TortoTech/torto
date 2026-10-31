@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/app-core",
+    "crates/android-bridge",
     "apps/desktop",
     "apps/inspect",
     "crates/formats",

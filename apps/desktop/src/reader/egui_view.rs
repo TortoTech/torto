@@ -1,3 +1,4 @@
+use crate::plugins::chat_media::ChatImagePreview;
 use crate::ui::image_preview::update_preview_zoom;
 use rebook_publication::BookSource as _;
 #[cfg(test)]

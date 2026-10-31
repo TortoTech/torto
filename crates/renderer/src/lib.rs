@@ -26,6 +26,9 @@ use rebook_publication::{Rgba, SourceAnchor, SourceRange, TextBaseline};
 // alter Parley's advances or chosen line breaks.
 const SYNTHETIC_EMBOLDEN_EM: f64 = 0.025;
 
+/// Inactive focus content is blended toward its paper on every platform.
+pub const FOCUS_INACTIVE_OPACITY: f64 = 0.45;
+
 /// Pointer hit inside one retained text placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageTextHit {
@@ -1229,6 +1232,15 @@ impl PageDisplayList {
         for footnote in &self.footnote_regions {
             paint_footnote_region(scene, footnote, color, transform);
         }
+    }
+
+    /// Paint semantic reference icons in the same pixel scale as a native page.
+    pub fn paint_footnote_icons_scaled(&self, scene: &mut impl PaintScene, color: Color, scale: f32) {
+        let transform = Affine::scale(f64::from(scale.max(0.1)));
+        self.paint_footnote_icons_transformed(scene,color,transform);
+    }
+    pub fn paint_footnote_icons_transformed(&self,scene:&mut impl PaintScene,color:Color,transform:Affine) {
+        for footnote in &self.footnote_regions { paint_footnote_region(scene, footnote, color, transform); }
     }
 
     /// Returns the source-backed paragraph owning a semantic footnote icon.

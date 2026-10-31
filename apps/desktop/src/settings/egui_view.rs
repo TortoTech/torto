@@ -222,16 +222,43 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             let content_width = (ui.available_width() - SETTINGS_SCROLLBAR_GUTTER).max(1.0);
             ui.set_width(content_width);
             ui.add_space(12.0);
-            ui.vertical(|ui| match state.settings_tab {
-                SettingsTab::System => system_settings(ui, state),
-                SettingsTab::Typography => typography_settings(ui, state),
-                SettingsTab::Shortcuts => shortcut_settings(ui, state),
-                SettingsTab::Ai => ai_provider_settings(ui, state),
-                SettingsTab::AiChat => ai_chat_settings(ui, state),
-                SettingsTab::Ocr => ocr_settings(ui, state),
-                SettingsTab::Translation => translation_settings(ui, state),
-                SettingsTab::Cloud => cloud_settings(ui, state),
-                SettingsTab::About => about_settings(ui, state),
+            if let Some(error) = &state.credential_error {
+                ui.colored_label(palette().error, error);
+                if ui
+                    .add_enabled(
+                        !state.credentials_task.is_pending(),
+                        egui::Button::new(
+                            state
+                                .draft_language
+                                .text("重试解锁安全存储", "Retry unlocking secure storage"),
+                        ),
+                    )
+                    .clicked()
+                {
+                    state
+                        .credentials_task
+                        .begin(state.applied.sync_settings.clone());
+                }
+                if ui
+                    .button(state.draft_language.text("放弃更改", "Discard changes"))
+                    .clicked()
+                {
+                    state.close_overlay();
+                }
+                ui.add_space(12.0);
+            }
+            ui.add_enabled_ui(!state.credentials_task.is_pending(), |ui| {
+                ui.vertical(|ui| match state.settings_tab {
+                    SettingsTab::System => system_settings(ui, state),
+                    SettingsTab::Typography => typography_settings(ui, state),
+                    SettingsTab::Shortcuts => shortcut_settings(ui, state),
+                    SettingsTab::Ai => ai_provider_settings(ui, state),
+                    SettingsTab::AiChat => ai_chat_settings(ui, state),
+                    SettingsTab::Ocr => ocr_settings(ui, state),
+                    SettingsTab::Translation => translation_settings(ui, state),
+                    SettingsTab::Cloud => cloud_settings(ui, state),
+                    SettingsTab::About => about_settings(ui, state),
+                });
             });
             if let Some(error) = &state.error {
                 ui.add_space(8.0);
@@ -1362,10 +1389,10 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         &mut settings.chat_model,
                         language,
                     );
-                    settings_help_icon(ui, language.text(
-                        "使用能识图的模型",
-                        "Use a vision-capable model",
-                    ));
+                    settings_help_icon(
+                        ui,
+                        language.text("使用能识图的模型", "Use a vision-capable model"),
+                    );
                 });
                 ui.end_row();
 
@@ -1646,7 +1673,6 @@ fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     );
                 });
                 ui.end_row();
-
             });
     });
 }
@@ -1882,7 +1908,10 @@ fn default_font_selector(
         ),
         ReaderDefaultFont::Other => (language.text("其他", "Other"), &typography.other_font),
     };
-    let selected_text = format!("{category} · {}", crate::fonts::family_label(ui.ctx(), family));
+    let selected_text = format!(
+        "{category} · {}",
+        crate::fonts::family_label(ui.ctx(), family)
+    );
     let arrow_id = egui::IdSalt::new("settings-default-font-arrow");
     let arrow_size = 14.0;
     let button = egui::Button::new((
@@ -1973,9 +2002,12 @@ fn default_font_submenu(
                     let row_width = ui.available_width();
                     if ui
                         .add(
-                            egui::Button::selectable(selected, crate::fonts::family_label(ui.ctx(), family))
-                                .min_size(Vec2::new(row_width, 0.0))
-                                .truncate(),
+                            egui::Button::selectable(
+                                selected,
+                                crate::fonts::family_label(ui.ctx(), family),
+                            )
+                            .min_size(Vec2::new(row_width, 0.0))
+                            .truncate(),
                         )
                         .on_hover_text(family)
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -2012,7 +2044,10 @@ fn inherited_western_font_selector(
                 ReaderDefaultFont::SansSerif => language.text("无衬线", "Sans serif"),
                 ReaderDefaultFont::Other => language.text("其他", "Other"),
             };
-            format!("{category} · {}", crate::fonts::family_label(ui.ctx(), &choice.family))
+            format!(
+                "{category} · {}",
+                crate::fonts::family_label(ui.ctx(), &choice.family)
+            )
         },
     );
     let arrow_id = egui::IdSalt::new("settings-cjk-default-font-arrow");
@@ -2114,9 +2149,12 @@ fn inherited_western_font_submenu(
                     let row_width = ui.available_width();
                     if ui
                         .add(
-                            egui::Button::selectable(selected.as_ref() == Some(&value), crate::fonts::family_label(ui.ctx(), family))
-                                .min_size(Vec2::new(row_width, 0.0))
-                                .truncate(),
+                            egui::Button::selectable(
+                                selected.as_ref() == Some(&value),
+                                crate::fonts::family_label(ui.ctx(), family),
+                            )
+                            .min_size(Vec2::new(row_width, 0.0))
+                            .truncate(),
                         )
                         .on_hover_text(family)
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -2141,7 +2179,10 @@ fn inherited_cjk_font_selector(
     egui::ComboBox::from_id_salt("settings-latin-cjk-font")
         .width(SETTINGS_FONT_SELECT_WIDTH)
         .truncate()
-        .selected_text(selected.as_ref().map_or_else(|| inherited.into(), |family| crate::fonts::family_label(ui.ctx(), family)))
+        .selected_text(selected.as_ref().map_or_else(
+            || inherited.into(),
+            |family| crate::fonts::family_label(ui.ctx(), family),
+        ))
         .show_ui(ui, |ui| {
             if ui.selectable_label(selected.is_none(), inherited).clicked() {
                 *selected = None;
@@ -2150,7 +2191,10 @@ fn inherited_cjk_font_selector(
             ui.separator();
             for family in font_families {
                 if ui
-                    .selectable_label(selected.as_ref() == Some(family), crate::fonts::family_label(ui.ctx(), family))
+                    .selectable_label(
+                        selected.as_ref() == Some(family),
+                        crate::fonts::family_label(ui.ctx(), family),
+                    )
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
@@ -2173,7 +2217,8 @@ fn font_family_selector(
     let was_open = ui
         .ctx()
         .data(|data| data.get_temp::<bool>(popup_state_id).unwrap_or(false));
-    let selected_text = crate::fonts::family_label(ui.ctx(), &font_family_label(selected, language));
+    let selected_text =
+        crate::fonts::family_label(ui.ctx(), &font_family_label(selected, language));
     let response = egui::ComboBox::from_id_salt(id_salt)
         .width(SETTINGS_FONT_SELECT_WIDTH)
         .truncate()
@@ -2186,7 +2231,9 @@ fn font_family_selector(
                     family.clone(),
                     crate::fonts::family_label(ui.ctx(), &font_family_label(family, language)),
                 );
-                if response.clicked() { crate::fonts::request_family(ui.ctx(), family); }
+                if response.clicked() {
+                    crate::fonts::request_family(ui.ctx(), family);
+                }
                 if !was_open && is_selected {
                     response.scroll_to_me(Some(egui::Align::Center));
                 }

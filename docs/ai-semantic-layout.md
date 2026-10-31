@@ -35,7 +35,7 @@ dialogue cannot become new AI quotes. Invalid credits reject the whole new group
 there is no body-only repair. Captions and other text roles share the same request.
 
 The system prompt is maintained as sectioned Markdown in
-`apps/desktop/src/plugins/semantic_layout/prompt.md`: task, input and scope,
+`crates/app-core/src/plugins/semantic_layout/prompt.md`: task, input and scope,
 shared constraints and optional role-specific rules. Historical examples remain in test fixtures. Retry feedback
 also uses Markdown headings. Book input remains a separate JSON data message. Requests use
 `response_format.type = json_schema` and `strict = true`, with a unified schema for all text roles (required fields, non-null new-quote attribution, nullable alignment and no

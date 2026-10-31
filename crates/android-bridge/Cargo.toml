@@ -1,0 +1,53 @@
+[package]
+name = "torto-android-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "torto_android"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[[bin]]
+name = "torto-bindgen"
+path = "src/bindgen.rs"
+required-features = ["bindgen"]
+
+[dependencies]
+uniffi = { version = "=0.32.2", features = ["tokio"] }
+rebook-app-core = { path = "../app-core" }
+rebook-math = { path = "../math" }
+resvg.workspace = true
+rebook-formats = { path = "../formats" }
+rebook-publication = { path = "../publication" }
+rebook-reader = { path = "../reader" }
+rebook-layout = { path = "../layout" }
+rebook-renderer = { path = "../renderer" }
+image.workspace = true
+blake3.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+peniko.workspace = true
+kurbo.workspace = true
+tracing.workspace = true
+chrono = "0.4"
+anyrender.workspace = true
+anyrender_vello_cpu = { version = "0.18.0", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21.1"
+jni-platform = { package = "jni", version = "0.22.4", default-features = false }
+rustls-platform-verifier = { version = "0.7.1", default-features = false }
+ndk-sys = { version = "0.6.0", features = ["bitmap"] }
+
+[dev-dependencies]
+zip.workspace = true
+rebook-app-core = { path = "../app-core", features = ["test-support"] }
+uuid.workspace = true
