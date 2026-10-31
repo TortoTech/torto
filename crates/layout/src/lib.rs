@@ -5389,7 +5389,9 @@ fn prepare_inline_content(
                         metrics
                     };
                     inline_images.push(PreparedInlineImage {
-                        formula_presentation: run.original.as_ref().map(|_| FormulaPresentation {
+                        // Native LaTeX formulas need the same preview hit target
+                        // as formulas recognized from text or images.
+                        formula_presentation: Some(FormulaPresentation {
                             original: image.0.clone(),
                             latex: run.latex.clone(),
                         }),

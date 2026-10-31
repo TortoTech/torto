@@ -438,6 +438,10 @@ impl DesktopApp {
         self.shelf.complete_import(message);
     }
 
+    pub(crate) fn complete_settings_credentials(&mut self, message: crate::settings::CredentialsMessage) {
+        self.settings.complete_credentials(message);
+    }
+
     pub(crate) fn complete_settings_provider_models(
         &mut self,
         message: crate::settings::ProviderModelsMessage,

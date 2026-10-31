@@ -34,7 +34,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use app::DesktopApp;
-use library::LocalLibrary;
 
 #[cfg(all(target_os = "windows", feature = "memory-profiling"))]
 #[global_allocator]
@@ -64,10 +63,12 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(all(target_os = "windows", feature = "memory-profiling"))]
     if let Some(path) = env::var_os("TORTO_MEMORY_PROBE_BOOK") {
+        credentials::initialize_core()?;
         return reader::probe_memory(PathBuf::from(path).as_path())
             .map_err(|error| io::Error::other(error.to_string()).into());
     }
     let launch = parse_arguments()?;
+    credentials::initialize_core()?;
     diagnostics::install_panic_hook();
     rebook_formats::set_pdf_timing_sink(|book, stage, page, hit, elapsed_ms| {
         let thread = std::thread::current();
@@ -86,7 +87,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let reader_fonts = fonts::reader_fonts();
 
     let library =
-        LocalLibrary::load_default().map_err(|error| io::Error::other(error.to_string()))?;
+        crate::library::load_default().map_err(|error| io::Error::other(error.to_string()))?;
     let mut state = DesktopApp::new(library, Arc::clone(&reader_fonts));
     if let LaunchMode::Open(path) = launch {
         state.open_book(&path);

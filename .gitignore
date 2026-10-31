@@ -6,3 +6,15 @@
 *.profraw
 .DS_Store
 watchexec-preview*.log
+
+# Android generated files and local signing material
+/apps/android/.gradle/
+/apps/android/.kotlin/
+/apps/android/**/build/
+/apps/android/local.properties
+/apps/android/key.properties
+*.jks
+*.keystore
+
+# Synthetic Android device-test fixture, not a user book.
+!/apps/android/app/src/androidTest/assets/reader-interactions.epub

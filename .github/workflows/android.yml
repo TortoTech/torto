@@ -1,0 +1,60 @@
+name: Android
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install host font dependencies for UniFFI generator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig1-dev
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - name: Install Android toolchain
+        run: |
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+          rustup target add aarch64-linux-android x86_64-linux-android
+          cargo install cargo-ndk --version 4.1.2 --locked
+      - name: Build per-ABI debug APKs and device tests
+        working-directory: apps/android
+        run: ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest -PrustAbis=arm64-v8a,x86_64
+      - name: Build unsigned release APK and native symbols
+        working-directory: apps/android
+        run: ./gradlew :app:assembleRelease -PrustAbis=arm64-v8a
+      - name: Verify per-ABI APKs and 16 KB native alignment
+        run: |
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          for variant in ('debug', 'release'):
+              folder = Path('apps/android/app/build/outputs/apk') / variant
+              metadata = json.loads((folder / 'output-metadata.json').read_text())
+              for item in metadata['elements']:
+                  abi = next((f['value'] for f in item['filters'] if f['filterType'] == 'ABI'), 'arm64-v8a')
+                  subprocess.run(['python3', 'scripts/check-android-alignment.py', str(folder / item['outputFile']), '--abi', abi], check=True)
+          PY
+      - uses: actions/upload-artifact@v6
+        with:
+          name: torto-android
+          path: |
+            apps/android/app/build/outputs/apk/
+            apps/android/app/build/generated/rust/release/symbols/
+            apps/android/app/build/outputs/mapping/release/

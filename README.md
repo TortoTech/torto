@@ -18,6 +18,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue" alt="AGPL-3.0-only License"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-5b6ee1" alt="Windows and macOS">
   <img src="https://img.shields.io/badge/UI-egui-7c3aed" alt="Built with egui">
+  <a href="https://linux.do"><img src="https://img.shields.io/badge/LINUX-DO-FFB003.svg" alt="LINUX DO"></a>
 </p>
 
 <p align="center">
@@ -120,6 +121,8 @@ cargo test --locked --workspace
 ```
 
 The core reading pipeline is `parser → Reading IR → layout → renderer`. Architecture notes live in `docs/`:
+
+- [Android preview: Rust core + Kotlin, build and migration status](docs/android.md)
 - [Native rendering ADR](docs/adr-0001-native-epub-renderer.md) & [Parley evaluation](docs/parley-engine-evaluation.md)
 - [AI semantic layout](docs/ai-semantic-layout.md), [batching](docs/ai-layout-batching.md), and [scheduling](docs/ai-layout-scheduling.md)
 - [Native PDF reflow](docs/pdf-native-reflow.md) & [Reading statistics](docs/reading-statistics.md)

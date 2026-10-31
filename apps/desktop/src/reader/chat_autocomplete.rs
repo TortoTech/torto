@@ -1,6 +1,5 @@
-use percent_encoding::percent_decode_str;
 
-use crate::plugins::{CHAT_CITATION_PREFIX, chat_citation_marker_from_link};
+use crate::plugins::{chat_citation_marker_from_link};
 
 const MAX_REFERENCE_SUGGESTIONS: usize = 8;
 
@@ -28,27 +27,9 @@ pub(super) struct ChatReferenceToken {
     pub(super) query: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ChatCitation {
-    pub(super) section_index: usize,
-    pub(super) node: Option<String>,
-}
-
-pub(super) fn parse_chat_citation(locator: &str) -> Option<ChatCitation> {
-    let remainder = locator.strip_prefix(CHAT_CITATION_PREFIX)?;
-    let (section, node) = remainder
-        .split_once('/')
-        .map_or((remainder, None), |(section, node)| (section, Some(node)));
-    let section_index = section.parse().ok()?;
-    let node = node
-        .filter(|node| !node.is_empty())
-        .and_then(|node| percent_decode_str(node).decode_utf8().ok())
-        .map(std::borrow::Cow::into_owned);
-    Some(ChatCitation {
-        section_index,
-        node,
-    })
-}
+pub(super) use rebook_app_core::chat_markdown::parse_chat_citation;
+#[cfg(test)]
+use rebook_app_core::chat_markdown::ChatCitation;
 
 pub(super) fn chat_reference_token(
     input: &str,

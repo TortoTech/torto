@@ -8,7 +8,7 @@ use crate::reader::{
     focus_unit_contains_source_range,
 };
 
-const INACTIVE_OPACITY: f64 = 0.45;
+use rebook_renderer::FOCUS_INACTIVE_OPACITY;
 
 fn clear_content_rect(unit: &FocusUnit) -> egui::Rect {
     let mut rect = unit.rect;
@@ -118,7 +118,7 @@ impl DesktopReader {
         // Mixing the already-composited page with its own paper is equivalent
         // to 45% content opacity, including images, formulas and annotations.
         // Keep this single interaction layer independent of retained page tiles.
-        let opacity = ((1.0 - INACTIVE_OPACITY) * 255.0).round() as u8;
+        let opacity = ((1.0 - FOCUS_INACTIVE_OPACITY) * 255.0).round() as u8;
         let paper_color = Color::from_rgba8(paper.red, paper.green, paper.blue, opacity);
         if let Some((rect, color)) = self.focus_list_backdrop() {
             // Fade inactive ink toward its actual backdrop. Mixing it with

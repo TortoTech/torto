@@ -1,0 +1,4 @@
+[bindings.kotlin]
+package_name = "org.tortotech.torto.core"
+cdylib_name = "torto_android"
+android = true

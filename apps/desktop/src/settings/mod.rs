@@ -15,12 +15,17 @@ use crate::sync::SyncSettings;
 use crate::{async_task::TaskSlot, platform::UserEvent};
 
 mod egui_view;
-mod provider_models;
 mod font_downloads;
+mod provider_models;
 
 pub(crate) use egui_view::{choice_button, settings_overlay};
 pub(crate) use provider_models::ProviderModelsMessage;
 use provider_models::{ProviderModelsRequest, fetch_provider_models};
+
+pub(crate) struct CredentialsMessage {
+    pub id: u64,
+    pub result: Result<(PluginSettings, String), String>,
+}
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct AppliedSettings {
@@ -54,6 +59,8 @@ pub(crate) struct SettingsFeature {
     pub(crate) font_apply_requested: bool,
     pub(crate) font_apply_available: bool,
     settings_tab: SettingsTab,
+    credential_error: Option<String>,
+    credentials_task: TaskSlot<SyncSettings>,
     draft_spread: SpreadMode,
     draft_reading_mode: ReadingMode,
     draft_focus_style: FocusStyle,
@@ -92,16 +99,17 @@ impl SettingsFeature {
             tracing::warn!(%error, "failed to load reader preferences; using defaults");
             ReaderPreferences::default()
         });
+        let mut credential_error = None;
         let plugin_settings = PluginSettings::load_default().unwrap_or_else(|error| {
-            tracing::warn!(%error, "failed to load plugin settings; using defaults");
-            PluginSettings::default()
+            credential_error = Some(format!("无法读取安全凭据：{error}"));
+            PluginSettings::load_config().unwrap_or_default()
         });
         let sync_settings = SyncSettings::load_default().unwrap_or_else(|error| {
             tracing::warn!(%error, "failed to load WebDAV settings; using defaults");
             SyncSettings::new_device()
         });
         let sync_password = sync_settings.load_password().unwrap_or_else(|error| {
-            tracing::warn!(%error, "failed to load WebDAV credential");
+            credential_error = Some(format!("无法读取安全凭据：{error}"));
             String::new()
         });
         let mut available_reader_font_families =
@@ -134,11 +142,13 @@ impl SettingsFeature {
             sync_settings,
             sync_password,
         };
-        Self::from_applied(
+        let mut feature = Self::from_applied(
             applied,
             available_reader_font_families,
             available_interface_font_families,
-        )
+        );
+        feature.credential_error = credential_error;
+        feature
     }
 
     fn from_applied(
@@ -152,6 +162,8 @@ impl SettingsFeature {
             font_apply_requested: false,
             font_apply_available: false,
             settings_tab: SettingsTab::System,
+            credential_error: None,
+            credentials_task: TaskSlot::default(),
             draft_spread: applied.spread,
             draft_reading_mode: applied.reading_mode,
             draft_focus_style: applied.focus_style,
@@ -222,6 +234,21 @@ impl SettingsFeature {
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     ) {
+        if let Some(request) = self.credentials_task.take_pending() {
+            let proxy = proxy.clone();
+            runtime.spawn_blocking(move || {
+                let result = (|| {
+                    rebook_app_core::credentials::retry_unlock().map_err(|e| e.to_string())?;
+                    let plugins = PluginSettings::load_default().map_err(|e| e.to_string())?;
+                    let password = request.payload.load_password().map_err(|e| e.to_string())?;
+                    Ok((plugins, password))
+                })();
+                let _ = proxy.send_event(UserEvent::SettingsCredentials(CredentialsMessage {
+                    id: request.id,
+                    result,
+                }));
+            });
+        }
         let Some(request) = self.provider_models_task.take_pending() else {
             return;
         };
@@ -233,6 +260,23 @@ impl SettingsFeature {
                 result,
             }));
         });
+    }
+
+    pub(crate) fn complete_credentials(&mut self, message: CredentialsMessage) {
+        if self.credentials_task.complete(message.id).is_none() {
+            return;
+        }
+        match message.result {
+            Ok((plugins, password)) => {
+                self.applied.plugin_settings = plugins.clone();
+                self.applied.sync_password = password.clone();
+                self.draft_plugin_settings = plugins;
+                self.draft_sync_password = password;
+                self.credential_error = None;
+                self.revision = self.revision.wrapping_add(1);
+            }
+            Err(error) => self.credential_error = Some(error),
+        }
     }
 
     pub(crate) fn complete_provider_models(&mut self, message: ProviderModelsMessage) {
@@ -399,6 +443,18 @@ impl SettingsFeature {
     }
 
     fn apply_settings(&mut self) {
+        if self.credential_error.is_some() || self.credentials_task.is_pending() {
+            // Never interpret unavailable keys as an instruction to erase them.
+            self.error = Some(
+                self.draft_language
+                    .text(
+                        "请先解锁安全存储，再保存设置",
+                        "Unlock secure storage before saving settings",
+                    )
+                    .into(),
+            );
+            return;
+        }
         let mut plugin_settings = self.draft_plugin_settings.clone();
         plugin_settings.normalize();
         let mut typography = self.draft_typography.clone();
@@ -680,11 +736,16 @@ mod tests {
     #[test]
     fn table_chart_shortcut_defaults_migrates_and_detects_conflicts() {
         let mut shortcuts = ShortcutPreferences::default();
-        assert_eq!(ShortcutAction::FocusTableChart.binding(&shortcuts),
-            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num4));
+        assert_eq!(
+            ShortcutAction::FocusTableChart.binding(&shortcuts),
+            egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Num4)
+        );
         let mut legacy = serde_json::to_value(&shortcuts).unwrap();
         legacy.as_object_mut().unwrap().remove("focus_table_chart");
-        assert_eq!(serde_json::from_value::<ShortcutPreferences>(legacy).unwrap(), shortcuts);
+        assert_eq!(
+            serde_json::from_value::<ShortcutPreferences>(legacy).unwrap(),
+            shortcuts
+        );
         let custom = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Num4);
         ShortcutAction::FocusTableChart.set_binding(&mut shortcuts, custom);
         assert_eq!(ShortcutAction::FocusTableChart.binding(&shortcuts), custom);
@@ -697,12 +758,18 @@ mod tests {
     #[test]
     fn feedback_shortcut_can_be_customized_and_checked_for_conflicts() {
         let mut shortcuts = ShortcutPreferences::default();
-        assert_eq!(ShortcutAction::OpenFeedback.binding(&shortcuts), egui::KeyboardShortcut::new(
-            egui::Modifiers::CTRL | egui::Modifiers::ALT, egui::Key::P));
+        assert_eq!(
+            ShortcutAction::OpenFeedback.binding(&shortcuts),
+            egui::KeyboardShortcut::new(egui::Modifiers::CTRL | egui::Modifiers::ALT, egui::Key::P)
+        );
         assert!(!shortcuts.has_conflicts());
-        let custom = egui::KeyboardShortcut::new(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::P);
+        let custom = egui::KeyboardShortcut::new(
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            egui::Key::P,
+        );
         ShortcutAction::OpenFeedback.set_binding(&mut shortcuts, custom);
-        let restored: ShortcutPreferences = serde_json::from_value(serde_json::to_value(&shortcuts).unwrap()).unwrap();
+        let restored: ShortcutPreferences =
+            serde_json::from_value(serde_json::to_value(&shortcuts).unwrap()).unwrap();
         assert_eq!(ShortcutAction::OpenFeedback.binding(&restored), custom);
         let conflicting = shortcuts.open_settings;
         ShortcutAction::OpenFeedback.set_binding(&mut shortcuts, conflicting);
@@ -751,6 +818,31 @@ mod tests {
             state.draft_settings().focus_style,
             FocusStyle::SurroundingDim
         );
+
+        // A denied unlock must not persist empty draft keys or alter the
+        // applied model configuration, even if another setting was edited.
+        state.credential_error = Some("denied".into());
+        state.apply_settings();
+        assert_eq!(state.revision, 0);
+        assert!(state.applied == applied);
+        assert!(state.error.is_some());
+
+        let id = state
+            .credentials_task
+            .begin(state.applied.sync_settings.clone());
+        state.credentials_task.take_pending().unwrap();
+        state.complete_credentials(CredentialsMessage {
+            id: id + 1,
+            result: Ok((PluginSettings::default(), "stale".into())),
+        });
+        assert!(state.credential_error.is_some());
+        assert!(state.applied.sync_password.is_empty());
+        state.complete_credentials(CredentialsMessage {
+            id,
+            result: Ok((PluginSettings::default(), "unlocked".into())),
+        });
+        assert!(state.credential_error.is_none());
+        assert_eq!(state.applied.sync_password, "unlocked");
 
         let mut changed = applied.clone();
         changed.theme = match applied.theme {

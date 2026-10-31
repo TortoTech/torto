@@ -1,0 +1,2659 @@
+//! Optional source-backed semantics. Recognition uses original text; composition
+//! runs after translation, so translation's block/segment keys never change.
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, RwLock};
+use std::time::Duration;
+
+use rebook_publication::{
+    Block, Book, BookSource, CaptionPosition, FigureBlock, Inline, PublicationError,
+    PublicationUrl, QuoteBlock, RasterResource, Resource, Section, SourceRange, TextBlock,
+    TextBlockKind,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use super::{PluginSettings, ReasoningEffort, ai, llm_json, text_block_text};
+mod visible;
+pub use visible::{
+    block_ranges, empty_recognition, merge_recognition, needs_recognition, recognition_groups,
+};
+
+mod batching;
+mod citations;
+pub mod enhancements;
+mod formulas;
+mod headings;
+mod image_tables;
+mod log;
+mod normalize;
+mod text_formulas;
+mod wire;
+pub use batching::{fixed_batches, semantic_units};
+pub use log::local_translation_event;
+pub use log::translation_event;
+pub use log::{event as diagnostic_event, with_job};
+mod code_blocks;
+mod quote_sources;
+
+// This is the on-disk data format, not an application release or prompt revision.
+const CACHE_FORMAT_VERSION: u32 = 1;
+const OVERLAP: usize = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SemanticLayoutSettings {
+    pub enabled: bool,
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: ReasoningEffort,
+}
+
+impl Default for SemanticLayoutSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: String::new(),
+            model: String::new(),
+            reasoning_effort: ReasoningEffort::None,
+        }
+    }
+}
+
+// Internal request roles, not user settings. All recognizers are always enabled.
+#[derive(Clone)]
+struct RecognitionRoles {
+    quotes: bool,
+    captions: bool,
+    headings: bool,
+}
+impl Default for RecognitionRoles {
+    fn default() -> Self {
+        Self {
+            quotes: true,
+            captions: true,
+            headings: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum Proposal {
+    CodeOrQuote {
+        body: Vec<usize>,
+        presentation: code_blocks::Presentation,
+        language: Option<String>,
+        #[serde(default)]
+        captions: Vec<usize>,
+        #[serde(default)]
+        sources: Vec<usize>,
+        #[serde(default)]
+        body_index: Option<usize>,
+    },
+    QuoteBefore {
+        body: Vec<usize>,
+        attribution: usize,
+        alignment: Option<QuoteAlignment>,
+    },
+    QuoteInline {
+        body: Vec<usize>,
+        credit: String,
+        alignment: Option<QuoteAlignment>,
+    },
+    SectionHeading {
+        block: usize,
+    },
+    Quote {
+        body: Vec<usize>,
+        attribution: Option<usize>,
+        #[serde(default)]
+        alignment: Option<QuoteAlignment>,
+    },
+    Figure {
+        images: Vec<usize>,
+        captions: Vec<usize>,
+    },
+    QuoteAttribution {
+        quote: usize,
+        attribution: Option<usize>,
+        body_index: Option<usize>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Response {
+    groups: Vec<Proposal>,
+    #[serde(default)]
+    citations: Vec<String>,
+    #[serde(default)]
+    formulas: Vec<text_formulas::Proposal>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+enum Annotation {
+    TableChart {
+        source: SourceRange,
+        members: Vec<SourceRange>,
+        svg: String,
+        language: String,
+    },
+    FormulaNotes {
+        source: SourceRange,
+        latex: String,
+        notes: Vec<enhancements::SymbolNote>,
+        language: String,
+    },
+    CodeOrQuote {
+        body: Vec<SourceRange>,
+        presentation: code_blocks::Presentation,
+        language: Option<String>,
+        captions: Vec<SourceRange>,
+        sources: Vec<SourceRange>,
+        credit: Option<SourceRange>,
+    },
+    ImageTable {
+        href: PublicationUrl,
+        table: rebook_publication::TableBlock,
+    },
+    ImageText {
+        href: PublicationUrl,
+        text: rebook_publication::ImageText,
+    },
+    TextFormulas {
+        source: SourceRange,
+        spans: Vec<text_formulas::Span>,
+    },
+    UnreadableFormula {
+        href: PublicationUrl,
+    },
+    ImageFormula {
+        href: PublicationUrl,
+        formula: rebook_publication::ImageFormula,
+    },
+    InlineCitations {
+        source: SourceRange,
+        spans: Vec<citations::Citation>,
+    },
+    QuoteBefore {
+        body: Vec<SourceRange>,
+        attribution: SourceRange,
+        alignment: Option<QuoteAlignment>,
+    },
+    QuoteInline {
+        body: Vec<SourceRange>,
+        credit: String,
+        alignment: Option<QuoteAlignment>,
+    },
+    SectionHeading {
+        source: SourceRange,
+    },
+    Quote {
+        body: Vec<SourceRange>,
+        attribution: Option<SourceRange>,
+        #[serde(default)]
+        alignment: Option<QuoteAlignment>,
+    },
+    Figure {
+        images: Vec<SourceRange>,
+        captions: Vec<SourceRange>,
+        before: bool,
+    },
+    QuoteAttribution {
+        quote: SourceRange,
+        attribution: SourceRange,
+        inside: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QuoteAlignment {
+    Start,
+    Center,
+    End,
+    Justify,
+}
+
+impl QuoteAlignment {
+    fn text_alignment(self) -> rebook_publication::TextAlignment {
+        use rebook_publication::TextAlignment;
+        match self {
+            Self::Start => TextAlignment::Start,
+            Self::Center => TextAlignment::Center,
+            Self::End => TextAlignment::End,
+            Self::Justify => TextAlignment::Justify,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Recognition {
+    #[serde(default)]
+    image_text_revision: u32,
+    #[serde(default)]
+    formulas_checked: bool,
+    fingerprint: String,
+    annotations: Vec<Annotation>,
+    #[serde(default)]
+    skipped_groups: usize,
+}
+
+impl Recognition {
+    pub fn has_annotations(&self) -> bool {
+        !self.annotations.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct WindowResult {
+    groups: Vec<Proposal>,
+    citations: Vec<String>,
+    formulas: Vec<text_formulas::Proposal>,
+    skipped_groups: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WindowCache {
+    key: String,
+    groups: Vec<Proposal>,
+    citations: Vec<String>,
+    formulas: Vec<text_formulas::Proposal>,
+}
+
+pub struct SemanticLayoutSource {
+    chart_fonts: Arc<[peniko::Blob<u8>]>,
+    formula_note_views: RwLock<HashSet<String>>,
+    chart_views: RwLock<HashSet<String>>,
+    unified_citations: std::sync::atomic::AtomicBool,
+    heuristic_cache: RwLock<HashMap<usize, (String, Vec<Annotation>)>>,
+    fingerprints: RwLock<HashMap<usize, (u64, String)>>,
+    recognition_misses: RwLock<HashMap<usize, RecognitionMiss>>,
+    transaction: RwLock<()>,
+    enabled: std::sync::atomic::AtomicBool,
+    inner: Arc<dyn BookSource>,
+    original: Arc<dyn BookSource>,
+    state: RwLock<HashMap<usize, Recognition>>,
+    partial: RwLock<HashMap<usize, BTreeMap<(usize, usize), Recognition>>>,
+    cache_identity: RwLock<Option<Value>>,
+}
+
+struct RecognitionMiss {
+    hash: String,
+    identity: Value,
+    path: PathBuf,
+}
+
+const DERIVED_SECTION_CACHE_CAPACITY: usize = 16;
+
+fn cache_section<T>(cache: &mut HashMap<usize, T>, index: usize, value: T) {
+    if cache.len() >= DERIVED_SECTION_CACHE_CAPACITY
+        && !cache.contains_key(&index)
+        && let Some(evicted) = cache.keys().next().copied()
+    {
+        cache.remove(&evicted);
+    }
+    cache.insert(index, value);
+}
+
+impl SemanticLayoutSource {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new(inner: Arc<dyn BookSource>, original: Arc<dyn BookSource>) -> Self {
+        Self::with_fonts(inner, original, crate::fonts::reader_fonts())
+    }
+
+    pub fn with_fonts(
+        inner: Arc<dyn BookSource>,
+        original: Arc<dyn BookSource>,
+        fonts: Arc<[peniko::Blob<u8>]>,
+    ) -> Self {
+        Self {
+            chart_fonts: fonts,
+            formula_note_views: RwLock::new(HashSet::new()),
+            chart_views: RwLock::new(HashSet::new()),
+            unified_citations: std::sync::atomic::AtomicBool::new(false),
+            heuristic_cache: RwLock::new(HashMap::new()),
+            fingerprints: RwLock::new(HashMap::new()),
+            recognition_misses: RwLock::new(HashMap::new()),
+            transaction: RwLock::new(()),
+            enabled: std::sync::atomic::AtomicBool::new(true),
+            inner,
+            original,
+            state: RwLock::new(HashMap::new()),
+            partial: RwLock::new(HashMap::new()),
+            cache_identity: RwLock::new(None),
+        }
+    }
+
+    pub fn try_commit_together<T>(&self, commit: impl FnOnce() -> T) -> Option<T> {
+        let _guard = match self.transaction.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("content commit lock poisoned"),
+        };
+        Some(commit())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_together<T>(&self, commit: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let _guard = self.transaction.write().expect("content commit lock");
+        if started.elapsed().as_millis() >= 100 {
+            crate::diagnostics::log(
+                "reader.content_commit_lock_slow",
+                &[crate::diagnostics::Field::F32(
+                    "wait_ms",
+                    started.elapsed().as_secs_f32() * 1000.0,
+                )],
+            );
+        }
+        commit()
+    }
+
+    pub fn original(&self) -> Arc<dyn BookSource> {
+        self.original.clone()
+    }
+
+    pub fn set_unified_citations(&self, enabled: bool) -> bool {
+        self.unified_citations
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed)
+            != enabled
+    }
+
+    fn original_snapshot(&self, index: usize) -> Result<(Section, String), PublicationError> {
+        let before = self.original.content_revision();
+        let original = self.original.parse_section(index)?;
+        let revision = before.filter(|_| before == self.original.content_revision());
+        if let Some(revision) = revision
+            && let Ok(cache) = self.fingerprints.read()
+            && let Some((cached_revision, hash)) = cache.get(&index)
+            && *cached_revision == revision
+        {
+            return Ok((original, hash.clone()));
+        }
+        let cached = self
+            .original
+            .cached_section_fingerprint(index)
+            .filter(|_| before == self.original.content_revision());
+        let hash = cached
+            .map(|hash| {
+                use std::fmt::Write as _;
+                let mut value = String::with_capacity(64);
+                for byte in hash {
+                    write!(value, "{byte:02x}").unwrap();
+                }
+                value
+            })
+            .unwrap_or_else(|| fingerprint(&original));
+        if let Some(revision) = revision
+            && let Ok(mut cache) = self.fingerprints.write()
+        {
+            cache_section(&mut cache, index, (revision, hash.clone()));
+        }
+        Ok((original, hash))
+    }
+
+    fn cached_heuristics(&self, index: usize, original: &Section, hash: &str) -> Vec<Annotation> {
+        if let Ok(cache) = self.heuristic_cache.read()
+            && let Some((cached_hash, annotations)) = cache.get(&index)
+            && cached_hash == hash
+        {
+            return annotations.clone();
+        }
+        let annotations = citations::heuristic_annotations(original);
+        if let Ok(mut cache) = self.heuristic_cache.write() {
+            cache_section(&mut cache, index, (hash.to_owned(), annotations.clone()));
+        }
+        annotations
+    }
+
+    fn cached_recognition(
+        &self,
+        index: usize,
+        original: &Section,
+        hash: &str,
+        identity: &Value,
+    ) -> Option<Recognition> {
+        let missing_path = self.recognition_misses.read().ok().and_then(|cache| {
+            cache
+                .get(&index)
+                .filter(|miss| miss.hash == hash && &miss.identity == identity)
+                .map(|miss| miss.path.clone())
+        });
+        // A cloud sync or another worker can create a previously absent file.
+        // Check its existence cheaply without serializing the section again.
+        if missing_path.is_some_and(|path| !path.try_exists().unwrap_or(true)) {
+            return None;
+        }
+        let recognition = load_recognition_inner(original, identity, hash, false);
+        if let Ok(current) = self.cache_identity.read()
+            && current.as_ref() == Some(identity)
+            && let Ok(mut misses) = self.recognition_misses.write()
+        {
+            misses.remove(&index);
+            if recognition.is_none()
+                && let Some(path) = recognition_path(identity, hash)
+                && !path.try_exists().unwrap_or(true)
+            {
+                cache_section(
+                    &mut misses,
+                    index,
+                    RecognitionMiss {
+                        hash: hash.into(),
+                        identity: identity.clone(),
+                        path,
+                    },
+                );
+            }
+        }
+        recognition
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut views) = self.formula_note_views.write() {
+            views.clear();
+        }
+        if let Ok(mut views) = self.chart_views.write() {
+            views.clear();
+        }
+        if let Ok(mut state) = self.state.write() {
+            state.clear();
+        }
+        if let Ok(mut partial) = self.partial.write() {
+            partial.clear();
+        }
+        if let Ok(mut misses) = self.recognition_misses.write() {
+            misses.clear();
+        }
+    }
+
+    /// A subsection is cached independently, but composed using durable original
+    /// source ranges. Never mark the whole chapter complete after a partial scan.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_scope(
+        &self,
+        index: usize,
+        full_hash: &str,
+        range: std::ops::Range<usize>,
+        result: Recognition,
+    ) -> bool {
+        let Ok(original) = self.original.parse_section(index) else {
+            return false;
+        };
+        if fingerprint(&original) != full_hash {
+            return false;
+        }
+        self.install_prepared_scope(index, &original, full_hash, range, result)
+    }
+
+    pub fn install_prepared_scope(
+        &self,
+        index: usize,
+        original: &Section,
+        full_hash: &str,
+        range: std::ops::Range<usize>,
+        mut result: Recognition,
+    ) -> bool {
+        if result.annotations.is_empty() {
+            return false;
+        }
+        if range.end > original.blocks.len() || range.start >= range.end {
+            return false;
+        }
+        if fingerprint(&scope_section(&original, range.clone())) != result.fingerprint {
+            return false;
+        }
+        result.fingerprint = full_hash.to_owned();
+        let changed = !result.annotations.is_empty();
+        if let Ok(mut partial) = self.partial.write() {
+            let groups = partial.entry(index).or_default();
+            groups.retain(|(start, end), _| *end <= range.start || range.end <= *start);
+            groups.insert((range.start, range.end), result);
+        }
+        changed
+    }
+
+    pub fn configure(&self, book_id: &str, settings: &PluginSettings) {
+        self.enabled.store(
+            settings.semantic_layout.enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if let Ok(mut identity) = self.cache_identity.write() {
+            // Same lock order as cache installation below. A concurrent old
+            // prefetch must not repopulate annotations after a model switch.
+            self.clear();
+            *identity = recognition_identity(book_id, settings);
+        }
+    }
+
+    /// Apply only inline citation structure to original translation input.
+    /// Keeping all block indices intact is essential for translation storage.
+    pub fn prepare_citation_input(&self, index: usize, hash: &str, section: &mut Section) {
+        if self
+            .unified_citations
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            citations::apply_heuristic_fallback(section);
+        }
+        if let Ok(state) = self.state.read()
+            && let Some(result) = state
+                .get(&index)
+                .filter(|result| result.fingerprint == hash)
+        {
+            apply_text_translation_citations(section, result);
+            if self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                image_tables::prepare(section, result);
+            }
+        }
+        if let Ok(state) = self.partial.read()
+            && let Some(results) = state.get(&index)
+        {
+            for result in results.values().filter(|result| result.fingerprint == hash) {
+                apply_text_translation_citations(section, result);
+                if self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    image_tables::prepare(section, result);
+                }
+            }
+        }
+    }
+
+    pub fn has_recognition(&self, index: usize, hash: &str) -> bool {
+        self.state.read().ok().is_some_and(|state| {
+            state
+                .get(&index)
+                .is_some_and(|result| result.fingerprint == hash)
+        })
+    }
+
+    // Image rechecks must not make existing semantic/translation snapshots unready.
+    pub fn has_current_recognition(&self, index: usize, hash: &str) -> bool {
+        self.state.read().ok().is_some_and(|state| {
+            state.get(&index).is_some_and(|r| {
+                r.fingerprint == hash && r.image_text_revision >= formulas::TEXT_REVISION
+            })
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install(&self, index: usize, result: Recognition) -> bool {
+        let Ok(original) = self.original.parse_section(index) else {
+            return false;
+        };
+        if fingerprint(&original) != result.fingerprint {
+            return false;
+        }
+        let changed = !result.annotations.is_empty();
+        if let Ok(mut state) = self.state.write() {
+            state.insert(index, result);
+        }
+        changed
+    }
+}
+
+impl BookSource for SemanticLayoutSource {
+    fn inner_source(&self) -> Option<&dyn BookSource> {
+        Some(self.inner.as_ref())
+    }
+    fn visible_formula_notes(
+        &self,
+        source: &SourceRange,
+        latex: &str,
+    ) -> Vec<rebook_publication::FormulaNote> {
+        let visible = self
+            .formula_note_views
+            .try_read()
+            .ok()
+            .is_some_and(|views| {
+                views.contains(&format!("{:?}#{}", source.start.spine, source.start.node))
+            });
+        if !visible {
+            return Vec::new();
+        }
+        self.formula_notes(source, latex)
+            .iter()
+            .map(enhancements::SymbolNote::render_note)
+            .collect()
+    }
+    fn book(&self) -> &Book {
+        self.inner.book()
+    }
+    fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+        let _transaction = self.transaction.read().map_err(|_| {
+            PublicationError::InvalidPublication("content commit lock poisoned".into())
+        })?;
+        let mut section = self.inner.parse_section(index)?;
+        let unified_citations = self
+            .unified_citations
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            if !unified_citations {
+                citations::clear_markers(&mut section.blocks);
+            }
+            text_formulas::restore_originals(&mut section.blocks);
+            if unified_citations {
+                let (original, hash) = self.original_snapshot(index)?;
+                citations::compose_many(
+                    &mut section.blocks,
+                    &self.cached_heuristics(index, &original, &hash),
+                );
+                citations::apply_heuristic_fallback(&mut section);
+            }
+            return Ok(section);
+        }
+        let mut recognition = self
+            .state
+            .read()
+            .ok()
+            .and_then(|state| state.get(&index).cloned());
+        let partial = self
+            .partial
+            .read()
+            .ok()
+            .and_then(|state| state.get(&index).cloned());
+        let identity = self
+            .cache_identity
+            .read()
+            .ok()
+            .and_then(|value| value.clone());
+        let snapshot =
+            (unified_citations || recognition.is_some() || partial.is_some() || identity.is_some())
+                .then(|| self.original_snapshot(index))
+                .transpose()?;
+        if recognition.is_none() {
+            if let (Some(identity), Some((original, hash))) = (identity, snapshot.as_ref()) {
+                recognition = self.cached_recognition(index, original, hash, &identity);
+                if let Ok(current) = self.cache_identity.read() {
+                    if current.as_ref() == Some(&identity) {
+                        if let Some(result) = &recognition
+                            && let Ok(mut state) = self.state.write()
+                        {
+                            state.insert(index, result.clone());
+                        }
+                    } else {
+                        recognition = None;
+                    }
+                }
+            }
+        }
+        if let Some((original, hash)) = snapshot.as_ref() {
+            let full = recognition
+                .as_ref()
+                .filter(|result| result.fingerprint == *hash);
+            if let Some(recognition) = full {
+                for annotation in &recognition.annotations {
+                    if image_policy_allows(&recognition, annotation)
+                        && headings::annotation_eligible(&original, annotation)
+                    {
+                        compose(&mut section.blocks, annotation);
+                    }
+                }
+            }
+            if full.is_none_or(|result| result.image_text_revision < formulas::TEXT_REVISION)
+                && let Some(results) = partial
+            {
+                for recognition in results
+                    .values()
+                    .filter(|result| result.fingerprint == *hash)
+                {
+                    for annotation in &recognition.annotations {
+                        if full.is_some() && image_annotation_href(annotation).is_none() {
+                            continue;
+                        }
+                        if image_policy_allows(&recognition, annotation)
+                            && headings::annotation_eligible(&original, annotation)
+                        {
+                            compose(&mut section.blocks, annotation);
+                        }
+                    }
+                }
+            }
+        }
+        self.apply_chart_views(&mut section.blocks);
+        text_formulas::normalize_formula_quotes(&mut section.blocks);
+        if unified_citations && let Some((original, hash)) = snapshot.as_ref() {
+            citations::compose_many(
+                &mut section.blocks,
+                &self.cached_heuristics(index, original, hash),
+            );
+            citations::apply_heuristic_fallback(&mut section);
+        }
+        Ok(section)
+    }
+    fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+        if let Some(resource) = self.chart_resource(href) {
+            return Ok(resource);
+        }
+        self.inner.resource(href)
+    }
+    fn raster_resource(
+        &self,
+        href: &PublicationUrl,
+    ) -> Result<Option<RasterResource>, PublicationError> {
+        if let Some(result) = self.chart_raster(href) {
+            return result.map(Some);
+        }
+        self.inner.raster_resource(href)
+    }
+    fn raster_resource_dimensions(
+        &self,
+        href: &rebook_publication::PublicationUrl,
+    ) -> Result<Option<[u32; 2]>, rebook_publication::PublicationError> {
+        if self.chart_resource(href).is_some() {
+            return self.image_resource_dimensions(href);
+        }
+        self.inner.raster_resource_dimensions(href)
+    }
+
+    fn image_resource_dimensions(
+        &self,
+        href: &PublicationUrl,
+    ) -> Result<Option<[u32; 2]>, PublicationError> {
+        if let Some(resource) = self.chart_resource(href) {
+            let options = resvg::usvg::Options::default();
+            let tree = resvg::usvg::Tree::from_data(&resource.bytes, &options)
+                .map_err(|e| PublicationError::InvalidPublication(e.to_string()))?;
+            return Ok(Some([
+                tree.size().width().ceil() as u32,
+                tree.size().height().ceil() as u32,
+            ]));
+        }
+        self.inner.image_resource_dimensions(href)
+    }
+}
+
+pub fn fingerprint(section: &Section) -> String {
+    digest(&serde_json::to_vec(section).expect("section serializes"))
+}
+
+pub fn scope_section(section: &Section, range: std::ops::Range<usize>) -> Section {
+    Section {
+        id: section.id.clone(),
+        href: section.href.clone(),
+        blocks: section.blocks[range].to_vec(),
+        anchors: section.anchors.clone(),
+    }
+}
+
+pub fn log_scope(
+    settings: &PluginSettings,
+    index: usize,
+    start: usize,
+    end: usize,
+    prefetch: bool,
+) {
+    if let Ok((provider, model)) = settings.semantic_layout_endpoint() {
+        log::event(
+            provider,
+            model,
+            "scope.scheduled",
+            json!({"section_index":index,"start":start,"end":end,"prefetch":prefetch}),
+        );
+    }
+}
+
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn paragraph(block: &Block) -> Option<&TextBlock> {
+    match block {
+        Block::Text(text)
+            if text.kind == TextBlockKind::Paragraph
+                && text.source.is_some()
+                && !text_block_text(text).trim().is_empty() =>
+        {
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+fn quote_anchor(block: &Block) -> Option<&SourceRange> {
+    match block {
+        Block::Quote(quote) => quote
+            .source
+            .as_ref()
+            .or_else(|| quote.body.iter().find_map(|text| text.source.as_ref())),
+        Block::Text(text) if text.kind == TextBlockKind::Blockquote => text.source.as_ref(),
+        _ => None,
+    }
+}
+
+fn unattributed_quote_body(block: &Block) -> Option<&[TextBlock]> {
+    quote_anchor(block)?;
+    match block {
+        Block::Quote(quote) if quote.attribution.is_none() && !quote.body.is_empty() => {
+            Some(&quote.body)
+        }
+        Block::Text(text) if text.kind == TextBlockKind::Blockquote => {
+            Some(std::slice::from_ref(text))
+        }
+        _ => None,
+    }
+}
+
+fn attribution_text(block: &Block) -> Option<&TextBlock> {
+    match block {
+        Block::Text(text)
+            if matches!(
+                text.kind,
+                TextBlockKind::Paragraph | TextBlockKind::QuoteAttribution
+            ) && text.source.is_some()
+                && !text_block_text(text).trim().is_empty() =>
+        {
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+fn source(block: &Block) -> Option<&SourceRange> {
+    match block {
+        Block::Text(text) => text.source.as_ref(),
+        Block::Image(image) => image.source.as_ref(),
+        _ => None,
+    }
+}
+
+fn input_block(index: usize, block: &Block) -> Value {
+    if let Some(text) = paragraph(block) {
+        return json!({"id": index, "type": "paragraph", "text": text_block_text(text),
+            "align": format!("{:?}", text.style.align)});
+    }
+    match block {
+        Block::Image(image) if image.source.is_some() => {
+            json!({"id": index, "type": "image", "alt": image.alt})
+        }
+        Block::Text(text) if matches!(text.kind, TextBlockKind::Heading(_)) => {
+            json!({"id": index, "type": "boundary", "heading": text_block_text(text)})
+        }
+        // Already recognized semantics are never sent as classification targets.
+        _ => json!({"id": index, "type": "protected_boundary"}),
+    }
+}
+
+fn image_needs_caption(section: &Section, index: usize) -> bool {
+    if !matches!(section.blocks.get(index), Some(Block::Image(image)) if image.source.is_some() && image.text_layer.is_none() && image.formula.is_none() && !image.formula_image)
+    {
+        return false;
+    }
+    // The parser can leave a recognized caption adjacent to standalone images;
+    // the existing renderer already groups those. Protect that entire image run.
+    let mut start = index;
+    let mut end = index + 1;
+    while start > 0 && matches!(section.blocks[start - 1], Block::Image(_)) {
+        start -= 1;
+    }
+    while end < section.blocks.len() && matches!(section.blocks[end], Block::Image(_)) {
+        end += 1;
+    }
+    let caption = |block: Option<&Block>| matches!(block, Some(Block::Text(text)) if text.kind == TextBlockKind::Caption);
+    !caption(start.checked_sub(1).and_then(|i| section.blocks.get(i)))
+        && !caption(section.blocks.get(end))
+}
+
+#[cfg(test)]
+fn section_input_block(section: &Section, index: usize) -> Value {
+    section_input_block_eligible(section, index, code_blocks::eligible(section, index))
+}
+
+fn section_input_block_eligible(section: &Section, index: usize, eligible: bool) -> Value {
+    if code_blocks::body(&section.blocks[index]).is_some() && !eligible {
+        json!({"id":index,"type":"protected_boundary"})
+    } else if let Some(input) = code_blocks::input(index, &section.blocks[index]) {
+        input
+    } else if matches!(&section.blocks[index], Block::Text(t) if matches!(t.kind, TextBlockKind::Caption | TextBlockKind::QuoteAttribution) && t.source.is_some())
+    {
+        let Block::Text(text) = &section.blocks[index] else {
+            unreachable!()
+        };
+        json!({"id":index,"type":"attribution_candidate","text":text_block_text(text)})
+    } else if let Some(body) = unattributed_quote_body(&section.blocks[index]) {
+        json!({"id":index,"type":"quote_missing_attribution","body":body.iter().enumerate().map(|(i,text)|
+            json!({"index":i,"text":text_block_text(text),"attribution_eligible":i>0 && i+1==body.len() && text.source.is_some()})).collect::<Vec<_>>()})
+    } else if matches!(section.blocks[index],Block::Text(ref text) if text.kind==TextBlockKind::QuoteAttribution)
+        && index > 0
+        && unattributed_quote_body(&section.blocks[index - 1]).is_some()
+        && attribution_text(&section.blocks[index]).is_some()
+    {
+        json!({"id":index,"type":"attribution_candidate","text":text_block_text(attribution_text(&section.blocks[index]).expect("source-backed attribution"))})
+    } else if matches!(section.blocks[index], Block::Image(_))
+        && !image_needs_caption(section, index)
+    {
+        json!({"id":index,"type":"protected_boundary"})
+    } else {
+        input_block(index, &section.blocks[index])
+    }
+}
+
+const PROMPT: &str = include_str!("semantic_layout/prompt.md");
+
+fn window_roles(
+    section: &Section,
+    roles: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+) -> RecognitionRoles {
+    RecognitionRoles {
+        headings: roles.headings
+            && target
+                .clone()
+                .any(|i| headings::candidate(&section.blocks[i]).is_some()),
+        quotes: roles.quotes
+            && target.clone().any(|i| {
+                paragraph(&section.blocks[i]).is_some()
+                    || unattributed_quote_body(&section.blocks[i]).is_some()
+                    || code_blocks::body(&section.blocks[i]).is_some()
+            }),
+        captions: roles.captions && context.clone().any(|i| image_needs_caption(section, i)),
+    }
+}
+
+fn window_prompt(
+    section: &Section,
+    roles: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+) -> String {
+    let roles = window_roles(section, roles, target.clone(), context);
+    let mut out = String::new();
+    for part in PROMPT.split("\n## ") {
+        let enabled = if part.starts_with("Headings") {
+            roles.headings
+        } else if part.starts_with("Quotations") {
+            roles.quotes
+        } else if part.starts_with("Captions") {
+            roles.captions
+        } else if part.starts_with("Inline citations") {
+            !citations::window_candidates(section, target.clone()).is_empty()
+        } else {
+            true
+        };
+        if enabled {
+            if !out.is_empty() {
+                out.push_str("\n## ");
+            }
+            out.push_str(part);
+        }
+    }
+    if roles.quotes
+        && target
+            .clone()
+            .any(|i| code_blocks::body(&section.blocks[i]).is_some())
+    {
+        out.push_str("\n");
+        out.push_str(code_blocks::PROMPT);
+    }
+    out
+}
+
+fn request_contract_fingerprint() -> &'static str {
+    static FINGERPRINT: LazyLock<String> = LazyLock::new(|| {
+        digest(
+            &serde_json::to_vec(&json!([
+                "compact-wire-v1",
+                PROMPT,
+                code_blocks::PROMPT,
+                citations::PROMPT,
+                formulas::CHAPTER_PROMPT,
+                formulas::TRANSCRIBE_PROMPT,
+                formulas::chapter_cache_options(),
+                completion_options(&RecognitionRoles {
+                    quotes: true,
+                    captions: false,
+                    headings: false
+                }),
+                completion_options(&RecognitionRoles {
+                    quotes: false,
+                    captions: true,
+                    headings: false
+                }),
+                completion_options(&RecognitionRoles {
+                    quotes: false,
+                    captions: false,
+                    headings: true
+                }),
+                batching::BATCH_CHARS,
+                code_blocks::MAX_RUN_CHARS,
+                headings::MAX_CHARS,
+                OVERLAP
+            ]))
+            .expect("request contract serializes"),
+        )
+    });
+    FINGERPRINT.as_str()
+}
+
+fn completion_options(roles: &RecognitionRoles) -> Value {
+    let ids = json!({"type":"array","items":{"type":"integer"}});
+    let quote = json!({
+        "type":"object", "additionalProperties":false,
+        "properties":{
+            "kind":{"type":"string","enum":["quote"]},
+            "body":ids,
+            "attribution":{"type":["integer","null"],"description":"Immediately following paragraph containing an explicit author or work credit. Null is allowed only for a complete authored paragraph group supplied in paragraph_groups."},
+            "alignment":{"type":["string","null"],"enum":["start","center","end","justify",null],"description":"Quote-body alignment; null keeps the default."}
+        },
+        "required":["kind","body","attribution","alignment"]
+    });
+    let figure = json!({
+        "type":"object", "additionalProperties":false,
+        "properties":{
+            "kind":{"type":"string","enum":["figure"]},
+            "images":ids, "captions":ids
+        },
+        "required":["kind","images","captions"]
+    });
+    let attribution = json!({
+        "type":"object","additionalProperties":false,
+        "properties":{
+            "kind":{"type":"string","enum":["quote_attribution"]},
+            "quote":{"type":"integer"},
+            "attribution":{"type":["integer","null"]},
+            "body_index":{"type":["integer","null"]}
+        },
+        "required":["kind","quote","attribution","body_index"]
+    });
+    let heading = json!({
+        "type":"object", "additionalProperties":false,
+        "properties":{
+            "kind":{"type":"string","enum":["section_heading"]},
+            "block":{"type":"integer","description":"An ID from targets.classify_headings."}
+        },
+        "required":["kind","block"]
+    });
+    let mut items = Vec::new();
+    if roles.quotes {
+        let mut before = quote.clone();
+        before["properties"]["kind"]["enum"] = json!(["quote_before"]);
+        before["properties"]["attribution"]["type"] = json!("integer");
+        before["properties"]["attribution"]["description"] = json!(
+            "Immediately preceding paragraph naming the source and explicitly introducing the excerpt with a colon or terminal reporting cue such as 'writes' or 'as follows'."
+        );
+        let mut inline = quote.clone();
+        inline["properties"]["kind"]["enum"] = json!(["quote_inline"]);
+        inline["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("attribution");
+        inline["properties"]["credit"] = json!({"type":"string","description":"Exact nonempty suffix of the last body paragraph, including its credit delimiter (dash, opening parenthesis or line break). Copy the explicitly written author/work credit; never invent it."});
+        inline["required"] = json!(["kind", "body", "credit", "alignment"]);
+        items.extend([quote, before, inline, attribution, code_blocks::schema()]);
+    }
+    if roles.captions {
+        items.push(figure);
+    }
+    if roles.headings {
+        items.push(heading);
+    }
+    let no_groups = items.is_empty();
+    let item = if no_groups {
+        json!({"type":"object","properties":{},"required":[],"additionalProperties":false})
+    } else if items.len() == 1 {
+        items.remove(0)
+    } else {
+        json!({"anyOf":items})
+    };
+    let mut options = json!({"temperature":0.0,"output_schema":{
+                "type":"object", "additionalProperties":false,
+                "properties":{"groups":{"type":"array","items":item}, "citations":{"type":"array","description":"Select citation candidate IDs from `targets.classify_citations` only, in source order, without duplicates. Return [] when that list is empty. Never return citation text or block IDs.","items":{"type":"string","description":"An unchanged ID from `citation_candidates`, such as c0_0_0."}},
+                    "formulas":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
+                        "block":{"type":"integer"},"paragraph":{"type":"integer"},
+                        "original":{"type":"string","minLength":1,"description":"Exact contiguous substring of the designated math_texts paragraph, including markup and escaped entities. Copy the complete expression; do not rewrite it or supply offsets."},
+                        "latex":{"type":"string","description":"Faithful supported LaTeX, without dollar signs or Markdown. JSON-escape each literal command backslash as two backslashes, and a two-backslash row separator as four. Never simplify, solve, correct, or invent symbols."},
+                        "before":{"type":"string","description":"Exact immediately preceding text from math_texts to disambiguate repeated occurrences, or empty when unnecessary."},
+                        "after":{"type":"string","description":"Exact immediately following text from math_texts to disambiguate repeated occurrences, or empty when unnecessary."}
+                    },"required":["block","paragraph","original","latex","before","after"]}}},
+                "required":["groups","citations","formulas"]
+            }
+    });
+    if no_groups {
+        options["output_schema"]["properties"]["groups"]["maxItems"] = json!(0);
+    }
+    options
+}
+
+fn cache_path(key: &str) -> Option<PathBuf> {
+    crate::environment::paths().map(|dirs| {
+        dirs.cache_dir()
+            .join("semantic-layout-v1")
+            .join(format!("{key}.json"))
+    })
+}
+
+fn recognition_identity(book_id: &str, settings: &PluginSettings) -> Option<Value> {
+    let config = &settings.semantic_layout;
+    if !config.enabled {
+        return None;
+    }
+    let (provider, model) = settings.semantic_layout_endpoint().ok()?;
+    Some(json!([
+        CACHE_FORMAT_VERSION,
+        request_contract_fingerprint(),
+        book_id,
+        provider.id,
+        provider.base_url,
+        model,
+        config.reasoning_effort,
+        enhancements::contract(),
+        settings
+            .resolved_target_language(crate::preferences::AppLanguage::system_translation_target()),
+        true,
+        true
+    ]))
+}
+
+fn recognition_path(identity: &Value, hash: &str) -> Option<PathBuf> {
+    cache_path(&digest(format!("chapter:{identity}:{hash}").as_bytes()))
+}
+
+#[cfg(test)]
+fn load_recognition(section: &Section, identity: &Value) -> Option<Recognition> {
+    let hash = fingerprint(section);
+    load_recognition_with_hash(section, identity, &hash)
+}
+
+#[cfg(test)]
+fn load_recognition_with_hash(
+    section: &Section,
+    identity: &Value,
+    hash: &str,
+) -> Option<Recognition> {
+    load_recognition_inner(section, identity, hash, true)
+}
+
+fn image_annotation_href(annotation: &Annotation) -> Option<&PublicationUrl> {
+    match annotation {
+        Annotation::ImageTable { href, .. }
+        | Annotation::ImageText { href, .. }
+        | Annotation::ImageFormula { href, .. }
+        | Annotation::UnreadableFormula { href } => Some(href),
+        _ => None,
+    }
+}
+
+fn image_policy_allows(recognition: &Recognition, annotation: &Annotation) -> bool {
+    recognition.image_text_revision >= formulas::TEXT_REVISION
+        || image_annotation_href(annotation).is_none()
+}
+
+fn load_recognition_inner(
+    section: &Section,
+    identity: &Value,
+    hash: &str,
+    current_images: bool,
+) -> Option<Recognition> {
+    let bytes = std::fs::read(recognition_path(identity, hash)?).ok()?;
+    let mut result: Recognition = serde_json::from_slice(&bytes).ok()?;
+    if current_images
+        && result.image_text_revision < formulas::TEXT_REVISION
+        && !formulas::candidates(section).is_empty()
+    {
+        return None;
+    }
+    result
+        .annotations
+        .retain(|annotation| headings::annotation_eligible(section, annotation));
+    if !result.formulas_checked
+        || !formulas::validate_annotations(section, &result.annotations)
+        || !text_formulas::validate_annotations(section, &result.annotations)
+    {
+        return None;
+    }
+    if result.fingerprint != hash {
+        return None;
+    }
+    let locate = |range: &SourceRange| {
+        section
+            .blocks
+            .iter()
+            .position(|block| source(block).or_else(|| quote_anchor(block)) == Some(range))
+    };
+    let groups: Option<Vec<_>> = result
+        .annotations
+        .iter()
+        .filter(|a| {
+            !matches!(
+                a,
+                Annotation::TableChart { .. }
+                    | Annotation::FormulaNotes { .. }
+                    | Annotation::InlineCitations { .. }
+                    | Annotation::TextFormulas { .. }
+                    | Annotation::ImageTable { .. }
+                    | Annotation::ImageText { .. }
+                    | Annotation::ImageFormula { .. }
+                    | Annotation::UnreadableFormula { .. }
+            )
+        })
+        .map(|a| {
+            Some(match a {
+                Annotation::TableChart { .. }
+                | Annotation::FormulaNotes { .. }
+                | Annotation::InlineCitations { .. }
+                | Annotation::TextFormulas { .. }
+                | Annotation::ImageTable { .. }
+                | Annotation::ImageText { .. }
+                | Annotation::ImageFormula { .. }
+                | Annotation::UnreadableFormula { .. } => {
+                    unreachable!()
+                }
+                Annotation::CodeOrQuote {
+                    body,
+                    presentation,
+                    language,
+                    captions,
+                    sources,
+                    credit,
+                } => {
+                    let ids = body
+                        .iter()
+                        .map(|r| {
+                            section
+                                .blocks
+                                .iter()
+                                .position(|b| code_blocks::anchor(b) == Some(r))
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    let final_body = code_blocks::body(&section.blocks[*ids.last()?])?;
+                    let locate_attachment = |r: &SourceRange| {
+                        section
+                            .blocks
+                            .iter()
+                            .position(|b| code_blocks::attachment_anchor(b) == Some(r))
+                    };
+                    Proposal::CodeOrQuote {
+                        body: ids,
+                        presentation: *presentation,
+                        language: language.clone(),
+                        captions: captions
+                            .iter()
+                            .map(locate_attachment)
+                            .collect::<Option<Vec<_>>>()?,
+                        sources: sources
+                            .iter()
+                            .map(locate_attachment)
+                            .collect::<Option<Vec<_>>>()?,
+                        body_index: match credit {
+                            Some(range) => Some(
+                                final_body
+                                    .iter()
+                                    .position(|t| t.source.as_ref() == Some(range))?,
+                            ),
+                            None => None,
+                        },
+                    }
+                }
+                Annotation::QuoteBefore {
+                    body,
+                    attribution,
+                    alignment,
+                } => Proposal::QuoteBefore {
+                    body: body.iter().map(locate).collect::<Option<Vec<_>>>()?,
+                    attribution: locate(attribution)?,
+                    alignment: *alignment,
+                },
+                Annotation::QuoteInline {
+                    body,
+                    credit,
+                    alignment,
+                } => Proposal::QuoteInline {
+                    body: body.iter().map(locate).collect::<Option<Vec<_>>>()?,
+                    credit: credit.clone(),
+                    alignment: *alignment,
+                },
+                Annotation::SectionHeading { source } => Proposal::SectionHeading {
+                    block: locate(source)?,
+                },
+                Annotation::Quote {
+                    body,
+                    attribution,
+                    alignment,
+                } => Proposal::Quote {
+                    body: body.iter().map(locate).collect::<Option<Vec<_>>>()?,
+                    alignment: *alignment,
+                    attribution: match attribution {
+                        Some(range) => Some(locate(range)?),
+                        None => None,
+                    },
+                },
+                Annotation::Figure {
+                    images,
+                    captions,
+                    before,
+                } => {
+                    let images = images.iter().map(locate).collect::<Option<Vec<_>>>()?;
+                    let captions = captions.iter().map(locate).collect::<Option<Vec<_>>>()?;
+                    if (captions.first()? < images.first()?) != *before {
+                        return None;
+                    }
+                    Proposal::Figure { images, captions }
+                }
+                Annotation::QuoteAttribution {
+                    quote,
+                    attribution,
+                    inside,
+                } => {
+                    let index = section
+                        .blocks
+                        .iter()
+                        .position(|b| quote_anchor(b) == Some(quote))?;
+                    if *inside {
+                        let body = unattributed_quote_body(&section.blocks[index])?;
+                        let child = body
+                            .iter()
+                            .position(|text| text.source.as_ref() == Some(attribution))?;
+                        Proposal::QuoteAttribution {
+                            quote: index,
+                            attribution: None,
+                            body_index: Some(child),
+                        }
+                    } else {
+                        Proposal::QuoteAttribution {
+                            quote: index,
+                            attribution: Some(locate(attribution)?),
+                            body_index: None,
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    validate_window(
+        &groups?,
+        section,
+        &RecognitionRoles::default(),
+        0..section.blocks.len(),
+        0..section.blocks.len(),
+    )
+    .ok()?;
+    if !citations::validate_annotations(section, &result.annotations) {
+        return None;
+    }
+    Some(result)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn recognize(
+    section: &Section,
+    book_id: &str,
+    settings: &PluginSettings,
+) -> Result<Recognition, String> {
+    recognize_impl(section, book_id, settings, None, None, true).await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn recognize_with_source(
+    section: &Section,
+    book_id: &str,
+    settings: &PluginSettings,
+    source: &dyn BookSource,
+) -> Result<Recognition, String> {
+    recognize_impl(section, book_id, settings, Some(source), None, true).await
+}
+
+pub async fn recognize_visible(
+    section: &Section,
+    target: std::ops::Range<usize>,
+    book_id: &str,
+    settings: &PluginSettings,
+    source: &dyn BookSource,
+) -> Result<Recognition, String> {
+    recognize_impl(
+        section,
+        book_id,
+        settings,
+        Some(source),
+        Some(target),
+        false,
+    )
+    .await
+}
+
+/// Optional presentation metadata must never gate translation readiness.
+pub async fn enhance_visible(
+    section: &Section,
+    target: std::ops::Range<usize>,
+    book_id: &str,
+    settings: &PluginSettings,
+    mut base: Recognition,
+) -> Result<Option<Recognition>, String> {
+    let client = crate::http::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut enhanced = section.clone();
+    for annotation in &base.annotations {
+        compose(&mut enhanced.blocks, annotation);
+    }
+    let targets = section.blocks[target]
+        .iter()
+        .flat_map(block_ranges)
+        .collect::<Vec<_>>();
+    let (extra, _) = enhancements::recognize(&client, settings, &enhanced, &targets, book_id).await;
+    if extra.is_empty() {
+        return Ok(None);
+    }
+    // Retain the base annotations when the late result replaces its scope.
+    base.annotations.extend(extra);
+    Ok(Some(base))
+}
+
+async fn recognize_impl(
+    section: &Section,
+    book_id: &str,
+    settings: &PluginSettings,
+    source: Option<&dyn BookSource>,
+    target: Option<std::ops::Range<usize>>,
+    include_enhancements: bool,
+) -> Result<Recognition, String> {
+    let (provider, model) = settings.semantic_layout_endpoint()?;
+    let started = std::time::Instant::now();
+    log::event(
+        provider,
+        model,
+        "chapter.start",
+        json!({"book":book_id,"section":section.id,"href":section.href,"blocks":section.blocks.len()}),
+    );
+    let result = recognize_inner(
+        section,
+        book_id,
+        settings,
+        source,
+        target,
+        include_enhancements,
+    )
+    .await;
+    let mut details = json!({"book":book_id,"section":section.id,"href":section.href,"elapsed_ms":started.elapsed().as_millis()});
+    match &result {
+        Ok(recognition) => {
+            details["groups"] = json!(recognition.annotations.len());
+            details["skipped_groups"] = json!(recognition.skipped_groups);
+        }
+        Err(error) => {
+            details["error"] = json!(error);
+        }
+    }
+    log::event(
+        provider,
+        model,
+        if result.is_ok() {
+            "chapter.complete"
+        } else {
+            "chapter.failed"
+        },
+        details,
+    );
+    result
+}
+
+async fn recognize_inner(
+    section: &Section,
+    book_id: &str,
+    settings: &PluginSettings,
+    book_source: Option<&dyn BookSource>,
+    target: Option<std::ops::Range<usize>>,
+    include_enhancements: bool,
+) -> Result<Recognition, String> {
+    let (provider, model) = settings.semantic_layout_endpoint()?;
+    let config = &RecognitionRoles::default();
+    let fingerprint = fingerprint(section);
+    let mut identity = recognition_identity(book_id, settings);
+    if !include_enhancements {
+        identity = identity.map(|identity| json!([identity, "base-recognition-v1"]));
+    }
+    if let Some(target) = &target {
+        identity = identity
+            .map(|identity| json!([identity, "visible-target-v1", target.start, target.end]));
+    }
+    let fixed_target = target.is_some();
+    let target = target.unwrap_or(0..section.blocks.len());
+    let target_section = scope_section(section, target.clone());
+    if let Some(identity) = &identity
+        && let Some(mut cached) = load_recognition_inner(section, identity, &fingerprint, false)
+    {
+        if cached.image_text_revision < formulas::TEXT_REVISION
+            && let Some(source) = book_source
+        {
+            let client = crate::http::builder()
+                .timeout(Duration::from_secs(90))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let (images, failed) = formulas::recognize(
+                &client,
+                provider,
+                model,
+                settings.semantic_layout.reasoning_effort,
+                source,
+                &target_section,
+            )
+            .await;
+            // Negative and failed checks must also remove old replacements.
+            // Recompose from authored images until a current result is safe.
+            // This cache is scoped by its target identity. Never carry any
+            // unchecked legacy image annotation into the new policy revision.
+            cached
+                .annotations
+                .retain(|a| image_annotation_href(a).is_none());
+            cached.annotations.extend(images);
+            cached.image_text_revision = formulas::TEXT_REVISION;
+            cached.skipped_groups += failed;
+            if failed == 0
+                && let Some(path) = recognition_path(identity, &fingerprint)
+            {
+                let _ = crate::persistence::write_json_atomic(&path, &cached);
+            }
+        }
+        return Ok(cached);
+    }
+    let mut annotations = Vec::new();
+    let mut skipped_groups = 0;
+    let mut used = HashSet::new();
+    let client = crate::http::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let formulas_checked =
+        book_source.is_some() || formulas::candidates(&target_section).is_empty();
+    if let Some(source) = book_source {
+        let (recognized, failed) = formulas::recognize(
+            &client,
+            provider,
+            model,
+            settings.semantic_layout.reasoning_effort,
+            source,
+            &target_section,
+        )
+        .await;
+        annotations.extend(recognized);
+        skipped_groups += failed;
+    }
+    let mut working = section.clone();
+    for annotation in &annotations {
+        compose(&mut working.blocks, annotation);
+    }
+    let section = &working;
+    let mut start = target.start;
+    while start < target.end {
+        let end = if fixed_target {
+            target.end
+        } else {
+            window_end(section, start).min(target.end)
+        };
+        let lo = if fixed_target {
+            0
+        } else {
+            start.saturating_sub(OVERLAP)
+        };
+        let hi = if fixed_target {
+            section.blocks.len()
+        } else {
+            (end + OVERLAP).min(section.blocks.len())
+        };
+        let citation_candidates = citations::window_candidates(section, start..end);
+        let eligible = code_blocks::eligible_ids(section);
+        if (start..end).any(|i| {
+            let block = &section.blocks[i];
+            if code_blocks::body(block).is_some() {
+                eligible.contains(&i)
+            } else {
+                !text_formulas::input(block).is_empty()
+                    || paragraph(block).is_some()
+                    || citation_candidates.iter().any(|c| c.block == i)
+            }
+        }) {
+            let input =
+                unified_window_input(section, config, start..end, lo..hi, &citation_candidates);
+            let key = digest(
+                &serde_json::to_vec(&json!([
+                    CACHE_FORMAT_VERSION,
+                    request_contract_fingerprint(),
+                    book_id,
+                    fingerprint,
+                    provider.id,
+                    provider.base_url,
+                    model,
+                    settings.semantic_layout.reasoning_effort,
+                    config.quotes,
+                    config.captions,
+                    input
+                ]))
+                .map_err(|e| e.to_string())?,
+            );
+            let path = cache_path(&key);
+            let cached = path
+                .as_ref()
+                .and_then(|path| std::fs::read(path).ok())
+                .and_then(|bytes| serde_json::from_slice::<WindowCache>(&bytes).ok())
+                .filter(|cache| {
+                    cache.key == key
+                        && validate_citation_ids(&cache.citations, &citation_candidates).is_ok()
+                        && resolve_text_formulas(
+                            section,
+                            start..end,
+                            &cache.formulas,
+                            &cache.citations,
+                        )
+                        .1 == 0
+                        && validate_window(&cache.groups, section, config, start..end, lo..hi)
+                            .is_ok()
+                });
+            let window = if let Some(cache) = cached {
+                WindowResult {
+                    groups: cache.groups,
+                    citations: cache.citations,
+                    formulas: cache.formulas,
+                    skipped_groups: 0,
+                }
+            } else {
+                let groups = request_window_groups(
+                    &client,
+                    (provider, model, settings.semantic_layout.reasoning_effort),
+                    &input,
+                    section,
+                    config,
+                    start..end,
+                    lo..hi,
+                )
+                .await
+                .map_err(|error| format!("window {start}..{end}: {error}"))?;
+                if let Some(path) = &path
+                    && groups.skipped_groups == 0
+                    && let Err(error) = crate::persistence::write_json_atomic(
+                        path,
+                        &WindowCache {
+                            key,
+                            groups: groups.groups.clone(),
+                            citations: groups.citations.clone(),
+                            formulas: groups.formulas.clone(),
+                        },
+                    )
+                {
+                    tracing::warn!(%error, "failed to cache semantic layout");
+                }
+                groups
+            };
+            let mut window = window;
+            code_blocks::protect(&mut window, &citation_candidates);
+            skipped_groups += window.skipped_groups;
+            validate_window(&window.groups, section, config, start..end, lo..hi)?;
+            annotations.extend(citations::window_annotations(
+                &citation_candidates,
+                &window.citations,
+            ));
+            annotations.extend(
+                resolve_text_formulas(section, start..end, &window.formulas, &window.citations).0,
+            );
+            for group in &window.groups {
+                let ids = proposal_ids(group);
+                if ids.iter().any(|id| used.contains(id)) {
+                    continue;
+                }
+                used.extend(ids);
+                annotations.push(annotation(group, section));
+            }
+        }
+        start = end;
+    }
+    let (extra, enhancements_ok) = if include_enhancements {
+        let mut enhanced = working.clone();
+        for annotation in &annotations {
+            compose(&mut enhanced.blocks, annotation);
+        }
+        enhancements::recognize(
+            &client,
+            settings,
+            &enhanced,
+            &target_section
+                .blocks
+                .iter()
+                .flat_map(block_ranges)
+                .collect::<Vec<_>>(),
+            book_id,
+        )
+        .await
+    } else {
+        (Vec::new(), true)
+    };
+    annotations.extend(extra);
+    let result = Recognition {
+        formulas_checked,
+        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
+        fingerprint,
+        annotations,
+        skipped_groups,
+    };
+    if let Some(path) = identity
+        .as_ref()
+        .and_then(|identity| recognition_path(identity, &result.fingerprint))
+        && enhancements_ok
+        && result.skipped_groups == 0
+        && result.formulas_checked
+        && let Err(error) = crate::persistence::write_json_atomic(&path, &result)
+    {
+        tracing::warn!(%error, "failed to cache semantic chapter");
+    }
+    Ok(result)
+}
+
+async fn request_window_groups(
+    client: &reqwest::Client,
+    endpoint: (&super::AiProvider, &str, ReasoningEffort),
+    input: &Value,
+    section: &Section,
+    config: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+) -> Result<WindowResult, String> {
+    request_groups(client, endpoint, input, section, config, target, context).await
+}
+
+fn unified_window_input(
+    section: &Section,
+    config: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+    candidates: &[citations::WindowCandidate],
+) -> Value {
+    let eligible = code_blocks::eligible_ids(section);
+    let refs: Vec<_> = section.blocks.iter().collect();
+    let paragraph_groups: Vec<_> = rebook_layout::semantic_paragraph_groups(&refs)
+        .into_iter()
+        .filter(|group| {
+            group.start >= context.start
+                && group.end <= context.end
+                && group.clone().any(|id| target.contains(&id))
+        })
+        .map(|group| group.collect::<Vec<_>>())
+        .collect();
+    let blocks: Vec<_> = context
+        .map(|index| {
+            let mut block = section_input_block_eligible(section, index, eligible.contains(&index));
+            if target.contains(&index) {
+                if code_blocks::body(&section.blocks[index]).is_some() {
+                    // Code classification needs the authored literal lines, not
+                    // escaped formula markup in place of its body text.
+                    block["math_texts"] = if eligible.contains(&index) {
+                        json!(text_formulas::input(&section.blocks[index]))
+                    } else {
+                        json!([])
+                    };
+                } else {
+                    text_formulas::attach_input(&mut block, &section.blocks[index]);
+                }
+            }
+            if headings::candidate(&section.blocks[index]).is_some()
+                && let Some(text) = paragraph(&section.blocks[index])
+            {
+                block["style"] = headings::style(text);
+            }
+            let available: Vec<_> = candidates.iter().filter(|c| c.block == index).collect();
+            block["citation_candidates"] = json!(
+                available
+                    .iter()
+                    .map(|c| json!({"id":c.id,"paragraph":c.paragraph,"text":c.span.text}))
+                    .collect::<Vec<_>>()
+            );
+            if !available.is_empty()
+                && block.get("text").is_none()
+                && block.get("body").is_none()
+                && block
+                    .get("math_texts")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+            {
+                let mut seen = HashSet::new();
+                block["citation_paragraphs"] = json!(
+                    available
+                        .iter()
+                        .filter(|c| seen.insert(c.paragraph))
+                        .map(|c| json!({"index":c.paragraph,"text":c.paragraph_text}))
+                        .collect::<Vec<_>>()
+                );
+            }
+            block
+        })
+        .collect();
+    let mut input = json!({"target_start":target.start,"target_end_exclusive":target.end,
+        "quotes_enabled":config.quotes,"captions_enabled":config.captions,"headings_enabled":config.headings,
+        "blocks":blocks,
+        "targets":{"classify_headings":target.clone().filter(|i|headings::candidate(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),"classify_blocks":target.clone().filter(|i|paragraph(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
+            "classify_code_or_quote":target.clone().filter(|i|eligible.contains(i)).collect::<Vec<_>>(),
+            "complete_quote_sources":target.clone().filter(|i|unattributed_quote_body(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
+            "classify_citations":candidates.iter().map(|c|&c.id).collect::<Vec<_>>()}});
+    input["container_runs"] = json!(
+        code_blocks::runs(section, target.clone())
+            .into_iter()
+            .filter(|run| run.clone().all(|i| eligible.contains(&i)))
+            .map(|run| run.collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
+    if !paragraph_groups.is_empty() {
+        input["paragraph_groups"] = json!(paragraph_groups);
+    }
+    if config.headings
+        && target
+            .clone()
+            .any(|i| headings::number(&section.blocks[i]).is_some())
+    {
+        input["numbered_candidates"] = headings::context(section, target.start);
+    }
+    input
+}
+
+fn resolve_text_formulas(
+    section: &Section,
+    target: std::ops::Range<usize>,
+    proposals: &[text_formulas::Proposal],
+    ids: &[String],
+) -> (Vec<Annotation>, usize) {
+    if ids.is_empty() {
+        return text_formulas::resolve(section, target, proposals);
+    }
+    let mut protected = section.clone();
+    let candidates = citations::window_candidates(section, target.clone());
+    for a in citations::window_annotations(&candidates, ids) {
+        compose(&mut protected.blocks, &a);
+    }
+    text_formulas::resolve(&protected, target, proposals)
+}
+
+fn validate_citation_ids(
+    ids: &[String],
+    candidates: &[citations::WindowCandidate],
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    if ids
+        .iter()
+        .any(|id| !seen.insert(id) || !candidates.iter().any(|c| &c.id == id))
+    {
+        return Err("Use each eligible citation candidate ID at most once; never select context-only or invented IDs".into());
+    }
+    Ok(())
+}
+
+fn window_end(section: &Section, start: usize) -> usize {
+    fixed_batches(section, start..section.blocks.len())
+        .first()
+        .map_or(start, |r| r.end)
+}
+
+async fn request_groups(
+    client: &reqwest::Client,
+    endpoint: (&super::AiProvider, &str, ReasoningEffort),
+    input: &Value,
+    section: &Section,
+    config: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+) -> Result<WindowResult, String> {
+    crate::plugins::llm::budgeted(async {
+    let (provider, model, reasoning_effort) = endpoint;
+    let roles = window_roles(section, config, target.clone(), context.clone());
+    let config = &roles;
+    let mut messages = vec![
+        json!({"role":"system","content":wire::instructions(&window_prompt(section, config, target.clone(), context.clone()), std::iter::once(input))}),
+        json!({"role":"user","content":wire::encode(input).to_string()}),
+    ];
+    let candidates = citations::window_candidates(section, target.clone());
+    let mut fallback: Option<WindowResult> = None;
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        let message = ai::request_completion(
+            client,
+            provider,
+            model,
+            &messages,
+            None,
+            Some(4096),
+            reasoning_effort,
+            Some(&wire::options(&completion_options(config))),
+        )
+        .await?;
+        let content = ai::message_content(&message).ok_or("AI排版返回了空内容")?;
+        let parsed = llm_json::parse::<Value>(&content).and_then(|value| serde_json::from_value::<Response>(wire::decode(&value)).map_err(|error| error.to_string()))
+            .map_err(|e| format!("AI排版格式无效：{e}"))
+            .and_then(|mut response| {
+                log::event(provider, model, "window.proposals", json!({"section":section.id,"start":target.start,"end":target.end,"attempt":attempt+1,"groups":response.groups,"citations":response.citations}));
+                let ignored = normalize::response(&mut response, section, context.clone());
+                if ignored > 0 {
+                    log::event(provider, model, "window.redundant_ignored", json!({"section":section.id,"start":target.start,"end":target.end,"attempt":attempt+1,"count":ignored}));
+                }
+                let validation = validate_window(
+                    &response.groups,
+                    section,
+                    config,
+                    target.clone(),
+                    context.clone(),
+                );
+                let validation = validation.and_then(|()| validate_citation_ids(&response.citations, &candidates))
+                    .and_then(|()| if resolve_text_formulas(section,target.clone(),&response.formulas,&response.citations).1==0 {Ok(())} else {Err("Invalid text formula: copy an exact unique unprotected span, avoid overlaps, and use supported LaTeX".into())});
+                if validation.is_err() {
+                    let mut safe = retain_valid_groups(
+                        &response.groups,
+                        section,
+                        config,
+                        target.clone(),
+                        context.clone(),
+                    );
+                    let mut seen = HashSet::new();
+                    safe.citations = response.citations.iter().filter(|id| candidates.iter().any(|c| &c.id==*id) && seen.insert((*id).clone())).cloned().collect();
+                    safe.skipped_groups += response.citations.len() - safe.citations.len();
+                    let (valid_math, invalid_math) = resolve_text_formulas(section,target.clone(),&response.formulas,&response.citations);
+                    safe.formulas = response.formulas.iter().filter(|proposal| {
+                        let (single,invalid)=resolve_text_formulas(section,target.clone(),std::slice::from_ref(proposal),&response.citations);
+                        invalid==0 && !single.is_empty() && single.iter().all(|a| match a { Annotation::TextFormulas {source,spans}=>valid_math.iter().any(|other|matches!(other,Annotation::TextFormulas {source:s,spans:valid} if s==source && spans.iter().all(|span|valid.contains(span)))),_=>false })
+                    }).cloned().collect();
+                    safe.skipped_groups += invalid_math;
+                    if fallback
+                        .as_ref()
+                        .is_none_or(|previous| safe.groups.len()+safe.citations.len()+safe.formulas.len() > previous.groups.len()+previous.citations.len()+previous.formulas.len())
+                    {
+                        fallback = Some(safe);
+                    }
+                }
+                validation.map(|()| response)
+            });
+        // Validate before persisting; malformed output remains retryable.
+        match parsed {
+            Ok(response) => {
+                return Ok(WindowResult {
+                    groups: response.groups,
+                    citations: response.citations,
+                    formulas: response.formulas,
+                    skipped_groups: 0,
+                });
+            }
+            Err(error) => {
+                log::event(
+                    provider,
+                    model,
+                    "window.invalid_output",
+                    json!({"section":section.id,"href":section.href,"start":target.start,"end":target.end,"attempt":attempt + 1,"quotes":config.quotes,"captions":config.captions,"error":error}),
+                );
+                last_error = error;
+                messages.push(json!({"role":"assistant","content":content}));
+                let feedback = format!(
+                    "# Correct the response\n\n## Structural error\n\n{last_error}\n\n## Requirements\n\n\
+                     - Use the previous book input and the same response schema.\n\
+                     - Use existing eligible IDs, preserve order and adjacency, and avoid overlaps or protected blocks.\n\
+                     - Omit groups whose IDs cannot satisfy these structural requirements."
+                );
+                messages.push(json!({"role":"user","content":wire::prompt(&feedback)}));
+            }
+        }
+    }
+    if let Some(safe) = fallback {
+        log::event(
+            provider,
+            model,
+            "window.partial",
+            json!({"section":section.id,"href":section.href,"start":target.start,"end":target.end,"accepted":safe.groups.len(),"skipped":safe.skipped_groups}),
+        );
+        return Ok(safe);
+    }
+    Err(last_error)
+    }).await
+}
+
+fn retain_valid_groups(
+    groups: &[Proposal],
+    section: &Section,
+    config: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+) -> WindowResult {
+    let mut safe = WindowResult::default();
+    for group in groups {
+        safe.groups.push(group.clone());
+        if validate_window(
+            &safe.groups,
+            section,
+            config,
+            target.clone(),
+            context.clone(),
+        )
+        .is_err()
+        {
+            safe.groups.pop();
+            safe.skipped_groups += 1;
+        }
+    }
+    safe
+}
+
+fn proposal_ids(group: &Proposal) -> Vec<usize> {
+    let mut ids = match group {
+        Proposal::CodeOrQuote {
+            body,
+            captions,
+            sources,
+            ..
+        } => body
+            .iter()
+            .chain(captions)
+            .chain(sources)
+            .copied()
+            .collect(),
+        Proposal::QuoteBefore {
+            body, attribution, ..
+        } => body.iter().copied().chain([*attribution]).collect(),
+        Proposal::QuoteInline { body, .. } => body.clone(),
+        Proposal::SectionHeading { block } => vec![*block],
+        Proposal::Quote {
+            body, attribution, ..
+        } => body
+            .iter()
+            .copied()
+            .chain(attribution.iter().copied())
+            .collect::<Vec<_>>(),
+        Proposal::Figure { images, captions } => images.iter().chain(captions).copied().collect(),
+        Proposal::QuoteAttribution {
+            quote, attribution, ..
+        } => std::iter::once(*quote)
+            .chain(attribution.iter().copied())
+            .collect(),
+    };
+    ids.sort_unstable();
+    ids
+}
+
+fn consecutive(ids: &[usize]) -> bool {
+    !ids.is_empty()
+        && ids
+            .windows(2)
+            .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
+}
+
+fn validate_window(
+    groups: &[Proposal],
+    section: &Section,
+    config: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+) -> Result<(), String> {
+    let mut used = HashSet::new();
+    let eligible = code_blocks::eligible_ids(section);
+    let refs: Vec<_> = section.blocks.iter().collect();
+    let paragraph_groups = rebook_layout::semantic_paragraph_groups(&refs);
+    for group in groups {
+        let ids = proposal_ids(group);
+        let valid_ids = consecutive(&ids)
+            && paragraph_groups.iter().all(|range| {
+                !ids.iter().any(|id| range.contains(id))
+                    || range.clone().all(|id| ids.contains(&id))
+            })
+            && ids.iter().any(|id| target.contains(id))
+            && ids
+                .iter()
+                .all(|id| context.contains(id) && *id < section.blocks.len() && used.insert(*id));
+        if !valid_ids {
+            return Err(format!("AI排版包含越界、重叠或不连续的段落：{ids:?}"));
+        }
+        let text_ids = |ids: &[usize]| {
+            ids.iter()
+                .all(|id| paragraph(&section.blocks[*id]).is_some())
+        };
+        let valid = match group {
+            Proposal::CodeOrQuote {
+                body,
+                presentation,
+                language,
+                captions,
+                sources,
+                body_index,
+            } => {
+                config.quotes
+                    && code_blocks::valid(
+                        section,
+                        body,
+                        *presentation,
+                        language.as_deref(),
+                        captions,
+                        sources,
+                        *body_index,
+                        &eligible,
+                    )
+            }
+            Proposal::QuoteBefore {
+                body, attribution, ..
+            } => {
+                config.quotes
+                    && consecutive(body)
+                    && text_ids(body)
+                    && attribution.checked_add(1) == body.first().copied()
+                    && text_ids(&[*attribution])
+                    && quote_sources::introduces_quote(&text_block_text(
+                        paragraph(&section.blocks[*attribution]).unwrap(),
+                    ))
+            }
+            Proposal::QuoteInline { body, credit, .. } => {
+                config.quotes
+                    && consecutive(body)
+                    && if body.len() == 1
+                        && unattributed_quote_body(&section.blocks[body[0]]).is_some()
+                    {
+                        unattributed_quote_body(&section.blocks[body[0]])
+                            .unwrap()
+                            .last()
+                            .is_some_and(|text| quote_sources::split_credit(text, credit).is_some())
+                    } else {
+                        text_ids(body)
+                            && body.last().is_some_and(|id| {
+                                quote_sources::split_credit(
+                                    paragraph(&section.blocks[*id]).unwrap(),
+                                    credit,
+                                )
+                                .is_some()
+                            })
+                    }
+            }
+            Proposal::SectionHeading { block } => {
+                config.headings && headings::candidate(&section.blocks[*block]).is_some()
+            }
+            Proposal::Quote {
+                body, attribution, ..
+            } => {
+                config.quotes
+                    && consecutive(body)
+                    && text_ids(body)
+                    && match attribution {
+                        Some(id) => {
+                            body.last().and_then(|last| last.checked_add(1)) == Some(*id)
+                                && text_ids(&[*id])
+                                && quote_sources::credit_like(&text_block_text(
+                                    paragraph(&section.blocks[*id]).unwrap(),
+                                ))
+                        }
+                        None => paragraph_groups
+                            .iter()
+                            .any(|group| group.clone().eq(body.iter().copied())),
+                    }
+            }
+            Proposal::Figure { images, captions } => {
+                config.captions
+                    && consecutive(images)
+                    && consecutive(captions)
+                    && text_ids(captions)
+                    && images.iter().all(|id| image_needs_caption(section, *id))
+                    && (images.last().and_then(|id| id.checked_add(1)) == captions.first().copied()
+                        || captions.last().and_then(|id| id.checked_add(1))
+                            == images.first().copied())
+            }
+            Proposal::QuoteAttribution {
+                quote,
+                attribution,
+                body_index,
+            } => {
+                config.quotes
+                    && unattributed_quote_body(&section.blocks[*quote]).is_some_and(|body| {
+                        match (*attribution, *body_index) {
+                            (Some(id), None) => {
+                                quote.checked_add(1) == Some(id)
+                                    && attribution_text(&section.blocks[id]).is_some_and(|text| {
+                                        quote_sources::credit_like(&text_block_text(text))
+                                    })
+                            }
+                            (None, Some(index)) => {
+                                index > 0
+                                    && index.checked_add(1) == Some(body.len())
+                                    && body[index].source.is_some()
+                                    && quote_sources::credit_like(&text_block_text(&body[index]))
+                            }
+                            _ => false,
+                        }
+                    })
+            }
+        };
+        if !valid {
+            return Err(format!(
+                "Invalid semantic group {ids:?}: use existing eligible IDs, preserve protected blocks and order, and avoid overlaps. Caption and external attribution IDs must be adjacent to their target. Quote completion requires a quote without attribution and exactly one eligible external credit or last-body index."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn annotation(group: &Proposal, section: &Section) -> Annotation {
+    let range = |id: &usize| {
+        source(&section.blocks[*id])
+            .expect("validated source")
+            .clone()
+    };
+    match group {
+        Proposal::CodeOrQuote {
+            body,
+            presentation,
+            language,
+            captions,
+            sources,
+            body_index,
+        } => Annotation::CodeOrQuote {
+            body: body
+                .iter()
+                .map(|i| {
+                    code_blocks::anchor(&section.blocks[*i])
+                        .expect("validated authored block")
+                        .clone()
+                })
+                .collect(),
+            presentation: *presentation,
+            language: language.clone(),
+            captions: captions
+                .iter()
+                .map(|i| {
+                    code_blocks::attachment_anchor(&section.blocks[*i])
+                        .unwrap()
+                        .clone()
+                })
+                .collect(),
+            sources: sources
+                .iter()
+                .map(|i| {
+                    code_blocks::attachment_anchor(&section.blocks[*i])
+                        .unwrap()
+                        .clone()
+                })
+                .collect(),
+            credit: body_index.map(|i| {
+                code_blocks::body(&section.blocks[*body.last().unwrap()]).unwrap()[i]
+                    .source
+                    .clone()
+                    .unwrap()
+            }),
+        },
+        Proposal::QuoteBefore {
+            body,
+            attribution,
+            alignment,
+        } => Annotation::QuoteBefore {
+            body: body.iter().map(range).collect(),
+            attribution: range(attribution),
+            alignment: *alignment,
+        },
+        Proposal::QuoteInline {
+            body,
+            credit,
+            alignment,
+        } => Annotation::QuoteInline {
+            body: body
+                .iter()
+                .map(|id| {
+                    source(&section.blocks[*id])
+                        .or_else(|| quote_anchor(&section.blocks[*id]))
+                        .unwrap()
+                        .clone()
+                })
+                .collect(),
+            credit: credit.clone(),
+            alignment: *alignment,
+        },
+        Proposal::SectionHeading { block } => Annotation::SectionHeading {
+            source: range(block),
+        },
+        Proposal::Quote {
+            body,
+            attribution,
+            alignment,
+        } => Annotation::Quote {
+            body: body.iter().map(range).collect(),
+            attribution: attribution.as_ref().map(range),
+            alignment: *alignment,
+        },
+        Proposal::Figure { images, captions } => Annotation::Figure {
+            images: images.iter().map(range).collect(),
+            captions: captions.iter().map(range).collect(),
+            before: captions[0] < images[0],
+        },
+        Proposal::QuoteAttribution {
+            quote,
+            attribution,
+            body_index,
+        } => Annotation::QuoteAttribution {
+            quote: quote_anchor(&section.blocks[*quote])
+                .expect("validated quote")
+                .clone(),
+            attribution: attribution.map_or_else(
+                || {
+                    unattributed_quote_body(&section.blocks[*quote]).unwrap()[body_index.unwrap()]
+                        .source
+                        .clone()
+                        .unwrap()
+                },
+                |id| source(&section.blocks[id]).unwrap().clone(),
+            ),
+            inside: body_index.is_some(),
+        },
+    }
+}
+
+// Resolve against source ranges, never translated block indices. Bilingual
+// companion paragraphs have no source and stay attached to their original.
+fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
+    if let Annotation::TableChart {
+        source,
+        members,
+        svg,
+        ..
+    } = annotation
+    {
+        enhancements::apply_chart(blocks, source, members, svg);
+        return;
+    }
+    if matches!(annotation, Annotation::FormulaNotes { .. }) {
+        return;
+    }
+    if let Annotation::CodeOrQuote {
+        body,
+        presentation,
+        language,
+        captions,
+        sources,
+        credit,
+    } = annotation
+    {
+        code_blocks::compose(
+            blocks,
+            body,
+            *presentation,
+            language.as_deref(),
+            captions,
+            sources,
+            credit.as_ref(),
+        );
+        return;
+    }
+    if let Annotation::ImageTable { href, table } = annotation {
+        image_tables::compose(blocks, href, table);
+        return;
+    }
+    if let Annotation::ImageText { href, text } = annotation {
+        formulas::compose_text(blocks, href, text);
+        return;
+    }
+    if let Annotation::TextFormulas { source, spans } = annotation {
+        text_formulas::compose(blocks, source, spans);
+        return;
+    }
+    if let Annotation::UnreadableFormula { href } = annotation {
+        formulas::compose(blocks, href, None);
+        return;
+    }
+    if let Annotation::ImageFormula { href, formula } = annotation {
+        formulas::compose(blocks, href, Some(formula));
+        return;
+    }
+    if let Annotation::InlineCitations { source, spans } = annotation {
+        citations::compose(blocks, source, spans);
+        return;
+    }
+    if quote_sources::compose(blocks, annotation) {
+        return;
+    }
+    if let Annotation::SectionHeading { source } = annotation {
+        headings::compose(blocks, source);
+        return;
+    }
+    if let Annotation::QuoteAttribution {
+        quote,
+        attribution,
+        inside,
+    } = annotation
+    {
+        complete_quote_attribution(blocks, quote, attribution, *inside);
+        return;
+    }
+    let ranges: Vec<_> = match annotation {
+        Annotation::Quote {
+            body, attribution, ..
+        } => body.iter().chain(attribution).collect(),
+        Annotation::Figure {
+            images,
+            captions,
+            before,
+        } => {
+            if *before {
+                captions.iter().chain(images).collect()
+            } else {
+                images.iter().chain(captions).collect()
+            }
+        }
+        Annotation::CodeOrQuote { .. }
+        | Annotation::QuoteAttribution { .. }
+        | Annotation::SectionHeading { .. }
+        | Annotation::QuoteBefore { .. }
+        | Annotation::QuoteInline { .. }
+        | Annotation::InlineCitations { .. }
+        | Annotation::TextFormulas { .. }
+        | Annotation::ImageTable { .. }
+        | Annotation::ImageText { .. }
+        | Annotation::ImageFormula { .. }
+        | Annotation::TableChart { .. }
+        | Annotation::FormulaNotes { .. }
+        | Annotation::UnreadableFormula { .. } => unreachable!(),
+    };
+    let positions: Option<Vec<_>> = ranges
+        .iter()
+        .map(|range| {
+            blocks
+                .iter()
+                .position(|block| source(block) == Some(*range))
+        })
+        .collect();
+    let Some(positions) = positions else {
+        return;
+    };
+    let Some(&start) = positions.first() else {
+        return;
+    };
+    let mut end = positions.last().copied().unwrap() + 1;
+    if end <= start {
+        return;
+    }
+    if matches!(blocks.get(end), Some(Block::Text(text)) if text.source.is_none()) {
+        end += 1;
+    }
+    let present: Vec<_> = blocks[start..end].iter().filter_map(source).collect();
+    if present != ranges
+        || blocks[start..end]
+            .iter()
+            .any(|b| !matches!(b, Block::Text(_) | Block::Image(_)))
+    {
+        return;
+    }
+    let spanning = Some(SourceRange {
+        start: ranges[0].start.clone(),
+        end: ranges.last().unwrap().end.clone(),
+    });
+    let selected = blocks[start..end].to_vec();
+    let replacement = match annotation {
+        Annotation::Quote {
+            attribution,
+            alignment,
+            ..
+        } => {
+            let mut credit: Option<TextBlock> = None;
+            let mut body = Vec::new();
+            let mut in_credit = false;
+            for block in selected {
+                let Block::Text(mut text) = block else {
+                    return;
+                };
+                if attribution
+                    .as_ref()
+                    .is_some_and(|range| text.source.as_ref() == Some(range))
+                {
+                    in_credit = true;
+                }
+                text.kind = if in_credit {
+                    TextBlockKind::QuoteAttribution
+                } else {
+                    TextBlockKind::Blockquote
+                };
+                if in_credit {
+                    if let Some(credit) = &mut credit {
+                        credit.content.push(Inline::Break);
+                        credit.content.extend(text.content);
+                    } else {
+                        credit = Some(text);
+                    }
+                } else {
+                    text.style.semantic_alignment = alignment.map(QuoteAlignment::text_alignment);
+                    body.push(text);
+                }
+            }
+            Block::Quote(QuoteBlock {
+                body,
+                attribution: credit,
+                source: spanning,
+            })
+        }
+        Annotation::Figure { before, .. } => compose_figure(selected, *before, spanning),
+        Annotation::CodeOrQuote { .. }
+        | Annotation::QuoteAttribution { .. }
+        | Annotation::SectionHeading { .. }
+        | Annotation::QuoteBefore { .. }
+        | Annotation::QuoteInline { .. }
+        | Annotation::InlineCitations { .. }
+        | Annotation::TextFormulas { .. }
+        | Annotation::ImageTable { .. }
+        | Annotation::ImageText { .. }
+        | Annotation::ImageFormula { .. }
+        | Annotation::TableChart { .. }
+        | Annotation::FormulaNotes { .. }
+        | Annotation::UnreadableFormula { .. } => unreachable!(),
+    };
+    blocks.splice(start..end, [replacement]);
+}
+
+fn compose_figure(selected: Vec<Block>, before: bool, source: Option<SourceRange>) -> Block {
+    let mut images = Vec::new();
+    let mut captions = Vec::new();
+    for block in selected {
+        match block {
+            Block::Image(image) => images.push(image),
+            Block::Text(mut text) => {
+                text.kind = TextBlockKind::Caption;
+                captions.push(text);
+            }
+            _ => unreachable!("composition only accepts text and image blocks"),
+        }
+    }
+    Block::Figure(FigureBlock {
+        body: Vec::new(),
+        images,
+        captions,
+        caption_position: if before {
+            CaptionPosition::Before
+        } else {
+            CaptionPosition::After
+        },
+        style: rebook_publication::BlockStyle::default(),
+        source,
+    })
+}
+
+fn complete_quote_attribution(
+    blocks: &mut Vec<Block>,
+    anchor: &SourceRange,
+    credit_source: &SourceRange,
+    inside: bool,
+) {
+    let Some(index) = blocks.iter().position(|block| {
+        quote_anchor(block) == Some(anchor) && unattributed_quote_body(block).is_some()
+    }) else {
+        return;
+    };
+    let standalone = matches!(blocks[index], Block::Text(_));
+    let mut quote = match &blocks[index] {
+        Block::Quote(quote) => quote.clone(),
+        Block::Text(text) => QuoteBlock {
+            body: vec![text.clone()],
+            attribution: None,
+            source: text.source.clone(),
+        },
+        _ => return,
+    };
+    let mut end = index + 1;
+    let parts = if inside {
+        let Some(child) = quote
+            .body
+            .iter()
+            .position(|text| text.source.as_ref() == Some(credit_source))
+        else {
+            return;
+        };
+        if child == 0
+            || quote.body[child + 1..]
+                .iter()
+                .any(|text| text.source.is_some())
+        {
+            return;
+        }
+        quote.body.split_off(child)
+    } else {
+        if standalone
+            && let Some(Block::Text(companion)) = blocks.get(end)
+            && companion.source.is_none()
+        {
+            quote.body.push(companion.clone());
+            end += 1;
+        }
+        let Some(Block::Text(credit)) = blocks.get(end) else {
+            return;
+        };
+        if credit.source.as_ref() != Some(credit_source) {
+            return;
+        }
+        let mut parts = vec![credit.clone()];
+        end += 1;
+        if let Some(Block::Text(companion)) = blocks.get(end)
+            && companion.source.is_none()
+        {
+            parts.push(companion.clone());
+            end += 1;
+        }
+        parts
+    };
+    let mut parts = parts.into_iter();
+    let Some(mut credit) = parts.next() else {
+        return;
+    };
+    credit.kind = TextBlockKind::QuoteAttribution;
+    for companion in parts {
+        credit.content.push(Inline::Break);
+        credit.content.extend(companion.content);
+    }
+    quote.attribution = Some(credit);
+    quote.source = Some(SourceRange {
+        start: anchor.start.clone(),
+        end: credit_source.end.clone(),
+    });
+    blocks.splice(index..end, [Block::Quote(quote)]);
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod local_perf_tests;
+
+#[cfg(test)]
+mod attribution_tests;
+
+pub fn apply_translation_citations(section: &mut Section, result: &Recognition) {
+    image_tables::prepare(section, result);
+    apply_text_translation_citations(section, result);
+}
+
+fn apply_text_translation_citations(section: &mut Section, result: &Recognition) {
+    for annotation in &result.annotations {
+        if let Annotation::InlineCitations { source, spans } = annotation {
+            citations::compose(&mut section.blocks, source, spans);
+        }
+        if let Annotation::TextFormulas { source, spans } = annotation {
+            text_formulas::compose(&mut section.blocks, source, spans);
+        }
+    }
+}
