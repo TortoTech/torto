@@ -162,3 +162,7 @@ Torto 仍在持续开发中。当前不支持带 DRM 的电子书；原始版式
 本项目基于 [GNU Affero General Public License v3.0](LICENSE)（`AGPL-3.0-only`）开源。
 
 Android 新架构预览：[构建步骤与当前功能范围](docs/android.md)
+
+## 鸣谢
+
+- [Linux.do](https://linux.do)

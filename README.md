@@ -162,3 +162,7 @@ Report reproducible issues in [GitHub Issues](https://github.com/TortoTech/torto
 ## License
 
 Torto is available under the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`).
+
+## Acknowledgments
+
+- [Linux.do](https://linux.do)
