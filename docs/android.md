@@ -77,6 +77,8 @@ Android 保留 Android Keystore 不可导出密钥及逐项 AES-GCM 密文，使
 
 前置：仓库固定 Rust toolchain、JDK 17、Android SDK 36、NDK `28.2.13676358`、`cargo-ndk 4.1.2`。
 
+Linux 构建宿主还需安装 `pkg-config` 和 `libfontconfig1-dev`（Debian／Ubuntu）；它们供宿主上的 UniFFI 生成器使用，不进入 Android 安装包。
+
 ```sh
 rustup target add aarch64-linux-android x86_64-linux-android
 cargo install cargo-ndk --version 4.1.2 --locked
