@@ -24,7 +24,7 @@ mod smoke;
 mod statistics;
 mod sync;
 mod ui;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod updater;
 
 use std::env;
@@ -41,6 +41,15 @@ static ALLOCATOR: rebook_windows_window_background::CountingAllocator =
     rebook_windows_window_background::CountingAllocator;
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--torto-update-helper")) {
+        return match env::args_os().nth(2).map(PathBuf::from)
+            .ok_or_else(|| "Missing update job".to_string())
+            .and_then(|path| updater::macos::helper(&path)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => { eprintln!("{error}"); ExitCode::FAILURE }
+        };
+    }
     let result = run();
     let error = result.as_ref().err().map(ToString::to_string);
     diagnostics::log(
@@ -106,9 +115,22 @@ fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
         .next()
         .and_then(|value| value.into_string().ok())
         .unwrap_or_else(|| "torto".into());
-    let Some(first) = arguments.next() else {
+    let Some(mut first) = arguments.next() else {
         return Ok(LaunchMode::Shelf);
     };
+    #[cfg(target_os = "macos")]
+    if first == "--torto-update-health" || first == "--torto-update-rollback" {
+        let path = arguments.next().ok_or("Missing update session path")?;
+        if first == "--torto-update-health" {
+            updater::macos::set_health_job(PathBuf::from(path)).map_err(io::Error::other)?;
+        } else {
+            updater::macos::set_rollback_job(PathBuf::from(path)).map_err(io::Error::other)?;
+        }
+        // Normal relaunch opens the shelf. The existing smoke mode can follow
+        // the prefix to verify the first-frame handshake in an isolated profile.
+        let Some(next) = arguments.next() else { return Ok(LaunchMode::Shelf); };
+        first = next;
+    }
     if first == "--smoke-test"
         || first == "--smoke-test-open-event"
         || first == "--smoke-test-minimize"

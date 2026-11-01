@@ -181,6 +181,10 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           ARCH: ${{ matrix.arch }}
+          TORTO_MACOS_UPDATE_SIGNING_KEY: ${{ secrets.TORTO_MACOS_UPDATE_SIGNING_KEY }}
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+          CARGO_PROFILE_RELEASE_STRIP: "none"
+          CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "packed"
         shell: bash
         run: |
           set -euo pipefail
@@ -192,6 +196,13 @@ jobs:
           mkdir -p "$staging_dir"
           ditto "$app_bundle" "$staging_dir/Torto.app"
           ln -s /Applications "$staging_dir/Applications"
+
+          # The helper consumes the signed app directly, without mounting a DMG.
+          python3 scripts/package-macos-update.py "$app_bundle" dist "$TORTO_VERSION" "$ARCH"
+          cargo run --locked --release --package rebook-app-core --example sign-macos-update \
+            --target "$TARGET" -- "dist/Torto-$TORTO_VERSION-macos-$ARCH.zip" "$TORTO_VERSION"
+          python3 scripts/smoke/macos-update.py \
+            "target/$TARGET/release/torto" "target/$TARGET/release/examples/sign-macos-update"
 
           echo "Disk usage before cleaning release artifacts:"
           df -h .
@@ -254,6 +265,8 @@ jobs:
           name: Torto-${{ steps.version.outputs.version }}-macos-${{ matrix.arch }}
           path: |
             dist/*.dmg
+            dist/*.zip
+            dist/*.sig.json
             dist/*.sha256
           if-no-files-found: error
 
@@ -291,6 +304,8 @@ jobs:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
           files: |
             dist/*.dmg
+            dist/*.zip
+            dist/*.sig.json
             dist/*.sha256
           fail_on_unmatched_files: true
           # Release notes are created once by the publishing flow. Asset jobs

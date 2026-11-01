@@ -204,6 +204,19 @@ pub fn flush() {
     }
 }
 
+/// Worker-side durability barrier used before replacing the running application.
+pub fn flush_checked() -> Result<(), String> {
+    let (tx, rx) = mpsc::channel();
+    service().sender.send(Write::Flush(tx))
+        .map_err(|_| "Statistics writer is unavailable".to_string())?;
+    rx.recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "Timed out saving reading statistics".to_string())?;
+    if service().failed.load(Ordering::Relaxed) {
+        return Err("Reading statistics could not be saved".into());
+    }
+    Ok(())
+}
+
 pub struct Tracker {
     fraction: Duration,
     book: String,
@@ -218,6 +231,10 @@ pub struct Tracker {
     offset: i32,
 }
 impl Tracker {
+    pub fn flush_pending(&mut self) {
+        self.save();
+    }
+
     pub fn completion_summary(&mut self) -> SyncResult<(u64, Option<String>)> {
         self.save();
         flush();

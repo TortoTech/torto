@@ -85,11 +85,11 @@ pub(crate) struct SettingsFeature {
     provider_models_cache: HashMap<String, Vec<String>>,
     provider_models_errors: HashMap<String, String>,
     provider_models_loading: Option<String>,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     update_check_requested: bool,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     update_requested: bool,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     update_check_status: UpdateCheckStatus,
 }
 
@@ -188,11 +188,11 @@ impl SettingsFeature {
             provider_models_cache: HashMap::new(),
             provider_models_errors: HashMap::new(),
             provider_models_loading: None,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             update_check_requested: false,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             update_requested: false,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             update_check_status: UpdateCheckStatus::Idle,
         }
     }
@@ -314,17 +314,17 @@ impl SettingsFeature {
         }
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub(crate) fn take_update_check_request(&mut self) -> bool {
         std::mem::take(&mut self.update_check_requested)
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub(crate) fn take_update_request(&mut self) -> bool {
         std::mem::take(&mut self.update_requested)
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub(crate) fn complete_update_check(
         &mut self,
         result: crate::updater::ManualUpdateCheckResult,
@@ -720,7 +720,7 @@ impl ShortcutAction {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 enum UpdateCheckStatus {
     Idle,
     Checking,

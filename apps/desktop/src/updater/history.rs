@@ -162,6 +162,7 @@ mod tests {
         )
         .unwrap();
         let target = UpdateRelease {
+            macos_signature: None,
             version: "0.10.0".into(),
             notes: "authoritative".into(),
             asset: UpdateAsset {

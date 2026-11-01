@@ -17,14 +17,17 @@ use sha2::{Digest, Sha256};
 
 use crate::async_task::{TaskResult, TaskSlot};
 use crate::http::github;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use crate::platform::UserEvent;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
 use crate::preferences::AppLanguage;
 use crate::ui::{dialog_action_button, palette};
 
 #[cfg(test)]
 #[path = "updater/asset_download_tests.rs"]
 mod asset_download_tests;
+#[cfg(any(target_os = "windows", test))]
 const WINDOWS_INSTALL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $targetProcess = Get-Process -Id ([int]$env:TORTO_UPDATE_PARENT_PID) -ErrorAction SilentlyContinue
@@ -58,7 +61,7 @@ enum UpdateState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct InstallRequest {
-    update: DownloadedUpdate,
+    pub(crate) update: DownloadedUpdate,
 }
 
 #[derive(Debug)]
@@ -74,7 +77,7 @@ pub(crate) enum ManualUpdateCheckResult {
     Failed(String),
 }
 
-pub(crate) struct WindowsUpdater {
+pub(crate) struct DesktopUpdater {
     check_task: TaskSlot<()>,
     download_task: TaskSlot<UpdateRelease>,
     history_task: TaskSlot<UpdateRelease>,
@@ -84,9 +87,11 @@ pub(crate) struct WindowsUpdater {
     manual_check: bool,
     dialog_visible: bool,
     release_notes_cache: CommonMarkCache,
+    #[cfg(target_os = "macos")]
+    rollback_notice: bool,
 }
 
-impl WindowsUpdater {
+impl DesktopUpdater {
     pub(crate) fn new() -> Self {
         let mut check_task = TaskSlot::default();
         if automatic_check_enabled() {
@@ -102,10 +107,12 @@ impl WindowsUpdater {
             manual_check: false,
             dialog_visible: false,
             release_notes_cache: CommonMarkCache::default(),
+            #[cfg(target_os = "macos")]
+            rollback_notice: macos::was_rolled_back(),
         }
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub(crate) fn spawn_pending_tasks(
         &mut self,
         runtime: &tokio::runtime::Runtime,
@@ -147,7 +154,7 @@ impl WindowsUpdater {
     }
 
     pub(crate) fn request_check(&mut self) {
-        if !manual_updates_supported() {
+        if !manual_updates_supported() || matches!(self.state, UpdateState::Installing) {
             return;
         }
         self.manual_check = true;
@@ -245,6 +252,25 @@ impl WindowsUpdater {
         reason = "the update modal keeps its state-specific actions in one auditable flow"
     )]
     pub(crate) fn overlay(&mut self, ctx: &egui::Context, language: AppLanguage) {
+        #[cfg(target_os = "macos")]
+        if self.rollback_notice {
+            crate::ui::modal(ctx, egui::Id::unique("update-rollback"), 0.42)
+                .frame(egui::Frame::new().fill(palette().surface).corner_radius(12).inner_margin(22))
+                .show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.label(language.text("新版未能正常启动，已恢复到更新前的版本", "The update could not start. Your previous version has been restored"));
+                    if ui.button(language.text("知道了", "OK")).clicked() { self.rollback_notice = false; }
+                });
+            return;
+        }
+        if matches!(self.state, UpdateState::Installing) {
+            crate::ui::modal(ctx, egui::Id::unique("desktop-installing"), 0.42)
+                .frame(egui::Frame::new().fill(palette().surface).corner_radius(12).inner_margin(22))
+                .show(ctx, |ui| {
+                    ui.label(language.text("正在准备更新并保存阅读记录…", "Preparing update and saving reading data…"));
+                });
+            return;
+        }
         if !self.dialog_visible {
             return;
         }
@@ -341,7 +367,7 @@ impl WindowsUpdater {
                             ui.label(language.text("正在下载…", "Downloading…"));
                         }
                         UpdateDialogView::Ready(_) | UpdateDialogView::InstallFailed(_, _) => {
-                            if dialog_action_button(ui, language.text("安装", "Install"), true)
+                            if dialog_action_button(ui, language.text("安装并重启", "Install and restart"), true)
                                 .clicked()
                             {
                                 action = Some(UpdateAction::Install);
@@ -378,6 +404,9 @@ impl WindowsUpdater {
             }
             Some(UpdateAction::Install) => {
                 if let Some(update) = view.downloaded() {
+                    self.check_task.cancel();
+                    self.history_task.cancel();
+                    self.manual_check = false;
                     self.install_request = Some(InstallRequest {
                         update: update.clone(),
                     });
@@ -397,6 +426,7 @@ impl WindowsUpdater {
         if !matches!(self.state, UpdateState::Installing) {
             return;
         }
+        self.dialog_visible = true;
         self.state = UpdateState::InstallFailed {
             update: request.update,
             message,
@@ -519,7 +549,13 @@ pub(crate) fn manual_updates_supported() -> bool {
 }
 
 async fn check_for_update() -> Result<Option<UpdateRelease>, String> {
-    check_for_update_version(env!("CARGO_PKG_VERSION")).await
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let platform = Platform::MacosArm64;
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    let platform = Platform::MacosX64;
+    #[cfg(not(target_os = "macos"))]
+    let platform = Platform::WindowsX64;
+    check_release(env!("CARGO_PKG_VERSION"), platform, UpdateSource::Automatic).await
 }
 
 #[cfg(test)]
@@ -559,7 +595,7 @@ mod tests {
         let release = release_from_github(github_release("v0.9.0", Some(&digest)), "0.8.3")
             .unwrap()
             .unwrap();
-        let mut updater = WindowsUpdater::new();
+        let mut updater = DesktopUpdater::new();
         updater.check_task.cancel();
         updater.state = UpdateState::Available(release.clone());
         updater.begin_history(&release);
@@ -649,6 +685,7 @@ mod tests {
                 browser_download_url: "https://gitee.com/TortoTech/torto/releases/download/v0.2.12/Torto-0.2.12-x86_64.msi".into() }],
         };
         let manifest = GiteeManifest {
+            macos_signature: None,
             version: "0.2.12".into(),
             tag: "v0.2.12".into(),
             asset: ManifestAsset {
@@ -815,7 +852,7 @@ mod tests {
         let release = release_from_github(github_release("v0.2.12", Some(&digest)), "0.2.11")
             .unwrap()
             .unwrap();
-        let mut updater = WindowsUpdater::new();
+        let mut updater = DesktopUpdater::new();
         updater.state = UpdateState::Available(release);
         let ctx = egui::Context::default();
         crate::ui::apply_interface_typography(
@@ -859,7 +896,7 @@ mod tests {
         let release = release_from_github(github_release("v0.2.12", Some(&digest)), "0.2.11")
             .unwrap()
             .unwrap();
-        let mut updater = WindowsUpdater::new();
+        let mut updater = DesktopUpdater::new();
 
         updater.request_update();
         assert!(!updater.dialog_visible);

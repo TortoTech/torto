@@ -3469,6 +3469,19 @@ impl DesktopReader {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn update_save_job(&mut self) -> Box<dyn FnOnce() -> Result<(), String> + Send> {
+        self.statistics.flush_pending();
+        let pending = self.progress_store.clone()
+            .map(|store| (store, self.book_id.clone(), self.progress_locator()));
+        Box::new(move || {
+            if let Some((store, id, locator)) = pending {
+                store.save_progress(&id, &locator).map_err(|e| e.to_string())?;
+            }
+            crate::statistics::flush_checked()
+        })
+    }
+
     pub(crate) fn prepare_for_shutdown(&self) {
         self.persist_progress();
     }

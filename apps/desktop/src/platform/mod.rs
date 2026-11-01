@@ -26,8 +26,13 @@ pub(crate) enum UserEvent {
     },
     #[cfg(target_os = "macos")]
     OpenBook(std::path::PathBuf),
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     Update(crate::updater::UpdateTaskMessage),
+    #[cfg(target_os = "macos")]
+    MacUpdatePrepared {
+        request: crate::updater::InstallRequest,
+        result: Result<(), String>,
+    },
     ShelfImport(crate::shelf::ShelfImportTaskMessage),
     ShelfOpen(crate::shelf::OpenTaskMessage),
     ShelfOpenHeader(crate::shelf::OpenHeaderMessage),

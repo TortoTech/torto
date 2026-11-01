@@ -8,6 +8,7 @@ import path from 'node:path';
 import { createArtifactSource, createAssetDownloader, artifactName } from './sync-gitee-release.mjs';
 import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease, updateManifest, request, uploadAttachment } from './sync-gitee-release.mjs';
 import { gitPushDiagnostics } from './sync-gitee-release.mjs';
+import { macosUpdateManifest } from './sync-gitee-release.mjs';
 
 test('git push errors distinguish transport, permission and timeout failures without printing secrets', () => {
   const details = gitPushDiagnostics({status:128, stderr:Buffer.from('error: RPC failed; HTTP 502 curl 92 HTTP/2 stream 3 was not closed cleanly\nfatal: the remote end hung up unexpectedly\nsecret-token https://user:secret-token@example.test/private')});
@@ -24,6 +25,35 @@ const release = () => ({
   tag_name: 'v0.7.0', name: 'Torto 0.7.0', body: 'Updated notes', draft: false, prerelease: false,
   assets: requiredAssets('v0.7.0').map(name => ({ name, size: bytes.length, digest,
     browser_download_url: `https://github.com/TortoTech/torto/releases/download/v0.7.0/${name}` })),
+});
+
+// Golden signature authenticates only the inert string "installer fixture" for
+// an old version, never an installable bundle. No private key is needed in tests.
+const macSignature = {version:'0.7.0', name:'Torto-0.7.0-macos-arm64.zip', size:17,
+  sha256:'b97d800ba8d0420dc6a0342045a15a97d785bd61d4cf9902d0c334ba32ec188b',
+  signature:'MBuJ82GTbhIxqMGGBGjjrctJQfjel5jdgKPe4d/QV8XQxzgbArO0X9I5T/a6u4ykClwgz6FSD3WdVODnYoG2CQ=='};
+
+test('macOS mirror manifests bind the pinned publisher signature to the matching ZIP', () => {
+  const r = release();
+  r.assets.push({...r.assets[0], name:macSignature.name});
+  const result = macosUpdateManifest(r, 'arm64', macSignature);
+  assert.equal(result.asset.name, 'torto-macos-arm64-update.json');
+  assert.deepEqual(JSON.parse(result.bytes).macos_signature, macSignature);
+  assert.equal(artifactName({name:macSignature.name + '.sig.json'}), 'Torto-0.7.0-macos-arm64');
+  for (const field of ['signature', 'sha256', 'name', 'version', 'size']) {
+    const invalid = {...macSignature, [field]:field === 'size' ? 18 : 'invalid'};
+    assert.throws(() => macosUpdateManifest(r, 'arm64', invalid));
+  }
+  assert.throws(() => macosUpdateManifest(r, 'x86_64', macSignature));
+  assert.equal(validateRelease(r).length, 5); // both ZIP sets must complete first
+  for (const arch of ['arm64','x86_64']) {
+    for (const suffix of ['.zip','.zip.sha256','.zip.sig.json']) {
+      const name = `Torto-0.7.0-macos-${arch}${suffix}`;
+      if (!r.assets.some(a => a.name === name)) r.assets.push({...r.assets[0], name,
+        browser_download_url:`https://github.com/TortoTech/torto/releases/download/v0.7.0/${name}`});
+    }
+  }
+  assert.deepEqual(validateRelease(r), []);
 });
 
 function temporary(t) {
@@ -271,4 +301,40 @@ test('does not mark a mirror verified when remote content is corrupt', async () 
     throw new Error('Must not update notes on failed verification');
   };
   await assert.rejects(syncRelease(source, api, async () => Buffer.alloc(bytes.length)), /verification failed/);
+});
+
+test('macOS completion markers follow remote verification and resume without duplicate uploads', async () => {
+  const source = release(), payloads = new Map(source.assets.map(a => [a.name, bytes]));
+  for (const arch of ['arm64', 'x86_64']) {
+    const sig = {...macSignature, name:`Torto-0.7.0-macos-${arch}.zip`};
+    if (arch === 'x86_64') sig.signature = 'iRv52/c5Igt1yPooZXTLoFuZIHE1FhndvnNKSUb/8iiUbF1hDDcNfYHb14/B1bwnYzTnITAHfNDIuE13WUWnDg==';
+    for (const [name, content] of [[sig.name, bytes], [sig.name + '.sha256', bytes], [sig.name + '.sig.json', Buffer.from(JSON.stringify(sig))]]) {
+      payloads.set(name, content);
+      source.assets.push({name, size:content.length, digest:`sha256:${createHash('sha256').update(content).digest('hex')}`,
+        browser_download_url:`https://github.com/TortoTech/torto/releases/download/v0.7.0/${name}`});
+    }
+  }
+  assert.deepEqual(validateRelease(source), []);
+  const files = [], verified = new Set();
+  const api = async (method, _suffix, data) => {
+    if (method === 'GET') return {id:1};
+    if (method === 'LIST') return [...files];
+    if (method === 'UPLOAD') {
+      if (data.asset.name.startsWith('torto-')) assert.equal(verified.size, source.assets.length);
+      files.push(data.asset); payloads.set(data.asset.name, data.bytes); return {};
+    }
+    if (method === 'PATCH') return {};
+    throw new Error(`Unexpected operation ${method}`);
+  };
+  const download = async asset => {
+    if (asset.browser_download_url.startsWith('https://gitee.com/') && !asset.name.startsWith('torto-')) verified.add(asset.name);
+    return payloads.get(asset.name);
+  };
+  await syncRelease(source, api, download);
+  await syncRelease(source, api, download);
+  assert.equal(files.length, source.assets.length + 3);
+  for (const arch of ['arm64','x86_64']) {
+    const marker = JSON.parse(payloads.get(`torto-macos-${arch}-update.json`));
+    assert.equal(marker.macos_signature.name, `Torto-0.7.0-macos-${arch}.zip`);
+  }
 });

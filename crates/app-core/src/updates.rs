@@ -14,14 +14,24 @@ pub enum Platform {
     WindowsX64,
     AndroidArm64,
     AndroidX64,
+    MacosArm64,
+    MacosX64,
 }
 impl Platform {
-    pub const ALL: [Self; 3] = [Self::WindowsX64, Self::AndroidArm64, Self::AndroidX64];
+    pub const ALL: [Self; 5] = [
+        Self::WindowsX64, Self::AndroidArm64, Self::AndroidX64,
+        Self::MacosArm64, Self::MacosX64,
+    ];
+    pub fn is_macos(self) -> bool {
+        matches!(self, Self::MacosArm64 | Self::MacosX64)
+    }
     pub fn suffix(self) -> &'static str {
         match self {
             Self::WindowsX64 => "-x86_64.msi",
             Self::AndroidArm64 => "-android-arm64-v8a.apk",
             Self::AndroidX64 => "-android-x86_64.apk",
+            Self::MacosArm64 => "-macos-arm64.zip",
+            Self::MacosX64 => "-macos-x86_64.zip",
         }
     }
     pub fn name(self, version: &str) -> String {
@@ -30,6 +40,8 @@ impl Platform {
     pub fn manifest(self) -> &'static str {
         match self {
             Self::WindowsX64 => "torto-update.json",
+            Self::MacosArm64 => "torto-macos-arm64-update.json",
+            Self::MacosX64 => "torto-macos-x86_64-update.json",
             _ => "torto-android-update.json",
         }
     }
@@ -40,11 +52,15 @@ pub enum UpdateSource {
     Github,
     Gitee,
 }
+pub mod macos_auth;
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateRelease {
     pub version: String,
     pub notes: String,
     pub asset: UpdateAsset,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub macos_signature: Option<macos_auth::SignedUpdate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -120,6 +136,19 @@ pub async fn check_release(
     }
 }
 
+async fn read_signature_body(mut response: reqwest::Response, expected: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if bytes.len() + chunk.len() > 8192 {
+            return Err("Update signature exceeds 8 KiB".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() as u64 != expected {
+        return Err("Incomplete update signature".into());
+    }
+    Ok(bytes)
+}
 async fn read_metadata<T:serde::de::DeserializeOwned>(mut response:reqwest::Response)->Result<T,String>{
     let mut bytes=Vec::new();while let Some(chunk)=response.chunk().await.map_err(|e|e.to_string())?{if bytes.len()+chunk.len()>2*1024*1024{return Err("Release metadata exceeds 2 MiB".into());}bytes.extend_from_slice(&chunk);}
     serde_json::from_slice(&bytes).map_err(|e|e.to_string())
@@ -135,8 +164,26 @@ pub async fn check_github_platform(
         .map_err(|error| error.to_string())?
         .error_for_status()
         .map_err(|error| error.to_string())?;
-    let release:GitHubRelease=read_metadata(response).await?;
-    release_from_github_platform(release, current, platform)
+    let release: GitHubRelease = read_metadata(response).await?;
+    let signature_name = format!("{}.sig.json", platform.name(release.tag_name.trim_start_matches('v')));
+    let signature = release.assets.iter().find(|a| a.name == signature_name)
+        .map(|a| (a.id, a.name.clone(), a.browser_download_url.clone(), a.size));
+    let tag = release.tag_name.clone();
+    let mut update = release_from_github_platform(release, current, platform)?;
+    if let Some(u) = update.as_mut().filter(|_| platform.is_macos()) {
+        let (id, name, url, size) = signature.ok_or("The release is missing its signed macOS update manifest")?;
+        validate_release_url(&url, "github.com", &tag, &name)?;
+        if id == 0 || size == 0 || size > 8192 {
+            return Err("Invalid update signature attachment".into());
+        }
+        let response = github::asset_request(client, &github::TORTO.asset_url(id))
+            .send().await.map_err(|e| e.to_string())?
+            .error_for_status().map_err(|e| e.to_string())?;
+        let bytes = read_signature_body(response, size).await?;
+        u.macos_signature = Some(serde_json::from_slice(&bytes).map_err(|e| e.to_string())?);
+        macos_auth::verify_release(u)?;
+    }
+    Ok(update)
 }
 
 pub async fn check_gitee_platform(
@@ -226,6 +273,7 @@ pub async fn download_update_progress(
     progress: std::sync::Arc<dyn Fn(u8) + Send + Sync>,
 ) -> Result<DownloadedUpdate, String> {
     validate_asset(&release.asset)?;
+    macos_auth::verify_release(&release)?;
     AppVersion::parse(&release.version)?;
     if !Platform::ALL.iter().any(|p|release.asset.name==p.name(&release.version)){return Err("Installer version does not match release".into());}
     let project=crate::environment::paths().ok_or_else(||"Unable to resolve the local update directory".to_owned())?;
@@ -350,6 +398,7 @@ pub fn installer_request(client: &reqwest::Client, url: &str) -> reqwest::Reques
 
 pub fn verify_installer_file(update: &DownloadedUpdate) -> Result<(), String> {
     use std::io::Read;
+    macos_auth::verify_release(&update.release)?;
     let file=std::fs::File::open(&update.installer_path).map_err(|e|e.to_string())?;
     if file.metadata().map_err(|e|e.to_string())?.len()!=update.release.asset.size{return Err("Cached installer size mismatch".into());}
     let mut bytes=Vec::new();file.take(MAX_INSTALLER_BYTES+1).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
@@ -403,6 +452,7 @@ pub fn release_from_github_platform(
             .body
             .filter(|body| !body.trim().is_empty())
             .unwrap_or_else(|| "This release does not include release notes.".into()),
+        macos_signature: None,
         asset: UpdateAsset {
             name: asset.name,
             url: asset.browser_download_url,
@@ -460,14 +510,18 @@ pub fn release_from_gitee_platform(
         size: manifest.asset.size,
     };
     validate_asset(&asset)?;
-    Ok(Some(UpdateRelease {
+    let macos_signature=manifest.macos_signature;
+    let update=UpdateRelease {
         version: version.to_string(),
         notes: release
             .body
             .filter(|body| !body.trim().is_empty())
             .unwrap_or_else(|| "This release does not include release notes.".into()),
         asset,
-    }))
+        macos_signature,
+    };
+    macos_auth::verify_release(&update)?;
+    Ok(Some(update))
 }
 
 pub fn validate_release_url(value: &str, host: &str, tag: &str, name: &str) -> Result<(), String> {
@@ -551,6 +605,8 @@ pub struct GiteeManifest {
     pub version: String,
     pub tag: String,
     pub asset: ManifestAsset,
+    #[serde(default)]
+    pub macos_signature: Option<macos_auth::SignedUpdate>,
 }
 
 #[derive(Deserialize)]
@@ -676,6 +732,7 @@ mod mobile_tests {
         let m = GiteeManifest {
             version: "0.10.0".into(),
             tag: "v0.10.0".into(),
+            macos_signature: None,
             asset: ManifestAsset {
                 name: "Torto-0.10.0-android-arm64-v8a.apk".into(),
                 sha256: "a".repeat(64),

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, createPublicKey, verify } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -24,6 +24,15 @@ export function validateRelease(release) {
   if (release.draft || release.prerelease) throw new Error('Only published stable releases can be mirrored');
   const required = requiredAssets(release.tag_name);
   const names = new Set(release.assets.map(asset => asset.name));
+  // Historical releases predate automatic macOS updates. Once any update ZIP
+  // appears, wait for both architectures and their signatures/checksums.
+  if ([...names].some(name => /-macos-(?:arm64|x86_64)\.zip(?:\.|$)/.test(name))) {
+    const version = release.tag_name.replace(/^v/, '');
+    required.push(...['arm64', 'x86_64'].flatMap(arch => {
+      const zip = `Torto-${version}-macos-${arch}.zip`;
+      return [zip, `${zip}.sha256`, `${zip}.sig.json`];
+    }));
+  }
   const missing = required.filter(name => !names.has(name));
   if (missing.length) return missing;
   for (const asset of release.assets) {
@@ -49,7 +58,7 @@ export function verifyAsset(asset, bytes) {
 // Actions downloads do not access Release asset URLs. Always compare extracted
 // files against Release digests: a rebuilt version can have several artifacts.
 export function artifactName(asset) {
-  const mac = /^(Torto-\d+\.\d+\.\d+-macos-(?:arm64|x86_64))\.dmg(?:\.sha256)?$/.exec(asset.name);
+  const mac = /^(Torto-\d+\.\d+\.\d+-macos-(?:arm64|x86_64))\.(?:dmg(?:\.sha256)?|zip(?:\.sha256|\.sig\.json)?)$/.exec(asset.name);
   if (mac) return mac[1];
   const windows = /^(Torto-\d+\.\d+\.\d+)-x86_64\.msi$/.exec(asset.name);
   return windows ? `${windows[1]}-windows-x86_64` : null;
@@ -177,6 +186,30 @@ export function updateManifest(release) {
   }) + '\n');
   return { bytes, asset: { name: 'torto-update.json', size: bytes.length,
     digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` } };
+}
+
+export function macosUpdateManifest(release, arch, signature) {
+  if (!['arm64', 'x86_64'].includes(arch)) throw new Error('Unsupported macOS architecture');
+  const version = release.tag_name.replace(/^v/, '');
+  const name = `Torto-${version}-macos-${arch}.zip`;
+  const installer = release.assets.find(asset => asset.name === name);
+  const sha256 = installer?.digest?.replace(/^sha256:/, '');
+  if (!installer || signature.version !== version || signature.name !== name ||
+      signature.size !== installer.size || signature.sha256 !== sha256 ||
+      !/^[a-f0-9]{64}$/.test(sha256) || installer.size > 256 * 1024 * 1024) {
+    throw new Error('Signed macOS metadata does not match the release');
+  }
+  const hex = fs.readFileSync(new URL('../assets/macos/update-public-key.hex', import.meta.url), 'utf8').trim();
+  if (!/^[a-f0-9]{64}$/.test(hex)) throw new Error('Invalid macOS update public key');
+  const key = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(hex, 'hex')]), format: 'der', type: 'spki' });
+  const message = `TORTO-MACOS-UPDATE-V1\n${version}\n${name}\n${installer.size}\n${sha256}\n`;
+  if (typeof signature.signature !== 'string' || !verify(null, Buffer.from(message), key, Buffer.from(signature.signature, 'base64'))) {
+    throw new Error('Invalid macOS publisher signature');
+  }
+  const bytes = Buffer.from(JSON.stringify({version, tag: release.tag_name,
+    asset: {name, size: installer.size, sha256}, macos_signature: signature}) + '\n');
+  return {bytes, asset: {name: `torto-macos-${arch}-update.json`, size: bytes.length,
+    digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}`}};
 }
 
 const transportCodes = new Set([
@@ -345,6 +378,18 @@ async function mirrorTag(tag, token, directory) {
 }
 
 export async function syncRelease(release, api, download) {
+  const incomplete = validateRelease(release);
+  if (incomplete.length) throw new Error(`Release is not complete: ${incomplete.join(', ')}`);
+  const manifests = [updateManifest(release)];
+  for (const arch of ['arm64', 'x86_64']) {
+    const name = `Torto-${release.tag_name.replace(/^v/, '')}-macos-${arch}.zip`;
+    if (!release.assets.some(asset => asset.name === name)) continue;
+    const asset = release.assets.find(asset => asset.name === `${name}.sig.json`);
+    if (!asset || asset.size > 8192) throw new Error('Missing or oversized macOS update signature');
+    const bytes = await download(asset);
+    verifyAsset(asset, bytes);
+    manifests.push(macosUpdateManifest(release, arch, JSON.parse(bytes)));
+  }
   const tag = encodeURIComponent(release.tag_name);
   let target = await api('GET', `/releases/tags/${tag}`, null, true);
   const metadata = {
@@ -370,12 +415,13 @@ export async function syncRelease(release, api, download) {
     verifyAsset(asset, await download({ ...asset, browser_download_url: url }));
   }
   // Completion marker for clients: publish only after all installers are verified.
-  const manifest = updateManifest(release);
-  if (planAssets([manifest.asset], final).length) {
-    await api('UPLOAD', `/releases/${target.id}/attach_files`, manifest);
+  for (const manifest of manifests) {
+    if (planAssets([manifest.asset], final).length) {
+      await api('UPLOAD', `/releases/${target.id}/attach_files`, manifest);
+    }
+    verifyAsset(manifest.asset, await download({ ...manifest.asset,
+      browser_download_url: `https://gitee.com/TortoTech/torto/releases/download/${tag}/${manifest.asset.name}` }));
   }
-  verifyAsset(manifest.asset, await download({ ...manifest.asset,
-    browser_download_url: `https://gitee.com/TortoTech/torto/releases/download/${tag}/torto-update.json` }));
   // Update notes after every attachment has been verified; reruns also propagate edited notes.
   await api('PATCH', `/releases/${target.id}`, metadata);
 }

@@ -563,8 +563,16 @@ impl ApplicationHandler<UserEvent> for Application {
             }
             #[cfg(target_os = "macos")]
             UserEvent::OpenBook(path) => self.app.open_book(&path),
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             UserEvent::Update(message) => self.app.complete_update(message),
+            #[cfg(target_os = "macos")]
+            UserEvent::MacUpdatePrepared { request, result } => match result {
+                Ok(()) => event_loop.exit(),
+                Err(error) => {
+                    self.app.report_update_install_error(request, error);
+                    if let Some(state) = &self.window { state.window.request_redraw(); }
+                }
+            },
             UserEvent::Feedback(message) => self.app.complete_feedback(message),
             UserEvent::FeedbackImages(message) => self.app.complete_feedback_images(message),
             UserEvent::FeedbackPreview(message) => self.app.complete_feedback_preview(message),
@@ -796,6 +804,18 @@ impl ApplicationHandler<UserEvent> for Application {
                         .gpu
                         .prewarm_reader(&self.app, &self.runtime, &self.proxy);
                     self.app.spawn_pending_tasks(&self.runtime, &self.proxy);
+                    #[cfg(target_os = "macos")]
+                    {
+                        crate::updater::macos::confirm_health(&self.runtime);
+                        if let Some(request) = self.app.take_update_install_request() {
+                            let save = self.app.update_save_job();
+                            let proxy = self.proxy.clone();
+                            self.runtime.spawn_blocking(move || {
+                                let result = crate::updater::macos::prepare(&request.update, save);
+                                let _ = proxy.send_event(UserEvent::MacUpdatePrepared { request, result });
+                            });
+                        }
+                    }
                     #[cfg(target_os = "windows")]
                     if let Some(request) = self.app.take_update_install_request() {
                         match crate::updater::launch_installer_after_exit(&request) {

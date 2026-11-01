@@ -31,8 +31,8 @@ pub(crate) struct DesktopApp {
     fullscreen_toggle_requested: bool,
     memory_sample: Option<(std::time::Instant, bool)>,
     memory_peak: usize,
-    #[cfg(target_os = "windows")]
-    updater: crate::updater::WindowsUpdater,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    updater: crate::updater::DesktopUpdater,
 }
 
 impl DesktopApp {
@@ -73,8 +73,8 @@ impl DesktopApp {
             fullscreen_toggle_requested: false,
             memory_sample: None,
             memory_peak: 0,
-            #[cfg(target_os = "windows")]
-            updater: crate::updater::WindowsUpdater::new(),
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            updater: crate::updater::DesktopUpdater::new(),
         }
     }
 
@@ -234,7 +234,7 @@ impl DesktopApp {
         }) {
             self.fullscreen_toggle_requested = true;
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             if self.settings.take_update_check_request() {
                 self.updater.request_check();
@@ -380,7 +380,7 @@ impl DesktopApp {
         let shelf_finished = started.elapsed();
         self.settings.spawn_pending_tasks(runtime, proxy);
         self.feedback.spawn_pending_tasks(runtime, proxy);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         self.updater.spawn_pending_tasks(runtime, proxy);
         let settings_finished = started.elapsed();
         if let Some(reader) = self.reader.as_mut() {
@@ -449,16 +449,17 @@ impl DesktopApp {
         self.settings.complete_provider_models(message);
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub(crate) fn complete_update(&mut self, message: crate::updater::UpdateTaskMessage) {
         if let Some(result) = self.updater.complete(message) {
             self.settings.complete_update_check(result);
         }
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub(crate) fn take_update_install_request(&mut self) -> Option<crate::updater::InstallRequest> {
         let request = self.updater.take_install_request();
+        #[cfg(target_os = "windows")]
         if request.is_some()
             && let Some(reader) = self.reader.as_ref()
         {
@@ -467,13 +468,21 @@ impl DesktopApp {
         request
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub(crate) fn report_update_install_error(
         &mut self,
         request: crate::updater::InstallRequest,
         message: String,
     ) {
         self.updater.report_install_error(request, message);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn update_save_job(&mut self) -> Box<dyn FnOnce() -> Result<(), String> + Send> {
+        match self.reader.as_mut() {
+            Some(reader) => reader.update_save_job(),
+            None => Box::new(crate::statistics::flush_checked),
+        }
     }
 
     pub(crate) fn complete_reader_search(&mut self, message: SearchTaskMessage) {

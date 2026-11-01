@@ -665,7 +665,7 @@ fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             });
 
         ui.add_space(14.0);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         if crate::updater::manual_updates_supported() {
             ui.horizontal(|ui| {
                 let checking = matches!(
@@ -708,7 +708,7 @@ fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             );
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         if crate::updater::manual_updates_supported() {
             ui.add_space(8.0);
             match &state.update_check_status {
