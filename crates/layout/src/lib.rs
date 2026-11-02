@@ -15,6 +15,8 @@ use text_layout::{Layout, PositionedLayoutItem};
 mod caption_labels;
 mod formula_images;
 mod image_text;
+#[cfg(test)]
+mod image_sizing_tests;
 mod list_markers;
 #[cfg(test)]
 mod figure_typesetting_tests;
@@ -1096,6 +1098,8 @@ pub struct FormulaPresentation {
 
 /// Positioned raster image.
 pub struct ImagePlacement {
+    /// Authored overflow clipping in page coordinates; pixels keep their scale.
+    pub clip: Option<FixedPageTextRect>,
     pub formula_presentation: Option<FormulaPresentation>,
     pub image: RasterImage,
     pub x: f32,
@@ -1105,6 +1109,12 @@ pub struct ImagePlacement {
     pub source: Option<SourceRange>,
     pub text_layer: Option<FixedPageTextLayer>,
     pub replacement: Option<FixedPageTextReplacementPlacement>,
+}
+
+impl ImagePlacement {
+    pub fn visible_rect(&self) -> FixedPageTextRect {
+        self.clip.unwrap_or(FixedPageTextRect { x:self.x, y:self.y, width:self.width, height:self.height })
+    }
 }
 
 /// Translated text repainted inside the original fixed-layout page image.
@@ -1731,6 +1741,21 @@ impl LayoutEngine {
             let block = layout_blocks[block_index];
             match block {
                 Block::Text(block) => {
+                    if unified_reflow && block.kind == TextBlockKind::Preformatted
+                        && let Some(language) = &block.style.code_language {
+                        let mut header_style = reader_style.clone();
+                        header_style.typography.font_size *= 0.75;
+                        header_style.typography.minimum_font_size = 1.0;
+                        let header = TextBlock {
+                            kind: TextBlockKind::Caption,
+                            content: vec![Inline::Text(rebook_publication::TextRun { text: language.as_str().into(), style: Default::default(), link: None })],
+                            style: rebook_publication::BlockStyle { align: TextAlignment::End, semantic_alignment: Some(TextAlignment::End), margin_after: 4.0, line_height: 1.2, ..Default::default() },
+                            source: None,
+                        };
+                        let prepared = self.shape_text_from_source(source, &header, &header_style, content_width)?;
+                        paginator.keep_together_if_fits(prepared_flow_height(&prepared) + reader_style.typography.font_size * 1.5 + 4.0);
+                        paginator.push_text(&prepared, &header)?;
+                    }
                     if unified_reflow && self.push_noted_formula(&mut paginator, source, block, reader_style, content_width)? {
                         block_index += 1;
                         continue;
@@ -2074,6 +2099,10 @@ impl LayoutEngine {
                         image_style.margin_before = gap;
                         image_style.margin_after = gap;
                     }
+                    if paginator.image_visible_size(&raster, image_style) == (0.0,0.0) {
+                        block_index += 1;
+                        continue;
+                    }
                     let replacements = paginator.push_image(
                         raster,
                         image_style,
@@ -2223,7 +2252,7 @@ impl LayoutEngine {
         )?;
         if unified_reflow {
             let width = (content_width - media_start_offset).max(1.0);
-            let media_width = images.iter().map(|(raster, style, _)| paginator.image_display_size(raster, *style).0).fold(0.0, f32::max);
+            let media_width = images.iter().map(|(raster, style, _)| paginator.image_visible_size(raster, *style).0).fold(0.0, f32::max);
             self.align_media_sources(source, &mut before_captions, reader_style, width, media_width)?;
             self.align_media_sources(source, &mut after_captions, reader_style, width, media_width)?;
         }
@@ -2239,7 +2268,7 @@ impl LayoutEngine {
         };
         let image_height = images
             .iter()
-            .map(|(raster, style, _)| paginator.image_display_size(raster, *style).1)
+            .map(|(raster, style, _)| paginator.image_visible_size(raster, *style).1)
             .sum::<f32>();
         let caption_height = before_captions
             .iter().chain(&after_captions)
@@ -6122,32 +6151,49 @@ impl Paginator {
         let aspect_ratio = intrinsic_width / intrinsic_height;
         let content_height = self.bottom - self.top;
         let media_width = (self.width - self.media_start_offset).max(1.0);
-        let containing_width = style
-            .container_width
-            .map_or(media_width, |width| width.resolve(media_width))
-            .clamp(1.0, media_width);
-        let requested_height = style.height.map(|height| height.resolve(content_height));
-        let requested_width = style
-            .width
-            .map(|width| width.resolve(containing_width))
-            .or_else(|| requested_height.map(|height| height * aspect_ratio))
-            .unwrap_or(intrinsic_width)
-            .max(1.0);
-        let requested_height = requested_height
-            .unwrap_or(requested_width / aspect_ratio)
-            .max(1.0);
-        let max_width = style
-            .max_width
-            .map_or(containing_width, |width| width.resolve(containing_width))
-            .clamp(1.0, containing_width);
-        let max_height = style
-            .max_height
-            .map_or(content_height, |height| height.resolve(content_height))
-            .clamp(1.0, content_height);
-        let scale = (max_width / requested_width)
-            .min(max_height / requested_height)
-            .min(1.0);
-        (requested_width * scale, requested_height * scale)
+        let containing_width = style.container_width.map_or(media_width, |w| w.resolve(media_width)).max(0.0);
+        let containing_height = style.container_height.map(|h| h.resolve(content_height).max(0.0));
+        let height = |h: ImageLength| match h {
+            ImageLength::Pixels(v) => Some(v),
+            ImageLength::Fraction(v) => containing_height.map(|h| h * v),
+        };
+        let explicit_height = style.height.and_then(height);
+        let mut width = style.width.map(|w| w.resolve(containing_width))
+            .or_else(|| explicit_height.map(|h| h * aspect_ratio)).unwrap_or(intrinsic_width).max(0.0);
+        let mut height_used = explicit_height.unwrap_or(width / aspect_ratio).max(0.0);
+        // Resolve CSS constraints first. Auto axes preserve the intrinsic ratio
+        // unless simultaneous minimum/maximum constraints require distortion.
+        let min_w = style.min_width.map_or(0.0, |w| w.resolve(containing_width));
+        let min_h = style.min_height.and_then(height).unwrap_or(0.0);
+        let max_w = style.max_width.map_or(f32::MAX, |w| w.resolve(containing_width)).max(min_w);
+        let max_h = style.max_height.and_then(height).unwrap_or(f32::MAX).max(min_h);
+        {
+            if style.width.is_none() && explicit_height.is_none() {
+                let scale = (max_w / width).min(max_h / height_used).min(1.0)
+                    .max((min_w / width).max(min_h / height_used));
+                width *= scale; height_used *= scale;
+            } else if explicit_height.is_none() {
+                let next = width.clamp(min_w, max_w);
+                height_used = next / aspect_ratio; width = next;
+            } else if style.width.is_none() {
+                let next = height_used.clamp(min_h, max_h);
+                width = next * aspect_ratio; height_used = next;
+            }
+        }
+        width = width.clamp(min_w, max_w);
+        height_used = height_used.clamp(min_h, max_h);
+        if width <= 0.0 || height_used <= 0.0 { return (0.0, 0.0); }
+        // Reader page fitting is separate from authored containing-block widths.
+        // An auto image may overflow a narrow parent, as with overflow:visible.
+        let scale = (media_width / width).min(content_height / height_used).min(1.0);
+        (width * scale, height_used * scale)
+    }
+
+    fn image_visible_size(&self, image: &RasterImage, style: ImageStyle) -> (f32, f32) {
+        let (w,h) = self.image_display_size(image, style);
+        let width = style.clip_width.map_or(w, |v| v.resolve((self.width-self.media_start_offset).max(1.0)).max(0.0).min(w));
+        let height = style.clip_height.map_or(h, |v| v.resolve(self.bottom-self.top).max(0.0).min(h));
+        if width <= 0.0 || height <= 0.0 { (0.0,0.0) } else { (width,height) }
     }
 
     fn prepare_group(&mut self, content_height: f32, outer_gap: f32) {
@@ -6208,11 +6254,15 @@ impl Paginator {
         self.forced_page_break = false;
         self.previous_block_was_paragraph = false;
         let (width, height) = self.image_display_size(&image, style);
+        if width <= 0.0 || height <= 0.0 { return Vec::new(); }
+        let (visible_width, visible_height) = self.image_visible_size(&image, style);
+        if visible_width <= 0.0 || visible_height <= 0.0 { return Vec::new(); }
+
         let media_width = (self.width - self.media_start_offset).max(1.0);
         let block_gap = style.margin_before.max(minimum_before);
         let page_count_before_spacing = self.pages.len();
         self.ensure_minimum_spacing(block_gap);
-        if self.cursor_y + height > self.bottom && self.column_has_content {
+        if self.cursor_y + visible_height > self.bottom && self.column_has_content {
             self.advance_column();
         }
         if restore_gap_on_empty_page || self.pages.len() > page_count_before_spacing {
@@ -6244,6 +6294,7 @@ impl Paginator {
                 .collect()
         });
         self.items.push(PageItem::Image(ImagePlacement {
+            clip: (visible_width < width || visible_height < height).then_some(FixedPageTextRect { x, y: self.cursor_y, width: visible_width, height: visible_height }),
             formula_presentation: None,
             image,
             x,
@@ -6260,7 +6311,7 @@ impl Paginator {
             self.pending_leading_gap = trailing_gap;
         }
         self.column_has_content = true;
-        self.cursor_y += height + trailing_gap;
+        self.cursor_y += visible_height + trailing_gap;
         replacements
     }
 
@@ -6341,7 +6392,7 @@ impl Paginator {
                 }),
             PageItem::Quote(quote) => Some(quote.y + quote.height),
             PageItem::FigureBody(body) => Some(body.y + body.height),
-            PageItem::Image(image) => Some(image.y + image.height),
+            PageItem::Image(image) => Some(image.visible_rect().y + image.visible_rect().height),
             PageItem::Table(table) => Some(table.y + table.height),
             PageItem::Separator(separator) => Some(separator.y + 1.0),
         })
@@ -10857,8 +10908,9 @@ mod tests {
                 ..style
             },
         );
-        assert!((width - 400.0).abs() < 0.001);
-        assert!((height - 300.0).abs() < 0.001);
+        // Auto-sized replaced content can overflow a narrower containing block.
+        assert!((width - 800.0).abs() < 0.001);
+        assert!((height - 600.0).abs() < 0.001);
     }
 
     #[test]

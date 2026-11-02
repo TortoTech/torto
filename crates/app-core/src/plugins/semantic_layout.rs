@@ -1205,6 +1205,13 @@ fn load_recognition_inner(
     if result.fingerprint != hash {
         return None;
     }
+    if result.annotations.iter().any(|a| matches!(a, Annotation::CodeOrQuote { .. })) {
+        let mut classified = section.clone();
+        for a in &result.annotations {
+            if matches!(a, Annotation::ImageText { .. }) { compose(&mut classified.blocks, a); }
+        }
+        if !result.annotations.iter().all(|a| code_blocks::cached_valid(&classified, a)) { return None; }
+    }
     let locate = |range: &SourceRange| {
         section
             .blocks
@@ -1217,7 +1224,8 @@ fn load_recognition_inner(
         .filter(|a| {
             !matches!(
                 a,
-                Annotation::TableChart { .. }
+                Annotation::CodeOrQuote { .. }
+                    | Annotation::TableChart { .. }
                     | Annotation::FormulaNotes { .. }
                     | Annotation::InlineCitations { .. }
                     | Annotation::TextFormulas { .. }
@@ -1239,52 +1247,7 @@ fn load_recognition_inner(
                 | Annotation::UnreadableFormula { .. } => {
                     unreachable!()
                 }
-                Annotation::CodeOrQuote {
-                    body,
-                    presentation,
-                    language,
-                    captions,
-                    sources,
-                    credit,
-                } => {
-                    let ids = body
-                        .iter()
-                        .map(|r| {
-                            section
-                                .blocks
-                                .iter()
-                                .position(|b| code_blocks::anchor(b) == Some(r))
-                        })
-                        .collect::<Option<Vec<_>>>()?;
-                    let final_body = code_blocks::body(&section.blocks[*ids.last()?])?;
-                    let locate_attachment = |r: &SourceRange| {
-                        section
-                            .blocks
-                            .iter()
-                            .position(|b| code_blocks::attachment_anchor(b) == Some(r))
-                    };
-                    Proposal::CodeOrQuote {
-                        body: ids,
-                        presentation: *presentation,
-                        language: language.clone(),
-                        captions: captions
-                            .iter()
-                            .map(locate_attachment)
-                            .collect::<Option<Vec<_>>>()?,
-                        sources: sources
-                            .iter()
-                            .map(locate_attachment)
-                            .collect::<Option<Vec<_>>>()?,
-                        body_index: match credit {
-                            Some(range) => Some(
-                                final_body
-                                    .iter()
-                                    .position(|t| t.source.as_ref() == Some(range))?,
-                            ),
-                            None => None,
-                        },
-                    }
-                }
+                Annotation::CodeOrQuote { .. } => unreachable!(),
                 Annotation::QuoteBefore {
                     body,
                     attribution,
@@ -1497,7 +1460,6 @@ async fn recognize_inner(
     include_enhancements: bool,
 ) -> Result<Recognition, String> {
     let (provider, model) = settings.semantic_layout_endpoint()?;
-    let config = &RecognitionRoles::default();
     let fingerprint = fingerprint(section);
     let mut identity = recognition_identity(book_id, settings);
     if !include_enhancements {
@@ -1549,7 +1511,6 @@ async fn recognize_inner(
     }
     let mut annotations = Vec::new();
     let mut skipped_groups = 0;
-    let mut used = HashSet::new();
     let client = crate::http::builder()
         .timeout(Duration::from_secs(90))
         .build()
@@ -1574,6 +1535,74 @@ async fn recognize_inner(
         compose(&mut working.blocks, annotation);
     }
     let section = &working;
+    let (groups, failed) = recognize_windows(&client, settings, section, book_id, &fingerprint, target.clone(), fixed_target, false).await?;
+    annotations.extend(groups);
+    skipped_groups += failed;
+    for nested in code_blocks::nested_sections(section, target.clone()) {
+        let (groups, failed) = recognize_windows(&client, settings, &nested, book_id, &fingerprint, 0..nested.blocks.len(), false, true).await?;
+        annotations.extend(groups);
+        skipped_groups += failed;
+    }
+    let (extra, enhancements_ok) = if include_enhancements {
+        let mut enhanced = working.clone();
+        for annotation in &annotations {
+            compose(&mut enhanced.blocks, annotation);
+        }
+        enhancements::recognize(
+            &client,
+            settings,
+            &enhanced,
+            &target_section
+                .blocks
+                .iter()
+                .flat_map(block_ranges)
+                .collect::<Vec<_>>(),
+            book_id,
+        )
+        .await
+    } else {
+        (Vec::new(), true)
+    };
+    annotations.extend(extra);
+    let result = Recognition {
+        formulas_checked,
+        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
+        fingerprint,
+        annotations,
+        skipped_groups,
+    };
+    if let Some(path) = identity
+        .as_ref()
+        .and_then(|identity| recognition_path(identity, &result.fingerprint))
+        && enhancements_ok
+        && result.skipped_groups == 0
+        && result.formulas_checked
+        && let Err(error) = crate::persistence::write_json_atomic(&path, &result)
+    {
+        tracing::warn!(%error, "failed to cache semantic chapter");
+    }
+    Ok(result)
+}
+
+async fn recognize_windows(
+    client: &reqwest::Client,
+    settings: &PluginSettings,
+    section: &Section,
+    book_id: &str,
+    fingerprint: &str,
+    target: std::ops::Range<usize>,
+    fixed_target: bool,
+    code_only: bool,
+) -> Result<(Vec<Annotation>, usize), String> {
+    let (provider, model) = settings.semantic_layout_endpoint()?;
+    let config = &RecognitionRoles {
+        quotes: true,
+        captions: !code_only,
+        headings: !code_only,
+    };
+    let mut annotations = Vec::new();
+    let mut skipped_groups = 0;
+    let mut used = HashSet::new();
     let mut start = target.start;
     while start < target.end {
         let end = if fixed_target {
@@ -1591,9 +1620,16 @@ async fn recognize_inner(
         } else {
             (end + OVERLAP).min(section.blocks.len())
         };
-        let citation_candidates = citations::window_candidates(section, start..end);
+        let citation_candidates = if code_only {
+            Vec::new()
+        } else {
+            citations::window_candidates(section, start..end)
+        };
         let eligible = code_blocks::eligible_ids(section);
         if (start..end).any(|i| {
+            if code_only {
+                return eligible.contains(&i);
+            }
             let block = &section.blocks[i];
             if code_blocks::body(block).is_some() {
                 eligible.contains(&i)
@@ -1603,8 +1639,23 @@ async fn recognize_inner(
                     || citation_candidates.iter().any(|c| c.block == i)
             }
         }) {
-            let input =
+            let mut input =
                 unified_window_input(section, config, start..end, lo..hi, &citation_candidates);
+            if code_only {
+                for name in [
+                    "classify_headings",
+                    "classify_blocks",
+                    "complete_quote_sources",
+                    "classify_citations",
+                ] {
+                    input["targets"][name] = json!([]);
+                }
+                for block in input["blocks"].as_array_mut().unwrap() {
+                    block["math_texts"] = json!([]);
+                    block["citation_candidates"] = json!([]);
+                    block.as_object_mut().unwrap().remove("citation_paragraphs");
+                }
+            }
             let key = digest(
                 &serde_json::to_vec(&json!([
                     CACHE_FORMAT_VERSION,
@@ -1617,6 +1668,7 @@ async fn recognize_inner(
                     settings.semantic_layout.reasoning_effort,
                     config.quotes,
                     config.captions,
+                    code_only,
                     input
                 ]))
                 .map_err(|e| e.to_string())?,
@@ -1682,10 +1734,16 @@ async fn recognize_inner(
                 &citation_candidates,
                 &window.citations,
             ));
-            annotations.extend(
-                resolve_text_formulas(section, start..end, &window.formulas, &window.citations).0,
-            );
+            if !code_only {
+                annotations.extend(
+                    resolve_text_formulas(section, start..end, &window.formulas, &window.citations)
+                        .0,
+                );
+            }
             for group in &window.groups {
+                if code_only && !matches!(group, Proposal::CodeOrQuote { .. }) {
+                    continue;
+                }
                 let ids = proposal_ids(group);
                 if ids.iter().any(|id| used.contains(id)) {
                     continue;
@@ -1696,45 +1754,7 @@ async fn recognize_inner(
         }
         start = end;
     }
-    let (extra, enhancements_ok) = if include_enhancements {
-        let mut enhanced = working.clone();
-        for annotation in &annotations {
-            compose(&mut enhanced.blocks, annotation);
-        }
-        enhancements::recognize(
-            &client,
-            settings,
-            &enhanced,
-            &target_section
-                .blocks
-                .iter()
-                .flat_map(block_ranges)
-                .collect::<Vec<_>>(),
-            book_id,
-        )
-        .await
-    } else {
-        (Vec::new(), true)
-    };
-    annotations.extend(extra);
-    let result = Recognition {
-        formulas_checked,
-        image_text_revision: crate::plugins::semantic_layout::formulas::TEXT_REVISION,
-        fingerprint,
-        annotations,
-        skipped_groups,
-    };
-    if let Some(path) = identity
-        .as_ref()
-        .and_then(|identity| recognition_path(identity, &result.fingerprint))
-        && enhancements_ok
-        && result.skipped_groups == 0
-        && result.formulas_checked
-        && let Err(error) = crate::persistence::write_json_atomic(&path, &result)
-    {
-        tracing::warn!(%error, "failed to cache semantic chapter");
-    }
-    Ok(result)
+    Ok((annotations, skipped_groups))
 }
 
 async fn request_window_groups(

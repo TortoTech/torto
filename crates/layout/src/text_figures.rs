@@ -19,7 +19,7 @@ fn slice_bounds(page: &PageLayout) -> (f32, f32) {
             .map(|line| text.origin_y + line.metrics().block_min_coord),
         PageItem::Quote(quote) => (!quote.continued_before).then_some(quote.y),
         PageItem::FigureBody(body) => Some(body.y),
-        PageItem::Image(image) => Some(image.y),
+        PageItem::Image(image) => Some(image.visible_rect().y),
         PageItem::Table(table) => Some(table.y),
         PageItem::Separator(line) => Some(line.y),
     }).reduce(f32::min).unwrap_or(0.0);
@@ -560,7 +560,7 @@ fn natural_right(item: &PageItem) -> f32 {
         PageItem::Text(text) => text.origin_x + text.layout.width(),
         PageItem::FigureBody(body) => body.x + body.width,
         PageItem::Quote(quote) => quote.x + quote.width,
-        PageItem::Image(image) => image.x + image.width,
+        PageItem::Image(image) => image.visible_rect().x + image.visible_rect().width,
         // The grid is already centered in the measuring viewport. That offset
         // is not intrinsic width; carrying it forward adds padding a second time.
         PageItem::Table(table) => {
@@ -597,7 +597,7 @@ fn page_item_bottom(item: &PageItem) -> f32 {
             }),
         PageItem::FigureBody(body) => body.y + body.height,
         PageItem::Quote(quote) => quote.y + quote.height,
-        PageItem::Image(image) => image.y + image.height,
+        PageItem::Image(image) => image.visible_rect().y + image.visible_rect().height,
         PageItem::Table(table) => table.y + table.height,
         PageItem::Separator(line) => line.y + 1.0,
     }
@@ -621,6 +621,7 @@ fn translate(item: &mut PageItem, x: f32, y: f32) {
         PageItem::Image(image) => {
             image.x += x;
             image.y += y;
+            if let Some(clip) = &mut image.clip { clip.x += x; clip.y += y; }
             if let Some(replacement) = &mut image.replacement {
                 for segment in &mut replacement.segments {
                     segment.rect.x += x;

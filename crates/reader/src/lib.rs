@@ -5928,6 +5928,7 @@ mod tests {
             leading_gap: 0.0,
             items: vec![rebook_layout::PageItem::Image(
                 rebook_layout::ImagePlacement {
+                    clip: None,
                     formula_presentation: None,
                     image: rebook_layout::RasterImage {
                         deferred: None,

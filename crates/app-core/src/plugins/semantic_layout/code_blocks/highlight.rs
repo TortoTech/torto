@@ -14,6 +14,11 @@ static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 const MAX_BYTES: usize = 128 * 1024;
 const MAX_LINE_BYTES: usize = 8 * 1024;
 
+pub(super) fn label(language: &str) -> String {
+    SYNTAXES.find_syntax_by_token(language.trim()).map_or_else(
+        || language.trim().to_owned(), |syntax| syntax.name.clone())
+}
+
 fn colors(
     text: &str,
     language: &str,

@@ -97,6 +97,7 @@ const ENUMS: &[(&str, &str)] = &[
     ("code_or_quote", "cqk"),
     ("authored_quote", "aq"),
     ("authored_preformatted", "ap"),
+    ("recognized_image_text", "itx"),
     ("quote", "q"),
     ("quote_before", "qb"),
     ("quote_inline", "qi"),

@@ -13,14 +13,51 @@ pub(super) enum Presentation {
     Quote,
 }
 
+fn image_text(text: &TextBlock) -> bool {
+    text.kind == TextBlockKind::Paragraph
+        && text
+            .content
+            .iter()
+            .any(|i| matches!(i, Inline::Image(r) if r.image.ocr_text.is_some()))
+        && text.content.iter().all(|i| match i {
+            Inline::Image(r) => r.image.ocr_text.is_some(),
+            Inline::Text(t) => t.text.trim().is_empty(),
+            Inline::Break => true,
+            _ => false,
+        })
+}
+
+fn literal_text(text: &TextBlock) -> String {
+    if !text
+        .content
+        .iter()
+        .any(|i| matches!(i, Inline::Image(r) if r.image.ocr_text.is_some()))
+    {
+        return text_block_text(text);
+    }
+    text.content
+        .iter()
+        .map(|i| match i {
+            Inline::Image(r) => r
+                .image
+                .ocr_text
+                .as_ref()
+                .map_or_else(String::new, |t| t.text.clone()),
+            Inline::Break => "\n".into(),
+            _ => i.text_runs().iter().map(|r| r.text.as_str()).collect(),
+        })
+        .collect()
+}
+
 pub(super) fn body(block: &Block) -> Option<&[TextBlock]> {
     match block {
         Block::Quote(q) if !q.body.is_empty() && anchor(block).is_some() => Some(&q.body),
         Block::Text(t)
-            if matches!(
+            if (matches!(
                 t.kind,
                 TextBlockKind::Blockquote | TextBlockKind::Preformatted
-            ) && t.source.is_some() =>
+            ) || image_text(t))
+                && t.source.is_some() =>
         {
             Some(std::slice::from_ref(t))
         }
@@ -35,10 +72,10 @@ pub(super) fn anchor(block: &Block) -> Option<&SourceRange> {
             .as_ref()
             .or_else(|| q.body.iter().find_map(|t| t.source.as_ref())),
         Block::Text(t)
-            if matches!(
+            if (matches!(
                 t.kind,
                 TextBlockKind::Blockquote | TextBlockKind::Preformatted
-            ) =>
+            ) || image_text(t)) =>
         {
             t.source.as_ref()
         }
@@ -50,8 +87,8 @@ pub(super) fn input(index: usize, block: &Block) -> Option<Value> {
     let body = body(block)?;
     let missing_credit = !matches!(block, Block::Quote(q) if q.attribution.is_some());
     Some(
-        json!({"id":index,"type":if matches!(block,Block::Text(t) if t.kind==TextBlockKind::Preformatted) {"authored_preformatted"} else {"authored_quote"},
-        "body":body.iter().enumerate().map(|(i,t)| json!({"index":i,"text":text_block_text(t),
+        json!({"id":index,"type":if matches!(block,Block::Text(t) if image_text(t)) {"recognized_image_text"} else if matches!(block,Block::Text(t) if t.kind==TextBlockKind::Preformatted) {"authored_preformatted"} else {"authored_quote"},
+        "body":body.iter().enumerate().map(|(i,t)| json!({"index":i,"text":literal_text(t),
             "attribution_eligible":missing_credit && i>0 && i+1==body.len() && t.source.is_some()})).collect::<Vec<_>>(),
         "attribution":match block {Block::Quote(q)=>q.attribution.as_ref().map(text_block_text),_=>None}}),
     )
@@ -94,6 +131,11 @@ pub(super) fn eligible_ids(section: &Section) -> HashSet<usize> {
                 for inline in &text.content {
                     count += match inline {
                         Inline::Break => 1,
+                        Inline::Image(r) => r
+                            .image
+                            .ocr_text
+                            .as_ref()
+                            .map_or(0, |t| t.text.chars().count()),
                         _ => inline
                             .text_runs()
                             .iter()
@@ -155,7 +197,12 @@ pub(super) fn valid(
         return false;
     }
     if language.is_some_and(|l| {
-        presentation != Presentation::Code || l.is_empty() || l.len() > 40 || !l.is_ascii()
+        presentation != Presentation::Code
+            || l.is_empty()
+            || l.len() > 40
+            || !l
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b" +#._-".contains(&b))
     }) {
         return false;
     }
@@ -236,7 +283,62 @@ pub(super) fn compose(
     sources: &[SourceRange],
     credit: Option<&SourceRange>,
 ) {
+    compose_in(
+        blocks,
+        members,
+        presentation,
+        language,
+        captions,
+        sources,
+        credit,
+        false,
+    );
+}
+
+fn compose_in(
+    blocks: &mut Vec<Block>,
+    members: &[SourceRange],
+    presentation: Presentation,
+    language: Option<&str>,
+    captions: &[SourceRange],
+    sources: &[SourceRange],
+    credit: Option<&SourceRange>,
+    in_figure: bool,
+) {
     if members.is_empty() {
+        return;
+    }
+    // Resolve within one authored container. Keep the surrounding figure/note
+    // and its captions intact; never merge across an enclosing boundary.
+    if !blocks
+        .iter()
+        .any(|b| attachment_anchor(b) == members.first())
+    {
+        for block in blocks {
+            match block {
+                Block::Figure(f) => compose_in(
+                    &mut f.body,
+                    members,
+                    presentation,
+                    language,
+                    captions,
+                    sources,
+                    credit,
+                    true,
+                ),
+                Block::Note(n) => compose_in(
+                    &mut n.blocks,
+                    members,
+                    presentation,
+                    language,
+                    captions,
+                    sources,
+                    credit,
+                    false,
+                ),
+                _ => {}
+            }
+        }
         return;
     }
     let mut entries = Vec::new();
@@ -354,6 +456,7 @@ pub(super) fn compose(
         Presentation::Quote => {
             for t in &mut body_text {
                 t.kind = TextBlockKind::Blockquote;
+                t.style.code_language = None;
                 t.style.literal_links = true;
             }
             let attribution = if before.is_empty()
@@ -371,6 +474,13 @@ pub(super) fn compose(
             })]
         }
     };
+    if in_figure && presentation == Presentation::Code {
+        let mut replacement: Vec<_> = before.into_iter().map(Block::Text).collect();
+        replacement.append(&mut content);
+        replacement.extend(after.into_iter().map(Block::Text));
+        blocks.splice(start..end, replacement);
+        return;
+    }
     let plain_quote = presentation == Presentation::Quote && before.is_empty() && after.is_empty();
     let replacement = if plain_quote {
         content.pop().unwrap()
@@ -401,7 +511,22 @@ fn prepare_code(body: &mut [TextBlock], language: Option<&str>) {
         .reduce(f32::min)
         .unwrap_or(0.0);
     for t in body.iter_mut() {
+        // OCR stays attached to the image until AI confirms code. Materialize
+        // its original literal spelling here, before highlighting, even when
+        // the displayed prose already has a translated companion.
+        for inline in &mut t.content {
+            if let Inline::Image(r) = inline
+                && let Some(ocr) = &r.image.ocr_text
+            {
+                *inline = Inline::Text(TextRun {
+                    text: ocr.text.clone(),
+                    style: Default::default(),
+                    link: None,
+                });
+            }
+        }
         t.kind = TextBlockKind::Preformatted;
+        t.style.code_language = None;
         t.style.literal_links = true;
         t.style.paragraph_group = None;
         t.style.margin_start = (t.style.margin_start - base_indent).max(0.0);
@@ -424,7 +549,108 @@ fn prepare_code(body: &mut [TextBlock], language: Option<&str>) {
     }
     if let Some(language) = language {
         highlight::apply(body, language);
+        if let Some(first) = body.first_mut() {
+            first.style.code_language =
+                rebook_publication::CodeLanguage::new(&highlight::label(language));
+        }
     }
+}
+
+/// Small classification scopes for authored containers. The enclosing block
+/// remains a protected boundary in the ordinary prose classifier.
+pub(super) fn nested_sections(section: &Section, target: std::ops::Range<usize>) -> Vec<Section> {
+    fn visit(blocks: &[Block], source: &Section, out: &mut Vec<Section>) {
+        for block in blocks {
+            let children = match block {
+                Block::Figure(f) => &f.body,
+                Block::Note(n) => &n.blocks,
+                _ => continue,
+            };
+            let nested = Section {
+                id: source.id.clone(),
+                href: source.href.clone(),
+                blocks: children.clone(),
+                anchors: Vec::new(),
+            };
+            if !eligible_ids(&nested).is_empty() {
+                out.push(nested);
+            }
+            visit(children, source, out);
+        }
+    }
+    let mut out = Vec::new();
+    visit(&section.blocks[target], section, &mut out);
+    out
+}
+
+pub(super) fn has_nested_candidates(block: &Block) -> bool {
+    let children = match block {
+        Block::Figure(f) => &f.body,
+        Block::Note(n) => &n.blocks,
+        _ => return false,
+    };
+    children
+        .iter()
+        .any(|b| body(b).is_some() || has_nested_candidates(b))
+}
+
+pub(super) fn cached_valid(section: &Section, annotation: &Annotation) -> bool {
+    let Annotation::CodeOrQuote {
+        body: members,
+        presentation,
+        language,
+        captions,
+        sources,
+        credit,
+    } = annotation
+    else {
+        return true;
+    };
+    if members.is_empty() {
+        return false;
+    }
+    let ids = members
+        .iter()
+        .map(|r| section.blocks.iter().position(|b| anchor(b) == Some(r)))
+        .collect::<Option<Vec<_>>>();
+    if let Some(ids) = ids {
+        let locate = |r: &SourceRange| {
+            section
+                .blocks
+                .iter()
+                .position(|b| attachment_anchor(b) == Some(r))
+        };
+        let Some(captions) = captions.iter().map(locate).collect::<Option<Vec<_>>>() else {
+            return false;
+        };
+        let Some(sources) = sources.iter().map(locate).collect::<Option<Vec<_>>>() else {
+            return false;
+        };
+        let credit = match credit {
+            Some(range) => {
+                let Some(i) = body(&section.blocks[*ids.last().unwrap()])
+                    .and_then(|ts| ts.iter().position(|t| t.source.as_ref() == Some(range)))
+                else {
+                    return false;
+                };
+                Some(i)
+            }
+            None => None,
+        };
+        return valid(
+            section,
+            &ids,
+            *presentation,
+            language.as_deref(),
+            &captions,
+            &sources,
+            credit,
+            &eligible_ids(section),
+        );
+    }
+    nested_sections(section, 0..section.blocks.len())
+        .iter()
+        .any(|s| cached_valid(s, annotation))
 }
 
 #[cfg(test)]
@@ -432,3 +658,6 @@ mod tests;
 
 #[cfg(test)]
 mod group_tests;
+
+#[cfg(test)]
+mod local_books;

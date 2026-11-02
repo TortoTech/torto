@@ -183,6 +183,7 @@ pub fn needs_recognition(section: &Section, target: Range<usize>) -> bool {
     if !formulas::candidates(&target).is_empty() {
         return true;
     }
+    if target.blocks.iter().any(code_blocks::has_nested_candidates) { return true; }
     let eligible = code_blocks::eligible_ids(&target);
     target.blocks.iter().enumerate().any(|(i, block)| {
         if code_blocks::body(block).is_some() && !eligible.contains(&i) {

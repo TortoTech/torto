@@ -447,7 +447,7 @@ struct ReadingIrParser<'a> {
     suppressed_content: bool,
     inside_breadcrumb: bool,
     inside_hidden_content: bool,
-    image_width_contexts: HashMap<roxmltree::NodeId, rebook_publication::ImageContainerWidth>,
+    image_width_contexts: HashMap<roxmltree::NodeId, image_context::ImageContext>,
     navigation_documents: HashSet<String>,
     ancestor_targets: HashSet<String>,
     heading_fragments: HashSet<String>,
@@ -2271,7 +2271,11 @@ impl<'a> ReadingIrParser<'a> {
             return Ok(None);
         }
         let mut style = self.styles.image_style(node);
-        style.container_width = self.image_container_width(node);
+        let geometry = self.image_geometry(node);
+        style.container_width = (geometry.width != rebook_publication::ImageContainerWidth { fraction: Some(1.0), pixels: None }).then_some(geometry.width);
+        style.container_height = geometry.height;
+        style.clip_width = geometry.clip_width;
+        style.clip_height = geometry.clip_height;
         if let Some((margin_before, margin_after)) = container_style {
             style.margin_before = style.margin_before.max(margin_before);
             style.margin_after = style.margin_after.max(margin_after);
@@ -4170,23 +4174,14 @@ impl StyleSheet {
     }
 
     fn image_style(&self, node: Node<'_, '_>) -> ImageStyle {
+        let properties = self.cascaded_properties(node);
         let mut style = ImageStyle {
-            width: attribute_local(node, "width").and_then(image_length),
-            height: attribute_local(node, "height").and_then(image_length),
+            width: image_context::dimension(self, node, &properties, "width"),
+            height: image_context::dimension(self, node, &properties, "height"),
             ..ImageStyle::default()
         };
-        let properties = self.cascaded_properties(node);
-        // HTML dimensions are presentational hints. CSS auto explicitly clears
-        // that hint so the missing axis can use the image's intrinsic ratio.
-        for (name, dimension) in [("width", &mut style.width), ("height", &mut style.height)] {
-            if let Some(value) = properties.get(name) {
-                if value.trim().eq_ignore_ascii_case("auto") {
-                    *dimension = None;
-                } else if let Some(value) = image_length(value) {
-                    *dimension = Some(value);
-                }
-            }
-        }
+        style.min_width = properties.get("min-width").and_then(|v| image_length(v));
+        style.min_height = properties.get("min-height").and_then(|v| image_length(v));
         if let Some(value) = properties
             .get("max-width")
             .and_then(|value| image_length(value))
@@ -4648,11 +4643,14 @@ fn declarations_with_priority(style: &str) -> impl Iterator<Item = (String, Stri
         let (value, important) = value.rsplit_once('!')
             .filter(|(_, suffix)| suffix.trim().eq_ignore_ascii_case("important"))
             .map_or((value, false), |(value, _)| (value, true));
-        Some((
-            name.trim().to_ascii_lowercase(),
-            value.trim().to_ascii_lowercase(),
-            important,
-        ))
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+        if matches!(name.as_str(), "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height")
+            && image_length(&value).is_none()
+            && !matches!(value.as_str(), "auto" | "none" | "inherit" | "initial" | "unset" | "revert" | "revert-layer" | "min-content" | "max-content" | "fit-content" | "stretch")
+            && !["calc(", "var(", "min(", "max(", "clamp(", "fit-content("].iter().any(|prefix| value.starts_with(prefix))
+        { return None; }
+        Some((name, value, important))
     })
 }
 
@@ -4740,16 +4738,14 @@ fn image_length(value: &str) -> Option<ImageLength> {
     if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("none") {
         return None;
     }
+    // Nonzero unitless dimensions are HTML hints, not valid CSS lengths.
+    if value.parse::<f32>().is_ok_and(|n| n != 0.0) { return None; }
     if let Some(percent) = value.strip_suffix('%') {
         let fraction = percent.trim().parse::<f32>().ok()? / 100.0;
-        return fraction
-            .is_finite()
-            .then_some(ImageLength::Fraction(fraction.max(0.0)));
+        return (fraction.is_finite() && fraction >= 0.0).then_some(ImageLength::Fraction(fraction));
     }
     let pixels = css_length(value)?;
-    pixels
-        .is_finite()
-        .then_some(ImageLength::Pixels(pixels.max(0.0)))
+    (pixels.is_finite() && pixels >= 0.0).then_some(ImageLength::Pixels(pixels))
 }
 
 fn inline_em_length(value: &str) -> Option<f32> {

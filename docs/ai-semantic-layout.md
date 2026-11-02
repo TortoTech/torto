@@ -16,11 +16,13 @@ original-image fallback and unified formula rendering.
 
 `parser → rewrite → translation → semantic layout → sentence structure → layout`
 
-Recognition reads the rewritten, untranslated publication. Only source-backed
-ordinary paragraphs and unassociated images are classification candidates. Existing semantic
-blocks are represented as protected boundaries, without their text, except for
-recognized quotes missing an attribution. Those are exposed only for credit
-completion, without reclassifying or restyling their body. Headings
+Recognition reads the rewritten, untranslated publication. Source-backed ordinary
+paragraphs, unassociated images, quotation/preformatted containers and faithful
+image-text transcriptions can be candidates. Code/quotation classification jointly
+determines complete member groups, presentation, language and explicit attachments.
+Authored figures and notes keep their outer structure; eligible children are
+classified in separate bounded scopes through the same classifier. Ordinary
+figure content remains protected from general prose reclassification. Headings
 provide read-only context. Model output contains IDs and roles, never replacement
 text or styles, except for exact source-credit suffixes copied for localization.
 Local validation rejects nonexistent IDs, overlaps, discontinuous
@@ -47,7 +49,7 @@ source-protection and relationship checks still run after parsing.
 has no attribution. It can consume the immediately following paragraph or move
 the quote's separate final body paragraph into its attribution field. The latter
 must leave at least one body paragraph. Both cases preserve source links and
-bilingual companions. Already attributed quotes stay protected. `quote_inline`
+bilingual companions. Existing explicit attributions are preserved and close a grouping run. `quote_inline`
 can also extract an explicitly written suffix from a recognized quote's final
 body paragraph without recommending alignment or changing its recognized scope. The model cannot generate new
 credit text or infer an author absent from the supplied book content.
@@ -214,3 +216,30 @@ text outside the formula image; copying the formula still copies LaTeX.
 The extra request and cache retain the compact wire-key convention. Their cache
 key includes book, original context, target language, endpoint/model and policy
 revision. Existing image transcription and semantic-window caches can be reused.
+
+## Code images and authored code containers
+
+Image recognition runs before the shared code/quotation classifier. Pure source
+code is transcribed literally, with indentation and line breaks, using the existing
+image-text result. The classifier receives that text rather than the image alt
+label and can select code, a quotation, or leave ordinary text unchanged. The same
+response jointly decides grouping and syntax language; transport retains `cqk`,
+`pr`, and `lg`. Code composition uses the original transcription, not its translation,
+then reuses the existing preformatted styling and light/dark syntax highlighting.
+A confirmed language appears as a small source-free layout label; unknown syntax
+remains plain code. Labels never change search or source offsets.
+
+Eligible code/quotation children inside figures and notes use independent scopes,
+so groups cannot cross those containers. Composition and cache validation resolve
+original source ranges recursively. Existing outer figures, captions and credits
+remain in place, without adding another wrapper around code already in a figure.
+Image recognition revision 8 refreshes legacy text-image decisions.
+
+Opt-in offline regressions accept `TORTO_ISSUE65_BOOK` (*Structured Writing*) and
+`TORTO_ISSUE70_BOOK` (*The Algorithm Design Manual*), then run
+`cargo test --locked -p rebook-app-core local_structured_writing_nested_html -- --ignored --nocapture`
+and `cargo test --locked -p rebook-app-core local_algorithm_manual_image_geometry -- --ignored --nocapture`.
+They read original EPUBs, inject deterministic classification/OCR results, and do
+not issue AI requests or alter the library. Figure 3.5's HTML and original source
+ranges survive composition; the algorithm figure keeps its 192×216 intrinsic size
+and the separate transcribed C example keeps source node `n267`.

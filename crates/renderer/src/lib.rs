@@ -2402,6 +2402,7 @@ struct GlyphCommand {
 
 #[derive(Clone)]
 struct ImageCommand {
+    clip: Option<Rect>,
     origin: Option<rebook_layout::RasterOrigin>,
     formula: Option<String>,
     image: ImageBrush,
@@ -2442,10 +2443,12 @@ impl ImageCommand {
                 f64::from(self.image.image.width.max(1)) / f64::from(data.width.max(1)),
                 f64::from(self.image.image.height.max(1)) / f64::from(data.height.max(1)),
             );
+        if let Some(clip) = self.clip { scene.push_clip_layer(Fill::NonZero, page_transform, &clip); }
         scene.draw_image(
             ImageBrush::new(data.clone()).as_ref(),
             page_transform * transform,
         );
+        if self.clip.is_some() { scene.pop_layer(); }
         Some(data)
     }
 }
@@ -2621,17 +2624,18 @@ impl DisplayListCompiler {
                             f64::from(image.height) / f64::from(image.image.height.max(1)),
                         );
                     commands.push(DisplayCommand::Image(ImageCommand {
+                        clip: image.clip.map(|c| Rect::new(c.x.into(), c.y.into(), (c.x+c.width).into(), (c.y+c.height).into())),
                         origin: image.image.origin.clone(),
                         formula: image.formula_presentation.as_ref().map(|f| f.latex.clone()),
                         image: ImageBrush::new(data),
                         deferred: image.image.deferred.clone(),
                         transform,
-                        bounds: Rect::new(
+                        bounds: image.clip.map_or_else(|| Rect::new(
                             f64::from(image.x),
                             f64::from(image.y),
                             f64::from(image.x + image.width),
                             f64::from(image.y + image.height),
-                        ),
+                        ), |c| Rect::new(c.x.into(),c.y.into(),(c.x+c.width).into(),(c.y+c.height).into())),
                         width: image
                             .formula_presentation
                             .as_ref()
@@ -2794,7 +2798,7 @@ fn page_item_top(item: &PageItem) -> Option<f32> {
             .get(text.lines.start)
             .map(|line| text.origin_y + line.metrics().block_min_coord),
         PageItem::Quote(quote) => (!quote.continued_before).then_some(quote.y),
-        PageItem::Image(image) => Some(image.y),
+        PageItem::Image(image) => Some(image.visible_rect().y),
         PageItem::Table(table) => Some(table.y),
         PageItem::Separator(separator) => Some(separator.y),
     }
@@ -2810,7 +2814,7 @@ fn page_item_bottom(item: &PageItem) -> Option<f32> {
             .and_then(|line| text.layout.get(line))
             .map(|line| text.origin_y + line.metrics().block_max_coord),
         PageItem::Quote(quote) => (!quote.continued_after).then_some(quote.y + quote.height),
-        PageItem::Image(image) => Some(image.y + image.height),
+        PageItem::Image(image) => Some(image.visible_rect().y + image.visible_rect().height),
         PageItem::Table(table) => Some(table.y + table.height),
         PageItem::Separator(separator) => Some(separator.y + 1.0),
     }
@@ -3140,6 +3144,7 @@ fn compile_text_commands(
                     height: image.image.height,
                 };
                 commands.push(DisplayCommand::Image(ImageCommand {
+                    clip: None,
                     origin: image.image.origin.clone(),
                     formula: image.formula_presentation.as_ref().map(|f| f.latex.clone()),
                     image: ImageBrush::new(data),
@@ -3582,6 +3587,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
+                clip: None,
                 formula_presentation: Some(rebook_layout::FormulaPresentation {
                     original,
                     latex: r"\sigma=\sqrt{k\theta^2}".into(),
@@ -4643,6 +4649,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
+                clip: None,
                 formula_presentation: None,
                 image: RasterImage {
                     deferred: None,
@@ -4736,6 +4743,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
+                clip: None,
                 formula_presentation: None,
                 image: RasterImage {
                     deferred: None,
@@ -4803,4 +4811,24 @@ mod tests {
         assert_eq!(fragment.quote, "译文");
         assert_eq!(fragment.range, source);
     }
+    #[test]
+    fn overflow_clip_limits_paint_and_hit_bounds_without_resizing_the_original_image() {
+        let page = PageLayout {
+            viewport: LayoutViewport::new(300, 300).unwrap(), background: Rgba::BLACK, leading_gap: 0.0,
+            items: vec![PageItem::Image(ImagePlacement {
+                clip: Some(rebook_publication::FixedPageTextRect { x:10.0,y:20.0,width:40.0,height:50.0 }),
+                formula_presentation: None,
+                image: RasterImage {deferred:None,origin:None,blob:None,width:100,height:100,pixels:vec![255;40000].into()},
+                x:10.0,y:20.0,width:200.0,height:200.0,source:None,text_layer:None,replacement:None,
+            })],
+        };
+        let list=DisplayListCompiler.compile(&page);
+        assert_eq!(list.image_bounds(),Some(Rect::new(10.0,20.0,50.0,70.0)));
+        assert!(list.image_at(25.0,40.0).is_some());
+        assert!(list.image_at(80.0,40.0).is_none());
+        let DisplayCommand::Image(command)=&list.commands[0] else {panic!()};
+        assert_eq!(command.clip,Some(Rect::new(10.0,20.0,50.0,70.0)));
+        assert_eq!(command.transform.as_coeffs()[0],2.0);
+    }
+
 }

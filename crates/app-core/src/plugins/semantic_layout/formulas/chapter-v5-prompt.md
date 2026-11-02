@@ -20,3 +20,5 @@ Do not extract isolated labels from charts, diagrams, tables, photos, decoration
 or screenshots with mixed graphics. Keep those as not_formula. If pure text is
 unclear or cannot be represented faithfully, use unreadable_text. Formula results
 keep text=null and literal=false; text results keep latex/equation_number=null.
+
+Pure source-code images also use recognized_text with exact literal Unicode, original indentation and line breaks, and literal=true. Do not add code fences or escape literal HTML/XML as markup. A following shared code/quotation classification step determines presentation and syntax language.

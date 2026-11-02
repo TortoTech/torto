@@ -296,3 +296,42 @@ fn explicit_pullquote_semantics_do_not_require_author_styles() {
 fn assert_close(actual: f32, expected: f32) {
     assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
 }
+
+#[test]
+fn legacy_dimensions_apply_only_to_supported_elements_and_css_keeps_its_priority() {
+    let section = parse("<p width='0%' height='4%'><img src='a.png'/></p><div width='10%'><img src='b.png'/></div><p style='width:0%'><img src='c.png'/></p><img src='d.png' width='600' height='400' style='width:auto'/><img src='e.png' width='600' style='width:40%;width:-1px;width:garbage'/>");
+    let images: Vec<_> = section.blocks.iter().filter_map(|b| if let Block::Image(i)=b {Some(i)} else {None}).collect();
+    assert_eq!(images.len(),5);
+    assert!(images[0].style.container_width.is_none());
+    assert!(images[1].style.container_width.is_none());
+    assert_eq!(images[2].style.container_width.unwrap().resolve(800.0),0.0);
+    assert_eq!(images[3].style.width,None);
+    assert_eq!(images[3].style.height,Some(ImageLength::Pixels(400.0)));
+    assert_eq!(images[4].style.width,Some(ImageLength::Fraction(0.4)));
+}
+
+#[test]
+fn containing_heights_and_overflow_are_separate_from_image_sizing() {
+    let section = parse("<div style='width:0'><img src='visible.png'/></div><div style='width:0;overflow:hidden'><img src='clipped.png'/></div><div style='height:200px'><img src='half.png' style='height:50%'/><p><img src='auto.png' style='height:50%'/></p></div><div style='height:50%'><img src='indefinite.png' style='height:100%'/></div>");
+    let images: Vec<_> = section.blocks.iter().filter_map(|b| if let Block::Image(i)=b {Some(i)} else {None}).collect();
+    assert_eq!(images.len(),5);
+    assert!(images[0].style.clip_width.is_none());
+    assert_eq!(images[1].style.clip_width.unwrap().resolve(800.0),0.0);
+    assert_eq!(images[2].style.container_height.unwrap().resolve(700.0),200.0);
+    assert!(images[3].style.container_height.is_none());
+    assert!(images[4].style.container_height.is_none());
+    assert_eq!(image_context::html_dimension("0%",true),None);
+    assert_eq!(image_context::html_dimension("0%",false),Some(ImageLength::Fraction(0.0)));
+    assert_eq!(image_context::html_dimension("2em",false),Some(ImageLength::Pixels(2.0)));
+}
+
+#[test]
+fn inline_wrappers_do_not_establish_width_and_overflow_axes_compute_together() {
+    let section=parse("<p style='display:inline;width:0'><img src='a.png' style='width:100%'/></p><div style='display:contents;width:0'><img src='b.png'/></div><div style='width:100px;height:50px;overflow-x:hidden;overflow-y:visible'><img src='c.png'/></div>");
+    let images:Vec<_>=section.blocks.iter().filter_map(|b|if let Block::Image(i)=b{Some(i)}else{None}).collect();
+    assert_eq!(images.len(),3);
+    assert!(images[0].style.container_width.is_none());
+    assert!(images[1].style.container_width.is_none());
+    assert_eq!(images[2].style.clip_width.unwrap().resolve(800.0),100.0);
+    assert_eq!(images[2].style.clip_height.unwrap().resolve(700.0),50.0);
+}

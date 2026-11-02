@@ -5,8 +5,7 @@ preserved in the proposed representation under ordinary reader reflow and
 typography. This requirement applies equally to Unicode text, LaTeX and XHTML tables.
 
 Judge the exact representation returned, not a hypothetical richer
-reconstruction. Unicode text is rendered as ordinary prose, with no additional
-visual or semantic markup. Preserving the character sequence alone is
+reconstruction. Ordinary Unicode text is rendered as prose. Pure source-code transcriptions enter the shared code/quotation classifier, which can retain literal preformatted text and syntax highlighting; indentation and line breaks must already be faithful. Preserving the character sequence alone is
 insufficient if the image encodes distinctions or relationships that this
 string cannot express. Do not assume that information is decorative merely
 because it is typographic. Without a clear basis for treating it as incidental,

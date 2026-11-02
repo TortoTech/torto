@@ -239,6 +239,7 @@ fn painting_uses_only_visible_ready_blobs_and_preserves_geometry_and_hits() {
     };
     let placement = |request, y| {
         rebook_layout::PageItem::Image(rebook_layout::ImagePlacement {
+            clip: None,
             formula_presentation: None,
             image: raster(request),
             x: 20.0,

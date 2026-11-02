@@ -5834,6 +5834,7 @@ mod tests {
             },
             leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
+                clip: None,
                 formula_presentation: None,
                 image: RasterImage {
                     deferred: None,
@@ -5884,6 +5885,7 @@ mod tests {
                 background: Rgba::BLACK,
                 leading_gap,
                 items: vec![PageItem::Image(ImagePlacement {
+                    clip: None,
                     formula_presentation: None,
                     image: RasterImage {
                         deferred: None,
