@@ -68,10 +68,44 @@ impl rebook_app_core::credentials::SecretStore for CoreSecrets {
             .map_err(core_error)
     }
     fn delete(&self, s: &str, a: &str) -> rebook_app_core::credentials::Result<()> {
-        entry(s, a)
-            .and_then(|e| e.delete_credential())
-            .map_err(core_error)
+        delete_native(s, a)
     }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn delete_native(s: &str, a: &str) -> rebook_app_core::credentials::Result<()> {
+    entry(s, a)
+        .and_then(|e| e.delete_credential())
+        .map_err(core_error)
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn delete_native(s: &str, a: &str) -> rebook_app_core::credentials::Result<()> {
+    use security_framework::{
+        item::{ItemClass, ItemSearchOptions},
+        os::macos::keychain::{SecKeychain, SecPreferencesDomain},
+    };
+    // The keyring backend reads the secret before deleting it, which can ask
+    // for authorization again after migration. Delete by exact metadata only,
+    // in the same user-domain keychain as keyring's reads and writes.
+    if s.is_empty() || a.is_empty() {
+        return Err(rebook_app_core::credentials::Error::Store(
+            "安全凭据标识不能为空".into(),
+        ));
+    }
+    let delete = || {
+        let keychain = SecKeychain::default_for_domain(SecPreferencesDomain::User)?;
+        ItemSearchOptions::new()
+            .keychains(&[keychain])
+            .class(ItemClass::generic_password())
+            .service(s)
+            .account(a)
+            .delete()
+    };
+    delete().map_err(|error| match error.code() {
+        -25300 => rebook_app_core::credentials::Error::NoEntry, // errSecItemNotFound
+        _ => rebook_app_core::credentials::Error::Store(error.to_string()),
+    })
 }
 fn core_error(e: keyring::Error) -> rebook_app_core::credentials::Error {
     match e {

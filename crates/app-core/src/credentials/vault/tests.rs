@@ -9,6 +9,7 @@ struct Native {
     writes: AtomicUsize,
     deletes: AtomicUsize,
     deny: AtomicBool,
+    deny_cleanup: AtomicBool,
     fail_save: Mutex<Option<PathBuf>>,
 }
 impl SecretStore for Native {
@@ -30,6 +31,9 @@ impl SecretStore for Native {
     }
     fn delete(&self, s: &str, a: &str) -> Result<()> {
         self.deletes.fetch_add(1, Ordering::SeqCst);
+        if self.deny_cleanup.load(Ordering::SeqCst) {
+            return Err(fail("cleanup denied"));
+        }
         self.inner.delete(s, a)
     }
 }
@@ -243,4 +247,88 @@ fn negative_cache_is_bounded_before_any_master_key_is_created() {
         MAX_ENTRIES
     );
     assert_eq!(f.native.writes.load(Ordering::SeqCst), 0);
+}
+
+const SERVICES: [(&str, &str); 4] = [
+    ("Rebook AI", "provider"),
+    ("Rebook PDF OCR", "mineru"),
+    ("Torto Web Search", "search"),
+    ("Rebook WebDAV", "device"),
+];
+
+#[test]
+fn all_credential_types_share_one_unlock_and_updates_never_revisit_legacy_items() {
+    let f = Fixture::new();
+    for (service, account) in SERVICES {
+        f.vault.write(service, account, "original").unwrap();
+    }
+    let reads = f.native.reads.load(Ordering::SeqCst);
+    let deletes = f.native.deletes.load(Ordering::SeqCst);
+    let reopened = f.reopen();
+    for (service, account) in SERVICES {
+        assert_eq!(reopened.read(service, account).unwrap(), "original");
+        reopened.write(service, account, "updated").unwrap();
+        reopened.delete(service, account).unwrap();
+        reopened.write(service, account, "restored").unwrap();
+    }
+    assert_eq!(f.native.reads.load(Ordering::SeqCst), reads + 1); // master only
+    assert_eq!(f.native.deletes.load(Ordering::SeqCst), deletes);
+    for (service, account) in SERVICES {
+        assert_eq!(f.vault.read(service, account).unwrap(), "restored");
+    }
+    assert_eq!(f.native.reads.load(Ordering::SeqCst), reads + 1);
+}
+
+#[test]
+fn concurrent_readers_unlock_master_only_once() {
+    let f = Fixture::new();
+    for (service, account) in SERVICES {
+        f.vault.write(service, account, "stored").unwrap();
+    }
+    let vault = Arc::new(f.reopen());
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let reads = f.native.reads.load(Ordering::SeqCst);
+    std::thread::scope(|scope| {
+        for i in 0..8 {
+            let vault = vault.clone();
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                barrier.wait();
+                let (service, account) = SERVICES[i % SERVICES.len()];
+                for _ in 0..5 {
+                    assert_eq!(vault.read(service, account).unwrap(), "stored");
+                }
+            });
+        }
+    });
+    assert_eq!(f.native.reads.load(Ordering::SeqCst), reads + 1);
+}
+
+#[test]
+fn failed_legacy_cleanup_does_not_prompt_again_on_updates_or_reopen() {
+    let f = Fixture::new();
+    f.native
+        .inner
+        .write("Rebook WebDAV", "device", "old")
+        .unwrap();
+    f.native.deny_cleanup.store(true, Ordering::SeqCst);
+    assert_eq!(f.vault.read("Rebook WebDAV", "device").unwrap(), "old");
+    let reads = f.native.reads.load(Ordering::SeqCst);
+    let deletes = f.native.deletes.load(Ordering::SeqCst);
+    assert_eq!(deletes, 1);
+    let reopened = f.reopen();
+    assert_eq!(reopened.read("Rebook WebDAV", "device").unwrap(), "old");
+    reopened.write("Rebook WebDAV", "device", "new").unwrap();
+    assert_eq!(f.vault.read("Rebook WebDAV", "device").unwrap(), "new");
+    reopened.delete("Rebook WebDAV", "device").unwrap();
+    assert!(matches!(
+        f.reopen().read("Rebook WebDAV", "device"),
+        Err(Error::NoEntry)
+    ));
+    assert_eq!(f.native.reads.load(Ordering::SeqCst), reads + 2); // two reopened masters
+    assert_eq!(f.native.deletes.load(Ordering::SeqCst), deletes);
+    assert_eq!(
+        f.native.inner.read("Rebook WebDAV", "device").unwrap(),
+        "old"
+    );
 }

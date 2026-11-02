@@ -265,9 +265,12 @@ impl SecretStore for VaultStore {
                 return Ok(());
             }
             let mut payload = state.payload.clone();
+            let needs_cleanup = !payload.entries.contains_key(&id);
             payload.entries.insert(id, Some(value.into()));
             self.save(state, payload)?;
-            self.cleanup(service, account);
+            if needs_cleanup {
+                self.cleanup(service, account);
+            }
             Ok(())
         })
     }
@@ -278,9 +281,12 @@ impl SecretStore for VaultStore {
                 return Err(Error::NoEntry);
             }
             let mut payload = state.payload.clone();
+            let needs_cleanup = !payload.entries.contains_key(&id);
             payload.entries.insert(id, None);
             self.save(state, payload)?;
-            self.cleanup(service, account);
+            if needs_cleanup {
+                self.cleanup(service, account);
+            }
             Ok(())
         })
     }
