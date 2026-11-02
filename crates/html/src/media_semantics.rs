@@ -1,6 +1,129 @@
 //! Media relationships depend on authored structure and resolved CSS, never selector names.
 use super::*;
 
+/// Repair publisher quotation wrappers only when the caption label and adjacent
+/// media provide strong evidence. Run after parsing/filtering so source nodes,
+/// inline styles and fragment anchors are never allocated a second time.
+pub(super) fn resolve_quoted_captions(blocks: &mut Vec<Block>, headings: &HashSet<String>) {
+    resolve_caption_scope(blocks, headings, false);
+}
+
+fn resolve_caption_scope(blocks: &mut Vec<Block>, headings: &HashSet<String>, in_figure: bool) {
+    for block in blocks.iter_mut() {
+        match block {
+            Block::Figure(figure) => resolve_caption_scope(&mut figure.body, headings, true),
+            Block::Note(note) => resolve_caption_scope(&mut note.blocks, headings, false),
+            _ => {}
+        }
+    }
+    let candidates: Vec<_> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, block)| {
+            let text = match block {
+                Block::Quote(quote) if quote.attribution.is_none() && quote.body.len() == 1 => {
+                    &quote.body[0]
+                }
+                Block::Text(text) if text.kind == TextBlockKind::Blockquote => text,
+                _ => return false,
+            };
+            let adjacent = i
+                .checked_sub(1)
+                .and_then(|j| blocks.get(j))
+                .is_some_and(|b| matches!(b, Block::Image(_)))
+                || matches!(blocks.get(i + 1), Some(Block::Image(_)));
+            adjacent
+                && text.kind == TextBlockKind::Blockquote
+                && text
+                    .source
+                    .as_ref()
+                    .is_some_and(|r| !headings.contains(&r.start.node))
+                && strong_caption_label(
+                    &text
+                        .content
+                        .iter()
+                        .map(|inline| match inline {
+                            Inline::Break => "\n".to_owned(),
+                            _ => inline.text_runs().iter().map(|r| r.text.as_str()).collect(),
+                        })
+                        .collect::<String>(),
+                )
+        })
+        .collect();
+    if !candidates.iter().any(|candidate| *candidate) {
+        return;
+    }
+    for (block, candidate) in blocks.iter_mut().zip(&candidates) {
+        if !candidate {
+            continue;
+        }
+        if let Block::Quote(quote) = block {
+            *block = Block::Text(quote.body.remove(0));
+        }
+        let Block::Text(text) = block else {
+            unreachable!()
+        };
+        text.kind = TextBlockKind::Caption;
+    }
+    // An existing figure already provides the media boundary. Keep its body
+    // instead of introducing a second figure wrapper around the same image.
+    if in_figure {
+        return;
+    }
+    let caption_or_image = |b: &Block| {
+        matches!(b, Block::Image(_))
+            || matches!(b, Block::Text(t) if t.kind == TextBlockKind::Caption)
+    };
+    let mut pending = std::mem::take(blocks).into_iter().enumerate().peekable();
+    while let Some((index, block)) = pending.next() {
+        if !caption_or_image(&block) {
+            blocks.push(block);
+            continue;
+        }
+        let mut changed = candidates[index];
+        let mut run = vec![block];
+        while pending
+            .peek()
+            .is_some_and(|(_, block)| caption_or_image(block))
+        {
+            let (index, block) = pending.next().unwrap();
+            changed |= candidates[index];
+            run.push(block);
+        }
+        if changed {
+            blocks.extend(nested_media::group_images_and_captions(
+                run,
+                BlockStyle::default(),
+            ));
+        } else {
+            blocks.extend(run);
+        }
+    }
+}
+
+fn strong_caption_label(text: &str) -> bool {
+    let Some((identifier, description)) =
+        caption_label_rest(text).and_then(|rest| rest.split_once([':', '：']))
+    else {
+        return false;
+    };
+    let identifier = identifier.trim();
+    // A delimited, complete figure identifier is stronger than a sentence such
+    // as "Figure 1.1 shows ...". No word/verb denylist or book-specific labels.
+    !description.trim().is_empty()
+        && starts_with_caption_identifier(identifier)
+        && identifier.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || caption_identifier_start(c)
+                || matches!(c, '.' | '-' | '–' | '—' | '(' | ')' | '（' | '）')
+        })
+        && (identifier
+            .chars()
+            .any(|c| c.is_ascii_digit() || !c.is_ascii() && caption_identifier_start(c))
+            || identifier.len() == 1
+            || identifier.chars().all(|c| "IVXLCDM".contains(c)))
+}
+
 fn protected(node: Node<'_, '_>, headings: &HashSet<String>) -> bool {
     node.descendants().filter(Node::is_element).any(|n| {
         matches!(n.tag_name().name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6")

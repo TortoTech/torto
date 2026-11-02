@@ -20,7 +20,15 @@ visible. Hidden/clip/scroll/auto overflow retains a separate clip rectangle, rat
 than resizing the image's pixels. Renderers and image hit bounds use the visible
 rectangle; previews retain the original resource. Zero-sized or fully clipped
 images produce no painted image. Source anchors are unchanged. Source IR revision
-15 rebuilds previously cached container-width hints.
+16 rebuilds previously cached container-width hints and caption relationships.
+
+Before AI layout, HTML heuristics recover standalone quotation-wrapped captions
+next to images when they contain a complete numbered label, a colon and a
+description. The existing media grouping keeps the image and caption together;
+already authored figures retain their own wrapper. Source ranges and anchors are
+unchanged. Attributed or multi-paragraph quotations, prose such as “Figure 1.1
+shows…”, TOC destinations and intervening content remain protected. This requires
+no AI request and does not change the compact AI response contract.
 
 References: [HTML rendering](https://html.spec.whatwg.org/multipage/rendering.html),
 [CSS sizing](https://www.w3.org/TR/CSS22/visudet.html), and

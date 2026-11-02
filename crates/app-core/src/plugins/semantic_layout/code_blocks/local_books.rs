@@ -89,11 +89,23 @@ fn local_algorithm_manual_image_geometry_and_transcribed_c_keep_original_anchors
     let figure = section
         .blocks
         .iter()
-        .find(|b| matches!(b,Block::Image(i) if i.href.path().ends_with("Image00001.gif")))
+        .find(|b| matches!(b,Block::Figure(f) if f.images.iter().any(|i| i.href.path().ends_with("Image00001.gif"))))
         .unwrap();
-    let Block::Image(image) = figure else {
+    let Block::Figure(group) = figure else {
         panic!()
     };
+    assert_eq!(group.images.len(), 1);
+    let image = &group.images[0];
+    assert_eq!(group.captions.len(), 1);
+    assert_eq!(group.captions[0].kind, TextBlockKind::Caption);
+    assert_eq!(
+        group.captions[0].source.as_ref().unwrap().start.node,
+        "n265"
+    );
+    assert_eq!(
+        text_block_text(&group.captions[0]),
+        "Figure 1.1: Animation of insertion sort in action (time flows down)"
+    );
     assert!(image.style.container_width.is_none());
     assert_eq!(image.source.as_ref().unwrap().start.node, "n263");
     for unified in [false, true] {
@@ -122,6 +134,13 @@ fn local_algorithm_manual_image_geometry_and_transcribed_c_keep_original_anchors
             })
             .unwrap();
         assert_eq!((placed.width, placed.height), (192.0, 216.0));
+        assert!(
+            !layout
+                .pages
+                .iter()
+                .flat_map(|p| &p.items)
+                .any(|i| matches!(i, PageItem::Quote(_)))
+        );
     }
     let code_index = section
         .blocks
@@ -160,5 +179,21 @@ fn local_algorithm_manual_image_geometry_and_transcribed_c_keep_original_anchors
         .unwrap();
     assert_eq!(code.kind, TextBlockKind::Preformatted);
     assert_eq!(code.style.code_language.unwrap().as_str(), "C");
-    eprintln!("#70 image restored to 192x216 in book/unified modes; #69 C code retains n267");
+    let mut captions = 0;
+    for index in 0..source.book().sections.len() {
+        let chapter = source.parse_section(index).unwrap();
+        for block in &chapter.blocks {
+            if let Block::Figure(figure) = block {
+                captions += figure
+                    .captions
+                    .iter()
+                    .filter(|t| text_block_text(t).starts_with("Figure "))
+                    .count();
+            }
+        }
+    }
+    assert_eq!(captions, 116);
+    eprintln!(
+        "#70 image and caption grouped without AI; 192x216 in book/unified modes; 116 numbered captions associated; #69 C code retains n267"
+    );
 }

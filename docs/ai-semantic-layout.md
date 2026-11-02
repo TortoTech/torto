@@ -243,3 +243,8 @@ They read original EPUBs, inject deterministic classification/OCR results, and d
 not issue AI requests or alter the library. Figure 3.5's HTML and original source
 ranges survive composition; the algorithm figure keeps its 192×216 intrinsic size
 and the separate transcribed C example keeps source node `n267`.
+HTML heuristics now associate Figure 1.1's quotation-wrapped caption before AI
+classification, preserving `n263`/`n265` and keeping the separate code image out of
+the group. The same local-book regression verifies all 116 numbered captions in
+this EPUB are associated and that neither reading mode draws a quotation bar for
+the Figure 1.1 caption. Source IR revision 16 invalidates old structural caches.

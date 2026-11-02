@@ -392,6 +392,13 @@ pub fn parse_section_with_resource_metadata(
     }
 
     page_markers::annotate(root, &mut parser);
+    let heading_nodes = parser
+        .anchors
+        .iter()
+        .filter(|anchor| parser.heading_fragments.contains(&anchor.fragment))
+        .map(|anchor| anchor.source.node.clone())
+        .collect();
+    media_semantics::resolve_quoted_captions(&mut parser.blocks, &heading_nodes);
     structured_figures::attach_sources(&mut parser.blocks);
 
     #[cfg(debug_assertions)]
@@ -2484,6 +2491,10 @@ fn has_caption_semantic_attribute(node: Node<'_, '_>) -> bool {
 }
 
 fn starts_with_numbered_caption_label(text: &str) -> bool {
+    caption_label_rest(text).is_some_and(starts_with_caption_identifier)
+}
+
+fn caption_label_rest(text: &str) -> Option<&str> {
     let text = text.trim_start_matches(|character: char| {
         character.is_whitespace()
             || matches!(
@@ -2494,7 +2505,7 @@ fn starts_with_numbered_caption_label(text: &str) -> bool {
 
     for label in ["图片", "图表", "插图", "图版", "表格", "图", "表"] {
         if let Some(rest) = text.strip_prefix(label) {
-            return starts_with_caption_identifier(rest.trim_start());
+            return Some(rest.trim_start());
         }
     }
 
@@ -2513,33 +2524,35 @@ fn starts_with_numbered_caption_label(text: &str) -> bool {
             if label == "fig" {
                 rest = rest.strip_prefix('.').unwrap_or(rest);
             }
-            return starts_with_caption_identifier(rest.trim_start());
+            return Some(rest.trim_start());
         }
     }
-    false
+    None
 }
 
 fn starts_with_caption_identifier(text: &str) -> bool {
-    text.chars().next().is_some_and(|character| {
-        character.is_ascii_digit()
-            || character.is_ascii_uppercase()
-            || matches!(
-                character,
-                '一' | '二'
-                    | '三'
-                    | '四'
-                    | '五'
-                    | '六'
-                    | '七'
-                    | '八'
-                    | '九'
-                    | '十'
-                    | '百'
-                    | '千'
-                    | '零'
-                    | '〇'
-            )
-    })
+    text.chars().next().is_some_and(caption_identifier_start)
+}
+
+fn caption_identifier_start(character: char) -> bool {
+    character.is_ascii_digit()
+        || character.is_ascii_uppercase()
+        || matches!(
+            character,
+            '一' | '二'
+                | '三'
+                | '四'
+                | '五'
+                | '六'
+                | '七'
+                | '八'
+                | '九'
+                | '十'
+                | '百'
+                | '千'
+                | '零'
+                | '〇'
+        )
 }
 
 fn is_note_section_heading(node: Node<'_, '_>) -> bool {
