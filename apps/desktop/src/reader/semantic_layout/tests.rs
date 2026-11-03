@@ -3,6 +3,30 @@ use crate::reader::*;
 #[path = "open_perf_tests.rs"]
 mod open_perf_tests;
 
+pub(in crate::reader) fn finish_test_viewport_reflow(reader: &mut DesktopReader) {
+    let Some(viewport) = reader.semantic_layout.pending_viewport else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let prepared = reader
+        .reader
+        .prepare_resize_request(viewport, reader.progress_source_range())
+        .prepare()
+        .unwrap();
+    let unit = reader.reader.reading_unit_location().index;
+    assert!(reader.adopt_semantic_reflow(
+        &runtime,
+        reader.semantic_layout.reflow_version,
+        unit,
+        reader.reader.style(),
+        Ok(prepared)
+    ));
+}
+
 #[test]
 #[ignore = "requires TORTO_OPEN_BOOK and optional TORTO_OPEN_LOCATOR; read-only book/progress profiling"]
 fn local_book_open_performance() {
