@@ -13,6 +13,10 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.tortotech.torto.core.*
@@ -74,6 +78,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     private var selectionHandle=false
     private val missingCovers = LruCache<String, Boolean>(256)
     private val covers = object : LruCache<String, Bitmap>(8 * 1024 * 1024) { override fun sizeOf(key: String, value: Bitmap) = value.allocationByteCount }
+    fun cachedCover(id: String): Bitmap? = covers.get(id)
     suspend fun cover(id: String): Bitmap? {
         covers.get(id)?.let { return it }
         if (missingCovers.get(id) == true) return null
@@ -83,11 +88,17 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         } catch (e: CancellationException) { throw e } catch (_: Exception) { missingCovers.put(id,true); null }
     }
     init {
-        viewModelScope.launch {CloudRuntime.state.collect {status->
-            val changed=status.revision!=state.value.cloudStatus.revision
-            mutable.update {it.copy(cloudStatus=status)}
-            if(changed)runOperation {val books=core.books();covers.evictAll();missingCovers.evictAll();mutable.update {it.copy(books=books)}}
-        }}
+        viewModelScope.launch { CloudRuntime.state.collect { status ->
+            if (status.coverRevision != state.value.cloudStatus.coverRevision) missingCovers.evictAll()
+            mutable.update { it.copy(cloudStatus = status) }
+        } }
+        viewModelScope.launch { CloudRuntime.state.map { it.revision }.distinctUntilChanged().drop(1).collectLatest {
+            delay(250)
+            runCatching { core.books() }.onSuccess { books ->
+                missingCovers.evictAll()
+                mutable.update { it.copy(books = books) }
+            }
+        } }
         runOperation {
         val preferences=withContext(Dispatchers.IO) { application.getSharedPreferences("reading",0).let { Triple(it.getFloat("size",20f),it.getBoolean("unified",false),it.getBoolean("dark",false)) } }
         val system=withContext(Dispatchers.IO) { application.getSharedPreferences("interface",0).let { it.getString("theme","system")!! to it.getString("language","system")!! } }

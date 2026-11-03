@@ -10,6 +10,13 @@ const LOCAL: &str = "change-index:local-v1";
 const PENDING: &str = "change-index:pending-v1";
 const REPAIR: &str = "change-index:validated-v1";
 const RECHECK_MS: u64 = 24 * 60 * 60 * 1000;
+const SESSION: &str = "change-index:resume-v1";
+
+#[derive(Serialize, Deserialize)]
+struct Session {
+    identity: String,
+    token: String,
+}
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Revision {
@@ -34,6 +41,54 @@ mod tests {
         WebDavClient::new(&settings, "secret".into())
             .unwrap()
             .with_store(store, crate::sync::account_key(&settings))
+    }
+
+    #[test]
+    fn partial_checkpoints_resume_per_book_and_per_kind_without_hiding_remote_changes() {
+        let server = FakeWebDav::start();
+        let local = client(&server);
+        let peer = client(&server);
+        let a = format!("{:064x}", 1);
+        let b = format!("{:064x}", 2);
+        let books = BTreeSet::from([a.clone(), b.clone()]);
+        let devices = BTreeSet::from([local.device_id.clone(), peer.device_id.clone()]);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            publish(&peer, true).await.unwrap();
+            let plan = Plan::prepare(&local, devices.clone(), &books)
+                .await
+                .unwrap();
+            plan.checkpoint(&local, &a, false).unwrap();
+            plan.checkpoint(&local, &a, true).unwrap();
+            let retry = Plan::prepare(&local, devices.clone(), &books)
+                .await
+                .unwrap();
+            assert_eq!(retry.reading, BTreeSet::from([b.clone()]));
+            assert_eq!(retry.derived, BTreeSet::from([b.clone()]));
+            record(&peer, &b, false).unwrap();
+            publish(&peer, false).await.unwrap();
+            let unrelated = Plan::prepare(&local, devices.clone(), &books)
+                .await
+                .unwrap();
+            assert!(!unrelated.reading.contains(&a));
+            assert!(!unrelated.derived.contains(&a));
+            record(&peer, &a, false).unwrap();
+            publish(&peer, false).await.unwrap();
+            let changed = Plan::prepare(&local, devices.clone(), &books)
+                .await
+                .unwrap();
+            assert!(changed.reading.contains(&a));
+            assert!(!changed.derived.contains(&a));
+            server.objects.lock().unwrap().remove(&format!(
+                "/dav/Rebook/v1/library/changes/{}.json",
+                peer.device_id
+            ));
+            let legacy = Plan::prepare(&local, devices, &books).await.unwrap();
+            assert!(
+                legacy.reading.contains(&a) && legacy.derived.contains(&a),
+                "peers without a valid index must be rescanned"
+            );
+        });
+        server.stop();
     }
 
     #[test]
@@ -217,6 +272,9 @@ pub(super) struct Plan {
     snapshots: Vec<(String, Vec<u8>)>,
     books: BTreeSet<String>,
     repair: bool,
+    token: String,
+    revisions: BTreeMap<String, [Vec<u8>; 2]>,
+    resumable: bool,
 }
 
 impl Plan {
@@ -226,33 +284,56 @@ impl Plan {
         books: &BTreeSet<String>,
     ) -> SyncResult<Self> {
         let repair = !fresh(webdav, REPAIR)?;
+        let peers = devices
+            .iter()
+            .filter(|device| *device != &webdav.device_id)
+            .cloned()
+            .collect::<Vec<_>>();
         let mut plan = Self {
             reading: BTreeSet::new(),
             derived: BTreeSet::new(),
             snapshots: Vec::new(),
             books: books.clone(),
             repair,
+            token: String::new(),
+            revisions: BTreeMap::new(),
+            resumable: true,
         };
         let mut fallback = repair;
         for device in devices {
             if uuid::Uuid::parse_str(&device).is_err() {
                 fallback = true;
+                if device != webdav.device_id {
+                    plan.resumable = false;
+                }
                 continue;
             }
             let path = format!("library/changes/{device}.json");
             let key = format!("change-index:applied:{device}");
             let Some(object) = webdav.get_optional(&path).await? else {
                 fallback = true;
+                if device != webdav.device_id {
+                    plan.resumable = false;
+                }
                 continue;
             };
             let Some(current) = decode(&object.bytes, &device) else {
                 fallback = true;
+                if device != webdav.device_id {
+                    plan.resumable = false;
+                }
                 continue;
             };
             let previous = webdav
                 .cache_get(&key)?
                 .and_then(|bytes| decode(&bytes, &device));
             if device != webdav.device_id {
+                for book in books {
+                    let revision = current.books.get(book).cloned().unwrap_or_default();
+                    let parts = plan.revisions.entry(book.clone()).or_default();
+                    parts[0].extend(serde_json::to_vec(&(&device, &revision.reading))?);
+                    parts[1].extend(serde_json::to_vec(&(&device, &revision.derived))?);
+                }
                 if let Some(previous) = previous {
                     for book in current.books.keys().chain(previous.books.keys()) {
                         let before = previous.books.get(book).cloned().unwrap_or_default();
@@ -285,7 +366,68 @@ impl Plan {
         }
         plan.reading.retain(|book| books.contains(book));
         plan.derived.retain(|book| books.contains(book));
+        // Resume only the same remote snapshot. Own uploads must not invalidate
+        // completed peer work; new remote revisions or a new audit do.
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(webdav.cache_get(REPAIR)?.unwrap_or_default());
+        for device in peers {
+            digest.update(device.as_bytes());
+        }
+        let identity = format!("{:x}", digest.finalize());
+        plan.token = webdav
+            .cache_get(SESSION)?
+            .and_then(|b| serde_json::from_slice::<Session>(&b).ok())
+            .filter(|s| s.identity == identity)
+            .map(|s| s.token)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        webdav.cache_set(
+            SESSION,
+            &serde_json::to_vec(&Session {
+                identity,
+                token: plan.token.clone(),
+            })?,
+        )?;
+        for book in books {
+            if plan.completed(webdav, book, false)? {
+                plan.reading.remove(book);
+            }
+            if plan.completed(webdav, book, true)? {
+                plan.derived.remove(book);
+            }
+        }
         Ok(plan)
+    }
+
+    pub fn completed(&self, webdav: &WebDavClient, book: &str, derived: bool) -> SyncResult<bool> {
+        if !self.resumable {
+            return Ok(false);
+        }
+        Ok(webdav
+            .cache_get(&format!("change-index:checkpoint:{derived}:{book}"))?
+            .as_deref()
+            == Some(self.checkpoint_value(book, derived).as_bytes()))
+    }
+
+    pub fn checkpoint(&self, webdav: &WebDavClient, book: &str, derived: bool) -> SyncResult<()> {
+        if !self.resumable {
+            return Ok(());
+        }
+        webdav.cache_set(
+            &format!("change-index:checkpoint:{derived}:{book}"),
+            self.checkpoint_value(book, derived).as_bytes(),
+        )
+    }
+
+    fn checkpoint_value(&self, book: &str, derived: bool) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(self.token.as_bytes());
+        hash.update(book.as_bytes());
+        if let Some(revisions) = self.revisions.get(book) {
+            hash.update(&revisions[usize::from(derived)]);
+        }
+        format!("{:x}", hash.finalize())
     }
 
     // Call only after all selected reading/derived payloads have been applied.
@@ -299,6 +441,7 @@ impl Plan {
         if self.repair {
             webdav.cache_set(REPAIR, &rate_limit::now_ms().to_le_bytes())?;
         }
+        webdav.cache_remove(SESSION)?;
         Ok(())
     }
 }

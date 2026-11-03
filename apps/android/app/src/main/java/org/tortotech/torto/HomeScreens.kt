@@ -30,7 +30,7 @@ import org.tortotech.torto.core.*
     val recent=state.books.filter { it.lastRead>0uL }.maxByOrNull { it.lastRead }?.id
     LazyVerticalGrid(columns=GridCells.Fixed(3),contentPadding=PaddingValues(start=18.dp,end=18.dp,top=20.dp,bottom=32.dp),horizontalArrangement=Arrangement.spacedBy(14.dp),verticalArrangement=Arrangement.spacedBy(22.dp)) {
         items(state.books,key={it.id}) { book ->
-            val cover by produceState<Bitmap?>(null,book.id){value=model.cover(book.id)}
+            val cover by produceState<Bitmap?>(model.cachedCover(book.id),book.id,state.cloudStatus.coverRevision){value=model.cover(book.id)}
             Column(Modifier.combinedClickable(onClick={model.open(book)},onLongClick={onActions(book)})) {
                 Box(Modifier.fillMaxWidth().aspectRatio(.7f).shadow(3.dp,RoundedCornerShape(6.dp)).clip(RoundedCornerShape(6.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest).then(if(book.id==recent)Modifier.border(3.dp,MaterialTheme.colorScheme.primary,RoundedCornerShape(6.dp)) else Modifier),contentAlignment=Alignment.Center) {
                     cover?.let { Image(it.asImageBitmap(),null,Modifier.fillMaxSize(),contentScale=ContentScale.Crop) } ?: AppIcon("book",modifier=Modifier.size(32.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)

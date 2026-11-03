@@ -31,11 +31,27 @@ internal fun localDateTime(ms:Long):String=if(ms<=0)"—" else DateTimeFormatter
         SettingToggle(tr("后台自动同步","Sync automatically in background"),draft.background,!state.busy){draft=draft.copy(background=it)}
         Text(tr("后台同步由系统调度，省电模式下可能延后","Background sync is scheduled by Android and may be delayed by battery optimization"),style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
         val status=state.cloudStatus
-        if(status.running){Text(cloudStage(status.stage));if(status.total>0u)LinearProgressIndicator(progress={status.completed.toFloat()/status.total.toFloat()},modifier=Modifier.fillMaxWidth())else LinearProgressIndicator(Modifier.fillMaxWidth());TextButton(onClick={CloudRuntime.cancel()}){Text(tr("停止同步","Stop sync"))}}
+        CloudSyncSummary(status)
+        if(status.running)TextButton(onClick={CloudRuntime.cancel()}){Text(tr("停止同步","Stop sync"))}
         else Text(tr("上次同步：","Last sync: ")+localDateTime(status.lastSuccess),style=MaterialTheme.typography.bodySmall)
-        status.error?.let {Text(it,color=MaterialTheme.colorScheme.error)}
         Row(horizontalArrangement=Arrangement.spacedBy(12.dp)){Button(onClick={model.saveCloud(draft,password,clear){password="";clear=false}},enabled=!state.busy){Text(tr("保存","Save"))};OutlinedButton(onClick=model::synchronize,enabled=saved.enabled&&!status.running){Text(tr("立即同步","Sync now"))}}
         state.cloudPresets.firstOrNull {it.id==draft.provider}?.let {preset->TextButton(onClick={context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(preset.helpUrl)))}){Text(tr("查看云盘配置说明","Cloud setup guide"))}}
+    }
+}
+
+@Composable internal fun CloudSyncSummary(status:CloudStatus,modifier:Modifier=Modifier){
+    if(!status.running && status.error==null && status.retryAt==0L)return
+    Surface(modifier.fillMaxWidth(),shape=MaterialTheme.shapes.medium,color=MaterialTheme.colorScheme.surfaceContainerLow){
+        Column(Modifier.padding(12.dp),verticalArrangement=Arrangement.spacedBy(6.dp)){
+            if(status.booksTotal>0u)Text(tr("已就绪 ${status.booksCompleted}/${status.booksTotal} 本","${status.booksCompleted}/${status.booksTotal} books ready"),style=MaterialTheme.typography.labelLarge)
+            if(status.running){
+                Text(cloudStage(status.stage),style=MaterialTheme.typography.bodySmall)
+                if(status.booksTotal>0u)LinearProgressIndicator(progress={status.booksCompleted.toFloat()/status.booksTotal.toFloat()},modifier=Modifier.fillMaxWidth())
+                else if(status.total>0u)LinearProgressIndicator(progress={status.completed.toFloat()/status.total.toFloat()},modifier=Modifier.fillMaxWidth())
+                else LinearProgressIndicator(Modifier.fillMaxWidth())
+            }else if(status.retryAt>0)Text(tr("同步已暂停，最早重试时间：","Sync paused; retry no earlier than: ")+localDateTime(status.retryAt),style=MaterialTheme.typography.bodySmall)
+            status.error?.let {Text(it,color=MaterialTheme.colorScheme.error,style=MaterialTheme.typography.bodySmall)}
+        }
     }
 }
 @Composable private fun cloudStage(stage:String)=when(stage){"preparing"->tr("准备同步","Preparing sync");"checking"->tr("检查云端变更","Checking cloud changes");"uploading"->tr("上传书籍","Uploading books");"downloading"->tr("下载书籍","Downloading books");"statistics"->tr("同步阅读统计","Syncing reading statistics");else->tr("同步进度与批注","Syncing progress and annotations")}

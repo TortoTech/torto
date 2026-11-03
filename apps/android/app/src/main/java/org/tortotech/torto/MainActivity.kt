@@ -125,7 +125,7 @@ class MainActivity : ComponentActivity() {
                         ActionIcon("chat",tr("阅读助手","Reading assistant"),!state.busy){model.loadChat();panel="chat"}
                         ActionIcon("search",tr("搜索","Search"),!state.chatWorking){panel="search"}
                     } else if(route==null&&tab==0){
-                        if(state.cloud?.enabled==true)ActionIcon("sync",tr("立即同步","Sync now"),!state.busy){model.synchronize()}
+                        if(state.cloud?.enabled==true)ActionIcon("sync",tr("立即同步","Sync now"),!state.busy&&!state.cloudStatus.running){model.synchronize()}
                         ActionIcon("add",tr("导入书籍","Import book"),!state.busy){picker.launch(arrayOf("*/*"))}
                     }
                 },colors=TopAppBarDefaults.topAppBarColors(containerColor=MaterialTheme.colorScheme.background)
@@ -171,7 +171,10 @@ class MainActivity : ComponentActivity() {
                     "book-statistics"->BookStatisticsScreen(state,model)
                     "about"->AboutScreen(state,model){open("licenses")}
                     "licenses"->LicenseScreen()
-                    else->if(tab==0)ShelfScreen(state,model){bookActions=it} else ProfileScreen(state,{open("settings")},{open("statistics")})
+                    else->if(tab==0)Column(Modifier.fillMaxSize()) {
+                        CloudSyncSummary(state.cloudStatus, Modifier.padding(horizontal=18.dp,vertical=8.dp))
+                        Box(Modifier.weight(1f)) { ShelfScreen(state,model){bookActions=it} }
+                    } else ProfileScreen(state,{open("settings")},{open("statistics")})
                 }
                     state.selected?.let {selection->
                         Row(Modifier.align(Alignment.BottomCenter).fillMaxWidth().horizontalScroll(rememberScrollState()).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal=12.dp),verticalAlignment=Alignment.CenterVertically){

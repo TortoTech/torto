@@ -48,6 +48,7 @@ pub struct SyncReport {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncStage {
+    Books,
     Preparing,
     Checking,
     Uploading,
@@ -68,10 +69,122 @@ pub enum SyncProgress {
     },
     Downloaded {
         book: Box<RemoteLibraryBook>,
+        books_completed: u64,
+        books_total: u64,
         cache_path: PathBuf,
         completed: u64,
         total: u64,
     },
+    CoverDownloaded {
+        book_id: String,
+        bytes: Vec<u8>,
+    },
+}
+
+const DOWNLOAD_BATCH_SIZE: usize = 8;
+struct DownloadContext<'a> {
+    store: &'a SyncStore,
+    settings: &'a SyncSettings,
+    plan: &'a super::changes::Plan,
+    offset: u64,
+    total: u64,
+}
+
+async fn download_in_batches(
+    webdav: &WebDavClient,
+    store: &SyncStore,
+    settings: &SyncSettings,
+    local: &BTreeMap<String, LocalSyncBook>,
+    remote: &BTreeSet<String>,
+    cache: &Path,
+    plan: &super::changes::Plan,
+    report: &mut SyncReport,
+    progress: &mut impl FnMut(SyncProgress),
+) -> SyncResult<()> {
+    let mut missing = Vec::new();
+    let mut present = 0;
+    for id in remote {
+        if store.is_locally_removed(id)? {
+            continue;
+        }
+        if local.contains_key(id) {
+            present += 1;
+        } else {
+            missing.push(id.clone());
+        }
+    }
+    let total = present + missing.len() as u64;
+    progress(SyncProgress::Stage {
+        stage: SyncStage::Books,
+        completed: present,
+        total,
+    });
+    for id in local.keys() {
+        fs::remove_file(partial_download_path(cache, id)).ok();
+    }
+    for (index, batch) in missing.chunks(DOWNLOAD_BATCH_SIZE).enumerate() {
+        let ids = batch.iter().cloned().collect();
+        let manifests =
+            prepare_downloads(webdav, store, &BTreeMap::new(), &ids, cache, progress).await?;
+        let bytes = manifests.iter().map(|(_, m)| m.content_length).sum();
+        let context = DownloadContext {
+            store,
+            settings,
+            plan,
+            offset: present + (index * DOWNLOAD_BATCH_SIZE) as u64,
+            total,
+        };
+        download_books(
+            webdav,
+            manifests,
+            cache,
+            bytes,
+            Some(&context),
+            report,
+            progress,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn pending_cover_key(id: &str) -> String {
+    format!("pending-cover:{id}")
+}
+
+pub fn acknowledge_downloaded_cover(settings: &SyncSettings, id: &str) -> SyncResult<()> {
+    SyncStore::open_default(settings.device_id.clone())?
+        .cache_remove(&super::account_key(settings), &pending_cover_key(id))
+}
+
+async fn download_pending_covers(
+    webdav: &WebDavClient,
+    books: &BTreeSet<String>,
+    progress: &mut impl FnMut(SyncProgress),
+) -> SyncResult<()> {
+    for id in books {
+        let Some(path) = webdav.cache_get(&pending_cover_key(id))? else {
+            continue;
+        };
+        let path = String::from_utf8(path)?;
+        // Pending paths originated in a validated immutable book manifest.
+        if path != format!("books/{id}/cover.bin") {
+            return Err(io::Error::other("Invalid pending cover path").into());
+        }
+        let object = match webdav.cached_object(&path)? {
+            Some(object) => Some(object),
+            None => webdav.get_optional(&path).await?,
+        };
+        if let Some(object) = object {
+            progress(SyncProgress::CoverDownloaded {
+                book_id: id.clone(),
+                bytes: object.bytes,
+            });
+        } else {
+            webdav.cache_remove(&pending_cover_key(id))?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn run_sync<F>(
@@ -265,40 +378,9 @@ where
         &webdav,
         all_book_ids.iter().cloned().collect(),
     )?);
-    let manifests = prepare_downloads(
-        &webdav,
-        &store,
-        &local_by_id,
-        &remote_book_ids,
-        &download_cache_dir,
-        &mut progress,
-    )
-    .await?;
-    let mut derived = prepare_derived_data(
-        &webdav,
-        change_plan.derived.iter().cloned(),
-        &download_cache_dir.join("derived"),
-        |stage, completed, total| {
-            progress(SyncProgress::Stage {
-                stage,
-                completed,
-                total,
-            });
-        },
-    )
-    .await?;
-    report.derived_operations = derived.operation_count();
-    let book_upload_bytes = pending_uploads
-        .iter()
-        .map(|(length, _)| *length)
-        .sum::<u64>();
-    let book_download_bytes = manifests
-        .iter()
-        .map(|(_, manifest)| manifest.content_length)
-        .sum::<u64>();
-    let upload_total = book_upload_bytes.saturating_add(derived.upload_bytes());
-    let download_total = book_download_bytes.saturating_add(derived.download_bytes());
-    let derived_cache = download_cache_dir.join("derived");
+    // Make original books useful before scanning OCR/PDF archives for the
+    // whole library. Immutable manifests and per-book checkpoints survive retries.
+    let upload_total = pending_uploads.iter().map(|(size, _)| *size).sum();
     upload_books(
         &webdav,
         pending_uploads,
@@ -307,53 +389,69 @@ where
         &mut progress,
     )
     .await?;
-    derived
-        .execute(
-            &webdav,
-            &derived_cache,
-            SyncStage::Uploading,
-            book_upload_bytes,
-            upload_total,
-            &mut progress,
-        )
-        .await?;
-    // Publish only after book content and manifests exist on the server.
     super::changes::publish(&webdav, false).await?;
-    progress(SyncProgress::Stage {
-        stage: SyncStage::Discovering,
-        completed: 0,
-        total: 0,
-    });
     publish_device_library(&webdav, &store, &settings, &local_by_id).await?;
-    download_books(
+    download_in_batches(
         &webdav,
-        manifests,
+        &store,
+        &settings,
+        &local_by_id,
+        &remote_book_ids,
         &download_cache_dir,
-        download_total,
+        &change_plan,
         &mut report,
         &mut progress,
     )
     .await?;
-    derived
-        .execute(
-            &webdav,
-            &derived_cache,
-            SyncStage::Downloading,
-            book_download_bytes,
-            download_total,
-            &mut progress,
-        )
-        .await?;
     sync_reading_data(
         &webdav,
         &store,
         &settings,
         change_plan.reading.clone(),
+        Some(&change_plan),
         &mut report,
         &mut progress,
     )
     .await?;
-
+    for book_id in &change_plan.derived {
+        let mut derived = prepare_derived_data(
+            &webdav,
+            std::iter::once(book_id.clone()),
+            &download_cache_dir.join("derived"),
+            |stage, completed, total| {
+                progress(SyncProgress::Stage {
+                    stage,
+                    completed,
+                    total,
+                });
+            },
+        )
+        .await?;
+        report.derived_operations += derived.operation_count();
+        let cache = download_cache_dir.join("derived");
+        derived
+            .execute(
+                &webdav,
+                &cache,
+                SyncStage::Uploading,
+                0,
+                derived.upload_bytes(),
+                &mut progress,
+            )
+            .await?;
+        derived
+            .execute(
+                &webdav,
+                &cache,
+                SyncStage::Downloading,
+                0,
+                derived.download_bytes(),
+                &mut progress,
+            )
+            .await?;
+        change_plan.checkpoint(&webdav, book_id, true)?;
+    }
+    download_pending_covers(&webdav, &all_book_ids, &mut progress).await?;
     super::changes::publish(&webdav, true).await?;
     change_plan.acknowledge(&webdav)?;
 
@@ -520,9 +618,11 @@ async fn download_books(
     manifests: Vec<(String, BookManifest)>,
     cache_dir: &Path,
     total: u64,
+    context: Option<&DownloadContext<'_>>,
     report: &mut SyncReport,
     progress: &mut impl FnMut(SyncProgress),
 ) -> SyncResult<()> {
+    let book_count = manifests.len() as u64;
     let mut partial_lengths = BTreeMap::new();
     let mut completed = 0_u64;
     for (book_id, manifest) in &manifests {
@@ -537,7 +637,7 @@ async fn download_books(
         completed,
         total,
     });
-    for (book_id, manifest) in manifests {
+    for (index, (book_id, manifest)) in manifests.into_iter().enumerate() {
         let content_length = manifest.content_length;
         let cache_path = partial_download_path(cache_dir, &book_id);
         let mut current_length = partial_lengths.get(&book_id).copied().unwrap_or_default();
@@ -557,9 +657,29 @@ async fn download_books(
         completed = completed
             .saturating_sub(current_length)
             .saturating_add(content_length);
+        if let Some(ctx) = context {
+            if ctx.plan.reading.contains(&book_id)
+                && !ctx.plan.completed(webdav, &book_id, false)?
+            {
+                sync_reading_data(
+                    webdav,
+                    ctx.store,
+                    ctx.settings,
+                    BTreeSet::from([book_id.clone()]),
+                    Some(ctx.plan),
+                    report,
+                    progress,
+                )
+                .await?;
+            }
+        }
         report.downloaded_books += 1;
+        let books_completed = context.map_or(index as u64 + 1, |ctx| ctx.offset + index as u64 + 1);
+        let books_total = context.map_or(book_count, |ctx| ctx.total);
         progress(SyncProgress::Downloaded {
             book: Box::new(book),
+            books_completed,
+            books_total,
             cache_path,
             completed,
             total,
@@ -657,6 +777,7 @@ async fn sync_reading_data<F>(
     store: &SyncStore,
     settings: &SyncSettings,
     all_book_ids: BTreeSet<String>,
+    plan: Option<&super::changes::Plan>,
     report: &mut SyncReport,
     progress: &mut F,
 ) -> SyncResult<()>
@@ -676,6 +797,12 @@ where
     });
     for (index, book_id) in all_book_ids.into_iter().enumerate() {
         validate_book_id(&book_id)?;
+        if !pending.contains(&book_id)
+            && let Some(plan) = plan
+            && plan.completed(webdav, &book_id, false)?
+        {
+            continue;
+        }
         let files = webdav
             .list_json_files(&format!("state/{book_id}/devices/"))
             .await?;
@@ -684,7 +811,13 @@ where
         if missing {
             webdav.invalidate_object(&format!("state/{book_id}/devices/{own_file}"))?;
         }
-        let uploaded = if missing || pending.contains(&book_id) {
+        let repair_local = if missing && !pending.contains(&book_id) {
+            let (_, snapshot) = store.reading_snapshot(&book_id)?;
+            snapshot.progress.is_some() || !snapshot.annotations.is_empty()
+        } else {
+            false
+        };
+        let uploaded = if pending.contains(&book_id) || repair_local {
             Some(push_reading_state(webdav, store, settings, &book_id).await?)
         } else {
             None
@@ -692,6 +825,9 @@ where
         merge_remote_reading(webdav, store, settings, &book_id, files, report).await?;
         if let Some(revision) = uploaded {
             store.acknowledge_reading(&super::account_key(settings), &book_id, revision)?;
+        }
+        if let Some(plan) = plan {
+            plan.checkpoint(webdav, &book_id, false)?;
         }
         progress(SyncProgress::Stage {
             stage: SyncStage::ReadingData,
@@ -826,12 +962,23 @@ async fn discover_remote_books(
 async fn download_manifest(webdav: &WebDavClient, book_id: &str) -> SyncResult<BookManifest> {
     validate_book_id(book_id)?;
     let manifest_path = format!("books/{book_id}/manifest.json");
-    let manifest_object = webdav
-        .get_optional(&manifest_path)
-        .await?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, manifest_path.clone()))?;
+    let cached = webdav.cached_object(&manifest_path)?;
+    let fetched = cached.is_none();
+    let manifest_object = match cached {
+        Some(object) => object,
+        None => webdav
+            .get_optional(&manifest_path)
+            .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, manifest_path.clone()))?,
+    };
     let manifest: BookManifest = serde_json::from_slice(&manifest_object.bytes)?;
     validate_manifest(&manifest, book_id)?;
+    if fetched {
+        webdav.cache_set(
+            &format!("manifest-verified:{manifest_path}"),
+            &super::rate_limit::now_ms().to_le_bytes(),
+        )?;
+    }
     Ok(manifest)
 }
 
@@ -865,13 +1012,17 @@ async fn download_book(
         .into());
     }
     let cover = if let Some(path) = &manifest.cover_path {
-        Some(
-            webdav
-                .get_optional(path)
-                .await?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.clone()))?
-                .bytes,
-        )
+        let cached = webdav.cached_object(path)?.map(|object| object.bytes);
+        let intrinsic = || {
+            rebook_formats::open_bytes(content.clone(), &manifest.file_name)
+                .ok()
+                .and_then(|book| book.cover_bytes().map(<[u8]>::to_vec))
+        };
+        let cover = cached.or_else(intrinsic);
+        if cover.is_none() {
+            webdav.cache_set(&pending_cover_key(book_id), path.as_bytes())?;
+        }
+        cover
     } else {
         None
     };
@@ -997,6 +1148,270 @@ pub mod tests {
     use uuid::Uuid;
 
     type FakeObjects = Arc<Mutex<HashMap<String, (Vec<u8>, String)>>>;
+
+    #[test]
+    fn bootstrap_publishes_first_batch_before_scanning_later_manifests_and_resumes_after_429() {
+        let server = FakeWebDav::start();
+        let settings = test_settings(server.base_url(), "Bootstrap receiver");
+        let directory = test_download_cache("bootstrap-429");
+        fs::create_dir_all(&directory).unwrap();
+        let store = SyncStore::open_at(directory.join("state.sqlite3"), settings.device_id.clone())
+            .unwrap();
+        let peer = Uuid::new_v4().to_string();
+        let timestamp = super::super::protocol::HybridTimestamp {
+            wall_time_ms: 0,
+            counter: 0,
+            device_id: peer.clone(),
+        };
+        let mut ids = Vec::new();
+        for i in 0..11 {
+            let content = format!("bootstrap unique {} {i}", settings.device_id).into_bytes();
+            let id = format!("{:x}", Sha256::digest(&content));
+            let manifest = BookManifest {
+                version: PROTOCOL_VERSION,
+                book_id: id.clone(),
+                title: format!("Book {i}"),
+                authors: vec![],
+                file_name: "book.pdf".into(),
+                content_path: format!("books/{id}/content.pdf"),
+                content_sha256: id.clone(),
+                content_length: content.len() as u64,
+                cover_path: None,
+                added_at: 0,
+            };
+            let mut objects = server.objects.lock().unwrap();
+            objects.insert(
+                format!("/dav/Rebook/v1/books/{id}/manifest.json"),
+                (
+                    serde_json::to_vec(&manifest).unwrap(),
+                    format!("\"manifest-{i}\""),
+                ),
+            );
+            objects.insert(
+                format!("/dav/Rebook/v1/{}", manifest.content_path),
+                (content, format!("\"content-{i}\"")),
+            );
+            ids.push(id);
+        }
+        ids.sort();
+        let catalog = DeviceLibrary {
+            version: PROTOCOL_VERSION,
+            device_id: peer.clone(),
+            device_name: "Peer".into(),
+            updated_at: timestamp.clone(),
+            books: ids
+                .iter()
+                .map(|id| super::super::protocol::DeviceBookEntry {
+                    book_id: id.clone(),
+                    present: true,
+                    changed_at: timestamp.clone(),
+                })
+                .collect(),
+        };
+        server.objects.lock().unwrap().insert(
+            format!("/dav/Rebook/v1/library/devices/{peer}.json"),
+            (serde_json::to_vec(&catalog).unwrap(), "\"catalog\"".into()),
+        );
+        let index = serde_json::json!({"version":1,"device":peer,"books":{}});
+        server.objects.lock().unwrap().insert(
+            format!("/dav/Rebook/v1/library/changes/{peer}.json"),
+            (serde_json::to_vec(&index).unwrap(), "\"index\"".into()),
+        );
+        let stopped_path = format!("books/{}/manifest.json", ids[8]);
+        server.fail_get_once(stopped_path, 429);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut local = Vec::new();
+        let mut visible = Vec::new();
+        let mut first_request_count = 0;
+        let first = runtime.block_on(run_sync_with_store(
+            settings.clone(),
+            "secret".into(),
+            vec![],
+            store.clone(),
+            directory.join("downloads"),
+            |event| {
+                if let SyncProgress::Downloaded {
+                    book,
+                    books_completed,
+                    books_total,
+                    ..
+                } = event
+                {
+                    if visible.is_empty() {
+                        first_request_count = server
+                            .requests
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|(m, p, _)| m == "GET" && p.ends_with("/manifest.json"))
+                            .count();
+                    }
+                    assert_eq!(books_total, 11);
+                    assert_eq!(books_completed, visible.len() as u64 + 1);
+                    let path = directory.join(format!("{}.pdf", book.id));
+                    fs::write(&path, &book.content).unwrap();
+                    local.push(LocalSyncBook {
+                        id: book.id.clone(),
+                        title: book.title.clone(),
+                        authors: book.authors.clone(),
+                        file_name: book.file_name.clone(),
+                        path,
+                        cover_bytes: None,
+                        added_at: book.added_at,
+                    });
+                    visible.push(book.id.clone());
+                }
+            },
+        ));
+        assert!(
+            first
+                .unwrap_err()
+                .downcast_ref::<super::super::RateLimited>()
+                .is_some()
+        );
+        assert_eq!(visible.len(), 8);
+        assert_eq!(first_request_count, 8);
+        assert!(
+            !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(m, p, _)| (m == "GET" || m == "PROPFIND") && p.contains("/derived/")),
+            "auxiliary scans must not block originals"
+        );
+        runtime.block_on(async {
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        });
+        server.requests.lock().unwrap().clear();
+        let report = runtime
+            .block_on(run_sync_with_store(
+                settings,
+                "secret".into(),
+                local,
+                store,
+                directory.join("downloads"),
+                |event| {
+                    if let SyncProgress::Downloaded { book, .. } = event {
+                        visible.push(book.id);
+                    }
+                },
+            ))
+            .unwrap();
+        assert_eq!(report.downloaded_books, 3);
+        assert_eq!(visible.len(), 11);
+        let requests = server.requests.lock().unwrap();
+        assert!(
+            !requests.iter().any(|(m, p, _)| m == "GET"
+                && ids[..8]
+                    .iter()
+                    .any(|id| p == &format!("/dav/Rebook/v1/books/{id}/manifest.json"))),
+            "already validated manifests must not be fetched on resume"
+        );
+        assert!(
+            !requests.iter().any(|(m, p, _)| m == "PROPFIND"
+                && ids[..8]
+                    .iter()
+                    .any(|id| p == &format!("/dav/Rebook/v1/state/{id}/devices/"))),
+            "completed reading-state checks must not be repeated"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p.contains("/state/")),
+            "a fresh device must not upload empty reading states"
+        );
+        drop(requests);
+        server.stop();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn missing_cover_is_deferred_and_its_rate_limit_does_not_discard_the_original() {
+        let server = FakeWebDav::start();
+        let settings = test_settings(server.base_url(), "Deferred cover");
+        let directory = test_download_cache("deferred-cover");
+        fs::create_dir_all(&directory).unwrap();
+        let store = SyncStore::open_at(directory.join("state.sqlite3"), settings.device_id.clone())
+            .unwrap();
+        let content = b"synthetic PDF without an intrinsic cover".to_vec();
+        let id = format!("{:x}", Sha256::digest(&content));
+        let cover_path = format!("books/{id}/cover.bin");
+        let manifest = BookManifest {
+            version: PROTOCOL_VERSION,
+            book_id: id.clone(),
+            title: "Cover test".into(),
+            authors: vec![],
+            file_name: "book.pdf".into(),
+            content_path: format!("books/{id}/content.pdf"),
+            content_sha256: id.clone(),
+            content_length: content.len() as u64,
+            cover_path: Some(cover_path.clone()),
+            added_at: 0,
+        };
+        server.objects.lock().unwrap().insert(
+            format!("/dav/Rebook/v1/{}", manifest.content_path),
+            (content.clone(), "\"content\"".into()),
+        );
+        server.objects.lock().unwrap().insert(
+            format!("/dav/Rebook/v1/{cover_path}"),
+            (b"cover pixels".to_vec(), "\"cover\"".into()),
+        );
+        server.fail_get_once(cover_path.clone(), 429);
+        let client = WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(store, super::super::account_key(&settings));
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let book = download_book(
+                &client,
+                &id,
+                manifest,
+                &directory.join("original.part"),
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(book.content, content);
+            assert!(book.cover.is_none());
+            assert!(
+                !server
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(m, p, _)| m == "GET" && p.ends_with("/cover.bin"))
+            );
+            let ids = BTreeSet::from([id.clone()]);
+            assert!(
+                download_pending_covers(&client, &ids, &mut |_| {})
+                    .await
+                    .unwrap_err()
+                    .downcast_ref::<super::super::RateLimited>()
+                    .is_some()
+            );
+            assert_eq!(
+                client
+                    .cache_get(&pending_cover_key(&id))
+                    .unwrap()
+                    .as_deref(),
+                Some(cover_path.as_bytes())
+            );
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let mut downloaded = false;
+            download_pending_covers(&client, &ids, &mut |event| {
+                if let SyncProgress::CoverDownloaded { book_id, bytes } = event {
+                    assert_eq!(book_id, id);
+                    assert_eq!(bytes, b"cover pixels");
+                    downloaded = true;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(downloaded);
+        });
+        server.stop();
+        let _ = fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn manifest_paths_are_content_addressed_and_cannot_escape_root() {
@@ -1176,6 +1591,7 @@ pub mod tests {
                 &store,
                 &settings,
                 ids.clone(),
+                None,
                 &mut SyncReport::default(),
                 &mut |_| {},
             )
@@ -1192,6 +1608,7 @@ pub mod tests {
                 &store,
                 &settings,
                 ids,
+                None,
                 &mut SyncReport::default(),
                 &mut |_| {},
             )
@@ -1284,7 +1701,7 @@ pub mod tests {
     }
 
     #[test]
-    fn books_and_ocr_share_one_progress_total_in_each_direction() {
+    fn originals_are_streamed_before_separate_ocr_transfer_progress() {
         let server = FakeWebDav::start();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let content = Uuid::new_v4().to_string().into_bytes();
@@ -1407,16 +1824,20 @@ pub mod tests {
     }
 
     fn assert_grouped_progress(updates: &[(u64, u64)], book_bytes: u64, total: u64) {
-        assert!(total > book_bytes);
-        assert_eq!(updates.first(), Some(&(0, total)));
-        assert_eq!(updates.last(), Some(&(total, total)));
+        let archive_bytes = total - book_bytes;
+        assert_eq!(updates.first(), Some(&(0, book_bytes)));
+        assert_eq!(updates.last(), Some(&(archive_bytes, archive_bytes)));
+        assert!(updates.contains(&(book_bytes, book_bytes)));
         assert!(
             updates
                 .iter()
-                .all(|&(completed, denominator)| denominator == total && completed <= total)
+                .all(|&(completed, denominator)| completed <= denominator)
         );
-        assert!(updates.contains(&(book_bytes, total)));
-        assert!(updates.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        let first_archive = updates
+            .iter()
+            .position(|&(_, denominator)| denominator == archive_bytes)
+            .unwrap();
+        assert!(updates[..first_archive].contains(&(book_bytes, book_bytes)));
     }
 
     #[test]
@@ -1466,6 +1887,7 @@ pub mod tests {
                 manifests,
                 &cache,
                 5,
+                None,
                 &mut SyncReport::default(),
                 &mut |event| updates.push(event),
             )
@@ -1689,6 +2111,9 @@ pub mod tests {
                 }
             })
             .collect::<Vec<_>>();
+        store
+            .save_progress(&books[0].id, &reading_locator(&books[0].id, 0.25))
+            .unwrap();
         let sync = || {
             runtime
                 .block_on(run_sync_with_store(
@@ -1799,6 +2224,7 @@ pub mod tests {
         pub requests: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
         fail_next_put: Arc<AtomicBool>,
         listing_etags: Arc<AtomicBool>,
+        fault: Arc<Mutex<Option<(String, u16)>>>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
@@ -1819,6 +2245,8 @@ pub mod tests {
             let thread_fail = Arc::clone(&fail_next_put);
             let listing_etags = Arc::new(AtomicBool::new(true));
             let thread_listing_etags = Arc::clone(&listing_etags);
+            let fault = Arc::new(Mutex::new(None));
+            let thread_fault = fault.clone();
             let handle = thread::spawn(move || {
                 while thread_running.load(Ordering::Acquire) {
                     match listener.accept() {
@@ -1830,6 +2258,7 @@ pub mod tests {
                                 &thread_requests,
                                 &thread_fail,
                                 &thread_listing_etags,
+                                &thread_fault,
                             );
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1847,6 +2276,7 @@ pub mod tests {
                 requests,
                 fail_next_put,
                 listing_etags,
+                fault,
                 handle: Some(handle),
             }
         }
@@ -1857,6 +2287,10 @@ pub mod tests {
 
         pub fn omit_listing_etags(&self) {
             self.listing_etags.store(false, Ordering::Relaxed);
+        }
+
+        pub fn fail_get_once(&self, suffix: String, status: u16) {
+            *self.fault.lock().unwrap() = Some((suffix, status));
         }
 
         fn paths(&self) -> Vec<String> {
@@ -1889,6 +2323,7 @@ pub mod tests {
         requests: &Mutex<Vec<(String, String, Option<String>)>>,
         fail_next_put: &AtomicBool,
         listing_etags: &AtomicBool,
+        fault: &Mutex<Option<(String, u16)>>,
     ) {
         stream.set_nonblocking(false).unwrap();
         stream
@@ -1928,6 +2363,22 @@ pub mod tests {
             path.clone(),
             header_map.get("if-none-match").cloned(),
         ));
+        let status = {
+            let mut fault = fault.lock().unwrap();
+            if method == "GET"
+                && fault
+                    .as_ref()
+                    .is_some_and(|(suffix, _)| path.ends_with(suffix))
+            {
+                fault.take().map(|(_, status)| status)
+            } else {
+                None
+            }
+        };
+        if let Some(status) = status {
+            write_response(&mut stream, status, &[], None);
+            return;
+        }
         if method == "PUT" && fail_next_put.swap(false, Ordering::Relaxed) {
             write_response(&mut stream, 500, &[], None);
             return;
@@ -2020,8 +2471,13 @@ pub mod tests {
             _ => "Error",
         };
         let etag = etag.map_or_else(String::new, |value| format!("ETag: {value}\r\n"));
+        let retry = if status == 429 {
+            "Retry-After: 1\r\n"
+        } else {
+            ""
+        };
         let header = format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n{etag}Connection: close\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n{etag}{retry}Connection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(header.as_bytes()).unwrap();

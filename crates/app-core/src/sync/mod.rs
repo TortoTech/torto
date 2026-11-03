@@ -17,7 +17,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use engine::{LocalSyncBook, SyncMode, SyncProgress, SyncReport, SyncStage, run_sync};
+pub use engine::{LocalSyncBook, SyncMode, SyncProgress, SyncReport, SyncStage, run_sync, acknowledge_downloaded_cover};
 pub use rate_limit::RateLimited;
 pub use schedule::{ScheduleSnapshot, SyncSchedule, SYNC_CHECK_INTERVAL};
 pub use settings::{CloudProviderKind, SyncSettings};

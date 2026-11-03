@@ -407,6 +407,7 @@ fn execute(
                 } => request.report(
                     match stage {
                         sync::SyncStage::Preparing => "preparing",
+                        sync::SyncStage::Books => "books",
                         sync::SyncStage::Checking => "checking",
                         sync::SyncStage::Uploading => "uploading",
                         sync::SyncStage::Downloading | sync::SyncStage::PreparingDownload => {
@@ -419,13 +420,21 @@ fn execute(
                     total as usize,
                 ),
                 sync::SyncProgress::Downloaded {
-                    book, cache_path, ..
+                    book, cache_path, books_completed, books_total, ..
                 } => match library.import_remote(*book) {
                     Ok(_) => {
                         let _ = std::fs::remove_file(cache_path);
+                        request.report("library_changed", books_completed as usize, books_total as usize);
                     }
                     Err(e) => import_error = Some(e),
                 },
+                sync::SyncProgress::CoverDownloaded { book_id, bytes } => {
+                    match library.update_missing_covers(&[(book_id.clone(), bytes)])
+                        .and_then(|()| sync::acknowledge_downloaded_cover(settings, &book_id)) {
+                        Ok(()) => request.report("cover_changed", 0, 0),
+                        Err(e) => import_error = Some(e),
+                    }
+                }
             },
         ),
     ))?;

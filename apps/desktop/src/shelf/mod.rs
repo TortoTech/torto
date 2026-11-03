@@ -67,6 +67,7 @@ fn sync_progress_log(progress: &SyncProgress) -> Option<String> {
             completed, total, ..
         } => Some(format!("sync downloaded_book progress={completed}/{total}")),
         SyncProgress::Stage { .. } => None,
+        SyncProgress::CoverDownloaded { .. } => None,
     }
 }
 
@@ -928,6 +929,7 @@ impl ShelfFeature {
                 cache_path,
                 completed,
                 total,
+                ..
             } => {
                 match self.shelf.library.import_remote(*book) {
                     Ok(imported) => {
@@ -949,6 +951,14 @@ impl ShelfFeature {
                     completed,
                     total,
                 };
+            }
+            SyncProgress::CoverDownloaded { book_id, bytes } => {
+                let result = self.shelf.library.update_missing_covers(&[(book_id.clone(), bytes)])
+                    .and_then(|()| crate::sync::acknowledge_downloaded_cover(&self.sync.settings, &book_id));
+                match result {
+                    Ok(()) => self.cover_textures.remove(&book_id),
+                    Err(error) => self.sync.import_error = Some(error.to_string()),
+                }
             }
         }
     }

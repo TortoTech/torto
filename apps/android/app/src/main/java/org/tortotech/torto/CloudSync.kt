@@ -8,6 +8,7 @@ import kotlinx.coroutines.*
 import kotlin.coroutines.resume
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.tortotech.torto.core.*
@@ -16,7 +17,7 @@ internal object NativeRuntime {
     @Volatile private var instance:MobileCore?=null
     @Synchronized fun core(context:Context):MobileCore=instance ?: MobileCore(File(context.applicationContext.filesDir,"core").absolutePath).also {instance=it}
 }
-data class CloudStatus(val running:Boolean=false,val stage:String="",val completed:UInt=0u,val total:UInt=0u,val lastSuccess:Long=0,val error:String?=null,val revision:Long=0)
+data class CloudStatus(val running:Boolean=false,val stage:String="",val completed:UInt=0u,val total:UInt=0u,val lastSuccess:Long=0,val error:String?=null,val revision:Long=0,val booksCompleted:UInt=0u,val booksTotal:UInt=0u,val retryAt:Long=0,val coverRevision:Long=0)
 /** One transaction per process. Native also serializes library manifest mutations. */
 internal object CloudRuntime {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -36,10 +37,10 @@ internal object CloudRuntime {
         generation.incrementAndGet()
         runCatching { request?.cancel() }
         timer?.cancel(); timer = null
-        mutable.value = mutable.value.copy(running = false)
+        mutable.update { it.copy(running = false, revision = it.revision + 1) }
     }
     // Rust queued the library change in the same transaction as the import/remove.
-    fun libraryChanged() { wake.trySend(Unit) }
+    fun libraryChanged() { mutable.update { it.copy(revision = it.revision + 1) }; wake.trySend(Unit) }
     fun initialize(context: Context) { scope.launch { runCatching {
         val last = context.getSharedPreferences("cloud-status", 0).getLong("success", 0)
         if (mutable.value.lastSuccess == 0L) mutable.value = mutable.value.copy(lastSuccess = last)
@@ -120,9 +121,19 @@ internal object CloudRuntime {
         if (worker != null && foreground && config.foreground) return@withLock null
         val control = ChatRequest(); request = control; worker?.control = control
         if (worker?.isStopped == true) control.cancel()
+        val changed = java.util.concurrent.atomic.AtomicBoolean()
         control.observeAi(object: AiProgressListener {
             override fun update(stage: String, completed: UInt, total: UInt) {
-                if (token == generation.get()) mutable.value = mutable.value.copy(running = true, stage = stage, completed = completed, total = total, error = null)
+                if (stage == "library_changed" || stage == "cover_changed") changed.set(true)
+                if (token != generation.get()) return
+                mutable.update { status -> when (stage) {
+                    "library_changed" -> status.copy(running = true, revision = status.revision + 1, booksCompleted = completed, booksTotal = total, error = null, retryAt = 0)
+                    "cover_changed" -> status.copy(revision = status.revision + 1, coverRevision = status.coverRevision + 1)
+                    "books" -> status.copy(running = true, booksCompleted = completed, booksTotal = total, stage = "downloading", error = null, retryAt = 0)
+                    "preparing" -> status.copy(running = true, stage = stage, booksCompleted = 0u, booksTotal = 0u, completed = 0u, total = 0u, error = null, retryAt = 0)
+                    else -> status.copy(running = true, stage = stage, completed = completed, total = total, error = null, retryAt = 0)
+                } }
+
             }
         })
         try {
@@ -132,9 +143,9 @@ internal object CloudRuntime {
             if (run.summary != null) {
                 val now = System.currentTimeMillis()
                 context.getSharedPreferences("cloud-status", 0).edit().putLong("success", now).apply()
-                mutable.value = mutable.value.copy(running = false, lastSuccess = now, error = run.error, revision = mutable.value.revision + 1)
+                mutable.update { it.copy(running = false, lastSuccess = now, error = run.error, revision = it.revision + 1, retryAt = run.retryAfterMs?.let { ms -> now + ms.toLong() } ?: 0) }
             } else {
-                mutable.value = mutable.value.copy(running = false, error = run.error ?: mutable.value.error)
+                mutable.update { it.copy(running = false, error = run.error ?: it.error, retryAt = run.retryAfterMs?.let { ms -> System.currentTimeMillis() + ms.toLong() } ?: 0) }
             }
             if (!foreground && config.background) retry(context, run.retryAfterMs)
             run
@@ -142,6 +153,7 @@ internal object CloudRuntime {
             if (token == generation.get()) mutable.value = mutable.value.copy(running = false, error = if (e is CancellationException) null else e.message?.take(500))
             throw e
         } finally {
+            if (changed.get()) mutable.update { it.copy(revision = it.revision + 1) }
             request = null; worker?.control = null; control.close()
         }
     }
