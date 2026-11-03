@@ -23,11 +23,23 @@ fn local_structured_writing_nested_html_keeps_its_figure_and_language() {
     let scope = scopes
         .iter()
         .find(|s| {
-            s.blocks
+            s.section.blocks
                 .iter()
                 .any(|b| anchor(b).is_some_and(|r| r.start.node == "n40"))
         })
         .unwrap();
+    let input = window_input(
+        &scope.section,
+        &RecognitionRoles::default(),
+        0..scope.section.blocks.len(),
+        0..scope.section.blocks.len(),
+        &[],
+        Some(&scope.context),
+    );
+    assert!(scope.context.iter().any(|t| t.contains("list is nested inside another")));
+    assert!(input["blocks"].as_array().unwrap().iter().any(|b|
+        b["text"].as_str().is_some_and(|t| t.contains("Nested list structure in HTML"))));
+    let scope = &scope.section;
     let id = scope
         .blocks
         .iter()

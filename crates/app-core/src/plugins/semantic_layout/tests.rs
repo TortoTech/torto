@@ -1313,6 +1313,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
             },
             0..1,
             0..1,
+            false,
         ));
     server.join().unwrap();
     assert_eq!(result.unwrap().groups.len(), 1);
@@ -1655,6 +1656,7 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
             &roles,
             0..4,
             0..5,
+            false,
         ))
         .unwrap();
     server.join().unwrap();

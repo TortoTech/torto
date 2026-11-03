@@ -516,6 +516,94 @@ fn transcribed_code_uses_the_shared_classifier_and_retains_literal_c_with_langua
 }
 
 #[test]
+fn nested_request_keeps_literal_markup_caption_and_bounded_nonselectable_context() {
+    let descriptor = rebook_publication::SpineItem {
+        id: rebook_publication::SpineItemId::new("chapter").unwrap(),
+        href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+        media_type: "application/xhtml+xml".into(),
+        linear: true,
+        properties: vec![],
+    };
+    let s = rebook_html::parse_section(
+        "<html><body><p>This example demonstrates an HTML nested list.</p><figure><pre>&lt;ol&gt;\n  &lt;li&gt;Dogs&lt;/li&gt;\n&lt;/ol&gt;</pre><figcaption>Figure 3.5 – Nested list structure in HTML</figcaption></figure><p>The inner list belongs to the outer list item.</p></body></html>",
+        &descriptor, |_| None,
+    ).unwrap();
+    let index = s.blocks.iter().position(has_nested_candidates).unwrap();
+    let scopes = nested_sections(&s, index..index + 1);
+    let scope = &scopes[0];
+    let input = window_input(
+        &scope.section,
+        &RecognitionRoles::default(),
+        0..scope.section.blocks.len(),
+        0..scope.section.blocks.len(),
+        &[],
+        Some(&scope.context),
+    );
+    let compact = wire::encode(&input);
+    assert_eq!(compact["tg"]["cqk"], json!([0]));
+    assert_eq!(compact["tg"]["cb"], json!([]));
+    assert!(
+        compact["bs"][0]["d"][0]["t"]
+            .as_str()
+            .unwrap()
+            .contains("<li>Dogs</li>")
+    );
+    assert!(
+        compact["bs"][1]["t"]
+            .as_str()
+            .unwrap()
+            .contains("Nested list structure in HTML")
+    );
+    assert!(
+        compact["bs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b.get("mt").is_none())
+    );
+    assert!(
+        compact["cx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(Value::is_string)
+    );
+    assert!(
+        scope
+            .context
+            .iter()
+            .any(|t| t.contains("demonstrates an HTML"))
+    );
+    assert!(
+        scope
+            .context
+            .iter()
+            .any(|t| t.contains("inner list belongs"))
+    );
+    assert_eq!(scope.section.blocks.len(), 2);
+
+    // Multibyte prose cannot cause unbounded prompts or become a candidate.
+    let mut large = s.clone();
+    let Block::Text(before) = &mut large.blocks[index - 1] else {
+        panic!()
+    };
+    before.content = vec![Inline::Text(TextRun {
+        text: "说明".repeat(MAX_CONTEXT_CHARS),
+        style: Default::default(),
+        link: None,
+    })];
+    let scopes = nested_sections(&large, index..index + 1);
+    assert!(
+        scopes[0]
+            .context
+            .iter()
+            .map(|t| t.chars().count())
+            .sum::<usize>()
+            <= MAX_CONTEXT_CHARS
+    );
+}
+
+#[test]
 fn authored_figure_code_is_classified_inside_its_own_container_without_losing_caption() {
     let descriptor = rebook_publication::SpineItem {
         id: rebook_publication::SpineItemId::new("chapter").unwrap(),
@@ -532,13 +620,13 @@ fn authored_figure_code_is_classified_inside_its_own_container_without_losing_ca
     let p = proposal(Presentation::Code, vec![], Some("html"));
     validate_window(
         &[p.clone()],
-        &scopes[0],
+        &scopes[0].section,
         &RecognitionRoles::default(),
-        0..scopes[0].blocks.len(),
-        0..scopes[0].blocks.len(),
+        0..scopes[0].section.blocks.len(),
+        0..scopes[0].section.blocks.len(),
     )
     .unwrap();
-    let a = annotation(&p, &scopes[0]);
+    let a = annotation(&p, &scopes[0].section);
     assert!(cached_valid(&s, &a));
     super::super::compose(&mut s.blocks, &a);
     let Block::Figure(outer) = &s.blocks[0] else {

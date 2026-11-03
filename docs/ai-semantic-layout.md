@@ -231,7 +231,13 @@ highlighting; no language badge or extra text is inserted into the book. Unknown
 syntax remains plain code. Search and source offsets remain unchanged.
 
 Eligible code/quotation children inside figures and notes use independent scopes,
-so groups cannot cross those containers. Composition and cache validation resolve
+so groups cannot cross those containers. These requests retain literal caption
+and credit text, and include up to 2,000 characters of adjacent explanations and
+enclosing context without selectable IDs. They use a code/quotation-only prompt
+and schema; formula-formatting tags never reinterpret literal example markup.
+Grouping, presentation and language are still decided together using the existing
+compact keys. The request contract invalidates earlier classification caches.
+Composition and cache validation resolve
 original source ranges recursively. Existing outer figures, captions and credits
 remain in place, without adding another wrapper around code already in a figure.
 Image recognition revision 8 refreshes legacy text-image decisions.

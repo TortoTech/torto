@@ -996,6 +996,7 @@ fn request_contract_fingerprint() -> &'static str {
                 "compact-wire-v1",
                 PROMPT,
                 code_blocks::PROMPT,
+                code_blocks::SCOPE_PROMPT,
                 citations::PROMPT,
                 formulas::CHAPTER_PROMPT,
                 formulas::TRANSCRIBE_PROMPT,
@@ -1535,11 +1536,11 @@ async fn recognize_inner(
         compose(&mut working.blocks, annotation);
     }
     let section = &working;
-    let (groups, failed) = recognize_windows(&client, settings, section, book_id, &fingerprint, target.clone(), fixed_target, false).await?;
+    let (groups, failed) = recognize_windows(&client, settings, section, book_id, &fingerprint, target.clone(), fixed_target, None).await?;
     annotations.extend(groups);
     skipped_groups += failed;
     for nested in code_blocks::nested_sections(section, target.clone()) {
-        let (groups, failed) = recognize_windows(&client, settings, &nested, book_id, &fingerprint, 0..nested.blocks.len(), false, true).await?;
+        let (groups, failed) = recognize_windows(&client, settings, &nested.section, book_id, &fingerprint, 0..nested.section.blocks.len(), false, Some(&nested.context)).await?;
         annotations.extend(groups);
         skipped_groups += failed;
     }
@@ -1592,8 +1593,9 @@ async fn recognize_windows(
     fingerprint: &str,
     target: std::ops::Range<usize>,
     fixed_target: bool,
-    code_only: bool,
+    code_context: Option<&[String]>,
 ) -> Result<(Vec<Annotation>, usize), String> {
+    let code_only = code_context.is_some();
     let (provider, model) = settings.semantic_layout_endpoint()?;
     let config = &RecognitionRoles {
         quotes: true,
@@ -1639,23 +1641,7 @@ async fn recognize_windows(
                     || citation_candidates.iter().any(|c| c.block == i)
             }
         }) {
-            let mut input =
-                unified_window_input(section, config, start..end, lo..hi, &citation_candidates);
-            if code_only {
-                for name in [
-                    "classify_headings",
-                    "classify_blocks",
-                    "complete_quote_sources",
-                    "classify_citations",
-                ] {
-                    input["targets"][name] = json!([]);
-                }
-                for block in input["blocks"].as_array_mut().unwrap() {
-                    block["math_texts"] = json!([]);
-                    block["citation_candidates"] = json!([]);
-                    block.as_object_mut().unwrap().remove("citation_paragraphs");
-                }
-            }
+            let input = window_input(section, config, start..end, lo..hi, &citation_candidates, code_context);
             let key = digest(
                 &serde_json::to_vec(&json!([
                     CACHE_FORMAT_VERSION,
@@ -1707,6 +1693,7 @@ async fn recognize_windows(
                     config,
                     start..end,
                     lo..hi,
+                    code_only,
                 )
                 .await
                 .map_err(|error| format!("window {start}..{end}: {error}"))?;
@@ -1765,16 +1752,29 @@ async fn request_window_groups(
     config: &RecognitionRoles,
     target: std::ops::Range<usize>,
     context: std::ops::Range<usize>,
+    code_only: bool,
 ) -> Result<WindowResult, String> {
-    request_groups(client, endpoint, input, section, config, target, context).await
+    request_groups(client, endpoint, input, section, config, target, context, code_only).await
 }
 
+#[cfg(test)]
 fn unified_window_input(
     section: &Section,
     config: &RecognitionRoles,
     target: std::ops::Range<usize>,
     context: std::ops::Range<usize>,
     candidates: &[citations::WindowCandidate],
+) -> Value {
+    window_input(section, config, target, context, candidates, None)
+}
+
+fn window_input(
+    section: &Section,
+    config: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+    candidates: &[citations::WindowCandidate],
+    code_context: Option<&[String]>,
 ) -> Value {
     let eligible = code_blocks::eligible_ids(section);
     let refs: Vec<_> = section.blocks.iter().collect();
@@ -1790,7 +1790,7 @@ fn unified_window_input(
     let blocks: Vec<_> = context
         .map(|index| {
             let mut block = section_input_block_eligible(section, index, eligible.contains(&index));
-            if target.contains(&index) {
+            if target.contains(&index) && code_context.is_none() {
                 if code_blocks::body(&section.blocks[index]).is_some() {
                     // Code classification needs the authored literal lines, not
                     // escaped formula markup in place of its body text.
@@ -1849,6 +1849,14 @@ fn unified_window_input(
             .map(|run| run.collect::<Vec<_>>())
             .collect::<Vec<_>>()
     );
+    if let Some(context) = code_context {
+        // Keep literal caption/source text rather than moving it into
+        // math_texts and subsequently clearing it for a code-only request.
+        input["context"] = json!(context);
+        for name in ["classify_headings", "classify_blocks", "complete_quote_sources", "classify_citations"] {
+            input["targets"][name] = json!([]);
+        }
+    }
     if !paragraph_groups.is_empty() {
         input["paragraph_groups"] = json!(paragraph_groups);
     }
@@ -1907,13 +1915,26 @@ async fn request_groups(
     config: &RecognitionRoles,
     target: std::ops::Range<usize>,
     context: std::ops::Range<usize>,
+    code_only: bool,
 ) -> Result<WindowResult, String> {
     crate::plugins::llm::budgeted(async {
     let (provider, model, reasoning_effort) = endpoint;
     let roles = window_roles(section, config, target.clone(), context.clone());
     let config = &roles;
+    let prompt = if code_only {
+        format!("{}{}", code_blocks::SCOPE_PROMPT, code_blocks::PROMPT)
+    } else {
+        window_prompt(section, config, target.clone(), context.clone())
+    };
+    let mut options = completion_options(config);
+    if code_only {
+        options["output_schema"]["properties"]["groups"]["items"] = code_blocks::schema();
+        for name in ["citations", "formulas"] {
+            options["output_schema"]["properties"][name]["maxItems"] = json!(0);
+        }
+    }
     let mut messages = vec![
-        json!({"role":"system","content":wire::instructions(&window_prompt(section, config, target.clone(), context.clone()), std::iter::once(input))}),
+        json!({"role":"system","content":wire::instructions(&prompt, std::iter::once(input))}),
         json!({"role":"user","content":wire::encode(input).to_string()}),
     ];
     let candidates = citations::window_candidates(section, target.clone());
@@ -1928,7 +1949,7 @@ async fn request_groups(
             None,
             Some(4096),
             reasoning_effort,
-            Some(&wire::options(&completion_options(config))),
+            Some(&wire::options(&options)),
         )
         .await?;
         let content = ai::message_content(&message).ok_or("AI排版返回了空内容")?;
