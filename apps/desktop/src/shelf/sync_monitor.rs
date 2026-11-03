@@ -1,10 +1,10 @@
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Duration;
 
 use super::sync_schedule::SyncSchedule;
 use crate::sync::{SyncMode, SyncStore};
-
-const CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// UI configuration at dispatch time. Results are valid only for this snapshot.
 #[derive(Clone, PartialEq, Eq)]
@@ -49,11 +49,7 @@ impl MonitorState {
     fn observe(&mut self, probe: Probe, now: Instant, now_ms: u64) -> Option<SyncDecision> {
         let mut refresh = false;
         if let Ok(token) = probe.derived {
-            refresh = token.is_some() && token != self.schedule.derived_token;
-            self.schedule.derived_token = token;
-            if refresh {
-                self.schedule.request(SyncMode::Derived);
-            }
+            refresh = self.schedule.observe_derived(token);
         }
         let mode = if self.running {
             None
@@ -107,10 +103,12 @@ impl SyncMonitor {
                 schedule: key.schedule,
                 running: key.running,
             };
-            let mut timer = tokio::time::interval(CHECK_INTERVAL);
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut first = true;
             loop {
-                timer.tick().await;
+                if !first {
+                    tokio::time::sleep(state.schedule.poll_delay(Instant::now())).await;
+                }
+                first = false;
                 let store = store.clone();
                 let account = key.account.clone();
                 let running = key.running;

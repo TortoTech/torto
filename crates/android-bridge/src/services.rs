@@ -2,13 +2,13 @@
 use crate::*;
 use rebook_app_core::{
     plugins::{self, PluginSettings},
-    sync::{self, SyncSettings, SyncStore},
+    sync::{SyncSettings, SyncStore},
 };
 
-pub(crate) async fn cancellable<T>(
+pub(crate) async fn cancellable<T, E: From<&'static str>>(
     request: &chat::ChatRequest,
-    future: impl std::future::Future<Output = std::result::Result<T, String>>,
-) -> std::result::Result<T, String> {
+    future: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, E> {
     if request.cancelled.load(std::sync::atomic::Ordering::Acquire) {
         return Err("已停止处理".into());
     }
@@ -120,28 +120,19 @@ impl MobileCore {
         username: String,
         password: Option<String>,
     ) -> Result<()> {
-        work(move || {
-            if !url.starts_with("https://") {
-                return Err(error("WebDAV 服务地址必须使用 HTTPS"));
-            }
-            let mut settings = SyncSettings::load_default().map_err(error)?;
-            settings.provider = sync::CloudProviderKind::Custom;
-            settings.base_url = url;
-            settings.username = username;
-            settings.enabled = true;
-            settings.device_name = "Torto Android".into();
-            settings.normalize();
-            if let Some(password) = password {
-                settings.save_password(&password).map_err(error)?;
-            }
-            settings.save_default().map_err(error)
-        })
-        .await
+        let mut options = self.clone().cloud_options().await?;
+        options.provider = "custom".into();
+        options.url = url;
+        options.username = username;
+        options.enabled = true;
+        self.save_cloud_options(options, password).await.map(|_| ())
     }
+
     pub async fn sync_library(self: Arc<Self>) -> Result<SyncSummary> {
         let o = self.clone().cloud_options().await?;
-        self.sync_cancellable(o.account, false, chat::ChatRequest::new())
-            .await
+        let run = self.sync_scheduled(o.account, cloud::CloudSyncTrigger::Manual, chat::ChatRequest::new()).await?;
+        if let Some(error_message) = run.error { return Err(error(error_message)); }
+        run.summary.ok_or_else(|| error("同步已排队，等待重试期限"))
     }
     pub async fn download_reading_fonts(self: Arc<Self>) -> Result<()> {
         work(move || {

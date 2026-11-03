@@ -152,7 +152,7 @@ Rust bridge 回归覆盖导入去重、搜索定位、绘制、选择、批注�
 
 ### 当前验证结果（2026-10-31）
 
-- `cargo test --locked --workspace`：1,802 通过、0 失败；124 项真实书库／外部服务等用例按原配置忽略。新增覆盖云同步取消／账户切换、统计周期、富文本脚注、更新元数据及诊断脱敏
+- `cargo test --locked --workspace`：1,831 通过、0 失败；127 项真实书库／外部服务等用例按原配置忽略。共享调度回归覆盖长时间限流、进程恢复、时钟回拨、统计单独重试和失败退避；原生桥接使用本地 WebDAV 验证首次自动同步、空闲零网络请求、派生数据独立任务、取消与账户切换，不访问个人云盘
 - macOS 生产代码构建、隔离 EPUB smoke test 通过（Apple M6 / Metal，54 帧）；桌面端更新检查继续由原有回归覆盖
 - Android API 36 ARM64 模拟器（SwiftShader）使用 Release 原生库，以常规 mmap 和安装解压两种方式各通过 12 项 instrumentation 测试：Keystore 隔离、JNI 帧复制、选择／批注／重排、专注与链接、字体和 AI 设置、富文本脚注／公式、统计周期、后台任务实际执行、日志共享／APK 拦截、许可资源及 HTTPS 不受信任证书拦截。测试不调用付费模型或个人 WebDAV 服务
 - 本轮使用模拟器验证；此前 Redmi K60（Android 15 / API 35）8 项阅读及设置测试通过。home 暂时离线，不把新增 4 项记为真机验证
@@ -161,7 +161,9 @@ Rust bridge 回归覆盖导入去重、搜索定位、绘制、选择、批注�
 
 ## 调度、维护与边界
 
-同步采用进程级串行事务与原生书库锁；账户／配置变更取消旧请求并丢弃过期结果。前台按后台计时器处理进度同步，首次、书库变更及定期执行完整同步；退出阅读后先落盘统计，再安排后台工作。WorkManager 周期任务最短 15 分钟并要求网络连接，实际执行受系统电量与后台限制影响，不保证精确时刻（[Android 调度说明](https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started/define-work)）。关闭同步时取消相关工作，不让未启用功能持续轮询。
+同步调度统一在 `app-core/sync/schedule.rs`，桌面与 Android 共用：阅读变更安静 10 秒后同步、连续变更最多延迟 60 秒、每 15 分钟完整检查；OCR、生成目录／元数据和 PDF 重排结果使用独立派生数据任务。普通失败从 30 秒开始指数退避，统计失败单独从 5 分钟开始重试；中国科技云等服务的限流期限由共享核心保留，手动同步也不会绕过限流。译文及 AI 排版缓存尚不属于云同步范围。
+
+Android 通过 Rust 返回的下次检查／重试时间安排前台计时与系统后台唤醒，不在 Kotlin 重复判断任务类型、重试次数或全量间隔。调度快照、在途任务和派生数据变更标记持久化，进程回收后恢复；进程内继续使用单调时钟。同步采用进程级串行事务与原生书库锁；账户／配置变更取消旧请求、重置调度并丢弃过期结果。退出阅读后先落盘统计，再安排后台工作。WorkManager 周期任务最短 15 分钟并要求网络连接，实际执行受系统电量与后台限制影响，不保证精确时刻（[Android 调度说明](https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started/define-work)）。关闭同步时取消相关工作，不让未启用功能持续轮询。
 
 更新逻辑从桌面提取至 `app-core/updates`，Android 根据 ABI 选择 `Torto-{version}-android-{abi}.apk`；GitHub 优先 Asset API，Gitee 使用 `torto-android-update.json`，默认源自动回退。下载前验证来源、文件名及元数据，完成后核对大小／SHA-256；调用系统安装器前额外核对包名、版本号与本机签名。Debug／正式包互相隔离，正式覆盖升级需要同一正式证书签名的发布包。
 

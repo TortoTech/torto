@@ -493,7 +493,7 @@ impl ShelfFeature {
             self.shelf.library.books(),
         );
         self.shelf.focus_selected_book = true;
-        self.start_sync(SyncMode::Reading);
+        self.sync.schedule.request(SyncMode::Reading);
     }
 
     fn refresh_read_activity(&mut self) {
@@ -589,16 +589,9 @@ impl ShelfFeature {
         if !self.sync.settings.enabled {
             return;
         }
-        if self
-            .sync
-            .schedule
-            .rate_limit_deadline(Instant::now())
-            .is_some()
-        {
-            self.sync.schedule.request(mode);
+        if !self.sync.schedule.start_requested(mode, Instant::now()) {
             return;
         }
-        self.sync.schedule.started(mode);
         self.sync.button = SyncButtonState::Running {
             stage: SyncStage::Preparing,
             completed: 0,
@@ -875,12 +868,14 @@ impl ShelfFeature {
         let Some(task) = self.sync.task.complete(message.id) else {
             return;
         };
-        let success = message.result.is_ok() && self.sync.import_error.is_none();
-        self.sync.schedule.completed_with_limit(
+        self.sync.schedule.finished(
             task.mode,
-            success,
+            if self.sync.import_error.is_some() {
+                Err(message.rate_limit)
+            } else {
+                message.result.as_ref().map_err(|_| message.rate_limit)
+            },
             Instant::now(),
-            message.rate_limit,
         );
         if matches!(task.mode, SyncMode::Full { .. } | SyncMode::Derived)
             || message
@@ -897,12 +892,6 @@ impl ShelfFeature {
                     return;
                 }
                 if let Some(error) = report.statistics_error {
-                    self.sync.schedule.completed_with_limit(
-                        SyncMode::Statistics,
-                        false,
-                        Instant::now(),
-                        report.statistics_rate_limit,
-                    );
                     self.sync_failed(format!(
                         "{}: {error}",
                         self.language.text(
@@ -911,11 +900,6 @@ impl ShelfFeature {
                         )
                     ));
                     return;
-                }
-                if matches!(task.mode, SyncMode::Full { .. }) {
-                    self.sync
-                        .schedule
-                        .completed(SyncMode::Statistics, true, Instant::now());
                 }
                 self.sync.button = SyncButtonState::completed(Instant::now());
             }

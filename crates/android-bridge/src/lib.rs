@@ -247,6 +247,7 @@ impl MobileCore {
             for book in library.books() {
                 store.register_book_if_missing(&book.id).map_err(error)?;
             }
+            cloud::library_changed(&owner)?;
             Ok(())
         })
         .await?;
@@ -262,7 +263,7 @@ impl MobileCore {
             services::store()?
                 .set_book_present(&id, false)
                 .map_err(error)?;
-            Ok(())
+            cloud::library_changed(&self)
         })
         .await
     }

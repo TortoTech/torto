@@ -4,6 +4,7 @@ mod engine;
 mod listing;
 mod protocol;
 mod rate_limit;
+mod schedule;
 mod settings;
 mod store;
 #[cfg(any(test, feature = "test-support"))]
@@ -18,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use engine::{LocalSyncBook, SyncMode, SyncProgress, SyncReport, SyncStage, run_sync};
 pub use rate_limit::RateLimited;
+pub use schedule::{ScheduleSnapshot, SyncSchedule, SYNC_CHECK_INTERVAL};
 pub use settings::{CloudProviderKind, SyncSettings};
 pub use store::SyncStore;
 

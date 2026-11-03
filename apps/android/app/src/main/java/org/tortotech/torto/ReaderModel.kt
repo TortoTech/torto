@@ -151,16 +151,16 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         core.saveAiSettings(url.trim(),key.takeIf { it.isNotBlank() },layout.trim(),translation.trim(),chat.trim(),language)
         val settings=core.serviceSettings();mutable.update { it.copy(services=settings,notice="AI 设置已保存") }
     }
-    fun saveSync(url: String, user: String, password: String) = runOperation {
-        core.saveSyncSettings(url.trim(),user.trim(),password.takeIf { it.isNotBlank() })
-        val settings=core.serviceSettings();mutable.update { it.copy(services=settings,notice="同步设置已保存") }
+    fun saveSync(url: String, user: String, password: String) {
+        val options = state.value.cloud ?: return
+        saveCloud(options.copy(enabled = true, provider = "custom", url = url.trim(), username = user.trim()), password)
     }
     fun saveCloud(options:CloudOptions,password:String,clearPassword:Boolean=false,done:()->Unit={}){
         CloudRuntime.cancel()
         runOperation {val saved=core.saveCloudOptions(options,if(clearPassword)"" else password.takeIf {it.isNotBlank()});val services=core.serviceSettings();mutable.update {it.copy(cloud=saved,services=services)};withContext(Dispatchers.IO){CloudRuntime.schedule(getApplication());if(CloudRuntime.foreground)CloudRuntime.foreground(getApplication(),true)};done()}
     }
     fun synchronize(){viewModelScope.launch {
-        try{val report=CloudRuntime.perform(getApplication(),true);report?.let {mutable.update {it.copy(notice="同步完成：上传 ${report.uploaded} 本，下载 ${report.downloaded} 本")}}}
+        try{val report=CloudRuntime.perform(getApplication(),CloudSyncTrigger.MANUAL);report?.summary?.let {summary->mutable.update {it.copy(notice="同步完成：上传 ${summary.uploaded} 本，下载 ${summary.downloaded} 本")}}}
         catch(e:Exception){if(e !is CancellationException)mutable.update {it.copy(error=e.message)}}
     }}
     fun applicationForeground(value:Boolean){
@@ -294,7 +294,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
                 }; file
             } catch (e: Exception) { file.delete(); throw e }
         }
-        try { val books = core.importBook(imported.absolutePath); mutable.update { it.copy(books = books) };CloudRuntime.libraryChanged(getApplication()) }
+        try { val books = core.importBook(imported.absolutePath); mutable.update { it.copy(books = books) };CloudRuntime.libraryChanged() }
         finally { withContext(Dispatchers.IO) { imported.delete() } }
     }
     fun open(book: BookSummary) {
@@ -455,7 +455,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         withContext(Dispatchers.IO) { check(getApplication<Application>().getSharedPreferences("interface",0).edit().putString("theme",theme).putString("language",language).commit()) }
         mutable.update { it.copy(appTheme=theme,language=language) }
     }
-    fun removeBook(book: BookSummary) = runOperation { core.removeBook(book.id);CloudRuntime.libraryChanged(getApplication()); covers.remove(book.id); missingCovers.remove(book.id); val books=core.books(); mutable.update { it.copy(books=books) } }
+    fun removeBook(book: BookSummary) = runOperation { core.removeBook(book.id);CloudRuntime.libraryChanged(); covers.remove(book.id); missingCovers.remove(book.id); val books=core.books(); mutable.update { it.copy(books=books) } }
     fun loadStatistics() = runOperation { val statistics=core.statistics(); mutable.update { it.copy(statistics=statistics) } }
     fun loadAnnotations() {
         val token=generation

@@ -16,7 +16,7 @@ use super::settings::SyncSettings;
 use super::store::SyncStore;
 use super::webdav::WebDavClient;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SyncMode {
     Reading,
     Derived,

@@ -290,6 +290,7 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
         touch_and_focus(&core, &root).await;
         advanced_reading(&core, &books[0].id).await;
         long_focus_continuation(&core,&root).await;
+        statistics_cloud_and_diagnostics(&core, &root, &books[0].id).await;
         drop(core);
         // The process-wide statistics worker can still own its SQLite handle
         // after MobileCore is dropped. Windows cannot unlink that open file;
@@ -951,16 +952,74 @@ async fn statistics_cloud_and_diagnostics(
     assert!(preserved.password_saved);
     let report = core
         .clone()
-        .sync_cancellable(saved.account.clone(), false, chat::ChatRequest::new())
+        .sync_scheduled(
+            saved.account.clone(),
+            cloud::CloudSyncTrigger::Automatic,
+            chat::ChatRequest::new(),
+        )
         .await
         .unwrap();
-    assert!(report.uploaded >= 1);
+    assert!(report.summary.unwrap().uploaded >= 1);
+    let count_after_full = server.requests.lock().unwrap().len();
+    let idle = core
+        .clone()
+        .sync_scheduled(
+            saved.account.clone(),
+            cloud::CloudSyncTrigger::Automatic,
+            chat::ChatRequest::new(),
+        )
+        .await
+        .unwrap();
+    assert!(idle.summary.is_none() && idle.error.is_none());
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        count_after_full,
+        "idle polling must not send HTTP requests"
+    );
+    cloud::forget_schedule_cache();
+    let restarted = MobileCore::new(root.join("data").to_string_lossy().into_owned()).unwrap();
+    let idle = restarted
+        .sync_scheduled(
+            saved.account.clone(),
+            cloud::CloudSyncTrigger::Automatic,
+            chat::ChatRequest::new(),
+        )
+        .await
+        .unwrap();
+    assert!(idle.summary.is_none());
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        count_after_full,
+        "a new core must recover the successful schedule"
+    );
+    sync::mark_derived_dirty(book, sync::DerivedDataKind::Metadata).unwrap();
+    let derived = core
+        .clone()
+        .sync_scheduled(
+            saved.account.clone(),
+            cloud::CloudSyncTrigger::Automatic,
+            chat::ChatRequest::new(),
+        )
+        .await
+        .unwrap();
+    assert!(derived.error.is_none(), "{:?}", derived.error);
+    assert_eq!(derived.summary.unwrap().uploaded, 0);
+    assert!(
+        server.requests.lock().unwrap()[count_after_full..]
+            .iter()
+            .all(|(_, path, _)| !path.ends_with("/library/devices/")),
+        "dirty derived data must not rescan the library"
+    );
     let count = server.requests.lock().unwrap().len();
     let cancelled = chat::ChatRequest::new();
     cancelled.cancel();
     assert!(
         core.clone()
-            .sync_cancellable(saved.account.clone(), true, cancelled)
+            .sync_scheduled(
+                saved.account.clone(),
+                cloud::CloudSyncTrigger::Automatic,
+                cancelled
+            )
             .await
             .is_err()
     );
@@ -973,12 +1032,53 @@ async fn statistics_cloud_and_diagnostics(
         .unwrap();
     assert!(
         core.clone()
-            .sync_cancellable(saved.account, true, chat::ChatRequest::new())
+            .sync_scheduled(
+                saved.account,
+                cloud::CloudSyncTrigger::Automatic,
+                chat::ChatRequest::new()
+            )
             .await
             .err()
             .unwrap()
             .to_string()
             .contains("配置已改变")
+    );
+    let mut unavailable = core.clone().cloud_options().await.unwrap();
+    unavailable.url = "http://127.0.0.1:1/dav".into();
+    let unavailable = core
+        .clone()
+        .save_cloud_options(unavailable, None)
+        .await
+        .unwrap();
+    let failed = core
+        .clone()
+        .sync_scheduled(
+            unavailable.account.clone(),
+            cloud::CloudSyncTrigger::Automatic,
+            chat::ChatRequest::new(),
+        )
+        .await
+        .unwrap();
+    assert!(failed.error.is_some());
+    assert!(
+        failed
+            .retry_after_ms
+            .is_some_and(|ms| (29_000..=30_000).contains(&ms))
+    );
+    cloud::forget_schedule_cache();
+    let recovered = MobileCore::new(root.join("data").to_string_lossy().into_owned()).unwrap();
+    let waiting = recovered
+        .sync_scheduled(
+            unavailable.account,
+            cloud::CloudSyncTrigger::Automatic,
+            chat::ChatRequest::new(),
+        )
+        .await
+        .unwrap();
+    assert!(waiting.summary.is_none() && waiting.error.is_none());
+    assert!(
+        waiting.next_poll_ms >= 29_000,
+        "retry must survive a new core instance"
     );
     let log = root.join("data/logs/android.log");
     std::fs::create_dir_all(log.parent().unwrap()).unwrap();
