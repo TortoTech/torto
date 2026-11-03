@@ -66,7 +66,6 @@ fn local_structured_writing_nested_html_keeps_its_figure_and_language() {
         .find(|t| t.source.as_ref().is_some_and(|r| r.start.node == "n40"))
         .unwrap();
     assert_eq!(code.kind, TextBlockKind::Preformatted);
-    assert_eq!(code.style.code_language.unwrap().as_str(), "HTML");
     assert!(
         code.content
             .iter()
@@ -178,7 +177,6 @@ fn local_algorithm_manual_image_geometry_and_transcribed_c_keep_original_anchors
         .find(|t| t.source.as_ref().is_some_and(|r| r.start.node == "n267"))
         .unwrap();
     assert_eq!(code.kind, TextBlockKind::Preformatted);
-    assert_eq!(code.style.code_language.unwrap().as_str(), "C");
     let mut captions = 0;
     for index in 0..source.book().sections.len() {
         let chapter = source.parse_section(index).unwrap();

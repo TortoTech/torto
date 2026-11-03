@@ -1741,21 +1741,6 @@ impl LayoutEngine {
             let block = layout_blocks[block_index];
             match block {
                 Block::Text(block) => {
-                    if unified_reflow && block.kind == TextBlockKind::Preformatted
-                        && let Some(language) = &block.style.code_language {
-                        let mut header_style = reader_style.clone();
-                        header_style.typography.font_size *= 0.75;
-                        header_style.typography.minimum_font_size = 1.0;
-                        let header = TextBlock {
-                            kind: TextBlockKind::Caption,
-                            content: vec![Inline::Text(rebook_publication::TextRun { text: language.as_str().into(), style: Default::default(), link: None })],
-                            style: rebook_publication::BlockStyle { align: TextAlignment::End, semantic_alignment: Some(TextAlignment::End), margin_after: 4.0, line_height: 1.2, ..Default::default() },
-                            source: None,
-                        };
-                        let prepared = self.shape_text_from_source(source, &header, &header_style, content_width)?;
-                        paginator.keep_together_if_fits(prepared_flow_height(&prepared) + reader_style.typography.font_size * 1.5 + 4.0);
-                        paginator.push_text(&prepared, &header)?;
-                    }
                     if unified_reflow && self.push_noted_formula(&mut paginator, source, block, reader_style, content_width)? {
                         block_index += 1;
                         continue;

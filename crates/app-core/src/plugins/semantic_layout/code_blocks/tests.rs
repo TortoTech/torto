@@ -507,7 +507,6 @@ fn transcribed_code_uses_the_shared_classifier_and_retains_literal_c_with_langua
         .unwrap();
     assert_eq!(literal_text(t), literal);
     assert_eq!(t.source, original);
-    assert_eq!(t.style.code_language.unwrap().as_str(), "C");
     assert!(
         t.content
             .iter()
@@ -556,7 +555,6 @@ fn authored_figure_code_is_classified_inside_its_own_container_without_losing_ca
         .flat_map(Block::text_blocks)
         .find(|t| t.kind == TextBlockKind::Preformatted)
         .unwrap();
-    assert_eq!(t.style.code_language.unwrap().as_str(), "HTML");
     assert_eq!(
         t.source,
         before.body[0].text_blocks().next().unwrap().source
@@ -614,12 +612,12 @@ fn cached_ocr_and_nested_code_groups_are_revalidated_against_the_recognized_view
             .blocks
             .iter()
             .flat_map(Block::text_blocks)
-            .any(|t| t.kind == TextBlockKind::Preformatted && t.style.code_language.is_some())
+            .any(|t| t.kind == TextBlockKind::Preformatted && t.content.iter().any(|i| matches!(i, Inline::Text(r) if r.style.syntax_colors.is_some())))
     );
 }
 
 #[test]
-fn confirmed_code_language_is_a_layout_label_without_changing_source_selection() {
+fn confirmed_code_keeps_source_selection_without_a_language_label() {
     use rebook_layout::{LayoutViewport, PageItem, ReaderStyle, ReaderTypesetting};
     let mut s = section(vec![quote(&["int value = 7;"])]);
     let range = anchor(&s.blocks[0]).unwrap().clone();
@@ -642,10 +640,6 @@ fn confirmed_code_language_is_a_layout_label_without_changing_source_selection()
         )
         .unwrap();
     let page = &layout.pages[0];
-    assert!(
-        page.items
-            .iter()
-            .any(|i| matches!(i,PageItem::Text(t) if t.text.as_ref()=="C" && t.source.is_none()))
-    );
+    assert!(!page.items.iter().any(|i| matches!(i, PageItem::Text(t) if t.source.is_none())));
     assert!(page.items.iter().any(|i| matches!(i,PageItem::Text(t) if t.text.contains("int value = 7;") && t.source.as_ref()==Some(&range))));
 }

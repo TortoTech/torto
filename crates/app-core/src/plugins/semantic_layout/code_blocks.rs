@@ -456,7 +456,6 @@ fn compose_in(
         Presentation::Quote => {
             for t in &mut body_text {
                 t.kind = TextBlockKind::Blockquote;
-                t.style.code_language = None;
                 t.style.literal_links = true;
             }
             let attribution = if before.is_empty()
@@ -526,7 +525,6 @@ fn prepare_code(body: &mut [TextBlock], language: Option<&str>) {
             }
         }
         t.kind = TextBlockKind::Preformatted;
-        t.style.code_language = None;
         t.style.literal_links = true;
         t.style.paragraph_group = None;
         t.style.margin_start = (t.style.margin_start - base_indent).max(0.0);
@@ -549,10 +547,6 @@ fn prepare_code(body: &mut [TextBlock], language: Option<&str>) {
     }
     if let Some(language) = language {
         highlight::apply(body, language);
-        if let Some(first) = body.first_mut() {
-            first.style.code_language =
-                rebook_publication::CodeLanguage::new(&highlight::label(language));
-        }
     }
 }
 

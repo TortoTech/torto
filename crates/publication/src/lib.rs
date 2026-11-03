@@ -1353,46 +1353,6 @@ pub enum TextAlignment {
     Justify,
 }
 
-/// A bounded syntax label. Keeping this value inline preserves Copy styles and
-/// avoids interning arbitrary model output in a process-global string cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CodeLanguage {
-    bytes: [u8; 40],
-    length: u8,
-}
-impl CodeLanguage {
-    pub fn new(value: &str) -> Option<Self> {
-        let value = value.trim();
-        if value.is_empty()
-            || value.len() > 40
-            || !value.bytes().all(|b| b.is_ascii() && !b.is_ascii_control())
-        {
-            return None;
-        }
-        let mut bytes = [0; 40];
-        bytes[..value.len()].copy_from_slice(value.as_bytes());
-        Some(Self {
-            bytes,
-            length: value.len() as u8,
-        })
-    }
-    pub fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.bytes[..usize::from(self.length)])
-            .expect("validated ASCII syntax label")
-    }
-}
-impl Serialize for CodeLanguage {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
-    }
-}
-impl<'de> Deserialize<'de> for CodeLanguage {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::new(&String::deserialize(deserializer)?)
-            .ok_or_else(|| serde::de::Error::custom("invalid syntax label"))
-    }
-}
-
 /// Paragraph base direction; Auto uses the first strong character.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextDirection {
@@ -1408,9 +1368,6 @@ pub enum ListMarkerFormat { LowerAlpha, UpperAlpha }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BlockStyle {
-    /// AI-confirmed syntax label for the first paragraph of a code group.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code_language: Option<CodeLanguage>,
     /// Keep authored URL text visible inside technical/quotation groups.
     #[serde(default)]
     pub literal_links: bool,
@@ -1475,7 +1432,6 @@ pub struct BlockStyle {
 impl Default for BlockStyle {
     fn default() -> Self {
         Self {
-            code_language: None,
             literal_links: false,
             reference_owner: None,
             paragraph_group: None,

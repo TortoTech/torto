@@ -226,8 +226,9 @@ label and can select code, a quotation, or leave ordinary text unchanged. The sa
 response jointly decides grouping and syntax language; transport retains `cqk`,
 `pr`, and `lg`. Code composition uses the original transcription, not its translation,
 then reuses the existing preformatted styling and light/dark syntax highlighting.
-A confirmed language appears as a small source-free layout label; unknown syntax
-remains plain code. Labels never change search or source offsets.
+The recognized language remains classification/cache metadata used for syntax
+highlighting; no language badge or extra text is inserted into the book. Unknown
+syntax remains plain code. Search and source offsets remain unchanged.
 
 Eligible code/quotation children inside figures and notes use independent scopes,
 so groups cannot cross those containers. Composition and cache validation resolve
