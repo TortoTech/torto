@@ -158,7 +158,7 @@ class ReadingIntegrationTest {
                 info=PageInfo(section=0u,sectionCount=1u,page=0u,pageCount=1u,progress=0.0,
                     regions=emptyList(),marks=emptyList(),focusBounds=listOf(Rect(20f,200f,200f,60f)),
                     focusFadeColor=0x8CFFFFFFu,focusHighlight=false,isScroll=true,scrollDistance=0.0,
-                    scrollContext=9001uL,controls=emptyList(),rasterTop=-pad,rasterHeight=height+2*pad,
+                    scrollContext=9001uL,controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),rasterTop=-pad,rasterHeight=height+2*pad,
                     previousFocus=FocusTarget(-120f,listOf(Rect(20f,80f,200f,60f))),
                     nextFocus=FocusTarget(120f,listOf(Rect(20f,320f,200f,60f))),focusIndex=1u,focusCount=3u,canGoBack=false)
                 view.present(ReaderFrame(bitmap!!,info,77uL),null)

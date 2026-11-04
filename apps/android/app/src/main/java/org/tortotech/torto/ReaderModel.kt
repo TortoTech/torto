@@ -60,6 +60,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     private val mutable = MutableStateFlow(ScreenState())
     val state = mutable.asStateFlow()
     private val operations = Mutex()
+    private var searchGeneration=0L
     private var statsGeneration=0L
     private var updateGeneration=0L
     private var updateRequest:ChatRequest?=null
@@ -445,7 +446,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
                 "page"->if(frame!=null)mutable.update {it.copy(frame=frame,selected=null)}
                 "none"->{val width=viewport?.width?.toFloat() ?: 360f
                     if(x<width*.3f||x>width*.7f)publish(session.turn(x>width*.7f),token)
-                    else mutable.update {it.copy(chromeVisible=!it.chromeVisible)}
+                    else toggleChrome()
                 }
                 else->{
                     documentGeneration++;documentId=null
@@ -455,6 +456,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             }
         } }
     }
+    fun toggleChrome(){mutable.update {it.copy(chromeVisible=!it.chromeVisible)}}
     private fun readerOperation(block: suspend (MobileReader) -> MobilePage) {
         cancelAi()
         val token=generation
@@ -491,8 +493,12 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         }
     }
     fun search(query: String) {
-        val token=generation
-        runOperation { if(token==generation) { val hits=reader?.search(query).orEmpty(); if(token==generation) mutable.update { it.copy(hits=hits) } } }
+        val token=generation;val request=++searchGeneration
+        mutable.update {it.copy(hits=emptyList())}
+        runOperation {if(token==generation&&request==searchGeneration){
+            val hits=reader?.search(query).orEmpty()
+            if(token==generation&&request==searchGeneration)mutable.update {it.copy(hits=hits)}
+        }}
     }
     fun jump(hit: SearchHit) = readerOperation { it.goToSource(hit.source) }
     fun beginHandle(start:Boolean){selectionHandle=true;val token=generation;runOperation {if(token==generation)reader?.beginSelectionHandle(start)}}

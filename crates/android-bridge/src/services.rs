@@ -380,18 +380,11 @@ pub(crate) fn toc_items(s: &ReaderState) -> Vec<TocItem> {
     s.session
         .toc_items()
         .iter()
-        .filter_map(|t| {
-            t.target.as_ref().map(|href| TocItem {
-                title: s
-                    .toc_labels
-                    .get(&t.id)
-                    .filter(|_| s.options.translated)
-                    .cloned()
-                    .unwrap_or_else(|| t.label.clone()),
-                href: href.to_string(),
-                depth: t.depth as u32,
+        .map(|t| TocItem {
+                id: t.id.clone(),ancestors:t.ancestors.clone(),has_children:t.has_children,
+                title: s.toc_labels.get(&t.id).filter(|_|s.options.translated).cloned().unwrap_or_else(||t.label.clone()),
+                href: t.target.as_ref().map(ToString::to_string).unwrap_or_default(),depth:t.depth as u32,
             })
-        })
         .collect()
 }
 #[uniffi::export]

@@ -41,6 +41,11 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
             .await
             .unwrap();
         let first = reader.clone().page().await.unwrap();
+        let contents=reader.clone().toc().await.unwrap();
+        reader.with(|s|{let expected=s.session.toc_items();assert_eq!(contents.len(),expected.len());
+            for (actual,expected) in contents.iter().zip(expected){assert_eq!(actual.id,expected.id);assert_eq!(actual.ancestors,expected.ancestors);assert_eq!(actual.has_children,expected.has_children);}
+            assert_eq!(first.info().active_toc_id,s.session.snapshot().active_toc_id);Ok(())}).unwrap();
+
         assert_eq!(first.pixels.len(), 360 * 640 * 4);
         assert!(
             first

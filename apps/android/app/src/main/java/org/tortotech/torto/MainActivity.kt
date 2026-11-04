@@ -63,7 +63,6 @@ class MainActivity : ComponentActivity() {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     val routes=remember { mutableStateListOf<String>() }
     var panel by remember { mutableStateOf<String?>(null) }
-    var query by remember { mutableStateOf("") }
     var editing by remember { mutableStateOf<Annotation?>(null) }
     var bookActions by remember { mutableStateOf<BookSummary?>(null) }
     var deleteBook by remember { mutableStateOf<BookSummary?>(null) }
@@ -81,6 +80,11 @@ class MainActivity : ComponentActivity() {
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){it?.let(model::importBook)}
     fun open(route:String){ routes.add(route);if(route in listOf("ai","translation","assistant","sync","layout"))model.loadServices();if(route=="statistics")model.loadStatistics() }
     fun closePanel(){if(panel=="chat")model.cancelChat();panel=null;editing=null}
+    fun readerPanel(name:String){
+        if(name=="navigation"&&panel==name){closePanel();return}
+        when(name){"chat"->model.loadChat();"marks"->model.loadAnnotations()}
+        panel=name
+    }
     fun back(){when{panel!=null->closePanel();state.active!=null->if(state.frame?.info?.canGoBack==true)model.returnLocation() else model.back();routes.isNotEmpty()->routes.removeAt(routes.lastIndex);tab!=0->tab=0}}
     BackHandler(panel!=null||state.active!=null||routes.isNotEmpty()||tab!=0){back()}
     LaunchedEffect(state.interaction){
@@ -114,6 +118,7 @@ class MainActivity : ComponentActivity() {
         }
     }
     TortoTheme(state) {
+        val safe=readerSafePadding()
         val route=routes.lastOrNull()
         val title=when(route){
             "settings"->tr("设置","Settings");"system"->tr("系统","System");"typography"->tr("排版","Typesetting")
@@ -123,41 +128,24 @@ class MainActivity : ComponentActivity() {
         }
         Scaffold(
             containerColor=MaterialTheme.colorScheme.background,
+            contentWindowInsets=if(state.active!=null)WindowInsets(0,0,0,0)else ScaffoldDefaults.contentWindowInsets,
             snackbarHost={SnackbarHost(snackbar)},
-            topBar={if(state.active==null||state.chromeVisible)TopAppBar(
+            topBar={if(state.active==null)TopAppBar(
                 title={if(state.active==null)Text(title)},
                 navigationIcon={if(state.active!=null||route!=null)ActionIcon("back",tr("返回","Back")){back()}},
                 actions={
-                    if(state.active!=null){
-                        if(state.processing)ActionIcon("stop",tr("停止处理","Stop processing")){model.cancelAi(true)}
-                        ActionIcon("chat",tr("阅读助手","Reading assistant"),!state.busy){model.loadChat();panel="chat"}
-                        ActionIcon("search",tr("搜索","Search"),!state.chatWorking){panel="search"}
-                    } else if(route==null&&tab==0){
+                    if(route==null&&tab==0){
                         if(state.cloud?.enabled==true)ActionIcon("sync",tr("立即同步","Sync now"),!state.busy&&!state.cloudStatus.running){model.synchronize()}
                         ActionIcon("add",tr("导入书籍","Import book"),!state.busy){picker.launch(arrayOf("*/*"))}
                     }
                 },colors=TopAppBarDefaults.topAppBarColors(containerColor=MaterialTheme.colorScheme.background)
             )},
-            bottomBar={
-                if(state.active!=null&&state.chromeVisible) Column(Modifier.navigationBarsPadding().background(MaterialTheme.colorScheme.surface)) {
-                    Row(Modifier.fillMaxWidth().height(56.dp),horizontalArrangement=Arrangement.SpaceEvenly,verticalAlignment=Alignment.CenterVertically){
-                        ActionIcon("toc",tr("目录","Contents")){panel="toc"}
-                        ActionIcon("marks",tr("批注与高亮","Notes and highlights"),!state.chatWorking){model.loadAnnotations();panel="marks"}
-                        IconButton(onClick={model.translate(!state.translated)},enabled=!state.busy&&!state.chatWorking){AppIcon("translate",tr("翻译","Translation"),tint=if(state.translated)MaterialTheme.colorScheme.primary else LocalContentColor.current)}
-                        ActionIcon("select",tr("文字选择模式","Selection mode"),!state.translated){panel="selection"}
-                        ActionIcon("type",tr("字体排版","Typography")){panel="typography"}
-                        ActionIcon(if(state.dark)"sun" else "moon",tr("切换明暗模式","Toggle light/dark"),!state.busy&&!state.chatWorking){model.configure(state.fontSize,state.unified,!state.dark)}
-                    }
-                } else if(state.active==null&&route==null) NavigationBar(containerColor=MaterialTheme.colorScheme.background){
-                    NavigationBarItem(selected=tab==0,onClick={tab=0},icon={AppIcon("library")},label={Text(tr("书架","Library"))})
-                    NavigationBarItem(selected=tab==1,onClick={tab=1;model.loadStatistics()},icon={AppIcon("person")},label={Text(tr("我","Me"))})
-                }
-            }
+            bottomBar={if(state.active==null&&route==null)CompactHomeBar(tab){tab=it;if(it==1)model.loadStatistics()}}
         ){padding->
-            Box(Modifier.fillMaxSize().padding(padding)) {
-                if(state.active!=null) Column(Modifier.fillMaxSize()) {
+            Box(Modifier.fillMaxSize().padding(if(state.active==null)padding else PaddingValues(0.dp))) {
+                if(state.active!=null) Column(Modifier.fillMaxSize().padding(top=safe.calculateTopPadding()+ReaderBarHeight,bottom=safe.calculateBottomPadding()+ReaderBarHeight)) {
                     Box(Modifier.fillMaxWidth().weight(1f)){
-                    AndroidView(factory={ReaderView(it).apply {onSize=model::measure;onMotion=model::readerMotion;onTap=model::tap;onTurn=model::turn;onScroll=model::scroll;onHandleStart=model::beginHandle;onHandleMove=model::dragHandle;onHandleEnd=model::endHandle;onSelect={x,y,ex,ey->if(!model.state.value.chatWorking)model.select(x,y,ex,ey)}}},update={it.isEnabled=!state.chatWorking;it.present(state.frame,state.selected)},modifier=Modifier.fillMaxSize())
+                    AndroidView(factory={ReaderView(it).apply {onSize=model::measure;onMotion=model::readerMotion;onTap=model::tap;onTurn=model::turn;onScroll=model::scroll;onHandleStart=model::beginHandle;onHandleMove=model::dragHandle;onHandleEnd=model::endHandle;onSelect={x,y,ex,ey->if(!model.state.value.chatWorking)model.select(x,y,ex,ey)}}},update={it.isEnabled=!state.chatWorking;it.importantForAccessibility=if(panel=="navigation")android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS else android.view.View.IMPORTANT_FOR_ACCESSIBILITY_AUTO;it.present(state.frame,state.selected)},modifier=Modifier.fillMaxSize())
                     if(showProcessing||state.aiError!=null||state.aiPaused)Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow).padding(horizontal=16.dp,vertical=8.dp)){
                         if(state.processing){
                             val stage=when(state.aiStage){"translation"->tr("正在翻译","Translating");"layout"->tr("正在排版","Recognizing layout");"toc"->tr("正在翻译目录","Translating contents");"prefetch"->tr("正在预处理下一页","Processing next page");else->tr("准备处理","Preparing")}
@@ -176,8 +164,6 @@ class MainActivity : ComponentActivity() {
                             }}
                         }
                     }
-                    val page=state.frame?.info
-                    Text(page?.let {"${it.section+1u}/${it.sectionCount} · ${(it.progress*100).toInt()}%"+(if(state.focus&&it.focusCount>0u)" · ${it.focusIndex+1u}/${it.focusCount}" else "")} ?: "",Modifier.align(Alignment.CenterHorizontally).padding(vertical=4.dp),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 } else when(route){
                     "settings"->SettingsScreen(::open)
                     "system"->SystemScreen(state,model)
@@ -190,7 +176,7 @@ class MainActivity : ComponentActivity() {
                     else->if(tab==0)ShelfScreen(state,model){bookActions=it} else ProfileScreen(state,{open("settings")},{open("statistics")})
                 }
                     state.selected?.let {selection->
-                        Row(Modifier.align(Alignment.BottomCenter).fillMaxWidth().horizontalScroll(rememberScrollState()).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal=12.dp),verticalAlignment=Alignment.CenterVertically){
+                        Row(Modifier.align(Alignment.BottomCenter).padding(bottom=safe.calculateBottomPadding()+ReaderBarHeight).fillMaxWidth().horizontalScroll(rememberScrollState()).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal=12.dp),verticalAlignment=Alignment.CenterVertically){
                             TextButton(onClick={model.saveAnnotation(null)}){Text(tr("高亮","Highlight"))}
                             TextButton(onClick={editing=null;panel="note"}){Text(tr("批注","Note"))}
                             TextButton(onClick={context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("",selection.text));model.clearSelection()}){Text(tr("复制","Copy"))}
@@ -199,7 +185,12 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                if(showBusy)LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter))
+                if(state.active!=null){
+                    ReadingChrome(state,showBusy||state.chatWorking,showProcessing,panel,::back,::readerPanel,
+                        onTranslate={model.translate(!state.translated)},onTheme={model.configure(state.fontSize,state.unified,!state.dark)},onStop={model.cancelAi(true)})
+                    ReadingNavigation(state,panel=="navigation",model,::closePanel)
+                }
+                if(showBusy)LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter).padding(top=if(state.active!=null)safe.calculateTopPadding()+ReaderBarHeight else 0.dp))
             }
         }
         state.interaction?.let {interaction->
@@ -212,16 +203,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        if(panel!=null)ModalBottomSheet(onDismissRequest={closePanel()},sheetState=rememberModalBottomSheetState(skipPartiallyExpanded=panel=="chat")) {
+        if(panel!=null&&panel!="navigation")ModalBottomSheet(onDismissRequest={closePanel()},sheetState=rememberModalBottomSheetState(skipPartiallyExpanded=panel=="chat")) {
             when(panel){
-                "toc"->LazyColumn(Modifier.fillMaxHeight(.8f),contentPadding=PaddingValues(16.dp)){
-                    item{Text(state.active?.title.orEmpty(),style=MaterialTheme.typography.titleLarge,modifier=Modifier.padding(bottom=16.dp))}
-                    items(state.toc){entry->ListItem(headlineContent={Text(entry.title)},modifier=Modifier.padding(start=(entry.depth.toInt()*16).dp).clickable {model.navigate(entry.href);closePanel()},colors=ListItemDefaults.colors(containerColor=MaterialTheme.colorScheme.surfaceContainerLow))}
-                }
-                "search"->Column(Modifier.fillMaxHeight(.85f).padding(20.dp).imePadding()){
-                    OutlinedTextField(query,{query=it},label={Text(tr("搜索书中内容","Search in book"))},singleLine=true,modifier=Modifier.fillMaxWidth(),trailingIcon={ActionIcon("search",tr("搜索","Search"),!state.busy){model.search(query)}})
-                    LazyColumn{items(state.hits){hit->ListItem(headlineContent={Text(hit.title,style=MaterialTheme.typography.labelMedium)},supportingContent={Text(hit.excerpt)},modifier=Modifier.clickable {model.jump(hit);closePanel()},colors=ListItemDefaults.colors(containerColor=MaterialTheme.colorScheme.surfaceContainerLow))}}
-                }
                 "typography"->TypographyPanel(state,model,::closePanel,{panel="layout-settings";model.loadServices()},{panel="translation-settings";model.loadServices()})
                 "layout-settings"->ServiceSettingsPanel(state,model,"layout"){panel="providers"}
                 "translation-settings"->ServiceSettingsPanel(state,model,"translation"){panel="providers"}

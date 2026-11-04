@@ -71,6 +71,9 @@ pub struct BookSummary {
 }
 #[derive(Clone, uniffi::Record)]
 pub struct TocItem {
+    pub id: String,
+    pub ancestors: Vec<String>,
+    pub has_children: bool,
     pub title: String,
     pub href: String,
     pub depth: u32,
@@ -128,6 +131,8 @@ pub struct PageInfo {
     pub previous_focus: Option<FocusTarget>,
     pub next_focus: Option<FocusTarget>,
     pub controls: Vec<ReadingControl>,
+    pub active_toc_id: Option<String>,
+    pub active_toc_path: Vec<String>,
     pub focus_index: u32,
     pub focus_count: u32,
     pub can_go_back: bool,
@@ -767,6 +772,8 @@ fn finish_page_info(
     s.store.save_progress(&s.book_id, &locator).map_err(error)?;
     let controls=presentation::controls(s)?;
     Ok(PageInfo {
+        active_toc_id:state.active_toc_id,
+        active_toc_path:state.active_toc_path,
         controls,
         section: state.location.section_index as u32,
         section_count: s.source.book().sections.len() as u32,

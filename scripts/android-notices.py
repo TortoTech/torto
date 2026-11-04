@@ -65,6 +65,8 @@ for artifact in json.loads(Path(args.artifacts).read_text()):
             if 'classes.jar' in archive.namelist() and archive.getinfo('classes.jar').file_size<32*1024*1024:
                 with zipfile.ZipFile(io.BytesIO(archive.read('classes.jar'))) as classes:files+=archive_texts(classes)
     rows.append(dict(name=group+':'+name,version=version,license=' / '.join(licenses) or 'See upstream license',url=url,texts=list(dict.fromkeys(files)),ecosystem='Android'))
+symbols=root/'apps/android/third_party/material-symbols'
+rows.append(dict(name='Material Symbols Rounded',version=(symbols/'NOTICE.md').read_text().split('Revision: ')[1].splitlines()[0],license='Apache-2.0',url='https://github.com/google/material-design-icons',texts=license_files(symbols),ecosystem='Artwork'))
 rows.insert(0,dict(name='Torto',version=next(p['version'] for p in packages.values() if p['name']=='torto-android-bridge'),license='AGPL-3.0-only',url='https://github.com/TortoTech/torto',texts=[store((root/'LICENSE').read_bytes())],ecosystem='Application'))
 rows=sorted(rows,key=lambda p:(p['ecosystem']!='Application',p['ecosystem'],p['name'].lower()))
 output=Path(args.output);output.parent.mkdir(parents=True,exist_ok=True)

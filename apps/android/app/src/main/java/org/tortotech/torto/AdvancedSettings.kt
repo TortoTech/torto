@@ -51,7 +51,7 @@ import org.tortotech.torto.core.*
     Dialog(onDismissRequest={if(!state.busy)close()},properties=DialogProperties(usePlatformDefaultWidth=false)){
         Surface(Modifier.fillMaxWidth().padding(12.dp).heightIn(max=780.dp),shape=MaterialTheme.shapes.large){
             Column(Modifier.padding(20.dp).imePadding()){
-                Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically){Text(tr("AI 提供商","AI provider"),Modifier.weight(1f),style=MaterialTheme.typography.titleLarge);ActionIcon("close",tr("关闭","Close"),!state.busy,close)}
+                Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically){Text(tr("AI 提供商","AI provider"),Modifier.weight(1f),style=MaterialTheme.typography.titleLarge);ActionIcon("close",tr("关闭","Close"),!state.busy,onClick=close)}
                 if(state.busy)LinearProgressIndicator(Modifier.fillMaxWidth())
                 Column(Modifier.weight(1f,false).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(12.dp)){
                     SettingChoice(tr("提供商类型","Provider type"),draft.kind,state.providerKinds.map {it.id to it.name},!state.busy){id->val kind=state.providerKinds.first {it.id==id};draft=draft.copy(kind=id,baseUrl=kind.baseUrl,name=if(draft.name.isBlank()||state.providerKinds.any {it.name==draft.name})kind.name else draft.name)}
