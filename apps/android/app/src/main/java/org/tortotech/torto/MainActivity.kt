@@ -49,9 +49,17 @@ class MainActivity : ComponentActivity() {
         setContent { TortoApp(readerModel) }
     }
 }
+/** Fast cached reader operations need no transient loading UI. Finishing hides it immediately. */
+@Composable internal fun loadingVisible(active:Boolean):Boolean {
+    var visible by remember(active){mutableStateOf(false)}
+    LaunchedEffect(active){if(active){delay(200);visible=true}}
+    return active&&visible
+}
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable fun TortoApp(model: ReaderModel = viewModel()) {
     val state by model.state.collectAsStateWithLifecycle()
+    val showBusy=loadingVisible(state.busy)
+    val showProcessing=loadingVisible(state.processing)
     var tab by rememberSaveable { mutableIntStateOf(0) }
     val routes=remember { mutableStateListOf<String>() }
     var panel by remember { mutableStateOf<String?>(null) }
@@ -150,7 +158,7 @@ class MainActivity : ComponentActivity() {
                 if(state.active!=null) Column(Modifier.fillMaxSize()) {
                     Box(Modifier.fillMaxWidth().weight(1f)){
                     AndroidView(factory={ReaderView(it).apply {onSize=model::measure;onMotion=model::readerMotion;onTap=model::tap;onTurn=model::turn;onScroll=model::scroll;onHandleStart=model::beginHandle;onHandleMove=model::dragHandle;onHandleEnd=model::endHandle;onSelect={x,y,ex,ey->if(!model.state.value.chatWorking)model.select(x,y,ex,ey)}}},update={it.isEnabled=!state.chatWorking;it.present(state.frame,state.selected)},modifier=Modifier.fillMaxSize())
-                    if(state.processing||state.aiError!=null||state.aiPaused)Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow).padding(horizontal=16.dp,vertical=8.dp)){
+                    if(showProcessing||state.aiError!=null||state.aiPaused)Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow).padding(horizontal=16.dp,vertical=8.dp)){
                         if(state.processing){
                             val stage=when(state.aiStage){"translation"->tr("正在翻译","Translating");"layout"->tr("正在排版","Recognizing layout");"toc"->tr("正在翻译目录","Translating contents");"prefetch"->tr("正在预处理下一页","Processing next page");else->tr("准备处理","Preparing")}
                             Text(stage+(if(state.aiTotal>0u)" ${state.aiCompleted}/${state.aiTotal}" else ""),style=MaterialTheme.typography.labelMedium)
@@ -191,7 +199,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                if(state.busy)LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter))
+                if(showBusy)LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter))
             }
         }
         state.interaction?.let {interaction->
