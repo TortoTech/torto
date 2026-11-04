@@ -1,5 +1,6 @@
-//! Display controls are projected from existing AI results; toggles never call a model.
+//! Local presentation controls; toggles never call a model.
 use crate::*;
+use rebook_app_core::plugins;
 #[derive(Clone, uniffi::Record)]
 pub struct ReadingControl {
     pub kind: String,
@@ -46,7 +47,22 @@ pub(crate) fn controls(s: &mut ReaderState) -> Result<Vec<ReadingControl>> {
         )
     });
     ranges.dedup();
-    for_ranges(s, &ranges)
+    let mut controls = for_ranges(s, &ranges)?;
+    let candidates = sentence_candidates(s, &ranges)?;
+    if !candidates.is_empty() {
+        controls.push(ReadingControl {
+            kind: "sentences".into(),
+            source: serde_json::to_string(
+                &candidates
+                    .iter()
+                    .map(|(range, _, _)| range)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(error)?,
+            active: candidates.iter().all(|(_, _, active)| *active),
+        });
+    }
+    Ok(controls)
 }
 pub(crate) fn for_ranges(s: &ReaderState, ranges: &[SourceRange]) -> Result<Vec<ReadingControl>> {
     let mut controls = Vec::new();
@@ -91,8 +107,73 @@ pub(crate) fn for_ranges(s: &ReaderState, ranges: &[SourceRange]) -> Result<Vec<
     }
     Ok(controls)
 }
+
+type SentenceCandidate = (SourceRange, plugins::ParagraphStructureKey, bool);
+fn sentence_candidates(s: &ReaderState, ranges: &[SourceRange]) -> Result<Vec<SentenceCandidate>> {
+    if !s.focus {
+        return Ok(vec![]);
+    }
+    let mut candidates = Vec::new();
+    for (index, section) in s.session.current_reading_unit_content().map_err(error)? {
+        for block in &section.blocks {
+            for range in rebook_app_core::reading_text::focus_block_structure_ranges(block) {
+                if !ranges.iter().any(|current| {
+                    current.start.spine == range.start.spine
+                        && current.start.node == range.start.node
+                }) {
+                    continue;
+                }
+                let key = plugins::ParagraphStructureKey {
+                    section_index: index,
+                    node: range.start.node.clone(),
+                };
+                if candidates.iter().any(|(_, existing, _)| existing == &key) {
+                    continue;
+                }
+                let active = s.pipeline.structure.is_active(&key);
+                let can_structure = block
+                    .text_blocks()
+                    .find(|text| {
+                        text.source
+                            .as_ref()
+                            .is_some_and(|r| r.start.node == range.start.node)
+                    })
+                    .is_some_and(|text| {
+                        s.pipeline.structure.can_structure_text(
+                            text,
+                            matches!(block, rebook_publication::Block::Quote(_)),
+                        )
+                    });
+                if active || can_structure {
+                    candidates.push((range, key, active));
+                }
+            }
+        }
+    }
+    Ok(candidates)
+}
+
 pub(crate) fn toggle(s: &mut ReaderState, control: &ReadingControl) -> Result<Option<SourceRange>> {
     let anchor = match control.kind.as_str() {
+        "sentences" => {
+            // An action queued before a turn must never modify the new focused paragraph.
+            let current = controls(s)?.into_iter().find(|c| c.kind == "sentences");
+            if current.as_ref().is_none_or(|c| c.source != control.source) {
+                return Ok(None);
+            }
+            let ranges: Vec<SourceRange> = serde_json::from_str(&control.source).map_err(error)?;
+            let candidates = sentence_candidates(s, &ranges)?;
+            let activate = !candidates.iter().all(|(_, _, active)| *active);
+            for (_, key, _) in candidates {
+                s.pipeline
+                    .structure
+                    .set_active(key, activate)
+                    .map_err(error)?;
+            }
+            s.focus_anchor
+                .clone()
+                .or_else(|| s.session.current_locator().source)
+        }
         "formula" => {
             let ranges: Vec<SourceRange> = serde_json::from_str(&control.source).map_err(error)?;
             if ranges.len() > 128 || !s.pipeline.semantic.toggle_formula_notes(&ranges) {

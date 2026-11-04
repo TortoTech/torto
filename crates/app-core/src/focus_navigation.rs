@@ -48,6 +48,18 @@ pub fn overflow_target(
     }
 }
 
+/// Keep intermediate stops on text-line starts; preserve the block's exact ends.
+pub fn line_aligned_overflow_target(
+    current: f32, top: f32, bottom: f32, step: f32, forward: bool, line_starts: &[f32],
+) -> Option<f32> {
+    let target = overflow_target(current, top, bottom, step, forward)?;
+    if (target-top).abs()<0.01 || (target-bottom).abs()<0.01 { return Some(target); }
+    Some(line_starts.iter().copied()
+        .filter(|p| p.is_finite() && *p>=top && *p<=bottom && if forward { *p>current+1.0 } else { *p<current-1.0 })
+        .min_by(|a,b| (a-target).abs().total_cmp(&(b-target).abs()))
+        .unwrap_or(target))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +79,14 @@ mod tests {
         assert_eq!(overflow_target(900.0, 0.0, 900.0, 600.0, true), None);
         assert_eq!(duration(20.0), MIN_DURATION);
         assert_eq!(duration(2000.0), MAX_DURATION);
+    }
+    #[test]
+    fn text_stops_follow_lines_and_reverse_without_losing_the_ends() {
+        let lines = (0..40).map(|i| i as f32 * 27.0).collect::<Vec<_>>();
+        let middle = line_aligned_overflow_target(0.0, 0.0, 900.0, 600.0, true, &lines).unwrap();
+        assert!(lines.contains(&middle));
+        assert_eq!(line_aligned_overflow_target(middle,0.0,900.0,600.0,true,&lines),Some(900.0));
+        assert_eq!(line_aligned_overflow_target(900.0,0.0,900.0,600.0,false,&lines),Some(middle));
+        assert_eq!(line_aligned_overflow_target(middle,0.0,900.0,600.0,false,&lines),Some(0.0));
     }
 }

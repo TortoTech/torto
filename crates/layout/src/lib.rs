@@ -3167,7 +3167,14 @@ impl LayoutEngine {
         if should_optimize {
             let analysis = linebreak::parley::ParagraphAnalysis::new(&text);
             for _ in 0..4 {
-                let Some(prepared) = linebreak::parley::plan_optimized_reusable(
+                let prepared = if text.contains('\n') {
+                    linebreak::parley::plan_sentences(
+                        &mut layout, &text, available_width, first_line_indent,
+                        continuation_indent, typography.font_size, &hyphen_widths,
+                        block.style.sentence_indents,
+                        sentence_reference.as_ref().map(|r|(r.layout.as_ref(),r.text.as_ref())),
+                    )
+                } else { linebreak::parley::plan_optimized_reusable(
                     &mut layout,
                     &text,
                     available_width,
@@ -3176,7 +3183,8 @@ impl LayoutEngine {
                     typography.font_size,
                     &hyphen_widths,
                     &analysis,
-                ) else {
+                ) };
+                let Some(prepared) = prepared else {
                     break;
                 };
                 let plan = &prepared.plan;
@@ -7565,6 +7573,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sentence_split_keeps_optimized_english_hyphenation() {
+        let sentences=["A short opening sentence. ",
+            "Extraordinary typographical considerations improve international readability and representation. ",
+            "Characteristically complicated terminology benefits from professionally balanced typography."];
+        let mut block=TextBlock {
+            kind:TextBlockKind::Paragraph,
+            content:sentences.iter().enumerate().flat_map(|(i,s)| {
+                let mut items=Vec::new();if i>0 {items.push(Inline::Break);}
+                items.push(Inline::Text(TextRun {text:(*s).into(),style:TextStyle {
+                    language:rebook_publication::TextLanguage::EnglishUs,
+                    hyphenation:rebook_publication::HyphenationMode::Auto,..Default::default()
+                },link:None}));items
+            }).collect(),
+            style:BlockStyle {sentence_indents:true,preserve_sentence_prefix:true,indent:24.0,..Default::default()},
+            source:None,
+        };
+        let style=ReaderStyle {typesetting:ReaderTypesetting::unified(),..Default::default()};
+        let mut engine=LayoutEngine::new();
+        let mut found=false;
+        for width in (120..300).step_by(10) {
+            let shaped=engine.shape_text(&block,&style,width as f32);
+            assert_eq!(shaped.text.replace('\n',""),sentences.concat());
+            assert_eq!(shaped.layout.lines().filter(|l|l.break_reason()==parley::layout::BreakReason::Explicit).count(),2);
+            for hyphen in shaped.hyphens.iter() {
+                assert_ne!(shaped.layout.get(hyphen.line_index).unwrap().break_reason(),parley::layout::BreakReason::Explicit);
+            }
+            found|=!shaped.hyphens.is_empty();
+        }
+        assert!(found,"each sentence must retain dictionary hyphenation instead of falling back to greedy wrapping");
+        block.style.preserve_sentence_prefix=false;
+        assert!(engine.shape_text(&block,&style,180.0).layout.len()>3);
     }
 
     #[test]

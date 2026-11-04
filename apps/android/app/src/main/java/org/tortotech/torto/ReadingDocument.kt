@@ -44,7 +44,7 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
             TextButton(onClick={selected=null}){Text(tr("取消选择","Clear selection"))}
         }}
         failure?.let {Text(it,color=MaterialTheme.colorScheme.error)}
-        BoxWithConstraints(Modifier.fillMaxWidth().heightIn(max=520.dp)){
+        BoxWithConstraints(Modifier.fillMaxWidth().heightIn(min=56.dp,max=520.dp)){
             val density=LocalDensity.current.density
             val width=maxWidth.value.toUInt().coerceAtLeast(100u)
             val first by produceState<DocumentFrame?>(null,interaction,width,density,revision,foreground,background){
@@ -54,7 +54,8 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
             val initial=first
             if(initial==null){if(failure==null)LinearProgressIndicator(Modifier.fillMaxWidth());return@BoxWithConstraints}
             val list=rememberLazyListState()
-            LazyColumn(Modifier.fillMaxWidth(),state=list){
+            val naturalHeight=if(initial.total==1u)(initial.frame.bitmap.height/density+(if(initial.controls.isEmpty())0 else 48)).dp else maxHeight
+            LazyColumn(Modifier.fillMaxWidth().height(naturalHeight.coerceIn(1.dp,maxHeight)),state=list){
                 item {
                     if(initial.controls.isNotEmpty())Row(Modifier.fillMaxWidth()){
                         initial.controls.forEach {control->TextButton(onClick={scope.launch {

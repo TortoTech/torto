@@ -367,7 +367,10 @@ pub(crate) fn recognize_work(s: &mut ReaderState, request: &chat::ChatRequest) -
         );
     }
     let mut style = s.session.style();
-    style.typesetting = rebook_app_core::reading::typesetting(&style.typesetting,TypesettingMode::Unified);
+    if !s.focus {
+        s.classic_typesetting = rebook_app_core::reading::typesetting(&s.classic_typesetting,TypesettingMode::Unified);
+    }
+    style.typesetting = rebook_app_core::reading::effective_typesetting(s.focus, &s.classic_typesetting);
     s.pipeline.semantic.configure_presentation(&plugins::pdf_native::cache_identity(&s.book_id,s.pipeline.rewrite.as_ref()),&settings,true);
     s.session.refresh_source_with_style(style).map_err(error)?;
     s.scroll_center = true;
@@ -508,7 +511,7 @@ impl MobileReader {
                     request.report("prefetch", 1, 1);
                     Ok(())
                 })();
-                s.session.restore_locator(&original).map_err(error)?;
+                scroll::restore_position(s, &original, before)?;
                 s.focus_anchor = focus;
                 s.scroll_distance = distance;
                 s.scroll_context = context;

@@ -1,11 +1,7 @@
 package org.tortotech.torto
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.Dp
@@ -20,8 +16,8 @@ import android.app.Activity
 import androidx.core.view.WindowCompat
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.unit.dp
 
 internal val ReaderMonospace=staticCompositionLocalOf {android.graphics.Typeface.MONOSPACE}
@@ -67,6 +63,7 @@ private val symbolResources=mapOf(
     "marks" to R.drawable.ic_symbol_marks,
     "note" to R.drawable.ic_symbol_note,
     "translate" to R.drawable.ic_symbol_translate,
+    "sentences" to R.drawable.ic_symbol_sentences,
     "select" to R.drawable.ic_symbol_select,
     "type" to R.drawable.ic_symbol_type,
     "moon" to R.drawable.ic_symbol_moon,
@@ -97,18 +94,14 @@ private val filledSymbolResources=mapOf(
     val resource=(if(filled)filledSymbolResources[name] else null) ?: symbolResources[name] ?: R.drawable.ic_symbol_info
     Icon(androidx.compose.ui.res.painterResource(resource),description,modifier.size(size*1.2f),tint=tint)
 }
-/** One shape clips both activation color and the bounded pressed indication. */
-@Composable internal fun RoundedIconControl(enabled:Boolean=true,shape:Shape=RoundedCornerShape(16.dp),container:Color=Color.Transparent,modifier:Modifier=Modifier,onClick:()->Unit,content:@Composable ()->Unit) {
+/** A transparent 48dp target; only the unchanged icon's ink reacts to input. */
+@Composable fun ActionIcon(name:String,label:String,enabled:Boolean=true,selected:Boolean=false,modifier:Modifier=Modifier,onClick:()->Unit) {
     val interaction=remember {androidx.compose.foundation.interaction.MutableInteractionSource()}
     val pressed by interaction.collectIsPressedAsState()
-    val scale by androidx.compose.animation.core.animateFloatAsState(if(pressed).94f else 1f,androidx.compose.animation.core.tween(120),label="icon press")
-    val background by androidx.compose.animation.animateColorAsState(container,androidx.compose.animation.core.tween(120),label="icon selection")
-    Box(modifier.size(48.dp).graphicsLayer {scaleX=scale;scaleY=scale}.clip(shape).background(background)
-        .clickable(interactionSource=interaction,indication=ripple(),enabled=enabled,role=Role.Button,onClick=onClick),contentAlignment=Alignment.Center){content()}
-}
-@Composable fun ActionIcon(name:String,label:String,enabled:Boolean=true,selected:Boolean=false,onClick:()->Unit) {
-    val ink=if(selected)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-    RoundedIconControl(enabled=enabled,container=if(selected)MaterialTheme.colorScheme.primaryContainer else Color.Transparent,onClick=onClick){
-        AppIcon(name,label,size=22.dp,tint=if(enabled)ink else ink.copy(alpha=.38f),filled=selected)
+    val target=when { !enabled->MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.38f);selected||pressed->MaterialTheme.colorScheme.primary;else->MaterialTheme.colorScheme.onSurfaceVariant }
+    val ink by androidx.compose.animation.animateColorAsState(target,androidx.compose.animation.core.tween(100),label="icon ink")
+    Box(modifier.size(48.dp).semantics {this.selected=selected}
+        .clickable(interactionSource=interaction,indication=null,enabled=enabled,role=Role.Button,onClick=onClick),contentAlignment=Alignment.Center){
+        AppIcon(name,label,size=22.dp,tint=ink)
     }
 }

@@ -1,8 +1,47 @@
 //! Source-based reading text and linked notes shared by native hosts.
 use rebook_publication::{
     Block, Inline, InlineRole, LinkRole, PublicationUrl, Section, SourceAnchor, SourceRange,
-    TextBlock,
+    TextBlock, TextBlockKind,
 };
+
+/// Authored text eligible for the focused paragraph structure action on every host.
+pub fn focus_block_structure_ranges(block: &Block) -> Vec<SourceRange> {
+    match block {
+        Block::Text(text)
+            if matches!(
+                text.kind,
+                TextBlockKind::Paragraph
+                    | TextBlockKind::Blockquote
+                    | TextBlockKind::Caption
+                    | TextBlockKind::ListItem { .. }
+            ) =>
+        {
+            text.source.iter().cloned().collect()
+        }
+        Block::Figure(figure) => figure.text_blocks()
+            .filter_map(|caption| caption.source.clone())
+            .collect(),
+        Block::Quote(quote) => quote
+            .body
+            .iter()
+            .filter(|body| {
+                matches!(
+                    body.kind,
+                    TextBlockKind::Paragraph | TextBlockKind::Blockquote
+                )
+            })
+            .filter_map(|body| body.source.clone())
+            .collect(),
+        Block::Text(_)
+        | Block::Table(_)
+        | Block::Image(_)
+        | Block::Note(_)
+        | Block::Separator(_)
+        | Block::LineBreak
+        | Block::PageBreak => Vec::new(),
+    }
+}
+
 
 pub enum FocusFootnoteSource {
     Citation {

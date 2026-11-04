@@ -2,9 +2,11 @@ package org.tortotech.torto
 
 import android.graphics.Bitmap
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.getVelocityFromNanos
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
+import kotlin.math.abs
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
@@ -18,7 +20,7 @@ class ReadingIntegrationTest {
         val core=MobileCore(File(context.filesDir,"core").absolutePath)
         val original=core.readingOptions()
         try {
-            val reading=original.copy(fontWeight=575u,focusStyle="highlight",scrollFocus=true,sentenceSplit=true,translated=false)
+            val reading=original.copy(fontWeight=575u,focusStyle="highlight",sentenceSplit=true,translated=false)
             core.saveReadingOptions(reading)
             assertEquals(575u.toUShort(),core.readingOptions().fontWeight)
             assertTrue(core.fontFamilies().monospace.contains("monospace"))
@@ -53,7 +55,13 @@ class ReadingIntegrationTest {
                 val selected=reader.documentSelect(id,0u,rect.x+2,rect.y+rect.height/2,rect.x+80,rect.y+rect.height/2,null)
                 assertNotNull(selected);assertTrue(selected!!.text.isNotEmpty());assertTrue(selected.bounds.isNotEmpty())
             }
-            reader.notePage(markup,1uL,total-1u,viewport,0xff000000u,0xfff8f5eeu).page.use {page->assertTrue(page.info().regions.any {it.text.contains("25:")})}
+            val tail=StringBuilder()
+            for(index in maxOf(0,total.toInt()-2) until total.toInt()){
+                tail.append(reader.notePage(markup,1uL,index.toUInt(),viewport,0xff000000u,0xfff8f5eeu).page.use {page->
+                    assertTrue(page.info().regions.isNotEmpty());page.info().regions.joinToString(""){it.text}
+                })
+            }
+            assertTrue("The complete final note paragraph remains reachable",tail.contains("25:")&&tail.contains("selectable."))
             assertEquals(progress,reader.page().use {it.info().progress},0.000001)
             reader.configure(34f,true,false).close()
             val larger=reader.notePage(markup,1uL,0u,viewport,0xff000000u,0xfff8f5eeu)
@@ -125,7 +133,96 @@ class ReadingIntegrationTest {
             assertEquals("A swipe advances exactly one block",1,turns)
             assertEquals("Touch moves must not trigger native rasterization",0f,scrolled,0f)
             assertEquals("Each reading drag reports once; selection-handle drags do not",2,gestures)
+            var unitTurns=0
+            view.onUnitTurn={assertTrue(it);unitTurns++}
+            event(0,260f,180f,start+800);event(2,90f,184f,start+840)
+            assertEquals("Dragging horizontally does not commit before release",0,unitTurns)
+            event(3,90f,184f,start+880)
+            assertEquals(0,unitTurns)
+            event(0,260f,180f,start+900);event(2,90f,184f,start+940);event(1,90f,184f,start+980)
+            assertEquals("A pending block reply serializes the horizontal turn",0,unitTurns)
+            view.present(ReaderFrame(bitmap,info.copy(scrollDistance=0.0)),null)
+            assertEquals("Focus horizontal release changes semantic units, not focus blocks",1,unitTurns)
+            assertEquals(1,turns)
             view.onWindowFocusChanged(false);bitmap.recycle()
+        }
+    }
+    @Test fun focusSettlingPreservesVelocityAndSoftensBlockEdges(){
+        for(velocity in listOf(0f,500f,8000f)){
+            val curve=focusSettle(180f,velocity)
+            assertTrue(curve.durationNanos in 1..800_000_000L)
+            assertEquals(0f,curve.getValueFromNanos(0),.001f)
+            assertEquals(velocity.coerceAtMost(5400f),curve.getVelocityFromNanos(0),.1f)
+            var previous=0f
+            for(t in 0..80){val value=curve.getValueFromNanos(curve.durationNanos*t/80)
+                assertTrue("Settling must stay monotone without bouncing",value>=previous-.01f&&value<=180.01f);previous=value}
+            assertEquals(180f,curve.getValueFromNanos(curve.durationNanos),.001f)
+            assertEquals(0f,curve.getVelocityFromNanos(curve.durationNanos),.001f)
+        }
+        val near=focusDragPosition(101.0,0.0,100.0,640f)
+        assertTrue(near>100.9&&near<101.0)
+        assertTrue(focusDragPosition(1000.0,0.0,100.0,640f)<164.01)
+        assertEquals(50.0,focusDragPosition(50.0,0.0,100.0,640f),.0001)
+    }
+    @Test fun shortFocusStopsDoNotTravelPastSeveralParagraphsOrSkipOnReversal(){
+        // A 32dp stop used to allow a further 64dp of travel, then spring back.
+        for(start in listOf(0.0,1200.0)){
+            assertTrue(focusDragPosition(start+300,start-32,start+32,640f,start)<=start+40.01)
+            assertTrue(focusDragPosition(start-300,start-32,start+32,640f,start)>=start-40.01)
+            assertEquals(start+20,focusDragPosition(start+20,start-32,start+32,640f,start),.001)
+        }
+        assertEquals(true,focusDragDestination(18f,0f,-32f,32f))
+        assertEquals(false,focusDragDestination(-18f,0f,-32f,32f))
+        assertNull(focusDragDestination(10f,0f,-32f,32f))
+        assertNull("A reversing flick returns to the same block",focusDragDestination(60f,-800f,-32f,32f))
+        assertNull(focusDragDestination(-60f,800f,-32f,32f))
+        assertEquals(true,focusDragDestination(8f,800f,-32f,32f))
+        assertNull("Long paragraphs retain the existing confirmation distance",focusDragDestination(18f,0f,-200f,200f))
+        assertEquals(true,focusDragDestination(36f,0f,-200f,200f))
+        assertNull("A real section edge keeps its deliberate gesture threshold",focusDragDestination(18f,0f,null,null))
+        for(distance in listOf(4f,-4f,32f,-32f)){
+            val curve=focusSettle(distance,0f)
+            for(t in 0..40)assertTrue("Short settling cannot cross the chosen stop",abs(curve.getValueFromNanos(curve.durationNanos*t/40))<=abs(distance)+.01f)
+        }
+        val instrumentation=InstrumentationRegistry.getInstrumentation()
+        instrumentation.runOnMainSync {
+            val context=instrumentation.targetContext;val density=context.resources.displayMetrics.density
+            val width=(360*density).toInt();val height=(640*density).toInt();val pad=160f
+            val bitmap=Bitmap.createBitmap(width,(960*density).toInt(),Bitmap.Config.ARGB_8888)
+            val output=Bitmap.createBitmap(width,height,Bitmap.Config.ARGB_8888)
+            val view=ReaderView(context);view.layout(0,0,width,height)
+            var info=PageInfo(section=0u,sectionCount=1u,page=0u,pageCount=1u,progress=0.0,regions=emptyList(),marks=emptyList(),focusBounds=emptyList(),
+                focusFadeColor=0u,focusHighlight=false,isScroll=true,scrollDistance=0.0,scrollContext=9200uL,rasterTop=-pad,rasterHeight=960f,
+                previousFocus=FocusTarget(-32f,emptyList()),nextFocus=FocusTarget(32f,emptyList()),controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),focusIndex=1u,focusCount=3u,canGoBack=false)
+            var turns=0
+            try {
+                bitmap.eraseColor(android.graphics.Color.WHITE)
+                android.graphics.Canvas(bitmap).drawRect(0f,480*density,width.toFloat(),484*density,android.graphics.Paint().apply {color=android.graphics.Color.BLACK})
+                view.present(ReaderFrame(bitmap,info,92uL),null)
+                view.onScroll={fail("Dragging a short paragraph never rasterizes")}
+                view.onTurn={forward->
+                    assertEquals(turns==0,forward);turns++
+                    val offset=if(forward)32.0 else 0.0
+                    info=info.copy(scrollDistance=offset,rasterTop=-pad-offset.toFloat())
+                    view.present(ReaderFrame(bitmap,info,92uL),null)
+                }
+                var clock=android.os.SystemClock.uptimeMillis()
+                fun event(action:Int,y:Float,time:Long){android.view.MotionEvent.obtain(clock,time,action,180*density,y*density,0).also {view.onTouchEvent(it);it.recycle()}}
+                event(0,280f,clock);event(2,120f,clock+80)
+                view.draw(android.graphics.Canvas(output))
+                val stripe=(0 until height).first {output.getPixel(width/2,it)==android.graphics.Color.BLACK}/density
+                assertTrue("Dragging cannot carry the visible text two short blocks past its target",320-stripe<=40.5f)
+                event(3,120f,clock+200);assertEquals(0,turns)
+                clock+=500
+                event(0,280f,clock);event(2,250f,clock+120);event(1,250f,clock+300)
+                assertEquals("A slow short swipe can confirm one short block",1,turns)
+                clock+=500
+                event(0,250f,clock);event(2,280f,clock+120);event(1,280f,clock+300)
+                assertEquals("The short stop is reversible",2,turns)
+                clock+=500
+                event(0,280f,clock);event(2,268f,clock+120);event(1,268f,clock+300)
+                assertEquals("Small deliberate motion still cancels",2,turns)
+            }finally {view.onWindowFocusChanged(false);bitmap.recycle();output.recycle()}
         }
     }
     @Test(timeout=20000) fun focusDragUsesRetainedPixelsSnapsOnceAndStopsDrawing() {
@@ -205,6 +302,47 @@ class ReadingIntegrationTest {
             }
             android.os.SystemClock.sleep(450);instrumentation.waitForIdleSync()
             assertFalse(moving.get());assertEquals("Cancelled gestures must not advance",1,turns.get())
+            instrumentation.runOnMainSync {
+                // An edge has no neighbouring focus block in the retained strip.
+                info=info.copy(previousFocus=null,nextFocus=null,focusCount=1u,focusIndex=0u)
+                view.present(ReaderFrame(bitmap!!,info,77uL),null)
+                view.onTurn={forward->
+                    assertTrue(forward);turns.incrementAndGet()
+                    info=info.copy(scrollContext=9002uL,scrollDistance=0.0)
+                    view.present(ReaderFrame(bitmap!!,info,78uL),null)
+                }
+                val density=view.resources.displayMetrics.density;val start=android.os.SystemClock.uptimeMillis()
+                fun event(action:Int,y:Float,t:Long){android.view.MotionEvent.obtain(start,t,action,180f*density,y*density,0).also {view.onTouchEvent(it);it.recycle()}}
+                event(0,280f,start);event(2,200f,start+40)
+                assertEquals("Dragging at an edge cannot enter the next unit",1,turns.get())
+                event(3,200f,start+80)
+                assertEquals("Cancelling an edge drag keeps the current unit",1,turns.get())
+                event(0,280f,start+100);event(2,200f,start+140);event(1,200f,start+180)
+                assertEquals("Release commits exactly one separate unit turn",2,turns.get())
+                assertFalse("Replacing the unit settles the pending navigation",moving.get())
+                assertEquals("Edge dragging never requests scroll/raster work",0,nativeScrolls.get())
+            }
+            val queuedTurns=java.util.concurrent.atomic.AtomicInteger()
+            instrumentation.runOnMainSync {
+                info=info.copy(scrollContext=9100uL,scrollDistance=0.0,rasterTop=-160f,
+                    previousFocus=FocusTarget(-60f,emptyList()),nextFocus=FocusTarget(60f,emptyList()),focusCount=3u)
+                view.present(ReaderFrame(bitmap!!,info,80uL),null)
+                // Hold the native reply across a second complete pointer sequence.
+                view.onTurn={assertTrue(it);queuedTurns.incrementAndGet()}
+                val density=view.resources.displayMetrics.density;val start=android.os.SystemClock.uptimeMillis()
+                fun event(action:Int,y:Float,t:Long){android.view.MotionEvent.obtain(start,t,action,180f*density,y*density,0).also {view.onTouchEvent(it);it.recycle()}}
+                event(0,280f,start);event(2,200f,start+40);event(1,200f,start+80)
+                assertEquals(1,queuedTurns.get())
+                event(0,280f,start+100);event(2,200f,start+140);event(1,200f,start+180)
+                assertEquals("A pending native reply serializes the next committed gesture",1,queuedTurns.get())
+                info=info.copy(scrollDistance=60.0,rasterTop=-220f)
+                view.present(ReaderFrame(bitmap!!,info,80uL),null)
+                assertEquals("The buffered swipe is applied exactly once after confirmation",2,queuedTurns.get())
+                info=info.copy(scrollDistance=120.0,rasterTop=-280f)
+                view.present(ReaderFrame(bitmap!!,info,80uL),null)
+            }
+            android.os.SystemClock.sleep(450);instrumentation.waitForIdleSync()
+            assertFalse("Rapid consecutive swipes settle without leaving an input barrier",moving.get())
         }finally {
             activity?.let {host->instrumentation.runOnMainSync {host.finish()}}
             instrumentation.removeMonitor(monitor)

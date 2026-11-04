@@ -6,4 +6,8 @@
         <item name="android:colorAccent">#389875</item>
         <item name="android:windowBackground">#F8F7F2</item>
     </style>
+    <style name="Animation.Torto.ImagePreview" parent="">
+        <item name="android:windowEnterAnimation">@anim/image_preview_enter</item>
+        <item name="android:windowExitAnimation">@anim/image_preview_exit</item>
+    </style>
 </resources>

@@ -10,6 +10,8 @@ pub struct TouchAction {
     pub markup: String,
     pub target: String,
     pub media: Option<Arc<MobilePage>>,
+    pub marker: String,
+    pub indicator: Option<Rect>,
 }
 impl TouchAction {
     pub(crate) fn new(kind: &str, text: String, target: String) -> Self {
@@ -19,6 +21,7 @@ impl TouchAction {
             markup: String::new(),
             target,
             media: None,
+            marker:String::new(),indicator:None,
         }
     }
 }
@@ -26,6 +29,9 @@ impl TouchAction {
     fn with_markup(mut self, markup: String) -> Self {
         self.markup = markup;
         self
+    }
+    fn with_reference(mut self, marker:String, indicator:Option<Rect>)->Self {
+        self.marker=marker;self.indicator=indicator;self
     }
 }
 fn rich_note(s: &ReaderState, target: &PublicationUrl, marker: &str) -> String {
@@ -57,59 +63,76 @@ fn rich_note(s: &ReaderState, target: &PublicationUrl, marker: &str) -> String {
 pub(crate) struct FocusUnit {
     pub ranges: Vec<SourceRange>,
     pub bounds: Vec<Rect>,
+    pub lines: Vec<Rect>,
+    pub headings: Vec<Rect>,
+    pub leading: bool,
+    pub group: Option<rebook_app_core::focus_content::Group>,
 }
-pub(crate) fn focus_units(s: &ReaderState) -> Result<Vec<FocusUnit>> {
-    if !s.focus {
-        return Ok(vec![]);
-    }
-    let section = s
-        .source
-        .parse_section(s.session.snapshot().location.section_index)
-        .map_err(error)?;
-    Ok(focus_units_on(&section, s.session.current_page()))
+fn union_rects(rects: &[Rect]) -> Option<Rect> {
+    rects.iter().cloned().reduce(|a,b| Rect {
+        x:a.x.min(b.x), y:a.y.min(b.y),
+        width:(a.x+a.width).max(b.x+b.width)-a.x.min(b.x),
+        height:(a.y+a.height).max(b.y+b.height)-a.y.min(b.y),
+    })
 }
-pub(crate) fn focus_units_on(
-    section: &rebook_publication::Section,
-    display: &rebook_renderer::PageDisplayList,
-) -> Vec<FocusUnit> {
-    let refs: Vec<_> = section.blocks.iter().collect();
-    let scopes = rebook_layout::semantic_list_groups(&refs)
-        .into_iter()
-        .chain(rebook_layout::semantic_paragraph_groups(&refs))
-        .collect::<Vec<_>>();
-    let mut units = Vec::new();
-    let mut index = 0;
-    while index < section.blocks.len() {
-        let end = scopes
-            .iter()
-            .filter(|range| range.start == index)
-            .map(|r| r.end)
-            .max()
-            .unwrap_or(index + 1);
-        let ranges = section.blocks[index..end]
-            .iter()
-            .filter(|b| !b.is_footnote_definition())
-            .flat_map(|b| {
-                text::block_source_range(b)
-                    .map_or_else(Vec::new, |r| text::focus_block_paint_ranges(b, r))
-            })
-            .collect::<Vec<_>>();
-        let bounds = display
-            .source_block_bounds(&ranges)
-            .into_iter()
-            .map(|r| Rect {
-                x: r.x0 as f32,
-                y: r.y0 as f32,
-                width: r.width() as f32,
-                height: r.height() as f32,
-            })
-            .collect::<Vec<_>>();
-        if !bounds.is_empty() {
-            units.push(FocusUnit { ranges, bounds });
-        }
-        index = end;
+impl FocusUnit {
+    pub(crate) fn navigation_bounds(&self) -> Option<Rect> {
+        let mut bounds=self.bounds.clone();
+        if self.leading { bounds.extend_from_slice(&self.headings); }
+        union_rects(&bounds)
     }
-    units
+    pub(crate) fn paint_bounds(&self, dim:bool) -> Vec<Rect> {
+        let mut result=self.navigation_bounds().into_iter().collect::<Vec<_>>();
+        if dim && !self.leading { result.extend(union_rects(&self.headings)); }
+        result
+    }
+    fn merge(&mut self, other:Self) {
+        self.ranges.extend(other.ranges);self.bounds.extend(other.bounds);
+        self.lines.extend(other.lines);self.headings.extend(other.headings);
+    }
+}
+/// Keep tall lists/containers navigable by top-level parts, as on desktop.
+/// Missing parts beyond the bounded raster are never mistaken for a short group.
+pub(crate) fn arrange_focus_units(units: Vec<FocusUnit>, height:f32) -> Vec<FocusUnit> {
+    let mut output=Vec::new();
+    let mut units=units.into_iter().filter(|u|!u.bounds.is_empty()).peekable();
+    while let Some(mut first)=units.next() {
+        let Some(group)=first.group.clone() else {output.push(first);continue;};
+        let mut parts=vec![first];
+        while units.peek().is_some_and(|unit|unit.group.as_ref()==Some(&group)) {parts.push(units.next().unwrap());}
+        let bounds=parts.iter().flat_map(|unit|unit.bounds.iter().cloned()).collect::<Vec<_>>();
+        // Desktop group cards include the block's 6dp and card's 4dp padding.
+        let fits=parts.len()==group.parts && union_rects(&bounds).is_some_and(|rect|rect.height+20.0 <= (height-32.0).max(1.0)+1.0);
+        if fits {
+            first=parts.remove(0);
+            for part in parts {first.merge(part);}
+            output.push(first);
+        }else {output.extend(parts);}
+    }
+    output
+}
+pub(crate) fn focus_units(s: &mut ReaderState) -> Result<Vec<FocusUnit>> {
+    if !s.focus { return Ok(vec![]); }
+    let specs=focus_specs(s)?;
+    Ok(arrange_focus_units(focus_units_on(&specs,s.session.current_page()),s.session.viewport().height as f32))
+}
+pub(crate) fn focus_specs(s:&mut ReaderState)->Result<Vec<rebook_app_core::focus_content::Unit>> {
+    let blocks=s.session.current_reading_unit_content().map_err(error)?.into_iter()
+        .flat_map(|(_,section)|section.blocks).collect::<Vec<_>>();
+    let allowed=s.session.current_reading_unit_source_ranges().map_err(error)?;
+    Ok(rebook_app_core::focus_content::units_in_ranges(&blocks,true,Some(&allowed)))
+}
+pub(crate) fn focus_units_on(specs:&[rebook_app_core::focus_content::Unit],display:&rebook_renderer::PageDisplayList)->Vec<FocusUnit> {
+    fn rects(rects:impl IntoIterator<Item=kurbo::Rect>)->Vec<Rect> {rects.into_iter().map(|r|Rect {
+        x:r.x0 as f32,y:r.y0 as f32,width:r.width() as f32,height:r.height() as f32,
+    }).collect()}
+    specs.iter().filter_map(|unit| {
+        let bounds=rects(display.source_content_bounds(&unit.ranges));
+        let headings=rects(display.source_content_bounds(&unit.headings));
+        if bounds.is_empty()&&headings.is_empty(){return None;}
+        let lines=rects(display.source_rects(&unit.ranges));
+        Some(FocusUnit {ranges:unit.ranges.clone(),bounds,lines,headings,leading:unit.leading,group:unit.group.clone()})
+    }).collect()
 }
 pub(crate) fn linked(
     section: &rebook_publication::Section,
@@ -191,6 +214,8 @@ fn note_at(s: &mut ReaderState, x: f32, y: f32) -> Result<Option<TouchAction>> {
     else {
         return Ok(None);
     };
+    let label=if number&0x2000_0000==0 {format!("[{}]",number&0x1fff_ffff)}else{(number&0x1fff_ffff).to_string()};
+    let indicator=s.session.current_page().footnote_indicator_at(x,y).map(|[x,y,width,height]|Rect{x,y,width,height});
     let section = s
         .source
         .parse_section(position.section_index)
@@ -210,7 +235,7 @@ fn note_at(s: &mut ReaderState, x: f32, y: f32) -> Result<Option<TouchAction>> {
                 FocusFootnoteSource::Inline(content, n) if n == number & 0x1fff_ffff => {
                     return Ok(Some(
                         TouchAction::new("note", content, String::new())
-                            .with_markup(inline_note_markup(block, number)),
+                            .with_markup(inline_note_markup(block, number)).with_reference(label.clone(),indicator.clone()),
                     ));
                 }
                 FocusFootnoteSource::Reference {
@@ -222,7 +247,7 @@ fn note_at(s: &mut ReaderState, x: f32, y: f32) -> Result<Option<TouchAction>> {
                         resolve_note(s, &target, &marker).unwrap_or_else(|| marker.clone());
                     return Ok(Some(
                         TouchAction::new("note", content, target.to_string())
-                            .with_markup(rich_note(s, &target, &marker)),
+                            .with_markup(rich_note(s, &target, &marker)).with_reference(label.clone(),indicator.clone()),
                     ));
                 }
                 FocusFootnoteSource::Citation {
@@ -232,7 +257,7 @@ fn note_at(s: &mut ReaderState, x: f32, y: f32) -> Result<Option<TouchAction>> {
                 } if n == number & 0x1fff_ffff => {
                     return Ok(Some(
                         TouchAction::new("note", content, String::new())
-                            .with_markup(inline_note_markup(block, number)),
+                            .with_markup(inline_note_markup(block, number)).with_reference(label.clone(),indicator.clone()),
                     ));
                 }
                 _ => {}
@@ -380,7 +405,8 @@ impl MobileReader {
                 if let Some(hit)=s.session.media_reference_at_current_spread(x,y).map_err(error)? {
                     if let Some(target)=s.media.resolve(&hit.source,&hit.key){return documents::reference(s,target)}
                 }
-                if let Some(note) = note_at(s, x, y)? {
+                if let Some(mut note) = note_at(s, x, y)? {
+                    if let Some(bar)=&mut note.indicator {bar.y+=view_y-y;}
                     return Ok(note);
                 }
                 if let Some(hit) = s.session.image_at_current_spread(x, y).map_err(error)? {
@@ -404,6 +430,7 @@ impl MobileReader {
                         markup: String::new(),
                         target,
                         media: Some(media),
+                        marker:String::new(),indicator:None,
                     });
                 }
                 let display = s.session.current_page();
@@ -438,6 +465,7 @@ impl MobileReader {
                             markup: String::new(),
                             target: String::new(),
                             media: Some(page),
+                            marker:String::new(),indicator:None,
                         });
                     }
                     let notes = s.store.annotations_for_book(&s.book_id).map_err(error)?;
@@ -455,7 +483,7 @@ impl MobileReader {
                 }
                 if s.focus
                     && let Some(index) = s.focus_units.iter().position(|u| {
-                        u.bounds.iter().any(|r| {
+                        u.paint_bounds(s.options.focus_style != "highlight").iter().any(|r| {
                             view_x >= r.x
                                 && view_x <= r.x + r.width
                                 && view_y >= r.y
@@ -475,6 +503,7 @@ impl MobileReader {
                         markup: String::new(),
                         target: String::new(),
                         media: Some(page),
+                        marker:String::new(),indicator:None,
                     });
                 }
                 Ok(TouchAction::new("none", String::new(), String::new()))
@@ -485,21 +514,29 @@ impl MobileReader {
     pub async fn focus_mode(self: Arc<Self>, enabled: bool) -> Result<Arc<MobilePage>> {
         work(move || {
             self.with(|s| {
+                let mut anchor = s.focus_anchor.clone().or_else(|| s.session.current_locator().source);
                 s.focus = enabled;
                 s.scroll_center = true;
                 scroll::invalidate(s);
                 s.pipeline
                     .structure
-                    .set_all_active(enabled && s.options.sentence_split)
+                    .set_enabled(enabled)
                     .map_err(error)?;
                 let mut style = s.session.style();
-                style.spread = if enabled && s.options.scroll_focus {
+                apply_presentation_mode(s, &mut style)?;
+                style.spread = if enabled {
                     SpreadMode::Scroll
                 } else {
                     SpreadMode::Single
                 };
                 s.session.refresh_source_with_style(style).map_err(error)?;
-                s.focus_anchor = None;
+                if let Some(range) = &anchor {
+                    if s.session.go_to_source(&range.start).is_err() {
+                        // RestoreLocator already falls back for obsolete bookmarks.
+                        anchor=s.session.current_locator().source;
+                    }
+                }
+                s.focus_anchor = anchor;
                 render(s)
             })
         })

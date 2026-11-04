@@ -17,7 +17,7 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class IconAppearanceTest {
-    @Test fun pressedAndActiveButtonsShareTheRoundedOutline(){
+    @Test fun pressedAndActiveButtonsOnlyChangeTheSameIconInk(){
         val instrumentation=InstrumentationRegistry.getInstrumentation()
         val monitor=instrumentation.addMonitor(MainActivity::class.java.name,null,false)
         var activity:MainActivity?=null
@@ -33,8 +33,9 @@ class IconAppearanceTest {
             instrumentation.runOnMainSync {activity!!.setContent {
                 TortoTheme(ScreenState(appTheme="light",language="en")){
                     Row(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.White).padding(start=24.dp,top=100.dp),horizontalArrangement=Arrangement.spacedBy(16.dp)){
-                        ActionIcon("search","Press outline"){}
-                        ActionIcon("search","Active outline",selected=true){}
+                        ActionIcon("toc","Normal ink"){}
+                        ActionIcon("toc","Press ink"){}
+                        ActionIcon("toc","Active ink",selected=true){}
                     }
                 }
             }}
@@ -45,8 +46,9 @@ class IconAppearanceTest {
                 assertNotNull(button)
                 return Rect().also {button!!.getBoundsInScreen(it)}
             }
-            val pressed=bounds("Press outline")
-            val active=bounds("Active outline")
+            val normal=bounds("Normal ink")
+            val pressed=bounds("Press ink")
+            val active=bounds("Active ink")
             val time=android.os.SystemClock.uptimeMillis()
             down=MotionEvent.obtain(time,time,MotionEvent.ACTION_DOWN,pressed.exactCenterX(),pressed.exactCenterY(),0)
             instrumentation.sendPointerSync(down)
@@ -57,10 +59,23 @@ class IconAppearanceTest {
             assertEquals(48f,pressed.width()/density,1f)
             fun pixel(rect:Rect,dp:Int)=bitmap!!.getPixel(rect.left+(dp*density).toInt(),rect.top+(dp*density).toInt())
             fun difference(color:Int)=kotlin.math.abs(Color.red(color)-255)+kotlin.math.abs(Color.green(color)-255)+kotlin.math.abs(Color.blue(color)-255)
-            assertTrue("Pressed ripple must reach the rounded-rectangle shoulder instead of using a circle",difference(pixel(pressed,7))>8)
-            assertTrue("Active fill reaches the same shoulder",difference(pixel(active,7))>8)
-            assertTrue("Pressed indication stays outside the rounded corner",difference(pixel(pressed,1))<8)
-            assertTrue("Active fill stays outside the same rounded corner",difference(pixel(active,1))<8)
+            for(rect in listOf(normal,pressed,active)){
+                assertTrue("Icons have no background at the former rounded shoulder",difference(pixel(rect,7))<3)
+                assertTrue("Transparent targets keep their corners empty",difference(pixel(rect,1))<3)
+                assertEquals(normal.width(),rect.width());assertEquals(normal.height(),rect.height())
+            }
+            var inkPixels=0;var changed=0;var maskDifference=0
+            for(y in 0 until normal.height())for(x in 0 until normal.width()){
+                val base=bitmap!!.getPixel(normal.left+x,normal.top+y)
+                val press=bitmap.getPixel(pressed.left+x,pressed.top+y)
+                val selected=bitmap.getPixel(active.left+x,active.top+y)
+                val delta=kotlin.math.abs(Color.red(press)-Color.red(selected))+kotlin.math.abs(Color.green(press)-Color.green(selected))+kotlin.math.abs(Color.blue(press)-Color.blue(selected))
+                assertTrue("Pressed and active differ only by subpixel colour rounding",delta<=6)
+                if(difference(base)>20){inkPixels++;if(base!=press)changed++}
+                if((difference(base)>8)!=(difference(press)>8))maskDifference++
+            }
+            assertTrue("The vector itself changes colour",inkPixels>100&&changed>inkPixels*.8)
+            assertTrue("Colour feedback cannot fill, move or scale the icon",maskDifference<inkPixels*.05)
             bitmap!!.recycle()
         }finally {
             down?.let {event->instrumentation.sendPointerSync(MotionEvent.obtain(event.downTime,android.os.SystemClock.uptimeMillis(),MotionEvent.ACTION_UP,event.x,event.y,0));event.recycle()}

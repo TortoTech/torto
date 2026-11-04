@@ -15,8 +15,8 @@ pub struct ReadingOptions {
     pub monospace_font: String,
     pub font_weight: u16,
     pub focus_style: String,
+    /// Legacy on-disk preference; paragraph structure is now controlled per focused unit.
     pub sentence_split: bool,
-    pub scroll_focus: bool,
     pub translated: bool,
     pub ai_prefetch: bool,
 }
@@ -31,7 +31,6 @@ impl Default for ReadingOptions {
             font_weight: 400,
             focus_style: "dim".into(),
             sentence_split: false,
-            scroll_focus: true,
             translated: false,
             ai_prefetch: true,
         }
@@ -389,10 +388,10 @@ impl MobileReader {
                 apply_typography(&mut style, &options);
                 s.pipeline
                     .structure
-                    .set_all_active(options.sentence_split && s.focus)
+                    .set_enabled(s.focus)
                     .map_err(error)?;
                 s.options = options;
-                style.spread = if s.focus && s.options.scroll_focus {
+                style.spread = if s.focus {
                     SpreadMode::Scroll
                 } else {
                     SpreadMode::Single

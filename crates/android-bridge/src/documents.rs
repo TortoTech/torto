@@ -135,7 +135,7 @@ fn page(
     if document.viewport != Some(key) {
         let mut style = rebook_app_core::reading::note_style(
             &document.style,
-            document.style.typography.font_size,
+            if id.starts_with("note-") {(document.style.typography.font_size*0.8).max(14.0)}else{document.style.typography.font_size},
         );
         if id.starts_with("document-") {
             style.typesetting =
@@ -193,7 +193,10 @@ fn page(
     let mut renderer = anyrender_vello_cpu::VelloCpuImageRenderer::new(width, pixels_height);
     let mut pixels = Vec::new();
     renderer.render_to_vec(
-        |scene| display.paint_scaled(scene, viewport.scale),
+        |scene| {display.paint_scaled(scene, viewport.scale);
+            let [r,g,b,a]=rebook_renderer::reference_color(background&0x00ff_0000<0x0080_0000);
+            display.paint_footnote_icons_scaled(scene,peniko::Color::from_rgba8(r,g,b,a),viewport.scale);
+        },
         &mut pixels,
     );
     let position = document.positions[index as usize];

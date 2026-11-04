@@ -23,10 +23,15 @@ struct ParagraphAtom {
     end: usize,
 }
 
-#[derive(Default)]
 struct StructureState {
     active: HashMap<ParagraphStructureKey, bool>,
     all_active: bool,
+    enabled: bool,
+}
+impl Default for StructureState {
+    fn default() -> Self {
+        Self { active: HashMap::new(), all_active: false, enabled: true }
+    }
 }
 
 /// A derived view layered after translation. The model only chooses atom ranges;
@@ -38,6 +43,11 @@ pub struct ParagraphStructureSource {
 }
 
 impl ParagraphStructureSource {
+    /// Suspend the derived view without discarding per-paragraph choices.
+    pub fn set_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.state.write().map_err(|_| "按句分段状态已损坏".to_owned())?.enabled = enabled;
+        Ok(())
+    }
     pub fn new(inner: Arc<dyn BookSource>) -> Self {
         let language_hint = inner
             .book()
@@ -63,7 +73,7 @@ impl ParagraphStructureSource {
         self.state
             .read()
             .ok()
-            .is_some_and(|s| s.all_active || s.active.get(key) == Some(&true))
+            .is_some_and(|s| s.enabled && (s.all_active || s.active.get(key) == Some(&true)))
     }
 
     pub fn is_structured(&self, key: &ParagraphStructureKey) -> bool {
@@ -94,13 +104,14 @@ impl ParagraphStructureSource {
         }) else {
             return Ok(false);
         };
-        Ok(paragraph_atoms_for_content_mode(
-            &primary.content,
-            &self.language_hint,
-            split_semicolons,
-        )
-        .len()
-            >= 2)
+        Ok(self.can_structure_text(primary, !split_semicolons))
+    }
+
+    /// Query an already prepared reading snapshot without parsing the source again.
+    pub fn can_structure_text(&self, text: &TextBlock, in_quote: bool) -> bool {
+        text_kind_is_structurable(text.kind)
+            && paragraph_atoms_for_content_mode(&text.content, &self.language_hint,
+                !in_quote && text.kind != TextBlockKind::Blockquote).len() >= 2
     }
 }
 
@@ -118,6 +129,7 @@ impl BookSource for ParagraphStructureSource {
             .state
             .read()
             .map_err(|_| PublicationError::InvalidPublication("按句分段状态已损坏".to_owned()))?;
+        if !state.enabled { return Ok(section); }
         let mut block_index = 0;
         while block_index < section.blocks.len() {
             let split_semicolons = !matches!(

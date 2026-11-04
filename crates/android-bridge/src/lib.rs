@@ -111,6 +111,23 @@ pub struct FocusTarget {
 pub fn focus_motion_duration(distance: f32) -> u32 {
     rebook_app_core::focus_navigation::duration(distance).as_millis() as u32
 }
+#[uniffi::export]
+pub fn reference_color(dark:bool)->u32 {
+    let [r,g,b,a]=rebook_renderer::reference_color(dark);
+    u32::from_be_bytes([a,r,g,b])
+}
+fn reference_ink(s:&ReaderState)->peniko::Color {
+    let [r,g,b,a]=rebook_renderer::reference_color(s.session.style().background.red<128);
+    peniko::Color::from_rgba8(r,g,b,a)
+}
+#[uniffi::export]
+pub fn page_turn_commit(distance: f32, width: f32, velocity: f32) -> bool {
+    rebook_app_core::page_navigation::commit(distance, width, velocity)
+}
+#[uniffi::export]
+pub fn page_turn_resisted_offset(distance: f32, width: f32) -> f32 {
+    rebook_app_core::page_navigation::resisted_offset(distance, width)
+}
 #[derive(Clone, Default, uniffi::Record)]
 pub struct PageInfo {
     pub section: u32,
@@ -349,15 +366,17 @@ impl MobileCore {
             });
             let store = services::store()?;
             store.register_book_if_missing(&id).map_err(error)?;
-            if let Some(progress) = store.load_progress(&id).map_err(error)? {
+            let restored_anchor = if let Some(progress) = store.load_progress(&id).map_err(error)? {
                 session.restore_locator(&progress.locator).map_err(error)?;
-            }
+                progress.locator.source
+            } else { None };
             store
                 .record_reading_activity(&id, &session.current_locator())
                 .map_err(error)?;
             rebook_app_core::statistics::register_book(book);
             let chat_path = self.root.join("chat").join(format!("{id}.json"));
             let messages = chat::load_messages(&chat_path);
+            let session_typesetting = session.style().typesetting;
             Ok(Arc::new(MobileReader {
                 state: Mutex::new(Some(ReaderState {
                     session,
@@ -388,10 +407,10 @@ impl MobileCore {
                     selection_start: None,
                     selection_end: None,
                     selection_drag_anchor: None,
+                    classic_typesetting: session_typesetting,
                     focus: false,
                     focus_units: vec![],
-                    focus_anchor: None,
-                    focus_last: false,
+                    focus_anchor: restored_anchor,
                     history: vec![],
                 })),
             }))
@@ -429,9 +448,9 @@ struct ReaderState {
     selection_end: Option<rebook_reader::ReaderTextHit>,
     selection_drag_anchor: Option<rebook_reader::ReaderTextHit>,
     focus: bool,
+    classic_typesetting: rebook_layout::ReaderTypesetting,
     focus_units: Vec<interactions::FocusUnit>,
     focus_anchor: Option<SourceRange>,
-    focus_last: bool,
     history: Vec<rebook_publication::LocatorV1>,
 }
 #[derive(uniffi::Object)]
@@ -460,34 +479,29 @@ impl MobileReader {
     pub async fn page(self: Arc<Self>) -> Result<Arc<MobilePage>> {
         work(move || self.with(render)).await
     }
+    /// Render one neighbour without publishing progress, selection or navigation.
+    /// Hosts retain at most the preceding and following viewport bitmaps.
+    pub async fn preview_turn(self: Arc<Self>, forward: bool) -> Result<Option<Arc<MobilePage>>> {
+        work(move || self.with(|s| {
+            if s.focus { return scroll::preview_unit(s,forward); }
+            let locator = s.session.current_locator();
+            let position = scroll::position(s);
+            let result = (|| {
+                s.session.turn_page(if forward { PageDirection::Next } else { PageDirection::Previous }).map_err(error)?;
+                if scroll::position(s) == position { return Ok(None); }
+                render_page_with_progress(s, false).map(Some)
+            })();
+            // Restoration also runs when parsing/rendering the neighbouring chapter fails.
+            scroll::restore_position(s, &locator, position)?;
+            result
+        })).await
+    }
     pub async fn turn(self: Arc<Self>, forward: bool) -> Result<Arc<MobilePage>> {
         work(move || {
             self.with(|s| {
                 clear_selection_state(s);
-                if s.focus && s.options.scroll_focus {
-                    return scroll::turn(s, forward);
-                }
                 if s.focus {
-                    let current = s
-                        .focus_anchor
-                        .as_ref()
-                        .and_then(|a| {
-                            s.focus_units
-                                .iter()
-                                .position(|u| u.ranges.iter().any(|r| r.start == a.start))
-                        })
-                        .unwrap_or(0);
-                    let next = if forward {
-                        current.checked_add(1).filter(|i| *i < s.focus_units.len())
-                    } else {
-                        current.checked_sub(1)
-                    };
-                    if let Some(next) = next {
-                        s.focus_anchor = s.focus_units[next].ranges.first().cloned();
-                        return render(s);
-                    }
-                    s.focus_anchor = None;
-                    s.focus_last = !forward;
+                    return scroll::turn(s, forward);
                 }
                 s.session
                     .turn_page(if forward {
@@ -500,6 +514,9 @@ impl MobileReader {
             })
         })
         .await
+    }
+    pub async fn turn_reading_unit(self: Arc<Self>, forward: bool) -> Result<Arc<MobilePage>> {
+        work(move ||self.with(|s|scroll::turn_unit(s,forward))).await
     }
     pub async fn resize(self: Arc<Self>, viewport: Viewport) -> Result<Arc<MobilePage>> {
         work(move || {
@@ -531,9 +548,8 @@ impl MobileReader {
                 } else {
                     TypesettingMode::Book
                 };
-                style.typesetting = rebook_app_core::reading::typesetting(&style.typesetting,mode);
-                let settings=rebook_app_core::plugins::PluginSettings::load_default().map_err(error)?;
-                s.pipeline.semantic.configure_presentation(&rebook_app_core::plugins::pdf_native::cache_identity(&s.book_id,s.pipeline.rewrite.as_ref()),&settings,unified);
+                s.classic_typesetting = rebook_app_core::reading::typesetting(&s.classic_typesetting,mode);
+                apply_presentation_mode(s, &mut style)?;
                 if dark {
                     style.background = rebook_publication::Rgba {
                         red: 24,
@@ -671,15 +687,25 @@ fn clear_selection_state(s: &mut ReaderState) {
     s.selection_end = None;
     s.selection_drag_anchor = None;
 }
+fn apply_presentation_mode(s: &mut ReaderState, style: &mut ReaderStyle) -> Result<()> {
+    style.typesetting = rebook_app_core::reading::effective_typesetting(s.focus, &s.classic_typesetting);
+    let settings = rebook_app_core::plugins::PluginSettings::load_default().map_err(error)?;
+    s.pipeline.semantic.configure_presentation(
+        &rebook_app_core::plugins::pdf_native::cache_identity(&s.book_id, s.pipeline.rewrite.as_ref()),
+        &settings,
+        style.typesetting.mode == TypesettingMode::Unified,
+    );
+    Ok(())
+}
 fn render(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
     clear_selection_state(s);
-    if s.focus && s.options.scroll_focus {
+    if s.focus {
         scroll::render(s)
     } else {
         render_page(s)
     }
 }
-fn page_info(s: &mut ReaderState) -> Result<PageInfo> {
+fn page_info(s: &mut ReaderState, persist: bool) -> Result<PageInfo> {
     let fragments = s.session.current_visible_text_fragments().map_err(error)?;
     let display = s.session.current_page();
     let regions = fragments
@@ -723,19 +749,12 @@ fn page_info(s: &mut ReaderState) -> Result<PageInfo> {
                     .any(|r| r.start.spine == a.start.spine && r.start.node == a.start.node)
             })
         })
-        .unwrap_or_else(|| {
-            if s.focus_last {
-                s.focus_units.len().saturating_sub(1)
-            } else {
-                0
-            }
-        });
-    s.focus_last = false;
+        .unwrap_or(0);
     s.focus_anchor = s
         .focus_units
         .get(index)
         .and_then(|u| u.ranges.first().cloned());
-    finish_page_info(s, regions, marks, index, false)
+    finish_page_info(s, regions, marks, index, false, persist)
 }
 fn finish_page_info(
     s: &mut ReaderState,
@@ -743,11 +762,12 @@ fn finish_page_info(
     marks: Vec<Rect>,
     index: usize,
     is_scroll: bool,
+    persist: bool,
 ) -> Result<PageInfo> {
     let focus_bounds = s
         .focus_units
         .get(index)
-        .map_or_else(Vec::new, |u| u.bounds.clone());
+        .map_or_else(Vec::new, |u| u.paint_bounds(s.options.focus_style != "highlight"));
     let state = s.session.snapshot();
     let mut locator = s.session.current_locator();
     if is_scroll && let Some(unit) = s.focus_units.get(index) {
@@ -769,7 +789,9 @@ fn finish_page_info(
             }
         }
     }
-    s.store.save_progress(&s.book_id, &locator).map_err(error)?;
+    if persist {
+        s.store.save_progress(&s.book_id, &locator).map_err(error)?;
+    }
     let controls=presentation::controls(s)?;
     Ok(PageInfo {
         active_toc_id:state.active_toc_id,
@@ -805,8 +827,10 @@ fn finish_page_info(
     })
 }
 fn render_page(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
-    s.selected = None;
-    let info = page_info(s)?;
+    render_page_with_progress(s, true)
+}
+fn render_page_with_progress(s: &mut ReaderState, persist: bool) -> Result<Arc<MobilePage>> {
+    let info = page_info(s, persist)?;
     let viewport = s.session.viewport();
     let width = (viewport.width as f32 * viewport.raster_scale).ceil() as u32;
     let height = (viewport.height as f32 * viewport.raster_scale).ceil() as u32;
@@ -816,10 +840,9 @@ fn render_page(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
     rasterizer.render_to_vec(
         |scene| {
             display.paint_scaled(scene, viewport.raster_scale);
-            let color = s.session.style().foreground;
             display.paint_footnote_icons_scaled(
                 scene,
-                peniko::Color::from_rgba8(color.red, color.green, color.blue, color.alpha),
+                reference_ink(s),
                 viewport.raster_scale,
             );
         },

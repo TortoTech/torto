@@ -15,9 +15,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import org.tortotech.torto.core.*
 
-@Composable internal fun SettingChoice(title:String,value:String,choices:List<Pair<String,String>>,enabled:Boolean=true,choose:(String)->Unit){
+@Composable internal fun SettingChoice(title:String,value:String,choices:List<Pair<String,String>>,enabled:Boolean=true,flat:Boolean=false,choose:(String)->Unit){
     var show by remember{mutableStateOf(false)}
-    ListItem(headlineContent={Text(title)},supportingContent={Text(choices.firstOrNull {it.first==value}?.second ?: value.ifEmpty {tr("未选择","Not selected")},maxLines=2,overflow=TextOverflow.Ellipsis)},trailingContent={AppIcon("next")},modifier=Modifier.clickable(enabled=enabled){show=true},colors=ListItemDefaults.colors(containerColor=MaterialTheme.colorScheme.surface))
+    ListItem(headlineContent={Text(title)},supportingContent={Text(choices.firstOrNull {it.first==value}?.second ?: value.ifEmpty {tr("未选择","Not selected")},maxLines=2,overflow=TextOverflow.Ellipsis)},trailingContent={AppIcon("next")},modifier=Modifier.clickable(enabled=enabled){show=true},colors=ListItemDefaults.colors(containerColor=if(flat)androidx.compose.ui.graphics.Color.Transparent else MaterialTheme.colorScheme.surface))
     if(show){var query by remember{mutableStateOf("")};AlertDialog(onDismissRequest={show=false},title={Text(title)},text={Column{
         OutlinedTextField(query,{query=it},label={Text(tr("搜索","Search"))},singleLine=true,modifier=Modifier.fillMaxWidth())
         LazyColumn(Modifier.heightIn(max=420.dp)){items(choices.filter {it.second.contains(query,true)||it.first.contains(query,true)}){(key,label)->

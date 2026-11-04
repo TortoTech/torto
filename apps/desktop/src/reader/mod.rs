@@ -1,4 +1,4 @@
-use rebook_app_core::reading_text::{FocusFootnoteSource, block_source_range, text_block_focus_footnotes, block_focus_footnotes, focus_footnote_text_in_section, find_block_containing_anchor, note_definition_containing_anchor, normalize_resolved_footnote_text, text_block_focus_text, block_focus_text, focus_block_paint_ranges, source_range_contains_anchor};
+use rebook_app_core::reading_text::{FocusFootnoteSource, focus_block_structure_ranges, block_source_range, text_block_focus_footnotes, block_focus_footnotes, focus_footnote_text_in_section, find_block_containing_anchor, note_definition_containing_anchor, normalize_resolved_footnote_text, text_block_focus_text, block_focus_text, focus_block_paint_ranges, source_range_contains_anchor};
 use crate::plugins::semantic_layout::SemanticLayoutSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1161,34 +1161,9 @@ fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, Publication
 
 
 
-fn text_block_has_link_role(block: &TextBlock, role: LinkRole) -> bool {
-    block.content.iter().any(|inline| {
-        matches!(inline, Inline::Text(run) if run.link.is_some() && run.style.link_role == role)
-    })
-}
-
 fn block_is_footnote_definition(block: &Block) -> bool {
-    if block.is_footnote_definition() {
-        return true;
-    }
-    match block {
-        Block::Note(_) => true,
-        Block::Text(block) => text_block_has_link_role(block, LinkRole::FootnoteBacklink),
-        Block::Quote(quote) => quote
-            .body
-            .iter()
-            .chain(quote.attribution.iter())
-            .any(|block| text_block_has_link_role(block, LinkRole::FootnoteBacklink)),
-        Block::Table(table) => table
-            .text_blocks()
-            .any(|text| text_block_has_link_role(text, LinkRole::FootnoteBacklink)),
-        Block::Figure(figure) => figure.text_blocks()
-            .any(|caption| text_block_has_link_role(caption, LinkRole::FootnoteBacklink)),
-        Block::Image(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => false,
-    }
+    rebook_app_core::focus_content::is_footnote_definition(block)
 }
-
-
 
 fn focus_footnote_text(
     source: &dyn BookSource,
@@ -1443,42 +1418,6 @@ fn merge_inferred_caption_focus_unit(image: &mut FocusUnit, caption: FocusUnit) 
     image.footnotes.extend(caption.footnotes);
 }
 
-fn focus_block_structure_ranges(block: &Block) -> Vec<SourceRange> {
-    match block {
-        Block::Text(text)
-            if matches!(
-                text.kind,
-                TextBlockKind::Paragraph
-                    | TextBlockKind::Blockquote
-                    | TextBlockKind::Caption
-                    | TextBlockKind::ListItem { .. }
-            ) =>
-        {
-            text.source.iter().cloned().collect()
-        }
-        Block::Figure(figure) => figure.text_blocks()
-            .filter_map(|caption| caption.source.clone())
-            .collect(),
-        Block::Quote(quote) => quote
-            .body
-            .iter()
-            .filter(|body| {
-                matches!(
-                    body.kind,
-                    TextBlockKind::Paragraph | TextBlockKind::Blockquote
-                )
-            })
-            .filter_map(|body| body.source.clone())
-            .collect(),
-        Block::Text(_)
-        | Block::Table(_)
-        | Block::Image(_)
-        | Block::Note(_)
-        | Block::Separator(_)
-        | Block::LineBreak
-        | Block::PageBreak => Vec::new(),
-    }
-}
 
 fn focus_unit_geometry_ranges(
     is_first_unit: bool,
@@ -2657,6 +2596,14 @@ impl DesktopReader {
             } else {
                 None
             };
+            if !rebook_app_core::focus_content::is_body(block, self.reader.style().typesetting.mode == rebook_layout::TypesettingMode::Unified)
+                && !matches!(block, Block::Text(text) if text.kind.is_heading())
+            {
+                if !matches!(block, Block::Text(text) if text.source.is_none()
+                    || matches!(text.kind, TextBlockKind::ListItem {depth, ..} if depth > 0))
+                { active_list_root = None; }
+                continue;
+            }
             let (range, paint_ranges, text, is_image, is_table, rectangular_activation, list_depth) =
                 match block {
                     Block::Text(block) => {
@@ -3549,11 +3496,7 @@ fn effective_typesetting(
     reading_mode: ReadingMode,
     configured: &ReaderTypesetting,
 ) -> ReaderTypesetting {
-    if reading_mode == ReadingMode::Focus {
-        ReaderTypesetting::unified()
-    } else {
-        configured.clone()
-    }
+    rebook_app_core::reading::effective_typesetting(reading_mode == ReadingMode::Focus, configured)
 }
 
 struct DesktopReaderResources {

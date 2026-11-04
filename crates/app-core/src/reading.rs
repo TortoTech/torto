@@ -7,6 +7,18 @@ use crate::plugins::{
 use rebook_publication::{BookSource, RenditionLayout};
 use std::sync::Arc;
 
+/// Focus presentation never changes the saved classic layout preference.
+pub fn effective_typesetting(
+    focus: bool,
+    configured: &rebook_layout::ReaderTypesetting,
+) -> rebook_layout::ReaderTypesetting {
+    if focus {
+        rebook_layout::ReaderTypesetting::unified()
+    } else {
+        configured.clone()
+    }
+}
+
 /// Change presentation without losing the reader's spacing preferences.
 pub fn typesetting(
     profile: &rebook_layout::ReaderTypesetting,

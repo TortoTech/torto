@@ -64,7 +64,7 @@ impl SyncStore {
         created_at: u64,
     ) -> SyncResult<AnnotationState> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let updated_at = tick(&transaction, &self.device_id, None)?;
         let annotation = AnnotationState {
             id,
@@ -110,7 +110,7 @@ impl SyncStore {
 
     pub fn delete_annotation(&self, id: &str) -> SyncResult<bool> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let Some(mut annotation) = read_annotation(&transaction, id)? else {
             return Ok(false);
         };
@@ -131,7 +131,7 @@ impl SyncStore {
 
     pub fn update_annotation_note(&self, id: &str, note: Option<String>) -> SyncResult<bool> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let Some(mut annotation) = read_annotation(&transaction, id)? else {
             return Ok(false);
         };
@@ -155,8 +155,7 @@ impl SyncStore {
 
     pub fn merge_annotations(&self, annotations: &[AnnotationState]) -> SyncResult<usize> {
         let mut connection = self.connection()?;
-        let transaction =
-            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let transaction = write_transaction(&mut connection)?;
         let changed = annotation_merge::merge(&transaction, &self.device_id, annotations)?;
         transaction.commit()?;
         Ok(changed)
@@ -164,8 +163,7 @@ impl SyncStore {
 
     fn compact_annotation_conflicts(&self, book_id: &str) -> SyncResult<usize> {
         let mut connection = self.connection()?;
-        let transaction =
-            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let transaction = write_transaction(&mut connection)?;
         let removed = annotation_merge::compact(&transaction, &self.device_id, book_id)?;
         transaction.commit()?;
         Ok(removed)
@@ -189,11 +187,7 @@ impl SyncStore {
     ) -> SyncResult<()> {
         locator.validate()?;
         let mut connection = self.connection()?;
-        let transaction = if refresh_activity {
-            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
-        } else {
-            connection.transaction()?
-        };
+        let transaction = write_transaction(&mut connection)?;
         if !refresh_activity {
             let current: Option<String> = transaction
                 .query_row(
@@ -278,7 +272,7 @@ impl SyncStore {
         progress.locator.validate()?;
         let book_id = progress.locator.publication_id.as_str();
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         tick(
             &transaction,
             &self.device_id,
@@ -318,7 +312,7 @@ impl SyncStore {
 
     pub fn set_book_present(&self, book_id: &str, present: bool) -> SyncResult<()> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let current = transaction
             .query_row(
                 "SELECT present FROM book_membership WHERE book_id = ?1",
@@ -402,7 +396,7 @@ impl SyncStore {
 
     pub fn tick(&self) -> SyncResult<HybridTimestamp> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let timestamp = tick(&transaction, &self.device_id, None)?;
         transaction.commit()?;
         Ok(timestamp)
@@ -442,7 +436,7 @@ impl SyncStore {
 
     pub fn reading_snapshot(&self, book_id: &str) -> SyncResult<(u64, DeviceBookState)> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let revision = transaction
             .query_row(
                 "SELECT revision FROM reading_changes WHERE device_id = ?1 AND book_id = ?2",
@@ -604,6 +598,14 @@ impl SyncStore {
     }
 }
 
+// A read-then-write DEFERRED transaction can fail immediately with BUSY or
+// BUSY_SNAPSHOT under WAL, even with busy_timeout. Reserve the single writer
+// before taking a snapshot so normal contention waits at BEGIN instead. Never
+// hold one of these short transactions across filesystem or network work.
+fn write_transaction(connection: &mut Connection) -> rusqlite::Result<Transaction<'_>> {
+    connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
 fn mark_reading_changed(
     transaction: &Transaction<'_>,
     device: &str,
@@ -668,7 +670,7 @@ impl HighlightRepository for SyncStore {
             return Ok(());
         }
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         for (expected, fingerprint) in checks {
             // A sync or edit may have replaced the annotation since it was read.
             transaction.execute(
@@ -709,7 +711,7 @@ impl HighlightRepository for SyncStore {
             return Ok(Vec::new());
         }
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let mut repaired = Vec::with_capacity(repairs.len());
         for (expected, ranges) in repairs {
             let Some(mut annotation) = read_annotation(&transaction, &expected.id)? else {
@@ -910,6 +912,42 @@ fn same_progress_location(a: &LocatorV1, b: &LocatorV1) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_navigation_snapshot_annotation_and_cloud_writers_share_the_database() {
+        let store=test_store("concurrent-reading-writers");
+        store.save_progress("book",&locator("book",0.0)).unwrap();
+        store.create_annotation("note".into(),"book".into(),vec![source_range()],"Quote".into(),None,0).unwrap();
+        let barrier=std::sync::Arc::new(std::sync::Barrier::new(4));
+        let results=std::thread::scope(|scope| {
+            let handles=(0..4).map(|worker| {
+                let store=&store;let barrier=barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let mut errors=Vec::new();
+                    for i in 1..=100 {
+                        let result=match worker {
+                            0=>store.save_progress("book",&locator("book",f64::from(i)/100.0)),
+                            1=>store.reading_snapshot("book").map(|_|()),
+                            2=>store.update_annotation_note("note",Some(format!("Note {i}"))).map(|_|()),
+                            _=>store.merge_progress(&ProgressState {locator:locator("remote-book",f64::from(i)/100.0),updated_at:HybridTimestamp {wall_time_ms:i as u64,counter:0,device_id:"other-device".into()}}).map(|_|()),
+                        };
+                        if let Err(error)=result {errors.push(error.to_string());}
+                    }
+                    errors
+                })
+            }).collect::<Vec<_>>();
+            handles.into_iter().flat_map(|h|h.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert!(results.is_empty(),"concurrent operations failed ({}): {:?}",results.len(),results.first());
+        assert_eq!(store.load_progress("book").unwrap().unwrap().locator.total_progression,Some(1.0));
+        assert_eq!(store.annotations_for_book("book").unwrap()[0].note.as_deref(),Some("Note 100"));
+        assert_eq!(store.load_progress("remote-book").unwrap().unwrap().locator.total_progression,Some(1.0));
+        let (revision,snapshot)=store.reading_snapshot("book").unwrap();
+        assert_eq!(revision,202,"every progress and annotation change remains in the sync revision");
+        assert_eq!(snapshot.progress.unwrap().locator.total_progression,Some(1.0));
+        cleanup(&store);
+    }
 
     #[test]
     fn sync_library_snapshot_preserves_removals_and_defers_new_unuploaded_books() {

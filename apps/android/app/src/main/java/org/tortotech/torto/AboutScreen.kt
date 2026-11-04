@@ -21,7 +21,7 @@ import org.tortotech.torto.core.updateReleaseNotes
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp).navigationBarsPadding(),verticalArrangement=Arrangement.spacedBy(16.dp)){
         Image(painterResource(R.drawable.ic_torto),tr("Torto 徽标","Torto logo"),Modifier.size(64.dp));Text("Torto",style=MaterialTheme.typography.headlineLarge);Text(state.appVersion)
         Text(tr("专注阅读的开源电子书阅读器","An open-source ebook reader focused on reading"))
-        SettingChoice(tr("更新来源","Update source"),state.updateSource,listOf("automatic" to tr("自动","Automatic"),"github" to "GitHub","gitee" to "Gitee"),!state.checkingUpdate&&!state.downloadingUpdate,model::updateSource)
+        SettingChoice(tr("更新来源","Update source"),state.updateSource,listOf("automatic" to tr("自动","Automatic"),"github" to "GitHub","gitee" to "Gitee"),!state.checkingUpdate&&!state.downloadingUpdate,choose=model::updateSource)
         Button(onClick=model::checkUpdates,enabled=!state.checkingUpdate&&!state.downloadingUpdate){Text(tr("检查更新","Check for updates"))}
         if(state.checkingUpdate)LinearProgressIndicator(Modifier.fillMaxWidth())
         if(state.updateChecked&&state.appUpdate==null)Text(tr("当前已是最新版本","You are up to date"))

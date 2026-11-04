@@ -20,6 +20,7 @@ class LoadingIndicatorTest {
         val instrumentation=InstrumentationRegistry.getInstrumentation()
         val monitor=instrumentation.addMonitor(MainActivity::class.java.name,null,false)
         val active=mutableStateOf(false)
+        val quietNavigation=mutableStateOf(false)
         val visible=AtomicBoolean()
         val everVisible=AtomicBoolean()
         val shown=CountDownLatch(1)
@@ -31,10 +32,15 @@ class LoadingIndicatorTest {
             activity=monitor.waitForActivityWithTimeout(5000) as? MainActivity
             assertNotNull(activity)
             instrumentation.runOnMainSync {activity!!.setContent {
-                val show=loadingVisible(active.value)
+                val show=loadingVisible(active.value,quietNavigation.value)
                 SideEffect {visible.set(show);if(show){everVisible.set(true);shown.countDown()}else if(finished.get())hidden.countDown()}
                 MaterialTheme {if(show)LinearProgressIndicator()}
             }}
+            instrumentation.waitForIdleSync()
+            instrumentation.runOnMainSync {quietNavigation.value=true;active.value=true}
+            android.os.SystemClock.sleep(400)
+            assertFalse("Section navigation never shows the header loading bar, even past the usual delay",everVisible.get())
+            instrumentation.runOnMainSync {active.value=false;quietNavigation.value=false}
             instrumentation.waitForIdleSync()
             instrumentation.runOnMainSync {active.value=true}
             instrumentation.waitForIdleSync()

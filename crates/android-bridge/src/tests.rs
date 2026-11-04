@@ -4,10 +4,116 @@ use rebook_app_core::plugins;
 fn root() -> PathBuf {
     std::env::temp_dir().join(format!("torto-android-test-{}", uuid::Uuid::new_v4()))
 }
+
+async fn focus_membership_and_heading_masks_follow_desktop_across_pages_and_resizes(core:&Arc<MobileCore>,root:&std::path::Path) {
+        use std::io::Write;
+        let path=root.join("focus-parity.epub");
+        let body="<h1>Chapter title</h1><p>Earlier paragraph.</p><h2>Topic title</h2><h3>Subtopic title</h3><p>Following paragraph.</p><p>Later paragraph.</p><div><p>Grouped one.</p><p>Grouped two.</p><p>Grouped three.</p></div><p>After container.</p><ul><li>Parent item.<ul><li>Nested child.</li><li>Other child.</li></ul></li><li>Last root item.</li></ul><p>Final paragraph.</p>";
+        let mut zip=zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        for (name,text) in [
+            ("mimetype","application/epub+zip".to_owned()),
+            ("META-INF/container.xml",r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>"#.into()),
+            ("book.opf",r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">focus-parity</dc:identifier><dc:title>Focus parity</dc:title><dc:language>en</dc:language></metadata><manifest><item id="body" href="body.xhtml" media-type="application/xhtml+xml"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/></manifest><spine><itemref idref="body"/></spine></package>"#.into()),
+            ("body.xhtml",format!("<html xmlns='http://www.w3.org/1999/xhtml'><body>{body}</body></html>")),
+            ("nav.xhtml",r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="body.xhtml">Chapter</a></li></ol></nav></body></html>"#.into()),
+        ] {zip.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(text.as_bytes()).unwrap();}
+        zip.finish().unwrap();
+        let book=core.clone().import_book(path.to_string_lossy().into_owned()).await.unwrap().into_iter().find(|b|b.title=="Focus parity").unwrap();
+        let reader=core.clone().open_book(book.id,Viewport {width:360,height:640,scale:1.0}).await.unwrap();
+        let mut options=core.clone().reading_options().await.unwrap();
+        options.focus_style="dim".into();options.sentence_split=false;options.translated=false;
+        reader.clone().apply_reading_options(options).await.unwrap();
+        reader.clone().configure(20.0,true,false).await.unwrap();
+        let following=reader.clone().search("Following paragraph".into()).await.unwrap().remove(0).source;
+        reader.clone().focus_mode(true).await.unwrap();
+        for height in [640,180] {
+            reader.clone().resize(Viewport {width:360,height,scale:1.0}).await.unwrap();
+            reader.clone().go_to_source(following.clone()).await.unwrap();
+            let (body,headings)=reader.with(|s| {
+                let unit=s.focus_units.iter().find(|u|u.ranges.iter().any(|r|serde_json::from_str::<SourceRange>(&following).unwrap().start.node==r.start.node)).unwrap();
+                assert!(!unit.leading);
+                assert!(!unit.headings.is_empty(),"both headings must survive retained logical-page assembly");
+                assert_eq!(unit.paint_bounds(false).len(),1,"highlight style does not add the preceding title");
+                assert_eq!(unit.paint_bounds(true).len(),2,"dim style clears the body and its preceding titles separately");
+                Ok((unit.navigation_bounds().unwrap(),unit.headings.clone()))
+            }).unwrap();
+            let focused=reader.clone().page().await.unwrap().info();
+            assert_eq!(focused.focus_bounds.len(),2);
+            assert!(headings.iter().all(|heading|heading.y+heading.height<=body.y+1.0));
+            let previous=reader.clone().turn(false).await.unwrap().info();
+            assert!(previous.next_focus.is_some());
+            let preview=previous.next_focus.unwrap();
+            assert_eq!(preview.bounds.len(),2,"a drag preview uses the same title association as its final frame");
+            reader.clone().turn(true).await.unwrap();
+            reader.with(|s| {
+                assert!(s.focus_anchor.as_ref().is_some_and(|r|r.start.node==serde_json::from_str::<SourceRange>(&following).unwrap().start.node),"turning never stops on either heading");Ok(())
+            }).unwrap();
+        }
+        let grouped=reader.clone().search("Grouped two".into()).await.unwrap().remove(0).source;
+        for (height,expected) in [(640,3),(120,1)] {
+            reader.clone().resize(Viewport {width:360,height,scale:1.0}).await.unwrap();
+            reader.clone().go_to_source(grouped.clone()).await.unwrap();
+            reader.with(|s| {
+                let group=s.focus_units.iter().find(|u|u.ranges.iter().any(|r|r.start.node==serde_json::from_str::<SourceRange>(&grouped).unwrap().start.node)).unwrap();
+                assert_eq!(group.ranges.len(),expected,"only a fully visible group fitting the viewport forms one stop");Ok(())
+            }).unwrap();
+        }
+        let child=reader.clone().search("Nested child".into()).await.unwrap().remove(0).source;
+        reader.clone().go_to_source(child.clone()).await.unwrap();
+        reader.with(|s| {
+            let unit=s.focus_units.iter().find(|u|u.ranges.iter().any(|r|r.start.node==serde_json::from_str::<SourceRange>(&child).unwrap().start.node)).unwrap();
+            assert_eq!(unit.ranges.len(),3,"a tall list splits by root items, retaining both nested children with their parent");Ok(())
+        }).unwrap();
+        reader.shutdown().await.unwrap();
+}
 fn fixture(path: &std::path::Path) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let paragraphs = (0..60).map(|i| format!("<p>Paragraph {i}: readers share stable source locations across devices. 中文搜索与选择。</p>")).collect::<String>();
     std::fs::write(path,format!(r#"<?xml version="1.0" encoding="UTF-8"?><FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0"><description><title-info><book-title>Android reader fixture</book-title><lang>en</lang></title-info></description><body><section id="one"><title><p>One</p></title>{paragraphs}</section></body></FictionBook>"#)).unwrap();
+}
+async fn classic_previews_preserve_progress_and_focus_restores_the_saved_layout(reader: &Arc<MobileReader>) {
+    let original = reader.clone().configure(20.0, false, false).await.unwrap();
+    let locator = reader.with(|s| Ok(s.session.current_locator())).unwrap();
+    let progress = reader.with(|s| Ok(s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator)).unwrap();
+    assert!(reader.clone().preview_turn(false).await.unwrap().is_none());
+    let preview = reader.clone().preview_turn(true).await.unwrap().unwrap();
+    assert_ne!(preview.info().regions[0].source, original.info().regions[0].source);
+    reader.with(|s| {
+        assert_eq!(s.session.current_locator(), locator);
+        assert_eq!(s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator, progress);
+        assert!(s.history.is_empty());
+        Ok(())
+    }).unwrap();
+    let turned = reader.clone().turn(true).await.unwrap();
+    assert_eq!(preview.pixels, turned.pixels);
+    // Old versions could persist false; that obsolete key must never restore paged focus.
+    let mut legacy = reader.with(|s| Ok(serde_json::to_value(&s.options).unwrap())).unwrap();
+    legacy["scroll_focus"] = serde_json::json!(false);
+    let options: settings::ReadingOptions = serde_json::from_value(legacy).unwrap();
+    assert!(serde_json::to_value(&options).unwrap().get("scroll_focus").is_none());
+    reader.clone().apply_reading_options(options).await.unwrap();
+    let focus = reader.clone().focus_mode(true).await.unwrap();
+    assert!(focus.info().is_scroll);
+    reader.clone().configure(22.0, false, true).await.unwrap();
+    reader.with(|s| {
+        assert_eq!(s.session.style().typesetting.mode, TypesettingMode::Unified);
+        assert_eq!(s.session.style().typesetting.line_break_strategy, rebook_layout::LineBreakStrategy::Optimized);
+        assert_eq!(s.classic_typesetting.mode, TypesettingMode::Book);
+        Ok(())
+    }).unwrap();
+    assert!(reader.clone().preview_turn(true).await.unwrap().is_none());
+    reader.clone().focus_mode(false).await.unwrap();
+    reader.with(|s| {
+        assert_eq!(s.session.style().typesetting.mode, TypesettingMode::Book);
+        assert_eq!(s.session.style().typography.font_size, 22.0);
+        Ok(())
+    }).unwrap();
+    reader.clone().configure(22.0, true, true).await.unwrap();
+    reader.clone().focus_mode(true).await.unwrap();
+    reader.clone().focus_mode(false).await.unwrap();
+    reader.with(|s| {assert_eq!(s.session.style().typesetting.mode, TypesettingMode::Unified);Ok(())}).unwrap();
+    reader.clone().configure(20.0, false, false).await.unwrap();
+    reader.with(|s| {s.session.restore_locator(&locator).map_err(error)?;render(s)?;Ok(())}).unwrap();
 }
 #[test]
 fn imported_book_search_navigation_render_and_close_use_shared_core() {
@@ -40,6 +146,7 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
             .open_book(books[0].id.clone(), viewport)
             .await
             .unwrap();
+        classic_previews_preserve_progress_and_focus_restores_the_saved_layout(&reader).await;
         let first = reader.clone().page().await.unwrap();
         let contents=reader.clone().toc().await.unwrap();
         reader.with(|s|{let expected=s.session.toc_items();assert_eq!(contents.len(),expected.len());
@@ -299,6 +406,7 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
         long_focus_continuation(&core,&root).await;
         retained_focus_chapter_boundaries(&core,&root).await;
         statistics_cloud_and_diagnostics(&core, &root, &books[0].id).await;
+        focus_membership_and_heading_masks_follow_desktop_across_pages_and_resizes(&core,&root).await;
         drop(core);
         // The process-wide statistics worker can still own its SQLite handle
         // after MobileCore is dropped. Windows cannot unlink that open file;
@@ -477,6 +585,10 @@ async fn touch_and_focus(core: &Arc<MobileCore>, root: &std::path::Path) {
         .await
         .unwrap();
     assert_eq!(action.kind, "note");
+    assert_eq!(action.marker,"1");
+    let indicator=action.indicator.as_ref().expect("the active note retains the desktop baseline indicator");
+    assert!((12.0..=16.0).contains(&indicator.width));
+    assert_eq!(indicator.height,2.0);
     assert!(action.text.contains("multi-paragraph"));
     assert!(action.text.contains("continuation"));
     assert!(action.markup.starts_with("**A multi-paragraph note.**"));
@@ -564,7 +676,6 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
     let mut options = core.clone().reading_options().await.unwrap();
     options.font_weight = 575;
     options.focus_style = "highlight".into();
-    options.scroll_focus = true;
     options.sentence_split = true;
     core.clone()
         .save_reading_options(options.clone())
@@ -600,6 +711,8 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
     let first = reader.clone().focus_mode(true).await.unwrap();
     assert!(first.info().is_scroll && first.info().focus_highlight);
     assert!(!first.info().focus_bounds.is_empty());
+    focused_sentence_action_is_local_and_survives_reflow(&reader).await;
+    let first = reader.clone().page().await.unwrap();
     let sources = first
         .info()
         .regions
@@ -857,6 +970,45 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
             .any(|t| t.title.contains("目录译文") && t.title.contains('\n'))
     );
     reader.shutdown().await.unwrap();
+}
+
+async fn focused_sentence_action_is_local_and_survives_reflow(reader: &Arc<MobileReader>) {
+    let page = reader.clone().page().await.unwrap();
+    let control = page.info().controls.into_iter().find(|c| c.kind == "sentences").unwrap();
+    assert!(!control.active, "legacy global sentence_split must not split the whole book");
+    let anchor = reader.with(|s| Ok(s.focus_anchor.clone().unwrap())).unwrap();
+    let original = reader.with(|s| s.pipeline.structure.parse_section(0).map_err(error)).unwrap();
+    let structured = reader.clone().toggle_reading_control(control.clone()).await.unwrap();
+    assert!(structured.info().controls.iter().any(|c| c.kind == "sentences" && c.active));
+    reader.with(|s| {
+        let changed = s.pipeline.structure.parse_section(0).map_err(error)?;
+        let mut changed_count = 0;
+        for (before, after) in original.blocks.iter().zip(&changed.blocks) {
+            if before != after {
+                assert!(before.text_blocks().any(|b| b.source.as_ref().is_some_and(|r| r.start.node == anchor.start.node)), "no neighbouring paragraph may be changed");
+                assert!(after.text_blocks().any(|b| b.style.sentence_indents));
+                changed_count += 1;
+            }
+        }
+        assert_eq!(changed_count, 1);
+        assert_eq!(s.focus_anchor.as_ref().unwrap().start.node, anchor.start.node);
+        Ok(())
+    }).unwrap();
+    let options = reader.with(|s| Ok(s.options.clone())).unwrap();
+    let reflowed = reader.clone().apply_reading_options(options).await.unwrap();
+    assert!(reflowed.info().controls.iter().any(|c| c.kind == "sentences" && c.active));
+    let classic = reader.clone().focus_mode(false).await.unwrap();
+    assert!(!classic.info().controls.iter().any(|c| c.kind == "sentences"));
+    reader.with(|s| { assert_eq!(s.pipeline.structure.parse_section(0).map_err(error)?.blocks, original.blocks); Ok(()) }).unwrap();
+    reader.clone().focus_mode(true).await.unwrap();
+    reader.clone().go_to_source(serde_json::to_string(&anchor).unwrap()).await.unwrap();
+    reader.clone().turn(true).await.unwrap();
+    let stale = reader.clone().toggle_reading_control(control.clone()).await.unwrap();
+    assert!(!stale.info().controls.iter().any(|c| c.kind == "sentences" && c.active), "a stale action cannot split the next paragraph");
+    reader.clone().go_to_source(serde_json::to_string(&anchor).unwrap()).await.unwrap();
+    let restored = reader.clone().toggle_reading_control(control).await.unwrap();
+    assert!(restored.info().controls.iter().any(|c| c.kind == "sentences" && !c.active));
+    reader.with(|s| { assert_eq!(s.pipeline.structure.parse_section(0).map_err(error)?.blocks, original.blocks); Ok(()) }).unwrap();
 }
 
 async fn long_focus_continuation(core: &Arc<MobileCore>, root: &std::path::Path) {
@@ -1144,34 +1296,100 @@ async fn retained_focus_chapter_boundaries(core: &Arc<MobileCore>, root: &std::p
     use std::io::Write;
     let path=root.join("focus-boundaries.epub");
     let mut zip=zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    let paragraphs=|prefix:&str| (0..10).map(|i|format!("<p>{prefix} block {i}: focus moves one paragraph at a time.</p>")).collect::<String>();
     let files=[
         ("mimetype","application/epub+zip".to_owned()),
         ("META-INF/container.xml",r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="book.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#.into()),
-        ("book.opf",r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">focus-boundaries</dc:identifier><dc:title>Focus boundaries</dc:title><dc:language>en</dc:language></metadata><manifest><item id="a" href="a.xhtml" media-type="application/xhtml+xml"/><item id="b" href="b.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="a"/><itemref idref="b"/></spine></package>"#.into()),
-        ("a.xhtml",format!("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{}</body></html>",(0..10).map(|i|format!("<p>A block {i}: focus moves one paragraph at a time.</p>")).collect::<String>())),
-        ("b.xhtml",format!("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{}</body></html>",(0..10).map(|i|format!("<p>B block {i}: the next chapter remains continuous.</p>")).collect::<String>())),
+        ("book.opf",r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">focus-boundaries</dc:identifier><dc:title>Focus boundaries</dc:title><dc:language>en</dc:language></metadata><manifest><item id="prelude" href="prelude.xhtml" media-type="application/xhtml+xml"/><item id="continuation" href="continuation.xhtml" media-type="application/xhtml+xml"/><item id="a" href="a.xhtml" media-type="application/xhtml+xml"/><item id="b" href="b.xhtml" media-type="application/xhtml+xml"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/></manifest><spine><itemref idref="prelude"/><itemref idref="continuation"/><itemref idref="a"/><itemref idref="b"/></spine></package>"#.into()),
+        ("prelude.xhtml","<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><h1>Heading-only prelude</h1></body></html>".into()),
+        ("continuation.xhtml",r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Prelude continuation in an unlisted spine file.</p></body></html>"#.into()),
+        ("a.xhtml",format!("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><h2 id=\"one\">First unit</h2>{}<h2 id=\"two\">Second unit</h2>{}</body></html>",paragraphs("A"),paragraphs("C"))),
+        ("b.xhtml",format!("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{}</body></html>",paragraphs("B"))),
+        ("nav.xhtml",r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="prelude.xhtml">Prelude</a><ol><li><a href="a.xhtml#one">First unit</a></li><li><a href="a.xhtml#two">Second unit</a></li></ol></li><li><a href="b.xhtml">Third unit</a></li></ol></nav></body></html>"#.into()),
     ];
     for (name,content) in files { zip.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(content.as_bytes()).unwrap(); }
     zip.finish().unwrap();
     let book=core.clone().import_book(path.to_string_lossy().into()).await.unwrap().into_iter().find(|b|b.title=="Focus boundaries").unwrap();
     let reader=core.clone().open_book(book.id.clone(),Viewport {width:360,height:640,scale:1.0}).await.unwrap();
     reader.clone().focus_mode(true).await.unwrap();
-    let source=reader.clone().search("A block 9:".into()).await.unwrap()[0].source.clone();
-    let last=reader.clone().go_to_source(source).await.unwrap().info();
-    let next=reader.clone().turn(true).await.unwrap().info();
-    assert_eq!(next.scroll_context,last.scroll_context,"crossing a chapter must preserve animation coordinates");
-    assert!(next.scroll_distance>last.scroll_distance);
-    assert_ne!(next.section,last.section,"the native source scope must follow the focused chapter");
     reader.with(|s| {
-        let saved=s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator.source.unwrap();
-        assert_eq!(saved.start.spine,s.focus_anchor.as_ref().unwrap().start.spine);
-        assert_eq!(saved.start.node,s.focus_anchor.as_ref().unwrap().start.node);
+        let expected=s.session.current_reading_unit_pages().map_err(error)?.iter().map(|p|p.position).collect::<Vec<_>>();
+        assert!(s.scroll_slices.iter().any(|p|p.position.section_index==1),"a parent prelude and its unlisted continuation share one reading unit: core={expected:?}, strip={:?}",s.scroll_slices.iter().map(|p|p.position).collect::<Vec<_>>());
+        assert!(s.scroll_slices.iter().all(|p|p.position.section_index<2));
         Ok(())
     }).unwrap();
-    let back=reader.clone().turn(false).await.unwrap().info();
-    assert_eq!(back.section,last.section);
-    assert!((back.scroll_distance-last.scroll_distance).abs()<0.1);
+    let middle=reader.clone().search("A block 3:".into()).await.unwrap()[0].source.clone();
+    let from=reader.clone().go_to_source(middle).await.unwrap().info();
+    let original=reader.clone().page().await.unwrap();
+    let saved=reader.with(|s|Ok(serde_json::to_vec(&s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator).map_err(error)?)).unwrap();
+    let prepared=reader.clone().preview_turn(true).await.unwrap().expect("focus prepares an adjacent semantic unit");
+    assert_eq!((prepared.width(),prepared.height()),(360,640),"a chapter preview retains only one viewport");
+    assert!(prepared.info().regions.iter().any(|r|r.text.contains("C block 0:")));
+    reader.clone().preview_turn(false).await.unwrap();
+    let restored=reader.clone().page().await.unwrap();
+    assert_eq!(restored.raster_id(),original.raster_id(),"peeking restores the live retained strip");
+    assert_eq!(restored.info().scroll_context,from.scroll_context);
+    reader.with(|s|{assert_eq!(serde_json::to_vec(&s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator).map_err(error)?,saved);Ok(())}).unwrap();
+    let actual=reader.clone().turn_reading_unit(true).await.unwrap();
+    let next=actual.info();
+    let start=-(next.raster_top.round() as i64);
+    for row in 0..640i64 {
+        let source=start+row;
+        assert!(source>=0&&source<i64::from(actual.height()));
+        let at=source as usize*360*4;let preview=row as usize*360*4;
+        assert_eq!(&actual.pixels[at..at+360*4],&prepared.pixels[preview..preview+360*4],"preview and committed pixels must align without a jump");
+    }
+    assert_eq!(next.section,from.section,"adjacent subheadings in one XHTML must remain distinct units");
+    assert_ne!(next.scroll_context,from.scroll_context);
+    assert!(next.regions.iter().any(|r|r.text.contains("C block 0:")));
+    assert!(next.regions.iter().all(|r|!r.text.contains("A block")));
+    let back=reader.clone().turn_reading_unit(false).await.unwrap().info();
+    assert!(back.regions.iter().any(|r|r.text.contains("A block 9:")),"returning to a previous unit selects its final block");
+    for (from,to,same_spine) in [("A","C",true),("C","B",false)] {
+        let source=reader.clone().search(format!("{from} block 9:")).await.unwrap()[0].source.clone();
+        let edge=reader.clone().go_to_source(source.clone()).await.unwrap().info();
+        assert!(edge.next_focus.is_none(),"{from}: an edge must not expose the next reading unit as another focus block; index={}/{}, texts={:?}",edge.focus_index,edge.focus_count,edge.regions.iter().map(|r|&r.text).collect::<Vec<_>>());
+        assert!(edge.regions.iter().all(|r|!r.text.contains(&format!("{to} block"))),"neighbouring unit text must not enter the raster/accessibility window");
+        let unit=reader.with(|s| Ok(s.session.current_reading_unit_anchor())).unwrap();
+        let clamped=reader.clone().scroll_by(2000.0).await.unwrap().info();
+        assert!(clamped.regions.iter().all(|r|!r.text.contains(&format!("{to} block"))));
+        reader.with(|s| {assert_eq!(s.session.current_reading_unit_anchor(),unit,"selection-edge scrolling cannot change units");Ok(())}).unwrap();
+        let last=reader.clone().go_to_source(source).await.unwrap().info();
+        let next=reader.clone().turn(true).await.unwrap().info();
+        assert_ne!(next.scroll_context,last.scroll_context,"a unit transition starts an independent scroll surface");
+        assert_eq!(next.section==last.section,same_spine);
+        assert!(next.previous_focus.is_none());
+        assert!(next.regions.iter().all(|r|!r.text.contains(&format!("{from} block"))));
+        reader.with(|s| {
+            assert_ne!(s.session.current_reading_unit_anchor(),unit);
+            let saved=s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator.source.unwrap();
+            assert_eq!(saved.start.spine,s.focus_anchor.as_ref().unwrap().start.spine);
+            assert_eq!(saved.start.node,s.focus_anchor.as_ref().unwrap().start.node);
+            Ok(())
+        }).unwrap();
+        let back=reader.clone().turn(false).await.unwrap().info();
+        assert_eq!(back.section,last.section);
+        reader.with(|s| {assert_eq!(s.session.current_reading_unit_anchor(),unit);Ok(())}).unwrap();
+        assert!(back.regions.iter().any(|r|r.text.contains(&format!("{from} block 9:"))));
+    }
+    let saved=reader.with(|s|Ok(s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator.source.unwrap())).unwrap();
     reader.shutdown().await.unwrap();
+    let reopened=core.clone().open_book(book.id.clone(),Viewport {width:360,height:640,scale:1.0}).await.unwrap();
+    reopened.clone().focus_mode(true).await.unwrap();
+    reopened.with(|s| {
+        let active=s.focus_anchor.as_ref().unwrap();
+        assert_eq!(active.start.spine,saved.start.spine);
+        assert_eq!(active.start.node,saved.start.node,"reopening must restore the focused block, not its page's leading paragraph");
+        let mut stale=s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator;
+        let range=stale.source.as_mut().unwrap();
+        range.start.node="obsolete-bookmark-node".into();range.end.node="obsolete-bookmark-node".into();
+        s.store.save_progress(&s.book_id,&stale).map_err(error)?;
+        Ok(())
+    }).unwrap();
+    reopened.shutdown().await.unwrap();
+    let fallback=core.clone().open_book(book.id.clone(),Viewport {width:360,height:640,scale:1.0}).await.unwrap();
+    assert!(!fallback.clone().focus_mode(true).await.unwrap().info().regions.is_empty(),"an obsolete bookmark must still use the core locator fallback");
+    fallback.shutdown().await.unwrap();
 }
 
 

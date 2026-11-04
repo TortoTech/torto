@@ -21,6 +21,13 @@ pub(crate) fn position(s: &ReaderState) -> ReaderPosition {
         page_index: l.page_index,
     }
 }
+/// Durable locators may point to the beginning of a paragraph spanning pages.
+/// Temporary peeks must restore the exact logical page as well as the source.
+pub(crate) fn restore_position(s: &mut ReaderState, locator: &rebook_publication::LocatorV1, position: ReaderPosition) -> Result<()> {
+    s.session.restore_locator(locator).map_err(error)?;
+    s.session.set_visible_position(position).map_err(error)?;
+    Ok(())
+}
 fn extent(page: &PageDisplayList) -> (f32, f32) {
     let top = page.content_top().unwrap_or(0.0);
     (
@@ -28,8 +35,22 @@ fn extent(page: &PageDisplayList) -> (f32, f32) {
         (page.content_bottom().unwrap_or(page.height() as f32) - top).max(1.0),
     )
 }
+fn current_extent(s: &ReaderState) -> (f32, f32) {
+    let position = position(s);
+    let page = s.session.current_page();
+    // Use the same semantic crops as desktop, including units sharing a spine.
+    let entry = s.session.cached_reading_unit_pages().into_iter().find(|p| p.position == position);
+    let top = entry.as_ref().and_then(|p| p.visible_top).or_else(|| page.content_top()).unwrap_or(0.0);
+    let bottom = entry.as_ref().and_then(|p| p.visible_bottom).or_else(|| page.content_bottom()).unwrap_or(page.height() as f32);
+    (top, (bottom-top).max(1.0))
+}
+fn unit_key(s: &mut ReaderState) -> (std::ops::Range<usize>, usize) {
+    (s.session.current_reading_unit_sections(), s.session.reading_unit_location().index)
+}
 fn step(s: &mut ReaderState, forward: bool) -> Result<bool> {
+    let original = s.session.current_locator();
     let old = position(s);
+    let unit = unit_key(s);
     s.session
         .turn_page(if forward {
             PageDirection::Next
@@ -37,6 +58,13 @@ fn step(s: &mut ReaderState, forward: bool) -> Result<bool> {
             PageDirection::Previous
         })
         .map_err(error)?;
+    // Raw logical turns leave the semantic cursor untouched. Synchronize it
+    // before comparing units, especially two TOC fragments in the same spine.
+    s.session.set_visible_position(position(s)).map_err(error)?;
+    if unit_key(s) != unit {
+        restore_position(s, &original, old)?;
+        return Ok(false);
+    }
     Ok(position(s) != old)
 }
 fn center(s: &mut ReaderState) -> Result<()> {
@@ -66,18 +94,11 @@ fn center(s: &mut ReaderState) -> Result<()> {
         })
         .or_else(|| units.first());
     if let Some(unit) = unit {
-        let top = unit
-            .bounds
-            .iter()
-            .map(|r| r.y)
-            .fold(f32::INFINITY, f32::min);
-        let bottom = unit
-            .bounds
-            .iter()
-            .map(|r| r.y + r.height)
-            .fold(0.0, f32::max);
+        let rect = unit.navigation_bounds().expect("focus body geometry");
+        let top = rect.y;
+        let bottom = rect.y + rect.height;
         let height = s.session.viewport().height as f32;
-        let origin = extent(s.session.current_page()).0;
+        let origin = current_extent(s).0;
         s.scroll_offset = if bottom - top > height * 0.8 {
             top - origin - 32.0
         } else {
@@ -90,8 +111,9 @@ fn center(s: &mut ReaderState) -> Result<()> {
 }
 fn window(s: &mut ReaderState, lower: f32, upper: f32) -> Result<Vec<Slice>> {
     let original = s.session.current_locator();
+    let original_position = position(s);
     let current = s.session.current_page_arc();
-    let (origin, height) = extent(&current);
+    let (origin, height) = current_extent(s);
     let mut slices = vec![Slice {
         position: position(s),
         page: current,
@@ -107,7 +129,7 @@ fn window(s: &mut ReaderState, lower: f32, upper: f32) -> Result<Vec<Slice>> {
             break;
         }
         let page = s.session.current_page_arc();
-        let (origin, height) = extent(&page);
+        let (origin, height) = current_extent(s);
         let gap = slices[0].page.leading_gap();
         let top = slices[0].top - height - gap;
         slices.insert(
@@ -121,7 +143,7 @@ fn window(s: &mut ReaderState, lower: f32, upper: f32) -> Result<Vec<Slice>> {
             },
         );
     }
-    s.session.restore_locator(&original).map_err(error)?;
+    restore_position(s, &original, original_position)?;
     let mut cursor = -s.scroll_offset + height;
     let mut extra = false;
     while slices.len() < 8 {
@@ -135,7 +157,7 @@ fn window(s: &mut ReaderState, lower: f32, upper: f32) -> Result<Vec<Slice>> {
             break;
         }
         let page = s.session.current_page_arc();
-        let (origin, height) = extent(&page);
+        let (origin, height) = current_extent(s);
         let gap = page.leading_gap();
         if let Some(last) = slices.last_mut() {
             last.height += gap;
@@ -150,11 +172,11 @@ fn window(s: &mut ReaderState, lower: f32, upper: f32) -> Result<Vec<Slice>> {
         });
         cursor += height;
     }
-    s.session.restore_locator(&original).map_err(error)?;
+    restore_position(s, &original, original_position)?;
     Ok(slices)
 }
 pub(crate) fn map_touch(s: &mut ReaderState, x: f32, y: f32) -> Result<(f32, f32)> {
-    if !(s.focus && s.options.scroll_focus) {
+    if !s.focus {
         return Ok((x, y));
     }
     if let Some(slice) = s
@@ -177,7 +199,7 @@ pub(crate) fn map_touch(s: &mut ReaderState, x: f32, y: f32) -> Result<(f32, f32
         }
         Ok((x, local))
     } else {
-        Ok((x, y + s.scroll_offset + extent(s.session.current_page()).0))
+        Ok((x, y + s.scroll_offset + current_extent(s).0))
     }
 }
 pub(crate) fn hit(
@@ -186,7 +208,7 @@ pub(crate) fn hit(
     y: f32,
     nearest: bool,
 ) -> Result<Option<rebook_reader::ReaderTextHit>> {
-    if s.focus && s.options.scroll_focus {
+    if s.focus {
         if let Some(slice) = s
             .scroll_slices
             .iter()
@@ -207,7 +229,7 @@ pub(crate) fn hit(
 }
 pub(crate) fn selected(s: &ReaderState) -> Option<SelectedText> {
     let selected = s.selected.as_ref()?;
-    let bounds = if s.focus && s.options.scroll_focus {
+    let bounds = if s.focus {
         s.scroll_slices
             .iter()
             .flat_map(|slice| {
@@ -241,7 +263,7 @@ pub(crate) fn selected(s: &ReaderState) -> Option<SelectedText> {
     })
 }
 pub(crate) fn visible_ranges(s: &ReaderState) -> Vec<SourceRange> {
-    if !(s.focus && s.options.scroll_focus) {
+    if !s.focus {
         return Vec::new();
     }
     let h = s.session.viewport().height as f32;
@@ -287,16 +309,8 @@ fn shift_bounds(bounds: &mut [Rect], delta: f32) {
     }
 }
 fn bounds(unit: &interactions::FocusUnit) -> (f32, f32) {
-    (
-        unit.bounds
-            .iter()
-            .map(|b| b.y)
-            .fold(f32::INFINITY, f32::min),
-        unit.bounds
-            .iter()
-            .map(|b| b.y + b.height)
-            .fold(f32::NEG_INFINITY, f32::max),
-    )
+    let rect=unit.navigation_bounds().expect("focus body geometry");
+    (rect.y,rect.y+rect.height)
 }
 fn active(s: &ReaderState) -> usize {
     s.focus_anchor
@@ -326,18 +340,20 @@ fn destination(s: &ReaderState, index: usize, forward: bool) -> Option<(usize, F
     let height = s.session.viewport().height as f32;
     let (top, bottom) = bounds(s.focus_units.get(index)?);
     if bottom - top > height - 64.0 {
-        if let Some(delta) = rebook_app_core::focus_navigation::overflow_target(
+        let lines = s.focus_units[index].lines.iter().map(|r| r.y-32.0).collect::<Vec<_>>();
+        if let Some(delta) = rebook_app_core::focus_navigation::line_aligned_overflow_target(
             0.0,
             top - 32.0,
             bottom - height + 32.0,
             height * 0.7,
             forward,
+            &lines,
         ) {
             return Some((
                 index,
                 FocusTarget {
                     delta,
-                    bounds: s.focus_units[index].bounds.clone(),
+                    bounds: s.focus_units[index].paint_bounds(s.options.focus_style != "highlight"),
                 },
             ));
         }
@@ -361,7 +377,7 @@ fn destination(s: &ReaderState, index: usize, forward: bool) -> Option<(usize, F
         next,
         FocusTarget {
             delta,
-            bounds: s.focus_units[next].bounds.clone(),
+            bounds: s.focus_units[next].paint_bounds(s.options.focus_style != "highlight"),
         },
     ))
 }
@@ -384,17 +400,18 @@ fn strip_size(s: &ReaderState) -> (u32, u32, f32, f32) {
 fn build_cache(s: &mut ReaderState) -> Result<Cache> {
     let (width, height, top, logical_height) = strip_size(s);
     let slices = window(s, top, top + logical_height)?;
+    let specs=interactions::focus_specs(s)?;
     let mut units = Vec::<interactions::FocusUnit>::new();
     let mut regions = Vec::new();
     for p in &slices {
-        let section = s
-            .source
-            .parse_section(p.position.section_index)
-            .map_err(error)?;
-        for mut unit in interactions::focus_units_on(&section, &p.page) {
+        for mut unit in interactions::focus_units_on(&specs, &p.page) {
             shift_bounds(&mut unit.bounds, p.origin - p.top);
+            shift_bounds(&mut unit.lines, p.origin - p.top);
+            shift_bounds(&mut unit.headings, p.origin - p.top);
             if let Some(old) = units.iter_mut().find(|u| u.ranges == unit.ranges) {
                 old.bounds.extend(unit.bounds);
+                old.lines.extend(unit.lines);
+                old.headings.extend(unit.headings);
             } else {
                 units.push(unit);
             }
@@ -440,7 +457,6 @@ fn build_cache(s: &mut ReaderState) -> Result<Cache> {
                     f64::from(logical_height),
                 ),
             );
-            let ink = s.session.style().foreground;
             for (index, p) in slices.iter().enumerate() {
                 if p.top > top + logical_height || p.top + p.height < top {
                     continue;
@@ -476,7 +492,7 @@ fn build_cache(s: &mut ReaderState) -> Result<Cache> {
                     .paint_scaled_at(scene, scale, 0.0, p.top - p.origin - top);
                 p.page.paint_footnote_icons_transformed(
                     scene,
-                    Color::from_rgba8(ink.red, ink.green, ink.blue, 255),
+                    reference_ink(s),
                     Affine::scale(f64::from(scale))
                         * Affine::translate((0.0, f64::from(p.top - p.origin - top))),
                 );
@@ -486,6 +502,7 @@ fn build_cache(s: &mut ReaderState) -> Result<Cache> {
         &mut pixels,
     );
     let raster = MobilePage::new(width, height, pixels, PageInfo::default());
+    let units=interactions::arrange_focus_units(units,s.session.viewport().height as f32);
     Ok(Cache {
         raster,
         distance: s.scroll_distance,
@@ -497,6 +514,9 @@ fn build_cache(s: &mut ReaderState) -> Result<Cache> {
     })
 }
 pub(crate) fn render(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
+    render_with_progress(s,true)
+}
+fn render_with_progress(s:&mut ReaderState,persist:bool)->Result<Arc<MobilePage>> {
     if s.scroll_center {
         let distance = s.scroll_distance;
         let previous = s.scroll_slices.clone();
@@ -534,6 +554,8 @@ pub(crate) fn render(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
     s.focus_units = cache.units.clone();
     for u in &mut s.focus_units {
         shift_bounds(&mut u.bounds, delta);
+        shift_bounds(&mut u.lines, delta);
+        shift_bounds(&mut u.headings, delta);
     }
     let mut regions = cache.regions.clone();
     for r in &mut regions {
@@ -567,8 +589,7 @@ pub(crate) fn render(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
         .focus_units
         .get(index)
         .and_then(|u| u.ranges.first().cloned());
-    // The session's source scope follows the focused content, even while the
-    // viewport still includes the end of the preceding chapter.
+    // Follow the focused logical page inside the current semantic reading unit.
     if let Some(unit) = s.focus_units.get(index) {
         let candidate = s
             .scroll_slices
@@ -600,7 +621,7 @@ pub(crate) fn render(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
             s.scroll_offset = -top;
         }
     }
-    let mut info = finish_page_info(s, regions, marks, index, true)?;
+    let mut info = finish_page_info(s, regions, marks, index, true, persist)?;
     info.raster_top = cache.top - delta;
     info.raster_height = cache.height;
     info.previous_focus = destination(s, index, false).map(|(_, t)| t);
@@ -615,13 +636,85 @@ pub(crate) fn turn(s: &mut ReaderState, forward: bool) -> Result<Arc<MobilePage>
         s.focus_anchor = s.focus_units[next].ranges.first().cloned();
         return scroll(s, target.delta, false);
     }
-    // Only an edge outside the bounded window needs another logical page.
+    // A bounded raster may end before this unit does. Keep logical page movement
+    // within the unit; only an explicit turn at its edge changes semantic units.
     if step(s, forward)? {
         invalidate(s);
         s.focus_anchor = None;
         s.scroll_center = true;
+    } else {
+        let result = s.session.go_to_adjacent_reading_unit(if forward { PageDirection::Next } else { PageDirection::Previous }).map_err(error)?;
+        if result.outcome == rebook_reader::NavigationOutcome::Moved {
+            if !forward {
+                if let Some(last) = s.session.current_reading_unit_pages().map_err(error)?.last() {
+                    s.session.set_visible_position(last.position).map_err(error)?;
+                }
+            }
+            let units = interactions::focus_units(s)?;
+            let target = if forward { units.first() } else { units.last() };
+            s.focus_anchor = target.and_then(|u| u.ranges.first().cloned());
+            s.scroll_offset = 0.0;
+            invalidate(s);
+            s.scroll_center = true;
+        }
     }
     render(s)
+}
+
+/// Horizontal focus navigation skips the whole semantic reading unit, even
+/// when its next heading lives in the same XHTML spine item.
+pub(crate) fn turn_unit(s: &mut ReaderState, forward: bool) -> Result<Arc<MobilePage>> {
+    move_unit(s,forward)?;
+    render(s)
+}
+fn move_unit(s:&mut ReaderState,forward:bool)->Result<bool> {
+    let result=s.session.go_to_adjacent_reading_unit(if forward {PageDirection::Next}else{PageDirection::Previous}).map_err(error)?;
+    if result.outcome==rebook_reader::NavigationOutcome::Moved {
+        if !forward && let Some(last)=s.session.current_reading_unit_pages().map_err(error)?.last() {
+            s.session.set_visible_position(last.position).map_err(error)?;
+        }
+        let units=interactions::focus_units(s)?;
+        s.focus_anchor=(if forward {units.first()}else{units.last()}).and_then(|u|u.ranges.first().cloned());
+        s.scroll_offset=0.0;
+        invalidate(s);
+        s.scroll_center=true;
+    }
+    Ok(result.outcome==rebook_reader::NavigationOutcome::Moved)
+}
+
+/// Prepare just the adjacent unit's visible viewport. The live scroll cache,
+/// source anchor and persisted progress are restored even when preparation fails.
+pub(crate) fn preview_unit(s:&mut ReaderState,forward:bool)->Result<Option<Arc<MobilePage>>> {
+    let viewport=s.session.viewport();
+    let bytes=(viewport.width as f64*f64::from(viewport.raster_scale)).ceil()*(viewport.height as f64*f64::from(viewport.raster_scale)).ceil()*4.0;
+    if bytes>12.0*1024.0*1024.0 {return Ok(None);}
+    let locator=s.session.current_locator();let position=position(s);
+    let scroll=(s.scroll_offset,s.scroll_distance,s.scroll_context,s.scroll_center);
+    let cache=s.scroll_cache.take();let slices=std::mem::take(&mut s.scroll_slices);
+    let units=std::mem::take(&mut s.focus_units);let anchor=s.focus_anchor.take();
+    let result=(||{
+        if !move_unit(s,forward)? {return Ok(None);}
+        let strip=render_with_progress(s,false)?;
+        let mut info=strip.info();let viewport=s.session.viewport();
+        let width=strip.width();let height=(viewport.height as f32*viewport.raster_scale).ceil() as u32;
+        let start=-(info.raster_top*viewport.raster_scale).round() as i64;
+        let paper=s.session.style().background;
+        let mut pixels=[paper.red,paper.green,paper.blue,255].repeat(width as usize*height as usize);
+        let stride=width as usize*4;
+        for row in 0..height as i64 {
+            let source=start+row;
+            if source>=0&&source<i64::from(strip.height()) {
+                let from=source as usize*stride;let to=row as usize*stride;
+                pixels[to..to+stride].copy_from_slice(&strip.pixels[from..from+stride]);
+            }
+        }
+        info.raster_top=0.0;info.raster_height=viewport.height as f32;
+        Ok(Some(MobilePage::new(width,height,pixels,info)))
+    })();
+    let restored=restore_position(s,&locator,position);
+    s.scroll_cache=cache;s.scroll_slices=slices;s.focus_units=units;s.focus_anchor=anchor;
+    (s.scroll_offset,s.scroll_distance,s.scroll_context,s.scroll_center)=scroll;
+    restored?;result
 }
 
 fn scroll(s: &mut ReaderState, delta: f32, follow_center: bool) -> Result<Arc<MobilePage>> {
@@ -635,10 +728,10 @@ fn scroll(s: &mut ReaderState, delta: f32, follow_center: bool) -> Result<Arc<Mo
         4.0 * s.session.viewport().height as f32,
     );
     for _ in 0..8 {
-        let (_, height) = extent(s.session.current_page());
+        let (_, height) = current_extent(s);
         if s.scroll_offset >= height {
             if !step(s, true)? {
-                s.scroll_offset = s.scroll_offset.min(height);
+                s.scroll_offset = s.scroll_offset.min(height - s.session.viewport().height as f32 / 2.0);
                 break;
             }
             let advance = height + s.session.current_page().leading_gap();
@@ -652,7 +745,7 @@ fn scroll(s: &mut ReaderState, delta: f32, follow_center: bool) -> Result<Arc<Mo
                     .max(-(s.session.viewport().height as f32) / 2.0);
                 break;
             }
-            let advance = extent(s.session.current_page()).1 + gap;
+            let advance = current_extent(s).1 + gap;
             s.scroll_offset += advance;
             travel -= advance;
         } else {

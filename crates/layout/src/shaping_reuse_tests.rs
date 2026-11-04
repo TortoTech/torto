@@ -26,6 +26,57 @@ fn converged_hyphen_plan_reuse_matches_full_replanning_geometry() {
         }
     }
 }
+#[test]
+fn sentence_hyphens_survive_ligature_reshaping_and_replanning() {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) { DISABLE_BREAK_PLAN_REUSE.with(|flag| flag.set(self.0)); }
+    }
+    let font=ReaderFontBlob::new(Arc::new(include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice()));
+    let sentences=[
+        "An efficient affiliation requires internationalization and experimentation.",
+        "Scientific investigation combines information about extraordinary opportunities, identification, computational processing and reading comprehension.",
+        "Professional typographical considerations improve international readability and representation across different languages."
+    ];
+    let mut block=reuse_test_block("");
+    block.content=sentences.iter().enumerate().flat_map(|(index,value)| {
+        let run=Inline::Text(TextRun {text:(*value).into(),style:TextStyle {
+            language:rebook_publication::TextLanguage::EnglishUs,..Default::default()
+        },link:None});
+        if index==0 {vec![run]} else {vec![Inline::Break,run]}
+    }).collect();
+    block.style.sentence_indents=true;
+    block.style.indent=24.;
+    let style=ReaderStyle {typesetting:ReaderTypesetting::unified(),..Default::default()};
+    let mut retained_ligature=false;
+    for preserve in [false,true] {
+        block.style.preserve_sentence_prefix=preserve;
+        for width in [180.,320.,371.] {
+            let previous=DISABLE_BREAK_PLAN_REUSE.with(|flag|flag.replace(true));
+            let restore=Restore(previous);
+            let expected=LayoutEngine::with_fonts([font.clone()]).shape_text(&block,&style,width);
+            drop(restore);
+            let actual=LayoutEngine::with_fonts([font.clone()]).shape_text(&block,&style,width);
+            assert_eq!(actual.text.as_ref(),sentences.join("\n"));
+            assert!(!expected.hyphens.is_empty(),"replanning must retain sentence hyphens: prefix={preserve}, width={width}");
+            assert_eq!(reuse_test_geometry(&actual),reuse_test_geometry(&expected));
+            assert_eq!(actual.hyphens.iter().map(|h|h.line_index).collect::<Vec<_>>(),expected.hyphens.iter().map(|h|h.line_index).collect::<Vec<_>>());
+            assert_eq!(actual.layout.lines().filter(|l|l.break_reason()==parley::layout::BreakReason::Explicit).count(),2);
+            for line in actual.layout.lines() {
+                assert!(!line.runs().find_map(|r|r.clusters().next().map(|c|c.is_ligature_continuation())).unwrap_or(false),"a new sentence line must never start halfway through a ligature");
+                retained_ligature|=line.runs().any(|r|r.clusters().any(|c|c.is_ligature_start()));
+                let glyph_end=line.items().filter_map(|item|match item {
+                    crate::text_layout::PositionedLayoutItem::GlyphRun(run)=>Some(run.positioned_glyphs().map(|g|g.x+g.advance).fold(0.,f32::max)),
+                    _=>None,
+                }).fold(0.,f32::max);
+                let metrics=line.metrics();
+                assert!((glyph_end-metrics.offset-metrics.advance).abs()<0.05,"reshaped sentence widths must match actual glyphs: prefix={preserve}, width={width}");
+            }
+        }
+    }
+    assert!(retained_ligature,"unbroken in-line ligatures must remain enabled");
+}
+
 fn reuse_test_block(value: &str) -> TextBlock {
     TextBlock {
         kind: TextBlockKind::Paragraph,

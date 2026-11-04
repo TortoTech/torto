@@ -324,64 +324,94 @@ mod tests {
             table_of_contents: vec![],
         });
         let original="The efficient office studies diffraction and difficult scientific effects. Officials offer sufficient information about artificial interference and different reflections. ".repeat(5);
-        let start = SourceAnchor {
-            spine: SpineItemId::new("chapter").unwrap(),
-            node: "p".into(),
-            text_offset: 0,
-        };
-        let range = SourceRange {
-            end: SourceAnchor {
-                text_offset: original.chars().count() as u64,
-                ..start.clone()
-            },
-            start,
-        };
-        let block = Block::Text(TextBlock {
-            kind: TextBlockKind::Paragraph,
-            content: vec![Inline::Text(TextRun {
-                text: original.clone(),
-                style: TextStyle {
-                    language: TextLanguage::EnglishUs,
+        for original in [original.clone(), original.trim_end().replace(". ", ".\n")] {
+            let start = SourceAnchor {
+                spine: SpineItemId::new("chapter").unwrap(),
+                node: "p".into(),
+                text_offset: 0,
+            };
+            let range = SourceRange {
+                end: SourceAnchor {
+                    text_offset: original.chars().count() as u64,
+                    ..start.clone()
+                },
+                start,
+            };
+            let block = Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: original
+                    .split('\n')
+                    .enumerate()
+                    .flat_map(|(index, text)| {
+                        let run = Inline::Text(TextRun {
+                            text: text.into(),
+                            style: TextStyle {
+                                language: TextLanguage::EnglishUs,
+                                ..Default::default()
+                            },
+                            link: None,
+                        });
+                        if index == 0 {
+                            vec![run]
+                        } else {
+                            vec![Inline::Break, run]
+                        }
+                    })
+                    .collect(),
+                style: rebook_publication::BlockStyle {
+                    sentence_indents: original.contains('\n'),
+                    preserve_sentence_prefix: original.contains('\n'),
                     ..Default::default()
                 },
-                link: None,
-            })],
-            style: Default::default(),
-            source: Some(range),
-        });
-        let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(Arc::new(
-            include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice(),
-        ))]);
-        let style = ReaderStyle {
-            typesetting: rebook_layout::ReaderTypesetting::unified(),
-            spread: SpreadMode::Single,
-            horizontal_margin: 0.,
-            ..Default::default()
-        };
-        for width in [280, 800] {
-            let layout = engine
-                .layout_blocks(
-                    &source,
-                    std::slice::from_ref(&block),
-                    LayoutViewport::new(width, 400).unwrap(),
-                    &style,
-                )
-                .unwrap();
-            let mut copied = String::new();
-            for page in layout.pages {
-                let display = DisplayListCompiler.compile(&page);
-                for region in &display.text_regions {
-                    if let TextRegion::Shaped(region) = region {
-                        if let Some(fragment) = region
-                            .visible_byte_range()
-                            .and_then(|range| region.selection_fragment(range))
-                        {
-                            copied.push_str(&fragment.quote);
+                source: Some(range),
+            });
+            let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(Arc::new(
+                include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice(),
+            ))]);
+            let style = ReaderStyle {
+                typesetting: rebook_layout::ReaderTypesetting::unified(),
+                spread: SpreadMode::Single,
+                horizontal_margin: 0.,
+                ..Default::default()
+            };
+            let mut hyphen_count = 0;
+            for width in [280, 800] {
+                let layout = engine
+                    .layout_blocks(
+                        &source,
+                        std::slice::from_ref(&block),
+                        LayoutViewport::new(width, 400).unwrap(),
+                        &style,
+                    )
+                    .unwrap();
+                hyphen_count += layout
+                    .pages
+                    .iter()
+                    .flat_map(|p| &p.items)
+                    .filter(
+                        |i| matches!(i,rebook_layout::PageItem::Text(t) if t.text.as_ref()=="\u{2010}"),
+                    )
+                    .count();
+                let mut copied = String::new();
+                for page in layout.pages {
+                    let display = DisplayListCompiler.compile(&page);
+                    for region in &display.text_regions {
+                        if let TextRegion::Shaped(region) = region {
+                            if let Some(fragment) = region
+                                .visible_byte_range()
+                                .and_then(|range| region.selection_fragment(range))
+                            {
+                                copied.push_str(&fragment.quote);
+                            }
                         }
                     }
                 }
+                assert_eq!(copied, original);
             }
-            assert_eq!(copied, original);
+            assert!(
+                hyphen_count > 0,
+                "copy checks must exercise actual hyphens with and without sentence breaks"
+            );
         }
     }
 

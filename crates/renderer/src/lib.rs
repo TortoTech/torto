@@ -150,6 +150,11 @@ struct FootnoteRegion {
 
 const FOOTNOTE_ICON_CENTER_ABOVE_BASELINE: f32 = 0.68;
 
+/// Shared reading-reference accent for native and desktop surfaces.
+pub fn reference_color(dark: bool) -> [u8;4] {
+    if dark {[96,165,250,255]}else{[37,99,235,255]}
+}
+
 fn footnote_activation_bar_y(
     origin_y: f32,
     metrics: rebook_layout::text_layout::LineMetrics,
@@ -1315,6 +1320,13 @@ impl PageDisplayList {
                 ]
             })
             .collect()
+    }
+
+    /// The same short baseline indicator painted by desktop popup activation.
+    pub fn footnote_indicator_at(&self,x:f32,y:f32)->Option<[f32;4]> {
+        self.footnote_regions.iter().rev().find(|r|r.website.is_none()&&r.bounds.contains(Point::new(f64::from(x),f64::from(y))))
+            .map(|r|{let width=r.bounds.width().clamp(12.0,16.0) as f32;
+                [r.bounds.center().x as f32-width/2.,r.activation_bar_y as f32,width,2.]})
     }
 
     pub fn paint_active_footnote_reference(
