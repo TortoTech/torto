@@ -316,7 +316,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     fun open(book: BookSummary) {
         cancelChat();cancelAi();processedPages.clear();prefetchKey=null;scrollPending=0f;selectionPending=null;selectionHandle=false
         generation++
-        mutable.update { it.copy(active = book, frame = null, interaction=null,chromeVisible=true,processing=false, hits = emptyList(), selected = null, messages=emptyList(),changes=emptyList(),annotations=emptyList(),translated=state.value.reading?.translated?:false,aiPaused=false,aiError=null,chatWorking=false,chatQuestion="",chatContent="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList()) }
+        mutable.update { it.copy(active = book, frame = null, interaction=null,chromeVisible=false,processing=false, hits = emptyList(), selected = null, messages=emptyList(),changes=emptyList(),annotations=emptyList(),translated=state.value.reading?.translated?:false,aiPaused=false,aiError=null,chatWorking=false,chatQuestion="",chatContent="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList()) }
         viewport = null
     }
     fun measure(width: Int, height: Int, density: Float) {
@@ -430,8 +430,8 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             if(token==generation)mutable.update {it.copy(focus=enabled)}
         } }
     }
-    fun followLink(target:String)=readerOperation {it.followLink(target)}
-    fun returnLocation()=readerOperation {it.goBack()}
+    fun followLink(target:String)=readerOperation(hideControls=true) {it.followLink(target)}
+    fun returnLocation()=readerOperation(hideControls=true) {it.goBack()}
     fun tap(x:Float,y:Float){
         if(state.value.chatWorking)return
         if(state.value.processing){cancelAi();return}
@@ -443,12 +443,14 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             val frame=result.media?.let {nativeFrame(it)}
             if(token!=generation)return@let
             when(result.kind){
-                "page"->if(frame!=null)mutable.update {it.copy(frame=frame,selected=null)}
+                "focus"->if(frame!=null)mutable.update {it.copy(frame=frame,selected=null)}
+                "page"->{hideChrome();if(frame!=null)mutable.update {it.copy(frame=frame,selected=null)}}
                 "none"->{val width=viewport?.width?.toFloat() ?: 360f
-                    if(x<width*.3f||x>width*.7f)publish(session.turn(x>width*.7f),token)
+                    if(!(state.value.focus&&(state.value.frame?.info?.focusCount ?:0u)>0u)&&(x<width*.2f||x>width*.8f)){hideChrome();publish(session.turn(x>width*.8f),token)}
                     else toggleChrome()
                 }
                 else->{
+                    if(result.kind!="external")hideChrome()
                     documentGeneration++;documentId=null
                     val notes=if(result.kind=="annotation")session.annotations() else state.value.annotations
                     if(token==generation)mutable.update {it.copy(annotations=notes,interaction=ReaderInteraction(result.kind,result.text,result.target,frame,result.markup))}
@@ -457,7 +459,9 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         } }
     }
     fun toggleChrome(){mutable.update {it.copy(chromeVisible=!it.chromeVisible)}}
-    private fun readerOperation(block: suspend (MobileReader) -> MobilePage) {
+    fun hideChrome(){mutable.update {if(it.chromeVisible)it.copy(chromeVisible=false)else it}}
+    private fun readerOperation(hideControls:Boolean=false,block: suspend (MobileReader) -> MobilePage) {
+        if(hideControls)hideChrome()
         cancelAi()
         val token=generation
         runOperation { if(token==generation) reader?.let { it.readingActivity(true,true); publish(block(it),token) } }
@@ -466,7 +470,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         if(active)cancelAi()
         mutable.update { it.copy(readerMoving=active) }
     }
-    fun turn(forward: Boolean) = readerOperation { it.turn(forward) }
+    fun turn(forward: Boolean) = readerOperation(hideControls=true) { it.turn(forward) }
     fun scroll(delta:Float){
         if(state.value.chatWorking)return
         cancelAi();scrollPending+=delta
@@ -482,7 +486,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
-    fun navigate(href: String) = readerOperation { it.navigate(href) }
+    fun navigate(href: String) = readerOperation(hideControls=true) { it.navigate(href) }
     fun configure(size: Float, unified: Boolean, dark: Boolean) {
         val token=generation
         runOperation {
@@ -500,10 +504,11 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             if(token==generation&&request==searchGeneration)mutable.update {it.copy(hits=hits)}
         }}
     }
-    fun jump(hit: SearchHit) = readerOperation { it.goToSource(hit.source) }
+    fun jump(hit: SearchHit) = readerOperation(hideControls=true) { it.goToSource(hit.source) }
     fun beginHandle(start:Boolean){selectionHandle=true;val token=generation;runOperation {if(token==generation)reader?.beginSelectionHandle(start)}}
     fun dragHandle(x:Float,y:Float){selectionHandle=true;select(x,y,x,y)}
     fun select(x: Float, y: Float, endX: Float, endY: Float) {
+        hideChrome()
         cancelAi();selectionPending=floatArrayOf(x,y,endX,endY,if(selectionHandle)1f else 0f)
         if(selectionJob?.isActive==true)return
         val token=generation
@@ -551,7 +556,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     fun saveAnnotation(note: String?) = annotationOperation { it.saveAnnotation(note?.trim()?.takeIf(String::isNotEmpty)) }
     fun editAnnotation(id: String,note: String?) = annotationOperation { it.editAnnotation(id,note?.trim()?.takeIf(String::isNotEmpty)) }
     fun deleteAnnotation(id: String) = annotationOperation { it.deleteAnnotation(id) }
-    fun jumpAnnotation(note: Annotation) = readerOperation { it.goToSource(note.source) }
+    fun jumpAnnotation(note: Annotation) = readerOperation(hideControls=true) { it.goToSource(note.source) }
     fun markFinished() = runOperation { reader?.markFinished(); mutable.update { it.copy(notice="已标记为读完") } }
     suspend fun readingActivity(eligible: Boolean, activity: Boolean = false) {
         val token=generation
@@ -598,7 +603,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     }
     fun removeChatImage(id:String){val token=generation;runOperation {if(token==generation){reader?.removeChatImage(id);mutable.update {it.copy(draftImages=it.draftImages.filterNot {a->a.id==id})}}}}
     fun previewChatImage(id:String){val token=generation;runOperation {if(token==generation)reader?.let {session->val frame=nativeFrame(session.chatImage(id));if(token==generation)mutable.update {it.copy(interaction=ReaderInteraction("image","","",frame))}}}}
-    fun followChatCitation(target:String)=readerOperation {it.followChatCitation(target)}
+    fun followChatCitation(target:String)=readerOperation(hideControls=true) {it.followChatCitation(target)}
     fun sendChat(question: String) {
         val images=state.value.draftImages
         if(state.value.chatWorking || (question.isBlank()&&images.isEmpty())) return

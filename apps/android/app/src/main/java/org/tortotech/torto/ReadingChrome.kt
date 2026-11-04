@@ -6,6 +6,9 @@ import androidx.compose.animation.core.updateTransition
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.indication
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -32,9 +35,10 @@ internal val ReaderBarHeight=56.dp
         Row(Modifier.fillMaxWidth().heightIn(min=ReaderBarHeight),verticalAlignment=Alignment.CenterVertically){
             listOf("library" to tr("书架","Library"),"person" to tr("我","Me")).forEachIndexed {index,(icon,label)->
                 val active=selected==index
-                Column(Modifier.weight(1f).heightIn(min=56.dp).semantics {this.selected=active}.clickable(role=Role.Tab,onClick={onSelect(index)}).padding(vertical=6.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center){
-                    Box(Modifier.size(44.dp,26.dp).background(if(active)MaterialTheme.colorScheme.primaryContainer else Color.Transparent,RoundedCornerShape(14.dp)),contentAlignment=Alignment.Center){
-                        AppIcon(icon,modifier=Modifier.size(22.dp),tint=if(active)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,filled=active)
+                val interaction=remember {MutableInteractionSource()}
+                Column(Modifier.weight(1f).heightIn(min=56.dp).semantics {this.selected=active}.clickable(role=Role.Tab,interactionSource=interaction,indication=null,onClick={onSelect(index)}).padding(vertical=6.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center){
+                    Box(Modifier.size(44.dp,26.dp).clip(RoundedCornerShape(14.dp)).indication(interaction,ripple(bounded=false,radius=28.dp)).background(if(active)MaterialTheme.colorScheme.primaryContainer else Color.Transparent,RoundedCornerShape(14.dp)),contentAlignment=Alignment.Center){
+                        AppIcon(icon,size=22.dp,tint=if(active)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,filled=active)
                     }
                     Spacer(Modifier.height(2.dp))
                     Text(label,fontSize=11.sp,lineHeight=14.sp,color=if(active)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
@@ -52,11 +56,14 @@ internal val ReaderBarHeight=56.dp
     val safe=readerSafePadding()
     val transition=updateTransition(state.chromeVisible,label="reading controls")
     transition.AnimatedVisibility(visible={it},enter=fadeIn(tween(180)),exit=fadeOut(tween(180)),modifier=Modifier.align(Alignment.TopCenter)){
-        Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background).padding(top=safe.calculateTopPadding()).height(ReaderBarHeight).padding(horizontal=8.dp),verticalAlignment=Alignment.CenterVertically){
-            ActionIcon("back",tr("返回","Back"),onClick=onBack)
-            Spacer(Modifier.weight(1f))
-            if(processing)ActionIcon("stop",tr("停止处理","Stop processing"),onClick=onStop)
-            ActionIcon("chat",tr("阅读助手","Reading assistant"),!blocked,selected=panel=="chat",onClick={onPanel("chat")})
+        Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background).padding(top=safe.calculateTopPadding()).height(ReaderBarHeight)){
+            Row(Modifier.fillMaxWidth().weight(1f).padding(horizontal=8.dp),verticalAlignment=Alignment.CenterVertically){
+                ActionIcon("back",tr("返回","Back"),onClick=onBack)
+                Spacer(Modifier.weight(1f))
+                if(processing)ActionIcon("stop",tr("停止处理","Stop processing"),onClick=onStop)
+                ActionIcon("chat",tr("阅读助手","Reading assistant"),!blocked,selected=panel=="chat",onClick={onPanel("chat")})
+            }
+            HorizontalDivider(color=MaterialTheme.colorScheme.outlineVariant.copy(alpha=.45f),thickness=.5.dp)
         }
     }
     transition.AnimatedVisibility(visible={it},enter=fadeIn(tween(180))+slideInVertically(tween(180)){it/5},exit=fadeOut(tween(180))+slideOutVertically(tween(180)){it/5},modifier=Modifier.align(Alignment.BottomCenter)){
@@ -75,8 +82,8 @@ internal val ReaderBarHeight=56.dp
         Surface(shape=RoundedCornerShape(18.dp),color=if(state.translated)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh,
             shadowElevation=3.dp,border=BorderStroke(.5.dp,MaterialTheme.colorScheme.outlineVariant.copy(alpha=.5f))){
             val ink=if(state.translated)MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary
-            IconButton(onClick=onTranslate,enabled=!blocked,modifier=Modifier.size(52.dp),colors=IconButtonDefaults.iconButtonColors(contentColor=ink,disabledContentColor=ink.copy(alpha=.38f))){
-                AppIcon("translate",if(state.translated)tr("关闭翻译","Turn translation off")else tr("开启翻译","Turn translation on"))
+            RoundedIconControl(onClick=onTranslate,enabled=!blocked,shape=RoundedCornerShape(18.dp),modifier=Modifier.size(52.dp)){
+                AppIcon("translate",if(state.translated)tr("关闭翻译","Turn translation off")else tr("开启翻译","Turn translation on"),tint=if(blocked)ink.copy(alpha=.38f)else ink)
             }
         }
     }

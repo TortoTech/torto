@@ -112,8 +112,8 @@ class ReadingIntegrationTest {
             val bitmap=Bitmap.createBitmap(720,1280,Bitmap.Config.ARGB_8888)
             val view=ReaderView(context);view.layout(0,0,720,1280)
             view.present(ReaderFrame(bitmap,info.copy(scrollDistance=0.0)),SelectedText("selected",listOf(Rect(30f,50f,80f,20f))))
-            var handle:Boolean?=null;var moved=false;var ended=false;var scrolled=0f;var turns=0
-            view.onHandleStart={handle=it};view.onHandleMove={_,_->moved=true};view.onHandleEnd={ended=true};view.onScroll={scrolled+=it};view.onTurn={turns++}
+            var handle:Boolean?=null;var moved=false;var ended=false;var scrolled=0f;var turns=0;var gestures=0
+            view.onReadingGesture={gestures++};view.onHandleStart={handle=it};view.onHandleMove={_,_->moved=true};view.onHandleEnd={ended=true};view.onScroll={scrolled+=it};view.onTurn={turns++}
             val density=context.resources.displayMetrics.density;val start=android.os.SystemClock.uptimeMillis()
             fun event(action:Int,x:Float,y:Float,time:Long){val e=android.view.MotionEvent.obtain(start,time,action,x*density,y*density,0);view.onTouchEvent(e);e.recycle()}
             event(0,110f,76f,start);event(2,135f,90f,start+30);event(1,135f,90f,start+60)
@@ -124,6 +124,7 @@ class ReadingIntegrationTest {
             event(0,160f,180f,start+600);event(2,160f,100f,start+640);event(1,160f,100f,start+680)
             assertEquals("A swipe advances exactly one block",1,turns)
             assertEquals("Touch moves must not trigger native rasterization",0f,scrolled,0f)
+            assertEquals("Each reading drag reports once; selection-handle drags do not",2,gestures)
             view.onWindowFocusChanged(false);bitmap.recycle()
         }
     }

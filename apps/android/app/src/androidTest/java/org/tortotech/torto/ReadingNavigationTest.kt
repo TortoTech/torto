@@ -105,6 +105,20 @@ class ReadingNavigationTest {
             var size=0 to 0
             instrumentation.runOnMainSync {reader(activity!!.window.decorView)!!.let {size=it.width to it.height}}
             assertTrue(size.second>0)
+            assertFalse("Books open with controls hidden like the old app",model!!.state.value.chromeVisible)
+            val originalFocus=model!!.state.value.focus
+            instrumentation.runOnMainSync {model!!.focus(true)}
+            await("focus is ready"){model!!.state.value.focus&&!model!!.state.value.busy&&model!!.state.value.frame!!.info.focusCount>0u}
+            val active=model!!.state.value.frame!!.info.focusBounds.first()
+            val raster=model!!.state.value.frame!!.rasterId
+            instrumentation.runOnMainSync {model!!.tap(active.x+2f,active.y+active.height/2)}
+            await("tapping the active block reveals chrome"){model!!.state.value.chromeVisible&&!model!!.state.value.busy}
+            assertEquals("Toggling chrome reuses native page pixels",raster,model!!.state.value.frame!!.rasterId)
+            instrumentation.runOnMainSync {model!!.tap(active.x+2f,active.y+active.height/2)}
+            await("tapping it again hides chrome"){!model!!.state.value.chromeVisible&&!model!!.state.value.busy}
+            instrumentation.runOnMainSync {model!!.focus(originalFocus)}
+            await("original reading mode restores"){model!!.state.value.focus==originalFocus&&!model!!.state.value.busy}
+            instrumentation.runOnMainSync {model!!.toggleChrome()}
             await("floating translation control is visible"){label("开启翻译","Turn translation on")!=null}
             assertNull("Reading progress labels were removed",node {it.text?.toString()?.let {s->s.contains('%')&&s.contains('/')}==true})
             instrumentation.runOnMainSync {model!!.toggleChrome()}
@@ -135,7 +149,13 @@ class ReadingNavigationTest {
             await("results shown in drawer"){node {it.text?.toString()?.contains("Independent")==true&&it.className!="android.widget.EditText"}!=null}
             click(node {it.text?.toString()?.contains("Independent")==true&&it.className!="android.widget.EditText"})
             await("result closes drawer"){label("搜本书","Search book")==null}
-            await("floating control restores"){label("开启翻译","Turn translation on")!=null}
+            await("navigation returns to unobstructed reading"){!model!!.state.value.chromeVisible&&label("开启翻译","Turn translation on")==null}
+            instrumentation.runOnMainSync {model!!.toggleChrome()}
+            await("controls can be reopened"){label("目录与搜索","Contents and search")!=null}
+            instrumentation.runOnMainSync {model!!.readerMotion(true)}
+            assertTrue("Programmatic motion alone does not change chrome",model!!.state.value.chromeVisible)
+            instrumentation.runOnMainSync {model!!.readerMotion(false);reader(activity!!.window.decorView)!!.onReadingGesture?.invoke()}
+            await("actual reading gestures hide the controls"){!model!!.state.value.chromeVisible&&label("目录与搜索","Contents and search")==null}
             instrumentation.runOnMainSync {model!!.back()}
             await("home restores"){model!!.state.value.active==null&&!model!!.state.value.busy}
             screenshot("navigation-home.png")

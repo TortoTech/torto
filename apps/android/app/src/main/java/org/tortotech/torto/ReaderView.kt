@@ -26,6 +26,8 @@ import kotlin.math.roundToInt
 /** Touch previews translate retained content; committed focus stops update native state. */
 class ReaderView(context: Context) : View(context) {
     var onMotion: ((Boolean) -> Unit)? = null
+    var onReadingGesture: (() -> Unit)? = null
+    private var reportedGesture=false
     var onSize: ((Int, Int, Float) -> Unit)? = null
     var onTap: ((Float, Float) -> Unit)? = null
     var onTurn: ((Boolean) -> Unit)? = null
@@ -157,7 +159,9 @@ class ReaderView(context: Context) : View(context) {
         }
         override fun onScroll(a:MotionEvent?,b:MotionEvent,dx:Float,dy:Float):Boolean {
             val current=frame ?: return false
-            if(selecting||!current.info.isScroll||a==null||abs(b.y-a.y)<=abs(b.x-a.x))return false
+            if(selecting||a==null)return false
+            if(!reportedGesture&&(current.info.isScroll||abs(b.x-a.x)>abs(b.y-a.y))){reportedGesture=true;onReadingGesture?.invoke()}
+            if(!current.info.isScroll||abs(b.y-a.y)<=abs(b.x-a.x))return false
             draggingFocus=true;dragDistance+=dy/density
             val low=minOf(dragStart,current.info.scrollDistance+(current.info.previousFocus?.delta ?: 0f))
             val high=maxOf(dragStart,current.info.scrollDistance+(current.info.nextFocus?.delta ?: 0f))
@@ -231,7 +235,7 @@ class ReaderView(context: Context) : View(context) {
         if(event.actionMasked==MotionEvent.ACTION_DOWN){
             blockedGesture=navigationPending||!isEnabled
             if(blockedGesture)return true
-            cancelAnimation();selecting=false;draggingFocus=false;dragDistance=0f;dragStart=displayPosition
+            cancelAnimation();selecting=false;draggingFocus=false;reportedGesture=false;dragDistance=0f;dragStart=displayPosition
             velocity?.recycle();velocity=VelocityTracker.obtain()
             val hit=handlePoints().indexOfFirst {(x,y)->hypot(event.x-x,event.y-y-6*density)<26*density}
             if(hit>=0){draggingHandle=true;pointerX=event.x;pointerY=event.y;onHandleStart?.invoke(hit==0);reportMotion();parent?.requestDisallowInterceptTouchEvent(true)}

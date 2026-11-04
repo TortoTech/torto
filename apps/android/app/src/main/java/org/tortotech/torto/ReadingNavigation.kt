@@ -19,6 +19,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -87,8 +88,8 @@ internal fun visibleContents(items:List<TocItem>,collapsed:Set<String>)=items.fi
                     Row(Modifier.padding(horizontal=16.dp).fillMaxWidth().height(56.dp).background(MaterialTheme.colorScheme.surfaceContainerHigh,RoundedCornerShape(24.dp)).padding(4.dp)){
                         listOf(tr("搜本书","Search book"),tr("目录","Contents")).forEachIndexed {index,label->
                             val selected=search==(index==0)
-                            Row(Modifier.weight(1f).fillMaxHeight().background(if(selected)MaterialTheme.colorScheme.surface else Color.Transparent,RoundedCornerShape(20.dp)).semantics {this.selected=selected}.clickable(role=Role.Tab){search=index==0},horizontalArrangement=Arrangement.Center,verticalAlignment=Alignment.CenterVertically){
-                                if(index==0){AppIcon("search",modifier=Modifier.size(19.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant);Spacer(Modifier.width(6.dp))}
+                            Row(Modifier.weight(1f).fillMaxHeight().clip(androidx.compose.foundation.shape.RoundedCornerShape(20.dp)).background(if(selected)MaterialTheme.colorScheme.surface else Color.Transparent,RoundedCornerShape(20.dp)).semantics {this.selected=selected}.clickable(role=Role.Tab){search=index==0},horizontalArrangement=Arrangement.Center,verticalAlignment=Alignment.CenterVertically){
+                                if(index==0){AppIcon("search",size=19.dp,tint=MaterialTheme.colorScheme.onSurfaceVariant);Spacer(Modifier.width(6.dp))}
                                 Text(label,style=MaterialTheme.typography.labelLarge,color=if(selected)MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }

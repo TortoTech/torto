@@ -148,7 +148,7 @@ private fun statisticsDate(ms:ULong?):String=if(ms==null||ms==0uL)"—" else Ins
                             StatisticsTime(book.milliseconds,20)
                             Text(book.title.ifEmpty {tr("未知书籍","Unknown book")},style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=1,overflow=TextOverflow.Ellipsis)
                         }
-                        Spacer(Modifier.width(8.dp));AppIcon("next",modifier=Modifier.size(18.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.width(8.dp));AppIcon("next",size=18.dp,tint=MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }

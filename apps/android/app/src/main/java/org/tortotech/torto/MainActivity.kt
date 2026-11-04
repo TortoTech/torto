@@ -82,7 +82,7 @@ class MainActivity : ComponentActivity() {
     fun closePanel(){if(panel=="chat")model.cancelChat();panel=null;editing=null}
     fun readerPanel(name:String){
         if(name=="navigation"&&panel==name){closePanel();return}
-        when(name){"chat"->model.loadChat();"marks"->model.loadAnnotations()}
+        when(name){"chat"->{model.hideChrome();model.loadChat()};"marks"->model.loadAnnotations()}
         panel=name
     }
     fun back(){when{panel!=null->closePanel();state.active!=null->if(state.frame?.info?.canGoBack==true)model.returnLocation() else model.back();routes.isNotEmpty()->routes.removeAt(routes.lastIndex);tab!=0->tab=0}}
@@ -145,7 +145,7 @@ class MainActivity : ComponentActivity() {
             Box(Modifier.fillMaxSize().padding(if(state.active==null)padding else PaddingValues(0.dp))) {
                 if(state.active!=null) Column(Modifier.fillMaxSize().padding(top=safe.calculateTopPadding()+ReaderBarHeight,bottom=safe.calculateBottomPadding()+ReaderBarHeight)) {
                     Box(Modifier.fillMaxWidth().weight(1f)){
-                    AndroidView(factory={ReaderView(it).apply {onSize=model::measure;onMotion=model::readerMotion;onTap=model::tap;onTurn=model::turn;onScroll=model::scroll;onHandleStart=model::beginHandle;onHandleMove=model::dragHandle;onHandleEnd=model::endHandle;onSelect={x,y,ex,ey->if(!model.state.value.chatWorking)model.select(x,y,ex,ey)}}},update={it.isEnabled=!state.chatWorking;it.importantForAccessibility=if(panel=="navigation")android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS else android.view.View.IMPORTANT_FOR_ACCESSIBILITY_AUTO;it.present(state.frame,state.selected)},modifier=Modifier.fillMaxSize())
+                    AndroidView(factory={ReaderView(it).apply {onSize=model::measure;onMotion=model::readerMotion;onReadingGesture=model::hideChrome;onTap=model::tap;onTurn=model::turn;onScroll=model::scroll;onHandleStart=model::beginHandle;onHandleMove=model::dragHandle;onHandleEnd=model::endHandle;onSelect={x,y,ex,ey->if(!model.state.value.chatWorking)model.select(x,y,ex,ey)}}},update={it.isEnabled=!state.chatWorking;it.importantForAccessibility=if(panel=="navigation")android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS else android.view.View.IMPORTANT_FOR_ACCESSIBILITY_AUTO;it.present(state.frame,state.selected)},modifier=Modifier.fillMaxSize())
                     if(showProcessing||state.aiError!=null||state.aiPaused)Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow).padding(horizontal=16.dp,vertical=8.dp)){
                         if(state.processing){
                             val stage=when(state.aiStage){"translation"->tr("正在翻译","Translating");"layout"->tr("正在排版","Recognizing layout");"toc"->tr("正在翻译目录","Translating contents");"prefetch"->tr("正在预处理下一页","Processing next page");else->tr("准备处理","Preparing")}

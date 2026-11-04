@@ -711,6 +711,10 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
     let target=reader.clone().search("Paragraph 0:".into()).await.unwrap()[0].source.clone();
     let origin=reader.clone().go_to_source(target).await.unwrap();
     let info=origin.info();
+    let active=&info.focus_bounds[0];
+    let tap=reader.clone().activate(active.x+2.0,active.y+active.height/2.0).await.unwrap();
+    assert_eq!(tap.kind,"none","an active focus block toggles controls instead of navigating");
+    assert!(tap.media.is_none(),"toggling controls must not render a replacement page");
     let next=reader.clone().turn(true).await.unwrap();
     assert_eq!(next.info().scroll_context,info.scroll_context);
     assert!((next.info().scroll_distance-info.scroll_distance-f64::from(info.next_focus.as_ref().unwrap().delta)).abs()<0.1);
@@ -719,7 +723,9 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
     assert_eq!(origin.raster_id(),next.raster_id(),"one-block navigation must reuse the strip");
     let target=origin.info().next_focus.unwrap();
     let r=&target.bounds[0];
-    let clicked=reader.clone().activate(r.x+2.0,r.y+r.height/2.0).await.unwrap().media.unwrap();
+    let action=reader.clone().activate(r.x+2.0,r.y+r.height/2.0).await.unwrap();
+    assert_eq!(action.kind,"focus","inactive blocks retain the distinct focus navigation action");
+    let clicked=action.media.unwrap();
     assert!((clicked.info().scroll_distance-info.scroll_distance-f64::from(target.delta)).abs()<0.1,"tapping a block must move the retained viewport as well as its focus mask");
     let context=clicked.info().scroll_context;
     reader.clone().trim_memory().await.unwrap();

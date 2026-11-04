@@ -463,11 +463,14 @@ impl MobileReader {
                         })
                     })
                 {
+                    if s.focus_anchor.as_ref().is_some_and(|anchor|s.focus_units[index].ranges.iter().any(|range|range==anchor)) {
+                        return Ok(TouchAction::new("none",String::new(),String::new()));
+                    }
                     s.scroll_center = true;
                     s.focus_anchor = s.focus_units[index].ranges.first().cloned();
                     let page = render(s)?;
                     return Ok(TouchAction {
-                        kind: "page".into(),
+                        kind: "focus".into(),
                         text: String::new(),
                         markup: String::new(),
                         target: String::new(),

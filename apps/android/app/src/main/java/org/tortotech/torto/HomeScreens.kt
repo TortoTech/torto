@@ -33,7 +33,7 @@ import org.tortotech.torto.core.*
             val cover by produceState<Bitmap?>(model.cachedCover(book.id),book.id,state.cloudStatus.coverRevision){value=model.cover(book.id)}
             Column(Modifier.combinedClickable(onClick={model.open(book)},onLongClick={onActions(book)})) {
                 Box(Modifier.fillMaxWidth().aspectRatio(.7f).shadow(3.dp,RoundedCornerShape(6.dp)).clip(RoundedCornerShape(6.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest).then(if(book.id==recent)Modifier.border(3.dp,MaterialTheme.colorScheme.primary,RoundedCornerShape(6.dp)) else Modifier),contentAlignment=Alignment.Center) {
-                    cover?.let { Image(it.asImageBitmap(),null,Modifier.fillMaxSize(),contentScale=ContentScale.Crop) } ?: AppIcon("book",modifier=Modifier.size(32.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)
+                    cover?.let { Image(it.asImageBitmap(),null,Modifier.fillMaxSize(),contentScale=ContentScale.Crop) } ?: AppIcon("book",size=32.dp,tint=MaterialTheme.colorScheme.onSurfaceVariant)
                     if(book.id==recent) Text(tr("继续阅读","Continue reading"),Modifier.align(Alignment.BottomCenter).fillMaxWidth().background(MaterialTheme.colorScheme.primary).padding(vertical=4.dp),color=MaterialTheme.colorScheme.onPrimary,fontSize=12.sp,textAlign=TextAlign.Center)
                 }
                 Spacer(Modifier.height(8.dp));Text(book.title,style=MaterialTheme.typography.titleSmall,maxLines=1,overflow=TextOverflow.Ellipsis)
