@@ -1047,6 +1047,7 @@ fn empty_text_source_spans() -> Arc<[TextSourceSpan]> {
 
 /// One positioned table chunk. Large tables can produce one chunk per page.
 pub struct TablePlacement {
+    pub source: Option<SourceRange>,
     pub cells: Vec<TableCellPlacement>,
     pub y: f32,
     pub height: f32,
@@ -1974,6 +1975,7 @@ impl LayoutEngine {
                     } else {
                         self.shape_table(source, table, reader_style, width)?
                     };
+                    prepared.source = table.source.clone();
                     if captions.before.is_empty() && captions.after.is_empty()
                         || prepared.row_heights.is_empty()
                     {
@@ -2762,6 +2764,7 @@ impl LayoutEngine {
             }
         }
         Ok(PreparedTable {
+            source: None,
             horizontal_offset: centered_table_offset(unified, content_width, &column_widths),
             column_widths,
             row_heights,
@@ -4804,6 +4807,7 @@ struct PreparedHyphen {
 }
 
 struct PreparedTable {
+    source: Option<SourceRange>,
     horizontal_offset: f32,
     column_widths: Vec<f32>,
     row_heights: Vec<f32>,
@@ -4818,6 +4822,7 @@ struct PreparedTable {
 impl Default for PreparedTable {
     fn default() -> Self {
         Self {
+            source: None,
             horizontal_offset: 0.0,
             column_widths: Vec::new(),
             row_heights: Vec::new(),
@@ -6105,6 +6110,7 @@ impl Paginator {
             })
             .collect();
         self.items.push(PageItem::Table(TablePlacement {
+            source: table.source.clone(),
             cells,
             y: table_y,
             height,

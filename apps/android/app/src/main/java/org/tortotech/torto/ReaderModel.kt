@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.tortotech.torto.core.*
@@ -24,6 +25,7 @@ import org.tortotech.torto.core.Annotation
 
 data class ReaderInteraction(val kind:String,val text:String,val target:String,val frame:ReaderFrame?=null,val markup:String="")
 data class ReaderFrame(val bitmap: Bitmap, val info: PageInfo, val rasterId: ULong = 0uL)
+data class DocumentFrame(val id:String,val index:UInt,val total:UInt,val frame:ReaderFrame,val controls:List<ReadingControl>)
 data class ScreenState(
     val books: List<BookSummary> = emptyList(), val loaded: Boolean = false, val active: BookSummary? = null,
     val frame: ReaderFrame? = null, val toc: List<TocItem> = emptyList(),
@@ -63,6 +65,8 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     private var updateRequest:ChatRequest?=null
     private var reader: MobileReader? = null
     private var readerBook: String? = null
+    private var documentGeneration=0L
+    private var documentId:String?=null
     @Volatile private var generation = 0L
     private var viewport: Viewport? = null
     private var resizeJob: Job? = null
@@ -342,6 +346,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
                             val toc = opened.toc()
                             mutable.update { it.copy(toc = toc) }
                             publish(opened.configure(state.value.fontSize,state.value.unified,state.value.dark), token)
+                            prepareReferences(opened,token)
                         } else publish(current.resize(next), token)
                     }
                 } catch (e: Exception) { mutable.update { it.copy(error = e.message) } }
@@ -363,7 +368,60 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         val frame=nativeFrame(page)
         if(token==generation)mutable.update {it.copy(frame=frame,selected=null)}
     }
-    fun dismissInteraction(){mutable.update {it.copy(interaction=null)}}
+    fun dismissInteraction(){
+        val id=documentId;documentId=null;documentGeneration++
+        val token=generation;mutable.update {it.copy(interaction=null)}
+        if(id!=null)viewModelScope.launch {operations.withLock {if(token==generation)withContext(NonCancellable){reader?.closeDocument(id)}}}
+    }
+    private fun prepareReferences(session:MobileReader,token:Long){viewModelScope.launch {
+        runCatching {if(session.prepareMediaReferences()){
+            state.map { !it.readerMoving&&it.interaction==null }.first {it}
+            operations.withLock {withContext(NonCancellable){if(token==generation&&reader===session)publish(session.refreshMediaReferences(),token)}}
+        }}
+    }}
+    fun toggleReadingControl(control:ReadingControl)=readerOperation {it.toggleReadingControl(control)}
+    suspend fun documentPage(interaction:ReaderInteraction,index:UInt,width:UInt,scale:Float,foreground:UInt,background:UInt):DocumentFrame? {
+        val token=generation;val documentToken=documentGeneration
+        return operations.withLock {withContext(NonCancellable){
+            if(token!=generation||state.value.interaction!==interaction)return@withContext null
+            val session=reader ?: return@withContext null
+            val viewport=Viewport(width,320u,scale.coerceIn(1f,4f))
+            val result=if(interaction.kind=="note")session.notePage(interaction.markup.ifBlank {interaction.text},documentToken.toULong(),index,viewport,foreground,background)
+                else session.referencePage(interaction.target,index,viewport,foreground,background)
+            val frame=nativeFrame(result.page)
+            if(token!=generation||state.value.interaction!==interaction){session.closeDocument(result.id);return@withContext null}
+            documentId=result.id
+            DocumentFrame(result.id,result.index,result.total,frame,result.controls)
+        }}
+    }
+    suspend fun documentSelect(document:DocumentFrame,x:Float,y:Float,ex:Float,ey:Float,handle:Boolean?):SelectedText? {
+        val token=generation;val documentToken=documentGeneration
+        return operations.withLock {withContext(NonCancellable){
+            if(token!=generation||documentToken!=documentGeneration||documentId!=document.id)return@withContext null
+            val result=reader?.documentSelect(document.id,document.index,x,y,ex,ey,handle)
+            if(token==generation&&documentToken==documentGeneration)result else null
+        }}
+    }
+    suspend fun toggleDocumentControl(document:DocumentFrame,control:ReadingControl):Boolean {
+        val token=generation;val documentToken=documentGeneration
+        return operations.withLock {withContext(NonCancellable){
+            if(token!=generation||documentToken!=documentGeneration||documentId!=document.id)return@withContext false
+            val session=reader ?: return@withContext false
+            publish(session.toggleDocumentControl(document.id,control),token)
+            token==generation&&documentToken==documentGeneration
+        }}
+    }
+    fun documentTap(document:DocumentFrame,x:Float,y:Float){
+        val token=generation
+        runOperation {if(token==generation)reader?.let {session->
+            val action=session.documentActivate(document.id,document.index,x,y)
+            when(action.kind){
+                "link"->{dismissInteraction();publish(session.followLink(action.target),token)}
+                "external","reference"->{documentGeneration++;documentId=null;mutable.update {it.copy(interaction=ReaderInteraction(action.kind,action.text,action.target,markup=action.markup))}}
+            }
+        }}
+    }
+
     fun focus(enabled:Boolean){
         val token=generation
         readerOperation { session->session.focusMode(enabled).also {
@@ -390,6 +448,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
                     else mutable.update {it.copy(chromeVisible=!it.chromeVisible)}
                 }
                 else->{
+                    documentGeneration++;documentId=null
                     val notes=if(result.kind=="annotation")session.annotations() else state.value.annotations
                     if(token==generation)mutable.update {it.copy(annotations=notes,interaction=ReaderInteraction(result.kind,result.text,result.target,frame,result.markup))}
                 }

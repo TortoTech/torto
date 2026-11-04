@@ -27,6 +27,41 @@ class ReadingIntegrationTest {
             core.saveReadingOptions(reading.copy(translated=true));assertTrue(core.readingOptions().translated)
         }finally{core.saveReadingOptions(original);core.close()}
     }
+    @Test fun nativeNotePagesUseReadingTypographyAndSelectionWithoutMovingBook():Unit=runBlocking {
+        val instrumentation=InstrumentationRegistry.getInstrumentation()
+        val context=instrumentation.targetContext
+        val core=MobileCore(File(context.filesDir,"core").absolutePath)
+        val before=core.books().map {it.id}.toSet()
+        val fixture=File(context.cacheDir,"native-notes.epub")
+        instrumentation.context.assets.open("reader-interactions.epub").use {input->fixture.outputStream().use {input.copyTo(it)}}
+        val book=core.importBook(fixture.absolutePath).first {it.title=="阅读交互测试"}
+        val reader=core.openBook(book.id,Viewport(360u,640u,2f))
+        try {
+            reader.configure(24f,true,false).close()
+            val progress=reader.page().use {it.info().progress}
+            val markup="**A reading note** with \\(x^2\\) and a [source](https://example.com)\n\n"+(0..25).joinToString("\n\n"){"Paragraph $it: long notes keep the reader typography and remain selectable."}
+            val viewport=Viewport(300u,240u,2f)
+            val first=reader.notePage(markup,1uL,0u,viewport,0xff000000u,0xfff8f5eeu)
+            val id=first.id
+            val total=first.total
+            first.page.use {page->
+                assertTrue(total>2u)
+                assertTrue(page.info().regions.any {it.text.contains("reading note")})
+                val bitmap=Bitmap.createBitmap(page.width().toInt(),page.height().toInt(),Bitmap.Config.ARGB_8888)
+                assertTrue(NativePixels.copyPage(page.id().toLong(),bitmap));bitmap.recycle()
+                val rect=page.info().regions.flatMap {it.bounds}.first()
+                val selected=reader.documentSelect(id,0u,rect.x+2,rect.y+rect.height/2,rect.x+80,rect.y+rect.height/2,null)
+                assertNotNull(selected);assertTrue(selected!!.text.isNotEmpty());assertTrue(selected.bounds.isNotEmpty())
+            }
+            reader.notePage(markup,1uL,total-1u,viewport,0xff000000u,0xfff8f5eeu).page.use {page->assertTrue(page.info().regions.any {it.text.contains("25:")})}
+            assertEquals(progress,reader.page().use {it.info().progress},0.000001)
+            reader.configure(34f,true,false).close()
+            val larger=reader.notePage(markup,1uL,0u,viewport,0xff000000u,0xfff8f5eeu)
+            assertTrue("Notes must inherit reader font size",larger.total>total);larger.page.close()
+            reader.closeDocument(id)
+            assertTrue(runCatching {reader.referencePage(id,0u,viewport,0xff000000u,0xfff8f5eeu)}.isFailure)
+        }finally {reader.shutdown();reader.close();if(book.id !in before)core.removeBook(book.id);core.close();fixture.delete()}
+    }
     private suspend fun checkProviderSettings(core:MobileCore){
         val original=core.aiOptions()
         var providerId:String?=null
@@ -123,7 +158,7 @@ class ReadingIntegrationTest {
                 info=PageInfo(section=0u,sectionCount=1u,page=0u,pageCount=1u,progress=0.0,
                     regions=emptyList(),marks=emptyList(),focusBounds=listOf(Rect(20f,200f,200f,60f)),
                     focusFadeColor=0x8CFFFFFFu,focusHighlight=false,isScroll=true,scrollDistance=0.0,
-                    scrollContext=9001uL,rasterTop=-pad,rasterHeight=height+2*pad,
+                    scrollContext=9001uL,controls=emptyList(),rasterTop=-pad,rasterHeight=height+2*pad,
                     previousFocus=FocusTarget(-120f,listOf(Rect(20f,80f,200f,60f))),
                     nextFocus=FocusTarget(120f,listOf(Rect(20f,320f,200f,60f))),focusIndex=1u,focusCount=3u,canGoBack=false)
                 view.present(ReaderFrame(bitmap!!,info,77uL),null)

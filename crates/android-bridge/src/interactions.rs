@@ -12,7 +12,7 @@ pub struct TouchAction {
     pub media: Option<Arc<MobilePage>>,
 }
 impl TouchAction {
-    fn new(kind: &str, text: String, target: String) -> Self {
+    pub(crate) fn new(kind: &str, text: String, target: String) -> Self {
         Self {
             kind: kind.into(),
             text,
@@ -111,7 +111,7 @@ pub(crate) fn focus_units_on(
     }
     units
 }
-fn linked(
+pub(crate) fn linked(
     section: &rebook_publication::Section,
     anchor: &SourceAnchor,
 ) -> Option<(PublicationUrl, LinkRole, String)> {
@@ -376,6 +376,9 @@ impl MobileReader {
                 let (x, y) = scroll::map_touch(s, x, y)?;
                 if let Some(url) = s.session.website_at_current_spread(x, y).map_err(error)? {
                     return Ok(TouchAction::new("external", String::new(), url));
+                }
+                if let Some(hit)=s.session.media_reference_at_current_spread(x,y).map_err(error)? {
+                    if let Some(target)=s.media.resolve(&hit.source,&hit.key){return documents::reference(s,target)}
                 }
                 if let Some(note) = note_at(s, x, y)? {
                     return Ok(note);

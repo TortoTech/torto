@@ -15,9 +15,12 @@ mod chat;
 mod chat_markup;
 mod chat_media;
 mod cloud;
+mod documents;
 mod interactions;
 mod maintenance;
 mod pixels;
+mod presentation;
+pub use presentation::ReadingControl;
 mod scroll;
 mod secrets;
 mod services;
@@ -124,6 +127,7 @@ pub struct PageInfo {
     pub raster_height: f32,
     pub previous_focus: Option<FocusTarget>,
     pub next_focus: Option<FocusTarget>,
+    pub controls: Vec<ReadingControl>,
     pub focus_index: u32,
     pub focus_count: u32,
     pub can_go_back: bool,
@@ -313,6 +317,7 @@ impl MobileCore {
             rebook_app_core::fonts::install(Arc::new(fonts.clone()));
             let settings =
                 rebook_app_core::plugins::PluginSettings::load_default().map_err(error)?;
+            let original=canonical.clone();
             let pipeline = rebook_app_core::reading::ReadingPipeline::new(
                 canonical,
                 &id,
@@ -323,7 +328,8 @@ impl MobileCore {
                 .translation
                 .set_enabled(options.translated)
                 .map_err(error)?;
-            let source: Arc<dyn BookSource> = pipeline.structure.clone();
+            let media=Arc::new(rebook_app_core::media::MediaReferenceSource::new(pipeline.structure.clone(),original));
+            let source: Arc<dyn BookSource> = media.clone();
             let mut session = ReaderSession::open_with_fonts(
                 source.clone(),
                 viewport,
@@ -354,6 +360,8 @@ impl MobileCore {
                     store,
                     book_id: id,
                     pipeline,
+                    media,
+                    document: None,
                     selected: None,
                     selection_mode: SelectionGranularity::Word,
                     tracker: rebook_app_core::statistics::Tracker::new(&book.id),
@@ -392,6 +400,8 @@ struct ReaderState {
     store: rebook_app_core::sync::SyncStore,
     book_id: String,
     pipeline: rebook_app_core::reading::ReadingPipeline,
+    media: Arc<rebook_app_core::media::MediaReferenceSource>,
+    document: Option<documents::Document>,
     selected: Option<rebook_reader::ReaderSelection>,
     selection_mode: SelectionGranularity,
     tracker: rebook_app_core::statistics::Tracker,
@@ -511,11 +521,14 @@ impl MobileReader {
                 let mut style = s.session.style();
                 settings::apply_typography(&mut style, &s.options);
                 style.typography.font_size = font_size;
-                style.typesetting.mode = if unified {
+                let mode = if unified {
                     TypesettingMode::Unified
                 } else {
                     TypesettingMode::Book
                 };
+                style.typesetting = rebook_app_core::reading::typesetting(&style.typesetting,mode);
+                let settings=rebook_app_core::plugins::PluginSettings::load_default().map_err(error)?;
+                s.pipeline.semantic.configure_presentation(&rebook_app_core::plugins::pdf_native::cache_identity(&s.book_id,s.pipeline.rewrite.as_ref()),&settings,unified);
                 if dark {
                     style.background = rebook_publication::Rgba {
                         red: 24,
@@ -535,7 +548,7 @@ impl MobileReader {
                 }
                 s.scroll_center = true;
                 scroll::invalidate(s);
-                s.session.set_style(style).map_err(error)?;
+                s.session.refresh_source_with_style(style).map_err(error)?;
                 render(s)
             })
         })
@@ -752,7 +765,9 @@ fn finish_page_info(
         }
     }
     s.store.save_progress(&s.book_id, &locator).map_err(error)?;
+    let controls=presentation::controls(s)?;
     Ok(PageInfo {
+        controls,
         section: state.location.section_index as u32,
         section_count: s.source.book().sections.len() as u32,
         page: state.location.page_index as u32,

@@ -367,7 +367,8 @@ pub(crate) fn recognize_work(s: &mut ReaderState, request: &chat::ChatRequest) -
         );
     }
     let mut style = s.session.style();
-    style.typesetting.mode = TypesettingMode::Unified;
+    style.typesetting = rebook_app_core::reading::typesetting(&style.typesetting,TypesettingMode::Unified);
+    s.pipeline.semantic.configure_presentation(&plugins::pdf_native::cache_identity(&s.book_id,s.pipeline.rewrite.as_ref()),&settings,true);
     s.session.refresh_source_with_style(style).map_err(error)?;
     s.scroll_center = true;
     scroll::invalidate(s);

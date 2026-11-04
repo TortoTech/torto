@@ -279,6 +279,7 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
         let id = jumped.id();
         drop(jumped);
         assert!(!pixels::registry().lock().unwrap().contains_key(&id));
+        native_document_pages(&reader).await;
         reader.clone().shutdown().await.unwrap();
         assert!(matches!(
             reader.clone().page().await,
@@ -288,6 +289,7 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
         drop(first);
         cached_translation_roundtrip(&core,&books[0].id).await;
         touch_and_focus(&core, &root).await;
+        media_and_presentation(&core,&root).await;
         advanced_reading(&core, &books[0].id).await;
         long_focus_continuation(&core,&root).await;
         retained_focus_chapter_boundaries(&core,&root).await;
@@ -1159,4 +1161,81 @@ async fn retained_focus_chapter_boundaries(core: &Arc<MobileCore>, root: &std::p
     assert_eq!(back.section,last.section);
     assert!((back.scroll_distance-last.scroll_distance).abs()<0.1);
     reader.shutdown().await.unwrap();
+}
+
+
+async fn native_document_pages(reader:&Arc<MobileReader>) {
+    let before=reader.clone().page().await.unwrap().info();
+    let markup=(0..45).map(|n|format!("Paragraph {n}: footnotes inherit the reader font and optimized composition.\n\n")).collect::<String>();
+    let viewport=Viewport {width:300,height:240,scale:1.0};
+    let first=reader.clone().note_page(markup.clone(),1,0,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
+    assert!(first.total>2,"long notes must remain scrollable");
+    assert!(first.page.info().regions.iter().any(|r|r.text.contains("Paragraph 0")));
+    let rect=first.page.info().regions.iter().flat_map(|r|&r.bounds).next().unwrap().clone();
+    let selection=reader.clone().document_select(first.id.clone(),0,rect.x+2.0,rect.y+rect.height/2.0,rect.x+50.0,rect.y+rect.height/2.0,None).await.unwrap().unwrap();
+    assert!(!selection.text.is_empty());assert!(!selection.bounds.is_empty());
+    let last=reader.clone().note_page(markup,1,first.total-1,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
+    assert_eq!(last.id,first.id);
+    assert!(last.page.info().regions.iter().any(|r|r.text.contains("44:")));
+    assert_eq!(reader.clone().page().await.unwrap().info().progress,before.progress,"preview must not move book progress");
+    reader.clone().close_document(first.id.clone()).await.unwrap();
+    assert!(reader.clone().reference_page(first.id,0,viewport.clone(),0xff000000,0xfff8f5ee).await.is_err());
+}
+
+async fn media_and_presentation(core:&Arc<MobileCore>,root:&std::path::Path) {
+    use std::io::Write;
+    use rebook_publication::{Block,Inline};
+    let path=root.join("media-controls.epub");
+    let body=r##"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Media</title></head><body><p>See Table 1.1 for measurements.</p><table id="t"><caption>Table 1.1 Measurements</caption><tr><th>Name</th><th>Value</th></tr><tr><td>A</td><td>2</td></tr><tr><td>B</td><td>4</td></tr></table><p><span class="math math-display">x</span></p><p>x is the position.</p></body></html>"##;
+    let mut zip=zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    for(name,content)in [
+        ("mimetype","application/epub+zip"),
+        ("META-INF/container.xml",r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="package.opf"/></rootfiles></container>"#),
+        ("package.opf",r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">mobile-media-controls</dc:identifier><dc:title>Media controls</dc:title><dc:language>en</dc:language></metadata><manifest><item id="body" href="body.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="body"/></spine></package>"#),
+        ("body.xhtml",body)
+    ]{zip.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(content.as_bytes()).unwrap();}zip.finish().unwrap();
+    let books=core.clone().import_book(path.to_string_lossy().into()).await.unwrap();
+    let book=books.iter().find(|b|b.title=="Media controls").unwrap();
+    let viewport=Viewport{width:360,height:640,scale:1.0};
+    let reader=core.clone().open_book(book.id.clone(),viewport.clone()).await.unwrap();
+    reader.clone().configure(20.0,true,false).await.unwrap();
+    assert!(reader.clone().prepare_media_references().await.unwrap());
+    assert!(!reader.clone().prepare_media_references().await.unwrap(),"catalog must be reused");
+    reader.clone().refresh_media_references().await.unwrap();
+    let (origin,key)=reader.with(|s|{
+        let section=s.source.parse_section(0).map_err(error)?;
+        let text=section.blocks.iter().flat_map(Block::text_blocks).next().unwrap();
+        let key=rebook_publication::media_references::MediaKey{kind:rebook_publication::media_references::MediaKind::Table,number:"1.1".into()};
+        Ok((text.source.clone().unwrap(),key))
+    }).unwrap();
+    let action=reader.with(|s|{let target=s.media.resolve(&origin,&key).unwrap();documents::reference(s,target)}).unwrap();
+    assert_eq!(action.kind,"reference");
+    let preview=reader.clone().reference_page(action.target.clone(),0,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
+    assert!(preview.page.info().regions.iter().any(|r|r.text.contains("Measurements")));
+    reader.with(|s|{
+        let original=s.pipeline.rewrite.parse_section(0).map_err(error)?;
+        let table=original.blocks.iter().find_map(|b|if let Block::Table(t)=b{t.source.clone()}else{None}).unwrap();
+        let (formula,latex)=original.blocks.iter().flat_map(Block::text_blocks).find_map(|t|t.content.iter().find_map(|i|if let Inline::Math(m)=i{Some((t.source.clone().unwrap(),m.latex.clone()))}else{None})).unwrap();
+        let fingerprint=plugins::semantic_layout::fingerprint(&original);
+        let recognition=serde_json::from_value(serde_json::json!({"fingerprint":fingerprint,"formulas_checked":true,"image_text_revision":999,"annotations":[
+            {"TableChart":{"source":table,"members":[table],"svg":"<svg xmlns='http://www.w3.org/2000/svg' width='200' height='100'><rect width='180' height='80' fill='green'/></svg>","language":"简体中文"}},
+            {"FormulaNotes":{"source":formula,"latex":latex,"language":"简体中文","notes":[{"symbol":"x","meaning":"位置","unit":"m","evidence":"x is the position.","known":true}]}}
+        ]})).unwrap();
+        assert!(s.pipeline.semantic.install_scope(0,&fingerprint,0..original.blocks.len(),recognition));
+        s.session.refresh_source().map_err(error)?;scroll::invalidate(s);Ok(())
+    }).unwrap();
+    let page=reader.clone().page().await.unwrap();
+    let controls=page.info().controls;
+    assert!(controls.iter().any(|c|c.kind=="formula"&&!c.active));
+    let chart=controls.iter().find(|c|c.kind=="chart").unwrap().clone();
+    assert!(!chart.active);
+    let updated=reader.clone().toggle_document_control(action.target.clone(),chart).await.unwrap();
+    assert!(updated.info().controls.iter().any(|c|c.kind=="chart"&&c.active));
+    let preview=reader.clone().reference_page(action.target.clone(),0,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
+    assert!(preview.controls.iter().any(|c|c.kind=="chart"&&c.active));
+    let formula=reader.clone().page().await.unwrap().info().controls.into_iter().find(|c|c.kind=="formula").unwrap();
+    let updated=reader.clone().toggle_reading_control(formula).await.unwrap();
+    assert!(updated.info().controls.iter().any(|c|c.kind=="formula"&&c.active));
+    reader.clone().close_document(action.target).await.unwrap();
+    reader.clone().shutdown().await.unwrap();
 }

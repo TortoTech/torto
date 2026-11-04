@@ -104,8 +104,7 @@ fn unified_heuristics_work_without_ai_and_book_mode_preserves_original_text() {
     )]);
     let inner = super::super::tests::original_source(original.clone());
     let source = SemanticLayoutSource::new(inner.clone(), inner);
-    source.configure("local-citations", &PluginSettings::default());
-    source.set_unified_citations(true);
+    source.configure_presentation("local-citations", &PluginSettings::default(),true);
     for _ in 0..2 {
         let displayed = source.parse_section(0).unwrap();
         let Block::Text(block) = &displayed.blocks[0] else {

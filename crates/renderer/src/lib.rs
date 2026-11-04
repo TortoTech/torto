@@ -2733,6 +2733,7 @@ fn table_region(table: &TablePlacement) -> Option<TableRegion> {
         .cells
         .iter()
         .filter_map(|cell| cell.text.as_ref()?.source.clone())
+        .chain(table.source.iter().cloned())
         .collect();
     Some(TableRegion {
         bounds,

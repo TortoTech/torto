@@ -9,6 +9,7 @@ pub mod generated_toc;
 pub mod highlights;
 pub mod http;
 pub mod library;
+pub mod media;
 pub mod persistence;
 pub mod plugins;
 pub mod preferences;

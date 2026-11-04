@@ -293,7 +293,8 @@ impl DesktopReader {
         style.typesetting = super::effective_typesetting(self.reading_mode, &settings.typesetting);
         self.selection_granularity = settings.selection_granularity;
         super::apply_theme_colors(&mut style, crate::ui::theme());
-        let citation_mode_changed = self.semantic_source.set_unified_citations(
+        let citation_mode_changed = self.semantic_source.configure_presentation(
+            &crate::plugins::pdf_native::cache_identity(&self.book_id,self.rewrite_source.as_ref()),&self.plugin_settings,
             style.focus_footnote_icons
                 && style.typesetting.mode == rebook_layout::TypesettingMode::Unified,
         );

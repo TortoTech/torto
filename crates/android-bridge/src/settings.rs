@@ -438,9 +438,9 @@ impl MobileReader {
                     .translation
                     .set_mode(settings.translation_mode)
                     .map_err(error)?;
-                s.pipeline.semantic.configure(
+                s.pipeline.semantic.configure_presentation(
                     &plugins::pdf_native::cache_identity(&s.book_id, s.pipeline.rewrite.as_ref()),
-                    &settings,
+                    &settings,s.session.style().typesetting.mode==TypesettingMode::Unified,
                 );
                 s.session.refresh_source().map_err(error)?;
                 s.scroll_center = true;

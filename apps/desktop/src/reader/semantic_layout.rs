@@ -356,12 +356,13 @@ impl DesktopReader {
             self.semantic_layout.groups.clear();
             self.semantic_layout.semantic_config = Some(semantic);
             if had_config {
-                self.semantic_source.configure(
+                self.semantic_source.configure_presentation(
                     &crate::plugins::pdf_native::cache_identity(
                         &self.book_id,
                         self.rewrite_source.as_ref(),
                     ),
                     &self.plugin_settings,
+                    self.reader.style().typesetting.mode==rebook_layout::TypesettingMode::Unified,
                 );
                 self.refresh_semantic_layout();
                 refreshed = true;

@@ -454,9 +454,8 @@ pub(crate) fn open_reader_staged(
         style.column_gap = 0.0;
     }
     apply_theme_colors(&mut style, crate::ui::theme());
-    semantic_source.set_unified_citations(
-        !fixed_page && style.typesetting.mode == rebook_layout::TypesettingMode::Unified,
-    );
+    semantic_source.configure_presentation(&crate::plugins::pdf_native::cache_identity(&book_id,rewrite_source.as_ref()),&plugin_settings,
+        !fixed_page && style.typesetting.mode==rebook_layout::TypesettingMode::Unified);
     let sync_settings = SyncSettings::load_default().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load WebDAV settings; using defaults");
         SyncSettings::new_device()

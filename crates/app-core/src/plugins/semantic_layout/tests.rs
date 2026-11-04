@@ -1788,3 +1788,37 @@ fn empty_citation_candidates_require_empty_ids_without_extracting_bibliography()
         .is_err()
     );
 }
+
+#[test]
+fn manual_scope_reopens_with_automatic_ai_disabled_and_preserves_model_identity() {
+    let raw=section(vec![text("q1","First quotation"),text("q2","Second quotation"),text("p","Claim (Just & Carpenter, 1992).")]);
+    let original=original_source(raw.clone());
+    let mut settings=PluginSettings::default();
+    settings.providers=vec![crate::plugins::AiProvider {
+        id:"local-test".into(),base_url:"https://example.invalid/v1".into(),api_key:"test-only".into(),
+        models:vec![crate::plugins::AiModelConfig::language("layout-test")],..Default::default()
+    }];
+    settings.semantic_layout.provider="local-test".into();settings.semantic_layout.model="layout-test".into();
+    settings.semantic_layout.enabled=false;
+    let id=format!("manual-reopen-{}",uuid::Uuid::new_v4());
+    let source=SemanticLayoutSource::new(original.clone(),original.clone());
+    assert!(source.configure_presentation(&id,&settings,true));
+    let scoped=scope_section(&raw,0..2);
+    let result=Recognition {fingerprint:fingerprint(&scoped),formulas_checked:true,image_text_revision:formulas::TEXT_REVISION,skipped_groups:0,
+        annotations:vec![annotation(&Proposal::Quote {body:vec![0,1],attribution:None,alignment:None},&raw)]};
+    assert!(source.install_scope(0,&fingerprint(&raw),0..2,result));
+    assert!(!source.configure_presentation(&id,&settings,true),"identical presentation must retain installed scopes");
+    let identity=source.cache_identity.read().unwrap().clone().unwrap();
+    let path=scope_presentation_path(&identity,&fingerprint(&raw)).unwrap();
+    assert!(path.exists());
+    drop(source);
+    let reopened=SemanticLayoutSource::new(original.clone(),original);
+    reopened.configure_presentation(&id,&settings,true);
+    let displayed=reopened.parse_section(0).unwrap();
+    assert!(matches!(&displayed.blocks[0],Block::Quote(q) if q.body.len()==2));
+    assert!(!settings.semantic_layout.enabled,"restoring presentation must not enable automatic model requests");
+    settings.semantic_layout.model="different-model".into();
+    reopened.configure_presentation(&id,&settings,true);
+    assert!(!matches!(reopened.parse_section(0).unwrap().blocks[0],Block::Quote(_)),"another model cannot reuse manual results");
+    std::fs::remove_file(path).unwrap();
+}

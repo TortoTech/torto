@@ -78,7 +78,7 @@ fn joined_table_caption_preserves_fragment_copy_hits_and_source_highlights() {
                 authored_alignment: None,
             };
             let mut table = TableBlock { visualization: None,
-                source: None,
+                source: block("table-root", "", TextBlockKind::Paragraph).source,
                 before: vec![],
                 after: vec![],
                 rows: vec![
@@ -98,6 +98,7 @@ fn joined_table_caption_preserves_fragment_copy_hits_and_source_highlights() {
             } else {
                 table.before.push(label);
             }
+            let root=table.source.clone().unwrap();
             let style = ReaderStyle {
                 spread: SpreadMode::Single,
                 typesetting: ReaderTypesetting::unified(),
@@ -112,6 +113,7 @@ fn joined_table_caption_preserves_fragment_copy_hits_and_source_highlights() {
                 )
                 .unwrap();
             let display = DisplayListCompiler.compile(&layout.pages[0]);
+            assert!(!display.source_table_bounds(std::slice::from_ref(&root)).is_empty(),"table root must remain available for chart controls");
             let mut indices = Vec::new();
             for range in [&label_source, &title_source] {
                 let (index, bytes) = (0..display.text_region_count())
@@ -286,6 +288,7 @@ fn table_page(
         items: vec![
             PageItem::Text(caption),
             PageItem::Table(TablePlacement {
+                source: None,
                 cells: vec![TableCellPlacement {
                     x: 20.0,
                     y: 50.0,

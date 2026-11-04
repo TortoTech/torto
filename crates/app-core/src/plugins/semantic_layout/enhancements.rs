@@ -105,6 +105,9 @@ fn same(a: &SourceRange, b: &SourceRange) -> bool {
 }
 
 impl SemanticLayoutSource {
+    pub fn formula_notes_visible(&self, sources: &[SourceRange]) -> bool {
+        self.formula_note_views.try_read().ok().is_some_and(|views|sources.iter().any(|source|views.contains(&format!("{:?}#{}",source.start.spine,source.start.node))))
+    }
     pub fn toggle_formula_notes(&self, sources: &[SourceRange]) -> bool {
         if self.formula_notes_for_sources(sources).is_empty() {
             return false;

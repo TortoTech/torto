@@ -160,6 +160,14 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     }
+                    state.frame?.info?.controls?.takeIf {it.isNotEmpty()}?.let {controls->
+                        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.Center){
+                            controls.forEach {control->TextButton(onClick={model.toggleReadingControl(control)},enabled=!state.busy&&!state.readerMoving){
+                                Text(if(control.kind=="formula")if(control.active)tr("收起公式备注","Hide formula notes") else tr("公式备注","Formula notes")
+                                    else if(control.active)tr("显示表格","Show table") else tr("显示图表","Show chart"))
+                            }}
+                        }
+                    }
                     val page=state.frame?.info
                     Text(page?.let {"${it.section+1u}/${it.sectionCount} · ${(it.progress*100).toInt()}%"+(if(state.focus&&it.focusCount>0u)" · ${it.focusIndex+1u}/${it.focusCount}" else "")} ?: "",Modifier.align(Alignment.CenterHorizontally).padding(vertical=4.dp),style=MaterialTheme.typography.labelSmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 } else when(route){
@@ -188,16 +196,11 @@ class MainActivity : ComponentActivity() {
         }
         state.interaction?.let {interaction->
             if(interaction.kind in listOf("image","formula"))MediaPreview(interaction,model::dismissInteraction,if(interaction.kind=="image"&&interaction.target.isNotEmpty())({model.attachBookImages(interaction.target);model.dismissInteraction();model.loadChat();panel="chat"})else null)
-            else if(interaction.kind=="note")ModalBottomSheet(onDismissRequest=model::dismissInteraction){
-                Column(Modifier.fillMaxWidth().heightIn(max=580.dp).verticalScroll(rememberScrollState()).padding(24.dp).navigationBarsPadding(),verticalArrangement=Arrangement.spacedBy(16.dp)){
-                    Text(tr("注释","Note"),style=MaterialTheme.typography.titleLarge)
-                    val assets=remember(interaction){AssistantAssetCache()}
-                    AssistantRichText(interaction.markup.ifBlank {interaction.text},assets){target->
-                        val uri=Uri.parse(target)
-                        if(uri.scheme in listOf("https","http"))context.startActivity(Intent(Intent.ACTION_VIEW,uri))
-                        else {model.followLink(target);model.dismissInteraction()}
-                    }
-                    if(interaction.target.isNotEmpty())TextButton(onClick={model.followLink(interaction.target);model.dismissInteraction()}){Text(tr("查看原文位置","Go to original note"))}
+            else if(interaction.kind in listOf("note","reference"))ModalBottomSheet(onDismissRequest=model::dismissInteraction,containerColor=MaterialTheme.colorScheme.surfaceContainerLow){
+                Column(Modifier.fillMaxWidth().padding(horizontal=24.dp).navigationBarsPadding(),verticalArrangement=Arrangement.spacedBy(12.dp)){
+                    Text(if(interaction.kind=="note")tr("注释","Note") else interaction.text,style=MaterialTheme.typography.titleLarge)
+                    ReadingDocument(interaction,model)
+                    if(interaction.kind=="note"&&interaction.target.isNotEmpty())TextButton(onClick={model.followLink(interaction.target);model.dismissInteraction()}){Text(tr("查看原文位置","Go to original note"))}
                 }
             }
         }

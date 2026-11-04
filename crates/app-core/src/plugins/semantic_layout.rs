@@ -507,10 +507,20 @@ impl SemanticLayoutSource {
         }
         result.fingerprint = full_hash.to_owned();
         let changed = !result.annotations.is_empty();
-        if let Ok(mut partial) = self.partial.write() {
+        // Persist displayed scopes separately from automatic chapter requests.
+        // Reopening a book must not require a model call to restore a manual page.
+        if let Ok(identity) = self.cache_identity.read()
+            && let Ok(mut partial) = self.partial.write()
+        {
+            if !partial.contains_key(&index) {cache_section(&mut partial,index,BTreeMap::new());}
             let groups = partial.entry(index).or_default();
             groups.retain(|(start, end), _| *end <= range.start || range.end <= *start);
+            if groups.len() >= 128 { if let Some(key)=groups.keys().next().copied(){groups.remove(&key);} }
             groups.insert((range.start, range.end), result);
+            if let Some(path)=identity.as_ref().and_then(|identity|scope_presentation_path(identity,full_hash)) {
+                let stored=groups.iter().map(|(&(start,end),result)|(start,end,result.clone())).collect::<Vec<_>>();
+                if let Err(error)=crate::persistence::write_json_atomic(&path,&stored){tracing::warn!(%error,"failed to cache displayed layout scopes");}
+            }
         }
         changed
     }
@@ -526,6 +536,20 @@ impl SemanticLayoutSource {
             self.clear();
             *identity = recognition_identity(book_id, settings);
         }
+    }
+
+    /// Cached presentation is independent of whether the host schedules AI work.
+    /// This method never invokes a model. Identities still validate model,
+    /// endpoint, language and content before any cached result can be applied.
+    pub fn configure_presentation(&self, book_id: &str, settings: &PluginSettings, unified: bool) -> bool {
+        if self.original.book().metadata.layout==rebook_publication::RenditionLayout::PrePaginated { return self.set_unified_citations(false); }
+        let mut effective=settings.clone();
+        effective.semantic_layout.enabled |= unified;
+        let identity=recognition_identity(book_id,&effective);
+        let changed=self.enabled.load(std::sync::atomic::Ordering::Relaxed)!=effective.semantic_layout.enabled
+            || self.cache_identity.read().ok().is_none_or(|old| *old!=identity);
+        if changed { self.configure(book_id,&effective); }
+        self.set_unified_citations(unified) || changed
     }
 
     /// Apply only inline citation structure to original translation input.
@@ -647,7 +671,7 @@ impl BookSource for SemanticLayoutSource {
             .read()
             .ok()
             .and_then(|state| state.get(&index).cloned());
-        let partial = self
+        let mut partial = self
             .partial
             .read()
             .ok()
@@ -676,6 +700,16 @@ impl BookSource for SemanticLayoutSource {
                     }
                 }
             }
+        }
+        if partial.is_none()
+            && let (Some(identity),Some((original,hash)))=(self.cache_identity.read().ok().and_then(|v|v.clone()),snapshot.as_ref())
+            && let Some(restored)=load_scope_presentation(&identity,original,hash)
+            && let Ok(current)=self.cache_identity.read()
+            && current.as_ref()==Some(&identity)
+            && let Ok(mut scopes)=self.partial.write()
+        {
+            cache_section(&mut scopes,index,restored.clone());
+            partial=Some(restored);
         }
         if let Some((original, hash)) = snapshot.as_ref() {
             let full = recognition
@@ -1144,6 +1178,19 @@ fn recognition_identity(book_id: &str, settings: &PluginSettings) -> Option<Valu
         true,
         true
     ]))
+}
+
+fn scope_presentation_path(identity:&Value,hash:&str)->Option<PathBuf> {
+    recognition_path(&json!([identity,"displayed-scopes-v1"]),hash)
+}
+fn load_scope_presentation(identity:&Value,original:&Section,hash:&str)->Option<BTreeMap<(usize,usize),Recognition>> {
+    let path=scope_presentation_path(identity,hash)?;
+    if std::fs::metadata(&path).ok()?.len()>4*1024*1024{return None}
+    let stored:Vec<(usize,usize,Recognition)>=serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if stored.len()>128{return None}
+    let groups=stored.into_iter().filter(|(start,end,result)|*start<*end&&*end<=original.blocks.len()&&result.fingerprint==hash)
+        .map(|(start,end,result)|((start,end),result)).collect::<BTreeMap<_,_>>();
+    (!groups.is_empty()).then_some(groups)
 }
 
 fn recognition_path(identity: &Value, hash: &str) -> Option<PathBuf> {
