@@ -40,9 +40,10 @@ const INITIAL_WIDTH: u32 = 1200;
 const INITIAL_HEIGHT: u32 = 800;
 const MOTION_DURATION: Duration = Duration::from_millis(180);
 const TOOLBAR_MOTION_DURATION: Duration = Duration::from_millis(200);
-const FOCUS_SCROLL_POINTS_PER_SECOND: f32 = 1_000.0;
-const FOCUS_SCROLL_MIN_DURATION: Duration = Duration::from_millis(160);
-const FOCUS_SCROLL_MAX_DURATION: Duration = Duration::from_millis(360);
+#[cfg(test)]
+const FOCUS_SCROLL_MIN_DURATION: Duration = rebook_app_core::focus_navigation::MIN_DURATION;
+#[cfg(test)]
+const FOCUS_SCROLL_MAX_DURATION: Duration = rebook_app_core::focus_navigation::MAX_DURATION;
 const FOCUS_UNIT_MIN_HEIGHT: f32 = 240.0;
 const FOCUS_TRAILING_SCROLL_SPACE: f32 = FOCUS_UNIT_MIN_HEIGHT / 2.0;
 const TOOLBAR_HIDE_DELAY: Duration = Duration::from_millis(500);
@@ -1882,8 +1883,7 @@ fn focus_unit_screen_center_y(
 }
 
 fn focus_scroll_duration(distance: f32) -> Duration {
-    let duration = Duration::from_secs_f32(distance.abs() / FOCUS_SCROLL_POINTS_PER_SECOND);
-    duration.clamp(FOCUS_SCROLL_MIN_DURATION, FOCUS_SCROLL_MAX_DURATION)
+    rebook_app_core::focus_navigation::duration(distance)
 }
 
 fn focus_scroll_target(
@@ -1893,35 +1893,7 @@ fn focus_scroll_target(
     step: f32,
     direction: PageDirection,
 ) -> Option<f32> {
-    let distance = (bottom - top).max(0.0);
-    let step_count = (distance / step.max(1.0)).ceil().max(1.0);
-    let balanced_step = distance / step_count;
-    let current_anchor = if balanced_step <= MOTION_EPSILON {
-        0.0
-    } else {
-        ((current - top) / balanced_step)
-            .round()
-            .clamp(0.0, step_count)
-    };
-    match direction {
-        PageDirection::Previous if current > top + FOCUS_SCROLL_BOUNDARY_EPSILON => {
-            let index = (current_anchor - 1.0).max(0.0);
-            Some(if index == 0.0 {
-                top
-            } else {
-                (top + index * balanced_step).max(top)
-            })
-        }
-        PageDirection::Next if current < bottom - FOCUS_SCROLL_BOUNDARY_EPSILON => {
-            let index = (current_anchor + 1.0).min(step_count);
-            Some(if index == step_count {
-                bottom
-            } else {
-                (top + index * balanced_step).min(bottom)
-            })
-        }
-        PageDirection::Previous | PageDirection::Next => None,
-    }
+    rebook_app_core::focus_navigation::overflow_target(current, top, bottom, step, matches!(direction, PageDirection::Next))
 }
 
 impl ScrollSectionLayout {

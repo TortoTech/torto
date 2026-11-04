@@ -23,7 +23,7 @@ import org.tortotech.torto.core.*
 import org.tortotech.torto.core.Annotation
 
 data class ReaderInteraction(val kind:String,val text:String,val target:String,val frame:ReaderFrame?=null,val markup:String="")
-data class ReaderFrame(val bitmap: Bitmap, val info: PageInfo)
+data class ReaderFrame(val bitmap: Bitmap, val info: PageInfo, val rasterId: ULong = 0uL)
 data class ScreenState(
     val books: List<BookSummary> = emptyList(), val loaded: Boolean = false, val active: BookSummary? = null,
     val frame: ReaderFrame? = null, val toc: List<TocItem> = emptyList(),
@@ -44,7 +44,7 @@ data class ScreenState(
     val chatContent: String = "", val chatReasoning: String = "", val chatActivity: String = "", val chatQuestion: String = "",
     val changes: List<ChatChange> = emptyList(), val translated: Boolean = false,
     val selectionMode: String = "word",
-    val interaction:ReaderInteraction?=null,val focus:Boolean=false,val chromeVisible:Boolean=true,
+    val interaction:ReaderInteraction?=null,val focus:Boolean=false,val chromeVisible:Boolean=true,val readerMoving:Boolean=false,
     val processing:Boolean=false,val autoLayout:Boolean=false,
     val appTheme: String = "system", val language: String = "system",
     val fontSize: Float = 20f, val unified: Boolean = false, val dark: Boolean = false,
@@ -262,7 +262,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     }
     fun processVisible(){
         val snapshot=state.value;val page=snapshot.frame?.info ?: return
-        if(snapshot.active==null||(!snapshot.autoLayout&&!snapshot.translated)||snapshot.chatWorking||snapshot.aiPaused||snapshot.selected!=null||snapshot.aiError!=null)return
+        if(snapshot.readerMoving||snapshot.active==null||(!snapshot.autoLayout&&!snapshot.translated)||snapshot.chatWorking||snapshot.aiPaused||snapshot.selected!=null||snapshot.aiError!=null)return
         val key="${snapshot.active.id}:${page.section}:${page.page}:${snapshot.fontSize}:${snapshot.unified}:${snapshot.autoLayout}:${snapshot.translated}:${page.regions.map {it.source}.hashCode()}"
         if(!processedPages.add(key))return
         while(processedPages.size>64)processedPages.remove(processedPages.first())
@@ -351,9 +351,12 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     }
     private suspend fun nativeFrame(page:MobilePage):ReaderFrame = withContext(Dispatchers.Default) {
         page.use {
-            val bitmap=Bitmap.createBitmap(page.width().toInt(),page.height().toInt(),Bitmap.Config.ARGB_8888)
-            check(NativePixels.copyPage(page.id().toLong(),bitmap)){"页面绘制失败"}
-            ReaderFrame(bitmap,page.info())
+            val rasterId=page.rasterId()
+            val retained=state.value.frame?.takeIf { it.rasterId==rasterId }
+            val bitmap=retained?.bitmap ?: Bitmap.createBitmap(page.width().toInt(),page.height().toInt(),Bitmap.Config.ARGB_8888).also {
+                check(NativePixels.copyPage(page.id().toLong(),it)){"页面绘制失败"}
+            }
+            ReaderFrame(bitmap,page.info(),rasterId)
         }
     }
     private suspend fun publish(page: MobilePage, token: Long = generation) {
@@ -397,6 +400,10 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         cancelAi()
         val token=generation
         runOperation { if(token==generation) reader?.let { it.readingActivity(true,true); publish(block(it),token) } }
+    }
+    fun readerMotion(active: Boolean) {
+        if(active)cancelAi()
+        mutable.update { it.copy(readerMoving=active) }
     }
     fun turn(forward: Boolean) = readerOperation { it.turn(forward) }
     fun scroll(delta:Float){

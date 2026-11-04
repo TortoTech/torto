@@ -3,6 +3,7 @@ pub mod credentials;
 pub mod diagnostics;
 pub mod environment;
 pub mod fonts;
+pub mod focus_navigation;
 pub mod generated_metadata;
 pub mod generated_toc;
 pub mod highlights;

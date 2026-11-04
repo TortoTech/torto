@@ -77,18 +77,105 @@ class ReadingIntegrationTest {
             val bitmap=Bitmap.createBitmap(720,1280,Bitmap.Config.ARGB_8888)
             val view=ReaderView(context);view.layout(0,0,720,1280)
             view.present(ReaderFrame(bitmap,info.copy(scrollDistance=0.0)),SelectedText("selected",listOf(Rect(30f,50f,80f,20f))))
-            var handle:Boolean?=null;var moved=false;var ended=false;var scrolled=0f
-            view.onHandleStart={handle=it};view.onHandleMove={_,_->moved=true};view.onHandleEnd={ended=true};view.onScroll={scrolled+=it}
+            var handle:Boolean?=null;var moved=false;var ended=false;var scrolled=0f;var turns=0
+            view.onHandleStart={handle=it};view.onHandleMove={_,_->moved=true};view.onHandleEnd={ended=true};view.onScroll={scrolled+=it};view.onTurn={turns++}
             val density=context.resources.displayMetrics.density;val start=android.os.SystemClock.uptimeMillis()
             fun event(action:Int,x:Float,y:Float,time:Long){val e=android.view.MotionEvent.obtain(start,time,action,x*density,y*density,0);view.onTouchEvent(e);e.recycle()}
             event(0,110f,76f,start);event(2,135f,90f,start+30);event(1,135f,90f,start+60)
             assertEquals(false,handle);assertTrue(moved&&ended)
             view.present(ReaderFrame(bitmap,info.copy(scrollDistance=0.0)),null)
-            event(0,160f,180f,start+100);event(2,160f,100f,start+140);event(1,160f,100f,start+180)
-            assertTrue(scrolled>0f)
+            event(0,160f,180f,start+100);event(2,160f,170f,start+300);event(1,160f,170f,start+500)
+            assertEquals("Short drags must return to the current block",0,turns)
+            event(0,160f,180f,start+600);event(2,160f,100f,start+640);event(1,160f,100f,start+680)
+            assertEquals("A swipe advances exactly one block",1,turns)
+            assertEquals("Touch moves must not trigger native rasterization",0f,scrolled,0f)
             view.onWindowFocusChanged(false);bitmap.recycle()
         }
     }
+    @Test(timeout=20000) fun focusDragUsesRetainedPixelsSnapsOnceAndStopsDrawing() {
+        val instrumentation=InstrumentationRegistry.getInstrumentation()
+        val monitor=instrumentation.addMonitor(MainActivity::class.java.name,null,false)
+        var activity:MainActivity?=null
+        var bitmap:Bitmap?=null
+        val idle=java.util.concurrent.CountDownLatch(1)
+        val moving=java.util.concurrent.atomic.AtomicBoolean()
+        val turns=java.util.concurrent.atomic.AtomicInteger()
+        val nativeScrolls=java.util.concurrent.atomic.AtomicInteger()
+        val draws=java.util.concurrent.atomic.AtomicInteger()
+        lateinit var view:ReaderView
+        lateinit var info:PageInfo
+        try {
+            android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand("am start -W -f 0x10008000 -n org.tortotech.torto.debug/org.tortotech.torto.MainActivity")).use {it.readBytes()}
+            activity=monitor.waitForActivityWithTimeout(5000) as? MainActivity
+            assertNotNull(activity)
+            instrumentation.runOnMainSync {
+                view=ReaderView(activity!!)
+                activity!!.setContentView(view)
+            }
+            instrumentation.waitForIdleSync()
+            android.os.SystemClock.sleep(300)
+            instrumentation.runOnMainSync {
+                assertTrue("Motion needs a real attached window",view.isShown&&view.hasWindowFocus())
+                val density=view.resources.displayMetrics.density
+                val height=view.height/density
+                val pad=160f
+                bitmap=Bitmap.createBitmap(view.width,view.height+(2*pad*density).toInt(),Bitmap.Config.ARGB_8888).apply {eraseColor(android.graphics.Color.rgb(40,80,120))}
+                info=PageInfo(section=0u,sectionCount=1u,page=0u,pageCount=1u,progress=0.0,
+                    regions=emptyList(),marks=emptyList(),focusBounds=listOf(Rect(20f,200f,200f,60f)),
+                    focusFadeColor=0x8CFFFFFFu,focusHighlight=false,isScroll=true,scrollDistance=0.0,
+                    scrollContext=9001uL,rasterTop=-pad,rasterHeight=height+2*pad,
+                    previousFocus=FocusTarget(-120f,listOf(Rect(20f,80f,200f,60f))),
+                    nextFocus=FocusTarget(120f,listOf(Rect(20f,320f,200f,60f))),focusIndex=1u,focusCount=3u,canGoBack=false)
+                view.present(ReaderFrame(bitmap!!,info,77uL),null)
+                view.onMotion={active->moving.set(active);if(!active)idle.countDown()}
+                view.onScroll={nativeScrolls.incrementAndGet()}
+                view.onTurn={forward->
+                    assertTrue(forward);turns.incrementAndGet()
+                    info=info.copy(scrollDistance=120.0,rasterTop=-pad-120f,focusBounds=listOf(Rect(20f,200f,200f,60f)))
+                    view.present(ReaderFrame(bitmap!!,info,77uL),null)
+                }
+                val start=android.os.SystemClock.uptimeMillis()
+                fun event(action:Int,y:Float,t:Long){android.view.MotionEvent.obtain(start,t,action,180f*density,y*density,0).also {view.onTouchEvent(it);it.recycle()}}
+                event(0,280f,start);event(2,210f,start+40)
+                assertTrue(moving.get());assertEquals(0,turns.get());assertEquals(0,nativeScrolls.get())
+                val output=Bitmap.createBitmap(view.width,view.height,Bitmap.Config.ARGB_8888)
+                try {
+                    view.draw(android.graphics.Canvas(output))
+                    assertNotEquals("Dragging must reveal cached content at the top edge",android.graphics.Color.WHITE,output.getPixel(2,2))
+                    assertNotEquals("Dragging must reveal cached content at the bottom edge",android.graphics.Color.WHITE,output.getPixel(2,view.height-3))
+                }finally{output.recycle()}
+                val clippedOutput=Bitmap.createBitmap(view.width,view.height+64,Bitmap.Config.ARGB_8888)
+                try {
+                    clippedOutput.eraseColor(android.graphics.Color.GREEN)
+                    val canvas=android.graphics.Canvas(clippedOutput);canvas.translate(0f,32f)
+                    view.draw(canvas)
+                    assertEquals("Overscan must not paint over the header",android.graphics.Color.GREEN,clippedOutput.getPixel(2,8))
+                    assertEquals("Overscan must not paint over the footer",android.graphics.Color.GREEN,clippedOutput.getPixel(2,view.height+48))
+                }finally{clippedOutput.recycle()}
+                event(1,210f,start+80)
+            }
+            assertTrue("Focus motion must settle",idle.await(2,java.util.concurrent.TimeUnit.SECONDS))
+            assertFalse(moving.get());assertEquals(1,turns.get());assertEquals(0,nativeScrolls.get())
+            // There must be no redraw timer left behind by the settled motion.
+            android.os.SystemClock.sleep(200)
+            instrumentation.runOnMainSync {view.viewTreeObserver.addOnDrawListener {draws.incrementAndGet()}}
+            instrumentation.waitForIdleSync();draws.set(0)
+            android.os.SystemClock.sleep(250)
+            assertEquals("Settled focus must stop repainting",0,draws.get())
+            instrumentation.runOnMainSync {
+                val density=view.resources.displayMetrics.density;val start=android.os.SystemClock.uptimeMillis()
+                fun event(action:Int,y:Float,t:Long){android.view.MotionEvent.obtain(start,t,action,180f*density,y*density,0).also {view.onTouchEvent(it);it.recycle()}}
+                event(0,280f,start);event(2,210f,start+40);event(3,210f,start+80)
+            }
+            android.os.SystemClock.sleep(450);instrumentation.waitForIdleSync()
+            assertFalse(moving.get());assertEquals("Cancelled gestures must not advance",1,turns.get())
+        }finally {
+            activity?.let {host->instrumentation.runOnMainSync {host.finish()}}
+            instrumentation.removeMonitor(monitor)
+            // The view can retain the bitmap until its final detached frame.
+        }
+    }
+
     @Test(timeout=20000) fun assistantFormatsWhileTokensContinue() {
         val instrumentation=InstrumentationRegistry.getInstrumentation()
         val text=androidx.compose.runtime.mutableStateOf("**持续回复**")

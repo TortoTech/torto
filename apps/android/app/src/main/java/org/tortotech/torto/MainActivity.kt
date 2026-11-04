@@ -85,8 +85,8 @@ class MainActivity : ComponentActivity() {
             "annotation"->{editing=state.annotations.firstOrNull {it.id==interaction.target};if(editing!=null)panel="note";model.dismissInteraction()}
         }}
     }
-    LaunchedEffect(state.active?.id,state.frame?.info?.section,state.frame?.info?.page,state.frame?.info?.regions?.map {it.source},state.autoLayout,state.translated,state.fontSize,state.unified,state.aiOptions,state.reading,state.settingsRevision,state.selected,panel,state.interaction?.kind,state.chatWorking,lifecycleState){
-        if(lifecycleState==Lifecycle.State.RESUMED&&panel==null&&state.interaction==null&&!state.chatWorking){delay(250);model.processVisible()}
+    LaunchedEffect(state.active?.id,state.frame?.info?.section,state.frame?.info?.page,state.frame?.info?.regions?.map {it.source},state.autoLayout,state.translated,state.fontSize,state.unified,state.aiOptions,state.reading,state.settingsRevision,state.selected,panel,state.interaction?.kind,state.chatWorking,state.readerMoving,state.processing,lifecycleState){
+        if(lifecycleState==Lifecycle.State.RESUMED&&panel==null&&state.interaction==null&&!state.chatWorking&&!state.readerMoving){delay(250);model.processVisible()}
     }
     DisposableEffect(lifecycle){
         model.applicationForeground(lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
@@ -149,7 +149,7 @@ class MainActivity : ComponentActivity() {
             Box(Modifier.fillMaxSize().padding(padding)) {
                 if(state.active!=null) Column(Modifier.fillMaxSize()) {
                     Box(Modifier.fillMaxWidth().weight(1f)){
-                    AndroidView(factory={ReaderView(it).apply {onSize=model::measure;onTap=model::tap;onTurn={next->if(!model.state.value.chatWorking)model.turn(next)};onScroll=model::scroll;onHandleStart=model::beginHandle;onHandleMove=model::dragHandle;onHandleEnd=model::endHandle;onSelect={x,y,ex,ey->if(!model.state.value.chatWorking)model.select(x,y,ex,ey)}}},update={it.present(state.frame,state.selected)},modifier=Modifier.fillMaxSize())
+                    AndroidView(factory={ReaderView(it).apply {onSize=model::measure;onMotion=model::readerMotion;onTap=model::tap;onTurn=model::turn;onScroll=model::scroll;onHandleStart=model::beginHandle;onHandleMove=model::dragHandle;onHandleEnd=model::endHandle;onSelect={x,y,ex,ey->if(!model.state.value.chatWorking)model.select(x,y,ex,ey)}}},update={it.isEnabled=!state.chatWorking;it.present(state.frame,state.selected)},modifier=Modifier.fillMaxSize())
                     if(state.processing||state.aiError!=null||state.aiPaused)Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow).padding(horizontal=16.dp,vertical=8.dp)){
                         if(state.processing){
                             val stage=when(state.aiStage){"translation"->tr("正在翻译","Translating");"layout"->tr("正在排版","Recognizing layout");"toc"->tr("正在翻译目录","Translating contents");"prefetch"->tr("正在预处理下一页","Processing next page");else->tr("准备处理","Preparing")}

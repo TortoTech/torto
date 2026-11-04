@@ -416,7 +416,7 @@ impl MobileReader {
                     });
                 s.scroll_offset = 0.0;
                 s.scroll_center = true;
-                s.scroll_slices.clear();
+                scroll::invalidate(s);
                 render(s)
             })
         })
@@ -444,7 +444,7 @@ impl MobileReader {
                 );
                 s.session.refresh_source().map_err(error)?;
                 s.scroll_center = true;
-                s.scroll_slices.clear();
+                scroll::invalidate(s);
                 render(s)
             })
         })

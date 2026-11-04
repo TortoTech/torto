@@ -347,13 +347,14 @@ pub(crate) fn preview_page(width: u32, height: u32, pixels: Vec<u8>) -> Arc<Mobi
             focus_index: 0,
             focus_count: 0,
             can_go_back: false,
+            ..Default::default()
         },
     )
 }
 
 pub(crate) fn follow(s: &mut ReaderState, target: &PublicationUrl) -> Result<Arc<MobilePage>> {
     s.scroll_center = true;
-    s.scroll_slices.clear();
+    scroll::invalidate(s);
     let locator = s.session.current_locator();
     s.session.go_to_href(target).map_err(error)?;
     s.history.push(locator);
@@ -480,7 +481,7 @@ impl MobileReader {
             self.with(|s| {
                 s.focus = enabled;
                 s.scroll_center = true;
-                s.scroll_slices.clear();
+                scroll::invalidate(s);
                 s.pipeline
                     .structure
                     .set_all_active(enabled && s.options.sentence_split)
@@ -507,7 +508,7 @@ impl MobileReader {
             self.with(|s| {
                 if let Some(locator) = s.history.last().cloned() {
                     s.scroll_center = true;
-                    s.scroll_slices.clear();
+                    scroll::invalidate(s);
                     s.session.restore_locator(&locator).map_err(error)?;
                     s.history.pop();
                     s.focus_anchor = None;

@@ -97,6 +97,15 @@ pub struct SelectedText {
     pub bounds: Vec<Rect>,
 }
 #[derive(Clone, uniffi::Record)]
+pub struct FocusTarget {
+    pub delta: f32,
+    pub bounds: Vec<Rect>,
+}
+#[uniffi::export]
+pub fn focus_motion_duration(distance: f32) -> u32 {
+    rebook_app_core::focus_navigation::duration(distance).as_millis() as u32
+}
+#[derive(Clone, Default, uniffi::Record)]
 pub struct PageInfo {
     pub section: u32,
     pub section_count: u32,
@@ -110,6 +119,11 @@ pub struct PageInfo {
     pub focus_highlight: bool,
     pub is_scroll: bool,
     pub scroll_distance: f64,
+    pub scroll_context: u64,
+    pub raster_top: f32,
+    pub raster_height: f32,
+    pub previous_focus: Option<FocusTarget>,
+    pub next_focus: Option<FocusTarget>,
     pub focus_index: u32,
     pub focus_count: u32,
     pub can_go_back: bool,
@@ -354,6 +368,8 @@ impl MobileCore {
                     root: self.root.clone(),
                     scroll_offset: 0.0,
                     scroll_distance: 0.0,
+                    scroll_context: scroll::context_id(),
+                    scroll_cache: None,
                     scroll_center: true,
                     scroll_slices: vec![],
                     selection_start: None,
@@ -390,6 +406,8 @@ struct ReaderState {
     root: PathBuf,
     scroll_offset: f32,
     scroll_distance: f64,
+    scroll_context: u64,
+    scroll_cache: Option<scroll::Cache>,
     scroll_center: bool,
     scroll_slices: Vec<scroll::Slice>,
     selection_start: Option<rebook_reader::ReaderTextHit>,
@@ -472,7 +490,7 @@ impl MobileReader {
         work(move || {
             self.with(|s| {
                 s.scroll_center = true;
-                s.scroll_slices.clear();
+                scroll::invalidate(s);
                 s.session.resize(viewport.validate()?).map_err(error)?;
                 render(s)
             })
@@ -516,7 +534,7 @@ impl MobileReader {
                     style.foreground = ReaderStyle::default().foreground;
                 }
                 s.scroll_center = true;
-                s.scroll_slices.clear();
+                scroll::invalidate(s);
                 s.session.set_style(style).map_err(error)?;
                 render(s)
             })
@@ -552,7 +570,7 @@ impl MobileReader {
             self.with(|s| {
                 let range: SourceRange = serde_json::from_str(&source).map_err(error)?;
                 s.scroll_center = true;
-                s.scroll_slices.clear();
+                scroll::invalidate(s);
                 let previous = s.session.current_locator();
                 s.session.go_to_source(&range.start).map_err(error)?;
                 s.history.push(previous);
@@ -695,18 +713,45 @@ fn page_info(s: &mut ReaderState) -> Result<PageInfo> {
             }
         });
     s.focus_last = false;
-    let focus_bounds = s
-        .focus_units
-        .get(index)
-        .map_or_else(Vec::new, |u| u.bounds.clone());
     s.focus_anchor = s
         .focus_units
         .get(index)
         .and_then(|u| u.ranges.first().cloned());
+    finish_page_info(s, regions, marks, index, false)
+}
+fn finish_page_info(
+    s: &mut ReaderState,
+    regions: Vec<TextRegion>,
+    marks: Vec<Rect>,
+    index: usize,
+    is_scroll: bool,
+) -> Result<PageInfo> {
+    let focus_bounds = s
+        .focus_units
+        .get(index)
+        .map_or_else(Vec::new, |u| u.bounds.clone());
     let state = s.session.snapshot();
-    s.store
-        .save_progress(&s.book_id, &s.session.current_locator())
-        .map_err(error)?;
+    let mut locator = s.session.current_locator();
+    if is_scroll && let Some(unit) = s.focus_units.get(index) {
+        let continuation = locator.source.as_ref().is_some_and(|leading| {
+            unit.ranges
+                .iter()
+                .any(|r| r.start.spine == leading.start.spine && r.start.node == leading.start.node)
+        });
+        if !continuation && let Some(anchor) = unit.ranges.first() {
+            locator.source = Some(anchor.clone());
+            if let Some(section) = s
+                .source
+                .book()
+                .sections
+                .iter()
+                .find(|p| p.id == anchor.start.spine)
+            {
+                locator.href = section.href.clone();
+            }
+        }
+    }
+    s.store.save_progress(&s.book_id, &locator).map_err(error)?;
     Ok(PageInfo {
         section: state.location.section_index as u32,
         section_count: s.source.book().sections.len() as u32,
@@ -717,8 +762,13 @@ fn page_info(s: &mut ReaderState) -> Result<PageInfo> {
         marks,
         focus_bounds,
         focus_highlight: s.options.focus_style == "highlight",
-        is_scroll: false,
+        is_scroll,
         scroll_distance: s.scroll_distance,
+        scroll_context: s.scroll_context,
+        raster_top: 0.0,
+        raster_height: s.session.viewport().height as f32,
+        previous_focus: None,
+        next_focus: None,
         focus_fade_color: {
             let paper = s.session.style().background;
             let alpha = ((1.0 - rebook_renderer::FOCUS_INACTIVE_OPACITY) * 255.0).round() as u32;

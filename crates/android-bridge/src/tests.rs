@@ -290,6 +290,7 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
         touch_and_focus(&core, &root).await;
         advanced_reading(&core, &books[0].id).await;
         long_focus_continuation(&core,&root).await;
+        retained_focus_chapter_boundaries(&core,&root).await;
         statistics_cloud_and_diagnostics(&core, &root, &books[0].id).await;
         drop(core);
         // The process-wide statistics worker can still own its SQLite handle
@@ -600,6 +601,11 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
         .collect::<Vec<_>>();
     let moved = reader.clone().scroll_by(500.0).await.unwrap();
     assert_eq!(moved.info().scroll_distance, 500.0);
+    assert_eq!(first.raster_id(), moved.raster_id(), "nearby scrolling must reuse retained pixels");
+    assert!(Arc::ptr_eq(&first.pixels, &moved.pixels));
+    assert!(moved.pixels.len() <= 24*1024*1024);
+    assert!(moved.info().raster_top < 0.0 && moved.info().raster_height > 640.0);
+
     assert_ne!(
         sources,
         moved
@@ -695,6 +701,25 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
             .with(|s| Ok((scroll::position(s), s.scroll_offset, s.focus_anchor.clone())))
             .unwrap()
     );
+    let target=reader.clone().search("Paragraph 0:".into()).await.unwrap()[0].source.clone();
+    let origin=reader.clone().go_to_source(target).await.unwrap();
+    let info=origin.info();
+    let next=reader.clone().turn(true).await.unwrap();
+    assert_eq!(next.info().scroll_context,info.scroll_context);
+    assert!((next.info().scroll_distance-info.scroll_distance-f64::from(info.next_focus.as_ref().unwrap().delta)).abs()<0.1);
+    let reversed=reader.clone().turn(false).await.unwrap();
+    assert!((reversed.info().scroll_distance-info.scroll_distance).abs()<0.1,"one-block movement must reverse to the same stop");
+    assert_eq!(origin.raster_id(),next.raster_id(),"one-block navigation must reuse the strip");
+    let target=origin.info().next_focus.unwrap();
+    let r=&target.bounds[0];
+    let clicked=reader.clone().activate(r.x+2.0,r.y+r.height/2.0).await.unwrap().media.unwrap();
+    assert!((clicked.info().scroll_distance-info.scroll_distance-f64::from(target.delta)).abs()<0.1,"tapping a block must move the retained viewport as well as its focus mask");
+    let context=clicked.info().scroll_context;
+    reader.clone().trim_memory().await.unwrap();
+    reader.with(|s| {assert!(s.scroll_cache.is_none());Ok(())}).unwrap();
+    let rebuilt=reader.clone().page().await.unwrap();
+    assert_eq!(rebuilt.info().scroll_context,context,"memory pressure must not reset motion coordinates");
+    assert_ne!(rebuilt.raster_id(),clicked.raster_id());
     reader.shutdown().await.unwrap();
 
     let providers = core.clone().providers().await.unwrap();
@@ -1100,4 +1125,38 @@ async fn statistics_cloud_and_diagnostics(
         .await
         .unwrap();
     server.stop();
+}
+
+async fn retained_focus_chapter_boundaries(core: &Arc<MobileCore>, root: &std::path::Path) {
+    use std::io::Write;
+    let path=root.join("focus-boundaries.epub");
+    let mut zip=zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    let files=[
+        ("mimetype","application/epub+zip".to_owned()),
+        ("META-INF/container.xml",r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="book.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#.into()),
+        ("book.opf",r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">focus-boundaries</dc:identifier><dc:title>Focus boundaries</dc:title><dc:language>en</dc:language></metadata><manifest><item id="a" href="a.xhtml" media-type="application/xhtml+xml"/><item id="b" href="b.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="a"/><itemref idref="b"/></spine></package>"#.into()),
+        ("a.xhtml",format!("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{}</body></html>",(0..10).map(|i|format!("<p>A block {i}: focus moves one paragraph at a time.</p>")).collect::<String>())),
+        ("b.xhtml",format!("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{}</body></html>",(0..10).map(|i|format!("<p>B block {i}: the next chapter remains continuous.</p>")).collect::<String>())),
+    ];
+    for (name,content) in files { zip.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(content.as_bytes()).unwrap(); }
+    zip.finish().unwrap();
+    let book=core.clone().import_book(path.to_string_lossy().into()).await.unwrap().into_iter().find(|b|b.title=="Focus boundaries").unwrap();
+    let reader=core.clone().open_book(book.id.clone(),Viewport {width:360,height:640,scale:1.0}).await.unwrap();
+    reader.clone().focus_mode(true).await.unwrap();
+    let source=reader.clone().search("A block 9:".into()).await.unwrap()[0].source.clone();
+    let last=reader.clone().go_to_source(source).await.unwrap().info();
+    let next=reader.clone().turn(true).await.unwrap().info();
+    assert_eq!(next.scroll_context,last.scroll_context,"crossing a chapter must preserve animation coordinates");
+    assert!(next.scroll_distance>last.scroll_distance);
+    assert_ne!(next.section,last.section,"the native source scope must follow the focused chapter");
+    reader.with(|s| {
+        let saved=s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator.source.unwrap();
+        assert_eq!(saved.start.spine,s.focus_anchor.as_ref().unwrap().start.spine);
+        assert_eq!(saved.start.node,s.focus_anchor.as_ref().unwrap().start.node);
+        Ok(())
+    }).unwrap();
+    let back=reader.clone().turn(false).await.unwrap().info();
+    assert_eq!(back.section,last.section);
+    assert!((back.scroll_distance-last.scroll_distance).abs()<0.1);
+    reader.shutdown().await.unwrap();
 }

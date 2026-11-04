@@ -196,6 +196,7 @@ impl MobileReader {
     pub async fn trim_memory(self: Arc<Self>) -> Result<()> {
         work(move || {
             self.with(|s| {
+                s.scroll_cache = None;
                 s.session
                     .set_cache_policy(rebook_reader::ReaderCachePolicy {
                         layout_bytes: 4 * 1024 * 1024,
@@ -301,7 +302,7 @@ pub(crate) fn translate_work(
     s.pipeline.translation.set_enabled(enabled).map_err(error)?;
     s.session.refresh_source().map_err(error)?;
     s.scroll_center = true;
-    s.scroll_slices.clear();
+    scroll::invalidate(s);
 
     Ok(())
 }
@@ -369,7 +370,7 @@ pub(crate) fn recognize_work(s: &mut ReaderState, request: &chat::ChatRequest) -
     style.typesetting.mode = TypesettingMode::Unified;
     s.session.refresh_source_with_style(style).map_err(error)?;
     s.scroll_center = true;
-    s.scroll_slices.clear();
+    scroll::invalidate(s);
 
     Ok(())
 }
@@ -492,6 +493,9 @@ impl MobileReader {
                 let original = s.session.current_locator();
                 let before = scroll::position(s);
                 let focus = s.focus_anchor.clone();
+                let distance = s.scroll_distance;
+                let context = s.scroll_context;
+                let cache = s.scroll_cache.take();
                 let offset = s.scroll_offset;
                 let center = s.scroll_center;
                 let slices = std::mem::take(&mut s.scroll_slices);
@@ -512,6 +516,9 @@ impl MobileReader {
                 })();
                 s.session.restore_locator(&original).map_err(error)?;
                 s.focus_anchor = focus;
+                s.scroll_distance = distance;
+                s.scroll_context = context;
+                s.scroll_cache = cache;
                 s.scroll_offset = offset;
                 s.scroll_center = center;
                 s.scroll_slices = slices;
