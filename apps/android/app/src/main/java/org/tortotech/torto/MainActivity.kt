@@ -171,10 +171,7 @@ class MainActivity : ComponentActivity() {
                     "book-statistics"->BookStatisticsScreen(state,model)
                     "about"->AboutScreen(state,model){open("licenses")}
                     "licenses"->LicenseScreen()
-                    else->if(tab==0)Column(Modifier.fillMaxSize()) {
-                        CloudSyncSummary(state.cloudStatus, Modifier.padding(horizontal=18.dp,vertical=8.dp))
-                        Box(Modifier.weight(1f)) { ShelfScreen(state,model){bookActions=it} }
-                    } else ProfileScreen(state,{open("settings")},{open("statistics")})
+                    else->if(tab==0)ShelfScreen(state,model){bookActions=it} else ProfileScreen(state,{open("settings")},{open("statistics")})
                 }
                     state.selected?.let {selection->
                         Row(Modifier.align(Alignment.BottomCenter).fillMaxWidth().horizontalScroll(rememberScrollState()).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal=12.dp),verticalAlignment=Alignment.CenterVertically){
