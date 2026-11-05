@@ -404,6 +404,18 @@ impl PageDisplayList {
         offset_x: f32,
         clip: Option<Rect>,
     ) -> Vec<ImageData> {
+        self.paint_image_layer_with_patch(scene, offset_x, clip, None)
+    }
+
+    /// A worker-rendered fixed-page viewport replaces pixels before translated
+    /// masks/glyphs and interaction overlays, preserving their paint order.
+    pub fn paint_image_layer_with_patch(
+        &self,
+        scene: &mut impl PaintScene,
+        offset_x: f32,
+        clip: Option<Rect>,
+        patch: Option<(&ImageData, Rect, Color)>,
+    ) -> Vec<ImageData> {
         let transform = Affine::translate((f64::from(offset_x), 0.0));
         let mut images = Vec::new();
         for command in &self.commands {
@@ -412,6 +424,23 @@ impl PageDisplayList {
                     && let Some(data) = image.paint_ready(scene, transform)
                 {
                     images.push(data);
+                    if let Some((data, bounds, background)) = patch
+                        && image.bounds.inflate(0.5, 0.5).contains_rect(bounds)
+                    {
+                        scene.push_clip_layer(Fill::NonZero, transform, &image.bounds);
+                        scene.fill(Fill::NonZero, transform, background, None, &bounds);
+                        scene.draw_image(
+                            ImageBrush::new(data.clone()).as_ref(),
+                            transform
+                                * Affine::translate((bounds.x0, bounds.y0))
+                                * Affine::scale_non_uniform(
+                                    bounds.width() / f64::from(data.width),
+                                    bounds.height() / f64::from(data.height),
+                                ),
+                        );
+                        scene.pop_layer();
+                        images.push(data.clone());
+                    }
                 }
             } else if command.paints_below_source_overlays() {
                 command.paint(scene, transform);

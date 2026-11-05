@@ -281,8 +281,66 @@ fn short_wire_keys_preserve_book_text_and_schema_roundtrips() {
 }
 
 #[test]
+fn formula_glossary_prefers_base_symbols_and_omits_undefined_entries() {
+    let raw = section(vec![
+        formula("display", "|A| + A + A_i + A_j + \\hat{p} + p", true),
+        text(
+            "definition",
+            "A is a matrix. A_i is row i. A_j is row j. p is probability. The estimator is p hat.",
+        ),
+    ]);
+    let (tables, formulas) = candidates(&raw);
+    let make = |symbol: &str, known| SymbolNote {
+        symbol: symbol.into(),
+        meaning: symbol.into(),
+        unit: String::new(),
+        evidence: if known {
+            "A is a matrix.".into()
+        } else {
+            String::new()
+        },
+        known,
+    };
+    let annotations = validate(
+        Output {
+            charts: vec![],
+            notes: vec![Notes {
+                id: 0,
+                notes: vec![
+                    make("|A|", true),
+                    make("A", true),
+                    make("A_i", true),
+                    make("A_j", true),
+                    make("p", false),
+                ],
+            }],
+        },
+        &tables,
+        &formulas,
+        "简体中文",
+    );
+    let Annotation::FormulaNotes { notes, .. } = &annotations[0] else {
+        panic!()
+    };
+    assert_eq!(
+        notes.iter().map(|n| n.symbol.as_str()).collect::<Vec<_>>(),
+        vec!["A", "A_i", "A_j"]
+    );
+    assert_eq!(note_symbol_key("\\left\\lVert A\\right\\rVert"), "A");
+    assert_eq!(note_symbol_key("P(A|B)"), "P(A|B)");
+    assert_ne!(note_symbol_key("\\hat{p}"), note_symbol_key("p"));
+}
+
+#[test]
 fn chart_toggle_keeps_table_cells_source_identity_and_immutable_resource() {
-    let raw = table();
+    let mut raw = table();
+    let Block::Table(corner_table) = &mut raw.blocks[0] else {
+        panic!()
+    };
+    let corner = &mut corner_table.rows[0].cells[0].text;
+    corner.content.clear();
+    let range = corner.source.as_mut().unwrap();
+    range.end = range.start.clone();
     let (tables, formulas) = candidates(&raw);
     let annotations = validate(
         Output {

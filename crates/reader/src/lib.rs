@@ -1,4 +1,5 @@
 //! Reader session with section, layout, and display-list caches.
+pub mod fixed_viewport;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -4517,13 +4518,29 @@ fn resolve_fragment_anchors(
     mut fragments: Vec<ContentFragment>,
     anchors: Vec<SectionAnchor>,
 ) -> (Vec<ContentFragment>, Vec<(String, usize)>) {
+    // Large KF8 documents can have tens of thousands of blocks and anchors.
+    // Resolve each anchor against only its node's ranges, retaining the old
+    // first-containing-fragment rule for split paragraphs and nested media.
+    let mut by_node: HashMap<String, Vec<(SourceRange, usize)>> = HashMap::new();
+    for (index, fragment) in fragments.iter().enumerate() {
+        let mut ranges = Vec::new();
+        for block in &fragment.blocks {
+            append_block_geometry_sources(block, &mut ranges);
+        }
+        for range in ranges {
+            by_node
+                .entry(range.start.node.clone())
+                .or_default()
+                .push((range, index));
+        }
+    }
     let mut resolved_anchors = Vec::with_capacity(anchors.len());
     for anchor in anchors {
-        let fragment_index = fragments
-            .iter()
-            .position(|fragment| {
-                fragment.blocks.iter().any(|block| {
-                    block_contains_source_anchor(block, &anchor.source)
+        let fragment_index = by_node
+            .get(&anchor.source.node)
+            .and_then(|entries| {
+                entries.iter().find_map(|(range, index)| {
+                    source_range_contains(range, &anchor.source).then_some(*index)
                 })
             })
             .unwrap_or(0);
@@ -5650,6 +5667,93 @@ pub enum ReaderError {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fragment_anchor_index_matches_recursive_lookup_for_large_and_split_sources() {
+        let spine = SpineItemId::new("chapter").unwrap();
+        let anchor = |node: &str, offset| SourceAnchor {
+            spine: spine.clone(),
+            node: node.into(),
+            text_offset: offset,
+        };
+        let text = |node: &str, start, end| TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "abcdef".into(),
+                style: Default::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: Some(SourceRange {
+                start: anchor(node, start),
+                end: anchor(node, end),
+            }),
+        };
+        let mut fragments = (0..1200)
+            .map(|n| ContentFragment {
+                blocks: vec![Block::Text(text(&format!("n{n}"), 0, 6))],
+                anchors: vec![],
+            })
+            .collect::<Vec<_>>();
+        fragments.push(ContentFragment {
+            blocks: vec![Block::Text(text("split", 0, 3))],
+            anchors: vec![],
+        });
+        fragments.push(ContentFragment {
+            blocks: vec![Block::Text(text("split", 3, 6))],
+            anchors: vec![],
+        });
+        fragments.push(ContentFragment {
+            blocks: vec![Block::Quote(rebook_publication::QuoteBlock {
+                body: vec![text("child", 0, 6)],
+                attribution: None,
+                source: None,
+            })],
+            anchors: vec![],
+        });
+        let mut targets = (0..1200)
+            .map(|n| anchor(&format!("n{n}"), 0))
+            .collect::<Vec<_>>();
+        targets.extend([
+            anchor("split", 0),
+            anchor("split", 3),
+            anchor("split", 5),
+            anchor("split", 6),
+            anchor("child", 2),
+            anchor("missing", 0),
+        ]);
+        let anchors = targets
+            .into_iter()
+            .enumerate()
+            .map(|(n, source)| SectionAnchor {
+                fragment: format!("a{n}"),
+                source,
+                page_label: None,
+            })
+            .collect::<Vec<_>>();
+        let expected = anchors
+            .iter()
+            .map(|a| {
+                (
+                    a.fragment.clone(),
+                    fragments
+                        .iter()
+                        .position(|f| {
+                            f.blocks
+                                .iter()
+                                .any(|b| block_contains_source_anchor(b, &a.source))
+                        })
+                        .unwrap_or(0),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (fragments, resolved) = resolve_fragment_anchors(fragments, anchors);
+        assert_eq!(resolved, expected);
+        assert_eq!(
+            fragments.iter().map(|f| f.anchors.len()).sum::<usize>(),
+            resolved.len()
+        );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 

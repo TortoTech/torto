@@ -1101,8 +1101,15 @@ fn apply_sentence_structure_mode(
         |inline| matches!(inline, Inline::Text(run) if !run.text.contains(['\n', '\r', '\t'])),
     );
     let mut content = Vec::new();
+    let chars = inline_text(&original).chars().collect::<Vec<_>>();
     for (index, atom) in atoms.iter().enumerate() {
-        if index > 0 {
+        let existing_break = chars[..atom.start]
+            .iter()
+            .rev()
+            .take_while(|c| c.is_whitespace())
+            .chain(chars[atom.start..].iter().take_while(|c| c.is_whitespace()))
+            .any(|c| matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}'));
+        if index > 0 && !existing_break {
             content.push(Inline::Break);
         }
         content.extend(slice_inlines(&original, atom.start, atom.end));
@@ -1168,6 +1175,71 @@ fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sentence_structure_keeps_authored_breaks_without_adding_blank_lines() {
+        let run = |text: &str| {
+            Inline::Text(TextRun {
+                text: text.into(),
+                style: Default::default(),
+                link: None,
+            })
+        };
+        for existing in [
+            vec![Inline::Break],
+            vec![run("\n")],
+            vec![Inline::Break, Inline::Break],
+        ] {
+            let expected_breaks = inline_text(&existing)
+                .chars()
+                .filter(|c| *c == '\n')
+                .count();
+            let mut original = vec![run("First sentence.")];
+            original.extend(existing);
+            original.push(run("Second sentence. Third sentence."));
+            let mut block = TextBlock {
+                kind: TextBlockKind::ListItem {
+                    ordered: false,
+                    ordinal: 1,
+                    depth: 0,
+                    marker_visible: true,
+                },
+                content: original,
+                style: Default::default(),
+                source: None,
+            };
+            let before = inline_text(&block.content);
+            apply_sentence_structure(&mut block, "en");
+            let after = inline_text(&block.content);
+            assert_eq!(
+                after.chars().filter(|c| *c == '\n').count(),
+                expected_breaks + 1
+            );
+            assert_eq!(after.replace('\n', ""), before.replace('\n', ""));
+            assert_eq!(after.contains("\n\n"), expected_breaks == 2);
+            assert!(block.style.sentence_indents);
+        }
+    }
+
+    #[test]
+    fn sentence_structure_keeps_titles_with_their_following_predicate() {
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "正如他在《为什么？如何解释？》中指出的那样，结果并不准确。下一句话。".into(),
+                style: Default::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        };
+        apply_sentence_structure(&mut block, "en");
+        assert_eq!(
+            inline_text(&block.content),
+            "正如他在《为什么？如何解释？》中指出的那样，结果并不准确。\n下一句话。"
+        );
+    }
+
 
     #[test]
     fn translated_sentences_before_years_are_structurable() {

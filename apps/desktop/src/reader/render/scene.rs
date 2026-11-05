@@ -139,6 +139,17 @@ fn evict_page_scene<T>(
 
 impl DesktopReader {
     pub(crate) fn page_scene(&mut self) -> ReaderScene {
+        let mut result = self.untransformed_page_scene();
+        let transform = self.pdf_view_affine();
+        if transform != Affine::IDENTITY {
+            let mut transformed = Scene::new();
+            transformed.append(&result.scene, Some(transform));
+            result.scene = Arc::new(transformed);
+        }
+        result
+    }
+
+    fn untransformed_page_scene(&mut self) -> ReaderScene {
         if self.is_scroll_mode() {
             return self.scroll_page_scene();
         }
@@ -146,20 +157,23 @@ impl DesktopReader {
         let mut scene = Scene::new();
         scene.append(&layers.underlay, None);
         let mut images = Vec::new();
+        let positions = self.reader.current_spread_positions().unwrap_or_default();
         match self.reader.current_spread() {
             Ok(spread) => {
                 let mut bridge = VelloScene::new(&mut scene);
-                images.extend(spread.primary.paint_image_layer_in(
+                images.extend(spread.primary.paint_image_layer_with_patch(
                     &mut bridge,
                     spread.primary_offset_x,
                     None,
+                    positions.first().and_then(|p|self.pdf_zoom.patch(p.section_index)).filter(|_|self.pdf_zoom_enabled()),
                 ));
                 self.paint_page_overlays(&spread.primary, &mut bridge, spread.primary_offset_x);
                 if let Some(secondary) = spread.secondary {
-                    images.extend(secondary.paint_image_layer_in(
+                    images.extend(secondary.paint_image_layer_with_patch(
                         &mut bridge,
                         spread.secondary_offset_x,
                         None,
+                        positions.get(1).and_then(|p|self.pdf_zoom.patch(p.section_index)).filter(|_|self.pdf_zoom_enabled()),
                     ));
                     self.paint_page_overlays(&secondary, &mut bridge, spread.secondary_offset_x);
                 }
@@ -221,10 +235,11 @@ impl DesktopReader {
                 clip.x1,
                 f64::from(visible_bottom - top + origin),
             ));
-            images.extend(entry.page.paint_image_layer_in(
+            images.extend(entry.page.paint_image_layer_with_patch(
                 &mut VelloScene::new(&mut page_scene),
                 0.0,
                 Some(visible_clip),
+                self.pdf_zoom.patch(entry.position.section_index).filter(|_|self.pdf_zoom_enabled()),
             ));
             page_scene.pop_layer();
             let transform = Affine::translate((

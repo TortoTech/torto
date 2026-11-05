@@ -16,7 +16,6 @@ pub(super) fn reusable_cell(block: &TextBlock) -> bool {
                     && run.style.footnote_number == 0
                     && run.style.link_role == LinkRole::Normal
                     && run.style.inline_role == InlineRole::Normal
-                    && run.style.display_writing_system.is_none()
             }
             Inline::Break => true,
             // Ruby, formulas, icons and note markers have width-dependent

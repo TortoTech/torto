@@ -4,7 +4,7 @@ use super::*;
 
 mod charts;
 const PROMPT: &str = include_str!("enhancements/prompt.md");
-pub(super) const REVISION: u32 = 1;
+pub(super) const REVISION: u32 = 2;
 pub(super) fn contract() -> Value {
     static CONTRACT: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
     CONTRACT
@@ -222,16 +222,10 @@ impl SemanticLayoutSource {
     }
 
     pub fn chart_anchor(&self, origin: &SourceRange) -> Option<SourceRange> {
-        let (root, active) = self.chart_control(origin)?;
-        if active {
-            return Some(root);
-        }
-        self.with_derived(|a| match a {
-            Annotation::TableChart {
-                source, members, ..
-            } if same(source, &root) => members.iter().find(|m| !same(m, source)).cloned(),
-            _ => None,
-        })
+        // Both presentations retain the table root's geometry. A cell anchor
+        // may have no geometry (for example an empty corner header), making
+        // the desktop reject the prepared layout and retry it indefinitely.
+        self.chart_control(origin).map(|(root, _)| root)
     }
     pub fn toggle_chart(&self, source: &SourceRange) -> bool {
         let Some((root, _)) = self.chart_control(source) else {
@@ -545,6 +539,31 @@ fn normalized_symbol(text: &str) -> String {
         .filter(|c| !c.is_whitespace() && *c != '{' && *c != '}')
         .collect()
 }
+// Only complete outer magnitude/norm wrappers are aliases. A_i, vectors,
+// estimators and bars inside P(A|B) retain their distinct identities.
+fn note_symbol_key(text: &str) -> String {
+    let normalized = normalized_symbol(text);
+    for (left, right) in [
+        ("\\lVert", "\\rVert"),
+        ("\\lvert", "\\rvert"),
+        ("\\|", "\\|"),
+        ("‖", "‖"),
+        ("||", "||"),
+        ("|", "|"),
+    ] {
+        if let Some(inner) = normalized
+            .strip_prefix(left)
+            .and_then(|s| s.strip_suffix(right))
+            && !inner.is_empty()
+            && !inner
+                .chars()
+                .any(|c| matches!(c, '|' | '‖' | '+' | '-' | '=' | '/' | '(' | ')'))
+        {
+            return inner.into();
+        }
+    }
+    normalized
+}
 fn short(text: &str, limit: usize) -> bool {
     !text.trim().is_empty()
         && text.chars().count() <= limit
@@ -682,8 +701,11 @@ fn validate(
             continue;
         }
         let mut symbols = HashSet::new();
-        let notes = result
-            .notes
+        let mut candidates = result.notes;
+        // Prefer a model's base definition when it also returned a redundant
+        // magnitude entry. Do not rewrite an isolated derived definition.
+        candidates.sort_by_key(|note| note_symbol_key(&note.symbol) != normalized_symbol(&note.symbol));
+        let notes = candidates
             .into_iter()
             .take(24)
             .filter(|note| {
@@ -692,11 +714,10 @@ fn validate(
                     && note.unit.len() <= 100
                     && note.evidence.len() <= 1500
                     && normalized_symbol(&formula.latex).contains(&normalized_symbol(&note.symbol))
-                    && (!note.known
-                        || !note.evidence.trim().is_empty()
-                            && formula.context.contains(&note.evidence))
-                    && (note.known || note.evidence.is_empty() && note.unit.is_empty())
-                    && symbols.insert(note.symbol.clone())
+                    && note.known
+                    && !note.evidence.trim().is_empty()
+                    && formula.context.contains(&note.evidence)
+                    && symbols.insert(note_symbol_key(&note.symbol))
             })
             .collect::<Vec<_>>();
         if !notes.is_empty() {

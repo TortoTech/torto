@@ -91,6 +91,26 @@ impl PdfModeSource {
 }
 
 impl BookSource for PdfModeSource {
+    fn fixed_page_points(&self, index: usize) -> Option<[f32; 2]> {
+        // UI geometry queries must never initialize an unopened PDF.
+        let generation = self.generation.load();
+        if !generation.enabled {
+            return None;
+        }
+        generation
+            .source
+            .get()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|source| source.fixed_page_points(index))
+    }
+    fn fixed_page_region(
+        &self,
+        index: usize,
+        region: [f32; 4],
+        pixels: [u32; 2],
+    ) -> Result<Option<RasterResource>, PublicationError> {
+        self.source()?.fixed_page_region(index, region, pixels)
+    }
     fn missing_font_resources(&self) -> bool {
         self.generation
             .load()
@@ -141,6 +161,7 @@ mod tests {
         book: Book,
     }
     impl BookSource for Stub {
+        fn fixed_page_points(&self, _: usize) -> Option<[f32; 2]> { Some([120.0,160.0]) }
         fn book(&self) -> &Book {
             &self.book
         }
@@ -159,6 +180,30 @@ mod tests {
             sections: Vec::new(),
             table_of_contents: Vec::new(),
         }
+    }
+
+    #[test]
+    fn viewport_geometry_never_initializes_an_unloaded_or_retired_pdf() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+        let source = PdfModeSource::new(book(), TableOfContentsOrigin::Embedded, None, move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::new(Stub { book: book() }))
+        });
+        assert_eq!(source.fixed_page_points(0), None);
+        assert_eq!(loads.load(Ordering::Relaxed), 0);
+        source.prepare().unwrap();
+        assert_eq!(source.fixed_page_points(0), Some([120.0, 160.0]));
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        let retired = source.retire();
+        assert_eq!(source.fixed_page_points(0), None);
+        assert!(
+            source
+                .fixed_page_region(0, [0., 0., 1., 1.], [100, 100])
+                .is_err()
+        );
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        drop(retired);
     }
 
     #[test]

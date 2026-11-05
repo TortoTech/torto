@@ -67,6 +67,7 @@ static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CHAT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 mod assistant;
+mod pdf_zoom;
 mod title_translations;
 #[cfg(test)]
 mod blank_lines_tests;
@@ -938,6 +939,7 @@ pub(super) struct DesktopReader {
     translation: TranslationUiState,
     pdf_toc: PdfTocUiState,
     pdf_ocr: PdfOcrUiState,
+    pdf_zoom: pdf_zoom::State,
     ui: ReaderUiState,
     canvas_size: Option<(u32, u32)>,
     scene_id: u64,
@@ -3349,7 +3351,10 @@ impl DesktopReader {
         let visible_is_pending = visible_position.is_some_and(|position| {
             visible_was_placeholder && !ready_placeholders.contains(&position)
         });
+        let pdf_preserving=self.pdf_zoom_enabled() && self.pdf_zoom.progress_lock.is_some_and(|offset|(offset-viewport.offset_y).abs()<0.1);
+        if !pdf_preserving { self.pdf_zoom.progress_lock=None; }
         if let Some(position) = visible_position
+            && !pdf_preserving
             && position != current
             && !visible_is_pending
         {
@@ -4415,6 +4420,7 @@ impl DesktopReader {
             translation: TranslationUiState::default(),
             pdf_toc,
             pdf_ocr,
+            pdf_zoom: Default::default(),
             ui: ReaderUiState {
                 classic_sidebar: chrome::SidebarState::default(),
                 opening_toolbar_pending: false,

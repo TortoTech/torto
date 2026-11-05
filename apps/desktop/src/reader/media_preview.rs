@@ -194,6 +194,10 @@ struct Cursor {
     chunk: usize,
     page: usize,
 }
+fn table_preview_width(available: f32) -> u32 {
+    (available - 64.0).clamp(1.0, 1440.0).floor() as u32
+}
+
 struct Job {
     generation: u64,
     source: Arc<dyn BookSource>,
@@ -203,6 +207,7 @@ struct Job {
     key: MediaKey,
     cursor: Cursor,
     style: ReaderStyle,
+    width: u32,
     ctx: egui::Context,
 }
 struct Ready {
@@ -431,7 +436,7 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
         .layout_blocks(
             job.source.as_ref(),
             &blocks,
-            LayoutViewport::new(1200, height).map_err(|e| e.to_string())?,
+            LayoutViewport::new(job.width, height).map_err(|e| e.to_string())?,
             &style,
         )
         .map_err(|e| e.to_string())?;
@@ -458,7 +463,7 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     let top = surface.map_or(0.0, |body| body.y);
     let height = surface.map_or_else(|| display.content_bottom().unwrap_or(100.0) + 8.0, |body| body.height)
         .ceil().clamp(1.0, height as f32) as usize;
-    let width = surface.map_or_else(|| rebook_layout::reading_content_width(1200.0, &style).ceil() as usize + 32, |body| body.width.ceil() as usize);
+    let width = surface.map_or_else(|| rebook_layout::reading_content_width(job.width as f32, &style).ceil() as usize + 32, |body| body.width.ceil() as usize);
     let left = surface.map_or_else(|| rebook_layout::reading_content_left(1200.0, &style) - 16.0, |body| body.x);
     if width * height * 4 > PIXEL_BUDGET {
         return Err("The preview exceeds the image memory limit.".into());
@@ -677,9 +682,19 @@ pub(super) struct MediaPreviewController {
     worker: Option<Worker>,
     active: Option<Preview>,
     restore_parent: bool,
+    content_version: u64,
+    presentation: Option<(u64, Option<u64>, ReaderStyle, u32)>,
 }
 
 impl MediaPreviewController {
+    pub(super) fn invalidate_content(&mut self) {
+        self.content_version = self.content_version.wrapping_add(1);
+        if let Some(worker) = &self.worker {
+            worker.generation.fetch_add(1, Ordering::AcqRel);
+            worker.pending.store(None);
+            worker.result.store(None);
+        }
+    }
     pub(super) fn with_links(links: Option<Arc<super::media_links::Source>>) -> Self {
         Self { links, ..Default::default() }
     }
@@ -869,6 +884,9 @@ impl super::DesktopReader {
         self.request_media_page(ctx, Cursor::default());
     }
     fn request_media_page(&mut self, ctx: &egui::Context, cursor: Cursor) {
+        let width = table_preview_width(ctx.content_rect().width());
+        let style = self.reader.style();
+        self.media_preview.presentation = Some((self.media_preview.content_version, self.source.content_revision(), style.clone(), width));
         let worker = self.media_preview.worker.get_or_insert_with(Worker::new);
         // One pending request and one result slot bound rapid close/reopen cycles.
         worker.result.store(None);
@@ -893,7 +911,8 @@ impl super::DesktopReader {
             origin: active.origin.clone(),
             key: active.key.clone(),
             cursor,
-            style: self.reader.style(),
+            style,
+            width,
             ctx: ctx.clone(),
         })));
         let _ = worker.tx.try_send(());
@@ -1008,10 +1027,10 @@ impl super::DesktopReader {
                 if active.motion.is_closing() { return; }
                 active.loading = false;
                 if completion.revision != self.source.content_revision() {
-                    active.texture = None;
-                    active.caption_textures.clear();
-                    active.error =
-                        Some("The book content changed. Please reopen the preview.".into());
+                    active.loading = true;
+                    // The next overlay frame queues the new revision. Keep the
+                    // old surface visible during that bounded replacement.
+                    ctx.request_repaint();
                     return;
                 }
                 match completion.result {
@@ -1069,6 +1088,15 @@ impl super::DesktopReader {
     }
 
     pub(super) fn media_preview_overlay(&mut self, ctx: &egui::Context) {
+        // Translation can complete while this popup is open. Re-measure its
+        // current content and reject older worker results, preserving the old
+        // texture until its replacement is ready. No parsing on the UI thread.
+        if self.media_preview.active.as_ref().is_some_and(|a| !a.motion.is_closing()) {
+            let stamp = (self.media_preview.content_version, self.source.content_revision(), self.reader.style(), table_preview_width(ctx.content_rect().width()));
+            if self.media_preview.presentation.as_ref().is_some_and(|previous| previous != &stamp) {
+                self.request_media_page(ctx, Cursor::default());
+            }
+        }
         let chart = self
             .media_preview
             .active

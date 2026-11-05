@@ -33,6 +33,8 @@ mod table_captions;
 mod media_captions;
 pub use table_captions::{Presentation as TablePresentation, presentation as table_presentation};
 mod table_shaping;
+mod table_widths;
+pub use table_widths::TableWidthStats;
 mod web_links;
 pub use raster_cache::{
     DeferredRaster, RasterCacheStats, RasterOrigin, clear_raster_cache, load_original_raster,
@@ -1147,6 +1149,7 @@ pub struct LayoutEngine {
     raster_target: [u32; 2],
     raster_generation: u64,
     deferred_images: bool,
+    table_widths: table_widths::Cache,
 }
 
 fn should_layout_flow_block(block: &Block, reader_style: &ReaderStyle) -> bool {
@@ -1383,6 +1386,7 @@ impl LayoutEngine {
             raster_target: [2048, 2048],
             raster_generation: raster_cache::generation(),
             deferred_images: false,
+            table_widths: table_widths::Cache::default(),
         }
     }
 
@@ -1413,6 +1417,10 @@ impl LayoutEngine {
 
     pub fn set_deferred_images(&mut self, enabled: bool) {
         self.deferred_images = enabled;
+    }
+    /// Lightweight worker-local counters for table layout performance audits.
+    pub fn table_width_stats(&self) -> TableWidthStats {
+        self.table_widths.stats()
     }
     pub fn deferred_images(&self) -> bool {
         self.deferred_images
@@ -2870,10 +2878,12 @@ impl LayoutEngine {
             let reusable = table_shaping::reusable_measurement(&block, &unwrapped);
             measured_cells.push(reusable.then_some(unwrapped));
         }
-        (
-            fit_adaptive_column_widths(&preferred_widths, &minimum_widths, content_width),
-            measured_cells,
-        )
+        let baseline = fit_adaptive_column_widths(&preferred_widths, &minimum_widths, content_width);
+        let widths = table_widths::optimize(
+            &mut self.table_widths, grid_cells, &measured_cells, &baseline,
+            &minimum_widths, &preferred_widths, content_width, reader_style, table_metrics.cell_padding,
+        );
+        (widths, measured_cells)
     }
 
     fn shape_text_with_min_width(
@@ -4217,10 +4227,7 @@ fn resolve_text_block_with_caption_emphasis<'a>(
             }
             TextBlockKind::ListItem { depth, .. } => {
                 resolved.style.margin_start =
-                    base_size * (profile.list_indent_em * (f32::from(depth) + 1.0)
-                        + if display_system == WritingSystem::Cjk {
-                            paragraph_indent_em(profile, display_system)
-                        } else { 0.0 });
+                    base_size * profile.list_indent_em * (f32::from(depth) + 1.0);
                 resolved.style.margin_start_fraction = 0.0;
             }
             TextBlockKind::DefinitionTerm { depth } => {
@@ -8800,6 +8807,117 @@ mod tests {
         let resolved = resolve_text_block(&block, &style, TextContext::Flow);
         assert!((resolved.style.margin_start - 30.0).abs() < 0.001);
         assert!(resolved.style.margin_start_fraction.abs() < 0.001);
+    }
+
+    #[test]
+    fn translated_lists_keep_the_same_level_indents_as_the_original() {
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..Default::default()
+        };
+        for depth in 0..3 {
+            let block = |display| TextBlock {
+                kind: TextBlockKind::ListItem {
+                    ordered: false,
+                    ordinal: 1,
+                    depth,
+                    marker_visible: true,
+                },
+                content: vec![Inline::Text(TextRun {
+                    text: "A list item".into(),
+                    style: TextStyle {
+                        display_writing_system: Some(display),
+                        ..Default::default()
+                    },
+                    link: None,
+                })],
+                style: Default::default(),
+                source: None,
+            };
+            let latin = block(WritingSystem::Latin);
+            let cjk = block(WritingSystem::Cjk);
+            let original = resolve_text_block(&latin, &style, TextContext::Flow);
+            let translated = resolve_text_block(&cjk, &style, TextContext::Flow);
+            assert_eq!(original.style.margin_start, translated.style.margin_start);
+            assert_eq!(original.style.indent, translated.style.indent);
+        }
+        let paragraph = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "中文正文".into(),
+                style: TextStyle {
+                    display_writing_system: Some(WritingSystem::Cjk),
+                    ..Default::default()
+                },
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        };
+        assert_eq!(
+            resolve_text_block(&paragraph, &style, TextContext::Flow)
+                .style
+                .indent,
+            style.typography.font_size * 2.0
+        );
+    }
+
+    #[test]
+    fn table_optimizer_reuses_widths_but_remeasures_translated_cell_text() {
+        let cell = |text: &str| TableCell {
+            text: TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: Default::default(),
+                    link: None,
+                })],
+                style: Default::default(),
+                source: None,
+            },
+            row_span: 1,
+            column_span: 1,
+            header: false,
+            authored_alignment: None,
+        };
+        let mut table = TableBlock {
+            visualization: None,
+            source: None,
+            before: vec![],
+            after: vec![],
+            rows: vec![
+                TableRow {
+                    cells: vec![
+                        cell("Label"),
+                        cell(
+                            "A description with many short words, which must wrap in a narrow table.",
+                        ),
+                    ],
+                },
+                TableRow {
+                    cells: vec![
+                        cell("Second label"),
+                        cell(
+                            "Another description with a different number of words and a longer explanation.",
+                        ),
+                    ],
+                },
+            ],
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..Default::default()
+        };
+        let mut engine = LayoutEngine::new();
+        let source = EmptySource::new("table-language");
+        let original = engine.shape_table(&source, &table, &style, 480.).unwrap();
+        assert!(original.column_widths.iter().sum::<f32>() <= 480.01);
+        let repeat = engine.shape_table(&source, &table, &style, 480.).unwrap();
+        assert_eq!(original.column_widths, repeat.column_widths);
+        table.rows[0].cells[0] = cell("翻译后的这一列现在包含很长的中文说明，需要重新分配宽度");
+        let translated = engine.shape_table(&source, &table, &style, 480.).unwrap();
+        assert_ne!(original.column_widths, translated.column_widths);
+        assert!(translated.column_widths.iter().sum::<f32>() <= 480.01);
     }
 
     #[test]

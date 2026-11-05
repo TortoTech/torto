@@ -203,10 +203,26 @@ Explicit adjacent continuations can share a chart. Reading and media previews
 provide Table/Chart buttons, initially showing the table. The original cells,
 source identities, translation inputs and text remain intact. Chart SVG generation
 runs on the layout worker and correctly uses zero as the baseline of signed bars.
+Switching either way restores the table root, whose geometry survives both
+presentations. Empty corner headers are not used as restoration anchors; they
+can lack text geometry and cause desktop background reflows to retry forever.
+The regression covers chart/table/chart switching before searching a source cell.
+macOS production-path verification uses the formal profile and the real
+*How We Read Now*, Table 1.1, with a model-generated Chinese chart. Two complete
+keyboard toggle cycles retain the same table focus. Settled logs show no repeated
+layout preparation; the existing one-second reader timer remains unchanged.
 
 Display-formula notes are generated during the same AI layout job, from nearby
 original text. A known meaning needs an exact evidence excerpt; undefined symbols
-remain explicitly undefined. Inline expressions do not receive notes. Notes are
+and unhelpful ordinary operators/constants are omitted. Meanings are concise noun
+phrases, without repeating the formula, background theory or unit text. The model
+explains base symbols once: `A`/`|A|` use `A`, and a vector and its norm share its
+base entry. Meaningful subscripts, vector/scalar differences and estimators remain
+distinct. Local validation prefers a valid base entry over redundant whole
+magnitude/norm wrappers, without stripping conditional-probability bars or changing
+an isolated derived definition. Prompt/policy fingerprints invalidate older
+verbose enhancement results; compact wire keys and target language are retained.
+Inline expressions do not receive notes. Notes are
 collapsed on each preview opening and formula change. The existing footnote
 shortcut (bare left Alt by default) toggles notes in an active formula preview;
 otherwise it keeps its normal footnote behavior. Bare-Alt combinations are not

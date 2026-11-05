@@ -142,7 +142,7 @@ impl DesktopReader {
         (!ranges.is_empty() && !text.is_empty()).then_some((ranges, text))
     }
 
-    fn hit_test_canvas(
+    pub(in crate::reader) fn hit_test_canvas(
         &mut self,
         x: f32,
         y: f32,

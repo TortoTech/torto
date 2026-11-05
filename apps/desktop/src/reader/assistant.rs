@@ -2601,6 +2601,7 @@ impl DesktopReader {
     }
 
     pub(super) fn refresh_translation_view(&mut self) {
+        self.media_preview.invalidate_content();
         let preserve_scroll_offset = self.is_scroll_mode() && self.scroll_viewport.is_some();
         match self.reader.refresh_source() {
             Ok(snapshot) => {

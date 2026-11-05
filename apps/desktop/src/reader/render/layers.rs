@@ -556,7 +556,7 @@ mod tests {
 
 impl DesktopReader {
     pub(crate) fn layered_scene(&mut self) -> Option<LayeredReaderScene> {
-        if self.completion.is_some() {
+        if self.completion.is_some() || self.pdf_zoom_enabled() {
             return None;
         }
         let mut result = LayeredReaderScene { layers: Vec::new() };

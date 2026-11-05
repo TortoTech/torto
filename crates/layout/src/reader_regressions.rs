@@ -89,7 +89,7 @@ fn copyright_heading_keeps_its_authored_center_alignment() {
 }
 
 #[test]
-fn translated_cjk_list_markers_start_inside_the_paragraph_text_column() {
+fn translated_cjk_list_markers_use_the_shared_level_indent() {
     let mut item = text("翻译后的列表项目");
     item.kind = TextBlockKind::ListItem {
         depth: 0,
@@ -105,8 +105,8 @@ fn translated_cjk_list_markers_start_inside_the_paragraph_text_column() {
         run.style.display_writing_system = Some(WritingSystem::Cjk);
     }
     let resolved = resolve_text_block(&item, &style, TextContext::Flow);
-    assert!(
-        resolved.style.margin_start
-            > style.typography.font_size * style.typesetting.paragraph_indent_em
+    assert_eq!(
+        resolved.style.margin_start,
+        style.typography.font_size * style.typesetting.list_indent_em
     );
 }

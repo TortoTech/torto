@@ -83,6 +83,26 @@ pub trait BookSource: Send + Sync {
             .map_or(Ok(None), |inner| inner.fixed_page_dimensions(section_index))
     }
 
+    /// Original fixed-page size in PDF points. Memory-only; no rasterization.
+    fn fixed_page_points(&self, index: usize) -> Option<[f32; 2]> {
+        self.inner_source()
+            .and_then(|inner| inner.fixed_page_points(index))
+    }
+
+    /// Worker-only high-resolution viewport raster. `region` is normalized
+    /// page x/y/width/height; output is bounded to the requested visible pixels.
+    /// This does not replace or invalidate the ordinary whole-page resource.
+    fn fixed_page_region(
+        &self,
+        index: usize,
+        region: [f32; 4],
+        pixels: [u32; 2],
+    ) -> Result<Option<RasterResource>, PublicationError> {
+        self.inner_source().map_or(Ok(None), |inner| {
+            inner.fixed_page_region(index, region, pixels)
+        })
+    }
+
     /// Dimensions of a source-owned raster, without generating its pixels.
     /// Such resources must be immutable for the publication ID and revision;
     /// this lets interactive readers schedule materialization after layout.

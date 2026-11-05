@@ -178,6 +178,11 @@ fn table_measurement_reuse_matches_fresh_shaping_including_bidi_and_hard_breaks(
                     },
                     link: None,
                 }));
+                if value.contains('中') {
+                    for inline in &mut block.content {
+                        if let Inline::Text(run)=inline { run.style.display_writing_system=Some(WritingSystem::Cjk); }
+                    }
+                }
                 assert!(table_shaping::reusable_cell(&block));
                 for width in [50.0, 115.0, 320.0] {
                     let measured = engine.shape_table_cell(&block, &style, 16_384.0, 8.0, &[], None);
@@ -286,10 +291,6 @@ fn complex_table_content_keeps_width_dependent_preparation() {
         },
         TextStyle {
             inline_role: InlineRole::Footnote,
-            ..Default::default()
-        },
-        TextStyle {
-            display_writing_system: Some(WritingSystem::Cjk),
             ..Default::default()
         },
     ] {

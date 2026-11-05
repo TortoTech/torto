@@ -1001,6 +1001,7 @@ impl DesktopReader {
         false
     }
     pub(super) fn refresh_semantic_layout(&mut self) {
+        self.media_preview.invalidate_content();
         self.refresh_preview_formula_notes();
         self.semantic_layout.reflow_version += 1;
         self.semantic_layout.reflow_dirty = true;
