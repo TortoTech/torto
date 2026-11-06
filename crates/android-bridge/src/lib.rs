@@ -16,8 +16,10 @@ mod chat_markup;
 mod chat_media;
 mod cloud;
 mod documents;
+mod feedback;
 mod interactions;
 mod maintenance;
+mod mobile_source;
 mod pixels;
 mod presentation;
 mod reflow;
@@ -322,19 +324,17 @@ impl MobileCore {
                 .find(|book| book.id == id)
                 .ok_or_else(|| error("Book not found"))?;
             let publication = rebook_formats::open_file(&book.path).map_err(error)?;
-            let canonical = publication.source();
+            let canonical = mobile_source::for_reading(publication.source());
             let options = settings::load_reading(&self.root);
             let mut style = ReaderStyle::default();
             style.spread = SpreadMode::Single;
             style.focus_footnote_icons = true;
-            style.horizontal_margin = 20.0;
             style.minimum_content_width = 0.0;
-            style.top_margin = 16.0;
-            style.bottom_margin = 16.0;
             style.typography.font_size = 20.0;
             style.typography.monospace_font = "monospace".into();
             style.typography.sans_serif_font = "sans-serif".into();
             settings::apply_typography(&mut style, &options);
+            apply_mobile_page_margins(&mut style);
             let fonts =
                 rebook_app_core::fonts::store::load(&self.root.join("fonts"), Default::default());
             rebook_app_core::fonts::install(Arc::new(fonts.clone()));
@@ -736,6 +736,7 @@ fn clear_selection_state(s: &mut ReaderState) {
 }
 fn apply_presentation_mode(s: &mut ReaderState, style: &mut ReaderStyle) -> Result<()> {
     style.typesetting = rebook_app_core::reading::effective_typesetting(s.focus, &s.classic_typesetting);
+    apply_mobile_page_margins(style);
     let settings = rebook_app_core::plugins::PluginSettings::load_default().map_err(error)?;
     s.pipeline.semantic.configure_presentation(
         &rebook_app_core::plugins::pdf_native::cache_identity(&s.book_id, s.pipeline.rewrite.as_ref()),
@@ -743,6 +744,13 @@ fn apply_presentation_mode(s: &mut ReaderState, style: &mut ReaderStyle) -> Resu
         style.typesetting.mode == TypesettingMode::Unified,
     );
     Ok(())
+}
+fn apply_mobile_page_margins(style: &mut ReaderStyle) {
+    // All mobile reading modes share the same app frame; authored block spacing
+    // remains part of the book's own layout.
+    style.horizontal_margin = 20.0;
+    style.top_margin = 16.0;
+    style.bottom_margin = 16.0;
 }
 fn render(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
     if s.enhancements.dirty {

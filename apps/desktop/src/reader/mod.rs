@@ -1194,86 +1194,9 @@ fn focus_footnote_text(
 
 
 
-fn focus_footnote_translation_ranges_in_section(
-    section: &Section,
-    target: &PublicationUrl,
-) -> Vec<SourceRange> {
-    let Some(fragment) = target.fragment() else {
-        return Vec::new();
-    };
-    let Some(anchor) = section
-        .anchors
-        .iter()
-        .find(|anchor| anchor.fragment == fragment)
-        .map(|anchor| &anchor.source)
-    else {
-        return Vec::new();
-    };
-    let target_block = section
-        .blocks
-        .iter()
-        .find_map(|block| note_definition_containing_anchor(block, anchor))
-        .or_else(|| {
-            section
-                .blocks
-                .iter()
-                .find_map(|block| find_block_containing_anchor(block, anchor))
-        });
-    let Some(target_block) = target_block else {
-        return Vec::new();
-    };
-    let mut ranges = Vec::new();
-    collect_focus_footnote_translation_ranges(target_block, &mut ranges);
-    ranges
+fn focus_footnote_translation_ranges_in_section(section: &Section, target: &PublicationUrl) -> Vec<SourceRange> {
+    rebook_app_core::reading_text::focus_footnote_translation_ranges_in_section(section, target)
 }
-
-fn collect_focus_footnote_translation_ranges(block: &Block, ranges: &mut Vec<SourceRange>) {
-    let mut push_text = |text: &TextBlock| {
-        if let Some(range) = &text.source
-            && !ranges.contains(range)
-        {
-            ranges.push(range.clone());
-        }
-    };
-    match block {
-        Block::Text(text) => push_text(text),
-        Block::Quote(quote) => {
-            for text in quote.body.iter().chain(quote.attribution.iter()) {
-                push_text(text);
-            }
-        }
-        Block::Table(table) => {
-            for text in table.text_blocks() {
-                push_text(text);
-            }
-        }
-        Block::Figure(figure) => {
-            for caption in figure.text_blocks() {
-                push_text(caption);
-            }
-        }
-        Block::Note(note) => {
-            for child in &note.blocks {
-                collect_focus_footnote_translation_ranges(child, ranges);
-            }
-        }
-        Block::Image(image) => {
-            if let Some(range) = &image.source
-                && !ranges.contains(range)
-            {
-                ranges.push(range.clone());
-            }
-        }
-        Block::Separator(_) | Block::LineBreak | Block::PageBreak => {}
-    }
-}
-
-
-
-
-
-
-
 
 
 fn markdown_table_cell(text: &str) -> String {

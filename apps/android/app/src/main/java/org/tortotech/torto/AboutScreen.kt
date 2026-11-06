@@ -13,7 +13,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import org.tortotech.torto.core.updateReleaseNotes
 
-@Composable fun AboutScreen(state:ScreenState,model:ReaderModel,licenses:()->Unit={}){
+@Composable fun AboutScreen(state:ScreenState,model:ReaderModel,licenses:()->Unit={},feedback:()->Unit={}){
     val context=LocalContext.current
     val cache=remember{AssistantAssetCache()}
     val language=tr("zh-CN","en")
@@ -45,7 +45,7 @@ import org.tortotech.torto.core.updateReleaseNotes
         SectionLabel(tr("诊断与反馈","Diagnostics and feedback"))
         SettingsGroup {
             SettingsItem(tr("导出诊断日志","Export diagnostic log"),enabled=!state.busy){model.exportDiagnostics(context)}
-            SettingsItem(tr("反馈问题","Report an issue")){context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse("https://github.com/TortoTech/torto/issues")))}
+            SettingsItem(tr("反馈问题","Report an issue"),onClick=feedback)
         }
         SectionLabel(tr("相关链接","Links"))
         SettingsGroup {

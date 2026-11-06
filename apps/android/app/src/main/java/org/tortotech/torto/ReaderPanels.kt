@@ -25,8 +25,8 @@ import androidx.compose.ui.unit.dp
     LaunchedEffect(Unit){model.loadFonts();model.loadServices()}
     val families=state.fontFamilies
     Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp).navigationBarsPadding(),verticalArrangement=Arrangement.spacedBy(12.dp)) {
-        if(state.active!=null||!state.focus)SettingsGroup {
-            if(state.active!=null)SettingToggle(tr("专注模式","Focus mode"),state.focus,!state.busy){model.focus(it)}
+        if(state.active!=null&&state.focusAvailable||!state.focus)SettingsGroup {
+            if(state.active!=null&&state.focusAvailable)SettingToggle(tr("专注模式","Focus mode"),state.focus,!state.busy){model.focus(it)}
             if(!state.focus)SettingToggle(tr("统一版式","Unified layout"),state.unified,!state.busy){model.configure(size,it,state.dark)}
         }
         if(options!=null){

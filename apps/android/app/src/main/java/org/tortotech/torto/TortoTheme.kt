@@ -22,13 +22,15 @@ import androidx.compose.ui.unit.dp
 
 internal val ReaderMonospace=staticCompositionLocalOf {android.graphics.Typeface.MONOSPACE}
 private val Chinese = staticCompositionLocalOf { true }
+internal val BrandGreen=Color(0xFF07C160)
+@Composable internal fun brandControlColor()=if(MaterialTheme.colorScheme.background.luminance()>.5f)BrandGreen else MaterialTheme.colorScheme.primary
 @Composable fun tr(chinese: String, english: String) = if (Chinese.current) chinese else english
 
-// Match the desktop Palette accents; surrounding UI surfaces stay neutral.
+// Vivid brand controls and accessible green text; surrounding surfaces stay neutral.
 private val LightColors=lightColorScheme(
-    primary=Color(0xFF448967),onPrimary=Color.White,primaryContainer=Color(0xFFDEECE4),onPrimaryContainer=Color(0xFF193C2A),inversePrimary=Color(0xFF8AC5A2),
-    secondary=Color(0xFF448967),onSecondary=Color.White,secondaryContainer=Color(0xFFE7F1EB),onSecondaryContainer=Color(0xFF254632),
-    tertiary=Color(0xFF448967),onTertiary=Color.White,tertiaryContainer=Color(0xFFDEECE4),onTertiaryContainer=Color(0xFF193C2A),
+    primary=Color(0xFF078A46),onPrimary=Color.White,primaryContainer=Color(0xFFDEECE4),onPrimaryContainer=Color(0xFF193C2A),inversePrimary=Color(0xFF8AC5A2),
+    secondary=Color(0xFF078A46),onSecondary=Color.White,secondaryContainer=Color(0xFFE7F1EB),onSecondaryContainer=Color(0xFF254632),
+    tertiary=Color(0xFF078A46),onTertiary=Color.White,tertiaryContainer=Color(0xFFDEECE4),onTertiaryContainer=Color(0xFF193C2A),
     background=Color(0xFFF4F5F7),onBackground=Color(0xFF2B3039),surface=Color.White,onSurface=Color(0xFF2B3039),
     surfaceVariant=Color(0xFFEBEDF0),onSurfaceVariant=Color(0xFF7B828D),outline=Color(0xFFA3A9B2),outlineVariant=Color(0xFFDEE1E6),
     inverseSurface=Color(0xFF2B3037),inverseOnSurface=Color(0xFFF4F5F7),surfaceTint=Color.Transparent,scrim=Color.Black,
@@ -40,9 +42,9 @@ private val LightColors=lightColorScheme(
     tertiaryFixed=Color(0xFFDEECE4),tertiaryFixedDim=Color(0xFFB7D6C4),onTertiaryFixed=Color(0xFF193C2A),onTertiaryFixedVariant=Color(0xFF315E44),
 )
 private val DarkColors=darkColorScheme(
-    primary=Color(0xFF589472),onPrimary=Color(0xFF10281B),primaryContainer=Color(0xFF263F31),onPrimaryContainer=Color(0xFFCCE6D6),inversePrimary=Color(0xFF448967),
-    secondary=Color(0xFF589472),onSecondary=Color(0xFF10281B),secondaryContainer=Color(0xFF293D32),onSecondaryContainer=Color(0xFFCCE6D6),
-    tertiary=Color(0xFF589472),onTertiary=Color(0xFF10281B),tertiaryContainer=Color(0xFF263F31),onTertiaryContainer=Color(0xFFCCE6D6),
+    primary=Color(0xFF36DA83),onPrimary=Color(0xFF10281B),primaryContainer=Color(0xFF263F31),onPrimaryContainer=Color(0xFFCCE6D6),inversePrimary=Color(0xFF078A46),
+    secondary=Color(0xFF36DA83),onSecondary=Color(0xFF10281B),secondaryContainer=Color(0xFF293D32),onSecondaryContainer=Color(0xFFCCE6D6),
+    tertiary=Color(0xFF36DA83),onTertiary=Color(0xFF10281B),tertiaryContainer=Color(0xFF263F31),onTertiaryContainer=Color(0xFFCCE6D6),
     background=Color(0xFF121416),onBackground=Color(0xFFE5E8EC),surface=Color(0xFF1C1F23),onSurface=Color(0xFFE5E8EC),
     surfaceVariant=Color(0xFF30363E),onSurfaceVariant=Color(0xFF9BA2AC),outline=Color(0xFF626B77),outlineVariant=Color(0xFF353C45),
     inverseSurface=Color(0xFFE5E8EC),inverseOnSurface=Color(0xFF252A31),surfaceTint=Color.Transparent,scrim=Color.Black,
@@ -55,7 +57,7 @@ private val DarkColors=darkColorScheme(
 )
 
 @Composable internal fun tortoSwitchColors()=SwitchDefaults.colors(
-    checkedTrackColor=MaterialTheme.colorScheme.primary,checkedThumbColor=Color.White,
+    checkedTrackColor=BrandGreen,checkedThumbColor=Color.White,
     uncheckedTrackColor=MaterialTheme.colorScheme.surface,uncheckedThumbColor=MaterialTheme.colorScheme.outline,
     uncheckedBorderColor=MaterialTheme.colorScheme.outlineVariant,
 )
@@ -99,6 +101,7 @@ private val symbolResources=mapOf(
     "sun" to R.drawable.ic_symbol_sun,
     "sync" to R.drawable.ic_symbol_sync,
     "settings" to R.drawable.ic_symbol_settings,
+    "feedback" to R.drawable.ic_symbol_feedback,
     "cloud" to R.drawable.ic_symbol_cloud,
     "ai" to R.drawable.ic_symbol_ai,
     "stats" to R.drawable.ic_symbol_stats,
@@ -123,13 +126,18 @@ private val filledSymbolResources=mapOf(
 )
 @Composable fun AppIcon(name:String,description:String?=null,modifier:Modifier=Modifier,tint:Color=LocalContentColor.current,filled:Boolean=false,size:Dp=24.dp) {
     val resource=(if(filled)filledSymbolResources[name] else null) ?: symbolResources[name] ?: R.drawable.ic_symbol_info
-    Icon(androidx.compose.ui.res.painterResource(resource),description,modifier.size(size*1.2f),tint=tint)
+    Box(modifier.size(size*1.2f)){
+        Icon(androidx.compose.ui.res.painterResource(resource),description,Modifier.matchParentSize(),tint=tint)
+        if(name=="highlight")androidx.compose.foundation.Canvas(Modifier.matchParentSize()){
+            drawLine(BrandGreen,androidx.compose.ui.geometry.Offset(this.size.width*.125f,this.size.height*.9f),androidx.compose.ui.geometry.Offset(this.size.width*.875f,this.size.height*.9f),strokeWidth=this.size.width/10f,cap=StrokeCap.Round)
+        }
+    }
 }
 /** A transparent 48dp target; only the unchanged icon's ink reacts to input. */
 @Composable fun ActionIcon(name:String,label:String,enabled:Boolean=true,selected:Boolean=false,modifier:Modifier=Modifier,iconSize:Dp=22.dp,onClick:()->Unit) {
     val interaction=remember {androidx.compose.foundation.interaction.MutableInteractionSource()}
     val pressed by interaction.collectIsPressedAsState()
-    val target=when { !enabled->MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.38f);selected||pressed->MaterialTheme.colorScheme.primary;else->MaterialTheme.colorScheme.onSurfaceVariant }
+    val target=when { !enabled->MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.38f);selected||pressed->brandControlColor();else->MaterialTheme.colorScheme.onSurfaceVariant }
     val ink by androidx.compose.animation.animateColorAsState(target,androidx.compose.animation.core.tween(100),label="icon ink")
     Box(modifier.size(48.dp).semantics {this.selected=selected}
         .clickable(interactionSource=interaction,indication=null,enabled=enabled,role=Role.Button,onClick=onClick),contentAlignment=Alignment.Center){

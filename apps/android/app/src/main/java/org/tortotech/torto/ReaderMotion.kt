@@ -6,6 +6,13 @@ import androidx.compose.animation.core.spring
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.sqrt
+import kotlin.math.roundToLong
+
+/** A full-width page/unit transition takes at most 150ms; releases scale by the remaining distance. */
+internal fun readerTurnDuration(distance:Float,width:Float):Long {
+    if(!distance.isFinite()||!width.isFinite()||width<=0f)return 1L
+    return (150f*(abs(distance)/width).coerceIn(0f,1f)).roundToLong().coerceIn(1L,150L)
+}
 
 /** Finite, non-oscillating settling; offsets/velocities stay in logical pixels. */
 internal fun focusSettle(distance:Float,velocity:Float):TargetBasedAnimation<Float,androidx.compose.animation.core.AnimationVector1D> {

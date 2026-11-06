@@ -52,6 +52,11 @@ pub trait BookSource: Send + Sync {
     }
     /// Parses one section into the normalized reading IR.
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError>;
+    /// Parse with only the HTML body's authored margins suppressed. Format
+    /// adapters opt in; source identities and descendant styles stay intact.
+    fn parse_section_without_body_margins(&self, index: usize) -> Result<Section, PublicationError> {
+        self.parse_section(index)
+    }
     /// Optional SHA-256 of `serde_json::to_vec()` for the last parsed section.
     /// This is a cached lookup, never I/O. Derived sources must return `None`
     /// when their output differs; consumers also validate `content_revision`.

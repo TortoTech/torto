@@ -1331,6 +1331,28 @@ impl PageDisplayList {
             })
     }
 
+    /// Touch hosts may enlarge a marker's hit area without changing its ink or
+    /// desktop mouse hit testing. Exact hits win; overlapping targets choose
+    /// the closest original rectangle, with a stable paint-order tie break.
+    pub fn footnote_touch_point(&self, x: f32, y: f32, minimum: f32) -> Option<(f32, f32)> {
+        let point = Point::new(x.into(), y.into());
+        let regions = || self.footnote_regions.iter().rev().filter(|r| r.website.is_none() && r.reference_owner.is_some());
+        let exact = regions().find(|r| r.bounds.contains(point));
+        let nearest = || regions().filter(|r| {
+            let dx = ((minimum as f64 - r.bounds.width()) / 2.).max(0.);
+            let dy = ((minimum as f64 - r.bounds.height()) / 2.).max(0.);
+            r.bounds.inflate(dx, dy).contains(point)
+        }).min_by(|a,b| {
+            let distance = |r: &FootnoteRegion| {
+                let dx = (point.x-r.bounds.center().x).abs()-r.bounds.width()/2.;
+                let dy = (point.y-r.bounds.center().y).abs()-r.bounds.height()/2.;
+                dx.max(0.).powi(2)+dy.max(0.).powi(2)
+            };
+            distance(a).total_cmp(&distance(b))
+        });
+        exact.or_else(nearest).map(|r| (r.bounds.center().x as f32,r.bounds.center().y as f32))
+    }
+
     pub fn footnote_reference_bounds(&self, source: &SourceRange, number: u32) -> Vec<[f32; 4]> {
         let owner = rebook_publication::source_block_identity(source);
         self.footnote_regions
@@ -3777,6 +3799,10 @@ mod tests {
         assert_eq!(list.footnote_regions.len(), 1);
         assert_eq!(list.footnote_regions[0].source, Some(source.clone()));
         let icon_bounds = list.footnote_regions[0].bounds;
+        let marker_center = (icon_bounds.center().x as f32,icon_bounds.center().y as f32);
+        assert_eq!(list.footnote_touch_point(marker_center.0,marker_center.1,48.),Some(marker_center));
+        assert_eq!(list.footnote_touch_point(icon_bounds.x1 as f32+8.,marker_center.1,48.),Some(marker_center));
+        assert!(list.footnote_touch_point(icon_bounds.x1 as f32+48.,marker_center.1,48.).is_none());
         assert_eq!(
             list.footnote_source_at(icon_bounds.center().x as f32, icon_bounds.center().y as f32),
             Some(source.clone())

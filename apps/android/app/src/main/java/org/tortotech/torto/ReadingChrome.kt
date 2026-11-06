@@ -19,6 +19,12 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
+import androidx.compose.foundation.shape.RoundedCornerShape
+import kotlinx.coroutines.delay
 
 internal val ReaderBarHeight=56.dp
 
@@ -44,7 +50,7 @@ internal val ReaderBarHeight=56.dp
                 val interaction=remember {MutableInteractionSource()}
                 Column(Modifier.weight(1f).heightIn(min=56.dp).semantics {this.selected=active}.clickable(role=Role.Tab,interactionSource=interaction,indication=null,onClick={onSelect(index)}).padding(vertical=6.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center){
                     val pressed by interaction.collectIsPressedAsState()
-                    val ink by animateColorAsState(if(active||pressed)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,tween(100),label="home icon ink")
+                    val ink by animateColorAsState(if(active||pressed)brandControlColor() else MaterialTheme.colorScheme.onSurfaceVariant,tween(100),label="home icon ink")
                     Box(Modifier.size(44.dp,26.dp),contentAlignment=Alignment.Center){AppIcon(icon,size=22.dp,tint=ink)}
                     Spacer(Modifier.height(2.dp))
                     Text(label,fontSize=11.sp,lineHeight=14.sp,color=if(active)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
@@ -57,7 +63,7 @@ internal val ReaderBarHeight=56.dp
 /** Overlay controls never participate in the native reading viewport's measurement. */
 @Composable internal fun BoxScope.ReadingChrome(
     state:ScreenState,blocked:Boolean,panel:String?,onBack:()->Unit,onPanel:(String)->Unit,
-    onTranslate:()->Unit,onTheme:()->Unit,onSplit:()->Unit={},
+    onTranslate:()->Unit,onTheme:()->Unit,onSplit:()->Unit={},onFeedback:()->Unit={},
 ){
     val safe=readerSafePadding()
     val bottomPanel=readingBottomPanel(panel)
@@ -66,6 +72,7 @@ internal val ReaderBarHeight=56.dp
             Row(Modifier.fillMaxWidth().weight(1f).padding(horizontal=8.dp),verticalAlignment=Alignment.CenterVertically){
                 ActionIcon("back",tr("返回","Back"),onClick=onBack)
                 Spacer(Modifier.weight(1f))
+                ActionIcon("feedback",tr("反馈问题","Report an issue"),onClick=onFeedback)
             }
             HorizontalDivider(color=MaterialTheme.colorScheme.outlineVariant.copy(alpha=.45f),thickness=.5.dp)
         }
@@ -76,7 +83,21 @@ internal val ReaderBarHeight=56.dp
             Row(Modifier.fillMaxWidth().height(ReaderBarHeight),horizontalArrangement=Arrangement.SpaceEvenly,verticalAlignment=Alignment.CenterVertically){
                 ActionIcon("toc",tr("目录与搜索","Contents and search"),selected=panel=="navigation"){onPanel("navigation")}
                 ActionIcon("marks",tr("批注与高亮","Notes and highlights"),!state.chatWorking,selected=readingPanelOwner(panel)=="marks"){onPanel("marks")}
-                ActionIcon("select",tr("文字选择模式","Selection mode"),!state.translated,selected=panel=="selection"){onPanel("selection")}
+                var selectionHint by remember {mutableStateOf(false)}
+                LaunchedEffect(selectionHint){if(selectionHint){delay(2000);selectionHint=false}}
+                Box {
+                    ActionIcon("select",tr("文字选择模式","Selection mode"),selected=panel=="selection"){
+                        if(state.translated)selectionHint=true else onPanel("selection")
+                    }
+                    if(selectionHint){
+                        val offset=with(LocalDensity.current){(-52).dp.roundToPx()}
+                        Popup(alignment=Alignment.TopCenter,offset=IntOffset(0,offset),onDismissRequest={selectionHint=false},properties=PopupProperties(focusable=false)){
+                            Surface(shape=RoundedCornerShape(6.dp),color=MaterialTheme.colorScheme.inverseSurface,contentColor=MaterialTheme.colorScheme.inverseOnSurface,shadowElevation=2.dp){
+                                Text(tr("翻译时仅支持按段选择","Only paragraph selection is available during translation"),Modifier.padding(horizontal=12.dp,vertical=8.dp).widthIn(max=260.dp),fontSize=13.sp)
+                            }
+                        }
+                    }
+                }
                 ActionIcon("type",tr("字体排版","Typography"),selected=readingPanelOwner(panel)=="typography"){onPanel("typography")}
                 ActionIcon(if(state.dark)"sun" else "moon",tr("切换明暗模式","Toggle light/dark"),!blocked,onClick=onTheme)
             }

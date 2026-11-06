@@ -422,6 +422,8 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
         media_and_presentation(&core,&root).await;
         ai_parity::verify(&core, &root).await;
         ai_parity::driver_delivery(&core).await;
+        ai_parity::linked_note_popup(&core,&root).await;
+        feedback::tests::verify(&core,&books[0].id,&root).await;
         advanced_reading(&core, &books[0].id).await;
         long_focus_continuation(&core,&root).await;
         retained_focus_chapter_boundaries(&core,&root).await;
@@ -1421,13 +1423,13 @@ async fn native_document_pages(reader:&Arc<MobileReader>) {
     let before=reader.clone().page().await.unwrap().info();
     let markup=(0..45).map(|n|format!("Paragraph {n}: footnotes inherit the reader font and optimized composition.\n\n")).collect::<String>();
     let viewport=Viewport {width:300,height:240,scale:1.0};
-    let first=reader.clone().note_page(markup.clone(),1,0,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
+    let first=reader.clone().note_page(markup.clone(),1,String::new(),String::new(),24.,0,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
     assert!(first.total>2,"long notes must remain scrollable");
     assert!(first.page.info().regions.iter().any(|r|r.text.contains("Paragraph 0")));
     let rect=first.page.info().regions.iter().flat_map(|r|&r.bounds).next().unwrap().clone();
     let selection=reader.clone().document_select(first.id.clone(),0,rect.x+2.0,rect.y+rect.height/2.0,rect.x+50.0,rect.y+rect.height/2.0,None).await.unwrap().unwrap();
     assert!(!selection.text.is_empty());assert!(!selection.bounds.is_empty());
-    let last=reader.clone().note_page(markup,1,first.total-1,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
+    let last=reader.clone().note_page(markup,1,String::new(),String::new(),24.,first.total-1,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
     assert_eq!(last.id,first.id);
     assert!(last.page.info().regions.iter().any(|r|r.text.contains("44:")));
     assert_eq!(reader.clone().page().await.unwrap().info().progress,before.progress,"preview must not move book progress");

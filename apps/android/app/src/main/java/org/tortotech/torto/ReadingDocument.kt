@@ -22,7 +22,7 @@ private data class DocumentSelection(val page:UInt,val text:SelectedText)
 private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Float,val ex:Float,val ey:Float,val handle:Boolean?)
 
 /** Only visible native pages retain bitmaps. Notes use reading typography and source-based selection. */
-@Composable internal fun ReadingDocument(interaction:ReaderInteraction,model:ReaderModel){
+@Composable internal fun ReadingDocument(interaction:ReaderInteraction,model:ReaderModel,firstLineIndent:Float=0f,onBaseline:(Float?)->Unit={}){
     val context=LocalContext.current
     val scope=rememberCoroutineScope()
     val foreground=MaterialTheme.colorScheme.onSurface.toArgb().toUInt()
@@ -31,6 +31,8 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
     var revision by remember(interaction){mutableIntStateOf(0)}
     var failure by remember(interaction,revision){mutableStateOf<String?>(null)}
     var selected by remember(interaction,revision){mutableStateOf<DocumentSelection?>(null)}
+    LaunchedEffect(selected!=null){model.documentInteraction(selected=selected!=null)}
+    DisposableEffect(interaction){onDispose {model.documentInteraction(moving=false,selected=false)}}
     val drags=remember(interaction,revision){Channel<DocumentDrag>(Channel.CONFLATED)}
     DisposableEffect(drags){onDispose {drags.close()}}
     LaunchedEffect(drags){for(drag in drags){
@@ -43,12 +45,13 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
         BoxWithConstraints(Modifier.fillMaxWidth().heightIn(min=56.dp,max=520.dp)){
             val density=LocalDensity.current.density
             val width=maxWidth.value.toUInt().coerceAtLeast(100u)
-            val first by produceState<DocumentFrame?>(null,interaction,width,density,revision,foreground,background){
-                try {value=model.documentPage(interaction,0u,width,density,foreground,background)}
+            val first by produceState<DocumentFrame?>(null,interaction,width,density,revision,foreground,background,firstLineIndent){
+                try {value=model.documentPage(interaction,0u,width,density,foreground,background,firstLineIndent).also {model.processVisible()}}
                 catch(e:CancellationException){throw e}catch(e:Exception){failure=e.message ?: unavailable}
             }
             val initial=first
             if(initial==null){if(failure==null)LinearProgressIndicator(Modifier.fillMaxWidth());return@BoxWithConstraints}
+            LaunchedEffect(initial.id,initial.firstTextBaseline){onBaseline(initial.firstTextBaseline ?: 0f)}
             val list=rememberLazyListState()
             val naturalHeight=if(initial.total==1u)(initial.frame.bitmap.height/density+(if(initial.controls.isEmpty())0 else 48)).dp else maxHeight
             LazyColumn(Modifier.fillMaxWidth().height(naturalHeight.coerceIn(1.dp,maxHeight)),state=list){
@@ -62,14 +65,15 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
                     }
                 }
                 items(initial.total.toInt(),key={"${initial.id}:$revision:$it"}){index->
-                    val page by produceState(if(index==0)initial else null,initial.id,index,width,density,revision,foreground,background){
-                        if(index!=0)try {value=model.documentPage(interaction,index.toUInt(),width,density,foreground,background)}
+                    val page by produceState(if(index==0)initial else null,initial.id,index,width,density,revision,foreground,background,firstLineIndent){
+                        if(index!=0)try {value=model.documentPage(interaction,index.toUInt(),width,density,foreground,background,firstLineIndent)}
                         catch(e:CancellationException){throw e}catch(e:Exception){failure=e.message}
                     }
                     page?.let {document->
                         var handle by remember(document){mutableStateOf<Boolean?>(null)}
                         Box(Modifier.fillMaxWidth().aspectRatio(document.frame.bitmap.width.toFloat()/document.frame.bitmap.height)) {
                         AndroidView(factory={ReaderView(it)},update={view->
+                            view.onMotion={model.documentInteraction(moving=it)}
                             view.onTap={x,y->if(selected!=null)selected=null else model.documentTap(document,x,y)}
                             view.onSelect={x,y,ex,ey->drags.trySend(DocumentDrag(document,x,y,ex,ey,null))}
                             view.onHandleStart={handle=it}

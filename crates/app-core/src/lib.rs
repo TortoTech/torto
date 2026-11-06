@@ -31,3 +31,5 @@ pub mod chat_markdown;
 pub mod provider_models;
 
 pub mod updates;
+
+pub mod feedback;

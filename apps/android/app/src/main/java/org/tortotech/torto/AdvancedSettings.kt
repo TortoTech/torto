@@ -42,7 +42,7 @@ import org.tortotech.torto.core.*
 }
 @Composable private fun ProviderEditor(initial:Provider,state:ScreenState,model:ReaderModel,close:()->Unit){
     var draft by remember(initial){mutableStateOf(initial.copy())}
-    var key by remember{mutableStateOf("")};var clearKey by remember{mutableStateOf(false)}
+    var key by remember{mutableStateOf("")}
     var manual by remember{mutableStateOf("")};var query by remember{mutableStateOf("")}
     val cacheKey=draft.kind+":"+draft.baseUrl
     val all=(draft.models+state.modelChoices[cacheKey].orEmpty()).distinct().sorted()
@@ -57,12 +57,11 @@ import org.tortotech.torto.core.*
                     Column(Modifier.padding(horizontal=16.dp,vertical=12.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
                     OutlinedTextField(draft.name,{draft=draft.copy(name=it.take(160))},label={Text(tr("名称","Name"))},modifier=Modifier.fillMaxWidth(),singleLine=true)
                     OutlinedTextField(draft.baseUrl,{draft=draft.copy(baseUrl=it.trim().take(2048))},label={Text("Base URL")},modifier=Modifier.fillMaxWidth(),singleLine=true)
-                    OutlinedTextField(key,{key=it;clearKey=false},label={Text(if(initial.keySaved)tr("API Key（已保存，留空保留）","API key (saved; leave empty to keep)")else "API Key")},visualTransformation=PasswordVisualTransformation(),modifier=Modifier.fillMaxWidth(),singleLine=true)
+                    OutlinedTextField(key,{key=it},label={Text(if(initial.keySaved)tr("API Key（已保存，留空保留）","API key (saved; leave empty to keep)")else "API Key")},visualTransformation=PasswordVisualTransformation(),modifier=Modifier.fillMaxWidth(),singleLine=true)
                     }
-                    if(initial.keySaved)SettingToggle(tr("清除已保存的 API Key","Clear saved API key"),clearKey,!state.busy){clearKey=it}
                     }
                     SettingsGroup { Column(Modifier.padding(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
-                    Row(verticalAlignment=Alignment.CenterVertically){Text(tr("模型","Models"),Modifier.weight(1f),style=MaterialTheme.typography.titleMedium);TextButton(onClick={model.fetchModels(draft,key,clearKey)},enabled=!state.busy&&draft.baseUrl.isNotBlank()){Text(tr("刷新列表","Refresh list"))}}
+                    Row(verticalAlignment=Alignment.CenterVertically){Text(tr("模型","Models"),Modifier.weight(1f),style=MaterialTheme.typography.titleMedium);ActionIcon("sync",tr("刷新模型列表","Refresh model list"),!state.busy&&draft.baseUrl.isNotBlank()){model.fetchModels(draft,key)}}
                     state.modelFetchError?.let {Text(it,color=MaterialTheme.colorScheme.error)}
                     Row(verticalAlignment=Alignment.CenterVertically){OutlinedTextField(manual,{manual=it.take(256)},label={Text(tr("手动添加模型 ID","Add model ID"))},modifier=Modifier.weight(1f),singleLine=true);ActionIcon("add",tr("添加模型","Add model"),manual.isNotBlank()&&!state.busy){draft=draft.copy(models=(draft.models+manual.trim()).distinct());manual=""}}
                     OutlinedTextField(query,{query=it},label={Text(tr("搜索模型","Search models"))},modifier=Modifier.fillMaxWidth(),singleLine=true)
@@ -71,7 +70,7 @@ import org.tortotech.torto.core.*
                     }
                     }}
                 }
-                Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.End){TextButton(onClick=close,enabled=!state.busy){Text(tr("取消","Cancel"))};Button(onClick={model.saveProvider(draft,key,clearKey,close)},enabled=!state.busy&&draft.name.isNotBlank()&&draft.baseUrl.isNotBlank()){Text(tr("保存","Save"))}}
+                Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.End){TextButton(onClick=close,enabled=!state.busy){Text(tr("取消","Cancel"))};Button(onClick={model.saveProvider(draft,key,false,close)},enabled=!state.busy&&draft.name.isNotBlank()&&draft.baseUrl.isNotBlank()){Text(tr("保存","Save"))}}
             }
         }
     }

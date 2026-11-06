@@ -64,4 +64,37 @@ class LoadingIndicatorTest {
             assertFalse("Completion must hide progress without a minimum display delay",visible.get())
         }finally {instrumentation.runOnMainSync {activity?.finish()};instrumentation.removeMonitor(monitor)}
     }
+    @Test fun statisticsLoadingNeverAddsProgressAcrossPeriodsOrBookDetails(){
+        val instrumentation=InstrumentationRegistry.getInstrumentation()
+        val monitor=instrumentation.addMonitor(MainActivity::class.java.name,null,false)
+        val state=mutableStateOf(ScreenState(statsLoading=true,statsKind="week"))
+        val detail=mutableStateOf(false)
+        var activity:MainActivity?=null
+        fun progress(node:android.view.accessibility.AccessibilityNodeInfo?):Boolean {
+            if(node==null)return false
+            if(node.isVisibleToUser&&(node.className=="android.widget.ProgressBar"||node.rangeInfo!=null))return true
+            return (0 until node.childCount).any {progress(node.getChild(it))}
+        }
+        try {
+            android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand("am start -W -f 0x10008000 -n org.tortotech.torto.debug/org.tortotech.torto.MainActivity")).use {it.readBytes()}
+            activity=monitor.waitForActivityWithTimeout(5000) as? MainActivity;assertNotNull(activity)
+            instrumentation.runOnMainSync {
+                val model=androidx.lifecycle.ViewModelProvider(activity!!)[ReaderModel::class.java]
+                activity!!.setContent {TortoTheme(ScreenState(language="en")){
+                    if(detail.value)BookStatisticsScreen(state.value,model)else StatisticsScreen(state.value,model){}
+                }}
+            }
+            for(period in listOf("week","month","year","all")){
+                instrumentation.runOnMainSync {state.value=state.value.copy(statsKind=period,statsOffset=if(period=="all")0 else -1)}
+                instrumentation.waitForIdleSync();android.os.SystemClock.sleep(250)
+                if(android.os.Build.VERSION.SDK_INT>=33)instrumentation.uiAutomation.clearCache()
+                assertFalse("Loading $period statistics cannot display a progress indicator",progress(instrumentation.uiAutomation.rootInActiveWindow))
+            }
+            instrumentation.runOnMainSync {detail.value=true}
+            instrumentation.waitForIdleSync();android.os.SystemClock.sleep(250)
+            if(android.os.Build.VERSION.SDK_INT>=33)instrumentation.uiAutomation.clearCache()
+            assertFalse("Loading book statistics stays quiet too",progress(instrumentation.uiAutomation.rootInActiveWindow))
+        }finally {instrumentation.runOnMainSync {activity?.finish()};instrumentation.removeMonitor(monitor)}
+    }
+
 }

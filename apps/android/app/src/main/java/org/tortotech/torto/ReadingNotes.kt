@@ -18,8 +18,17 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.text
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.foundation.text.InlineTextContent
+import androidx.compose.foundation.text.appendInlineContent
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.Placeholder
+import androidx.compose.ui.text.PlaceholderVerticalAlign
+import androidx.compose.ui.unit.em
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -97,19 +106,20 @@ private fun LazyListScope.noteEntries(notes:List<Annotation>,jump:(Annotation)->
     val annotation=note.note?.takeIf {it.isNotBlank()}
     val label=if(annotation==null)tr("高亮","Highlight")else tr("批注","Note")
     Card(onClick=jump,modifier=Modifier.fillMaxWidth().semantics {contentDescription=label},shape=RoundedCornerShape(16.dp),colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surfaceContainerLowest)){
-        Row(Modifier.fillMaxWidth().padding(16.dp),verticalAlignment=Alignment.Top){
-            AppIcon(if(annotation==null)"highlight"else"note",size=16.667.dp,tint=MaterialTheme.colorScheme.onSurfaceVariant)
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)){
-                if(annotation==null)Text(note.quote,fontSize=16.sp,maxLines=4,overflow=TextOverflow.Ellipsis)
-                else {
-                    Text(annotation,fontSize=16.sp)
-                    Spacer(Modifier.height(12.dp))
-                    Row(Modifier.height(IntrinsicSize.Min)){
-                        Box(Modifier.fillMaxHeight().width(2.dp).background(MaterialTheme.colorScheme.outlineVariant))
-                        Spacer(Modifier.width(12.dp))
-                        Text(note.quote,fontSize=14.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=4,overflow=TextOverflow.Ellipsis)
-                    }
+        Column(Modifier.fillMaxWidth().padding(16.dp)){
+            val content=buildAnnotatedString {appendInlineContent("marker", "\uFFFC");append(annotation ?: note.quote)}
+            val inline=mapOf("marker" to InlineTextContent(Placeholder(1.55.em,1.25.em,PlaceholderVerticalAlign.TextCenter)){
+                Box(Modifier.fillMaxSize(),contentAlignment=Alignment.CenterStart){
+                    AppIcon(if(annotation==null)"highlight"else"note",size=16.667.dp,tint=MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            })
+            Text(content,modifier=Modifier.clearAndSetSemantics {text=AnnotatedString(annotation ?: note.quote)},fontSize=16.sp,maxLines=if(annotation==null)4 else Int.MAX_VALUE,overflow=TextOverflow.Ellipsis,inlineContent=inline)
+            if(annotation!=null){
+                Spacer(Modifier.height(12.dp))
+                Row(Modifier.height(IntrinsicSize.Min)){
+                    Box(Modifier.fillMaxHeight().width(2.dp).background(MaterialTheme.colorScheme.outlineVariant))
+                    Spacer(Modifier.width(8.dp))
+                    Text(note.quote,fontSize=14.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=4,overflow=TextOverflow.Ellipsis)
                 }
             }
         }

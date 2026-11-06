@@ -11,6 +11,33 @@ use crate::source::{
 };
 
 #[test]
+#[ignore = "requires TORTO_BODY_MARGIN_BOOK pointing to a local book; read-only"]
+fn local_body_margin_filter_preserves_content_and_locations() {
+    let opened = crate::open_file(std::env::var_os("TORTO_BODY_MARGIN_BOOK").unwrap()).unwrap();
+    let source = opened.source();
+    let mut changed = 0;
+    let mut count = 0;
+    for index in 0..source.book().sections.len() {
+        let original = source.parse_section(index).unwrap();
+        let filtered = source.parse_section_without_body_margins(index).unwrap();
+        assert_eq!(original.anchors, filtered.anchors, "section {index} anchors");
+        let before = original.blocks.iter().flat_map(Block::text_blocks).collect::<Vec<_>>();
+        let after = filtered.blocks.iter().flat_map(Block::text_blocks).collect::<Vec<_>>();
+        assert_eq!(before.len(), after.len(), "section {index} text count");
+        for (a, b) in before.into_iter().zip(after) {
+            assert_eq!(a.content, b.content, "section {index} text");
+            assert_eq!(a.source, b.source, "section {index} selection identity");
+            changed += usize::from(a.style != b.style);
+            count += 1;
+        }
+        assert_eq!(source.parse_section(index).unwrap(), original,
+            "filtered parsing must not alter the desktop source");
+    }
+    println!("{}: {} sections, {count} text blocks, {changed} with body margins removed",
+        source.book().metadata.title, source.book().sections.len());
+}
+
+#[test]
 #[ignore = "requires local Kindle fixtures in test-data"]
 fn local_kindle_books_parse_every_section() {
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data");

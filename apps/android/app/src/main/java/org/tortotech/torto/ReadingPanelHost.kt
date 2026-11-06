@@ -21,6 +21,9 @@ import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.nestedscroll.*
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -61,15 +64,40 @@ internal fun readingBottomPanel(panel:String?)=panel!=null&&panel!="chat"
                 val closeLabel=tr("关闭阅读面板","Close reading panel")
                 if(!full)Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha=.12f)).clickable(interactionSource=remember {MutableInteractionSource()},indication=null,onClickLabel=closeLabel,onClick=onClose))
                 val paneLabel=when(displayed){"navigation"->tr("目录与搜索","Contents and search");"marks"->tr("批注与高亮面板","Notes and highlights panel");"marks-search"->tr("搜索笔记面板","Search notes panel");"typography"->tr("字体排版面板","Typography panel");"selection"->tr("选择模式面板","Selection mode panel");else->tr("阅读设置面板","Reading settings panel")}
-                Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth().animateContentSize(tween(180),alignment=Alignment.BottomCenter).then(if(full)Modifier.fillMaxHeight()else Modifier.heightIn(max=limit)).offset{IntOffset(0,drag.roundToInt())}.semantics {paneTitle=paneLabel}.pointerInput(Unit){detectTapGestures {}},
+                fun finishDrag(velocity:Float){
+                    settle?.cancel()
+                    if(drag>with(density){limit.toPx()}*.18f || drag>with(density){12.dp.toPx()}&&velocity>900f)onClose()
+                    else settle=scope.launch {animate(drag,0f,animationSpec=tween(160)){value,_->drag=value}}
+                }
+                val finish by rememberUpdatedState<(Float)->Unit>({finishDrag(it)})
+                val nested=remember {object:NestedScrollConnection {
+                    override fun onPreScroll(available:Offset,source:NestedScrollSource):Offset {
+                        if(source!=NestedScrollSource.UserInput||drag<=0f||available.y>=0f)return Offset.Zero
+                        settle?.cancel()
+                        val consumed=available.y.coerceAtLeast(-drag);drag+=consumed
+                        return Offset(0f,consumed)
+                    }
+                    override fun onPostScroll(consumed:Offset,available:Offset,source:NestedScrollSource):Offset {
+                        // A fling reaching the list edge must never drag/dismiss
+                        // the sheet. Only remaining finger movement may do so.
+                        if(source!=NestedScrollSource.UserInput||available.y<=0f)return Offset.Zero
+                        settle?.cancel();drag+=available.y
+                        return Offset(0f,available.y)
+                    }
+                    override suspend fun onPreFling(available:Velocity):Velocity {
+                        if(drag<=0f)return Velocity.Zero
+                        finish(available.y)
+                        return Velocity(0f,available.y)
+                    }
+                }}
+                val bodyDrag=Modifier.nestedScroll(nested).draggable(rememberDraggableState {delta->
+                    drag=(drag+delta).coerceAtLeast(0f)
+                },Orientation.Vertical,onDragStarted={settle?.cancel()},onDragStopped={finishDrag(it)})
+                Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth().animateContentSize(tween(180),alignment=Alignment.BottomCenter).then(if(full)Modifier.fillMaxHeight()else Modifier.heightIn(max=limit)).offset{IntOffset(0,drag.roundToInt())}.semantics {paneTitle=paneLabel}.then(bodyDrag).pointerInput(Unit){detectTapGestures {}},
                     shape=if(full)RectangleShape else RoundedCornerShape(topStart=20.dp,topEnd=20.dp),color=MaterialTheme.colorScheme.surfaceContainerLow){
                     Column(Modifier.fillMaxWidth().then(if(full)Modifier.fillMaxHeight()else Modifier).imePadding()){
                         if(full)Spacer(Modifier.height(safe.calculateTopPadding()+24.dp))
-                        Box(Modifier.fillMaxWidth().height(28.dp).draggable(rememberDraggableState {delta->drag=(drag+delta).coerceAtLeast(0f)},Orientation.Vertical,
-                            onDragStarted={settle?.cancel()},onDragStopped={velocity->
-                                if(drag>with(density){limit.toPx()}*.18f||velocity>900f)onClose()
-                                else settle=scope.launch {animate(drag,0f,animationSpec=tween(160)){value,_->drag=value}}
-                            }),contentAlignment=Alignment.Center){Box(Modifier.size(32.dp,3.dp).background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.22f),RoundedCornerShape(2.dp)))}
+                        Box(Modifier.fillMaxWidth().height(28.dp),contentAlignment=Alignment.Center){Box(Modifier.size(32.dp,3.dp).background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.22f),RoundedCornerShape(2.dp)))}
                         Box(Modifier.weight(1f,fill=full).fillMaxWidth().graphicsLayer {alpha=opacity.value}){
                             holder.SaveableStateProvider(displayed){content(displayed)}
                         }

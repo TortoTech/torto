@@ -1,4 +1,4 @@
-use rebook_app_core::reading_text::{block_source_range, source_range_for_node};
+use rebook_app_core::reading_text::source_range_for_node;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,11 +15,10 @@ use super::chat_autocomplete::{
 };
 use super::{
     AssistantPanel, ChatStreamMessage, ChatStreamingState, ChatTask, ChatTaskMessage,
-    DesktopReader, FocusFootnoteSource, FocusedMark, MarkRetention, PdfMetadataUpdate, PdfOcrTask,
+    DesktopReader, FocusedMark, MarkRetention, PdfMetadataUpdate, PdfOcrTask,
     PdfOcrTaskMessage, PdfOriginalTask, PdfOriginalTaskMessage, PdfTocTask, PdfTocTaskMessage,
     SearchTask, SearchTaskMessage, SidebarTab, SnapshotEffects, TocTranslationTask,
-    TocTranslationTaskMessage, TranslationTaskMessage, block_focus_footnotes,
-    focus_footnote_translation_ranges_in_section,
+    TocTranslationTaskMessage, TranslationTaskMessage,
 };
 use crate::platform::UserEvent;
 use crate::plugins::{
@@ -2788,77 +2787,7 @@ pub(super) fn append_linked_footnote_translation_ranges(
     source: &dyn BookSource,
     sections: &mut Vec<(usize, Vec<SourceRange>)>,
 ) {
-    let visible_sections = sections.clone();
-    let mut parsed_sections = HashMap::new();
-    let mut footnote_targets = Vec::new();
-    for (section_index, ranges) in &visible_sections {
-        let Ok(section) = source.parse_section(*section_index) else {
-            continue;
-        };
-        for block in &section.blocks {
-            let visible = block_source_range(block).is_some_and(|source| {
-                ranges
-                    .iter()
-                    .any(|range| translation_ranges_overlap(source, range))
-            });
-            if !visible {
-                continue;
-            }
-            for footnote in block_focus_footnotes(block) {
-                if let FocusFootnoteSource::Reference { target, .. } = footnote
-                    && !footnote_targets.contains(&target)
-                {
-                    footnote_targets.push(target);
-                }
-            }
-        }
-        parsed_sections.insert(*section_index, section);
-    }
-    for target in footnote_targets {
-        let Some(section_index) = source
-            .book()
-            .sections
-            .iter()
-            .position(|section| section.href.path() == target.path())
-        else {
-            continue;
-        };
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            parsed_sections.entry(section_index)
-        {
-            let Ok(section) = source.parse_section(section_index) else {
-                continue;
-            };
-            entry.insert(section);
-        }
-        let Some(section) = parsed_sections.get(&section_index) else {
-            continue;
-        };
-        let footnote_ranges = focus_footnote_translation_ranges_in_section(section, &target);
-        if footnote_ranges.is_empty() {
-            continue;
-        }
-        if let Some((_, ranges)) = sections
-            .iter_mut()
-            .find(|(candidate, _)| *candidate == section_index)
-        {
-            for range in footnote_ranges {
-                if !ranges.contains(&range) {
-                    ranges.push(range);
-                }
-            }
-        } else {
-            sections.push((section_index, footnote_ranges));
-        }
-    }
-}
-
-fn translation_ranges_overlap(left: &SourceRange, right: &SourceRange) -> bool {
-    left.start.spine == right.start.spine
-        && (left.start.node == right.start.node
-            || left.start.node == right.end.node
-            || left.end.node == right.start.node
-            || left.end.node == right.end.node)
+    rebook_app_core::reading_text::append_linked_footnote_translation_ranges(source, sections);
 }
 
 fn paragraph_reference(

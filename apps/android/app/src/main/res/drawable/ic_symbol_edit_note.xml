@@ -1,6 +1,4 @@
-<!-- Google Material Symbols Rounded, Apache-2.0. Source: symbols/web/edit_note/materialsymbolsrounded/edit_note_24px.svg -->
-<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="960" android:viewportHeight="960">
-    <group android:translateY="960">
-        <path android:fillColor="@android:color/white" android:pathData="M200-400q-17 0-28.5-11.5T160-440q0-17 11.5-28.5T200-480h200q17 0 28.5 11.5T440-440q0 17-11.5 28.5T400-400H200Zm0-160q-17 0-28.5-11.5T160-600q0-17 11.5-28.5T200-640h360q17 0 28.5 11.5T600-600q0 17-11.5 28.5T560-560H200Zm0-160q-17 0-28.5-11.5T160-760q0-17 11.5-28.5T200-800h360q17 0 28.5 11.5T600-760q0 17-11.5 28.5T560-720H200Zm320 520v-66q0-8 3-15.5t9-13.5l209-208q9-9 20-13t22-4q12 0 23 4.5t20 13.5l37 37q8 9 12.5 20t4.5 22q0 11-4 22.5T863-380L655-172q-6 6-13.5 9t-15.5 3h-66q-17 0-28.5-11.5T520-200Zm300-223-37-37 37 37ZM580-220h38l121-122-18-19-19-18-122 121v38Zm141-141-19-18 37 37-18-19Z"/>
-    </group>
+<!-- Torto selection action, matching the rounded outline icon system. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="@android:color/transparent" android:strokeColor="@android:color/white" android:strokeWidth="1.65" android:strokeLineCap="round" android:strokeLineJoin="round" android:pathData="M14,4 H5 A2,2 0,0 0,3,6 V19 A2,2 0,0 0,5,21 H18 A2,2 0,0 0,20,19 V13 M7,8 H11 M7,12 H10 M12,17 L13,13 L20,6 A2.12,2.12 0,0 0,17,3 L10,10 L9,14 Z M16,4 L19,7"/>
 </vector>

@@ -34,7 +34,7 @@ impl TouchAction {
         self.marker=marker;self.indicator=indicator;self
     }
 }
-fn rich_note(s: &ReaderState, target: &PublicationUrl, marker: &str) -> String {
+pub(crate) fn rich_note(s: &ReaderState, target: &PublicationUrl, marker: &str) -> String {
     let markup = s
         .source
         .book()
@@ -45,6 +45,7 @@ fn rich_note(s: &ReaderState, target: &PublicationUrl, marker: &str) -> String {
         .and_then(|section| text::focus_footnote_markdown_in_section(&section, target))
         .unwrap_or_default();
     let marker = marker.trim();
+    let marker = if markup.starts_with(marker) {marker} else {marker.trim_matches(['[',']'])};
     let explicit_marker = !marker.is_empty()
         && markup
             .strip_prefix(marker)
@@ -151,7 +152,7 @@ fn resolve_note(s: &ReaderState, target: &PublicationUrl, marker: &str) -> Optio
     let section = s.source.parse_section(index).ok()?;
     text::focus_footnote_text_in_section(&section, target, marker)
 }
-fn inline_note_markup(block: &Block, number: u32) -> String {
+pub(crate) fn inline_note_markup(block: &Block, number: u32) -> String {
     let mut found = Vec::new();
     for text in block.text_blocks() {
         for (index, range) in rebook_layout::paragraph_footnotes(text)
@@ -164,7 +165,7 @@ fn inline_note_markup(block: &Block, number: u32) -> String {
                 } else {
                     first.style.footnote_number
                 };
-                if ordinal == number & 0x1fff_ffff {
+                if number & 0x2000_0000 != 0 && ordinal == number & 0x1fff_ffff {
                     found.push(text::note_inline_markdown(&text.content[range]));
                 }
             }
@@ -172,7 +173,7 @@ fn inline_note_markup(block: &Block, number: u32) -> String {
         let citation = text
             .content
             .iter()
-            .filter(|i| matches!(i,Inline::Text(r) if r.style.inline_citation==number&0x1fff_ffff))
+            .filter(|i| number & 0x2000_0000 == 0 && matches!(i,Inline::Text(r) if r.style.inline_citation==number&0x1fff_ffff))
             .cloned()
             .collect::<Vec<_>>();
         if !citation.is_empty() {
@@ -182,6 +183,18 @@ fn inline_note_markup(block: &Block, number: u32) -> String {
     found.join("\n\n")
 }
 fn note_at(s: &mut ReaderState, x: f32, y: f32) -> Result<Option<TouchAction>> {
+    let exact = s.session.footnote_reference_at_current_spread(x, y).map_err(error)?.is_some();
+    let (x,y) = if exact {(x,y)} else {
+        // Exact authored links and images outrank a neighbouring enlarged note.
+        if s.session.image_at_current_spread(x,y).map_err(error)?.is_some() {return Ok(None);}
+        let page = s.session.current_page();
+        if let Some(hit) = page.hit_test_text(x,y,true)
+            && let Some(range) = page.text_region_source_range(hit.region_index,hit.cluster_start..hit.cluster_end)
+            && let Ok(section) = s.source.parse_section(s.session.snapshot().location.section_index)
+            && linked(&section, &range.start).is_some() {return Ok(None);}
+        let Some(point) = s.session.current_page().footnote_touch_point(x,y,48.) else {return Ok(None);};
+        point
+    };
     let Some((position, (owner, number))) = s
         .session
         .footnote_reference_at_current_spread(x, y)
@@ -209,7 +222,7 @@ fn note_at(s: &mut ReaderState, x: f32, y: f32) -> Result<Option<TouchAction>> {
             match note {
                 FocusFootnoteSource::Inline(content, n) if n == number & 0x1fff_ffff => {
                     return Ok(Some(
-                        TouchAction::new("note", content, String::new())
+                        TouchAction::new("note", content, format!("inline-note:{}:{owner}:{number}",position.section_index))
                             .with_markup(inline_note_markup(block, number)).with_reference(label.clone(),indicator.clone()),
                     ));
                 }
@@ -231,7 +244,7 @@ fn note_at(s: &mut ReaderState, x: f32, y: f32) -> Result<Option<TouchAction>> {
                     ..
                 } if n == number & 0x1fff_ffff => {
                     return Ok(Some(
-                        TouchAction::new("note", content, String::new())
+                        TouchAction::new("note", content, format!("inline-note:{}:{owner}:{number}",position.section_index))
                             .with_markup(inline_note_markup(block, number)).with_reference(label.clone(),indicator.clone()),
                     ));
                 }
@@ -486,9 +499,13 @@ impl MobileReader {
         })
         .await
     }
+    pub async fn focus_mode_available(self: Arc<Self>) -> Result<bool> {
+        work(move || self.with(|s| Ok(focus_mode_allowed(s)))).await
+    }
     pub async fn focus_mode(self: Arc<Self>, enabled: bool) -> Result<Arc<MobilePage>> {
         work(move || {
             self.with(|s| {
+                let enabled = enabled && focus_mode_allowed(s);
                 let mut anchor = s.focus_anchor.clone().or_else(|| s.session.current_locator().source);
                 s.focus = enabled;
                 s.scroll_center = true;
@@ -536,4 +553,9 @@ impl MobileReader {
         })
         .await
     }
+}
+
+fn focus_mode_allowed(s: &ReaderState) -> bool {
+    s.format != rebook_formats::BookFormat::Pdf
+        || s.source.book().metadata.layout != rebook_publication::RenditionLayout::PrePaginated
 }

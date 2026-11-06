@@ -5,6 +5,7 @@ use rebook_renderer::PageDisplayList;
 
 pub(crate) struct Document {
     id: String,
+    note: Option<Note>,
     target: Option<rebook_app_core::media::Target>,
     selection: Option<(
         u32,
@@ -20,12 +21,73 @@ pub(crate) struct Document {
     session: Option<ReaderSession>,
     positions: Vec<rebook_reader::ReaderPosition>,
 }
+#[derive(Clone)]
+struct Note {
+    markup: String,
+    target: String,
+    marker: String,
+    token: u64,
+    indent: f32,
+}
+
+fn inline_target(target:&str)->Option<(usize,u64,u32)> {
+    let mut parts=target.strip_prefix("inline-note:")?.split(':');
+    let result=(parts.next()?.parse().ok()?,parts.next()?.parse().ok()?,parts.next()?.parse().ok()?);
+    parts.next().is_none().then_some(result)
+}
+/// A popup contributes its own visible ranges, never the entire endnote chapter.
+pub(crate) fn translation_target(s: &ReaderState) -> Option<services::requests::Target> {
+    let document = s.document.as_ref()?;
+    let (index, ranges) = if let Some(note) = &document.note {
+        if let Some((index,owner,_))=inline_target(&note.target) {
+            let section=s.pipeline.rewrite.parse_section(index).ok()?;
+            let ranges=section.blocks.iter().flat_map(|b|b.text_blocks()).filter_map(|t|t.source.clone()).filter(|r|rebook_publication::source_block_identity(r)==owner).collect();
+            return Some(services::requests::Target {index,ranges,prefetch:false,defer:false});
+        }
+        let target = PublicationUrl::parse(&note.target).ok()?;
+        let index = s.source.book().sections.iter().position(|p| p.href.path() == target.path())?;
+        let section = s.pipeline.rewrite.parse_section(index).ok()?;
+        (index, rebook_app_core::reading_text::focus_footnote_translation_ranges_in_section(&section, &target))
+    } else {
+        (document.target.as_ref()?.section, document.section.blocks.iter().flat_map(rebook_app_core::plugins::semantic_layout::block_ranges).collect())
+    };
+    (!ranges.is_empty()).then_some(services::requests::Target {index, ranges, prefetch:false, defer:false})
+}
+
+/// Refresh only popup pixels. Body reflow remains dirty until the popup closes.
+pub(crate) fn refresh(s: &mut ReaderState) -> Result<bool> {
+    let Some(document) = &s.document else { return Ok(false); };
+    if let Some(spec) = document.note.clone() {
+        let markup = live_note(s, &spec);
+        if markup == spec.markup { return Ok(false); }
+        note(s, &markup, &spec.target, &spec.marker, spec.token, spec.indent)?;
+        Ok(true)
+    } else if let Some(target) = document.target.clone() {
+        let id = document.id.clone();
+        reference(s, target)?;
+        s.document.as_mut().unwrap().id = id;
+        Ok(true)
+    } else { Ok(false) }
+}
+fn live_note(s: &ReaderState, spec: &Note) -> String {
+    if let Some((index,owner,number))=inline_target(&spec.target) {
+        let markup=s.source.parse_section(index).ok().map(|section|section.blocks.iter()
+            .filter(|block|block.text_blocks().filter_map(|t|t.source.as_ref()).any(|r|rebook_publication::source_block_identity(r)==owner))
+            .map(|block|interactions::inline_note_markup(block,number)).filter(|s|!s.is_empty()).collect::<Vec<_>>().join("\n\n")).unwrap_or_default();
+        return if markup.is_empty(){spec.markup.clone()}else{markup};
+    }
+    PublicationUrl::parse(&spec.target).ok().filter(|t| t.fragment().is_some())
+        .map(|target| crate::interactions::rich_note(s, &target, &spec.marker))
+        .filter(|markup| !markup.is_empty()).unwrap_or_else(|| spec.markup.clone())
+}
+
 #[derive(uniffi::Record)]
 pub struct DocumentPage {
     pub id: String,
     pub index: u32,
     pub total: u32,
     pub controls: Vec<ReadingControl>,
+    pub first_text_baseline: Option<f32>,
     pub page: Arc<MobilePage>,
 }
 
@@ -53,6 +115,7 @@ pub(crate) fn reference(
     );
     s.document = Some(Document {
         selection: None,
+        note: None,
         target: Some(target),
         id: id.clone(),
         source,
@@ -69,11 +132,13 @@ pub(crate) fn reference(
 fn uuid_token() -> String {
     format!("document-{}", scroll::context_id())
 }
-fn note(s: &mut ReaderState, markup: &str, token: u64) -> Result<()> {
+fn note(s: &mut ReaderState, markup: &str, target: &str, marker: &str, token: u64, indent: f32) -> Result<()> {
     if markup.len() > 128 * 1024 {
         return Err(error("Note exceeds preview size limit"));
     }
-    let id = format!("note-{token}-{}", blake3::hash(markup.as_bytes()));
+    let spec = Note { markup: markup.into(), target: target.into(), marker: marker.into(), token, indent };
+    let markup = live_note(s, &spec);
+    let id = format!("note-{token}-{}-{}", blake3::hash(markup.as_bytes()), indent.to_bits());
     if s.document
         .as_ref()
         .is_some_and(|d| d.id == id && d.style == s.session.style())
@@ -82,7 +147,12 @@ fn note(s: &mut ReaderState, markup: &str, token: u64) -> Result<()> {
     }
     let mut descriptor = s.source.book().sections[s.session.location().section_index].clone();
     descriptor.id = rebook_publication::SpineItemId::new("popup-note").map_err(error)?;
-    let section = rebook_app_core::reading::note_section(markup, &descriptor).map_err(error)?;
+    let mut section = rebook_app_core::reading::note_section(&markup, &descriptor).map_err(error)?;
+    // Reserve the measured marker only on the first text line. The marker is
+    // painted by the host, so copying/selecting body text never includes it.
+    if let Some(first) = section.blocks.iter_mut().flat_map(|b| b.text_blocks_mut()).next() {
+        first.style.indent = indent.clamp(0., 160.);
+    }
     let origin = s.focus_anchor.clone().or_else(|| {
         s.session
             .current_visible_content_sources()
@@ -98,6 +168,7 @@ fn note(s: &mut ReaderState, markup: &str, token: u64) -> Result<()> {
     );
     s.document = Some(Document {
         selection: None,
+        note: Some(Note { markup, ..spec }),
         target: None,
         id,
         source,
@@ -233,6 +304,7 @@ fn page(
                 .chain(b.text_blocks().filter_map(|t| t.source.clone()))
         })
         .collect::<Vec<_>>();
+    let first_text_baseline = document.section.blocks.iter().flat_map(|b|b.text_blocks()).filter_map(|t|t.source.as_ref()).find_map(|source|display.source_text_baseline(source));
     let controls = if document.target.is_some() {
         presentation::for_ranges(s, &ranges)?
     } else {
@@ -243,6 +315,7 @@ fn page(
         index,
         total,
         controls,
+        first_text_baseline,
         page: MobilePage::new(
             width,
             pixels_height,
@@ -276,6 +349,9 @@ impl MobileReader {
         self: Arc<Self>,
         markup: String,
         token: u64,
+        target: String,
+        marker: String,
+        first_line_indent: f32,
         index: u32,
         viewport: Viewport,
         foreground: u32,
@@ -283,7 +359,7 @@ impl MobileReader {
     ) -> Result<DocumentPage> {
         work(move || {
             self.with(|s| {
-                note(s, &markup, token)?;
+                note(s, &markup, &target, &marker, token, first_line_indent)?;
                 let id = s.document.as_ref().unwrap().id.clone();
                 page(s, &id, index, viewport, foreground, background)
             })

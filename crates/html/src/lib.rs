@@ -54,6 +54,8 @@ pub enum HtmlError {
 /// Publication-level semantic hints that cannot be derived reliably from one HTML resource.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SectionParseHints<'a> {
+    /// Reader-owned page spacing replaces body margins, leaving child styles intact.
+    pub ignore_body_margins: bool,
     /// The publication navigation identifies this entire resource as Notes/Endnotes.
     pub note_section: bool,
     /// Known navigation resources and ancestor chapter targets, not guessed filenames.
@@ -339,7 +341,11 @@ pub fn parse_section_with_resource_metadata(
     })?;
     #[cfg(debug_assertions)]
     let document_finished = profile_started.elapsed();
-    let styles = StyleSheet::from_document_with_fonts(&document, &descriptor.href, &mut load_stylesheet, &mut font_metadata);
+    let mut styles = StyleSheet::from_document_with_fonts(&document, &descriptor.href, &mut load_stylesheet, &mut font_metadata);
+    if hints.ignore_body_margins {
+        styles.ignore_body_margins = true;
+        styles.cascaded_cache.get_mut().clear();
+    }
     #[cfg(debug_assertions)]
     let styles_finished = profile_started.elapsed();
     let root = document
@@ -3700,6 +3706,7 @@ impl QuoteLayoutMetrics {
 
 #[derive(Default)]
 struct StyleSheet {
+    ignore_body_margins: bool,
     rules: Vec<StyleRule>,
     marker_rules: Vec<(Selector, Option<rebook_publication::ListMarkerFormat>)>,
     rule_index: RuleIndex,
@@ -4293,6 +4300,9 @@ impl StyleSheet {
             insert_declarations(&mut properties, rule.important_declarations.iter().cloned());
         }
         insert_declarations(&mut properties, inline_important);
+        if self.ignore_body_margins && node.tag_name().name().eq_ignore_ascii_case("body") {
+            properties.retain(|name, _| name != "margin" && !name.starts_with("margin-"));
+        }
         let properties = Rc::new(properties);
         self.cascaded_cache
             .borrow_mut()
@@ -4788,6 +4798,53 @@ fn attribute_local<'a>(node: Node<'a, '_>, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_body_margin_filter_keeps_padding_child_spacing_and_source_anchors() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        for (body_margin, start, fraction) in [
+            ("margin:2em !important", 47.0, 0.0),
+            ("margin:2em; margin-inline-start:10% !important", 15.0, 0.1),
+        ] {
+            let xml = format!(r#"<html><head/><body style="{body_margin};padding-left:3px">
+                <h2 id="title" style="margin-left:9px;margin-top:13px">Title</h2>
+                <div style="margin-left:7px"><p id="text" style="margin-left:5px;margin-top:11px;text-indent:9px">Body text</p></div>
+                <ul style="margin-left:11px"><li style="margin-left:13px">List item</li></ul>
+                </body></html>"#);
+            let parse = |ignore_body_margins| parse_section_with_hints_and_image_classifier(
+                &xml, &descriptor, |_| None, |_| false,
+                SectionParseHints { ignore_body_margins, ..Default::default() },
+            ).unwrap();
+            let original = parse(false);
+            let filtered = parse(true);
+            let text = |section: &Section| section.blocks.iter().flat_map(Block::text_blocks).cloned().collect::<Vec<_>>();
+            let before = text(&original);
+            let after = text(&filtered);
+            assert_eq!(before.len(), after.len());
+            assert_eq!(original.anchors, filtered.anchors);
+            for (before, after) in before.iter().zip(&after) {
+                assert_eq!(before.source, after.source);
+                assert_eq!(before.content, after.content);
+                assert_eq!(before.kind, after.kind);
+            }
+            assert_close(before[1].style.margin_start, start);
+            assert_close(before[1].style.margin_start_fraction, fraction);
+            assert_close(after[0].style.margin_start, 12.0);
+            assert_close(after[0].style.margin_before, 13.0);
+            assert_close(after[1].style.margin_start, 15.0);
+            assert_close(after[1].style.margin_start_fraction, 0.0);
+            assert_close(after[1].style.margin_before, 11.0);
+            assert_close(after[1].style.indent, 9.0);
+            assert_close(after[2].style.margin_start, 27.0);
+            assert_eq!(parse(false), original, "filtering one parse cannot alter the default desktop parse");
+        }
+    }
 
     #[test]
     fn failed_quote_scan_does_not_skip_a_valid_suffix_with_a_different_inset() {

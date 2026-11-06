@@ -1,6 +1,4 @@
-<!-- Google Material Symbols Rounded, Apache-2.0. Source: symbols/web/ink_highlighter/materialsymbolsrounded/ink_highlighter_24px.svg -->
-<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="960" android:viewportHeight="960">
-    <group android:translateY="960">
-        <path android:fillColor="@android:color/white" android:pathData="M544-400 440-504 240-304l104 104 200-200Zm-47-161 104 104 199-199-104-104-199 199Zm-84-28 216 216-229 229q-24 24-56 24t-56-24l-2-2-3 3q-11 11-25.5 17t-30.5 6H108q-14 0-19-12t5-22l92-92-2-2q-24-24-24-56t24-56l229-229Zm0 0 227-227q24-24 56-24t56 24l104 104q24 24 24 56t-24 56L629-373 413-589Z"/>
-    </group>
+<!-- Torto selection action, matching the rounded outline icon system. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="@android:color/transparent" android:strokeColor="@android:color/white" android:strokeWidth="1.65" android:strokeLineCap="round" android:strokeLineJoin="round" android:pathData="M7,12 L16,3 L21,8 L12,17 Z M7,12 L4,15 L4,18 L7,18 L10,15 M14,5 L19,10"/>
 </vector>

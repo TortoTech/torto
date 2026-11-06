@@ -11,6 +11,7 @@ struct Server {
     requests: Arc<Mutex<Vec<Value>>>,
     pause: Arc<AtomicBool>,
     pause_translation: Arc<AtomicBool>,
+    fail_translation: Arc<AtomicBool>,
     pause_structure: Arc<AtomicBool>,
     entered: mpsc::Receiver<()>,
     release: mpsc::Sender<()>,
@@ -25,12 +26,14 @@ impl Server {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let pause = Arc::new(AtomicBool::new(false));
         let pause_translation = Arc::new(AtomicBool::new(false));
+        let fail_translation = Arc::new(AtomicBool::new(false));
         let pause_structure = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let (entered_tx, entered) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
         let (records, paused, stopped) = (requests.clone(), pause.clone(), stop.clone());
         let body_paused = pause_translation.clone();
+        let fail_once = fail_translation.clone();
         let structure_paused = pause_structure.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::Acquire) {
@@ -59,10 +62,14 @@ impl Server {
                 let payload: Value = serde_json::from_slice(&body).unwrap();
                 let user = text(&payload["messages"][1]["content"]);
                 let input: Value =
-                    serde_json::from_str(user.split("\n\n").next().unwrap()).unwrap();
+                    serde_json::Deserializer::from_str(&user).into_iter::<Value>().next().unwrap().unwrap();
                 records.lock().unwrap().push(payload);
                 let enhancement = input.get("tl").is_some() && input.get("tb").is_some();
                 let structure = input.get("bs").is_some() || input.get("tg").is_some();
+                if !enhancement && !structure && fail_once.swap(false,Ordering::AcqRel) {
+                    let _=write!(socket,"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}");
+                    continue;
+                }
                 if (structure
                     && input["tg"]["cqk"]
                         .as_array()
@@ -114,7 +121,8 @@ impl Server {
                         .keys()
                         .filter(|key| key.chars().next().is_some_and(|c| c.is_ascii_digit()))
                     {
-                        result.insert(key.clone(), json!("共享源位置"));
+                        let value=input[key].as_str().unwrap_or_default();
+                        result.insert(key.clone(), if value.contains("<inlinefootnote ") {json!(value.replace("Inline definition", "内嵌脚注译文").replace("Inline body", "正文"))}else{json!("共享源位置")});
                     }
                     result.insert("g".into(), json!([{"s":"source locations","t":"源位置"}]));
                     Value::Object(result)
@@ -133,6 +141,7 @@ impl Server {
             requests,
             pause,
             pause_translation,
+            fail_translation,
             pause_structure,
             entered,
             release,
@@ -869,4 +878,104 @@ pub(super) async fn driver_delivery(core: &Arc<MobileCore>) {
 }
 fn reading_ai_settle() -> std::time::Duration {
     rebook_app_core::reading_ai::SETTLE + std::time::Duration::from_millis(30)
+}
+
+/// Opening a linked endnote uses the shared retry/cache path and publishes only
+/// document pixels. Other entries in the note chapter remain untranslated.
+pub(super) async fn linked_note_popup(core:&Arc<MobileCore>,root:&std::path::Path) {
+    let original=plugins::PluginSettings::load_default().unwrap();
+    let reading=core.clone().reading_options().await.unwrap();
+    let server=Server::new();
+    let mut settings=original.clone();
+    settings.providers=vec![plugins::AiProvider {id:"notes-test".into(),kind:plugins::AiProviderKind::Custom,base_url:server.url.clone(),models:vec![plugins::AiModelConfig::language("test")],..Default::default()}];
+    settings.translation_provider="notes-test".into();settings.translation_model="test".into();
+    settings.target_language="简体中文".into();settings.translate_toc=false;settings.expert_translation=false;
+    settings.semantic_layout.enabled=false;settings.save_default().unwrap();
+    core.clone().save_reading_options(settings::ReadingOptions {translated:true,..reading.clone()}).await.unwrap();
+    let path=root.join("linked-notes.epub");
+    let mut zip=zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    for (name,body) in [
+        ("mimetype",r#"application/epub+zip"#),
+        ("META-INF/container.xml",r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>"#),
+        ("book.opf",r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">linked-notes</dc:identifier><dc:title>Linked notes</dc:title><dc:language>en</dc:language></metadata><manifest><item id="body" href="body.xhtml" media-type="application/xhtml+xml"/><item id="notes" href="notes.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="body"/><itemref idref="notes"/></spine></package>"#),
+        ("body.xhtml",r##"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><p>Body remains still<a epub:type="noteref" href="notes.xhtml#one">1</a>.</p><p>Inline body<span class="footnote">Inline definition</span></p></body></html>"##),
+        ("notes.xhtml",r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><section epub:type="endnotes"><aside epub:type="footnote" id="one"><p>First linked definition.</p></aside><aside epub:type="footnote" id="two"><p>Unrelated second definition.</p></aside></section></body></html>"#),
+    ] {zip.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(body.as_bytes()).unwrap();}
+    zip.finish().unwrap();
+    let book=core.clone().import_book(path.to_string_lossy().into()).await.unwrap().remove(0);
+    let viewport=Viewport {width:300,height:300,scale:1.};
+    let reader=core.clone().open_book(book.id,viewport.clone()).await.unwrap();
+    reader.clone().configure(24.,true,false).await.unwrap();
+    let before=reader.clone().page().await.unwrap().info();
+    let mut expanded=reader.with(|s| {
+        let raw=s.pipeline.rewrite.parse_section(0).map_err(error)?;
+        Ok(vec![(0,raw.blocks.iter().flat_map(plugins::semantic_layout::block_ranges).collect())])
+    }).unwrap();
+    reader.with(|s| {rebook_app_core::reading_text::append_linked_footnote_translation_ranges(s.pipeline.rewrite.as_ref(),&mut expanded);Ok(())}).unwrap();
+    assert_eq!(expanded.len(),2,"linked definitions participate in body translation demand");
+    assert_eq!(expanded[1].1.len(),1,"one note must not promote the whole notes container");
+    let target="notes.xhtml#one".to_string();
+    let first=reader.clone().note_page("First linked definition.".into(),42,target.clone(),"1".into(),24.,0,viewport.clone(),0xff000000,0xfff4f5f7).await.unwrap();
+    assert!(first.page.info().regions.iter().any(|r|r.text.contains("First linked")));
+    let bounds=first.page.info().regions[0].bounds.clone();
+    assert!(bounds[0].x>=25.,"only the first line reserves the visible marker");
+    #[derive(Default)] struct Listener {revision:std::sync::atomic::AtomicU64,notify:tokio::sync::Notify,pages:std::sync::atomic::AtomicUsize}
+    impl services::driver::ReaderAiListener for Listener {
+        fn update(&self,u:services::driver::ReaderAiUpdate){
+            self.revision.fetch_max(u.document_revision,Ordering::Release);
+            if u.page.is_some(){self.pages.fetch_add(1,Ordering::Relaxed);}
+            self.notify.notify_waiters();
+        }
+    }
+    let listener=Arc::new(Listener::default());
+    server.fail_translation.store(true,Ordering::Release);
+    let activity=services::driver::ReaderAiActivity {active:true,interacting:false,manual_layout:false,ui_epoch:100};
+    reader.clone().update_ai_demand(activity.clone(),listener.clone()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5),async {
+        loop {let wait=listener.notify.notified();tokio::pin!(wait);wait.as_mut().enable();if listener.revision.load(Ordering::Acquire)>0 {break;}wait.await;}
+    }).await.expect("translated popup must publish its revision without a body page");
+    let translated=reader.clone().note_page("First linked definition.".into(),42,target.clone(),"1".into(),24.,0,viewport.clone(),0xff000000,0xfff4f5f7).await.unwrap();
+    assert!(translated.page.info().regions.iter().any(|r|r.text.contains("共享源位置")));
+    assert_eq!(listener.pages.load(Ordering::Relaxed),0,"translation must not reflow the covered body");
+    let requests=server.requests.lock().unwrap();
+    assert_eq!(requests.len(),2,"mobile must reuse the shared first request plus one retry");
+    let payload=text(&requests[0]["messages"][1]["content"]);
+    assert!(payload.contains("First linked definition"));assert!(!payload.contains("Unrelated second"));drop(requests);
+    reader.with(|s| {
+        assert_eq!(s.session.location().section_index,before.section as usize);
+        let raw=s.pipeline.rewrite.parse_section(1).map_err(error)?;
+        let target=PublicationUrl::parse("notes.xhtml#two").unwrap();
+        let ranges=rebook_app_core::reading_text::focus_footnote_translation_ranges_in_section(&raw,&target);
+        let prepared=plugins::prepare_translation_inputs(&raw,false);
+        assert!(!s.pipeline.translation.untranslated_prepared(1,&prepared,&ranges).map_err(error)?.is_empty());Ok(())
+    }).unwrap();
+    reader.clone().close_document(translated.id).await.unwrap();
+    reader.clone().note_page("First linked definition.".into(),43,target,"1".into(),24.,0,viewport,0xff000000,0xfff4f5f7).await.unwrap();
+    reader.clone().update_ai_demand(activity,listener.clone()).await.unwrap();
+    assert_eq!(server.requests.lock().unwrap().len(),2,"reopening uses translation cache");
+    // Embedded footnotes must also resolve from the translated source rather
+    // than retaining the original string captured on the first tap.
+    reader.with(|s|{s.document=None;Ok(())}).unwrap();
+    let (owner,range)=reader.with(|s| {
+        let raw=s.pipeline.rewrite.parse_section(0).map_err(error)?;
+        let source=raw.blocks.iter().flat_map(|b|b.text_blocks()).find(|t|t.content.iter().flat_map(rebook_publication::Inline::text_runs).any(|r|r.text.contains("Inline body"))).unwrap().source.clone().unwrap();
+        Ok((rebook_publication::source_block_identity(&source),source))
+    }).unwrap();
+    let target=format!("inline-note:0:{owner}:{}",0x2000_0001u32);
+    reader.clone().note_page("Inline definition".into(),44,target.clone(),"1".into(),24.,0,Viewport {width:300,height:300,scale:1.},0xff000000,0xfff4f5f7).await.unwrap();
+    let revision=listener.revision.load(Ordering::Acquire);
+    reader.clone().update_ai_demand(services::driver::ReaderAiActivity {active:true,interacting:false,manual_layout:false,ui_epoch:101},listener.clone()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5),async {
+        loop {let wait=listener.notify.notified();tokio::pin!(wait);wait.as_mut().enable();if listener.revision.load(Ordering::Acquire)>revision {break;}wait.await;}
+    }).await.expect("inline notes must publish translated popup content");
+    let page=reader.clone().note_page("Inline definition".into(),44,target,"1".into(),24.,0,Viewport {width:300,height:300,scale:1.},0xff000000,0xfff4f5f7).await.unwrap();
+    assert!(page.page.info().regions.iter().any(|r|r.text.contains("内嵌脚注译文")));
+    assert_eq!(listener.pages.load(Ordering::Relaxed),0);
+    assert!(reader.with(|s|Ok(documents::translation_target(s).unwrap().ranges.contains(&range))).unwrap());
+    reader.clone().close_document(page.id).await.unwrap();
+    reader.clone().update_ai_demand(services::driver::ReaderAiActivity {active:true,interacting:false,manual_layout:false,ui_epoch:101},listener.clone()).await.unwrap();
+    assert!(listener.pages.load(Ordering::Relaxed)>0,"closing a popup publishes body results held during preview without another scroll");
+    assert_eq!(reader.with(|s|Ok(s.session.snapshot().location.section_index)).unwrap(),before.section as usize);
+
+    reader.shutdown().await.unwrap();core.clone().save_reading_options(reading).await.unwrap();original.save_default().unwrap();
 }

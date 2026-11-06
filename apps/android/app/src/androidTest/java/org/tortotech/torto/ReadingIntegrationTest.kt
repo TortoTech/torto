@@ -43,7 +43,7 @@ class ReadingIntegrationTest {
             val progress=reader.page().use {it.info().progress}
             val markup="**A reading note** with \\(x^2\\) and a [source](https://example.com)\n\n"+(0..25).joinToString("\n\n"){"Paragraph $it: long notes keep the reader typography and remain selectable."}
             val viewport=Viewport(300u,240u,2f)
-            val first=reader.notePage(markup,1uL,0u,viewport,0xff000000u,0xfff8f5eeu)
+            val first=reader.notePage(markup,1uL,"","",0f,0u,viewport,0xff000000u,0xfff8f5eeu)
             val id=first.id
             val total=first.total
             first.page.use {page->
@@ -57,14 +57,14 @@ class ReadingIntegrationTest {
             }
             val tail=StringBuilder()
             for(index in maxOf(0,total.toInt()-2) until total.toInt()){
-                tail.append(reader.notePage(markup,1uL,index.toUInt(),viewport,0xff000000u,0xfff8f5eeu).page.use {page->
+                tail.append(reader.notePage(markup,1uL,"","",0f,index.toUInt(),viewport,0xff000000u,0xfff8f5eeu).page.use {page->
                     assertTrue(page.info().regions.isNotEmpty());page.info().regions.joinToString(""){it.text}
                 })
             }
             assertTrue("The complete final note paragraph remains reachable",tail.contains("25:")&&tail.contains("selectable."))
             assertEquals(progress,reader.page().use {it.info().progress},0.000001)
             reader.configure(34f,true,false).close()
-            val larger=reader.notePage(markup,1uL,0u,viewport,0xff000000u,0xfff8f5eeu)
+            val larger=reader.notePage(markup,1uL,"","",0f,0u,viewport,0xff000000u,0xfff8f5eeu)
             assertTrue("Notes must inherit reader font size",larger.total>total);larger.page.close()
             reader.closeDocument(id)
             assertTrue(runCatching {reader.referencePage(id,0u,viewport,0xff000000u,0xfff8f5eeu)}.isFailure)

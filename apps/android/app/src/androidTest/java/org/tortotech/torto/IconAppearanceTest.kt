@@ -39,8 +39,11 @@ class IconAppearanceTest {
                     }
                 }
             }}
-            instrumentation.waitForIdleSync();android.os.SystemClock.sleep(200)
+            // Accessibility reports animated window transforms during launch;
+            // sample hit rectangles only after that finite transition settles.
+            instrumentation.waitForIdleSync();android.os.SystemClock.sleep(700)
             fun bounds(label:String):Rect {
+                if(android.os.Build.VERSION.SDK_INT>=33)instrumentation.uiAutomation.clearCache()
                 var button=find(instrumentation.uiAutomation.rootInActiveWindow,label)
                 while(button!=null&&!button.isClickable)button=button.parent
                 assertNotNull(button)

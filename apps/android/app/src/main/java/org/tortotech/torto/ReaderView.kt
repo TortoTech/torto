@@ -16,7 +16,6 @@ import android.graphics.RectF
 import android.view.VelocityTracker
 import android.view.ViewConfiguration
 import androidx.compose.animation.core.getVelocityFromNanos
-import org.tortotech.torto.core.focusMotionDuration
 import org.tortotech.torto.core.pageTurnCommit
 import org.tortotech.torto.core.pageTurnResistedOffset
 import androidx.core.view.ViewCompat
@@ -240,7 +239,7 @@ class ReaderView(context: Context) : View(context) {
         val unit=pageIsUnit
         val animator=ValueAnimator.ofFloat(start,target)
         motion=animator
-        animator.duration=if(unit){if(commit)140L else 150L}else focusMotionDuration(target-start).toLong()
+        animator.duration=readerTurnDuration(target-start,width/density)
         animator.interpolator=if(unit){if(commit)android.view.animation.PathInterpolator(.215f,.61f,.355f,1f)else android.view.animation.PathInterpolator(0f,0f,.58f,1f)}else android.animation.TimeInterpolator {t->t*t*(3f-2f*t)}
         animator.addUpdateListener {pageOffset=it.animatedValue as Float;invalidate()}
         animator.addListener(object:AnimatorListenerAdapter(){override fun onAnimationEnd(animation:Animator){

@@ -124,7 +124,6 @@ private fun statisticsDate(ms:ULong?):String=if(ms==null||ms==0uL)"—" else Ins
                 }
             }
         }
-        if(state.statsLoading)item{LinearProgressIndicator(Modifier.fillMaxWidth().padding(bottom=12.dp))}
         if(stats!=null) {
             val ranked=stats.books.filter {it.milliseconds>0uL}
             item {Row(Modifier.padding(bottom=12.dp),horizontalArrangement=Arrangement.spacedBy(12.dp)) {
@@ -159,7 +158,7 @@ private fun statisticsDate(ms:ULong?):String=if(ms==null||ms==0uL)"—" else Ins
 @Composable fun BookStatisticsScreen(state:ScreenState,model:ReaderModel) {
     LaunchedEffect(state.statsBookId){state.statsBookId?.let {model.loadBookStatistics(it)}}
     val detail=state.bookStatistics?.takeIf {it.id==state.statsBookId}
-    if(detail==null){if(state.statsLoading)Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){CircularProgressIndicator()};return}
+    if(detail==null)return
     val days=remember(detail.distribution){detail.distribution.filter {it.milliseconds>=60000uL}.sortedByDescending {it.day}}
     val measurer=rememberTextMeasurer()
     val textStyle=MaterialTheme.typography.bodyMedium.copy(fontFeatureSettings="tnum")

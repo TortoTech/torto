@@ -74,6 +74,7 @@ impl HtmlContext {
 
     pub fn hints<'a>(&'a self, descriptor: &SpineItem) -> SectionParseHints<'a> {
         SectionParseHints {
+            ignore_body_margins: false,
             note_section: descriptor.is_note_section()
                 || self.note_sections.contains(descriptor.href.path()),
             navigation_documents: &self.navigation_documents,

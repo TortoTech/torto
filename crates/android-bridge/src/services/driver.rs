@@ -10,6 +10,7 @@ pub(crate) struct State {
     demand: reading_ai::Demand,
     active: bool,
     interacting: bool,
+    popup: bool,
     epoch: u64,
     version: u64,
     view_dirty: bool,
@@ -20,6 +21,9 @@ pub(crate) struct State {
     done: VecDeque<String>,
     error: Option<String>,
     notice: Option<String>,
+    document_revision: u64,
+    error_serial: u64,
+    error_kind: String,
 }
 struct Running {
     request: Arc<chat::ChatRequest>,
@@ -44,6 +48,9 @@ pub struct ReaderAiUpdate {
     pub toc: Option<Vec<TocItem>>,
     pub error: Option<String>,
     pub notice: Option<String>,
+    pub document_revision: u64,
+    pub error_serial: u64,
+    pub error_kind: String,
 }
 #[uniffi::export(with_foreign)]
 pub trait ReaderAiListener: Send + Sync {
@@ -100,7 +107,7 @@ async fn update(
         return Ok(());
     }
     let r = reader.clone();
-    let (target, source, book, toc, settings, translated, revision, changed) =
+    let (target, source, book, toc, settings, translated, revision, changed, popup) =
         work(move || {
             r.with(|s| {
                 let mut settings = PluginSettings::load_default().map_err(error)?;
@@ -117,7 +124,8 @@ async fn update(
                 if changed {
                     s.enhancements.dirty = true;
                 }
-                let target = requests::target(s)?;
+                let popup = s.document.is_some();
+                let target = documents::translation_target(s).map(Ok).unwrap_or_else(|| requests::target(s))?;
                 Ok((
                     target,
                     s.pipeline.rewrite.clone(),
@@ -127,6 +135,7 @@ async fn update(
                     reading.translated,
                     s.pipeline.rewrite.revision(),
                     changed,
+                    popup,
                 ))
             })
         })
@@ -136,7 +145,15 @@ async fn update(
     )
     .to_hex()
     .to_string();
-    let demand = vec![(target.index, target.ranges.clone())];
+    let original_demand = vec![(target.index, target.ranges.clone())];
+    let demand = if translated && !popup && !activity.interacting {
+        let source = source.clone();
+        let mut demand = original_demand.clone();
+        work(move || {
+            rebook_app_core::reading_text::append_linked_footnote_translation_ranges(source.as_ref(), &mut demand);
+            Ok(demand)
+        }).await?
+    } else { original_demand.clone() };
     let reset = {
         let mut state = reader.ai.lock().map_err(error)?;
         let reset = state.context != context;
@@ -152,14 +169,17 @@ async fn update(
             state.context = context.clone();
         }
         let resume =
-            (state.interacting && !activity.interacting) || state.epoch != activity.ui_epoch;
+            (state.interacting && !activity.interacting) || state.epoch != activity.ui_epoch || state.popup != popup;
         state.view_dirty |= resume || changed;
         state.listener = Some(listener);
         state.active = true;
         state.interacting = activity.interacting;
+        state.popup = popup;
         state.manual_layout = activity.manual_layout;
         state.epoch = activity.ui_epoch;
         state.demand = demand.clone();
+        let obsolete = state.requests.iter().filter(|(key,work)| !activity.interacting && key.contains("\"linked-note\"") && !reading_ai::relevant(work.index,&work.sources,&demand)).map(|(key,_)|key.clone()).collect::<Vec<_>>();
+        for key in obsolete {if let Some(work)=state.requests.remove(&key){work.request.cancel();}}
         reset
     };
     if reset {
@@ -172,7 +192,7 @@ async fn update(
         })
         .await?;
     }
-    reader.scheduler.update(demand, activity.interacting);
+    reader.scheduler.update(demand.clone(), activity.interacting);
     // Resuming interaction may publish results already marked dirty by a
     // worker; it must not invent a source change and redraw unchanged pixels.
     if changed {
@@ -183,6 +203,22 @@ async fn update(
         return Ok(());
     }
     if !settings.semantic_layout.enabled && !translated && !activity.manual_layout {
+        content_changed(&reader).await;
+        return Ok(());
+    }
+    // Linked notes share desktop demand expansion, cache and translation retry.
+    // A popup updates its document only, without rebuilding the body viewport.
+    if translated {
+        for (index, ranges) in &demand {
+            let linked = if popup { ranges.clone() } else {
+                ranges.iter().filter(|range| !original_demand.iter().any(|(i,rs)| i==index && rs.contains(range))).cloned().collect()
+            };
+            if !linked.is_empty() {
+                start_note_translation(&reader, &context, requests::Target {index:*index, ranges:linked, prefetch:false, defer:false});
+            }
+        }
+    }
+    if popup {
         content_changed(&reader).await;
         return Ok(());
     }
@@ -392,6 +428,25 @@ async fn update(
     Ok(())
 }
 
+fn start_note_translation(reader: &Arc<MobileReader>, context: &str, target: requests::Target) {
+    let key = serde_json::json!([context,"linked-note",target.index,target.ranges]).to_string();
+    let request = {
+        let Ok(mut state) = reader.ai.lock() else {return;};
+        if !state.active || state.context != context || state.done.contains(&key) || state.requests.contains_key(&key) {return;}
+        if state.requests.len() >= reading_ai::MAX_QUEUED {state.replan=true;return;}
+        let request = chat::ChatRequest::new();
+        state.requests.insert(key.clone(), Running {request:request.clone(),kind:Kind::Translation,index:target.index,sources:target.ranges.clone()});
+        request
+    };
+    let reader=reader.clone();let context=context.to_owned();
+    runtime().spawn(async move {
+        let result = requests::translate(reader.clone(),target,true,request.clone()).await;
+        finish(&reader,&context,&key,&request,result);
+        content_changed(&reader).await;
+        replan(&reader);
+    });
+}
+
 fn replan(reader: &Arc<MobileReader>) {
     let activity = {
         let Ok(mut state) = reader.ai.lock() else {
@@ -451,7 +506,10 @@ fn finish(
             Err(error) if reading_ai::interrupted(&error.to_string()) => {}
             Err(error) => {
                 if kind != Kind::Enhancement {
+                    tracing::warn!(kind=?kind, error=%error, "Reader AI request failed after shared retries");
                     state.error = Some(error.to_string());
+                    state.error_serial = state.error_serial.wrapping_add(1);
+                    state.error_kind = if matches!(kind,Kind::Translation|Kind::Contents) {"translation"} else {"layout"}.into();
                 }
                 state.done.push_back(key.into());
             }
@@ -513,6 +571,9 @@ fn emit_at(
                 toc,
                 error: state.error.clone(),
                 notice,
+                document_revision:state.document_revision,
+                error_serial:state.error_serial,
+                error_kind:state.error_kind.clone(),
             },
         )
     };
@@ -599,18 +660,25 @@ pub(crate) async fn content_changed(reader: &Arc<MobileReader>) {
         return;
     }
     let r = reader.clone();
-    let page = work(move || {
+    let (page, document_changed) = work(move || {
         r.with(|s| {
+            if s.document.is_some() {
+                return documents::refresh(s).map(|changed| (None, changed));
+            }
             if s.enhancements.dirty && s.selected.is_none() && s.document.is_none() {
-                render(s).map(Some)
+                render(s).map(|page| (Some(page), false))
             } else {
-                Ok(None)
+                Ok((None, false))
             }
         })
     })
     .await
-    .ok()
-    .flatten();
+    .unwrap_or((None,false));
+    if document_changed {
+        if let Ok(mut state)=reader.ai.lock() {
+            if state.epoch==epoch && state.context==context {state.document_revision=state.document_revision.wrapping_add(1);}
+        }
+    }
     if !emit_at(reader, page, None, Some(epoch), Some(&context)) {
         mark_dirty(reader).await;
     }

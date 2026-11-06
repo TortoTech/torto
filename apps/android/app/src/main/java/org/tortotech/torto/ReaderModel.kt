@@ -23,9 +23,9 @@ import kotlinx.coroutines.sync.withLock
 import org.tortotech.torto.core.*
 import org.tortotech.torto.core.Annotation
 
-data class ReaderInteraction(val kind:String,val text:String,val target:String,val frame:ReaderFrame?=null,val markup:String="",val marker:String="",val indicator:Rect?=null)
+data class ReaderInteraction(val kind:String,val text:String,val target:String,val frame:ReaderFrame?=null,val markup:String="",val marker:String="",val indicator:Rect?=null,val revision:ULong=0u)
 data class ReaderFrame(val bitmap: Bitmap, val info: PageInfo, val rasterId: ULong = 0uL)
-data class DocumentFrame(val id:String,val index:UInt,val total:UInt,val frame:ReaderFrame,val controls:List<ReadingControl>)
+data class DocumentFrame(val id:String,val index:UInt,val total:UInt,val frame:ReaderFrame,val controls:List<ReadingControl>,val firstTextBaseline:Float?=null)
 data class ReadingCompletion(val statistics:BookStatistics,val finishedBooks:UInt)
 data class ScreenState(
     val books: List<BookSummary> = emptyList(), val loaded: Boolean = false, val active: BookSummary? = null,
@@ -42,14 +42,14 @@ data class ScreenState(
     val reading:ReadingOptions?=null,val fontFamilies:FontFamilies?=null,val aiOptions:AiOptions?=null,
     val providers:List<Provider> = emptyList(),val providerKinds:List<ProviderKind> = emptyList(),
     val modelChoices:Map<String,List<String>> = emptyMap(),val modelFetchError:String?=null,
-    val settingsRevision:Long=0, val aiStage:String="",val aiCompleted:UInt=0u,val aiTotal:UInt=0u,val aiError:String?=null,
+    val settingsRevision:Long=0, val aiStage:String="",val aiCompleted:UInt=0u,val aiTotal:UInt=0u,val aiError:String?=null,val aiErrorEvent:ULong=0u,val aiNoticeUntil:Long=0,val aiErrorKind:String="",
     val annotations: List<Annotation> = emptyList(), val annotationPreviewId:String?=null, val statistics: ReadingStatistics? = null,
     val messages: List<ChatMessage> = emptyList(), val chatWorking: Boolean = false,
     val chatDraft:String="",val draftImages:List<ChatAttachment> = emptyList(),val sendingImages:List<ChatAttachment> = emptyList(),
     val chatContent: String = "", val chatReasoning: String = "", val chatActivity: String = "", val chatQuestion: String = "",
     val changes: List<ChatChange> = emptyList(), val translated: Boolean = false,
     val selectionMode: String = "word",
-    val interaction:ReaderInteraction?=null,val focus:Boolean=false,val chromeVisible:Boolean=true,val readerMoving:Boolean=false,val quietUpdate:Boolean=false,
+    val interaction:ReaderInteraction?=null,val focus:Boolean=false,val focusAvailable:Boolean=false,val chromeVisible:Boolean=true,val readerMoving:Boolean=false,val quietUpdate:Boolean=false,
     val processing:Boolean=false,val enhancing:Boolean=false,val autoLayout:Boolean=false,
     val appTheme: String = "system", val language: String = "system",
     val fontSize: Float = 20f, val unified: Boolean = false, val dark: Boolean = false,
@@ -80,6 +80,8 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     private var turnPreviewGeneration=0L
     private var chatRequest: ChatRequest? = null
     private var chatJob: Job? = null
+    private var documentMoving=false
+    private var documentSelected=false
     private var aiUiEpoch=0uL
     private var aiVersion=0uL
     private var aiDemandJob:Job?=null
@@ -92,6 +94,9 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     private var selectionHandle=false
     private val missingCovers = LruCache<String, Boolean>(256)
     private val covers = object : LruCache<String, Bitmap>(8 * 1024 * 1024) { override fun sizeOf(key: String, value: Bitmap) = value.allocationByteCount }
+    suspend fun feedbackSession(environment:FeedbackEnvironment):MobileFeedback = operations.withLock {
+        withContext(NonCancellable){core.openFeedback(reader,environment)}
+    }
     fun cachedCover(id: String): Bitmap? = covers.get(id)
     suspend fun cover(id: String): Bitmap? {
         covers.get(id)?.let { return it }
@@ -266,7 +271,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         if(snapshot.active==null||snapshot.frame==null)return
         val token=generation;val epoch=aiUiEpoch
         val activity=ReaderAiActivity(CloudRuntime.foreground,
-            blocked||snapshot.busy||snapshot.readerMoving||snapshot.chatWorking||snapshot.selected!=null||snapshot.interaction!=null,manualLayout,epoch)
+            blocked||snapshot.busy||snapshot.readerMoving||snapshot.chatWorking||snapshot.selected!=null||documentMoving||documentSelected||snapshot.interaction?.kind?.let {it !in listOf("note","reference")}==true,manualLayout,epoch)
         aiDemandJob?.cancel()
         aiDemandJob=viewModelScope.launch {
             operations.withLock {withContext(NonCancellable){
@@ -279,7 +284,12 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
                             operations.withLock {
                                 if(token!=generation||update.uiEpoch!=aiUiEpoch||reader!==session||update.version<=aiVersion)return@withLock
                                 aiVersion=update.version
-                                mutable.update {it.copy(processing=update.processing,enhancing=update.enhancing,aiError=update.error,notice=update.notice ?: it.notice)}
+                                val freshError=update.error!=null&&(update.errorSerial!=state.value.aiErrorEvent||state.value.aiError==null)
+                                mutable.update {it.copy(aiNoticeUntil=if(freshError)android.os.SystemClock.uptimeMillis()+2000 else it.aiNoticeUntil,processing=update.processing,enhancing=update.enhancing,aiError=update.error,aiErrorEvent=update.errorSerial,aiErrorKind=update.errorKind,notice=update.notice ?: it.notice)}
+                                val popup=state.value.interaction
+                                if(!documentMoving&&!documentSelected&&popup?.kind in listOf("note","reference") && popup!=null && popup.revision!=update.documentRevision){
+                                    mutable.update {current->if(current.interaction===popup)current.copy(interaction=popup.copy(revision=update.documentRevision))else current}
+                                }
                                 val page=update.page
                                 if(page!=null&&!aiUiBlocked&&!state.value.readerMoving&&state.value.selected==null&&state.value.interaction==null){
                                     consumed.set(true)
@@ -297,7 +307,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
                         }
                         delivery.invokeOnCompletion {if(!consumed.get())update.page?.close()}
                     }
-                })}catch(e:CancellationException){throw e}catch(e:Exception){if(token==generation)mutable.update {it.copy(aiError=e.message)}}
+                })}catch(e:CancellationException){throw e}catch(e:Exception){if(token==generation)mutable.update {it.copy(aiError=e.message,aiErrorKind=if(it.translated)"translation"else"layout",aiNoticeUntil=android.os.SystemClock.uptimeMillis()+2000)}}
             }}
         }
     }
@@ -336,7 +346,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         clearTurnPreviews()
         cancelChat();cancelAi();aiVersion=0uL;manualLayout=false;scrollPending=0f;selectionPending=null;selectionHandle=false
         generation++
-        mutable.update { it.copy(active = book, frame = null, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=false,processing=false, hits = emptyList(), selected = null, messages=emptyList(),changes=emptyList(),annotations=emptyList(),translated=state.value.reading?.translated?:false,aiError=null,chatWorking=false,chatQuestion="",chatContent="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList()) }
+        mutable.update { it.copy(active = book, frame = null, focusAvailable=false, focus=false, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=false,processing=false, hits = emptyList(), selected = null, messages=emptyList(),changes=emptyList(),annotations=emptyList(),translated=state.value.reading?.translated?:false,aiError=null,chatWorking=false,chatQuestion="",chatContent="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList()) }
         viewport = null
     }
     fun measure(width: Int, height: Int, density: Float) {
@@ -362,7 +372,11 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
                             val opened = core.openBook(book.id, next)
                             if (token != generation) { opened.shutdown(); opened.close(); return@withContext }
                             reader = opened; readerBook = book.id
-                            opened.focusMode(state.value.focus).close()
+                            val focusAvailable=opened.focusModeAvailable()
+                            val focus=focusAvailable&&withContext(Dispatchers.IO){getApplication<Application>().getSharedPreferences("reading",0).getBoolean("focus",false)}
+                            opened.focusMode(focus).close()
+                            if(token!=generation){opened.shutdown();opened.close();if(reader===opened){reader=null;readerBook=null};return@withContext}
+                            mutable.update {it.copy(focusAvailable=focusAvailable,focus=focus)}
                             opened.selectionMode(state.value.selectionMode)
                             val toc = opened.toc()
                             mutable.update { it.copy(toc = toc) }
@@ -424,8 +438,20 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+    fun documentInteraction(moving:Boolean?=null,selected:Boolean?=null){
+        val nextMoving=moving ?: documentMoving
+        val nextSelected=selected ?: documentSelected
+        if(nextMoving==documentMoving&&nextSelected==documentSelected)return
+        documentMoving=nextMoving;documentSelected=nextSelected
+        if(nextMoving||nextSelected)reader?.suspendAi()
+        processVisible(aiUiBlocked)
+    }
     fun dismissInteraction(){
-        val id=documentId;documentId=null;documentGeneration++
+        documentMoving=false;documentSelected=false
+        // Media references own a native document as soon as the marker is
+        // tapped, even if the first preview page has not finished loading.
+        val id=documentId ?: state.value.interaction?.takeIf {it.kind=="reference"}?.target
+        documentId=null;documentGeneration++
         val token=generation;mutable.update {it.copy(interaction=null)}
         if(id!=null)viewModelScope.launch {operations.withLock {if(token==generation)withContext(NonCancellable){reader?.closeDocument(id)}}}
     }
@@ -436,18 +462,18 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         }}
     }}
     fun toggleReadingControl(control:ReadingControl)=readerOperation(quietUpdate=true) {it.toggleReadingControl(control)}
-    suspend fun documentPage(interaction:ReaderInteraction,index:UInt,width:UInt,scale:Float,foreground:UInt,background:UInt):DocumentFrame? {
+    suspend fun documentPage(interaction:ReaderInteraction,index:UInt,width:UInt,scale:Float,foreground:UInt,background:UInt,firstLineIndent:Float=0f):DocumentFrame? {
         val token=generation;val documentToken=documentGeneration
         return operations.withLock {withContext(NonCancellable){
             if(token!=generation||state.value.interaction!==interaction)return@withContext null
             val session=reader ?: return@withContext null
             val viewport=Viewport(width,320u,scale.coerceIn(1f,4f))
-            val result=if(interaction.kind=="note")session.notePage(interaction.markup.ifBlank {interaction.text},documentToken.toULong(),index,viewport,foreground,background)
+            val result=if(interaction.kind=="note")session.notePage(interaction.markup.ifBlank {interaction.text},documentToken.toULong(),interaction.target,interaction.marker,firstLineIndent,index,viewport,foreground,background)
                 else session.referencePage(interaction.target,index,viewport,foreground,background)
             val frame=nativeFrame(result.page)
             if(token!=generation||state.value.interaction!==interaction){session.closeDocument(result.id);return@withContext null}
             documentId=result.id
-            DocumentFrame(result.id,result.index,result.total,frame,result.controls)
+            DocumentFrame(result.id,result.index,result.total,frame,result.controls,result.firstTextBaseline)
         }}
     }
     suspend fun documentSelect(document:DocumentFrame,x:Float,y:Float,ex:Float,ey:Float,handle:Boolean?):SelectedText? {
@@ -479,6 +505,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun focus(enabled:Boolean){
+        if(!state.value.focusAvailable)return
         val token=generation
         readerOperation { session->session.focusMode(enabled).also {
             withContext(Dispatchers.IO){check(getApplication<Application>().getSharedPreferences("reading",0).edit().putBoolean("focus",enabled).commit())}
@@ -632,6 +659,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     }
     fun endHandle(){selectionHandle=false}
     fun selectionMode(mode: String) {
+        if(state.value.translated)return
         val token=generation
         runOperation { if(token==generation) { reader?.selectionMode(mode);if(token==generation)mutable.update { it.copy(selectionMode=mode) } } }
     }
@@ -655,7 +683,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         mutable.update { it.copy(appTheme=theme,language=language) }
     }
     fun removeBook(book: BookSummary) = runOperation { core.removeBook(book.id);CloudRuntime.libraryChanged(); covers.remove(book.id); missingCovers.remove(book.id); val books=core.books(); mutable.update { it.copy(books=books) } }
-    fun loadStatistics() = runOperation { val statistics=core.statistics(); mutable.update { it.copy(statistics=statistics) } }
+    fun loadStatistics() = runOperation(quietUpdate=true) { val statistics=core.statistics(); mutable.update { it.copy(statistics=statistics) } }
     fun loadAnnotations() {
         val token=generation
         runOperation { if(token==generation) { val notes=reader?.annotations().orEmpty(); if(token==generation) mutable.update { it.copy(annotations=notes,annotationPreviewId=it.annotationPreviewId?.takeIf {id->notes.any {n->n.id==id}}) } } }
