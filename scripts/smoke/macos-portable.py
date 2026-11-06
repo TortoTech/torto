@@ -26,33 +26,31 @@ def run(*args, **kwargs):
     return result
 
 def create_exfat_image(image):
-    command = ("/usr/bin/hdiutil", "create", "-ov", "-size", "1g", "-fs", "ExFAT",
-               "-type", "SPARSE", "-volname", "TortoPortableCheck", image)
-    try:
-        run(*command)
-    except RuntimeError as error:
-        # Hosted runners can deny ordinary-user ExFAT formatting. Elevate only
-        # creation of this disposable image, never the app or its GUI checks.
-        if os.environ.get("GITHUB_ACTIONS") != "true" or "Operation not permitted" not in str(error):
-            raise
-        print("Retrying disposable ExFAT image creation with runner privileges", flush=True)
-        run("/usr/bin/sudo", "-n", *command)
-        run("/usr/bin/sudo", "-n", "/usr/sbin/chown", f"{os.getuid()}:{os.getgid()}", image)
+    # macOS newfs_exfat restricts labels to 11 characters. hdiutil reports an
+    # invalid label as EPERM, even when elevated, rather than a naming error.
+    run("/usr/bin/hdiutil", "create", "-ov", "-size", "1g", "-fs", "ExFAT",
+        "-type", "SPARSE", "-volname", "TortoTest", image)
 
 def make_app(source, destination):
-    if source.is_dir():
-        shutil.copytree(source, destination)
-    else:
-        binary = destination / "Contents/MacOS/torto"
-        binary.parent.mkdir(parents=True)
-        shutil.copy2(source, binary)
-        (destination / "Contents/Info.plist").write_bytes(plistlib.dumps({
-            "CFBundleIdentifier": "io.github.l-chris.torto", "CFBundleExecutable": "torto",
-            "CFBundleName": "Torto Portable Check", "CFBundlePackageType": "APPL",
-            "CFBundleVersion": "0.9.0", "CFBundleShortVersionString": "0.9.0",
-            "LSMinimumSystemVersion": "15.0", "NSHighResolutionCapable": True,
-        }))
-        run("/usr/bin/codesign", "--force", "--sign", "-", destination)
+    # Sign generated fixtures on the host filesystem. Signing on exFAT can
+    # create AppleDouble sidecars which strict verification treats as code.
+    with tempfile.TemporaryDirectory(prefix="torto-portable-app-") as staging:
+        if not source.is_dir():
+            binary_source = source
+            source = Path(staging) / "Torto.app"
+            binary = source / "Contents/MacOS/torto"
+            binary.parent.mkdir(parents=True)
+            shutil.copyfile(binary_source, binary)
+            shutil.copymode(binary_source, binary)
+            (source / "Contents/Info.plist").write_bytes(plistlib.dumps({
+                "CFBundleIdentifier": "io.github.l-chris.torto", "CFBundleExecutable": "torto",
+                "CFBundleName": "Torto Portable Check", "CFBundlePackageType": "APPL",
+                "CFBundleVersion": "0.9.0", "CFBundleShortVersionString": "0.9.0",
+                "LSMinimumSystemVersion": "15.0", "NSHighResolutionCapable": True,
+            }))
+            run("/usr/bin/codesign", "--force", "--sign", "-", source)
+        # Preserve bundle bytes/modes without introducing ._* metadata files.
+        run("/usr/bin/ditto", "--norsrc", "--noextattr", "--noacl", source, destination)
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", destination)
 
 def check(app, report, book=None):

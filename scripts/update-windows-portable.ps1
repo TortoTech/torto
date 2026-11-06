@@ -16,7 +16,16 @@ try {
     # Re-check the profile lock after exit, in case another reader was launched.
     $lock = [IO.File]::Open((Join-Path $root 'Data\.instance.lock'), 'OpenOrCreate', 'ReadWrite', 'ReadWrite')
     $lock.Lock(0, 1)
-    $digest = (Get-FileHash -LiteralPath $job.staged -Algorithm SHA256).Hash.ToLowerInvariant()
+    # A Windows PowerShell child launched by PowerShell 7 can inherit a module
+    # path without Get-FileHash. Hash the staged file directly without modules.
+    $hashStream = [IO.File]::OpenRead($job.staged)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($sha256.ComputeHash($hashStream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+        $hashStream.Dispose()
+    }
     if ($digest -ne $job.sha256) { throw 'Staged program checksum mismatch' }
     if (-not (Test-Path -LiteralPath (Join-Path $root 'torto-portable.json'))) { throw 'Portable marker is missing' }
     [IO.File]::Copy($job.staged, $next, $true)
