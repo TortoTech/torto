@@ -25,6 +25,20 @@ def run(*args, **kwargs):
         raise RuntimeError(f"{args[0]} failed: {result.stderr.decode(errors='replace')[-3000:]}")
     return result
 
+def create_exfat_image(image):
+    command = ("/usr/bin/hdiutil", "create", "-ov", "-size", "1g", "-fs", "ExFAT",
+               "-type", "SPARSE", "-volname", "TortoPortableCheck", image)
+    try:
+        run(*command)
+    except RuntimeError as error:
+        # Hosted runners can deny ordinary-user ExFAT formatting. Elevate only
+        # creation of this disposable image, never the app or its GUI checks.
+        if os.environ.get("GITHUB_ACTIONS") != "true" or "Operation not permitted" not in str(error):
+            raise
+        print("Retrying disposable ExFAT image creation with runner privileges", flush=True)
+        run("/usr/bin/sudo", "-n", *command)
+        run("/usr/bin/sudo", "-n", "/usr/sbin/chown", f"{os.getuid()}:{os.getgid()}", image)
+
 def make_app(source, destination):
     if source.is_dir():
         shutil.copytree(source, destination)
@@ -138,7 +152,7 @@ def main():
             image = root / "portable.sparseimage"
             mount = root / "mounted"
             mount.mkdir()
-            run("/usr/bin/hdiutil", "create", "-size", "1g", "-fs", "ExFAT", "-type", "SPARSE", "-volname", "TortoPortableCheck", image)
+            create_exfat_image(image)
             run("/usr/bin/hdiutil", "attach", image, "-nobrowse", "-mountpoint", mount)
             try:
                 info = plistlib.loads(run("/usr/sbin/diskutil", "info", "-plist", mount).stdout)

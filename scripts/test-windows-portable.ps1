@@ -83,7 +83,8 @@ public class PortableNewFixture {
     public static void Main(string[] args) {
         if (args.Length < 2) return;
         string json = File.ReadAllText(Path.Combine(args[1], "request.json"));
-        string token = Regex.Match(json, "\"token\"\\s*:\\s*\"([^\"]+)\"").Groups[1].Value;
+        string token = Regex.Match(json, @"""token""\s*:\s*""([^""]+)""").Groups[1].Value;
+        if (String.IsNullOrEmpty(token)) return;
         File.WriteAllText(Path.Combine(args[1], "healthy"), token);
         System.Threading.Thread.Sleep(1000);
     }
@@ -107,7 +108,8 @@ public class PortableNewFixture {
         $helper = Start-Process -FilePath powershell.exe -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + (Join-Path $PSScriptRoot 'update-windows-portable.ps1') + '"')) -PassThru
         Assert ($helper.WaitForExit(60000)) 'Portable helper timed out'
         $expected = switch ($mode) {'success' {'completed'} 'rollback' {'rolled-back'} 'corrupt' {'failed'}}
-        Assert ((Get-Content -LiteralPath (Join-Path $session 'state.txt') -Raw) -eq $expected) ('Unexpected helper result: ' + $mode)
+        $actual = Get-Content -LiteralPath (Join-Path $session 'state.txt') -Raw
+        Assert ($actual -eq $expected) ('Unexpected helper result for ' + $mode + ': expected ' + $expected + ', received ' + $actual)
         $expectedHash = (Get-FileHash -LiteralPath $(if ($mode -eq 'success') {$good} else {$old}) -Algorithm SHA256).Hash
         Assert ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $expectedHash) 'Portable program contents mismatch'
         Assert ((Get-Content -LiteralPath $data -Raw) -eq 'saved data') 'Update changed user data'

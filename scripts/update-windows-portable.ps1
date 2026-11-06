@@ -49,7 +49,9 @@ try {
             Stop-Process -Id $replacement.Id -Force -ErrorAction SilentlyContinue
             $replacement.WaitForExit()
         }
-        [IO.File]::Replace($job.backup, $job.target, $null)
+        # Windows PowerShell coerces $null to an empty string for this .NET
+        # string parameter; File.Replace needs an actual null backup path.
+        [IO.File]::Replace($job.backup, $job.target, [NullString]::Value)
         Write-State 'rolled-back'
         Start-Process -FilePath $job.target -WorkingDirectory $root -ArgumentList ('--torto-portable-rollback "' + $directory + '"') | Out-Null
     } else { Write-State 'failed' }
