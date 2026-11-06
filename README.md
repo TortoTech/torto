@@ -16,8 +16,8 @@
 <p align="center">
   <a href="https://github.com/TortoTech/torto/releases/latest"><img src="https://img.shields.io/github/v/release/TortoTech/torto?display_name=tag&sort=semver" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue" alt="AGPL-3.0-only License"></a>
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-5b6ee1" alt="Windows and macOS">
-  <img src="https://img.shields.io/badge/UI-egui-7c3aed" alt="Built with egui">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Android-5b6ee1" alt="Windows, macOS and Android">
+  <img src="https://img.shields.io/badge/UI-egui%20%7C%20Compose-7c3aed" alt="Built with egui and Compose">
   <a href="https://linux.do"><img src="https://img.shields.io/badge/LINUX-DO-FFB003.svg" alt="LINUX DO"></a>
 </p>
 
@@ -34,9 +34,9 @@
 
 ## About
 
-Torto is an open-source desktop ebook reader designed around **Focus Mode**. Instead of treating a book as a static stack of pages, Focus Mode parses its structure into meaningful reading units—paragraphs, nested lists, quotations, code blocks, tables, and figures—and anchors the active unit at a steady reading line. Navigation, highlights, notes, footnotes, formula notes, table charts, translation, and AI conversations all stay attached to that context.
+Torto is an open-source ebook reader for Windows, macOS and Android, designed around **Focus Mode**. Instead of treating a book as a static stack of pages, Focus Mode parses its structure into meaningful reading units—paragraphs, nested lists, quotations, code blocks, tables, and figures—and anchors the active unit at a steady reading line. Navigation, highlights, notes, footnotes, formula notes, table charts, translation, and AI conversations all stay attached to that context.
 
-Classic single-column, two-column, and vertical-scroll layouts remain available whenever you want a traditional page or chapter view. Unlike browser-based readers, Torto parses, lays out, paginates, and renders content through a native Rust pipeline built on `egui`, `Parley`, `Vello`, and `wgpu`, downloading default reading fonts on demand in the background to keep the installer lightweight.
+On desktop, classic single-column, two-column, and vertical-scroll layouts remain available whenever you want a traditional page or chapter view. Unlike browser-based readers, Torto parses, lays out, paginates, and renders content through a native Rust pipeline built on `egui`, `Parley`, `Vello`, and `wgpu`, downloading default reading fonts on demand in the background to keep the installer lightweight.
 
 ## Focus Mode
 
@@ -94,6 +94,8 @@ Download the latest build from [GitHub Releases](https://github.com/TortoTech/to
 | Windows portable | `Torto-*-windows-x86_64-portable.zip` | Extract and run; settings and books stay in `Data` beside the program |
 | macOS, Apple silicon | `Torto-*-macos-arm64.dmg` | macOS 15 or later |
 | macOS, Intel | `Torto-*-macos-x86_64.dmg` | macOS 15 or later |
+| Android, ARM64 | `Torto-*-android-arm64-v8a.apk` | Android 8 or later |
+| Android, x86_64 | `Torto-*-android-x86_64.apk` | Android 8 or later |
 
 macOS also supports [portable mode](docs/macos-portable.md) using the same app:
 create `torto-portable-data` beside the `.app` in a writable folder. Move the
@@ -127,7 +129,7 @@ cargo test --locked --workspace
 
 The core reading pipeline is `parser → Reading IR → layout → renderer`. Architecture notes live in `docs/`:
 
-- [Android preview: Rust core + Kotlin, build and migration status](docs/android.md)
+- [Android app: Rust core + Kotlin, build and feature coverage](docs/android.md)
 - [Native rendering ADR](docs/adr-0001-native-epub-renderer.md) & [Parley evaluation](docs/parley-engine-evaluation.md)
 - [AI semantic layout](docs/ai-semantic-layout.md), [batching](docs/ai-layout-batching.md), and [scheduling](docs/ai-layout-scheduling.md)
 - [Native PDF reflow](docs/pdf-native-reflow.md) & [Reading statistics](docs/reading-statistics.md)

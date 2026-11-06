@@ -8,7 +8,7 @@ import path from 'node:path';
 import { createArtifactSource, createAssetDownloader, artifactName } from './sync-gitee-release.mjs';
 import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease, updateManifest, request, uploadAttachment } from './sync-gitee-release.mjs';
 import { gitPushDiagnostics } from './sync-gitee-release.mjs';
-import { macosUpdateManifest } from './sync-gitee-release.mjs';
+import { macosUpdateManifest, androidUpdateManifest } from './sync-gitee-release.mjs';
 
 test('git push errors distinguish transport, permission and timeout failures without printing secrets', () => {
   const details = gitPushDiagnostics({status:128, stderr:Buffer.from('error: RPC failed; HTTP 502 curl 92 HTTP/2 stream 3 was not closed cleanly\nfatal: the remote end hung up unexpectedly\nsecret-token https://user:secret-token@example.test/private')});
@@ -25,6 +25,75 @@ const release = () => ({
   tag_name: 'v0.7.0', name: 'Torto 0.7.0', body: 'Updated notes', draft: false, prerelease: false,
   assets: requiredAssets('v0.7.0').map(name => ({ name, size: bytes.length, digest,
     browser_download_url: `https://github.com/TortoTech/torto/releases/download/v0.7.0/${name}` })),
+});
+
+function addAndroidAssets(source) {
+  for (const abi of ['arm64-v8a', 'x86_64']) {
+    for (const suffix of ['.apk', '.apk.sha256']) {
+      const name = `Torto-0.7.0-android-${abi}${suffix}`;
+      source.assets.push({...source.assets[0], name,
+        browser_download_url:`https://github.com/TortoTech/torto/releases/download/v0.7.0/${name}`});
+    }
+  }
+}
+
+test('Android mirrors require both ABI sets and bind distinct manifests to matching APKs', () => {
+  const source = release();
+  assert.deepEqual(validateRelease(source), []); // historical desktop releases
+  addAndroidAssets(source);
+  const all = [...source.assets];
+  source.assets.pop();
+  assert.deepEqual(validateRelease(source), ['Torto-0.7.0-android-x86_64.apk.sha256']);
+  source.assets = all;
+  assert.deepEqual(validateRelease(source), []);
+  for (const abi of ['arm64-v8a', 'x86_64']) {
+    const result = androidUpdateManifest(source, abi);
+    const name = `Torto-0.7.0-android-${abi}.apk`;
+    assert.equal(result.asset.name, abi === 'arm64-v8a' ? 'torto-android-update.json' : 'torto-android-x86_64-update.json');
+    assert.deepEqual(JSON.parse(result.bytes), {version:'0.7.0', tag:'v0.7.0',
+      asset:{name, size:bytes.length, sha256:digest.replace('sha256:', '')}});
+    verifyAsset(result.asset, result.bytes);
+    assert.equal(artifactName({name}), `Torto-0.7.0-android-${abi}`);
+    assert.equal(artifactName({name:name+'.sha256'}), `Torto-0.7.0-android-${abi}`);
+  }
+  assert.throws(() => androidUpdateManifest(source, 'armeabi-v7a'));
+  source.assets.find(a => a.name.endsWith('-x86_64.apk')).digest = null;
+  assert.throws(() => androidUpdateManifest(source, 'x86_64'));
+});
+
+test('Android completion markers follow all remote attachment checks and resume safely', async () => {
+  const source = release();
+  addAndroidAssets(source);
+  const payloads = new Map(source.assets.map(a => [a.name, bytes]));
+  const files = [], verified = new Set();
+  let corrupt = true;
+  const api = async (method, _suffix, data) => {
+    if (method === 'GET') return {id:1};
+    if (method === 'LIST') return [...files];
+    if (method === 'UPLOAD') {
+      if (data.asset.name.startsWith('torto-')) assert.equal(verified.size, source.assets.length);
+      files.push(data.asset); payloads.set(data.asset.name, data.bytes); return {};
+    }
+    if (method === 'PATCH') return {};
+    throw new Error(`Unexpected operation ${method}`);
+  };
+  const download = async asset => {
+    if (asset.browser_download_url.startsWith('https://gitee.com/') && !asset.name.startsWith('torto-')) {
+      if (corrupt && asset.name.endsWith('-x86_64.apk')) return Buffer.alloc(bytes.length);
+      verified.add(asset.name);
+    }
+    return payloads.get(asset.name);
+  };
+  await assert.rejects(syncRelease(source, api, download), /verification failed/);
+  assert.ok(!files.some(a => a.name.startsWith('torto-')));
+  corrupt = false;
+  await syncRelease(source, api, download);
+  await syncRelease(source, api, download);
+  assert.equal(files.length, source.assets.length + 3);
+  for (const abi of ['arm64-v8a', 'x86_64']) {
+    const marker = androidUpdateManifest(source, abi);
+    assert.deepEqual(payloads.get(marker.asset.name), marker.bytes);
+  }
 });
 
 // Golden signature authenticates only the inert string "installer fixture" for

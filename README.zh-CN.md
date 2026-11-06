@@ -9,15 +9,15 @@
 <h1 id="torto-小龟阅读" align="center">Torto · 小龟阅读</h1>
 
 <p align="center">
-  一款以专注模式为核心、本地优先的 Windows 与 macOS 电子书阅读器。<br>
+  一款以专注模式为核心、本地优先的 Windows、macOS 与 Android 电子书阅读器。<br>
   不依赖 WebView，以原生 Rust 渲染，让书库始终由你掌控。
 </p>
 
 <p align="center">
   <a href="https://github.com/TortoTech/torto/releases/latest"><img src="https://img.shields.io/github/v/release/TortoTech/torto?display_name=tag&sort=semver" alt="最新版本"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue" alt="AGPL-3.0-only 许可证"></a>
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-5b6ee1" alt="支持 Windows 与 macOS">
-  <img src="https://img.shields.io/badge/UI-egui-7c3aed" alt="使用 egui 构建">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Android-5b6ee1" alt="支持 Windows、macOS 与 Android">
+  <img src="https://img.shields.io/badge/UI-egui%20%7C%20Compose-7c3aed" alt="使用 egui 与 Compose 构建">
   <a href="https://linux.do"><img src="https://img.shields.io/badge/LINUX-DO-FFB003.svg" alt="LINUX DO"></a>
 </p>
 
@@ -34,9 +34,9 @@
 
 ## 认识 Torto
 
-Torto（中文名“小龟阅读”）是一款围绕**专注模式**设计的开源桌面电子书阅读器。它不把书简单看作一叠静态页面，而是根据内容结构解析为有意义的阅读单元——段落、多级列表、引用、代码块、表格与图块——并让当前单元稳定锚定在舒适的居中起读位置。导航、高亮、批注、脚注、公式释义、表格图表、翻译和 AI 对话始终紧随当前上下文。
+Torto（中文名“小龟阅读”）是一款围绕**专注模式**设计、支持 Windows、macOS 与 Android 的开源电子书阅读器。它不把书简单看作一叠静态页面，而是根据内容结构解析为有意义的阅读单元——段落、多级列表、引用、代码块、表格与图块——并让当前单元稳定锚定在舒适的居中起读位置。导航、高亮、批注、脚注、公式释义、表格图表、翻译和 AI 对话始终紧随当前上下文。
 
-需要传统阅读方式时，可随时切换单栏、双栏和纵向滑动布局。与基于浏览器的阅读器不同，Torto 使用 `egui`、`Parley`、`Vello` 和 `wgpu` 构建原生 Rust 阅读管线，并在后台按需下载默认阅读字体，兼顾出版级排版与轻量安装包。
+桌面端需要传统阅读方式时，可随时切换单栏、双栏和纵向滑动布局。与基于浏览器的阅读器不同，Torto 使用 `egui`、`Parley`、`Vello` 和 `wgpu` 构建原生 Rust 阅读管线，并在后台按需下载默认阅读字体，兼顾出版级排版与轻量安装包。
 
 ## 专注模式
 
@@ -94,6 +94,8 @@ Torto（中文名“小龟阅读”）是一款围绕**专注模式**设计的�
 | Windows 便携版 | `Torto-*-windows-x86_64-portable.zip` | 解压即用，设置和书库保存在程序旁的 `Data` 目录 |
 | macOS，Apple 芯片 | `Torto-*-macos-arm64.dmg` | macOS 15 或更高版本 |
 | macOS，Intel | `Torto-*-macos-x86_64.dmg` | macOS 15 或更高版本 |
+| Android，ARM64 | `Torto-*-android-arm64-v8a.apk` | Android 8 或更高版本 |
+| Android，x86_64 | `Torto-*-android-x86_64.apk` | Android 8 或更高版本 |
 
 macOS 也支持[便携模式](docs/macos-portable.md)，直接使用普通应用：在可写文件夹中，
 于 `.app` 旁创建 `torto-portable-data`。移动整个文件夹即可携带书库和设置，外层文件夹可任意命名。
@@ -165,7 +167,7 @@ Torto 仍在持续开发中。当前不支持带 DRM 的电子书；原始版式
 
 本项目基于 [GNU Affero General Public License v3.0](LICENSE)（`AGPL-3.0-only`）开源。
 
-Android 新架构预览：[构建步骤与当前功能范围](docs/android.md)
+Android 应用：[构建步骤与当前功能范围](docs/android.md)
 
 ## 鸣谢
 

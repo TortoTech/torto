@@ -4,18 +4,54 @@ on:
     branches: [main]
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing stable release tag to build signed APKs for (optional)'
+        required: false
+        type: string
 permissions:
   contents: read
 concurrency:
-  group: android-${{ github.ref }}
-  cancel-in-progress: true
+  group: android-${{ inputs.release_tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release version and exact tag commit
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess
+          from pathlib import Path
+          version = re.search(r'^version = "(\d+\.\d+\.\d+)"', Path('Cargo.toml').read_text(), re.M).group(1)
+          tag = os.environ['RELEASE_TAG']
+          if tag:
+              if tag != 'v' + version:
+                  raise SystemExit('Stable release tag must match the workspace version')
+              commit = subprocess.check_output(['git', 'rev-parse', 'refs/tags/' + tag + '^{commit}'], text=True).strip()
+              head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+              if commit != head:
+                  raise SystemExit('Build must use the exact release tag commit')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('version=' + version + '\n')
+          PY
+      - name: Test release packaging and mirror protocol
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_android_release.py'
+          node --test scripts/sync-gitee-release.test.mjs
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -37,8 +73,39 @@ jobs:
         working-directory: apps/android
         run: ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest -PrustAbis=arm64-v8a,x86_64
       - name: Build unsigned release APK and native symbols
+        if: >-
+          github.repository != 'TortoTech/torto' ||
+          (!startsWith(github.ref, 'refs/tags/') && inputs.release_tag == '')
         working-directory: apps/android
         run: ./gradlew :app:assembleRelease -PrustAbis=arm64-v8a
+      - name: Build signed per-ABI release APKs
+        if: >-
+          github.repository == 'TortoTech/torto' &&
+          (startsWith(github.ref, 'refs/tags/') || inputs.release_tag != '')
+        working-directory: apps/android
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          TORTO_ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          TORTO_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          TORTO_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in ANDROID_KEYSTORE_BASE64 TORTO_ANDROID_STORE_PASSWORD TORTO_ANDROID_KEY_ALIAS TORTO_ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing Android release signing secret: $name" >&2
+              exit 1
+            fi
+          done
+          export TORTO_ANDROID_KEYSTORE="$RUNNER_TEMP/torto-android-release.jks"
+          trap 'rm -f "$TORTO_ANDROID_KEYSTORE"' EXIT
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$TORTO_ANDROID_KEYSTORE"
+          ./gradlew --no-daemon :app:assembleRelease -PrustAbis=arm64-v8a,x86_64
+          python3 ../../scripts/package-android-release.py
+      - name: Remove signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/torto-android-release.jks"
       - name: Verify per-ABI APKs and 16 KB native alignment
         run: |
           python3 - <<'PY'
@@ -58,3 +125,57 @@ jobs:
             apps/android/app/build/outputs/apk/
             apps/android/app/build/generated/rust/release/symbols/
             apps/android/app/build/outputs/mapping/release/
+      - name: Upload ARM64 release attachments
+        if: >-
+          github.repository == 'TortoTech/torto' &&
+          (startsWith(github.ref, 'refs/tags/') || inputs.release_tag != '')
+        uses: actions/upload-artifact@v6
+        with:
+          name: Torto-${{ steps.version.outputs.version }}-android-arm64-v8a
+          path: dist/android/*-arm64-v8a.apk*
+          if-no-files-found: error
+      - name: Upload x86_64 release attachments
+        if: >-
+          github.repository == 'TortoTech/torto' &&
+          (startsWith(github.ref, 'refs/tags/') || inputs.release_tag != '')
+        uses: actions/upload-artifact@v6
+        with:
+          name: Torto-${{ steps.version.outputs.version }}-android-x86_64
+          path: dist/android/*-x86_64.apk*
+          if-no-files-found: error
+
+  publish:
+    if: >-
+      github.repository == 'TortoTech/torto' &&
+      (startsWith(github.ref, 'refs/tags/') || inputs.release_tag != '')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: Torto-${{ needs.build.outputs.version }}-android-*
+          path: dist/android
+          merge-multiple: true
+      - name: Publish verified release attachments
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: python3 scripts/publish-android-release.py "$RELEASE_TAG" --directory dist/android
+      # GITHUB_TOKEN uploads do not trigger a release event. Tag builds are
+      # mirrored by workflow_run; manually rebuilt tags need an explicit sync.
+      - name: Mirror manually built release to Gitee
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: node scripts/sync-gitee-release.mjs --tag "$RELEASE_TAG" --artifact-dir dist/android --skip-incomplete

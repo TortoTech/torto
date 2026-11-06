@@ -2,7 +2,7 @@ name: Sync releases to Gitee
 
 on:
   workflow_run:
-    workflows: [Build Windows installer, Build macOS installers]
+    workflows: [Build Windows installer, Build macOS installers, Android]
     types: [completed]
   release:
     types: [published, edited]

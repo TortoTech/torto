@@ -45,7 +45,10 @@ impl Platform {
             Self::WindowsPortableX64 => "torto-windows-portable-update.json",
             Self::MacosArm64 => "torto-macos-arm64-update.json",
             Self::MacosX64 => "torto-macos-x86_64-update.json",
-            _ => "torto-android-update.json",
+            // Keep the original ARM64 marker for installed clients; x86_64
+            // needs its own marker because each manifest names one APK.
+            Self::AndroidArm64 => "torto-android-update.json",
+            Self::AndroidX64 => "torto-android-x86_64-update.json",
         }
     }
 }
@@ -731,6 +734,9 @@ mod mobile_tests {
             Platform::AndroidArm64.manifest(),
             "torto-android-update.json"
         );
+        assert_eq!(Platform::AndroidX64.manifest(), "torto-android-x86_64-update.json");
+        let markers: std::collections::HashSet<_> = Platform::ALL.iter().map(|p| p.manifest()).collect();
+        assert_eq!(markers.len(), Platform::ALL.len());
         let r=GiteeRelease{tag_name:"v0.10.0".into(),body:None,prerelease:false,assets:vec![GiteeAsset{name:"Torto-0.10.0-android-arm64-v8a.apk".into(),browser_download_url:"https://gitee.com/TortoTech/torto/releases/download/v0.10.0/Torto-0.10.0-android-arm64-v8a.apk".into()}]};
         let m = GiteeManifest {
             version: "0.10.0".into(),

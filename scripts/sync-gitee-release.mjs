@@ -39,6 +39,14 @@ export function validateRelease(release) {
     const zip = `Torto-${release.tag_name.replace(/^v/, '')}-windows-x86_64-portable.zip`;
     required.push(zip, `${zip}.sha256`);
   }
+  // Older releases have no Android build. Once one APK/checksum appears,
+  // require the complete split set before advertising either ABI on Gitee.
+  if ([...names].some(name => /-android-(?:arm64-v8a|x86_64)\.apk(?:\.|$)/.test(name))) {
+    required.push(...['arm64-v8a', 'x86_64'].flatMap(abi => {
+      const apk = `Torto-${release.tag_name.replace(/^v/, '')}-android-${abi}.apk`;
+      return [apk, `${apk}.sha256`];
+    }));
+  }
   const missing = required.filter(name => !names.has(name));
   if (missing.length) return missing;
   for (const asset of release.assets) {
@@ -66,6 +74,8 @@ export function verifyAsset(asset, bytes) {
 export function artifactName(asset) {
   const mac = /^(Torto-\d+\.\d+\.\d+-macos-(?:arm64|x86_64))\.(?:dmg(?:\.sha256)?|zip(?:\.sha256|\.sig\.json)?)$/.exec(asset.name);
   if (mac) return mac[1];
+  const android = /^(Torto-\d+\.\d+\.\d+-android-(?:arm64-v8a|x86_64))\.apk(?:\.sha256)?$/.exec(asset.name);
+  if (android) return android[1];
   const windows = /^(Torto-\d+\.\d+\.\d+)(?:-x86_64\.msi|-windows-x86_64-portable\.zip(?:\.sha256)?)$/.exec(asset.name);
   return windows ? `${windows[1]}-windows-x86_64` : null;
 }
@@ -184,13 +194,24 @@ export function planAssets(source, target) {
 
 export function updateManifest(release, portable = false) {
   const name = `Torto-${release.tag_name.replace(/^v/, '')}${portable ? '-windows-x86_64-portable.zip' : '-x86_64.msi'}`;
+  return installerManifest(release, name, portable ? 'torto-windows-portable-update.json' : 'torto-update.json');
+}
+
+export function androidUpdateManifest(release, abi) {
+  if (!['arm64-v8a', 'x86_64'].includes(abi)) throw new Error('Unsupported Android architecture');
+  const name = `Torto-${release.tag_name.replace(/^v/, '')}-android-${abi}.apk`;
+  return installerManifest(release, name, abi === 'arm64-v8a' ? 'torto-android-update.json' : 'torto-android-x86_64-update.json');
+}
+
+function installerManifest(release, name, marker) {
   const installer = release.assets.find(asset => asset.name === name);
-  if (!installer) throw new Error('Missing Windows installer for update manifest');
+  if (!installer || !Number.isSafeInteger(installer.size) || installer.size <= 0 ||
+      !/^sha256:[a-f0-9]{64}$/.test(installer.digest ?? '')) throw new Error('Missing or unverified installer for update manifest');
   const bytes = Buffer.from(JSON.stringify({
     version: release.tag_name.replace(/^v/, ''), tag: release.tag_name,
     asset: { name, size: installer.size, sha256: installer.digest.replace(/^sha256:/, '') },
   }) + '\n');
-  return { bytes, asset: { name: portable ? 'torto-windows-portable-update.json' : 'torto-update.json', size: bytes.length,
+  return { bytes, asset: { name: marker, size: bytes.length,
     digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` } };
 }
 
@@ -389,6 +410,11 @@ export async function syncRelease(release, api, download) {
   const manifests = [updateManifest(release)];
   if (release.assets.some(asset => asset.name.endsWith('-windows-x86_64-portable.zip'))) {
     manifests.push(updateManifest(release, true));
+  }
+  for (const abi of ['arm64-v8a', 'x86_64']) {
+    if (release.assets.some(asset => asset.name.endsWith(`-android-${abi}.apk`))) {
+      manifests.push(androidUpdateManifest(release, abi));
+    }
   }
   for (const arch of ['arm64', 'x86_64']) {
     const name = `Torto-${release.tag_name.replace(/^v/, '')}-macos-${arch}.zip`;

@@ -91,7 +91,7 @@ Android 路径为 `files/core/config/credentials.json`，不暴露给 FileProvid
 - 对话输入中的 @ 引用选择、历史消息编辑/重发、Mermaid/SVG 等复杂可视化，以及会话间持久正文改写；当前改写在阅读会话内临时保存
 - PDF 本地重排/OCR 结果读取及操作界面
 - 书籍导出／分享与更多平板交互（封面按需读取，已有磁盘缩略图及 8 MiB 内存缓存）
-- 真机功耗与大书内存测量；完整 TalkBack 人工走查；正式签名/上架
+- 真机功耗与大书内存测量；完整 TalkBack 人工走查；正式包覆盖升级真机验证；商店上架
 
 上述未接入项不通过复制 Dart 或桌面 UI 逻辑来实现。下一步继续补 Kotlin 展示层和共享服务的粗粒度命令；涉及调度顺序的规则先沉到 core 再接两端。
 
@@ -127,7 +127,11 @@ Release 使用 Rust release profile，保留独立 `.dbg` 后剥离库符号，R
 - `TORTO_ANDROID_KEY_ALIAS`
 - `TORTO_ANDROID_KEY_PASSWORD`
 
-APK：`apps/android/app/build/outputs/apk/`；Rust 符号：`apps/android/app/build/generated/rust/release/symbols/`。`.github/workflows/android.yml` 在 PR/main 构建 debug/device-test APK 与 unsigned release，并保存产物，不自动发布。
+APK：`apps/android/app/build/outputs/apk/`；Rust 符号：`apps/android/app/build/generated/rust/release/symbols/`。`.github/workflows/android.yml` 在 PR/main 构建 debug/device-test APK 与 unsigned release，仅保存 Actions 产物。稳定版本 tag 构建独立的 ARM64／x86_64 正式签名 APK；也可手动填写 `release_tag`，严格检出该 tag 对应提交。
+
+正式签名需要在 `TortoTech/torto` 仓库配置 `ANDROID_KEYSTORE_BASE64`、`ANDROID_STORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`，复用旧 `torto-app` 的证书。证书／密码只在签名步骤注入，临时证书随步骤清理，不进入产物。`scripts/package-android-release.py` 校验实际包名、版本、非 debuggable、正式证书 SHA-256、单架构和 16 KiB 对齐，生成 `Torto-{version}-android-{abi}.apk` 及 `.sha256`。证书指纹固定为旧正式证书的公开指纹；更换证书需单独设计升级兼容方案。
+
+独立发布任务只向已发布、标题与 tag 一致的稳定 GitHub Release 附加 APK／校验文件，沿用现有更新说明；不自动创建 Release。同名相同内容可重试，同名内容不同则拒绝覆盖，需发布新版本。签名缺失或校验失败不会发布 unsigned APK。符号、R8 mapping 和测试 APK 留在 Actions，不加入 Release。Android 工作流成功后触发现有 Gitee 镜像，手动 tag 构建显式触发同步；一旦 Release 出现 Android APK，镜像要求两个架构及校验文件全部齐备，验证所有远端附件后再写入各架构更新清单。旧版无 APK 的 Release 仍可镜像。
 
 ## APK 体积与打包方式
 
@@ -219,7 +223,7 @@ Android 收到实际入库事件后合并刷新书架，保留已有封面缓存
 
 Android 通过 Rust 返回的下次检查／重试时间安排前台计时与系统后台唤醒，不在 Kotlin 重复判断任务类型、重试次数或全量间隔。调度快照、在途任务和派生数据变更标记持久化，进程回收后恢复；进程内继续使用单调时钟。同步采用进程级串行事务与原生书库锁；账户／配置变更取消旧请求、重置调度并丢弃过期结果。退出阅读后先落盘统计，再安排后台工作。WorkManager 周期任务最短 15 分钟并要求网络连接，实际执行受系统电量与后台限制影响，不保证精确时刻（[Android 调度说明](https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started/define-work)）。关闭同步时取消相关工作，不让未启用功能持续轮询。
 
-更新逻辑从桌面提取至 `app-core/updates`，Android 根据 ABI 选择 `Torto-{version}-android-{abi}.apk`；GitHub 优先 Asset API，Gitee 使用 `torto-android-update.json`，默认源自动回退。下载前验证来源、文件名及元数据，完成后核对大小／SHA-256；调用系统安装器前额外核对包名、版本号与本机签名。Debug／正式包互相隔离，正式覆盖升级需要同一正式证书签名的发布包。
+更新逻辑从桌面提取至 `app-core/updates`，Android 根据 ABI 选择 `Torto-{version}-android-{abi}.apk`；GitHub 优先 Asset API，Gitee 的 ARM64 沿用 `torto-android-update.json`，x86_64 使用独立的 `torto-android-x86_64-update.json`，默认源自动回退。下载前验证来源、文件名及元数据，完成后核对大小／SHA-256；调用系统安装器前额外核对包名、版本号与本机签名。Debug／正式包互相隔离，正式覆盖升级需要同一正式证书签名的发布包。
 
 Android 启动时先向 `rustls-platform-verifier` 注册 Application，再启动 HTTP 服务；JVM 验证器的 AAR 版本读取 Cargo.lock，R8 保留其 JNI 入口。不关闭证书验证；本地 HTTPS 回归确认自签名证书被拒绝，实际 GitHub 更新检查确认可信 HTTPS 可用。
 
