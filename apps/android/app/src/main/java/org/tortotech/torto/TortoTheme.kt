@@ -23,6 +23,43 @@ import androidx.compose.ui.unit.dp
 internal val ReaderMonospace=staticCompositionLocalOf {android.graphics.Typeface.MONOSPACE}
 private val Chinese = staticCompositionLocalOf { true }
 @Composable fun tr(chinese: String, english: String) = if (Chinese.current) chinese else english
+
+// Match the desktop Palette accents; surrounding UI surfaces stay neutral.
+private val LightColors=lightColorScheme(
+    primary=Color(0xFF448967),onPrimary=Color.White,primaryContainer=Color(0xFFDEECE4),onPrimaryContainer=Color(0xFF193C2A),inversePrimary=Color(0xFF8AC5A2),
+    secondary=Color(0xFF448967),onSecondary=Color.White,secondaryContainer=Color(0xFFE7F1EB),onSecondaryContainer=Color(0xFF254632),
+    tertiary=Color(0xFF448967),onTertiary=Color.White,tertiaryContainer=Color(0xFFDEECE4),onTertiaryContainer=Color(0xFF193C2A),
+    background=Color(0xFFF4F5F7),onBackground=Color(0xFF2B3039),surface=Color.White,onSurface=Color(0xFF2B3039),
+    surfaceVariant=Color(0xFFEBEDF0),onSurfaceVariant=Color(0xFF7B828D),outline=Color(0xFFA3A9B2),outlineVariant=Color(0xFFDEE1E6),
+    inverseSurface=Color(0xFF2B3037),inverseOnSurface=Color(0xFFF4F5F7),surfaceTint=Color.Transparent,scrim=Color.Black,
+    error=Color(0xFFB43B36),onError=Color.White,errorContainer=Color(0xFFFBEAE8),onErrorContainer=Color(0xFF7F2824),
+    surfaceBright=Color.White,surfaceDim=Color(0xFFE5E7EB),surfaceContainerLowest=Color.White,surfaceContainerLow=Color(0xFFF4F5F7),
+    surfaceContainer=Color(0xFFF0F1F4),surfaceContainerHigh=Color(0xFFE9EBEF),surfaceContainerHighest=Color(0xFFE2E5E9),
+    primaryFixed=Color(0xFFDEECE4),primaryFixedDim=Color(0xFFB7D6C4),onPrimaryFixed=Color(0xFF193C2A),onPrimaryFixedVariant=Color(0xFF315E44),
+    secondaryFixed=Color(0xFFE7F1EB),secondaryFixedDim=Color(0xFFB7D6C4),onSecondaryFixed=Color(0xFF193C2A),onSecondaryFixedVariant=Color(0xFF315E44),
+    tertiaryFixed=Color(0xFFDEECE4),tertiaryFixedDim=Color(0xFFB7D6C4),onTertiaryFixed=Color(0xFF193C2A),onTertiaryFixedVariant=Color(0xFF315E44),
+)
+private val DarkColors=darkColorScheme(
+    primary=Color(0xFF589472),onPrimary=Color(0xFF10281B),primaryContainer=Color(0xFF263F31),onPrimaryContainer=Color(0xFFCCE6D6),inversePrimary=Color(0xFF448967),
+    secondary=Color(0xFF589472),onSecondary=Color(0xFF10281B),secondaryContainer=Color(0xFF293D32),onSecondaryContainer=Color(0xFFCCE6D6),
+    tertiary=Color(0xFF589472),onTertiary=Color(0xFF10281B),tertiaryContainer=Color(0xFF263F31),onTertiaryContainer=Color(0xFFCCE6D6),
+    background=Color(0xFF121416),onBackground=Color(0xFFE5E8EC),surface=Color(0xFF1C1F23),onSurface=Color(0xFFE5E8EC),
+    surfaceVariant=Color(0xFF30363E),onSurfaceVariant=Color(0xFF9BA2AC),outline=Color(0xFF626B77),outlineVariant=Color(0xFF353C45),
+    inverseSurface=Color(0xFFE5E8EC),inverseOnSurface=Color(0xFF252A31),surfaceTint=Color.Transparent,scrim=Color.Black,
+    error=Color(0xFFE18D85),onError=Color(0xFF4A1714),errorContainer=Color(0xFF482725),onErrorContainer=Color(0xFFF3C3BD),
+    surfaceBright=Color(0xFF383F48),surfaceDim=Color(0xFF121416),surfaceContainerLowest=Color(0xFF1C1F23),surfaceContainerLow=Color(0xFF121416),
+    surfaceContainer=Color(0xFF22262C),surfaceContainerHigh=Color(0xFF2A3037),surfaceContainerHighest=Color(0xFF343B44),
+    primaryFixed=Color(0xFFDEECE4),primaryFixedDim=Color(0xFFB7D6C4),onPrimaryFixed=Color(0xFF193C2A),onPrimaryFixedVariant=Color(0xFF315E44),
+    secondaryFixed=Color(0xFFE7F1EB),secondaryFixedDim=Color(0xFFB7D6C4),onSecondaryFixed=Color(0xFF193C2A),onSecondaryFixedVariant=Color(0xFF315E44),
+    tertiaryFixed=Color(0xFFDEECE4),tertiaryFixedDim=Color(0xFFB7D6C4),onTertiaryFixed=Color(0xFF193C2A),onTertiaryFixedVariant=Color(0xFF315E44),
+)
+
+@Composable internal fun tortoSwitchColors()=SwitchDefaults.colors(
+    checkedTrackColor=MaterialTheme.colorScheme.primary,checkedThumbColor=Color.White,
+    uncheckedTrackColor=MaterialTheme.colorScheme.surface,uncheckedThumbColor=MaterialTheme.colorScheme.outline,
+    uncheckedBorderColor=MaterialTheme.colorScheme.outlineVariant,
+)
+
 @Composable fun TortoTheme(state: ScreenState, content: @Composable () -> Unit) {
     val dark = if (state.active != null) state.dark else when(state.appTheme) { "dark" -> true; "light" -> false; else -> isSystemInDarkTheme() }
     val view = LocalView.current
@@ -35,15 +72,7 @@ private val Chinese = staticCompositionLocalOf { true }
         }
     }
     val chinese = when(state.language) { "zh-CN" -> true; "en" -> false; else -> LocalConfiguration.current.locales[0].language == "zh" }
-    val scheme = if(dark) darkColorScheme(
-        primary=Color(0xFFDDC2A4),onPrimary=Color(0xFF402D18),primaryContainer=Color(0xFF57422D),onPrimaryContainer=Color(0xFFF4DFC6),
-        secondary=Color(0xFFD0C3B4),onSecondary=Color(0xFF362F26),tertiary=Color(0xFFB8CEA5),surfaceTint=Color.Transparent,secondaryContainer=Color(0xFF4C443B),onSecondaryContainer=Color(0xFFEDE0D2),background=Color(0xFF121212),surface=Color(0xFF1C1C1C),
-        onSurface=Color(0xFFE9E1D9),onBackground=Color(0xFFE9E1D9),surfaceContainer=Color(0xFF25221F),surfaceContainerLow=Color(0xFF211F1D),surfaceContainerHigh=Color(0xFF2C2925),surfaceContainerHighest=Color(0xFF37332E),onSurfaceVariant=Color(0xFFCEC4B8),outlineVariant=Color(0xFF4D463D)
-    ) else lightColorScheme(
-        primary=Color(0xFF7B6751),onPrimary=Color.White,primaryContainer=Color(0xFFF1DEC6),onPrimaryContainer=Color(0xFF2B1C0D),
-        secondary=Color(0xFF6D6257),onSecondary=Color.White,tertiary=Color(0xFF566447),secondaryContainer=Color(0xFFEBDDCB),onSecondaryContainer=Color(0xFF342A1F),background=Color(0xFFFAF8F3),surface=Color(0xFFFAF8F3),
-        onSurface=Color(0xFF211B16),onBackground=Color(0xFF211B16),surfaceContainer=Color(0xFFF1ECE4),surfaceContainerLow=Color(0xFFF7F2EB),surfaceContainerHigh=Color(0xFFECE6DD),surfaceContainerHighest=Color(0xFFE6E0D6),onSurfaceVariant=Color(0xFF6D6257),outlineVariant=Color(0xFFD4C9BD),surfaceTint=Color.Transparent
-    )
+    val scheme=if(dark)DarkColors else LightColors
     CompositionLocalProvider(Chinese provides chinese,ReaderMonospace provides state.monoTypeface) { MaterialTheme(colorScheme=scheme,content=content) }
 }
 
@@ -79,6 +108,8 @@ private val symbolResources=mapOf(
     "send" to R.drawable.ic_symbol_send,
     "stop" to R.drawable.ic_symbol_stop,
     "copy" to R.drawable.ic_symbol_copy,
+    "highlight" to R.drawable.ic_symbol_highlight,
+    "edit-note" to R.drawable.ic_symbol_edit_note,
     "edit" to R.drawable.ic_symbol_edit,
     "check" to R.drawable.ic_symbol_check,
     "undo" to R.drawable.ic_symbol_undo,
@@ -95,13 +126,13 @@ private val filledSymbolResources=mapOf(
     Icon(androidx.compose.ui.res.painterResource(resource),description,modifier.size(size*1.2f),tint=tint)
 }
 /** A transparent 48dp target; only the unchanged icon's ink reacts to input. */
-@Composable fun ActionIcon(name:String,label:String,enabled:Boolean=true,selected:Boolean=false,modifier:Modifier=Modifier,onClick:()->Unit) {
+@Composable fun ActionIcon(name:String,label:String,enabled:Boolean=true,selected:Boolean=false,modifier:Modifier=Modifier,iconSize:Dp=22.dp,onClick:()->Unit) {
     val interaction=remember {androidx.compose.foundation.interaction.MutableInteractionSource()}
     val pressed by interaction.collectIsPressedAsState()
     val target=when { !enabled->MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.38f);selected||pressed->MaterialTheme.colorScheme.primary;else->MaterialTheme.colorScheme.onSurfaceVariant }
     val ink by androidx.compose.animation.animateColorAsState(target,androidx.compose.animation.core.tween(100),label="icon ink")
     Box(modifier.size(48.dp).semantics {this.selected=selected}
         .clickable(interactionSource=interaction,indication=null,enabled=enabled,role=Role.Button,onClick=onClick),contentAlignment=Alignment.Center){
-        AppIcon(name,label,size=22.dp,tint=ink)
+        AppIcon(name,label,size=iconSize,tint=ink)
     }
 }

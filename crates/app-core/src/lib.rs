@@ -20,6 +20,7 @@ pub mod statistics;
 pub mod sync;
 
 pub mod reading;
+pub mod reading_ai;
 
 pub mod reading_text;
 

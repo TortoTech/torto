@@ -11,7 +11,7 @@ use crate::preferences::AppLanguage;
 use rebook_app_core::statistics::period;
 pub(crate) use rebook_app_core::statistics::*;
 
-fn detail_reading_time_text(ms: u64, language: AppLanguage, size: f32) -> egui::text::LayoutJob {
+pub(crate) fn detail_reading_time_text(ms: u64, language: AppLanguage, size: f32) -> egui::text::LayoutJob {
     statistic_text(
         &[
             ((ms / 3_600_000).to_string(), language.text("小时", "hour")),

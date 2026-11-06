@@ -14,5 +14,9 @@ sentencex.workspace = true
 thiserror.workspace = true
 unicode-segmentation.workspace = true
 
+[dev-dependencies]
+rebook-formats = { path = "../formats" }
+serde_json.workspace = true
+
 [lints]
 workspace = true

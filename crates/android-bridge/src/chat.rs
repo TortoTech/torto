@@ -32,6 +32,7 @@ pub struct ChatReply {
 }
 #[derive(uniffi::Object)]
 pub struct ChatRequest {
+    pub(crate) scheduling: rebook_app_core::reading_ai::Cancellation,
     pub(crate) cancelled: AtomicBool,
     pub(crate) notify: Arc<tokio::sync::Notify>,
     progress: Mutex<Option<Arc<dyn AiProgressListener>>>,
@@ -41,12 +42,14 @@ impl ChatRequest {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            scheduling: Default::default(),
             cancelled: AtomicBool::new(false),
             notify: Arc::new(tokio::sync::Notify::new()),
             progress: Mutex::new(None),
         })
     }
     pub fn cancel(&self) {
+        self.scheduling.cancel();
         self.cancelled.store(true, Ordering::Release);
         self.notify.notify_one();
     }

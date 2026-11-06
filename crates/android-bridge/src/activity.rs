@@ -95,7 +95,9 @@ impl MobileReader {
     pub async fn mark_finished(self: Arc<Self>) -> Result<()> {
         work(move || {
             self.with(|s| {
-                s.tracker.mark_finished();
+                if s.tracker.completion_summary().map_err(error)?.1.is_none() {
+                    s.tracker.mark_finished();
+                }
                 Ok(())
             })
         })

@@ -32,6 +32,20 @@ import org.tortotech.torto.core.TocItem
 
 internal fun visibleContents(items:List<TocItem>,collapsed:Set<String>)=items.filter {entry->entry.ancestors.none {it in collapsed}}
 
+/** Shared inline search field for book contents and local notes. */
+@Composable internal fun RowScope.ReaderSearchInput(query:String,change:(String)->Unit,placeholder:String,focus:FocusRequester,enabled:Boolean=true,submit:()->Unit,cancel:()->Unit){
+    ActionIcon("search",tr("搜索","Search"),query.isNotBlank()&&enabled,onClick=submit)
+    BasicTextField(query,change,Modifier.weight(1f).fillMaxHeight().focusRequester(focus),singleLine=true,
+        textStyle=MaterialTheme.typography.bodyLarge.copy(color=MaterialTheme.colorScheme.onSurface),cursorBrush=SolidColor(MaterialTheme.colorScheme.primary),
+        keyboardOptions=KeyboardOptions(imeAction=ImeAction.Search),keyboardActions=KeyboardActions(onSearch={submit()}),
+        decorationBox={input->Box(Modifier.fillMaxSize(),contentAlignment=Alignment.CenterStart){
+            if(query.isEmpty())Text(placeholder,style=MaterialTheme.typography.bodyLarge,color=MaterialTheme.colorScheme.onSurfaceVariant)
+            input()
+        }})
+    VerticalDivider(Modifier.height(22.dp).padding(horizontal=8.dp),color=MaterialTheme.colorScheme.outlineVariant)
+    TextButton(onClick=cancel){Text(tr("取消","Cancel"),color=MaterialTheme.colorScheme.onSurfaceVariant)}
+}
+
 /** Reader-local drawer keeps the footer available; its state survives tab/visibility changes. */
 @Composable internal fun ReadingNavigation(state:ScreenState,open:Boolean,model:ReaderModel,onClose:()->Unit){
     val book=state.active?.id
@@ -69,16 +83,7 @@ internal fun visibleContents(items:List<TocItem>,collapsed:Set<String>)=items.fi
         Box(Modifier.padding(horizontal=16.dp).fillMaxWidth().height(pillHeight+8.dp).semantics {contentDescription=headerLabel},contentAlignment=Alignment.Center){
             Row(Modifier.fillMaxWidth().height(pillHeight).background(MaterialTheme.colorScheme.surfaceContainerHigh,RoundedCornerShape(20.dp)).padding(3.dp),verticalAlignment=Alignment.CenterVertically){
                 if(search){
-                    ActionIcon("search",tr("搜索","Search"),query.isNotBlank()&&!state.busy){submit()}
-                    BasicTextField(query,{query=it;submitted=false},Modifier.weight(1f).fillMaxHeight().focusRequester(focus),singleLine=true,
-                    textStyle=MaterialTheme.typography.bodyLarge.copy(color=MaterialTheme.colorScheme.onSurface),cursorBrush=SolidColor(MaterialTheme.colorScheme.primary),
-                    keyboardOptions=KeyboardOptions(imeAction=ImeAction.Search),keyboardActions=KeyboardActions(onSearch={submit()}),
-                    decorationBox={input->Box(Modifier.fillMaxSize(),contentAlignment=Alignment.CenterStart){
-                            if(query.isEmpty())Text(tr("搜索本书内容","Search this book"),style=MaterialTheme.typography.bodyLarge,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                            input()
-                    }})
-                    VerticalDivider(Modifier.height(22.dp).padding(horizontal=8.dp),color=MaterialTheme.colorScheme.outlineVariant)
-                    TextButton(onClick={search=false}){Text(tr("取消","Cancel"),color=MaterialTheme.colorScheme.onSurfaceVariant)}
+                    ReaderSearchInput(query,{query=it;submitted=false},tr("搜索本书内容","Search this book"),focus,!state.busy,::submit,{search=false})
                 }else{
                     listOf(tr("搜本书","Search book"),tr("目录","Contents")).forEachIndexed {index,label->
                         val selected=index==1
@@ -114,7 +119,7 @@ internal fun visibleContents(items:List<TocItem>,collapsed:Set<String>)=items.fi
                     Row(Modifier.fillMaxWidth().heightIn(min=52.dp).padding(start=indent.dp,end=24.dp),verticalAlignment=Alignment.CenterVertically){
                         if(entry.hasChildren)ActionIcon(if(entry.id in collapsed)"next"else"expand",if(entry.id in collapsed)tr("展开章节","Expand chapter")else tr("收起章节","Collapse chapter")){collapsed=if(entry.id in collapsed)collapsed-entry.id else collapsed+entry.id}
                         else Spacer(Modifier.width(48.dp))
-                        Text(entry.title,Modifier.weight(1f).clickable(enabled=entry.href.isNotBlank()){keyboard?.hide();model.navigate(entry.href);onClose()}.padding(vertical=14.dp),
+                        Text(entry.title,Modifier.weight(1f).clickable(enabled=entry.href.isNotBlank()){keyboard?.hide();model.navigateToc(entry.id);onClose()}.padding(vertical=14.dp),
                         style=MaterialTheme.typography.bodyLarge.copy(fontSize=17.sp),fontWeight=if(active)FontWeight.SemiBold else FontWeight.Normal,color=MaterialTheme.colorScheme.onSurface,maxLines=2,overflow=TextOverflow.Ellipsis)
                     }
                     if(active)Row(Modifier.fillMaxWidth().padding(start=(indent+64).dp,end=24.dp,top=8.dp,bottom=20.dp),verticalAlignment=Alignment.CenterVertically){

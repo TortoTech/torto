@@ -1357,6 +1357,18 @@ pub fn svg_font_database() -> Arc<resvg::usvg::fontdb::Database> {
     FONTS.get_or_init(|| {
         let mut fonts = resvg::usvg::fontdb::Database::new();
         fonts.load_system_fonts();
+        // fontdb's system discovery has no Android implementation. Body text
+        // uses fontique, but SVG text (charts/formula definitions) needs the
+        // same platform fonts registered explicitly in its own shared database.
+        #[cfg(target_os = "android")]
+        {
+            for directory in ["/system/fonts", "/product/fonts", "/system_ext/fonts", "/vendor/fonts"] {
+                fonts.load_fonts_dir(directory);
+            }
+            fonts.set_sans_serif_family("Roboto");
+            fonts.set_serif_family("Noto Serif");
+            fonts.set_monospace_family("Roboto Mono");
+        }
         Arc::new(fonts)
     }).clone()
 }

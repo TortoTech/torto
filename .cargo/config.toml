@@ -4,3 +4,8 @@
 # Keep WAL, transactions, foreign keys, locking, JSON and the database format.
 # -U overrides the bundled build script's earlier -D flags on supported compilers.
 LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_DBSTAT_VTAB"
+
+# MSI and portable ZIP use the same self-contained executable. A clean Windows
+# computer must not need an independently installed MSVC runtime.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

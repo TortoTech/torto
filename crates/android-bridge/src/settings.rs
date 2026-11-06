@@ -14,11 +14,9 @@ pub struct ReadingOptions {
     pub latin_cjk_font: String,
     pub monospace_font: String,
     pub font_weight: u16,
-    pub focus_style: String,
     /// Legacy on-disk preference; paragraph structure is now controlled per focused unit.
     pub sentence_split: bool,
     pub translated: bool,
-    pub ai_prefetch: bool,
 }
 impl Default for ReadingOptions {
     fn default() -> Self {
@@ -29,10 +27,8 @@ impl Default for ReadingOptions {
             latin_cjk_font: String::new(),
             monospace_font: "monospace".into(),
             font_weight: 400,
-            focus_style: "dim".into(),
             sentence_split: false,
             translated: false,
-            ai_prefetch: true,
         }
     }
 }
@@ -141,7 +137,6 @@ impl MobileCore {
     pub async fn save_reading_options(self: Arc<Self>, options: ReadingOptions) -> Result<()> {
         work(move || {
             if !(200..=900).contains(&options.font_weight)
-                || !matches!(options.focus_style.as_str(), "dim" | "highlight")
                 || [
                     &options.cjk_font,
                     &options.cjk_latin_font,
@@ -422,6 +417,7 @@ impl MobileReader {
         .await
     }
     pub async fn reload_ai_options(self: Arc<Self>) -> Result<Arc<MobilePage>> {
+        self.retry_ai();
         work(move || {
             self.with(|s| {
                 let settings = PluginSettings::load_default().map_err(error)?;
@@ -441,9 +437,7 @@ impl MobileReader {
                     &plugins::pdf_native::cache_identity(&s.book_id, s.pipeline.rewrite.as_ref()),
                     &settings,s.session.style().typesetting.mode==TypesettingMode::Unified,
                 );
-                s.session.refresh_source().map_err(error)?;
-                s.scroll_center = true;
-                scroll::invalidate(s);
+                reflow::refresh(s)?;
                 render(s)
             })
         })

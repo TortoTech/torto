@@ -28,8 +28,8 @@ pub(crate) enum UserEvent {
     OpenBook(std::path::PathBuf),
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     Update(crate::updater::UpdateTaskMessage),
-    #[cfg(target_os = "macos")]
-    MacUpdatePrepared {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    UpdatePrepared {
         request: crate::updater::InstallRequest,
         result: Result<(), String>,
     },

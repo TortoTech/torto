@@ -215,20 +215,42 @@ impl DesktopReader {
         self.semantic_layout.enhancements.receiver = Some(rx);
         job.log("enhancements.scheduled", serde_json::json!({}));
         let id = job.id.clone();
+        let scheduler = self.semantic_layout.scheduler.clone();
+        let task = rebook_app_core::reading_ai::Task {
+            key: serde_json::json!([
+                "enhance",
+                book,
+                job.index,
+                job.offset,
+                job.target.start,
+                job.target.end,
+                job.hash,
+                rebook_app_core::plugins::semantic_layout::configuration_key(&book, &settings)
+            ])
+            .to_string(),
+            kind: rebook_app_core::reading_ai::Kind::Enhancement,
+            section: job.index,
+            sources: job.section.blocks[job.target.clone()]
+                .iter()
+                .flat_map(block_ranges)
+                .collect(),
+            prefetch: false,
+        };
         self.semantic_layout.enhancements.worker = Some(runtime.spawn(
             crate::plugins::semantic_layout::with_job(id, async move {
-                let result = tokio::time::timeout(
-                    Duration::from_secs(180),
-                    crate::plugins::semantic_layout::enhance_visible(
-                        &job.section,
-                        job.target.clone(),
-                        &book,
-                        &settings,
-                        base,
-                    ),
-                )
-                .await
-                .unwrap_or_else(|_| Err("AI enhancements timed out".into()));
+                let result = scheduler
+                    .run(
+                        task,
+                        &Default::default(),
+                        crate::plugins::semantic_layout::enhance_visible(
+                            &job.section,
+                            job.target.clone(),
+                            &book,
+                            &settings,
+                            base,
+                        ),
+                    )
+                    .await;
                 let _ = tx.send((job, result));
                 let _ = proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO));
             }),

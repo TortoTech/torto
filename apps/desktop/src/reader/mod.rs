@@ -3392,7 +3392,7 @@ impl DesktopReader {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) fn update_save_job(&mut self) -> Box<dyn FnOnce() -> Result<(), String> + Send> {
         self.statistics.flush_pending();
         let pending = self.progress_store.clone()

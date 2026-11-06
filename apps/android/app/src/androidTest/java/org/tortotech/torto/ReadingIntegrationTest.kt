@@ -20,7 +20,7 @@ class ReadingIntegrationTest {
         val core=MobileCore(File(context.filesDir,"core").absolutePath)
         val original=core.readingOptions()
         try {
-            val reading=original.copy(fontWeight=575u,focusStyle="highlight",sentenceSplit=true,translated=false)
+            val reading=original.copy(fontWeight=575u,sentenceSplit=true,translated=false)
             core.saveReadingOptions(reading)
             assertEquals(575u.toUShort(),core.readingOptions().fontWeight)
             assertTrue(core.fontFamilies().monospace.contains("monospace"))
@@ -77,6 +77,8 @@ class ReadingIntegrationTest {
             core.saveProvider(Provider("","custom","Device test provider","http://127.0.0.1:1/v1",listOf("test-model"),false),"test-only",false)
             val provider=core.providers().single {it.name=="Device test provider"};providerId=provider.id
             assertTrue(provider.keySaved)
+            val credentialFile=File(InstrumentationRegistry.getInstrumentation().targetContext.filesDir,"core/config/credentials.json")
+            assertTrue("All hosts must use the shared plaintext store",credentialFile.readText().contains("test-only"))
             core.saveProvider(provider.copy(name="Device test renamed"),null,false)
             assertTrue(core.providers().single {it.id==provider.id}.keySaved)
             val ai=original.copy(layoutEnabled=false,layoutProvider=provider.id,layoutModel="test-model",layoutReasoning="none",translationProvider=provider.id,translationModel="test-model",translationReasoning="low",chatProvider=provider.id,chatModel="test-model",showOriginal=true,translateToc=true,expertTranslation=true)
@@ -91,14 +93,21 @@ class ReadingIntegrationTest {
         val book=core.importBook(fixture.absolutePath).first {it.title=="字体与滚动专注测试"}
         val reader=core.openBook(book.id,Viewport(360u,640u,2f))
         try {
+            ChatRequest().use {request->
+                val idle=reader.enhancePageCancellable(request)
+                assertNull(idle.page);assertFalse(idle.pending);assertFalse(idle.changed)
+                request.cancel()
+                val cancelled=runCatching {reader.enhancePageCancellable(request)}.exceptionOrNull()
+                assertNotNull(cancelled);assertTrue(cancelled!!.message.orEmpty().contains("已停止"))
+            }
             reader.goToSource(reader.search("Paragraph 0:").single().source).close()
             reader.focusMode(true).close()
             val page=reader.scrollBy(450f)
             val info=try{page.info()}finally{page.close()}
-            assertTrue(info.isScroll);assertTrue(info.focusHighlight);assertEquals(450.0,info.scrollDistance,0.1)
+            assertTrue(info.isScroll);assertFalse(info.focusHighlight);assertEquals(450.0,info.scrollDistance,0.1)
             checkNativeHandles(reader,info)
             checkViewGestures(info)
-            reader.applyReadingOptions(reading.copy(fontWeight=650u,focusStyle="dim")).use {assertFalse(it.info().focusHighlight)}
+            reader.applyReadingOptions(reading.copy(fontWeight=650u)).use {assertFalse(it.info().focusHighlight)}
             reader.focusMode(false).use {assertFalse(it.info().isScroll)}
         }finally{reader.shutdown();reader.close();fixture.delete()}
     }
@@ -479,19 +488,31 @@ class ReadingIntegrationTest {
         fixture.delete()
         Unit
     }
-    @Test fun secretsAreEncryptedAndBoundToTheirAccount() {
+    @Test fun legacyCredentialsCanBeImportedWithoutCreatingNewKeystoreKeys() {
         val context=InstrumentationRegistry.getInstrumentation().targetContext
-        val storage=KeystoreStorage(context)
+        val preferencesName="credential-migration-fixture"
+        val alias="torto.test.legacy-migration"
+        val preferences=context.getSharedPreferences(preferencesName,0)
+        val storage=LegacyKeystoreStorage(context,preferencesName,alias)
+        val keys=java.security.KeyStore.getInstance("AndroidKeyStore").apply {load(null)}
+        preferences.edit().clear().commit();keys.deleteEntry(alias)
+        assertTrue(storage.readAll().isEmpty())
+        assertFalse(keys.containsAlias(alias))
+        val generator=javax.crypto.KeyGenerator.getInstance("AES","AndroidKeyStore")
+        generator.init(android.security.keystore.KeyGenParameterSpec.Builder(alias,android.security.keystore.KeyProperties.PURPOSE_ENCRYPT or android.security.keystore.KeyProperties.PURPOSE_DECRYPT)
+            .setBlockModes("GCM").setEncryptionPaddings("NoPadding").build())
+        val key=generator.generateKey()
         val secret="fixture-secret-密钥"
+        val name="a".repeat(64)
         try {
-            storage.write("test","first",secret)
-            assertEquals(secret,storage.read("test","first"))
-            assertNull(storage.read("test","second"))
-            val ciphertext=context.getSharedPreferences("credentials",0).all.values.joinToString()
-            assertFalse(ciphertext.contains(secret))
-            storage.delete("test","first")
-            assertNull(storage.read("test","first"))
-        } finally { storage.delete("test","first") }
+            val cipher=javax.crypto.Cipher.getInstance("AES/GCM/NoPadding").apply {init(javax.crypto.Cipher.ENCRYPT_MODE,key);updateAAD(name.toByteArray())}
+            val encoded=android.util.Base64.encodeToString(cipher.iv+cipher.doFinal(secret.toByteArray()),android.util.Base64.NO_WRAP)
+            assertTrue(preferences.edit().putString(name,encoded).commit())
+            assertEquals(mapOf(name to secret),storage.readAll())
+            assertEquals(encoded,preferences.getString(name,null))
+            storage.clear()
+            assertTrue(storage.readAll().isEmpty())
+        } finally {preferences.edit().clear().commit();keys.deleteEntry(alias)}
     }
     @Test fun previewPinchZoomAndDoubleTapReset(){
         val instrumentation=InstrumentationRegistry.getInstrumentation()

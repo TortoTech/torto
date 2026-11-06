@@ -35,7 +35,7 @@ fn extent(page: &PageDisplayList) -> (f32, f32) {
         (page.content_bottom().unwrap_or(page.height() as f32) - top).max(1.0),
     )
 }
-fn current_extent(s: &ReaderState) -> (f32, f32) {
+pub(crate) fn current_extent(s: &ReaderState) -> (f32, f32) {
     let position = position(s);
     let page = s.session.current_page();
     // Use the same semantic crops as desktop, including units sharing a spine.
@@ -353,7 +353,7 @@ fn destination(s: &ReaderState, index: usize, forward: bool) -> Option<(usize, F
                 index,
                 FocusTarget {
                     delta,
-                    bounds: s.focus_units[index].paint_bounds(s.options.focus_style != "highlight"),
+                    bounds: s.focus_units[index].paint_bounds(),
                 },
             ));
         }
@@ -377,7 +377,7 @@ fn destination(s: &ReaderState, index: usize, forward: bool) -> Option<(usize, F
         next,
         FocusTarget {
             delta,
-            bounds: s.focus_units[next].paint_bounds(s.options.focus_style != "highlight"),
+            bounds: s.focus_units[next].paint_bounds(),
         },
     ))
 }
@@ -664,8 +664,11 @@ pub(crate) fn turn(s: &mut ReaderState, forward: bool) -> Result<Arc<MobilePage>
 /// Horizontal focus navigation skips the whole semantic reading unit, even
 /// when its next heading lives in the same XHTML spine item.
 pub(crate) fn turn_unit(s: &mut ReaderState, forward: bool) -> Result<Arc<MobilePage>> {
-    move_unit(s,forward)?;
-    render(s)
+    turn_unit_result(s,forward).map(|(page,_)|page)
+}
+pub(crate) fn turn_unit_result(s: &mut ReaderState, forward: bool) -> Result<(Arc<MobilePage>,bool)> {
+    let moved=move_unit(s,forward)?;
+    render(s).map(|page|(page,forward&&!moved))
 }
 fn move_unit(s:&mut ReaderState,forward:bool)->Result<bool> {
     let result=s.session.go_to_adjacent_reading_unit(if forward {PageDirection::Next}else{PageDirection::Previous}).map_err(error)?;

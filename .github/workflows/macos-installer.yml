@@ -176,6 +176,10 @@ jobs:
         timeout-minutes: 10
         run: node scripts/smoke/macos.mjs "target/${{ matrix.target }}/release/bundle/osx/Torto.app" "$RUNNER_TEMP/torto-smoke"
 
+      - name: Check macOS portable profile and external filesystem
+        timeout-minutes: 10
+        run: python3 scripts/smoke/macos-portable.py "target/${{ matrix.target }}/release/bundle/osx/Torto.app" --output "$RUNNER_TEMP/torto-portable-smoke"
+
       - name: Build and verify DMG
         if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
         env:
@@ -254,7 +258,11 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: macos-startup-${{ matrix.arch }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/torto-smoke
+          path: |
+            ${{ runner.temp }}/torto-smoke
+            ${{ runner.temp }}/torto-portable-smoke/**/result.json
+            ${{ runner.temp }}/torto-portable-smoke/**/console.log
+            ${{ runner.temp }}/torto-portable-smoke/**/logs/*.log
           if-no-files-found: warn
           retention-days: 14
 

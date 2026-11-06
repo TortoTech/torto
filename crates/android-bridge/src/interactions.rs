@@ -81,9 +81,9 @@ impl FocusUnit {
         if self.leading { bounds.extend_from_slice(&self.headings); }
         union_rects(&bounds)
     }
-    pub(crate) fn paint_bounds(&self, dim:bool) -> Vec<Rect> {
+    pub(crate) fn paint_bounds(&self) -> Vec<Rect> {
         let mut result=self.navigation_bounds().into_iter().collect::<Vec<_>>();
-        if dim && !self.leading { result.extend(union_rects(&self.headings)); }
+        if !self.leading { result.extend(union_rects(&self.headings)); }
         result
     }
     fn merge(&mut self, other:Self) {
@@ -138,34 +138,9 @@ pub(crate) fn linked(
     section: &rebook_publication::Section,
     anchor: &SourceAnchor,
 ) -> Option<(PublicationUrl, LinkRole, String)> {
-    for block in section.blocks.iter().flat_map(Block::text_blocks) {
-        let Some(range) = block.source.as_ref() else {
-            continue;
-        };
-        if range.start.spine != anchor.spine || range.start.node != anchor.node {
-            continue;
-        }
-        let mut offset = range.start.text_offset;
-        for inline in &block.content {
-            let length = match inline {
-                Inline::Text(r) => r.text.chars().count(),
-                Inline::Ruby(r) => r.base_text().chars().count(),
-                Inline::Math(_) | Inline::Image(_) | Inline::Break => 1,
-            } as u64;
-            if anchor.text_offset >= offset && anchor.text_offset < offset + length {
-                if let Inline::Text(r) = inline {
-                    return r
-                        .link
-                        .clone()
-                        .map(|link| (link, r.style.link_role, r.text.clone()));
-                }
-                return None;
-            }
-            offset += length;
-        }
-    }
-    None
+    rebook_publication::links::at_source(&section.blocks,anchor)
 }
+
 fn resolve_note(s: &ReaderState, target: &PublicationUrl, marker: &str) -> Option<String> {
     let index = s
         .source
@@ -483,7 +458,7 @@ impl MobileReader {
                 }
                 if s.focus
                     && let Some(index) = s.focus_units.iter().position(|u| {
-                        u.paint_bounds(s.options.focus_style != "highlight").iter().any(|r| {
+                        u.paint_bounds().iter().any(|r| {
                             view_x >= r.x
                                 && view_x <= r.x + r.width
                                 && view_y >= r.y

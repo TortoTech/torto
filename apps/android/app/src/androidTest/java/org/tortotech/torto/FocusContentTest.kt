@@ -22,7 +22,7 @@ class FocusContentTest {
         val core=MobileCore(File(context.filesDir,"core").absolutePath)
         val reading=core.readingOptions();val ai=core.aiOptions();val before=core.books().map {it.id}.toSet()
         val fixture=File(context.cacheDir,"focus-content.epub")
-        val body="<h1>Chapter</h1><p>Earlier discussion.</p><h2>Topic title</h2><h3>Subtopic title</h3><p>Topic body.</p><p>Unrelated discussion.</p><h2>Table topic</h2><p>Table 1. Values</p><table><tr><td>Value</td><td>42</td></tr></table><footer><p>Source: Table credit.</p><p>Note: Rounded values.</p></footer><p>After table.</p><h2>Figure topic</h2><figure><img src='diagram.png' alt='Diagram' width='120' height='60'/><figcaption>Figure 1. Diagram</figcaption><p>Source: Figure credit.</p></figure><p>After figure.</p>"
+        val body="<h1>Chapter</h1><p>Earlier discussion.</p><h2>Topic title</h2><h3>Subtopic title</h3><p>Topic body.</p><p>Unrelated discussion.</p><h2>Table topic</h2><p>Table 1. Values</p><table><tr><td>Value</td><td>42</td></tr></table><footer><p>Source: Table credit.</p><p>Note: Rounded values.</p></footer><p>After table.</p><h2>Figure topic</h2><figure><img src='diagram.png' alt='Diagram' width='120' height='60'/><figcaption>Figure 1. Diagram</figcaption><p>Source: Figure credit.</p></figure><p>After figure.</p><h2>Front figure topic</h2><div><p>Figure 2. Front diagram</p><img src='diagram.png' alt='Diagram' width='120' height='60'/><p>Source: Front credit.</p></div><p>After front figure.</p>"
         val files=mapOf(
             "mimetype" to "application/epub+zip",
             "META-INF/container.xml" to """<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>""",
@@ -37,7 +37,7 @@ class FocusContentTest {
         var imported:String?=null
         var reader:MobileReader?=null
         try {
-            core.saveAiOptions(ai.copy(layoutEnabled=false));core.saveReadingOptions(reading.copy(translated=false,sentenceSplit=false,focusStyle="dim"))
+            core.saveAiOptions(ai.copy(layoutEnabled=false));core.saveReadingOptions(reading.copy(translated=false,sentenceSplit=false))
             val book=core.importBook(fixture.absolutePath).first {it.title=="Focus content fixture"};imported=book.id
             val session=core.openBook(book.id,Viewport(360u,640u,2f));reader=session
             session.focusMode(true).close()
@@ -46,7 +46,8 @@ class FocusContentTest {
                 for((query,related,unrelated) in listOf(
                     Triple("Topic body",listOf("Topic title","Subtopic title","Topic body."),"Unrelated discussion."),
                     Triple("Table credit",listOf("Table topic","Table 1. Values","Source: Table credit.","Note: Rounded values."),"After table."),
-                    Triple("Figure credit",listOf("Figure topic","Figure 1. Diagram","Source: Figure credit."),"After figure.")
+                    Triple("Figure credit",listOf("Figure topic","Figure 1. Diagram","Source: Figure credit."),"After figure."),
+                    Triple("Front credit",listOf("Front figure topic","Figure 2. Front diagram","Source: Front credit."),"After front figure.")
                 )) {
                     val hit=session.search(query).single()
                     session.goToSource(hit.source).use {page->
@@ -80,9 +81,9 @@ class FocusContentTest {
                                     }
                             }
                             assertTrue(checked>0)
-                            if(query=="Figure credit") {
+                            if(query in listOf("Figure credit","Front credit")) {
                                 var imagePixels=0
-                                for(y in 0 until 1280)for(x in 0 until 720)if(source.getPixel(x,y-top)==0xff398975.toInt()) {
+                                for(y in 0 until 1280)for(x in 0 until 720)if(source.getPixel(x,y-top)==0xff398975.toInt()&&info.focusBounds.any {r->x>=r.x*2&&x<(r.x+r.width)*2&&y>=r.y*2&&y<(r.y+r.height)*2}) {
                                     assertEquals("The image itself stays clear along with its caption and credit",source.getPixel(x,y-top),output.getPixel(x,y));imagePixels++
                                 }
                                 assertTrue("The fixture must test the image body, not only its text",imagePixels>1000)

@@ -108,12 +108,7 @@ impl ReadingIrParser<'_> {
                 return false;
             }
             let text = node_text(node);
-            let lower = text.to_lowercase();
-            media_references::caption_label(&text)
-                .is_some_and(|label| label.key.kind == MediaKind::Figure)
-                && ![" shows ", " illustrates ", " depicts ", "所示", "展示了"]
-                    .iter()
-                    .any(|cue| lower.contains(cue))
+            numbered_caption_text(&text)
         }
         fn body(node: Node<'_, '_>) -> bool {
             node.is_element()
@@ -341,8 +336,12 @@ fn numbered_caption(text: &TextBlock) -> bool {
         .filter(|run| run.style.link_role != LinkRole::FootnoteReference)
         .map(|run| run.text.as_str())
         .collect();
+    numbered_caption_text(&value)
+}
+
+pub(super) fn numbered_caption_text(value: &str) -> bool {
     let lower = value.to_lowercase();
-    media_references::caption_label(&value).is_some_and(|label| label.key.kind == MediaKind::Figure)
+    media_references::caption_label(value).is_some_and(|label| label.key.kind == MediaKind::Figure)
         && ![" shows ", " illustrates ", " depicts ", "所示", "展示了"]
             .iter()
             .any(|cue| lower.contains(cue))

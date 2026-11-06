@@ -94,6 +94,12 @@ def scenario(root, helper, signer, name, *, healthy=True, tamper=False, unsafe=F
     directory = root / name
     directory.mkdir()
     target = app(directory / "installed", "0.0.1", True)
+    portable = target.parent / "torto-portable-data"
+    (portable / "config").mkdir(parents=True)
+    (portable / ".instance.lock").touch()
+    (portable / "config/credentials.json").write_text(json.dumps({"version":1,"entries":{}}))
+    (portable / "pending-reading.fixture").write_bytes(b"unsent portable progress and annotations")
+    portable_before = {str(path.relative_to(portable)): path.read_bytes() for path in portable.rglob("*") if path.is_file()}
     old = (target / "Contents/MacOS/torto").read_bytes()
     version = "0.0.1" if downgrade else "0.0.2"
     source = app(directory / "source", "0.0.3" if wrong_version else version, healthy)
@@ -144,6 +150,7 @@ def scenario(root, helper, signer, name, *, healthy=True, tamper=False, unsafe=F
                 assert (target / "Contents/MacOS/torto").read_bytes() == old
         process.wait(timeout=10)
         assert not list(target.parent.glob(".torto-update-*"))
+        assert {str(path.relative_to(portable)): path.read_bytes() for path in portable.rglob("*") if path.is_file()} == portable_before
         print(f"PASS {name}", flush=True)
     finally:
         if readonly:

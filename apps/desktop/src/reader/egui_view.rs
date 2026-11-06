@@ -659,7 +659,9 @@ impl DesktopReader {
     ) -> ReaderFramePlan {
         let ctx = root_ui.ctx().clone();
         let now = Instant::now();
-        self.prepare_nearby_footnotes(&ctx);
+        if self.completion.is_none() {
+            self.prepare_nearby_footnotes(&ctx);
+        }
         self.statistics.tick(
             ctx.input(|i| i.focused)
                 && self.completion.is_none()
@@ -679,16 +681,20 @@ impl DesktopReader {
             }),
             self.snapshot.total_progression,
         );
-        ctx.request_repaint_after(Duration::from_secs(1));
-        self.advance_frame(now);
+        if self.completion.is_none() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+            self.advance_frame(now);
+        }
         if self.completion.is_none() {
             self.apply_pending_focus_wheel_turn();
             self.copy_shortcut(&ctx, interaction_blocked);
             self.keyboard_shortcuts(&ctx, interaction_blocked);
         }
-        self.request_frame_repaint(&ctx);
-        if let Some(deadline) = self.next_transient_message_deadline() {
-            ctx.request_repaint_after(deadline.saturating_duration_since(now));
+        if self.completion.is_none() {
+            self.request_frame_repaint(&ctx);
+            if let Some(deadline) = self.next_transient_message_deadline() {
+                ctx.request_repaint_after(deadline.saturating_duration_since(now));
+            }
         }
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -703,7 +709,6 @@ impl DesktopReader {
                 color32(self.reader.style().background),
             );
         }
-        let (sidebar_progress, assistant_progress) = self.show_side_panels(root_ui);
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         self.window_menu(&ctx);
         if self.completion.is_some() {
@@ -713,6 +718,7 @@ impl DesktopReader {
                 .show(root_ui, |_| {});
             return self.completion_page_ui(root_ui, interaction_blocked);
         }
+        let (sidebar_progress, assistant_progress) = self.show_side_panels(root_ui);
 
         let background = self.reader.style().background;
         let background_ui = color32(background);
@@ -5089,6 +5095,10 @@ impl DesktopReader {
                 response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
         }
+        if let Some(p)=response.hover_pos() {
+            let point=self.pdf_document_point(p-response.rect.min-Vec2::new(offset_x,0.));
+            if self.internal_link_at_canvas(point.x,point.y).is_some() {response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);}
+        }
         self.classic_footnote_hover_interaction(response);
         let Some(position) = response.interact_pointer_pos() else {
             if !response.ctx.input(|input| input.pointer.primary_down()) {
@@ -5148,6 +5158,10 @@ impl DesktopReader {
                 .and_then(|unit| unit.media_key.clone().map(|key| (unit.range.clone(), key)))
             {
                 self.open_media_preview(&response.ctx, origin, key);
+                return;
+            }
+            if let Some(target)=self.internal_link_at_canvas(x,y) {
+                self.go_to_toc("",&target);
                 return;
             }
             if self.try_open_image_preview(&response.ctx, x, y) {

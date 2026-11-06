@@ -13,11 +13,72 @@ import org.tortotech.torto.core.PageInfo
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicBoolean
 
 @RunWith(AndroidJUnit4::class)
 class ReaderPagingTest {
     @Test fun classicDragPreviewsCancelsCommitsAndStopsDrawing()=verifyPaging(false)
     @Test fun focusUnitDragUsesPreparedPagesAndOldAppSlide()=verifyPaging(true)
+    @Test fun classicBookEndReleasesNavigationAndAllowsGoingBack()=verifyBookBoundary(false)
+    @Test fun focusBookEndReleasesNavigationAndAllowsGoingBack()=verifyBookBoundary(true)
+    private fun verifyBookBoundary(focus:Boolean){
+        val instrumentation=InstrumentationRegistry.getInstrumentation()
+        val monitor=instrumentation.addMonitor(MainActivity::class.java.name,null,false)
+        var activity:MainActivity?=null
+        val bitmaps=mutableListOf<Bitmap>()
+        try {
+            android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand("am start -W -f 0x10008000 -n org.tortotech.torto.debug/org.tortotech.torto.MainActivity")).use {it.readBytes()}
+            activity=monitor.waitForActivityWithTimeout(5000) as? MainActivity;assertNotNull(activity)
+            lateinit var view:ReaderView
+            instrumentation.runOnMainSync {view=ReaderView(activity!!);activity!!.setContentView(view)}
+            instrumentation.waitForIdleSync();android.os.SystemClock.sleep(200)
+            val calls=AtomicInteger();val taps=AtomicInteger();val moving=AtomicBoolean()
+            var settled=CountDownLatch(1)
+            instrumentation.runOnMainSync {
+                val info=PageInfo(section=0u,sectionCount=2u,page=0u,pageCount=1u,progress=0.0,
+                    regions=emptyList(),marks=emptyList(),focusBounds=emptyList(),focusFadeColor=0x8CFFFFFFu,focusHighlight=false,
+                    isScroll=focus,scrollDistance=0.0,scrollContext=1uL,rasterTop=0f,rasterHeight=view.height/view.resources.displayMetrics.density,
+                    previousFocus=null,nextFocus=null,controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),focusIndex=0u,focusCount=if(focus)1u else 0u,canGoBack=false)
+                fun frame(color:Int,section:UInt)=ReaderFrame(Bitmap.createBitmap(view.width,view.height,Bitmap.Config.ARGB_8888).apply {eraseColor(color);bitmaps.add(this)},info.copy(section=section,scrollContext=section.toULong()+1uL,progress=section.toDouble()),section.toULong()+1uL)
+                val previous=frame(Color.RED,0u);val last=frame(Color.BLUE,1u)
+                view.present(last,null,previous,null)
+                var completion=0L
+                view.onMotion={moving.set(it);if(!it)settled.countDown()};view.onTap={_,_->taps.incrementAndGet()}
+                val navigate:(Boolean)->Unit={forward->
+                    calls.incrementAndGet()
+                    view.present(last,null,previous,null,completion)
+                    assertTrue("An unrelated UI update must not acknowledge an unfinished turn",moving.get())
+                    // A real boundary reuses the existing bitmap and page metadata.
+                    view.postDelayed({
+                        completion++
+                        if(forward)view.present(last,null,previous,null,completion)
+                        else view.present(previous,null,null,last,completion)
+                    },40)
+                }
+                if(focus)view.onUnitTurn=navigate else view.onTurn=navigate
+            }
+            fun swipe(forward:Boolean){instrumentation.runOnMainSync {
+                val start=android.os.SystemClock.uptimeMillis();val from=view.width*if(forward).8f else .2f;val to=view.width*if(forward).3f else .7f
+                for((action,x,time)in listOf(Triple(MotionEvent.ACTION_DOWN,from,start),Triple(MotionEvent.ACTION_MOVE,to,start+100),Triple(MotionEvent.ACTION_UP,to,start+300)))MotionEvent.obtain(start,time,action,x,view.height*.5f,0).also {view.onTouchEvent(it);it.recycle()}
+            }}
+            repeat(2){index->
+                settled=CountDownLatch(1);swipe(true)
+                assertTrue("A no-op turn at book end must release the interaction lock",settled.await(2,TimeUnit.SECONDS))
+                assertEquals(index+1,calls.get())
+            }
+            settled=CountDownLatch(1);swipe(false)
+            assertTrue("The preceding page remains reachable after repeated end swipes",settled.await(2,TimeUnit.SECONDS));assertEquals(3,calls.get())
+            instrumentation.runOnMainSync {
+                val image=Bitmap.createBitmap(view.width,view.height,Bitmap.Config.ARGB_8888)
+                try{view.draw(Canvas(image));assertEquals(Color.RED,image.getPixel(view.width/2,view.height/2))}finally{image.recycle()}
+                val start=android.os.SystemClock.uptimeMillis()
+                for(action in listOf(MotionEvent.ACTION_DOWN,MotionEvent.ACTION_UP))MotionEvent.obtain(start,start+40,action,view.width*.5f,view.height*.5f,0).also {view.onTouchEvent(it);it.recycle()}
+            }
+            assertEquals("Tapping remains responsive after book-end recovery",1,taps.get())
+        }finally {
+            instrumentation.runOnMainSync {activity?.finish()};instrumentation.removeMonitor(monitor);bitmaps.forEach {it.recycle()}
+        }
+    }
     private fun verifyPaging(focus:Boolean){
         val instrumentation=InstrumentationRegistry.getInstrumentation()
         val monitor=instrumentation.addMonitor(MainActivity::class.java.name,null,false)

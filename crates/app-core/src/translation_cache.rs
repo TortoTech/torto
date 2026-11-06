@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 const LIMIT: usize = 4 * 1024 * 1024;
+static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[derive(Serialize, Deserialize)]
 struct Entry {
     input: String,
@@ -146,6 +147,20 @@ impl TranslationCache {
             .collect()
     }
     pub fn store(&mut self, batch: &[BlockTranslation]) -> io::Result<()> {
+        // Independently prepared visible/prefetch batches may share this file.
+        // Merge under a short write lock; never retain it across a model request.
+        let _guard=STORE_LOCK.lock().map_err(|_|io::Error::other("Translation cache lock poisoned"))?;
+        if let Ok(file)=fs::File::open(&self.path) {
+            let mut bytes=Vec::new();
+            if file.take(LIMIT as u64+1).read_to_end(&mut bytes).is_ok()&&bytes.len()<=LIMIT {
+                if let Ok(stored)=serde_json::from_slice::<Stored>(&bytes)
+                    &&stored.version==1&&stored.entries.len()<=4096 {
+                    for (key,entry) in stored.entries {
+                        if self.inputs.get(&key).is_some_and(|(_,_,input)|*input==entry.input){self.entries.insert(key,entry);}
+                    }
+                }
+            }
+        }
         for translated in batch {
             let key = key(translated.block_index, translated.segment_index);
             if let Some((_, _, input)) = self.inputs.get(&key) {
@@ -186,6 +201,19 @@ impl TranslationCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn independent_batches_merge_their_durable_results_instead_of_overwriting(){
+        let root=std::env::temp_dir().join(format!("torto-translation-concurrent-{}",uuid::Uuid::new_v4()));
+        let settings=PluginSettings::default();
+        let inputs=[TranslationBlockInput{block_index:0,segment_index:None,text:"First".into()},TranslationBlockInput{block_index:1,segment_index:None,text:"Second".into()}];
+        let mut first=TranslationCache::open_at(&root,"book",0,&settings,inputs.iter()).unwrap();
+        let mut second=TranslationCache::open_at(&root,"book",0,&settings,inputs.iter()).unwrap();
+        first.store(&[BlockTranslation{block_index:0,segment_index:None,text:"第一".into()}]).unwrap();
+        second.store(&[BlockTranslation{block_index:1,segment_index:None,text:"第二".into()}]).unwrap();
+        let loaded=TranslationCache::open_at(&root,"book",0,&settings,inputs.iter()).unwrap().load();
+        assert_eq!(loaded.len(),2);assert_eq!(loaded[0].text,"第一");assert_eq!(loaded[1].text,"第二");
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn restart_reuses_only_matching_source_language_and_model() {
         let root =

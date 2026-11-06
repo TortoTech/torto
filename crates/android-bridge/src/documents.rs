@@ -266,9 +266,7 @@ impl MobileReader {
     pub async fn refresh_media_references(self: Arc<Self>) -> Result<Arc<MobilePage>> {
         work(move || {
             self.with(|s| {
-                s.session.refresh_source().map_err(error)?;
-                s.scroll_center = true;
-                scroll::invalidate(s);
+                reflow::refresh(s)?;
                 render(s)
             })
         })
@@ -318,8 +316,7 @@ impl MobileReader {
                 presentation::toggle(s, &control)?;
                 reference(s, target)?;
                 s.document.as_mut().unwrap().id = id;
-                s.session.refresh_source().map_err(error)?;
-                scroll::invalidate(s);
+                reflow::refresh(s)?;
                 render(s)
             })
         })

@@ -39,10 +39,6 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
         }catch(e:CancellationException){throw e}catch(e:Exception){failure=e.message}
     }}
     Column(Modifier.fillMaxWidth()){
-        selected?.let {selection->Row {
-            TextButton(onClick={context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("",selection.text.text))}){Text(tr("复制","Copy"))}
-            TextButton(onClick={selected=null}){Text(tr("取消选择","Clear selection"))}
-        }}
         failure?.let {Text(it,color=MaterialTheme.colorScheme.error)}
         BoxWithConstraints(Modifier.fillMaxWidth().heightIn(min=56.dp,max=520.dp)){
             val density=LocalDensity.current.density
@@ -72,6 +68,7 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
                     }
                     page?.let {document->
                         var handle by remember(document){mutableStateOf<Boolean?>(null)}
+                        Box(Modifier.fillMaxWidth().aspectRatio(document.frame.bitmap.width.toFloat()/document.frame.bitmap.height)) {
                         AndroidView(factory={ReaderView(it)},update={view->
                             view.onTap={x,y->if(selected!=null)selected=null else model.documentTap(document,x,y)}
                             view.onSelect={x,y,ex,ey->drags.trySend(DocumentDrag(document,x,y,ex,ey,null))}
@@ -80,7 +77,13 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
                             view.onHandleEnd={handle=null}
                             view.onTurn={forward->scope.launch {list.animateScrollToItem((index+1+if(forward)1 else -1).coerceIn(1,initial.total.toInt()))}}
                             view.present(document.frame,selected?.takeIf {it.page==document.index}?.text)
-                        },modifier=Modifier.fillMaxWidth().aspectRatio(document.frame.bitmap.width.toFloat()/document.frame.bitmap.height))
+                        },modifier=Modifier.fillMaxSize())
+                        selected?.takeIf {it.page==document.index&&handle==null}?.let {selection->
+                            SelectionToolbar(selection.text,
+                                onCopy={context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("",selection.text.text))},
+                                onDismiss={selected=null},outsideClip=true)
+                        }
+                        }
                     } ?: Spacer(Modifier.fillMaxWidth().height(320.dp))
                 }
             }

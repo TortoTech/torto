@@ -116,6 +116,9 @@ impl ParagraphStructureSource {
 }
 
 impl BookSource for ParagraphStructureSource {
+    fn navigation_section(&self, index: usize) -> Result<Option<Section>, PublicationError> {
+        self.inner.navigation_section(index)
+    }
     fn inner_source(&self) -> Option<&dyn BookSource> {
         Some(self.inner.as_ref())
     }

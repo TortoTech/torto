@@ -230,7 +230,7 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         egui::Button::new(
                             state
                                 .draft_language
-                                .text("重试解锁安全存储", "Retry unlocking secure storage"),
+                                .text("重试读取凭据", "Retry reading credentials"),
                         ),
                     )
                     .clicked()

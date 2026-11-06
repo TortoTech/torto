@@ -83,6 +83,14 @@ pub trait BookSource: Send + Sync {
             .map_or(Ok(None), |inner| inner.fixed_page_dimensions(section_index))
     }
 
+    /// Worker-only authored content for navigation recovery. View overlays
+    /// should forward this to their unmodified input. `None` reuses the already
+    /// parsed section; format/mode adapters keep that default so IDs stay in the
+    /// currently selected publication.
+    fn navigation_section(&self, _index: usize) -> Result<Option<Section>, PublicationError> {
+        Ok(None)
+    }
+
     /// Original fixed-page size in PDF points. Memory-only; no rasterization.
     fn fixed_page_points(&self, index: usize) -> Option<[f32; 2]> {
         self.inner_source()

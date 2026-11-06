@@ -24,13 +24,15 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.style.TextAlign
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 internal fun readingPanelOwner(panel:String?):String?=when(panel){
-    "layout-settings","translation-settings","providers"->"typography"
-    "note"->"marks"
+    "layout-settings","translation-settings"->"typography"
+    "note","marks-search"->"marks"
     else->panel
 }
 internal fun readingBottomPanel(panel:String?)=panel!=null&&panel!="chat"
@@ -54,11 +56,11 @@ internal fun readingBottomPanel(panel:String?)=panel!=null&&panel!="chat"
         LaunchedEffect(panel){settle?.cancel();drag=0f}
         AnimatedVisibility(open,enter=fadeIn(tween(160))+slideInVertically(tween(200)){it/10},exit=fadeOut(tween(140))+slideOutVertically(tween(180)){it/10},modifier=Modifier.fillMaxSize().windowInsetsPadding(footer).clipToBounds()){
             BoxWithConstraints(Modifier.fillMaxSize()){
-                val full=displayed in setOf("navigation","marks","layout-settings","translation-settings","providers")
+                val full=displayed in setOf("navigation","marks","marks-search","layout-settings","translation-settings")
                 val limit=if(full)maxHeight else maxHeight*.88f
                 val closeLabel=tr("关闭阅读面板","Close reading panel")
                 if(!full)Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha=.12f)).clickable(interactionSource=remember {MutableInteractionSource()},indication=null,onClickLabel=closeLabel,onClick=onClose))
-                val paneLabel=when(displayed){"navigation"->tr("目录与搜索","Contents and search");"marks"->tr("批注与高亮面板","Notes and highlights panel");"typography"->tr("字体排版面板","Typography panel");"selection"->tr("选择模式面板","Selection mode panel");else->tr("阅读设置面板","Reading settings panel")}
+                val paneLabel=when(displayed){"navigation"->tr("目录与搜索","Contents and search");"marks"->tr("批注与高亮面板","Notes and highlights panel");"marks-search"->tr("搜索笔记面板","Search notes panel");"typography"->tr("字体排版面板","Typography panel");"selection"->tr("选择模式面板","Selection mode panel");else->tr("阅读设置面板","Reading settings panel")}
                 Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth().animateContentSize(tween(180),alignment=Alignment.BottomCenter).then(if(full)Modifier.fillMaxHeight()else Modifier.heightIn(max=limit)).offset{IntOffset(0,drag.roundToInt())}.semantics {paneTitle=paneLabel}.pointerInput(Unit){detectTapGestures {}},
                     shape=if(full)RectangleShape else RoundedCornerShape(topStart=20.dp,topEnd=20.dp),color=MaterialTheme.colorScheme.surfaceContainerLow){
                     Column(Modifier.fillMaxWidth().then(if(full)Modifier.fillMaxHeight()else Modifier).imePadding()){
@@ -80,9 +82,9 @@ internal fun readingBottomPanel(panel:String?)=panel!=null&&panel!="chat"
 
 @Composable internal fun ReadingPanelPage(title:String,onBack:()->Unit,content:@Composable ()->Unit){
     Column(Modifier.fillMaxSize()){
-        Row(Modifier.fillMaxWidth().heightIn(min=48.dp).padding(horizontal=8.dp),verticalAlignment=Alignment.CenterVertically){
-            ActionIcon("back",tr("返回字体排版","Back to typography"),onClick=onBack)
-            Text(title,style=MaterialTheme.typography.titleMedium)
+        Box(Modifier.fillMaxWidth().heightIn(min=48.dp).padding(horizontal=8.dp)){
+            Text(title,Modifier.fillMaxWidth().padding(horizontal=48.dp).align(Alignment.Center),fontSize=16.sp,textAlign=TextAlign.Center)
+            ActionIcon("back",tr("返回字体排版","Back to typography"),modifier=Modifier.align(Alignment.CenterStart),onClick=onBack)
         }
         Box(Modifier.weight(1f)){content()}
     }

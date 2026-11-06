@@ -1,35 +1,46 @@
 use crate::{Result, error};
 use rebook_app_core::credentials;
-use std::sync::Arc;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-/// Implemented by the Android host with Android Keystore. Called only from
-/// service workers; the callback must not retain an Activity or a View.
+/// One-time import of old Android Keystore preferences. All new reads/writes
+/// use the same Rust JSON store as Windows and macOS.
 #[uniffi::export(with_foreign)]
-pub trait SecureStorage: Send + Sync {
-    fn read(&self, service: String, account: String) -> Result<Option<String>>;
-    fn write(&self, service: String, account: String, value: String) -> Result<()>;
-    fn delete(&self, service: String, account: String) -> Result<()>;
+pub trait LegacyCredentialStorage: Send + Sync {
+    fn read_all(&self) -> Result<HashMap<String, String>>;
+    fn clear(&self) -> Result<()>;
 }
-struct Adapter(Arc<dyn SecureStorage>);
-impl credentials::SecretStore for Adapter {
-    fn read(&self, s: &str, a: &str) -> credentials::Result<String> {
-        self.0
-            .read(s.into(), a.into())
-            .map_err(|e| credentials::Error::Store(e.to_string()))?
-            .ok_or(credentials::Error::NoEntry)
+struct MigrationAdapter(Arc<dyn LegacyCredentialStorage>);
+impl credentials::LegacyCredentials for MigrationAdapter {
+    fn load(&self) -> credentials::Result<credentials::Migration> {
+        let android_entries = self
+            .0
+            .read_all()
+            .map_err(|_| credentials::Error::Store("无法迁移旧凭据，原数据已保留".into()))?
+            .into_iter()
+            .collect();
+        Ok(credentials::Migration {
+            android_entries,
+            ..Default::default()
+        })
     }
-    fn write(&self, s: &str, a: &str, v: &str) -> credentials::Result<()> {
+    fn cleanup(&self) -> credentials::Result<()> {
         self.0
-            .write(s.into(), a.into(), v.into())
-            .map_err(|e| credentials::Error::Store(e.to_string()))
-    }
-    fn delete(&self, s: &str, a: &str) -> credentials::Result<()> {
-        self.0
-            .delete(s.into(), a.into())
-            .map_err(|e| credentials::Error::Store(e.to_string()))
+            .clear()
+            .map_err(|_| credentials::Error::Store("无法移除已迁移的旧凭据".into()))
     }
 }
 #[uniffi::export]
-pub fn initialize_secure_storage(storage: Arc<dyn SecureStorage>) -> Result<()> {
-    credentials::install(Arc::new(Adapter(storage))).map_err(error)
+pub fn initialize_credential_storage(
+    path: String,
+    legacy: Arc<dyn LegacyCredentialStorage>,
+) -> Result<()> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(error("An absolute credential file path is required"));
+    }
+    credentials::install(Arc::new(credentials::FileStore::new(
+        path,
+        Some(Arc::new(MigrationAdapter(legacy))),
+    )))
+    .map_err(error)
 }

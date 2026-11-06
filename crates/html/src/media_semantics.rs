@@ -124,7 +124,7 @@ fn strong_caption_label(text: &str) -> bool {
             || identifier.chars().all(|c| "IVXLCDM".contains(c)))
 }
 
-fn protected(node: Node<'_, '_>, headings: &HashSet<String>) -> bool {
+pub(super) fn protected(node: Node<'_, '_>, headings: &HashSet<String>) -> bool {
     node.descendants().filter(Node::is_element).any(|n| {
         matches!(n.tag_name().name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
             || node_fragment(n).is_some_and(|id| headings.contains(id))

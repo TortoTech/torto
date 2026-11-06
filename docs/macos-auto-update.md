@@ -25,11 +25,13 @@ DMGs remain available for first installation and manual recovery.
 
 Installation directory permissions must allow replacement. Read-only volumes,
 App Translocation, and symlinked installation paths require moving the app to a
-writable Applications directory (for example `~/Applications`) or manual update.
+writable directory (for example `~/Applications`) or manual update.
 There is no privileged helper. The helper never modifies the user's library,
 credentials, or reading configuration.
 
-Sessions live under the downloaded version's `sessions/<UUID>` cache directory.
+Ordinary-profile sessions live under the downloaded version's `sessions/<UUID>`
+cache directory. In [portable mode](macos-portable.md), sessions use a private
+system temporary directory while the library and download cache remain portable.
 `state.json` records preparation, installation, completion, or failure. ZIP and
 helper copies are removed when installation finishes; only small diagnostics
 remain, with recent finished sessions retained. Staging and backups are removed

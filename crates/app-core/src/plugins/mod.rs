@@ -425,6 +425,13 @@ impl PluginSettings {
 }
 
 impl PluginSettings {
+    /// Native accounts used by versions predating the shared credential file.
+    pub fn legacy_credential_accounts(&self) -> Vec<(&'static str, String)> {
+        self.providers.iter().map(|provider| (AI_CREDENTIAL_SERVICE, provider.id.clone()))
+            .chain(self.web_search.services.iter().map(|service| ("Torto Web Search", service.id.clone())))
+            .chain(["paddle-ocr", "mineru"].map(|account| (PDF_OCR_CREDENTIAL_SERVICE, account.into())))
+            .collect()
+    }
     pub fn load_default() -> io::Result<Self> {
         let mut settings = Self::load_config()?;
         settings.load_api_keys()?;

@@ -52,6 +52,11 @@ fn identity(service: &str, account: &str) -> Result<String> {
     serde_json::to_string(&(service, account)).map_err(|_| fail("无法编码凭据标识"))
 }
 impl VaultStore {
+    /// Read-only compatibility path for migration to the shared plaintext store.
+    /// Does not create a master key or query individual native credentials.
+    pub fn migration_snapshot(&self) -> Result<std::collections::BTreeMap<String, Option<String>>> {
+        self.transaction(|state| Ok(state.payload.entries.clone()))
+    }
     pub fn new(path: PathBuf, native: Arc<dyn SecretStore>) -> Self {
         Self {
             path,

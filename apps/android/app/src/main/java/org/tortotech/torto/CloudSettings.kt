@@ -19,22 +19,35 @@ internal fun localDateTime(ms:Long):String=if(ms<=0)"—" else DateTimeFormatter
     val saved=state.cloud ?: return
     var draft by remember(saved){mutableStateOf(saved.copy())};var password by remember{mutableStateOf("")};var clear by remember{mutableStateOf(false)}
     val context=LocalContext.current
-    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp).imePadding(),verticalArrangement=Arrangement.spacedBy(12.dp)){
-        SettingToggle(tr("启用云同步","Enable cloud sync"),draft.enabled,!state.busy){draft=draft.copy(enabled=it)}
+    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp).imePadding(),verticalArrangement=Arrangement.spacedBy(12.dp)){
+        SettingsGroup {SettingToggle(tr("启用云同步","Enable cloud sync"),draft.enabled,!state.busy){draft=draft.copy(enabled=it)}}
+        SectionLabel(tr("账号配置","Account"))
+        SettingsGroup {
         SettingChoice(tr("云盘提供商","Cloud provider"),draft.provider,state.cloudPresets.map {it.id to it.name},!state.busy){id->val preset=state.cloudPresets.first {it.id==id};draft=draft.copy(provider=id,url=preset.url)}
+        Column(Modifier.padding(horizontal=16.dp,vertical=12.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
         OutlinedTextField(draft.url,{draft=draft.copy(url=it.take(2048))},label={Text(tr("WebDAV 地址","WebDAV URL"))},singleLine=true,modifier=Modifier.fillMaxWidth(),readOnly=draft.provider!="custom")
         OutlinedTextField(draft.username,{draft=draft.copy(username=it.take(512))},label={Text(tr("用户名","Username"))},singleLine=true,modifier=Modifier.fillMaxWidth())
         OutlinedTextField(password,{password=it;clear=false},label={Text(if(saved.passwordSaved)tr("密码（已保存，留空保留）","Password (saved; leave empty to keep)") else tr("密码","Password"))},singleLine=true,visualTransformation=PasswordVisualTransformation(),modifier=Modifier.fillMaxWidth())
+        }
         if(saved.passwordSaved)SettingToggle(tr("清除已保存的密码","Clear saved password"),clear,!state.busy){clear=it}
+        }
+        SectionLabel(tr("同步策略","Sync preferences"))
+        SettingsGroup {
+        Column(Modifier.padding(horizontal=16.dp,vertical=12.dp)){
         OutlinedTextField(draft.deviceName,{draft=draft.copy(deviceName=it.take(160))},label={Text(tr("设备名称","Device name"))},singleLine=true,modifier=Modifier.fillMaxWidth())
+        }
         SettingToggle(tr("前台自动同步","Sync automatically in foreground"),draft.foreground,!state.busy){draft=draft.copy(foreground=it)}
         SettingToggle(tr("后台自动同步","Sync automatically in background"),draft.background,!state.busy){draft=draft.copy(background=it)}
-        Text(tr("后台同步由系统调度，省电模式下可能延后","Background sync is scheduled by Android and may be delayed by battery optimization"),style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        SettingsNote(tr("后台同步由系统调度，省电模式下可能延后","Background sync is scheduled by Android and may be delayed by battery optimization"))
+        SectionLabel(tr("同步状态","Sync status"))
+        SettingsGroup { Column(Modifier.padding(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
         val status=state.cloudStatus
         CloudSyncSummary(status)
         if(status.running)TextButton(onClick={CloudRuntime.cancel()}){Text(tr("停止同步","Stop sync"))}
         else Text(tr("上次同步：","Last sync: ")+localDateTime(status.lastSuccess),style=MaterialTheme.typography.bodySmall)
         Row(horizontalArrangement=Arrangement.spacedBy(12.dp)){Button(onClick={model.saveCloud(draft,password,clear){password="";clear=false}},enabled=!state.busy){Text(tr("保存","Save"))};OutlinedButton(onClick=model::synchronize,enabled=saved.enabled&&!status.running){Text(tr("立即同步","Sync now"))}}
+        }}
         state.cloudPresets.firstOrNull {it.id==draft.provider}?.let {preset->TextButton(onClick={context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(preset.helpUrl)))}){Text(tr("查看云盘配置说明","Cloud setup guide"))}}
     }
 }

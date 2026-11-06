@@ -20,7 +20,8 @@ class LoadingIndicatorTest {
         val instrumentation=InstrumentationRegistry.getInstrumentation()
         val monitor=instrumentation.addMonitor(MainActivity::class.java.name,null,false)
         val active=mutableStateOf(false)
-        val quietNavigation=mutableStateOf(false)
+        val quietUpdate=mutableStateOf(false)
+        val aiProcessing=mutableStateOf(false)
         val visible=AtomicBoolean()
         val everVisible=AtomicBoolean()
         val shown=CountDownLatch(1)
@@ -32,15 +33,22 @@ class LoadingIndicatorTest {
             activity=monitor.waitForActivityWithTimeout(5000) as? MainActivity
             assertNotNull(activity)
             instrumentation.runOnMainSync {activity!!.setContent {
-                val show=loadingVisible(active.value,quietNavigation.value)
+                val show=loadingVisible(active.value,quietUpdate.value,aiProcessing.value)
                 SideEffect {visible.set(show);if(show){everVisible.set(true);shown.countDown()}else if(finished.get())hidden.countDown()}
                 MaterialTheme {if(show)LinearProgressIndicator()}
             }}
             instrumentation.waitForIdleSync()
-            instrumentation.runOnMainSync {quietNavigation.value=true;active.value=true}
+            instrumentation.runOnMainSync {quietUpdate.value=true;active.value=true}
             android.os.SystemClock.sleep(400)
-            assertFalse("Section navigation never shows the header loading bar, even past the usual delay",everVisible.get())
-            instrumentation.runOnMainSync {active.value=false;quietNavigation.value=false}
+            assertFalse("Navigation and local presentation updates never show the header bar, even past the usual delay",everVisible.get())
+            instrumentation.runOnMainSync {quietUpdate.value=false;aiProcessing.value=true}
+            android.os.SystemClock.sleep(400)
+            assertFalse("Translation, layout and prefetch must never show the generic header loading bar",everVisible.get())
+            instrumentation.runOnMainSync {aiProcessing.value=false;active.value=false}
+            instrumentation.waitForIdleSync()
+            android.os.SystemClock.sleep(300)
+            assertFalse("Finishing AI processing must not flash a late progress frame",everVisible.get())
+            instrumentation.runOnMainSync {active.value=false;quietUpdate.value=false}
             instrumentation.waitForIdleSync()
             instrumentation.runOnMainSync {active.value=true}
             instrumentation.waitForIdleSync()

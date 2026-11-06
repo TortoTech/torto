@@ -207,6 +207,67 @@ mod tests {
     use super::*;
     use rebook_layout::*;
     #[test]
+    #[ignore = "requires TORTO_TOC_PIPELINE_BOOK pointing to The Algorithm Design Manual; no model calls"]
+    fn local_translated_pipeline_keeps_authored_toc_recovery() {
+        let publication = rebook_formats::open_file_for_reading(
+            std::env::var_os("TORTO_TOC_PIPELINE_BOOK").unwrap(),
+            None,
+        )
+        .unwrap();
+        let source = publication.source();
+        let original = source.parse_section(0).unwrap();
+        let block = original.blocks.iter().position(|b| matches!(b,rebook_publication::Block::Text(t) if t.kind.is_heading() && t.content.iter().flat_map(rebook_publication::Inline::text_runs).map(|r|r.text.as_str()).collect::<String>()=="Preface")).unwrap();
+        let pipeline = ReadingPipeline::new(
+            source.clone(),
+            &format!("toc-pipeline-test-{}", uuid::Uuid::new_v4()),
+            &PluginSettings::default(),
+            Arc::default(),
+        );
+        pipeline
+            .translation
+            .set_target_language("简体中文")
+            .unwrap();
+        pipeline
+            .translation
+            .store_batch(
+                0,
+                &[crate::plugins::BlockTranslation {
+                    block_index: block,
+                    segment_index: None,
+                    text: "前言".into(),
+                }],
+            )
+            .unwrap();
+        pipeline.translation.set_enabled(true).unwrap();
+        let visible = pipeline.structure.parse_section(0).unwrap();
+        assert!(visible.blocks[block].text_blocks().any(|t| {
+            t.content
+                .iter()
+                .flat_map(rebook_publication::Inline::text_runs)
+                .any(|r| r.text == "前言")
+        }));
+        assert_eq!(
+            pipeline.structure.navigation_section(0).unwrap().unwrap(),
+            original
+        );
+        let mut reader = rebook_reader::ReaderSession::open(
+            pipeline.structure,
+            LayoutViewport::new(800, 600).unwrap(),
+            ReaderStyle {
+                typesetting: ReaderTypesetting::unified(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        reader.go_to_toc("2").unwrap();
+        assert_eq!(reader.source_anchor_for_toc("2").unwrap().node, "n24");
+        assert_eq!(reader.snapshot().active_toc_id.as_deref(), Some("2"));
+        reader
+            .go_to_adjacent_reading_unit(rebook_reader::PageDirection::Next)
+            .unwrap();
+        assert_eq!(reader.snapshot().active_toc_id.as_deref(), Some("3"));
+    }
+    #[test]
     fn unified_composition_and_notes_inherit_the_reading_profile() {
         let mut reader = ReaderStyle::default();
         reader.typography.monospace_font = "Reader mono".into();

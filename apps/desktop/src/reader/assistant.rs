@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rebook_publication::{BookSource, RenditionLayout, SourceRange};
+use crate::async_task::TaskResult;
 #[cfg(test)]
 use rebook_publication::Block;
+use rebook_publication::{BookSource, RenditionLayout, SourceRange};
 use rebook_reader::ReaderVisibleTextFragment;
-use crate::async_task::TaskResult;
 
 use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, build_chat_prompt_with_references,
@@ -68,15 +68,29 @@ impl DesktopReader {
 
     pub(crate) fn complete_pdf_native(&mut self, message: super::PdfNativeTaskMessage) {
         match message {
-            super::PdfNativeTaskMessage::Availability { book_id, job, message } => {
+            super::PdfNativeTaskMessage::Availability {
+                book_id,
+                job,
+                message,
+            } => {
                 if book_id != self.book_id
-                    || self.pdf_ocr.availability_task.in_flight(message.id).is_none_or(|active| active != &job)
-                    || self.pdf_ocr.availability_task.complete(message.id).is_none()
+                    || self
+                        .pdf_ocr
+                        .availability_task
+                        .in_flight(message.id)
+                        .is_none_or(|active| active != &job)
+                    || self
+                        .pdf_ocr
+                        .availability_task
+                        .complete(message.id)
+                        .is_none()
                 {
                     return;
                 }
-                if self.pdf_ocr.available || self.pdf_ocr.task.is_pending()
-                    || self.pdf_ocr.native_task.is_pending() || self.pdf_ocr.original_task.is_pending()
+                if self.pdf_ocr.available
+                    || self.pdf_ocr.task.is_pending()
+                    || self.pdf_ocr.native_task.is_pending()
+                    || self.pdf_ocr.original_task.is_pending()
                 {
                     return;
                 }
@@ -85,8 +99,10 @@ impl DesktopReader {
                         self.persist_progress();
                         self.reopen_requested = Some(self.source_path.clone());
                     }
-                    Ok(false) => {},
-                    Err(error) => tracing::warn!(%error, "failed to refresh selected PDF text result"),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to refresh selected PDF text result")
+                    }
                 }
             }
             super::PdfNativeTaskMessage::Progress {
@@ -239,10 +255,17 @@ impl DesktopReader {
                 let result = tokio::task::spawn_blocking(move || {
                     crate::plugins::pdf_native::selected_result_available(&probe_book)
                         .map_err(|error| error.to_string())
-                }).await.map_err(|error| error.to_string()).and_then(|result| result);
-                let _ = proxy.send_event(UserEvent::ReaderPdfNative(super::PdfNativeTaskMessage::Availability {
-                    book_id, job, message: TaskResult { id, result },
-                }));
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                let _ = proxy.send_event(UserEvent::ReaderPdfNative(
+                    super::PdfNativeTaskMessage::Availability {
+                        book_id,
+                        job,
+                        message: TaskResult { id, result },
+                    },
+                ));
             });
             self.pdf_ocr.availability_task.attach_worker(worker);
         }
@@ -348,6 +371,33 @@ impl DesktopReader {
         }
         if let Some(request) = self.translation.task.take_pending() {
             let book_id = self.book_id.clone();
+            let scheduler = self.semantic_layout.scheduler.clone();
+            let sources = self
+                .semantic_layout
+                .originals
+                .get(&request.payload.section_index)
+                .map(|section| {
+                    request
+                        .payload
+                        .blocks
+                        .iter()
+                        .filter_map(|b| section.blocks.get(b.block_index))
+                        .flat_map(crate::plugins::semantic_layout::block_ranges)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let task = rebook_app_core::reading_ai::Task {
+                key: rebook_app_core::reading_ai::translation_key(
+                    &book_id,
+                    request.payload.section_index,
+                    &request.payload.settings,
+                    &request.payload.blocks,
+                ),
+                kind: rebook_app_core::reading_ai::Kind::Translation,
+                section: request.payload.section_index,
+                sources,
+                prefetch: false,
+            };
             super::semantic_layout::translation_task_event(
                 &request.payload,
                 request.id,
@@ -364,7 +414,7 @@ impl DesktopReader {
                 let glossary = crate::plugins::glossary::Context::new(
                     &book_id, &payload.settings.target_language, Some(payload.section_index),
                 );
-                let result = crate::plugins::translate_blocks_with_glossary(
+                let result = scheduler.run(task,&Default::default(),crate::plugins::translate_blocks_with_glossary(
                     payload.settings,
                     payload.blocks,
                     Some(glossary),
@@ -373,7 +423,7 @@ impl DesktopReader {
                             TranslationTaskMessage::Batch { id, translations },
                         ));
                     },
-                )
+                ))
                 .await;
                 super::semantic_layout::translation_task_event(&logging_task, id, "translation.finished", serde_json::json!({"success":result.is_ok(),"elapsed_ms":started.elapsed().as_millis()}));
                 let _ = proxy.send_event(UserEvent::ReaderTranslation(
@@ -384,6 +434,19 @@ impl DesktopReader {
         }
         if let Some(request) = self.translation.toc_task.take_pending() {
             let book_id = self.book_id.clone();
+            let scheduler = self.semantic_layout.scheduler.clone();
+            let task = rebook_app_core::reading_ai::Task {
+                key: rebook_app_core::reading_ai::translation_key(
+                    &book_id,
+                    usize::MAX,
+                    &request.payload.settings,
+                    &request.payload.blocks,
+                ),
+                kind: rebook_app_core::reading_ai::Kind::Contents,
+                section: usize::MAX,
+                sources: vec![],
+                prefetch: false,
+            };
             let proxy = proxy.clone();
             let worker =
                 runtime.spawn(async move {
@@ -395,14 +458,19 @@ impl DesktopReader {
                         None,
                     );
                     let mut translations = Vec::new();
-                    let result = crate::plugins::translate_blocks_with_glossary(
-                        payload.settings,
-                        payload.blocks,
-                        Some(glossary),
-                        |batch| translations.extend(batch),
-                    )
-                    .await
-                    .map(|()| translations);
+                    let result = scheduler
+                        .run(
+                            task,
+                            &Default::default(),
+                            crate::plugins::translate_blocks_with_glossary(
+                                payload.settings,
+                                payload.blocks,
+                                Some(glossary),
+                                |batch| translations.extend(batch),
+                            ),
+                        )
+                        .await
+                        .map(|()| translations);
                     let _ = proxy.send_event(UserEvent::ReaderTocTranslation(
                         TocTranslationTaskMessage { id, result },
                     ));
@@ -846,7 +914,9 @@ impl DesktopReader {
         {
             return;
         }
-        self.pdf_ocr.availability_task.begin(uuid::Uuid::new_v4().to_string());
+        self.pdf_ocr
+            .availability_task
+            .begin(uuid::Uuid::new_v4().to_string());
     }
 
     pub(super) fn toggle_pdf_ocr_view(&mut self) -> bool {
@@ -2496,6 +2566,14 @@ impl DesktopReader {
                         self.translation.clear_error();
                         self.queue_visible_section_translation();
                     }
+                    Err(error)
+                        if rebook_app_core::reading_ai::failure(
+                            rebook_app_core::reading_ai::Kind::Translation,
+                            &error,
+                        ) == rebook_app_core::reading_ai::Failure::Interrupted =>
+                    {
+                        self.queue_visible_section_translation();
+                    }
                     Err(error) => {
                         self.fail_translation_batch(&request);
                         if let Ok((provider, model)) = self.plugin_settings.translation_endpoint() {
@@ -2588,6 +2666,14 @@ impl DesktopReader {
             Ok(translations) => {
                 self.accept_toc_titles(&request.toc_ids, &translations);
                 self.translation.clear_error();
+            }
+            Err(error)
+                if rebook_app_core::reading_ai::failure(
+                    rebook_app_core::reading_ai::Kind::Contents,
+                    &error,
+                ) == rebook_app_core::reading_ai::Failure::Interrupted =>
+            {
+                self.queue_toc_translation();
             }
             Err(error) => {
                 self.error = Some(format!(
@@ -2926,22 +3012,34 @@ mod tests {
         assert_eq!(reader.pdf_ocr.availability_task.active(), Some(&job));
         let request = reader.pdf_ocr.availability_task.take_pending().unwrap();
         reader.complete_pdf_native(super::super::PdfNativeTaskMessage::Availability {
-            book_id: reader.book_id.clone(), job: "old reader".into(),
-            message: TaskResult { id: request.id, result: Ok(true) },
+            book_id: reader.book_id.clone(),
+            job: "old reader".into(),
+            message: TaskResult {
+                id: request.id,
+                result: Ok(true),
+            },
         });
         assert!(reader.reopen_requested.is_none());
         assert!(reader.pdf_ocr.availability_task.is_pending());
         reader.complete_pdf_native(super::super::PdfNativeTaskMessage::Availability {
-            book_id: reader.book_id.clone(), job,
-            message: TaskResult { id: request.id, result: Ok(false) },
+            book_id: reader.book_id.clone(),
+            job,
+            message: TaskResult {
+                id: request.id,
+                result: Ok(false),
+            },
         });
         assert!(reader.reopen_requested.is_none());
         assert!(!reader.pdf_ocr.availability_task.is_pending());
         reader.refresh_synced_pdf_ocr();
         let request = reader.pdf_ocr.availability_task.take_pending().unwrap();
         reader.complete_pdf_native(super::super::PdfNativeTaskMessage::Availability {
-            book_id: reader.book_id.clone(), job: request.payload,
-            message: TaskResult { id: request.id, result: Ok(true) },
+            book_id: reader.book_id.clone(),
+            job: request.payload,
+            message: TaskResult {
+                id: request.id,
+                result: Ok(true),
+            },
         });
         assert_eq!(reader.reopen_requested, Some(reader.source_path.clone()));
         reader.pdf_ocr.available = true;
@@ -2953,7 +3051,10 @@ mod tests {
     #[ignore = "requires TORTO_TEST_EXPIRED_NATIVE_BOOK; verifies selected local cache without changing it"]
     fn local_expired_native_does_not_refresh_from_other_ocr_result() {
         let id = std::env::var("TORTO_TEST_EXPIRED_NATIVE_BOOK").unwrap();
-        assert_eq!(crate::plugins::pdf_native::selected(&id), crate::plugins::pdf_native::TextSource::Native);
+        assert_eq!(
+            crate::plugins::pdf_native::selected(&id),
+            crate::plugins::pdf_native::TextSource::Native
+        );
         assert!(crate::plugins::pdf_native::open(&id).unwrap().is_none());
         assert!(crate::plugins::pdf_ocr_result_available(&id).unwrap());
         assert!(!crate::plugins::pdf_native::selected_result_available(&id).unwrap());
@@ -3076,7 +3177,8 @@ mod tests {
         assert!(!reader.chat.task.is_pending());
         assert!(
             reader.chat.error.as_ref().unwrap().contains('8'),
-            "{:?}", reader.chat.error
+            "{:?}",
+            reader.chat.error
         );
     }
     use crate::plugins::BlockTranslation;

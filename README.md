@@ -91,8 +91,13 @@ Download the latest build from [GitHub Releases](https://github.com/TortoTech/to
 | **Platform** | **Package** | **Requirements** |
 | --- | --- | --- |
 | Windows | `Torto-*-x86_64.msi` | 64-bit Windows 10 or 11 |
+| Windows portable | `Torto-*-windows-x86_64-portable.zip` | Extract and run; settings and books stay in `Data` beside the program |
 | macOS, Apple silicon | `Torto-*-macos-arm64.dmg` | macOS 15 or later |
 | macOS, Intel | `Torto-*-macos-x86_64.dmg` | macOS 15 or later |
+
+macOS also supports [portable mode](docs/macos-portable.md) using the same app:
+create `torto-portable-data` beside the `.app` in a writable folder. Move the
+whole folder to carry its library and settings; the outer folder can have any name.
 
 After installing, import books from the shelf and open any book in Focus Mode:
 - Move between reading units with `↑` / `↓`, the mouse wheel, or the scrollbar.
@@ -102,7 +107,7 @@ After installing, import books from the shelf and open any book in Focus Mode:
 ## Privacy
 
 - Imported books, annotations, statistics, and cached OCR/reflow data stay in Torto's local application-data directory.
-- WebDAV passwords and API keys are stored in the operating system's secure credential store rather than plain configuration files.
+- WebDAV passwords and API keys are stored locally as plaintext in a separate `credentials.json` file, excluded from library cloud sync and diagnostic exports.
 - AI layout, translation, chat, and cloud OCR connect directly to the providers you configure. When enabled, AI layout and translation automatically send relevant text or images within the active scheduling range.
 - WebDAV sync connects directly from Torto to your chosen server with no Torto-operated relay.
 - Submitting in-app feedback publishes your description, optional screenshots, and the reading context shown in the dialog to a public GitHub Issue via TortoTech's feedback service. See the [privacy policy](PRIVACY.md).
@@ -143,7 +148,7 @@ cargo run --locked -p rebook-desktop --example generate_macos_icons
 
 ### macOS credentials and release signing
 
-Unit tests use an in-memory credential store and never touch the system Keychain. Production builds use the OS credential store.
+Unit tests use in-memory credentials and never touch the system Keychain. Production builds use the shared local plaintext credential file; the OS credential store is accessed only to migrate older saved credentials.
 
 The macOS installer workflow supports `MACOS_SIGNING_IDENTITY`, `MACOS_CERTIFICATE_P12_BASE64`, and `MACOS_CERTIFICATE_PASSWORD` with bundle identifier `io.github.l-chris.torto`.
 

@@ -42,19 +42,280 @@ class ReadingNavigationTest {
     private fun clickable(item:AccessibilityNodeInfo?):AccessibilityNodeInfo? {var target=item;while(target!=null&&!target.isClickable)target=target.parent;return target}
     private fun click(item:AccessibilityNodeInfo?){val target=clickable(item);assertNotNull(target);assertTrue(target!!.performAction(AccessibilityNodeInfo.ACTION_CLICK))}
     private fun reader(view:View):ReaderView?=if(view is ReaderView)view else if(view is ViewGroup)(0 until view.childCount).firstNotNullOfOrNull {reader(view.getChildAt(it))}else null
+    private fun <T> onMain(block:()->T):T {
+        var result:Result<T>?=null
+        instrumentation.runOnMainSync {result=runCatching(block)}
+        return result!!.getOrThrow()
+    }
 
-    private fun fixture(file:File){
+    private fun fixture(file:File,ambiguous:Boolean=false,identity:String="reader-navigation-ui"){
         val body="<h1 id='one'>Chapter One</h1><p>Independent paragraph for navigation and search. This is a second sentence.</p>"+(0..15).joinToString(""){"<p>Paragraph $it keeps source locations stable while controls show and hide. A second sentence remains in this paragraph.</p>"}+"<h2 id='two'>Chapter Two</h2><p>Another chapter in the same source.</p><h2 id='appendix'>Appendix</h2><p>End notes.</p>"
         val files=mapOf(
             "mimetype" to "application/epub+zip",
             "META-INF/container.xml" to """<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="package.opf"/></rootfiles></container>""",
-            "package.opf" to """<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">reader-navigation-ui</dc:identifier><dc:title>Navigation UI fixture</dc:title><dc:language>en</dc:language></metadata><manifest><item id="body" href="body.xhtml" media-type="application/xhtml+xml"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/></manifest><spine><itemref idref="body"/></spine></package>""",
+            "package.opf" to """<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">$identity</dc:identifier><dc:title>Navigation UI fixture</dc:title><dc:language>en</dc:language></metadata><manifest><item id="body" href="body.xhtml" media-type="application/xhtml+xml"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/></manifest><spine><itemref idref="body"/></spine></package>""",
             "body.xhtml" to """<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Navigation</title></head><body>$body</body></html>""",
             "nav.xhtml" to """<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Contents</title></head><body><nav epub:type="toc"><ol><li><a href="body.xhtml">Part One</a><ol><li><a href="body.xhtml#one">Chapter One</a></li><li><a href="body.xhtml#two">Chapter Two</a></li></ol></li><li><a href="body.xhtml#appendix">Appendix</a></li></ol></nav></body></html>"""
         )
-        java.util.zip.ZipOutputStream(file.outputStream()).use {zip->files.forEach {(name,text)->zip.putNextEntry(java.util.zip.ZipEntry(name));zip.write(text.toByteArray());zip.closeEntry()}}
+        val entries=if(ambiguous)files+("nav.xhtml" to """<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Contents</title></head><body><nav epub:type="toc"><ol><li><a href="body.xhtml">Chapter One</a></li><li><a href="body.xhtml">Chapter Two</a></li><li><a href="body.xhtml">Appendix</a></li></ol></nav></body></html>""")else files
+        java.util.zip.ZipOutputStream(file.outputStream()).use {zip->entries.forEach {(name,text)->zip.putNextEntry(java.util.zip.ZipEntry(name));zip.write(text.toByteArray());zip.closeEntry()}}
     }
     private fun screenshot(name:String){instrumentation.uiAutomation.takeScreenshot()?.let {bitmap->File(instrumentation.targetContext.cacheDir,name).outputStream().use {bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG,100,it)};bitmap.recycle()}}
+    private fun darkBackdrop():Boolean=instrumentation.uiAutomation.takeScreenshot()?.let {bitmap->
+        val dark=android.graphics.Color.luminance(bitmap.getPixel(bitmap.width/2,bitmap.height*4/5))<.5f
+        bitmap.recycle();dark
+    } ?: false
+
+    @Test fun completionPageRequiresExplicitMarkAndReturnsToExactBookPosition():Unit=runBlocking {
+        val core=NativeRuntime.core(instrumentation.targetContext)
+        val originalAi=core.aiOptions();val originalReading=core.readingOptions();val before=core.books().map {it.id}.toSet()
+        val file=File(instrumentation.targetContext.cacheDir,"book-end-ui.epub");fixture(file,true,"completion-ui-${System.nanoTime()}")
+        val book=core.importBook(file.path).first()
+        val monitor=instrumentation.addMonitor(MainActivity::class.java.name,null,false)
+        var activity:MainActivity?=null;var model:ReaderModel?=null;var originalFocus=false;var original:ScreenState?=null
+        try {
+            core.saveAiOptions(originalAi.copy(layoutEnabled=false));core.saveReadingOptions(originalReading.copy(translated=false))
+            android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand("am start -W -f 0x10008000 -n org.tortotech.torto.debug/org.tortotech.torto.MainActivity")).use {it.readBytes()}
+            activity=monitor.waitForActivityWithTimeout(5000) as? MainActivity;assertNotNull(activity)
+            instrumentation.runOnMainSync {model=ViewModelProvider(activity!!)[ReaderModel::class.java]}
+            await("model loads"){model!!.state.value.loaded&&!model!!.state.value.busy};originalFocus=model!!.state.value.focus;original=model!!.state.value
+            instrumentation.runOnMainSync {model!!.open(book)}
+            await("book opens"){model!!.state.value.frame!=null&&model!!.state.value.toc.size==3&&!model!!.state.value.busy}
+            val last=model!!.state.value.toc.last().id
+            for(focus in listOf(false,true)){
+                instrumentation.runOnMainSync {model!!.focus(focus)}
+                await("reading mode settles"){model!!.state.value.focus==focus&&!model!!.state.value.busy}
+                instrumentation.runOnMainSync {model!!.navigateToc(last)}
+                await("last chapter opens"){model!!.state.value.frame?.info?.activeTocId==last&&!model!!.state.value.busy}
+                val view=onMain {reader(activity!!.window.decorView)!!}
+                // Switching focus changes the immersive viewport and schedules
+                // a 100ms resize. Start the gesture on its displayed final frame.
+                var observed:ReaderFrame?=null;var stableSince=0L
+                await("the new viewport is displayed and has settled"){
+                    val state=model!!.state.value;val now=android.os.SystemClock.uptimeMillis()
+                    val displayed=onMain {ReaderView::class.java.getDeclaredField("frame").apply {isAccessible=true}.get(view)===state.frame}
+                    if(state.busy||!displayed){stableSince=0;false}
+                    else {
+                        if(observed!==state.frame||stableSince==0L){observed=state.frame;stableSince=now}
+                        now-stableSince>=180
+                    }
+                }
+                val calls=java.util.concurrent.atomic.AtomicInteger()
+                instrumentation.runOnMainSync {
+                    if(focus){val navigate=view.onUnitTurn!!;view.onUnitTurn={calls.incrementAndGet();navigate(it)}}
+                    else {val navigate=view.onTurn!!;view.onTurn={calls.incrementAndGet();navigate(it)}}
+                }
+                fun swipe(forward:Boolean){instrumentation.runOnMainSync {
+                    val start=android.os.SystemClock.uptimeMillis();val from=view.width*if(forward).8f else .2f;val to=view.width*if(forward).3f else .7f
+                    for((action,x,time)in listOf(Triple(android.view.MotionEvent.ACTION_DOWN,from,start),Triple(android.view.MotionEvent.ACTION_MOVE,to,start+100),Triple(android.view.MotionEvent.ACTION_UP,to,start+300)))android.view.MotionEvent.obtain(start,time,action,x,view.height*.5f,0).also {view.onTouchEvent(it);it.recycle()}
+                }}
+                val frame=model!!.state.value.frame!!
+                var finishedEvents:Int?=null
+                var ordinal:UInt?=null
+                repeat(2){index->
+                    val completion=model!!.state.value.turnCompletion
+                    swipe(true)
+                    await("a forward book boundary opens the completion page"){model!!.state.value.turnCompletion>completion&&model!!.state.value.completionPage&&!model!!.state.value.readerMoving}
+                    await("the reading statistics are ready"){model!!.state.value.completion!=null&&!model!!.state.value.completionLoading}
+                    assertEquals(index+1,calls.get());assertEquals(last,model!!.state.value.frame!!.info.activeTocId)
+                    val returned=model!!.state.value.frame!!
+                    assertEquals(frame.info.section,returned.info.section);assertEquals(frame.info.page,returned.info.page)
+                    assertEquals(frame.info.progress,returned.info.progress,0.0)
+                    val detail=model!!.state.value.completion!!.statistics
+                    if(!focus&&index==0){
+                        assertNotEquals("Entering the end page must not mark the book", "finished",detail.status)
+                        assertNotNull(label("标记读完","Mark finished"));assertNotNull(label("全书完","The End"))
+                        screenshot("completion-unmarked.png")
+                    }
+                    if(focus&&index==0){
+                        click(label("标记读完","Mark finished"))
+                        await("only an explicit click marks the book finished"){model!!.state.value.completion!!.statistics.status=="finished"&&!model!!.state.value.completionLoading}
+                        finishedEvents=core.bookStatistics(book.id).history.count {it.kind=="finished"}
+                        ordinal=model!!.state.value.completion!!.finishedBooks
+                        assertEquals(1,finishedEvents)
+                        assertTrue(ordinal!!>0u)
+                        await("finished heading is displayed"){label("已读完","Finished")!=null&&label("标记读完","Mark finished")==null}
+                        screenshot("completion-marked.png")
+                    }
+                    if(focus&&index==1){
+                        assertEquals("finished",detail.status)
+                        assertEquals("Reopening does not add duplicate completion events",finishedEvents,core.bookStatistics(book.id).history.count {it.kind=="finished"})
+                        assertEquals(ordinal,model!!.state.value.completion!!.finishedBooks)
+                    }
+                    if(focus&&index==1){
+                        click(label("退出阅读","Exit reading"))
+                        await("exit reading returns to the shelf"){model!!.state.value.active==null&&!model!!.state.value.busy}
+                    }else{
+                        // Exercise the visible completion page's rightward swipe,
+                        // rather than issuing another native previous-page turn.
+                        val start=android.os.SystemClock.uptimeMillis();val y=view.height*.4f
+                        fun event(action:Int,x:Float){val time=android.os.SystemClock.uptimeMillis();android.view.MotionEvent.obtain(start,time,action,x,y,0).also {instrumentation.sendPointerSync(it);it.recycle()}}
+                        event(android.view.MotionEvent.ACTION_DOWN,view.width*.2f)
+                        for(step in 1..6){android.os.SystemClock.sleep(15);event(android.view.MotionEvent.ACTION_MOVE,view.width*(.2f+.1f*step))}
+                        event(android.view.MotionEvent.ACTION_UP,view.width*.8f)
+                        await("swiping back reveals the exact last page or section"){!model!!.state.value.completionPage}
+                        assertEquals(last,model!!.state.value.frame!!.info.activeTocId)
+                        assertEquals(frame.info.page,model!!.state.value.frame!!.info.page)
+                        assertEquals("Synthetic-page back never turns native content",index+1,calls.get())
+                    }
+                }
+                if(!focus){
+                    val completion=model!!.state.value.turnCompletion
+                    swipe(false)
+                    await("native reverse paging still works after returning from the end page"){model!!.state.value.turnCompletion>completion&&!model!!.state.value.busy&&!model!!.state.value.readerMoving}
+                    assertEquals(3,calls.get());assertNotEquals(last,model!!.state.value.frame!!.info.activeTocId)
+                }
+                assertNull(model!!.state.value.error)
+            }
+        }finally {
+            model?.let {m->
+                if(m.state.value.active!=null){
+                    instrumentation.runOnMainSync {m.focus(originalFocus)};await("reading mode restores"){!m.state.value.busy&&m.state.value.focus==originalFocus}
+                    instrumentation.runOnMainSync {m.back()};await("reader closes"){m.state.value.active==null&&!m.state.value.busy}
+                }
+            }
+            original?.let {saved->
+                instrumentation.targetContext.getSharedPreferences("reading",0).edit().putBoolean("focus",originalFocus).commit()
+                instrumentation.runOnMainSync {model!!.configure(saved.fontSize,saved.unified,saved.dark)}
+                await("reading preferences restore"){!model!!.state.value.busy}
+            }
+            core.saveAiOptions(originalAi);core.saveReadingOptions(originalReading)
+            activity?.let {instrumentation.runOnMainSync {it.finish()}};instrumentation.removeMonitor(monitor)
+            if(book.id !in before)core.removeBook(book.id);file.delete()
+        }
+    }
+
+    @Test fun notesGroupByChapterAndSearchQuotesAndCommentText():Unit=runBlocking {
+        val context=instrumentation.targetContext;val core=NativeRuntime.core(context)
+        val originalAi=core.aiOptions();val originalReading=core.readingOptions();val before=core.books().map {it.id}.toSet()
+        val file=File(context.cacheDir,"grouped-notes.epub");fixture(file,true,"grouped-notes-ui")
+        val book=core.importBook(file.path).first()
+        val monitor=instrumentation.addMonitor(MainActivity::class.java.name,null,false)
+        var activity:MainActivity?=null;var model:ReaderModel?=null;var previous:ScreenState?=null
+        try {
+            core.saveAiOptions(originalAi.copy(layoutEnabled=false));core.saveReadingOptions(originalReading.copy(translated=false))
+            val native=core.openBook(book.id,org.tortotech.torto.core.Viewport(360u,640u,2f))
+            try {
+                native.focusMode(false).close();native.selectionMode("paragraph")
+                // Save in reverse chapter order to exercise source ordering.
+                for((query,note) in listOf("Another chapter" to "A needle only in this comment", "Independent paragraph" to null)){
+                    val hit=native.search(query).first()
+                    native.goToSource(hit.source).use {page->
+                        val rect=page.info().regions.first {it.text.contains(query)}.bounds.first()
+                        assertNotNull(native.select(rect.x+2,rect.y+rect.height/2,rect.x+20,rect.y+rect.height/2))
+                    }
+                    native.saveAnnotation(note)
+                }
+                val position=native.page().use {it.info().progress}
+                val notes=native.annotations()
+                assertEquals(listOf("Chapter One","Chapter Two"),notes.map {it.chapterTitle})
+                assertEquals(2,notes.map {it.chapterId}.distinct().size)
+                assertEquals("Listing notes must not move the reader",position,native.page().use {it.info().progress},0.0)
+            }finally{native.shutdown();native.close()}
+            android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand("am start -W -f 0x10008000 -n org.tortotech.torto.debug/org.tortotech.torto.MainActivity")).use {it.readBytes()}
+            activity=monitor.waitForActivityWithTimeout(5000) as? MainActivity;assertNotNull(activity)
+            instrumentation.runOnMainSync {model=ViewModelProvider(activity!!)[ReaderModel::class.java]}
+            await("model loads"){model!!.state.value.loaded&&!model!!.state.value.busy}
+            previous=model!!.state.value
+            instrumentation.runOnMainSync {model!!.interfaceSettings("light","en");model!!.open(book)}
+            await("notes fixture opens"){model!!.state.value.active?.id==book.id&&model!!.state.value.frame!=null&&!model!!.state.value.busy}
+            instrumentation.runOnMainSync {model!!.configure(model!!.state.value.fontSize,true,false)}
+            await("light reading palette applies"){!model!!.state.value.dark&&!model!!.state.value.busy}
+            instrumentation.runOnMainSync {if(!model!!.state.value.chromeVisible)model!!.toggleChrome()}
+            await("notes footer is available"){label("Notes and highlights")!=null};click(label("Notes and highlights"))
+            await("both chapters and two note types render"){label("Notes")!=null&&label("Chapter One")!=null&&label("Chapter Two")!=null&&label("Highlight")!=null&&label("Note")!=null}
+            await("light note cards are actually drawn"){!darkBackdrop()}
+            assertNull(label("Edit note"));assertNull(label("Delete annotation"))
+            assertNotNull(label("2 notes"));screenshot("notes-grouped-light.png")
+            val first=Rect().also {label("Chapter One")!!.getBoundsInScreen(it)}
+            val second=Rect().also {label("Chapter Two")!!.getBoundsInScreen(it)}
+            assertTrue("Chapter groups follow source order",first.top<second.top)
+            instrumentation.runOnMainSync {model!!.configure(model!!.state.value.fontSize,true,true)}
+            await("dark notes settle"){model!!.state.value.dark&&!model!!.state.value.busy&&darkBackdrop()}
+            screenshot("notes-grouped-dark.png")
+            click(label("Search notes"))
+            await("note search uses an inline input"){node {it.className?.toString()=="android.widget.EditText"}!=null}
+            assertNull(label("0 notes found"))
+            val viewport=onMain {reader(activity!!.window.decorView)!!.let {it.width to it.height}}
+            fun enter(text:String){
+                val field=node {it.className?.toString()=="android.widget.EditText"}!!
+                assertTrue(field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,Bundle().apply {putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,text)}))
+            }
+            enter("iNdePenDent")
+            await("search finds highlight quotes ignoring case"){label("1 note found")!=null&&label("Chapter One")!=null&&label("Chapter Two")==null}
+            enter("needle")
+            await("search also finds comment text"){label("1 note found")!=null&&label("Chapter Two")!=null&&label("Chapter One")==null}
+            await("search opens the real keyboard"){onMain {androidx.core.view.ViewCompat.getRootWindowInsets(activity!!.window.decorView)?.isVisible(WindowInsetsCompat.Type.ime())==true}}
+            assertEquals("Searching notes keeps native pagination stable",viewport,onMain {reader(activity!!.window.decorView)!!.let {it.width to it.height}})
+            screenshot("notes-search-keyboard.png")
+            click(label("Cancel"))
+            await("cancel returns to the grouped list"){label("Notes")!=null&&label("Chapter One")!=null&&label("Chapter Two")!=null}
+            click(label("Search notes"))
+            await("search reopens"){node {it.className?.toString()=="android.widget.EditText"}!=null}
+            enter("needle")
+            await("comment result is available"){label("A needle only in this comment")!=null}
+            click(label("A needle only in this comment"))
+            await("result opens note view at its exact chapter"){label("Notes list")!=null&&label("Search notes")==null&&!model!!.state.value.busy&&model!!.state.value.frame?.info?.activeTocId==model!!.state.value.annotations.last().chapterId&&model!!.state.value.annotationPreviewId==model!!.state.value.annotations.last().id}
+            assertNull("Ordinary floating actions are hidden in note view",label("Reading assistant"))
+            assertTrue(clickable(label("Previous note"))!!.isEnabled)
+            assertFalse("The last note has no next target",clickable(label("Next note"))!!.isEnabled)
+            assertEquals("Note toolbars overlay the unchanged page",viewport,onMain {reader(activity!!.window.decorView)!!.let {it.width to it.height}})
+            screenshot("notes-reading-preview.png")
+            click(label("Back to notes"))
+            await("the header menu returns to the notes panel"){label("Search notes")!=null&&label("Highlight")!=null}
+            click(label("Highlight"))
+            await("highlight cards enter the same note view"){label("Notes list")!=null&&!model!!.state.value.busy&&model!!.state.value.annotationPreviewId==model!!.state.value.annotations.first().id}
+            assertFalse("The first note has no previous target",clickable(label("Previous note"))!!.isEnabled)
+            click(label("Next note"))
+            await("next visits the following note without losing the toolbars"){model!!.state.value.annotationPreviewId==model!!.state.value.annotations.last().id&&!model!!.state.value.busy&&label("Notes list")!=null}
+            click(label("Previous note"))
+            await("previous returns to the first highlight"){model!!.state.value.annotationPreviewId==model!!.state.value.annotations.first().id&&!model!!.state.value.busy}
+            click(label("Notes list"))
+            await("the bottom list action also returns to notes"){label("Search notes")!=null&&label("Highlight")!=null}
+            click(label("Highlight"))
+            await("preview reopens"){label("Exit note view")!=null&&!model!!.state.value.busy}
+            click(label("Exit note view"))
+            await("closing exits to ordinary immersive reading"){model!!.state.value.annotationPreviewId==null&&label("Notes list")==null}
+            instrumentation.runOnMainSync {model!!.toggleChrome()}
+            await("ordinary reading controls are available again"){label("Contents and search")!=null}
+            assertEquals("Searching never mutates notes",2,model!!.state.value.annotations.size)
+        }finally {
+            model?.let {m->instrumentation.runOnMainSync {m.back()};await("reader closes"){m.state.value.active==null&&!m.state.value.busy}}
+            core.saveAiOptions(originalAi);core.saveReadingOptions(originalReading)
+            previous?.let {saved->instrumentation.runOnMainSync {model!!.interfaceSettings(saved.appTheme,saved.language)};await("interface restores"){!model!!.state.value.busy}}
+            activity?.let {instrumentation.runOnMainSync {it.finish()}};instrumentation.removeMonitor(monitor)
+            if(book.id !in before)core.removeBook(book.id);file.delete()
+        }
+    }
+
+    @Test fun ambiguousContentsNavigateByIdentityAndKeepSectionOrder():Unit=runBlocking {
+        val context=instrumentation.targetContext
+        val core=NativeRuntime.core(context)
+        val before=core.books().map {it.id}.toSet()
+        val originalAi=core.aiOptions();val originalReading=core.readingOptions()
+        val file=File(context.cacheDir,"ambiguous-contents.epub");fixture(file,true)
+        val book=core.importBook(file.absolutePath).first()
+        core.saveAiOptions(originalAi.copy(layoutEnabled=false));core.saveReadingOptions(originalReading.copy(translated=false))
+        val reader=core.openBook(book.id,org.tortotech.torto.core.Viewport(360u,640u,2f))
+        try {
+            val rows=reader.toc();assertEquals(3,rows.size);assertEquals(1,rows.map {it.href}.distinct().size)
+            for(focus in listOf(false,true)) {
+                reader.focusMode(focus).close()
+                var progress=-1.0
+                for(row in rows) {
+                    reader.navigateToc(row.id).use {page->val info=page.info();assertEquals(row.id,info.activeTocId);assertTrue(info.progress>=progress);progress=info.progress}
+                }
+                reader.navigateToc(rows[0].id).close()
+                for(index in listOf(1,2))reader.turnReadingUnit(true).use {assertEquals(rows[index].id,it.info().activeTocId)}
+                for(index in listOf(1,0))reader.turnReadingUnit(false).use {assertEquals(rows[index].id,it.info().activeTocId)}
+            }
+        }finally {
+            reader.shutdown();reader.close()
+            core.saveAiOptions(originalAi);core.saveReadingOptions(originalReading)
+            if(book.id !in before)core.removeBook(book.id)
+            file.delete()
+        }
+    }
 
     @Test fun referenceSheetUsesAlignedMarkersAndContentHeight():Unit=runBlocking {
         val context=instrumentation.targetContext
@@ -82,15 +343,34 @@ class ReadingNavigationTest {
             for(dark in listOf(false,true)){
                 instrumentation.runOnMainSync {model!!.configure(20f,true,dark)}
                 await("theme settles"){!model!!.state.value.busy&&model!!.state.value.dark==dark}
-                val frame=model!!.state.value.frame!!
-                val bitmap=frame.bitmap;val density=context.resources.displayMetrics.density
-                val height=minOf(bitmap.height,(180*density).toInt())
-                val pixels=IntArray(bitmap.width*height);bitmap.getPixels(pixels,0,bitmap.width,0,0,bitmap.width,height)
-                val accent=org.tortotech.torto.core.referenceColor(dark).toInt()
-                var left=bitmap.width;var top=height;var right=0;var bottom=0
-                pixels.forEachIndexed {index,pixel->if(pixel==accent){val x=index%bitmap.width;val y=index/bitmap.width;left=minOf(left,x);right=maxOf(right,x);top=minOf(top,y);bottom=maxOf(bottom,y)}}
-                assertTrue("Reference markers use the shared desktop accent",left<=right&&top<=bottom)
-                instrumentation.runOnMainSync {model!!.tap((left+right)/2f/density,(top+bottom)/2f/density)}
+                val density=context.resources.displayMetrics.density
+                var frame=model!!.state.value.frame!!
+                var observed:ReaderFrame?=null
+                var stableSince=0L
+                await("reference marker belongs to an actionable, unchanged frame") {
+                    val snapshot=model!!.state.value
+                    if(snapshot.busy){observed=null;return@await false}
+                    val candidate=snapshot.frame ?: return@await false
+                    if(observed!==candidate){observed=candidate;stableSince=android.os.SystemClock.uptimeMillis();return@await false}
+                    // Insets animate on launch; wait for their debounced native
+                    // resize before asserting that opening a note reuses pixels.
+                    if(android.os.SystemClock.uptimeMillis()-stableSince<350)return@await false
+                    val bitmap=candidate.bitmap
+                    val height=minOf(bitmap.height,(180*density).toInt())
+                    val pixels=IntArray(bitmap.width*height);bitmap.getPixels(pixels,0,bitmap.width,0,0,bitmap.width,height)
+                    val accent=org.tortotech.torto.core.referenceColor(dark).toInt()
+                    var left=bitmap.width;var top=height;var right=0;var bottom=0
+                    pixels.forEachIndexed {index,pixel->if(pixel==accent){val x=index%bitmap.width;val y=index/bitmap.width;left=minOf(left,x);right=maxOf(right,x);top=minOf(top,y);bottom=maxOf(bottom,y)}}
+                    if(left>right||top>bottom)return@await false
+                    var dispatched=false
+                    // A debounced viewport resize can begin while scanning pixels.
+                    instrumentation.runOnMainSync {
+                        if(!model!!.state.value.busy&&model!!.state.value.frame===candidate){
+                            frame=candidate;model!!.tap((left+right)/2f/density,(top+bottom)/2f/density);dispatched=true
+                        }
+                    }
+                    dispatched
+                }
                 android.os.SystemClock.sleep(600)
                 await("numbered note opens"){model!!.state.value.interaction?.kind=="note"}
                 assertEquals("1",model!!.state.value.interaction!!.marker)
@@ -128,8 +408,7 @@ class ReadingNavigationTest {
             activity=monitor.waitForActivityWithTimeout(5000) as? MainActivity;assertNotNull(activity)
             instrumentation.runOnMainSync {activity!!.setContent {TortoTheme(screen.value){
                 val blocked=loadingVisible(screen.value.busy)
-                val processing=loadingVisible(screen.value.processing)
-                Box(Modifier.fillMaxSize()){ReadingChrome(screen.value,blocked,processing,null,{},{},{},{},{})}
+                Box(Modifier.fillMaxSize()){ReadingChrome(screen.value,blocked,null,{},{},{},{})}
             }}}
             await("toolbar ready"){label("Reading assistant")!=null}
             fun button(name:String):AccessibilityNodeInfo {var found=label(name);while(found!=null&&!found.isClickable&&found.className!="android.widget.Button")found=found.parent;return found!!}
@@ -150,11 +429,15 @@ class ReadingNavigationTest {
             instrumentation.waitForIdleSync()
             for(name in listOf("Reading assistant","Contents and search","Notes and highlights","Selection mode","Typography","Toggle light/dark","Turn translation on"))assertTrue("Short reading updates keep $name enabled",button(name).isEnabled)
             instrumentation.runOnMainSync {screen.value=screen.value.copy(busy=false,processing=true)}
-            await("genuine AI processing gets a stop control"){label("Stop processing")!=null}
+            android.os.SystemClock.sleep(350)
+            assertNull("AI processing has no header pause/stop entry",label("Stop processing"))
             assertEquals("AI controls must not shift chat",chat,bounds("Reading assistant"))
+            instrumentation.runOnMainSync {screen.value=screen.value.copy(processing=false,enhancing=true)}
+            android.os.SystemClock.sleep(350)
+            assertNull("Optional generation has no header pause/stop entry",label("Stop processing"))
             instrumentation.runOnMainSync {screen.value=screen.value.copy(busy=true)}
             await("long operations still disable conflicting controls"){!button("Reading assistant").isEnabled}
-            instrumentation.runOnMainSync {screen.value=screen.value.copy(busy=false,processing=false)}
+            instrumentation.runOnMainSync {screen.value=screen.value.copy(busy=false,processing=false,enhancing=false)}
             await("controls restore after work"){button("Reading assistant").isEnabled}
         }finally {instrumentation.runOnMainSync {activity?.finish()};instrumentation.removeMonitor(monitor)}
     }
@@ -194,11 +477,29 @@ class ReadingNavigationTest {
             val originalFocus=model!!.state.value.focus
             instrumentation.runOnMainSync {model!!.focus(true)}
             await("focus is ready"){model!!.state.value.focus&&!model!!.state.value.busy&&model!!.state.value.frame!!.info.focusCount>0u}
+            fun immersiveBounds():Rect {
+                val bounds=Rect()
+                instrumentation.runOnMainSync {
+                    val view=reader(activity!!.window.decorView)!!
+                    val position=IntArray(2);view.getLocationInWindow(position)
+                    bounds.set(position[0],position[1],position[0]+view.width,position[1]+view.height)
+                }
+                return bounds
+            }
+            await("Focus content extends through both system-bar and cutout bands"){
+                val bounds=immersiveBounds()
+                bounds.top==0&&bounds.bottom==activity!!.window.decorView.height&&!model!!.state.value.busy
+            }
+            val fullScreen=immersiveBounds()
+            // Wait for the debounced native resize before comparing retained rasters.
+            android.os.SystemClock.sleep(250)
+            await("the full-screen native resize finishes"){!model!!.state.value.busy}
             val active=model!!.state.value.frame!!.info.focusBounds.first()
             val raster=model!!.state.value.frame!!.rasterId
             instrumentation.runOnMainSync {model!!.tap(active.x+2f,active.y+active.height/2)}
             await("tapping the active block reveals chrome"){model!!.state.value.chromeVisible&&!model!!.state.value.busy}
             await("status bar returns with the header"){statusVisible()}
+            assertEquals("Showing controls must not reserve top or bottom bands",fullScreen,immersiveBounds())
             assertEquals("Toggling chrome reuses native page pixels",raster,model!!.state.value.frame!!.rasterId)
             assertTrue("Native focus exposes a local sentence control",model!!.state.value.frame!!.info.controls.any {it.kind=="sentences"})
             await("current paragraph can be split"){label("当前段落按句分段","Split current paragraph")!=null}
@@ -213,6 +514,7 @@ class ReadingNavigationTest {
             instrumentation.runOnMainSync {model!!.tap(active.x+2f,active.y+active.height/2)}
             await("tapping it again hides chrome"){!model!!.state.value.chromeVisible&&!model!!.state.value.busy}
             await("status bar hides again"){!statusVisible()}
+            assertEquals("Hiding controls keeps the same immersive content plane",fullScreen,immersiveBounds())
             repeat(5){
                 val distance=model!!.state.value.frame!!.info.scrollDistance
                 instrumentation.runOnMainSync {model!!.turn(true)}
@@ -225,7 +527,9 @@ class ReadingNavigationTest {
             instrumentation.runOnMainSync {model!!.toggleChrome()}
             await("typography is available"){label("字体排版","Typography")!=null}
             click(label("字体排版","Typography"))
-            await("focus-specific options are shown"){label("专注样式","Focus style")!=null}
+            await("focus settings are shown"){label("专注模式","Focus mode")!=null}
+            assertNull("Android always dims surroundings without a style choice",label("专注样式","Focus style"))
+            assertFalse("Android does not highlight the focused block",model!!.state.value.frame!!.info.focusHighlight)
             assertNull("Focus always uses unified layout",label("统一版式","Unified layout"))
             assertNull("Focus always scrolls",label("滚动专注","Scrolling focus"))
             assertNull("Sentence splitting is a local floating action",label("按句分段显示","Split sentences onto separate lines"))

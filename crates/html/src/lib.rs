@@ -31,6 +31,7 @@ mod semantic_structures_tests;
 mod reader_regressions;
 mod media_semantics;
 mod nested_media;
+mod preceding_figures;
 mod paragraph_lists;
 mod definition_lists;
 mod paragraph_groups;
@@ -520,6 +521,10 @@ impl<'a> ReadingIrParser<'a> {
                     index += consumed;
                     continue;
                 }
+                if let Some(consumed) = self.try_parse_preceding_image_figure(&children[index..])? {
+                    index += consumed;
+                    continue;
+                }
                 if let Some(captions) = inferred_figure_caption_sibling(
                     &children,
                     index,
@@ -744,6 +749,10 @@ impl<'a> ReadingIrParser<'a> {
                     continue;
                 }
                 if let Some(consumed) = self.try_parse_table_caption_group(&children[index..])? {
+                    index += consumed;
+                    continue;
+                }
+                if let Some(consumed) = self.try_parse_preceding_image_figure(&children[index..])? {
                     index += consumed;
                     continue;
                 }

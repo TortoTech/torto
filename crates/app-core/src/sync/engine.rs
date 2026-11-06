@@ -201,6 +201,11 @@ where
     let cache_dir = download_cache_dir()?;
     let webdav = WebDavClient::new(&settings, password)?
         .with_store(store.clone(), super::account_key(&settings));
+    if crate::environment::portable_machine().is_some() && mode != SyncMode::Statistics {
+        let config = crate::environment::paths().ok_or_else(|| io::Error::other("Missing portable configuration"))?.config;
+        let previous = super::portable::previous_devices(&config, &settings.device_id)?;
+        sync_portable_previous_devices(&webdav, &store, &settings, previous).await?;
+    }
     let device = settings.device_id.clone();
     if mode == SyncMode::Statistics {
         progress(SyncProgress::Stage {
@@ -301,6 +306,22 @@ where
         report.statistics_error = Some(super::format_error_chain(error.as_ref()));
     }
     Ok(report)
+}
+
+/// Flush pending changes under their original actor, with their original HLC
+/// and vector clocks. Moving a profile must not turn old notes into new edits.
+async fn sync_portable_previous_devices(webdav: &WebDavClient, store: &SyncStore, settings: &SyncSettings, previous: Vec<String>) -> SyncResult<()> {
+    for device in previous {
+        let previous_store = SyncStore::open_at(store.path().into(), device.clone())?;
+        let mut previous_settings = settings.clone(); previous_settings.device_id = device;
+        let account = super::account_key(&previous_settings);
+        for (book, _, _) in previous_store.pending_reading(&account)? {
+            validate_book_id(&book)?;
+            let revision = push_reading_state(webdav, &previous_store, &previous_settings, &book).await?;
+            previous_store.acknowledge_reading(&account, &book, revision)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1148,6 +1169,40 @@ pub mod tests {
     use uuid::Uuid;
 
     type FakeObjects = Arc<Mutex<HashMap<String, (Vec<u8>, String)>>>;
+
+    #[test]
+    fn portable_move_flushes_previous_actor_without_retimestamping_or_losing_failed_uploads() {
+        let server = FakeWebDav::start();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let settings = test_settings(server.base_url(), "New computer");
+        let old_device = Uuid::new_v4().to_string();
+        let database = test_database("portable-move");
+        let old = SyncStore::open_at(database.clone(), old_device.clone()).unwrap();
+        let id = "c".repeat(64);
+        old.save_progress(&id, &reading_locator(&id, 0.37)).unwrap();
+        let start = rebook_publication::SourceAnchor { spine: rebook_publication::SpineItemId::new("chapter").unwrap(), node: "p".into(), text_offset: 0 };
+        let mut end = start.clone(); end.text_offset = 5;
+        old.create_annotation("note".into(), id.clone(), vec![rebook_publication::SourceRange { start, end }], "quote".into(), Some("unsent note".into()), 1).unwrap();
+        let (_, before) = old.reading_snapshot(&id).unwrap();
+        let current = SyncStore::open_at(database.clone(), settings.device_id.clone()).unwrap();
+        let client = WebDavClient::new(&settings, "secret".into()).unwrap().with_store(current.clone(), super::super::account_key(&settings));
+        let mut previous_settings = settings.clone(); previous_settings.device_id = old_device.clone();
+        let account = super::super::account_key(&previous_settings);
+        server.fail_next_put.store(true, Ordering::Relaxed);
+        assert!(runtime.block_on(sync_portable_previous_devices(&client, &current, &settings, vec![old_device.clone()])).is_err());
+        assert_eq!(old.pending_reading(&account).unwrap().len(), 1);
+        runtime.block_on(sync_portable_previous_devices(&client, &current, &settings, vec![old_device.clone()])).unwrap();
+        assert!(old.pending_reading(&account).unwrap().is_empty());
+        let path = format!("/dav/Rebook/v1/state/{id}/devices/{old_device}.json");
+        let objects = server.objects.lock().unwrap();
+        let uploaded: DeviceBookState = serde_json::from_slice(&objects.get(&path).unwrap().0).unwrap();
+        assert_eq!(uploaded.device_id, old_device);
+        assert_eq!(uploaded.progress, before.progress);
+        assert_eq!(uploaded.annotations, before.annotations);
+        assert!(!objects.keys().any(|path| path.ends_with(&format!("{}.json", settings.device_id))));
+        drop(objects); server.stop();
+        drop(old); drop(current); let _ = fs::remove_file(database);
+    }
 
     #[test]
     fn bootstrap_publishes_first_batch_before_scanning_later_manifests_and_resumes_after_429() {

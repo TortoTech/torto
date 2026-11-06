@@ -3,6 +3,7 @@ mod derived;
 mod engine;
 mod listing;
 mod protocol;
+mod portable;
 mod rate_limit;
 mod schedule;
 mod settings;

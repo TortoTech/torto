@@ -36,3 +36,21 @@ Rebook/v1/
 ## Local persistence
 
 Progress, annotations, HLC state, and local book membership are stored transactionally in `sync-v1.sqlite3` under the application data directory. Legacy `highlights.json` records are imported idempotently. The WebDAV password is stored in Windows Credential Manager under the `Rebook WebDAV` service name; it is not serialized with settings.
+
+Local database handles share an in-process access coordinator by canonical file
+path, including handles opened independently by reading and synchronization.
+The coordinator covers connection open through close, so local writers do not
+compete for SQLite's busy timeout and a final WAL checkpoint cannot race another
+local open. Different database files remain independent. The registry retains
+only weak references and removes expired entries. SQLite's five-second timeout
+still applies to competing processes; SQL failures continue to propagate.
+Read-then-write operations retain immediate transactions. Registering a missing
+book and advancing its HLC use one transaction without reopening the same store.
+
+Regression checks include 100 repetitions of four concurrent workers saving
+progress, taking upload snapshots, editing notes and merging remote progress
+(40,000 operations), plus 20 delayed-writer repetitions. The delayed-writer check
+reproduces `SQLITE_BUSY` on an uncoordinated connection with a 20 ms wait budget;
+an independently opened local handle succeeds after the first writer finishes.
+Final locators, notes and synchronization revisions are verified. These runs use
+temporary databases on macOS; Windows CI has not yet been rerun for this fix.

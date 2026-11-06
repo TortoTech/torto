@@ -27,11 +27,13 @@ internal val ReaderBarHeight=56.dp
 @Composable internal fun readerSafePadding():PaddingValues = WindowInsets.statusBarsIgnoringVisibility
     .union(WindowInsets.navigationBarsIgnoringVisibility).union(WindowInsets.displayCutout).asPaddingValues()
 
-/** The content plane never reserves toolbar/status-bar height or resizes on chrome changes. */
+/** Focus reading occupies the entire screen height, including hidden system-bar areas.
+ * Toolbar safe areas belong to the overlays; showing controls never resizes the page. */
 @OptIn(ExperimentalLayoutApi::class)
-@Composable internal fun readerContentPadding():PaddingValues = WindowInsets.displayCutout
-    .union(WindowInsets.navigationBarsIgnoringVisibility.only(WindowInsetsSides.Bottom))
-    .asPaddingValues()
+@Composable internal fun readerContentPadding(focus:Boolean):PaddingValues =
+    (if(focus)WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal)
+    else WindowInsets.displayCutout.union(WindowInsets.navigationBarsIgnoringVisibility.only(WindowInsetsSides.Bottom)))
+        .asPaddingValues()
 
 @Composable internal fun CompactHomeBar(selected:Int,onSelect:(Int)->Unit){
     Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).navigationBarsPadding()){
@@ -54,8 +56,8 @@ internal val ReaderBarHeight=56.dp
 
 /** Overlay controls never participate in the native reading viewport's measurement. */
 @Composable internal fun BoxScope.ReadingChrome(
-    state:ScreenState,blocked:Boolean,processing:Boolean,panel:String?,onBack:()->Unit,onPanel:(String)->Unit,
-    onTranslate:()->Unit,onTheme:()->Unit,onStop:()->Unit,onSplit:()->Unit={},
+    state:ScreenState,blocked:Boolean,panel:String?,onBack:()->Unit,onPanel:(String)->Unit,
+    onTranslate:()->Unit,onTheme:()->Unit,onSplit:()->Unit={},
 ){
     val safe=readerSafePadding()
     val bottomPanel=readingBottomPanel(panel)
@@ -64,7 +66,6 @@ internal val ReaderBarHeight=56.dp
             Row(Modifier.fillMaxWidth().weight(1f).padding(horizontal=8.dp),verticalAlignment=Alignment.CenterVertically){
                 ActionIcon("back",tr("返回","Back"),onClick=onBack)
                 Spacer(Modifier.weight(1f))
-                if(processing)ActionIcon("stop",tr("停止处理","Stop processing"),onClick=onStop)
             }
             HorizontalDivider(color=MaterialTheme.colorScheme.outlineVariant.copy(alpha=.45f),thickness=.5.dp)
         }

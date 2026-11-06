@@ -175,6 +175,24 @@ impl DesktopReader {
         }
     }
 
+    pub(in crate::reader) fn internal_link_at_canvas(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Option<rebook_publication::PublicationUrl> {
+        let hit = if self.is_scroll_mode() {
+            let (position, x, y) = self.scroll_page_coordinates(x, y)?;
+            self.reader.book_link_at_page(position, x, y).ok().flatten()
+        } else {
+            self.reader.book_link_at_current_spread(x, y).ok().flatten()
+        };
+        hit.filter(|(target, role, _)| {
+            target.website_url().is_none()
+                && *role == rebook_publication::LinkRole::Normal
+                && self.reader.section_index_for_href(target).is_some()
+        })
+        .map(|(target, _, _)| target)
+    }
     pub(in crate::reader) fn website_at_canvas(
         &mut self,
         x: f32,

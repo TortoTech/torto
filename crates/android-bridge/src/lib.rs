@@ -20,6 +20,7 @@ mod interactions;
 mod maintenance;
 mod pixels;
 mod presentation;
+mod reflow;
 pub use presentation::ReadingControl;
 mod scroll;
 mod secrets;
@@ -378,6 +379,11 @@ impl MobileCore {
             let messages = chat::load_messages(&chat_path);
             let session_typesetting = session.style().typesetting;
             Ok(Arc::new(MobileReader {
+                scheduler: Default::default(),
+                ai: Default::default(),
+                enhancement_claim: Default::default(),
+                ai_snapshots: Default::default(),
+                ai_delivery: Default::default(),
                 state: Mutex::new(Some(ReaderState {
                     session,
                     source,
@@ -394,6 +400,8 @@ impl MobileCore {
                     messages,
                     pending: None,
                     translation_config: None,
+                    enhancements: Default::default(),
+                    staged_layout: vec![],
                     toc_labels: Default::default(),
                     toc_config: None,
                     options,
@@ -434,6 +442,8 @@ struct ReaderState {
     messages: Vec<chat::ChatMessage>,
     pending: Option<chat::PendingChanges>,
     translation_config: Option<String>,
+    enhancements: services::enhancements::State,
+    staged_layout: Vec<services::requests::Staged>,
     toc_labels: std::collections::HashMap<String, String>,
     toc_config: Option<String>,
     options: settings::ReadingOptions,
@@ -455,7 +465,32 @@ struct ReaderState {
 }
 #[derive(uniffi::Object)]
 pub struct MobileReader {
+    scheduler: rebook_app_core::reading_ai::Scheduler,
+    ai: Mutex<services::driver::State>,
+    enhancement_claim: tokio::sync::Mutex<()>,
+    ai_snapshots: rebook_app_core::reading_ai::batching::Snapshots,
+    ai_delivery: Mutex<()>,
     state: Mutex<Option<ReaderState>>,
+}
+
+#[derive(uniffi::Record)]
+pub struct ReaderTurn {
+    pub page: Arc<MobilePage>,
+    pub reached_end: bool,
+}
+
+fn turn_result(s: &mut ReaderState, forward: bool, whole_unit: bool) -> Result<ReaderTurn> {
+    if whole_unit {
+        return scroll::turn_unit_result(s,forward).map(|(page,reached_end)|ReaderTurn {page,reached_end});
+    }
+    clear_selection_state(s);
+    if s.focus {
+        // Vertical focus stops are not synthetic book-completion pages.
+        return scroll::turn(s,forward).map(|page|ReaderTurn {page,reached_end:false});
+    }
+    let result=s.session.turn_page(if forward {PageDirection::Next}else{PageDirection::Previous}).map_err(error)?;
+    let reached_end=forward&&result.outcome==rebook_reader::NavigationOutcome::Boundary;
+    render(s).map(|page|ReaderTurn {page,reached_end})
 }
 impl MobileReader {
     fn with<T>(&self, f: impl FnOnce(&mut ReaderState) -> Result<T>) -> Result<T> {
@@ -466,6 +501,7 @@ impl MobileReader {
 #[uniffi::export]
 impl MobileReader {
     pub async fn shutdown(self: Arc<Self>) -> Result<()> {
+        self.stop_ai();
         work(move || {
             let state = self.state.lock().map_err(error)?.take();
             drop(state);
@@ -497,23 +533,11 @@ impl MobileReader {
         })).await
     }
     pub async fn turn(self: Arc<Self>, forward: bool) -> Result<Arc<MobilePage>> {
-        work(move || {
-            self.with(|s| {
-                clear_selection_state(s);
-                if s.focus {
-                    return scroll::turn(s, forward);
-                }
-                s.session
-                    .turn_page(if forward {
-                        PageDirection::Next
-                    } else {
-                        PageDirection::Previous
-                    })
-                    .map_err(error)?;
-                render(s)
-            })
-        })
-        .await
+        work(move ||self.with(|s|turn_result(s,forward,false).map(|result|result.page))).await
+    }
+    /// Distinguish an actual forward book boundary from an unavailable preview.
+    pub async fn turn_with_result(self: Arc<Self>, forward: bool, whole_unit: bool) -> Result<ReaderTurn> {
+        work(move ||self.with(|s|turn_result(s,forward,whole_unit))).await
     }
     pub async fn turn_reading_unit(self: Arc<Self>, forward: bool) -> Result<Arc<MobilePage>> {
         work(move ||self.with(|s|scroll::turn_unit(s,forward))).await
@@ -578,6 +602,29 @@ impl MobileReader {
     pub async fn navigate(self: Arc<Self>, href: String) -> Result<Arc<MobilePage>> {
         work(move || {
             self.with(|s| interactions::follow(s, &PublicationUrl::parse(&href).map_err(error)?))
+        })
+        .await
+    }
+    pub async fn navigate_toc(self: Arc<Self>, id: String) -> Result<Arc<MobilePage>> {
+        work(move || {
+            self.with(|s| {
+                let locator = s.session.current_locator();
+                s.session.go_to_toc(&id).map_err(error)?;
+                s.history.push(locator);
+                if s.history.len() > 32 {
+                    s.history.remove(0);
+                }
+                s.focus_anchor = s
+                    .session
+                    .source_anchor_for_toc(&id)
+                    .map(|start| SourceRange {
+                        end: start.clone(),
+                        start,
+                    });
+                s.scroll_center = true;
+                scroll::invalidate(s);
+                render(s)
+            })
         })
         .await
     }
@@ -698,6 +745,9 @@ fn apply_presentation_mode(s: &mut ReaderState, style: &mut ReaderStyle) -> Resu
     Ok(())
 }
 fn render(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
+    if s.enhancements.dirty {
+        reflow::refresh(s)?;
+    }
     clear_selection_state(s);
     if s.focus {
         scroll::render(s)
@@ -767,7 +817,7 @@ fn finish_page_info(
     let focus_bounds = s
         .focus_units
         .get(index)
-        .map_or_else(Vec::new, |u| u.paint_bounds(s.options.focus_style != "highlight"));
+        .map_or_else(Vec::new, |u| u.paint_bounds());
     let state = s.session.snapshot();
     let mut locator = s.session.current_locator();
     if is_scroll && let Some(unit) = s.focus_units.get(index) {
@@ -805,7 +855,7 @@ fn finish_page_info(
         regions,
         marks,
         focus_bounds,
-        focus_highlight: s.options.focus_style == "highlight",
+        focus_highlight: false,
         is_scroll,
         scroll_distance: s.scroll_distance,
         scroll_context: s.scroll_context,

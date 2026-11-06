@@ -146,16 +146,9 @@ fn team(app: &Path) -> Result<Option<String>, String> {
 }
 fn current_bundle() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let app = exe
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .ok_or("Run the installed Torto.app to update")?;
-    if app.extension().is_none_or(|s| s != "app") {
-        return Err("请先将 Torto.app 安装到应用程序目录，再使用自动更新".into());
-    }
-    validate_target(app)?;
-    Ok(app.to_path_buf())
+    let app = crate::profile::macos_bundle(&exe).ok_or("请从 Torto 应用包运行自动更新")?;
+    validate_target(&app)?;
+    Ok(app)
 }
 fn validate_target(app: &Path) -> Result<(), String> {
     if fs::symlink_metadata(app)
@@ -166,8 +159,8 @@ fn validate_target(app: &Path) -> Result<(), String> {
     {
         return Err("The installed application path must not contain symbolic links".into());
     }
-    if app.starts_with("/System") || app.to_string_lossy().contains("AppTranslocation") {
-        return Err("请先将应用从磁盘映像移到应用程序目录".into());
+    if app.starts_with("/System") || crate::profile::is_translocated(app) {
+        return Err("请用 Finder 将应用移至最终可写目录后重新打开".into());
     }
     verify_bundle(app, None)
 }
@@ -253,17 +246,37 @@ fn launch(app: &Path, job: Option<(&str, &Path)>) -> Result<Child, String> {
         .spawn()
         .map_err(|e| e.to_string())
 }
+fn session_root(update: &DownloadedUpdate, portable: bool) -> Result<PathBuf, String> {
+    if portable {
+        // Private job metadata/executables need ownership and mode checks even
+        // when the portable library is on a filesystem such as exFAT.
+        let root = std::env::temp_dir().join("torto-macos-update-sessions");
+        fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        let metadata = fs::symlink_metadata(&root).map_err(|e| e.to_string())?;
+        let uid: u32 = output("/usr/bin/id", &["-u".as_ref()])?.parse().map_err(|_| "Unable to determine update user")?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != uid {
+            return Err("Invalid private portable update directory".into());
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+        return fs::canonicalize(root).map_err(|e| e.to_string());
+    }
+    Ok(update.installer_path.parent().ok_or("No update cache directory")?.join("sessions"))
+}
+fn lock_portable_profile(app: &Path) -> Result<Option<fs::File>, String> {
+    let data = app.parent().ok_or("Missing application parent")?.join(crate::profile::MACOS_DATA);
+    match fs::symlink_metadata(&data) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => crate::profile::lock_portable_data(&data).map(Some).map_err(|e| e.to_string()),
+        _ => Err("Invalid portable profile directory".into()),
+    }
+}
 pub(crate) fn prepare(
     update: &DownloadedUpdate,
     save: Box<dyn FnOnce() -> Result<(), String> + Send>,
 ) -> Result<(), String> {
     verify_installer_file(update)?;
     let target = current_bundle()?;
-    let root = update
-        .installer_path
-        .parent()
-        .ok_or("No update cache directory")?
-        .join("sessions");
+    let root = session_root(update, crate::profile::is_portable())?;
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     // Completed sessions only; do not delete an installer that is still active.
     let mut old: Vec<_> = fs::read_dir(&root)
@@ -366,7 +379,7 @@ pub(crate) fn helper(dir: &Path) -> Result<(), String> {
             return Err("Refusing an update downgrade".into());
         }
         fs::create_dir(&staging).map_err(
-            |_| "当前安装目录不可写；请移到用户的 Applications 目录后更新，或手动安装新版",
+            |_| "当前应用所在目录不可写；请移到可写目录后更新，或手动替换应用",
         )?;
         fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
@@ -415,12 +428,17 @@ pub(crate) fn helper(dir: &Path) -> Result<(), String> {
             parent_exited = false; // Another instance already keeps the old app open.
             return Err("Another instance opened while preparing the update".into());
         }
+        let profile_lock = lock_portable_profile(&job.target).map_err(|error| {
+            parent_exited = false; // A differently named app may be using this same portable library.
+            error
+        })?;
         state(dir, "installing", "")?;
         let backup = staging.join("previous.app");
         fs::rename(&job.target, &backup).map_err(|e| e.to_string())?;
         let install: Result<(), String> = (|| {
             fs::rename(&source, &job.target).map_err(|e| e.to_string())?;
             verify_bundle(&job.target, Some(&job.update.release.version))?;
+            drop(profile_lock); // The relaunched reader acquires the same profile lock.
             let mut child = launch(&job.target, Some(("--torto-update-health", dir)))?;
             let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline {
@@ -510,5 +528,31 @@ pub(crate) fn confirm_health(runtime: &tokio::runtime::Runtime) {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    #[test]
+    fn portable_update_sessions_are_private_and_independent_of_library_location() {
+        let release = release_from_github(crate::updater::tests::github_release("v0.2.12", Some(&format!("sha256:{}", "a".repeat(64)))), "0.2.11").unwrap().unwrap();
+        let update = DownloadedUpdate { release, installer_path: "/Volumes/Portable/torto-portable-data/cache/updates/fixture.zip".into() };
+        let root = session_root(&update, true).unwrap();
+        assert!(!root.starts_with("/Volumes/Portable"));
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(session_root(&update, false).unwrap(), update.installer_path.parent().unwrap().join("sessions"));
+    }
+    #[test]
+    fn portable_update_respects_the_shared_data_lock_even_for_another_app_name() {
+        let root = std::env::temp_dir().join(format!("torto-update-lock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        assert!(lock_portable_profile(&root.join("Torto.app")).unwrap().is_none());
+        fs::create_dir(root.join(crate::profile::MACOS_DATA)).unwrap();
+        let guard = lock_portable_profile(&root.join("Other Reader.app")).unwrap().unwrap();
+        assert!(lock_portable_profile(&root.join("Torto.app")).is_err());
+        drop(guard);
+        drop(lock_portable_profile(&root.join("Torto.app")).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -42,8 +42,8 @@ class ReaderView(context: Context) : View(context) {
     var onHandleMove: ((Float, Float) -> Unit)? = null
     var onHandleEnd: (() -> Unit)? = null
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-    private val highlight = Paint().apply { color = 0x55389875 }
-    private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF398975.toInt() }
+    private val highlight = Paint().apply { color = 0x55448967 }
+    private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF448967.toInt() }
     private val focusShade = Paint()
     private val savedHighlight = Paint().apply { color = 0x55D8B86A }
     private val referencePaint=Paint(Paint.ANTI_ALIAS_FLAG)
@@ -87,6 +87,7 @@ class ReaderView(context: Context) : View(context) {
     private var previousPage:ReaderFrame?=null
     private var nextPage:ReaderFrame?=null
     private var navigationPending=false
+    private var lastTurnCompletion=0L
     private var blockedGesture=false
     private var reportedMotion=false
     private var dragStart=0.0
@@ -291,12 +292,15 @@ class ReaderView(context: Context) : View(context) {
         }
     })
     init {isFocusable=true;ViewCompat.setAccessibilityDelegate(this,accessibility)}
-    fun present(next:ReaderFrame?,selection:SelectedText?,previous:ReaderFrame?=null,following:ReaderFrame?=null){
+    fun present(next:ReaderFrame?,selection:SelectedText?,previous:ReaderFrame?=null,following:ReaderFrame?=null,turnCompletion:Long=0){
         val old=frame
-        if(old!==next){
+        val completed=turnCompletion!=lastTurnCompletion
+        lastTurnCompletion=turnCompletion
+        val confirmed=completed&&navigationPending
+        if(old!==next||confirmed){
             val continuous=old?.info?.isScroll==true&&next?.info?.isScroll==true&&old.info.scrollContext==next.info.scrollContext
             val pending=navigationPending
-            if(!continuous){
+            if(!continuous||confirmed&&pageDirection!=0){
                 stopMotion();displayPosition=next?.info?.scrollDistance ?: 0.0
                 previousFrame=null;frame=next
             }else{
@@ -318,7 +322,7 @@ class ReaderView(context: Context) : View(context) {
             accessibility.invalidateRoot();reportMotion()
         }
         previousPage=previous;nextPage=following
-        val changed=old!==next||selected!=selection
+        val changed=old!==next||confirmed||selected!=selection
         selected=selection
         if(changed)invalidate()
     }

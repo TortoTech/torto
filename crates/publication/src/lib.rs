@@ -3,6 +3,7 @@
 mod book_source;
 mod headings;
 mod toc;
+pub mod links;
 pub mod media_references;
 pub use headings::heading_ordinal_key;
 pub use toc::{TocMatch, toc_entry_for_href};

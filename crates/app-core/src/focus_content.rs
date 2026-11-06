@@ -330,6 +330,7 @@ mod tests {
         for media in [
             "<p>Table 1. Results</p><table><tr><td>Value</td><td>42</td></tr></table><footer><p>Source: Table author.</p><p>Unmarked credit continuation.</p><p>Note: Rounded values.</p></footer>",
             "<figure><img src='x.png' alt='Diagram'/><figcaption>Figure 1. Results</figcaption><p>Source: Image author.</p></figure>",
+            "<div><p>Figure 1. Results</p><img src='x.png' alt='Diagram'/><p>Source: Image author.</p></div>",
         ] {
             let blocks = parse(&format!(
                 "<p>Before.</p><h2>Media topic</h2>{media}<p>After.</p>"

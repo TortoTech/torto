@@ -143,6 +143,12 @@ impl RewriteBookSource {
 }
 
 impl BookSource for RewriteBookSource {
+    fn navigation_section(&self, index: usize) -> Result<Option<Section>, PublicationError> {
+        match self.inner.navigation_section(index)? {
+            Some(original) => Ok(Some(original)),
+            None => self.inner.parse_section(index).map(Some),
+        }
+    }
     fn inner_source(&self) -> Option<&dyn BookSource> {
         Some(self.inner.as_ref())
     }

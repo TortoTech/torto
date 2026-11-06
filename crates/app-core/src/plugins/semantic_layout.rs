@@ -336,7 +336,8 @@ impl SemanticLayoutSource {
         Some(commit())
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    /// Blocking atomic source commit for worker-owned sessions. UI threads use
+    /// `try_commit_together` and adopt a prepared layout asynchronously.
     pub fn commit_together<T>(&self, commit: impl FnOnce() -> T) -> T {
         let started = std::time::Instant::now();
         let _guard = self.transaction.write().expect("content commit lock");
@@ -617,6 +618,9 @@ impl SemanticLayoutSource {
 }
 
 impl BookSource for SemanticLayoutSource {
+    fn navigation_section(&self, index: usize) -> Result<Option<Section>, PublicationError> {
+        self.inner.navigation_section(index)
+    }
     fn inner_source(&self) -> Option<&dyn BookSource> {
         Some(self.inner.as_ref())
     }
@@ -1180,6 +1184,12 @@ fn recognition_identity(book_id: &str, settings: &PluginSettings) -> Option<Valu
     ]))
 }
 
+/// Non-secret identity for host jobs. Use the same model, endpoint, language and
+/// prompt revision checks as cached semantic presentation.
+pub fn configuration_key(book_id: &str, settings: &PluginSettings) -> Option<String> {
+    recognition_identity(book_id, settings).map(|identity| digest(identity.to_string().as_bytes()))
+}
+
 fn scope_presentation_path(identity:&Value,hash:&str)->Option<PathBuf> {
     recognition_path(&json!([identity,"displayed-scopes-v1"]),hash)
 }
@@ -1420,6 +1430,15 @@ pub async fn recognize_visible(
         false,
     )
     .await
+}
+
+/// Optional presentation metadata must never gate translation readiness.
+pub fn needs_enhancement(section: &Section, target: std::ops::Range<usize>, base: &Recognition) -> bool {
+    let mut scoped = scope_section(section, target);
+    for annotation in &base.annotations {
+        compose(&mut scoped.blocks, annotation);
+    }
+    enhancements::has_candidates(&scoped)
 }
 
 /// Optional presentation metadata must never gate translation readiness.

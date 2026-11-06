@@ -1,5 +1,6 @@
 //! Reader session with section, layout, and display-list caches.
 pub mod fixed_viewport;
+mod toc_navigation;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -336,6 +337,14 @@ pub struct TocViewItem {
     pub has_children: bool,
 }
 
+/// Source metadata resolved without pagination or changing the reader position.
+#[derive(Debug, Clone)]
+pub struct ReaderSourceContext {
+    pub section_index: usize,
+    pub node_order: Option<usize>,
+    pub toc: Option<TocViewItem>,
+}
+
 /// Complete reader state after a command has been applied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReaderSnapshot {
@@ -411,6 +420,8 @@ struct PreparedSection {
     anchor_segments: HashMap<String, usize>,
     reading_units: Vec<ReadingUnit>,
     source_fragments: HashMap<String, Vec<(Range<u64>, usize)>>,
+    source_order: HashMap<String, usize>,
+    toc_targets: HashMap<String, toc_navigation::Target>,
 }
 
 impl PreparedSection {
@@ -445,6 +456,7 @@ struct FixedReadingUnit {
 
 struct SectionRepository {
     source: Arc<dyn BookSource>,
+    navigation: Vec<Vec<TocViewItem>>,
     sections: Vec<SectionSlot>,
 }
 
@@ -462,8 +474,17 @@ enum SectionSlotState {
 impl SectionRepository {
     fn new(source: Arc<dyn BookSource>) -> Self {
         let section_count = source.book().sections.len();
+        let mut paths = HashMap::new();
+        for (i, section) in source.book().sections.iter().enumerate() {
+            paths.entry(section.href.path()).or_insert(i);
+        }
+        let mut navigation = vec![Vec::new(); section_count];
+        for row in flatten_toc(&source.book().table_of_contents) {
+            if let Some(&i) = row.target.as_ref().and_then(|t| paths.get(t.path())) { navigation[i].push(row); }
+        }
         Self {
             source,
+            navigation,
             sections: (0..section_count)
                 .map(|_| SectionSlot {
                     state: Mutex::new(SectionSlotState::Empty),
@@ -511,13 +532,15 @@ impl SectionRepository {
             }
             drop(state);
 
-            let layout_boundaries = top_level_toc_fragments_for_section(self.source.book(), index);
-            let reading_boundaries = semantic_toc_boundaries_for_section(self.source.book(), index);
             let parsed = {
                 let _timing =
                     rebook_layout::timing::stage(rebook_layout::timing::TimingStage::SectionParse);
-                self.source.parse_section(index).map(|section| {
-                    prepare_section(section, &layout_boundaries, &reading_boundaries)
+                self.source.parse_section(index).and_then(|mut section| {
+                    let navigation = toc_navigation::prepare(self.source.as_ref(), index, &self.navigation[index], &mut section)?;
+                    let mut prepared = prepare_section(section, &navigation.layout, &navigation.reading);
+                    prepared.estimated_bytes += navigation.targets.iter().map(|(id,t)| id.len() + t.href.to_string().len() + std::mem::size_of::<toc_navigation::Target>()).sum::<usize>();
+                    prepared.toc_targets = navigation.targets;
+                    Ok(prepared)
                 })
             };
             let mut state = slot
@@ -1133,18 +1156,16 @@ impl ReaderSession {
 
     pub fn snapshot(&self) -> ReaderSnapshot {
         let location = self.location();
-        let active_toc = active_toc_item_for_location(
-            &self.toc_items,
-            &self.toc_index.items_by_section[location.section_index],
-            self.toc_index.preceding_section_by_section[location.section_index]
-                .map_or(&[], |section_index| {
-                    self.toc_index.items_by_section[section_index].as_slice()
-                }),
-            location.section_index,
-            location.segment_index,
-            location.page_index,
-            |target| self.position_for_href(target),
-        );
+        let active_toc = self.current_page().leading_source_range().as_ref()
+            .and_then(|range|self.active_toc_at_source(&range.start))
+            .or_else(|| active_toc_item_for_location_by_item(
+                &self.toc_items,
+                &self.toc_index.items_by_section[location.section_index],
+                self.toc_index.preceding_section_by_section[location.section_index]
+                    .map_or(&[],|section|self.toc_index.items_by_section[section].as_slice()),
+                location.section_index,location.segment_index,location.page_index,
+                |item|self.toc_position(item),
+            ));
         let (active_toc_id, active_toc_path) = active_toc.map_or_else(
             || (None, Vec::new()),
             |item| {
@@ -4311,22 +4332,44 @@ fn prepare_section(
     // Build once on the section worker. Navigation then looks up the exact
     // child node without walking whole figures/tables on every search click.
     let mut source_fragments: HashMap<String, Vec<(Range<u64>, usize)>> = HashMap::new();
+    let mut source_order = HashMap::new();
     for (index, fragment) in fragments.iter().enumerate() {
         let mut ranges = Vec::new();
-        for block in &fragment.blocks { append_block_geometry_sources(block, &mut ranges); }
+        for block in &fragment.blocks {
+            append_block_geometry_sources(block, &mut ranges);
+        }
         for range in ranges {
-            let end = if range.start.node == range.end.node { range.end.text_offset }
-                else { range.start.text_offset.saturating_add(1) };
+            let order = source_order.len();
+            source_order
+                .entry(range.start.node.clone())
+                .or_insert(order);
+            let end = if range.start.node == range.end.node {
+                range.end.text_offset
+            } else {
+                range.start.text_offset.saturating_add(1)
+            };
             let entry = (range.start.text_offset..end, index);
             let entries = source_fragments.entry(range.start.node).or_default();
-            if !entries.contains(&entry) { entries.push(entry); }
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
         }
     }
-    let index_bytes = source_fragments.capacity() * std::mem::size_of::<(String, Vec<(Range<u64>, usize)>)>()
-        + source_fragments.iter().map(|(node, entries)| node.capacity()
-            + entries.capacity() * std::mem::size_of::<(Range<u64>, usize)>()).sum::<usize>();
+    let index_bytes = source_fragments.capacity()
+        * std::mem::size_of::<(String, Vec<(Range<u64>, usize)>)>()
+        + source_fragments
+            .iter()
+            .map(|(node, entries)| {
+                node.capacity() + entries.capacity() * std::mem::size_of::<(Range<u64>, usize)>()
+            })
+            .sum::<usize>();
     PreparedSection {
-        estimated_bytes: index_bytes + section_text.saturating_mul(4)
+        estimated_bytes: index_bytes
+            + source_order
+                .iter()
+                .map(|(n, _)| n.len() + std::mem::size_of::<(String, usize)>())
+                .sum::<usize>()
+            + section_text.saturating_mul(4)
             + fragments
                 .iter()
                 .map(|fragment| fragment.blocks.len() * std::mem::size_of::<Block>())
@@ -4338,6 +4381,8 @@ fn prepare_section(
         anchor_segments,
         reading_units,
         source_fragments,
+        source_order,
+        toc_targets: HashMap::new(),
     }
 }
 
@@ -4587,55 +4632,6 @@ fn build_layout_segments(
         })
         .collect();
     (segments, anchor_segments)
-}
-
-fn top_level_toc_fragments_for_section(book: &Book, section_index: usize) -> HashSet<String> {
-    let Some(section) = book.sections.get(section_index) else {
-        return HashSet::new();
-    };
-    book.table_of_contents
-        .iter()
-        .filter_map(|entry| entry.href.as_ref())
-        .filter(|href| href.path() == section.href.path())
-        .filter_map(PublicationUrl::fragment)
-        .map(str::to_owned)
-        .collect()
-}
-
-fn semantic_toc_boundaries_for_section(book: &Book, section_index: usize) -> Vec<Option<String>> {
-    fn append(entries: &[TocEntry], path: &str, fragments: &mut Vec<Option<String>>) {
-        for entry in entries {
-            // Navigable parents mark chapter preludes. Leaf entries mark the
-            // actual subsection units. Equal anchors are deduplicated below,
-            // so a parent and its first child never create an empty unit.
-            if let Some(href) = &entry.href
-                && href.path() == path
-            {
-                let fragment = href.fragment().map(str::to_owned);
-                if !fragments.contains(&fragment) {
-                    fragments.push(fragment);
-                }
-            }
-            append(&entry.children, path, fragments);
-        }
-    }
-
-    let Some(section) = book.sections.get(section_index) else {
-        return Vec::new();
-    };
-    let mut fragments = Vec::new();
-    if section
-        .properties
-        .iter()
-        .any(|property| property == rebook_publication::CONTINUATION_SECTION_PROPERTY)
-    {
-        // A storage cut is not a semantic heading. Keep its leading continuation
-        // separate from the first TOC target, so navigation and TOC highlighting
-        // continue using the preceding subsection until that target is reached.
-        fragments.push(None);
-    }
-    append(&book.table_of_contents, section.href.path(), &mut fragments);
-    fragments
 }
 
 fn build_fixed_reading_units(
@@ -5498,14 +5494,35 @@ fn nearest_visible_section(
         })
 }
 
+#[cfg(test)]
 fn active_toc_item_for_location<'a>(
+    items: &'a [TocViewItem],
+    current: &[usize],
+    preceding: &[usize],
+    section: usize,
+    segment: usize,
+    page: usize,
+    mut resolve: impl FnMut(&PublicationUrl) -> Option<ReaderPosition>,
+) -> Option<&'a TocViewItem> {
+    active_toc_item_for_location_by_item(
+        items,
+        current,
+        preceding,
+        section,
+        segment,
+        page,
+        |item| item.target.as_ref().and_then(&mut resolve),
+    )
+}
+
+fn active_toc_item_for_location_by_item<'a>(
     items: &'a [TocViewItem],
     current_section_items: &[usize],
     preceding_section_items: &[usize],
     current_section: usize,
     current_segment: usize,
     current_page: usize,
-    mut resolve: impl FnMut(&PublicationUrl) -> Option<ReaderPosition>,
+    mut resolve: impl FnMut(&TocViewItem) -> Option<ReaderPosition>,
 ) -> Option<&'a TocViewItem> {
     let mut first_in_current_section = None;
     // Previous-section entries only stand in while the current section has no
@@ -5521,7 +5538,7 @@ fn active_toc_item_for_location<'a>(
         let Some(item) = items.get(order) else {
             continue;
         };
-        let Some(position) = item.target.as_ref().and_then(&mut resolve) else {
+        let Some(position) = resolve(item) else {
             continue;
         };
         if position.section_index >= current_section {
@@ -5537,7 +5554,7 @@ fn active_toc_item_for_location<'a>(
         let Some(item) = items.get(order) else {
             continue;
         };
-        let Some(position) = item.target.as_ref().and_then(&mut resolve) else {
+        let Some(position) = resolve(item) else {
             continue;
         };
         let ReaderPosition {
@@ -8242,28 +8259,40 @@ mod tests {
 
     #[test]
     fn interactive_toc_navigation_does_not_parse_the_target_on_the_caller() {
-        let mut source = CountingSource::with_background_delay(
-            &["first".into(), "large target".into()],
-            Duration::from_millis(300),
-        );
-        Arc::get_mut(&mut source).unwrap().book.table_of_contents = vec![TocEntry {
-            label: "Target".into(),
-            href: Some(PublicationUrl::parse("section-1.xhtml#target").unwrap()),
-            children: Vec::new(),
-        }];
-        let target = PublicationUrl::parse("section-1.xhtml#target").unwrap();
-        let mut reader =
-            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        for by_id in [false, true] {
+            let mut source = CountingSource::with_background_delay(
+                &["first".into(), "large target".into()],
+                Duration::from_millis(300),
+            );
+            Arc::get_mut(&mut source).unwrap().book.table_of_contents = vec![TocEntry {
+                label: "Target".into(),
+                href: Some(PublicationUrl::parse("section-1.xhtml#target").unwrap()),
+                children: Vec::new(),
+            }];
+            let target = PublicationUrl::parse("section-1.xhtml#target").unwrap();
+            let mut reader =
+                ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
 
-        let started = Instant::now();
-        let attempt = reader.try_go_to_href(&target).unwrap();
-        assert_eq!(attempt, NavigationAttempt::Pending);
-        assert!(started.elapsed() < Duration::from_millis(100));
-        reader.wait_for_prefetch().unwrap();
-        let NavigationAttempt::Ready(result) = reader.try_go_to_href(&target).unwrap() else {
-            panic!("TOC target should be ready after prefetch");
-        };
-        assert_eq!(result.snapshot.location.section_index, 1);
+            let started = Instant::now();
+            let attempt = if by_id {
+                reader.try_go_to_toc("0")
+            } else {
+                reader.try_go_to_href(&target)
+            }
+            .unwrap();
+            assert_eq!(attempt, NavigationAttempt::Pending);
+            assert!(started.elapsed() < Duration::from_millis(100));
+            reader.wait_for_prefetch().unwrap();
+            let NavigationAttempt::Ready(result) = (if by_id {
+                reader.try_go_to_toc("0")
+            } else {
+                reader.try_go_to_href(&target)
+            })
+            .unwrap() else {
+                panic!("TOC target should be ready after prefetch");
+            };
+            assert_eq!(result.snapshot.location.section_index, 1);
+        }
     }
 
     #[test]
@@ -9546,6 +9575,8 @@ mod tests {
             anchor_segments: HashMap::new(),
             reading_units: Vec::new(),
             source_fragments: HashMap::new(),
+            source_order: HashMap::new(),
+            toc_targets: HashMap::new(),
         });
         let old = SegmentKey {
             section_index: 1,

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rebook_publication::{LocatorV1, SourceRange};
@@ -23,6 +24,57 @@ const DATABASE_SCHEMA_VERSION: u32 = 2;
 pub struct SyncStore {
     path: PathBuf,
     device_id: String,
+    access: Arc<Mutex<()>>,
+}
+
+// Coordinate the complete connection lifetime, including the final WAL
+// checkpoint/close. BEGIN IMMEDIATE prevents snapshot upgrades, but SQLite's
+// busy timeout is not a fair queue and can still expire under local contention.
+// Like the existing blocking SQLite API, use this from persistence/sync workers.
+// No guard escapes a store operation or spans unrelated I/O.
+struct StoreConnection<'a> {
+    // Fields drop in declaration order: close SQLite before releasing access.
+    connection: Connection,
+    _access: MutexGuard<'a, ()>,
+}
+
+impl std::ops::Deref for StoreConnection<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for StoreConnection<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+}
+
+fn database_access(path: &std::path::Path) -> SyncResult<Arc<Mutex<()>>> {
+    static ACCESS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    // Resolve aliases before entering the registry lock. A new database can
+    // still be keyed by its already-created, canonical parent directory.
+    let key = std::fs::canonicalize(path).or_else(|_| {
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        Ok::<_, io::Error>(
+            std::fs::canonicalize(parent)?.join(path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "同步数据库路径无效")
+            })?),
+        )
+    })?;
+    let mut registry = ACCESS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| io::Error::other("同步数据库访问注册表已损坏"))?;
+    registry.retain(|_, access| access.strong_count() > 0);
+    if let Some(access) = registry.get(&key).and_then(Weak::upgrade) {
+        return Ok(access);
+    }
+    let access = Arc::new(Mutex::new(()));
+    registry.insert(key, Arc::downgrade(&access));
+    Ok(access)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,9 +94,11 @@ impl SyncStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let access = database_access(&path)?;
         let store = Self {
             path,
             device_id: device_id.into(),
+            access,
         };
         store.initialize()?;
         Ok(store)
@@ -379,18 +433,21 @@ impl SyncStore {
     }
 
     pub fn register_book_if_missing(&self, book_id: &str) -> SyncResult<()> {
-        let connection = self.connection()?;
-        let exists: bool = connection.query_row(
+        let mut connection = self.connection()?;
+        let transaction = write_transaction(&mut connection)?;
+        let exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM book_membership WHERE book_id = ?1)",
             [book_id],
             |row| row.get(0),
         )?;
         if !exists {
-            let timestamp = self.tick()?;
-            // A removal committed after the existence check must win over this old snapshot.
-            connection.execute("INSERT OR IGNORE INTO book_membership(book_id,present,changed_hlc) VALUES (?1,1,?2)",
+            let timestamp = tick(&transaction, &self.device_id, None)?;
+            // Registration and its timestamp share one write transaction. An
+            // existing removal must never be resurrected by an old snapshot.
+            transaction.execute("INSERT OR IGNORE INTO book_membership(book_id,present,changed_hlc) VALUES (?1,1,?2)",
                 params![book_id, serde_json::to_string(&timestamp)?])?;
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -591,10 +648,17 @@ impl SyncStore {
         Ok(())
     }
 
-    fn connection(&self) -> SyncResult<Connection> {
+    fn connection(&self) -> SyncResult<StoreConnection<'_>> {
+        let access = self
+            .access
+            .lock()
+            .map_err(|_| io::Error::other("同步数据库访问锁已损坏"))?;
         let connection = Connection::open(&self.path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        Ok(connection)
+        Ok(StoreConnection {
+            connection,
+            _access: access,
+        })
     }
 }
 
@@ -914,38 +978,175 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reading_navigation_snapshot_annotation_and_cloud_writers_share_the_database() {
-        let store=test_store("concurrent-reading-writers");
-        store.save_progress("book",&locator("book",0.0)).unwrap();
-        store.create_annotation("note".into(),"book".into(),vec![source_range()],"Quote".into(),None,0).unwrap();
-        let barrier=std::sync::Arc::new(std::sync::Barrier::new(4));
-        let results=std::thread::scope(|scope| {
-            let handles=(0..4).map(|worker| {
-                let store=&store;let barrier=barrier.clone();
-                scope.spawn(move || {
-                    barrier.wait();
-                    let mut errors=Vec::new();
-                    for i in 1..=100 {
-                        let result=match worker {
-                            0=>store.save_progress("book",&locator("book",f64::from(i)/100.0)),
-                            1=>store.reading_snapshot("book").map(|_|()),
-                            2=>store.update_annotation_note("note",Some(format!("Note {i}"))).map(|_|()),
-                            _=>store.merge_progress(&ProgressState {locator:locator("remote-book",f64::from(i)/100.0),updated_at:HybridTimestamp {wall_time_ms:i as u64,counter:0,device_id:"other-device".into()}}).map(|_|()),
-                        };
-                        if let Err(error)=result {errors.push(error.to_string());}
-                    }
-                    errors
-                })
-            }).collect::<Vec<_>>();
-            handles.into_iter().flat_map(|h|h.join().unwrap()).collect::<Vec<_>>()
+    fn delayed_local_writer_does_not_exhaust_another_handles_sqlite_busy_timeout() {
+        let store = test_store("delayed-local-writer");
+        let alias = store
+            .path
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(store.path.file_name().unwrap());
+        let other = SyncStore::open_at(alias, "other-device").unwrap();
+        let unrelated = test_store("unrelated-writer");
+        let mut connection = store.connection().unwrap();
+        let transaction = write_transaction(&mut connection).unwrap();
+        let first = tick(&transaction, "device-a", None).unwrap();
+        // The uncoordinated connection reproduces SQLITE_BUSY under the same
+        // short budget. The coordinated local handle below must still succeed.
+        let mut raw = Connection::open(store.path()).unwrap();
+        raw.busy_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        assert!(
+            matches!(write_transaction(&mut raw), Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::DatabaseBusy)
+        );
+        drop(raw);
+        let (started, waiting) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let mut connection = other.connection()?;
+            // Model a slow local commit lasting longer than SQLite's wait
+            // budget without adding a five-second sleep to every test run.
+            connection.busy_timeout(std::time::Duration::from_millis(20))?;
+            let transaction = write_transaction(&mut connection)?;
+            let next = tick(&transaction, "other-device", None)?;
+            transaction.commit()?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(next)
         });
-        assert!(results.is_empty(),"concurrent operations failed ({}): {:?}",results.len(),results.first());
-        assert_eq!(store.load_progress("book").unwrap().unwrap().locator.total_progression,Some(1.0));
-        assert_eq!(store.annotations_for_book("book").unwrap()[0].note.as_deref(),Some("Note 100"));
-        assert_eq!(store.load_progress("remote-book").unwrap().unwrap().locator.total_progression,Some(1.0));
-        let (revision,snapshot)=store.reading_snapshot("book").unwrap();
-        assert_eq!(revision,202,"every progress and annotation change remains in the sync revision");
-        assert_eq!(snapshot.progress.unwrap().locator.total_progression,Some(1.0));
+        waiting.recv().unwrap();
+        // A different database remains independent while this one is busy.
+        let (done, received) = std::sync::mpsc::channel();
+        let independent = std::thread::spawn(move || {
+            unrelated
+                .save_progress("independent", &locator("independent", 0.7))
+                .unwrap();
+            done.send(()).unwrap();
+            unrelated
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        transaction.commit().unwrap();
+        drop(connection);
+        let next = handle
+            .join()
+            .unwrap()
+            .expect("local contention must wait before opening SQLite");
+        assert!(next > first);
+        assert_eq!(store.tick().unwrap().device_id, "device-a");
+        let unrelated = independent.join().unwrap();
+        assert_eq!(
+            unrelated
+                .load_progress("independent")
+                .unwrap()
+                .unwrap()
+                .locator
+                .total_progression,
+            Some(0.7)
+        );
+        cleanup(&unrelated);
+        cleanup(&store);
+    }
+
+    #[test]
+    fn reading_navigation_snapshot_annotation_and_cloud_writers_share_the_database() {
+        let store = test_store("concurrent-reading-writers");
+        store.save_progress("book", &locator("book", 0.0)).unwrap();
+        store
+            .create_annotation(
+                "note".into(),
+                "book".into(),
+                vec![source_range()],
+                "Quote".into(),
+                None,
+                0,
+            )
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let results = std::thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|worker| {
+                    let store = if worker % 2 == 0 {
+                        store.clone()
+                    } else {
+                        SyncStore::open_at(store.path.clone(), store.device_id.clone()).unwrap()
+                    };
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let mut errors = Vec::new();
+                        for i in 1..=100 {
+                            let result = match worker {
+                                0 => store
+                                    .save_progress("book", &locator("book", f64::from(i) / 100.0)),
+                                1 => store.reading_snapshot("book").map(|_| ()),
+                                2 => store
+                                    .update_annotation_note("note", Some(format!("Note {i}")))
+                                    .map(|_| ()),
+                                _ => store
+                                    .merge_progress(&ProgressState {
+                                        locator: locator("remote-book", f64::from(i) / 100.0),
+                                        updated_at: HybridTimestamp {
+                                            wall_time_ms: i as u64,
+                                            counter: 0,
+                                            device_id: "other-device".into(),
+                                        },
+                                    })
+                                    .map(|_| ()),
+                            };
+                            if let Err(error) = result {
+                                errors.push(format!("worker {worker}, operation {i}: {error:?}"));
+                            }
+                        }
+                        errors
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            results.is_empty(),
+            "concurrent operations failed ({}): {:?}",
+            results.len(),
+            results.first()
+        );
+        assert_eq!(
+            store
+                .load_progress("book")
+                .unwrap()
+                .unwrap()
+                .locator
+                .total_progression,
+            Some(1.0)
+        );
+        assert_eq!(
+            store.annotations_for_book("book").unwrap()[0]
+                .note
+                .as_deref(),
+            Some("Note 100")
+        );
+        assert_eq!(
+            store
+                .load_progress("remote-book")
+                .unwrap()
+                .unwrap()
+                .locator
+                .total_progression,
+            Some(1.0)
+        );
+        let (revision, snapshot) = store.reading_snapshot("book").unwrap();
+        assert_eq!(
+            revision, 202,
+            "every progress and annotation change remains in the sync revision"
+        );
+        assert_eq!(
+            snapshot.progress.unwrap().locator.total_progression,
+            Some(1.0)
+        );
         cleanup(&store);
     }
 

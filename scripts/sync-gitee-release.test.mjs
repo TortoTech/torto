@@ -33,6 +33,22 @@ const macSignature = {version:'0.7.0', name:'Torto-0.7.0-macos-arm64.zip', size:
   sha256:'b97d800ba8d0420dc6a0342045a15a97d785bd61d4cf9902d0c334ba32ec188b',
   signature:'MBuJ82GTbhIxqMGGBGjjrctJQfjel5jdgKPe4d/QV8XQxzgbArO0X9I5T/a6u4ykClwgz6FSD3WdVODnYoG2CQ=='};
 
+test('portable Windows releases have a distinct verified mirror manifest and reuse the Windows artifact', () => {
+  const r = release();
+  const name = 'Torto-0.7.0-windows-x86_64-portable.zip';
+  const portable = {...r.assets[0], name, browser_download_url:`https://github.com/TortoTech/torto/releases/download/v0.7.0/${name}`};
+  r.assets.push(portable);
+  assert.deepEqual(validateRelease(r), [name + '.sha256']);
+  r.assets.push({...portable, name:name+'.sha256', browser_download_url:portable.browser_download_url+'.sha256'});
+  assert.deepEqual(validateRelease(r), []);
+  const marker = updateManifest(r, true);
+  assert.equal(marker.asset.name, 'torto-windows-portable-update.json');
+  assert.deepEqual(JSON.parse(marker.bytes).asset, {name, size:bytes.length, sha256:digest.replace('sha256:','')});
+  assert.equal(artifactName(portable), 'Torto-0.7.0-windows-x86_64');
+  assert.equal(artifactName({name:name+'.sha256'}), 'Torto-0.7.0-windows-x86_64');
+  assert.equal(updateManifest(r).asset.name, 'torto-update.json');
+});
+
 test('macOS mirror manifests bind the pinned publisher signature to the matching ZIP', () => {
   const r = release();
   r.assets.push({...r.assets[0], name:macSignature.name});

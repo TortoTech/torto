@@ -21,6 +21,8 @@ use crate::http::github;
 use crate::platform::UserEvent;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod portable;
 use crate::preferences::AppLanguage;
 use crate::ui::{dialog_action_button, palette};
 
@@ -87,7 +89,7 @@ pub(crate) struct DesktopUpdater {
     manual_check: bool,
     dialog_visible: bool,
     release_notes_cache: CommonMarkCache,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     rollback_notice: bool,
 }
 
@@ -109,6 +111,8 @@ impl DesktopUpdater {
             release_notes_cache: CommonMarkCache::default(),
             #[cfg(target_os = "macos")]
             rollback_notice: macos::was_rolled_back(),
+            #[cfg(target_os = "windows")]
+            rollback_notice: portable::was_rolled_back(),
         }
     }
 
@@ -252,7 +256,7 @@ impl DesktopUpdater {
         reason = "the update modal keeps its state-specific actions in one auditable flow"
     )]
     pub(crate) fn overlay(&mut self, ctx: &egui::Context, language: AppLanguage) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if self.rollback_notice {
             crate::ui::modal(ctx, egui::Id::unique("update-rollback"), 0.42)
                 .frame(egui::Frame::new().fill(palette().surface).corner_radius(12).inner_margin(22))
@@ -440,6 +444,10 @@ pub(crate) fn launch_installer_after_exit(request: &InstallRequest) -> Result<()
     use std::process::Command;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if crate::profile::is_portable() { return portable::launch(&request.update); }
+    if request.update.release.asset.name != Platform::WindowsX64.name(&request.update.release.version) {
+        return Err("An installed Windows build requires an MSI update".into());
+    }
     verify_installer_file(&request.update)?;
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let install_directory = executable
@@ -554,7 +562,7 @@ async fn check_for_update() -> Result<Option<UpdateRelease>, String> {
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     let platform = Platform::MacosX64;
     #[cfg(not(target_os = "macos"))]
-    let platform = Platform::WindowsX64;
+    let platform = if crate::profile::is_portable() { Platform::WindowsPortableX64 } else { Platform::WindowsX64 };
     check_release(env!("CARGO_PKG_VERSION"), platform, UpdateSource::Automatic).await
 }
 

@@ -201,13 +201,10 @@ impl MobileReader {
         work(move || {
             self.with(|s| {
                 let anchor = toggle(s, &control)?;
-                s.session.refresh_source().map_err(error)?;
-                if let Some(anchor) = anchor {
+                reflow::refresh(s)?;
+                if !s.focus && let Some(anchor) = anchor {
                     s.session.go_to_source(&anchor.start).map_err(error)?;
-                    s.focus_anchor = Some(anchor)
                 }
-                s.scroll_center = true;
-                scroll::invalidate(s);
                 render(s)
             })
         })

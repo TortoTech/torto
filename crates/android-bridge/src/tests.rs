@@ -1,5 +1,6 @@
 use super::*;
 use rebook_app_core::plugins;
+mod ai_parity;
 
 fn root() -> PathBuf {
     std::env::temp_dir().join(format!("torto-android-test-{}", uuid::Uuid::new_v4()))
@@ -21,7 +22,7 @@ async fn focus_membership_and_heading_masks_follow_desktop_across_pages_and_resi
         let book=core.clone().import_book(path.to_string_lossy().into_owned()).await.unwrap().into_iter().find(|b|b.title=="Focus parity").unwrap();
         let reader=core.clone().open_book(book.id,Viewport {width:360,height:640,scale:1.0}).await.unwrap();
         let mut options=core.clone().reading_options().await.unwrap();
-        options.focus_style="dim".into();options.sentence_split=false;options.translated=false;
+        options.sentence_split=false;options.translated=false;
         reader.clone().apply_reading_options(options).await.unwrap();
         reader.clone().configure(20.0,true,false).await.unwrap();
         let following=reader.clone().search("Following paragraph".into()).await.unwrap().remove(0).source;
@@ -33,8 +34,7 @@ async fn focus_membership_and_heading_masks_follow_desktop_across_pages_and_resi
                 let unit=s.focus_units.iter().find(|u|u.ranges.iter().any(|r|serde_json::from_str::<SourceRange>(&following).unwrap().start.node==r.start.node)).unwrap();
                 assert!(!unit.leading);
                 assert!(!unit.headings.is_empty(),"both headings must survive retained logical-page assembly");
-                assert_eq!(unit.paint_bounds(false).len(),1,"highlight style does not add the preceding title");
-                assert_eq!(unit.paint_bounds(true).len(),2,"dim style clears the body and its preceding titles separately");
+                assert_eq!(unit.paint_bounds().len(),2,"dim style clears the body and its preceding titles separately");
                 Ok((unit.navigation_bounds().unwrap(),unit.headings.clone()))
             }).unwrap();
             let focused=reader.clone().page().await.unwrap().info();
@@ -113,6 +113,20 @@ async fn classic_previews_preserve_progress_and_focus_restores_the_saved_layout(
     reader.clone().focus_mode(false).await.unwrap();
     reader.with(|s| {assert_eq!(s.session.style().typesetting.mode, TypesettingMode::Unified);Ok(())}).unwrap();
     reader.clone().configure(20.0, false, false).await.unwrap();
+    reader.clone().focus_mode(false).await.unwrap();
+    let end=reader.clone().search("Paragraph 59:".into()).await.unwrap().remove(0).source;
+    reader.clone().go_to_source(end).await.unwrap();
+    let at_end=reader.with(|s|Ok(s.session.current_locator())).unwrap();
+    for _ in 0..2 {
+        let result=reader.clone().turn_with_result(true,false).await.unwrap();
+        assert!(result.reached_end,"only an explicit forward boundary reports the end");
+        reader.with(|s|{assert_eq!(s.session.current_locator(),at_end);Ok(())}).unwrap();
+    }
+    assert!(!reader.clone().turn_with_result(false,false).await.unwrap().reached_end);
+    reader.clone().focus_mode(true).await.unwrap();
+    assert!(reader.clone().turn_with_result(true,true).await.unwrap().reached_end,"the final focus unit can end before its last focused paragraph");
+    assert!(!reader.clone().turn_with_result(false,true).await.unwrap().reached_end);
+    reader.clone().focus_mode(false).await.unwrap();
     reader.with(|s| {s.session.restore_locator(&locator).map_err(error)?;render(s)?;Ok(())}).unwrap();
 }
 #[test]
@@ -378,6 +392,9 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
             .unwrap();
         reader.clone().reading_activity(false, false).await.unwrap();
         reader.clone().mark_finished().await.unwrap();
+        let count=core.clone().book_statistics(books[0].id.clone()).await.unwrap().history.iter().filter(|e|e.kind=="finished").count();
+        reader.clone().mark_finished().await.unwrap();
+        assert_eq!(core.clone().book_statistics(books[0].id.clone()).await.unwrap().history.iter().filter(|e|e.kind=="finished").count(),count,"marking an already finished book is idempotent");
         let stats = core.clone().statistics().await.unwrap();
         assert_eq!(stats.distribution.len(), 7);
         assert!(
@@ -400,8 +417,11 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
         drop(reader);
         drop(first);
         cached_translation_roundtrip(&core,&books[0].id).await;
+        reflow::tests::verify(&core, &root).await;
         touch_and_focus(&core, &root).await;
         media_and_presentation(&core,&root).await;
+        ai_parity::verify(&core, &root).await;
+        ai_parity::driver_delivery(&core).await;
         advanced_reading(&core, &books[0].id).await;
         long_focus_continuation(&core,&root).await;
         retained_focus_chapter_boundaries(&core,&root).await;
@@ -675,7 +695,6 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
     // All files/credentials use the existing isolated test profile.
     let mut options = core.clone().reading_options().await.unwrap();
     options.font_weight = 575;
-    options.focus_style = "highlight".into();
     options.sentence_split = true;
     core.clone()
         .save_reading_options(options.clone())
@@ -687,6 +706,11 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
     );
     let fonts = core.clone().font_families().await.unwrap();
     assert!(fonts.monospace.iter().any(|f| f == "monospace"));
+    // Old Android settings must not restore the removed style or prefetch controls.
+    let mut legacy = serde_json::to_value(&options).unwrap();
+    legacy["focus_style"] = "highlight".into();
+    legacy["ai_prefetch"] = false.into();
+    rebook_app_core::persistence::write_json_atomic(&core.root.join("android-reading.json"), &legacy).unwrap();
     let reader = core
         .clone()
         .open_book(
@@ -709,7 +733,7 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
         .await
         .unwrap();
     let first = reader.clone().focus_mode(true).await.unwrap();
-    assert!(first.info().is_scroll && first.info().focus_highlight);
+    assert!(first.info().is_scroll && !first.info().focus_highlight, "Android always dims surroundings, including when old settings request highlighting");
     assert!(!first.info().focus_bounds.is_empty());
     focused_sentence_action_is_local_and_survives_reflow(&reader).await;
     let first = reader.clone().page().await.unwrap();
@@ -1466,5 +1490,6 @@ async fn media_and_presentation(core:&Arc<MobileCore>,root:&std::path::Path) {
     let updated=reader.clone().toggle_reading_control(formula).await.unwrap();
     assert!(updated.info().controls.iter().any(|c|c.kind=="formula"&&c.active));
     reader.clone().close_document(action.target).await.unwrap();
+    reflow::tests::media(&reader).await;
     reader.clone().shutdown().await.unwrap();
 }
