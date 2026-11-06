@@ -15,9 +15,15 @@ mod chat;
 mod chat_markup;
 mod chat_media;
 mod cloud;
+mod documents;
+mod feedback;
 mod interactions;
 mod maintenance;
+mod mobile_source;
 mod pixels;
+mod presentation;
+mod reflow;
+pub use presentation::ReadingControl;
 mod scroll;
 mod secrets;
 mod services;
@@ -68,6 +74,9 @@ pub struct BookSummary {
 }
 #[derive(Clone, uniffi::Record)]
 pub struct TocItem {
+    pub id: String,
+    pub ancestors: Vec<String>,
+    pub has_children: bool,
     pub title: String,
     pub href: String,
     pub depth: u32,
@@ -97,6 +106,32 @@ pub struct SelectedText {
     pub bounds: Vec<Rect>,
 }
 #[derive(Clone, uniffi::Record)]
+pub struct FocusTarget {
+    pub delta: f32,
+    pub bounds: Vec<Rect>,
+}
+#[uniffi::export]
+pub fn focus_motion_duration(distance: f32) -> u32 {
+    rebook_app_core::focus_navigation::duration(distance).as_millis() as u32
+}
+#[uniffi::export]
+pub fn reference_color(dark:bool)->u32 {
+    let [r,g,b,a]=rebook_renderer::reference_color(dark);
+    u32::from_be_bytes([a,r,g,b])
+}
+fn reference_ink(s:&ReaderState)->peniko::Color {
+    let [r,g,b,a]=rebook_renderer::reference_color(s.session.style().background.red<128);
+    peniko::Color::from_rgba8(r,g,b,a)
+}
+#[uniffi::export]
+pub fn page_turn_commit(distance: f32, width: f32, velocity: f32) -> bool {
+    rebook_app_core::page_navigation::commit(distance, width, velocity)
+}
+#[uniffi::export]
+pub fn page_turn_resisted_offset(distance: f32, width: f32) -> f32 {
+    rebook_app_core::page_navigation::resisted_offset(distance, width)
+}
+#[derive(Clone, Default, uniffi::Record)]
 pub struct PageInfo {
     pub section: u32,
     pub section_count: u32,
@@ -110,6 +145,14 @@ pub struct PageInfo {
     pub focus_highlight: bool,
     pub is_scroll: bool,
     pub scroll_distance: f64,
+    pub scroll_context: u64,
+    pub raster_top: f32,
+    pub raster_height: f32,
+    pub previous_focus: Option<FocusTarget>,
+    pub next_focus: Option<FocusTarget>,
+    pub controls: Vec<ReadingControl>,
+    pub active_toc_id: Option<String>,
+    pub active_toc_path: Vec<String>,
     pub focus_index: u32,
     pub focus_count: u32,
     pub can_go_back: bool,
@@ -247,6 +290,7 @@ impl MobileCore {
             for book in library.books() {
                 store.register_book_if_missing(&book.id).map_err(error)?;
             }
+            cloud::library_changed(&owner)?;
             Ok(())
         })
         .await?;
@@ -262,7 +306,7 @@ impl MobileCore {
             services::store()?
                 .set_book_present(&id, false)
                 .map_err(error)?;
-            Ok(())
+            cloud::library_changed(&self)
         })
         .await
     }
@@ -280,24 +324,23 @@ impl MobileCore {
                 .find(|book| book.id == id)
                 .ok_or_else(|| error("Book not found"))?;
             let publication = rebook_formats::open_file(&book.path).map_err(error)?;
-            let canonical = publication.source();
+            let canonical = mobile_source::for_reading(publication.source());
             let options = settings::load_reading(&self.root);
             let mut style = ReaderStyle::default();
             style.spread = SpreadMode::Single;
             style.focus_footnote_icons = true;
-            style.horizontal_margin = 20.0;
             style.minimum_content_width = 0.0;
-            style.top_margin = 16.0;
-            style.bottom_margin = 16.0;
             style.typography.font_size = 20.0;
             style.typography.monospace_font = "monospace".into();
             style.typography.sans_serif_font = "sans-serif".into();
             settings::apply_typography(&mut style, &options);
+            apply_mobile_page_margins(&mut style);
             let fonts =
                 rebook_app_core::fonts::store::load(&self.root.join("fonts"), Default::default());
             rebook_app_core::fonts::install(Arc::new(fonts.clone()));
             let settings =
                 rebook_app_core::plugins::PluginSettings::load_default().map_err(error)?;
+            let original=canonical.clone();
             let pipeline = rebook_app_core::reading::ReadingPipeline::new(
                 canonical,
                 &id,
@@ -308,7 +351,8 @@ impl MobileCore {
                 .translation
                 .set_enabled(options.translated)
                 .map_err(error)?;
-            let source: Arc<dyn BookSource> = pipeline.structure.clone();
+            let media=Arc::new(rebook_app_core::media::MediaReferenceSource::new(pipeline.structure.clone(),original));
+            let source: Arc<dyn BookSource> = media.clone();
             let mut session = ReaderSession::open_with_fonts(
                 source.clone(),
                 viewport,
@@ -323,22 +367,31 @@ impl MobileCore {
             });
             let store = services::store()?;
             store.register_book_if_missing(&id).map_err(error)?;
-            if let Some(progress) = store.load_progress(&id).map_err(error)? {
+            let restored_anchor = if let Some(progress) = store.load_progress(&id).map_err(error)? {
                 session.restore_locator(&progress.locator).map_err(error)?;
-            }
+                progress.locator.source
+            } else { None };
             store
                 .record_reading_activity(&id, &session.current_locator())
                 .map_err(error)?;
             rebook_app_core::statistics::register_book(book);
             let chat_path = self.root.join("chat").join(format!("{id}.json"));
             let messages = chat::load_messages(&chat_path);
+            let session_typesetting = session.style().typesetting;
             Ok(Arc::new(MobileReader {
+                scheduler: Default::default(),
+                ai: Default::default(),
+                enhancement_claim: Default::default(),
+                ai_snapshots: Default::default(),
+                ai_delivery: Default::default(),
                 state: Mutex::new(Some(ReaderState {
                     session,
                     source,
                     store,
                     book_id: id,
                     pipeline,
+                    media,
+                    document: None,
                     selected: None,
                     selection_mode: SelectionGranularity::Word,
                     tracker: rebook_app_core::statistics::Tracker::new(&book.id),
@@ -347,21 +400,25 @@ impl MobileCore {
                     messages,
                     pending: None,
                     translation_config: None,
+                    enhancements: Default::default(),
+                    staged_layout: vec![],
                     toc_labels: Default::default(),
                     toc_config: None,
                     options,
                     root: self.root.clone(),
                     scroll_offset: 0.0,
                     scroll_distance: 0.0,
+                    scroll_context: scroll::context_id(),
+                    scroll_cache: None,
                     scroll_center: true,
                     scroll_slices: vec![],
                     selection_start: None,
                     selection_end: None,
                     selection_drag_anchor: None,
+                    classic_typesetting: session_typesetting,
                     focus: false,
                     focus_units: vec![],
-                    focus_anchor: None,
-                    focus_last: false,
+                    focus_anchor: restored_anchor,
                     history: vec![],
                 })),
             }))
@@ -375,6 +432,8 @@ struct ReaderState {
     store: rebook_app_core::sync::SyncStore,
     book_id: String,
     pipeline: rebook_app_core::reading::ReadingPipeline,
+    media: Arc<rebook_app_core::media::MediaReferenceSource>,
+    document: Option<documents::Document>,
     selected: Option<rebook_reader::ReaderSelection>,
     selection_mode: SelectionGranularity,
     tracker: rebook_app_core::statistics::Tracker,
@@ -383,26 +442,55 @@ struct ReaderState {
     messages: Vec<chat::ChatMessage>,
     pending: Option<chat::PendingChanges>,
     translation_config: Option<String>,
+    enhancements: services::enhancements::State,
+    staged_layout: Vec<services::requests::Staged>,
     toc_labels: std::collections::HashMap<String, String>,
     toc_config: Option<String>,
     options: settings::ReadingOptions,
     root: PathBuf,
     scroll_offset: f32,
     scroll_distance: f64,
+    scroll_context: u64,
+    scroll_cache: Option<scroll::Cache>,
     scroll_center: bool,
     scroll_slices: Vec<scroll::Slice>,
     selection_start: Option<rebook_reader::ReaderTextHit>,
     selection_end: Option<rebook_reader::ReaderTextHit>,
     selection_drag_anchor: Option<rebook_reader::ReaderTextHit>,
     focus: bool,
+    classic_typesetting: rebook_layout::ReaderTypesetting,
     focus_units: Vec<interactions::FocusUnit>,
     focus_anchor: Option<SourceRange>,
-    focus_last: bool,
     history: Vec<rebook_publication::LocatorV1>,
 }
 #[derive(uniffi::Object)]
 pub struct MobileReader {
+    scheduler: rebook_app_core::reading_ai::Scheduler,
+    ai: Mutex<services::driver::State>,
+    enhancement_claim: tokio::sync::Mutex<()>,
+    ai_snapshots: rebook_app_core::reading_ai::batching::Snapshots,
+    ai_delivery: Mutex<()>,
     state: Mutex<Option<ReaderState>>,
+}
+
+#[derive(uniffi::Record)]
+pub struct ReaderTurn {
+    pub page: Arc<MobilePage>,
+    pub reached_end: bool,
+}
+
+fn turn_result(s: &mut ReaderState, forward: bool, whole_unit: bool) -> Result<ReaderTurn> {
+    if whole_unit {
+        return scroll::turn_unit_result(s,forward).map(|(page,reached_end)|ReaderTurn {page,reached_end});
+    }
+    clear_selection_state(s);
+    if s.focus {
+        // Vertical focus stops are not synthetic book-completion pages.
+        return scroll::turn(s,forward).map(|page|ReaderTurn {page,reached_end:false});
+    }
+    let result=s.session.turn_page(if forward {PageDirection::Next}else{PageDirection::Previous}).map_err(error)?;
+    let reached_end=forward&&result.outcome==rebook_reader::NavigationOutcome::Boundary;
+    render(s).map(|page|ReaderTurn {page,reached_end})
 }
 impl MobileReader {
     fn with<T>(&self, f: impl FnOnce(&mut ReaderState) -> Result<T>) -> Result<T> {
@@ -413,6 +501,7 @@ impl MobileReader {
 #[uniffi::export]
 impl MobileReader {
     pub async fn shutdown(self: Arc<Self>) -> Result<()> {
+        self.stop_ai();
         work(move || {
             let state = self.state.lock().map_err(error)?.take();
             drop(state);
@@ -426,52 +515,38 @@ impl MobileReader {
     pub async fn page(self: Arc<Self>) -> Result<Arc<MobilePage>> {
         work(move || self.with(render)).await
     }
+    /// Render one neighbour without publishing progress, selection or navigation.
+    /// Hosts retain at most the preceding and following viewport bitmaps.
+    pub async fn preview_turn(self: Arc<Self>, forward: bool) -> Result<Option<Arc<MobilePage>>> {
+        work(move || self.with(|s| {
+            if s.focus { return scroll::preview_unit(s,forward); }
+            let locator = s.session.current_locator();
+            let position = scroll::position(s);
+            let result = (|| {
+                s.session.turn_page(if forward { PageDirection::Next } else { PageDirection::Previous }).map_err(error)?;
+                if scroll::position(s) == position { return Ok(None); }
+                render_page_with_progress(s, false).map(Some)
+            })();
+            // Restoration also runs when parsing/rendering the neighbouring chapter fails.
+            scroll::restore_position(s, &locator, position)?;
+            result
+        })).await
+    }
     pub async fn turn(self: Arc<Self>, forward: bool) -> Result<Arc<MobilePage>> {
-        work(move || {
-            self.with(|s| {
-                clear_selection_state(s);
-                if s.focus && s.options.scroll_focus {
-                    return scroll::turn(s, forward);
-                }
-                if s.focus {
-                    let current = s
-                        .focus_anchor
-                        .as_ref()
-                        .and_then(|a| {
-                            s.focus_units
-                                .iter()
-                                .position(|u| u.ranges.iter().any(|r| r.start == a.start))
-                        })
-                        .unwrap_or(0);
-                    let next = if forward {
-                        current.checked_add(1).filter(|i| *i < s.focus_units.len())
-                    } else {
-                        current.checked_sub(1)
-                    };
-                    if let Some(next) = next {
-                        s.focus_anchor = s.focus_units[next].ranges.first().cloned();
-                        return render(s);
-                    }
-                    s.focus_anchor = None;
-                    s.focus_last = !forward;
-                }
-                s.session
-                    .turn_page(if forward {
-                        PageDirection::Next
-                    } else {
-                        PageDirection::Previous
-                    })
-                    .map_err(error)?;
-                render(s)
-            })
-        })
-        .await
+        work(move ||self.with(|s|turn_result(s,forward,false).map(|result|result.page))).await
+    }
+    /// Distinguish an actual forward book boundary from an unavailable preview.
+    pub async fn turn_with_result(self: Arc<Self>, forward: bool, whole_unit: bool) -> Result<ReaderTurn> {
+        work(move ||self.with(|s|turn_result(s,forward,whole_unit))).await
+    }
+    pub async fn turn_reading_unit(self: Arc<Self>, forward: bool) -> Result<Arc<MobilePage>> {
+        work(move ||self.with(|s|scroll::turn_unit(s,forward))).await
     }
     pub async fn resize(self: Arc<Self>, viewport: Viewport) -> Result<Arc<MobilePage>> {
         work(move || {
             self.with(|s| {
                 s.scroll_center = true;
-                s.scroll_slices.clear();
+                scroll::invalidate(s);
                 s.session.resize(viewport.validate()?).map_err(error)?;
                 render(s)
             })
@@ -492,11 +567,13 @@ impl MobileReader {
                 let mut style = s.session.style();
                 settings::apply_typography(&mut style, &s.options);
                 style.typography.font_size = font_size;
-                style.typesetting.mode = if unified {
+                let mode = if unified {
                     TypesettingMode::Unified
                 } else {
                     TypesettingMode::Book
                 };
+                s.classic_typesetting = rebook_app_core::reading::typesetting(&s.classic_typesetting,mode);
+                apply_presentation_mode(s, &mut style)?;
                 if dark {
                     style.background = rebook_publication::Rgba {
                         red: 24,
@@ -515,8 +592,8 @@ impl MobileReader {
                     style.foreground = ReaderStyle::default().foreground;
                 }
                 s.scroll_center = true;
-                s.scroll_slices.clear();
-                s.session.set_style(style).map_err(error)?;
+                scroll::invalidate(s);
+                s.session.refresh_source_with_style(style).map_err(error)?;
                 render(s)
             })
         })
@@ -525,6 +602,29 @@ impl MobileReader {
     pub async fn navigate(self: Arc<Self>, href: String) -> Result<Arc<MobilePage>> {
         work(move || {
             self.with(|s| interactions::follow(s, &PublicationUrl::parse(&href).map_err(error)?))
+        })
+        .await
+    }
+    pub async fn navigate_toc(self: Arc<Self>, id: String) -> Result<Arc<MobilePage>> {
+        work(move || {
+            self.with(|s| {
+                let locator = s.session.current_locator();
+                s.session.go_to_toc(&id).map_err(error)?;
+                s.history.push(locator);
+                if s.history.len() > 32 {
+                    s.history.remove(0);
+                }
+                s.focus_anchor = s
+                    .session
+                    .source_anchor_for_toc(&id)
+                    .map(|start| SourceRange {
+                        end: start.clone(),
+                        start,
+                    });
+                s.scroll_center = true;
+                scroll::invalidate(s);
+                render(s)
+            })
         })
         .await
     }
@@ -551,7 +651,7 @@ impl MobileReader {
             self.with(|s| {
                 let range: SourceRange = serde_json::from_str(&source).map_err(error)?;
                 s.scroll_center = true;
-                s.scroll_slices.clear();
+                scroll::invalidate(s);
                 let previous = s.session.current_locator();
                 s.session.go_to_source(&range.start).map_err(error)?;
                 s.history.push(previous);
@@ -634,15 +734,36 @@ fn clear_selection_state(s: &mut ReaderState) {
     s.selection_end = None;
     s.selection_drag_anchor = None;
 }
+fn apply_presentation_mode(s: &mut ReaderState, style: &mut ReaderStyle) -> Result<()> {
+    style.typesetting = rebook_app_core::reading::effective_typesetting(s.focus, &s.classic_typesetting);
+    apply_mobile_page_margins(style);
+    let settings = rebook_app_core::plugins::PluginSettings::load_default().map_err(error)?;
+    s.pipeline.semantic.configure_presentation(
+        &rebook_app_core::plugins::pdf_native::cache_identity(&s.book_id, s.pipeline.rewrite.as_ref()),
+        &settings,
+        style.typesetting.mode == TypesettingMode::Unified,
+    );
+    Ok(())
+}
+fn apply_mobile_page_margins(style: &mut ReaderStyle) {
+    // All mobile reading modes share the same app frame; authored block spacing
+    // remains part of the book's own layout.
+    style.horizontal_margin = 20.0;
+    style.top_margin = 16.0;
+    style.bottom_margin = 16.0;
+}
 fn render(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
+    if s.enhancements.dirty {
+        reflow::refresh(s)?;
+    }
     clear_selection_state(s);
-    if s.focus && s.options.scroll_focus {
+    if s.focus {
         scroll::render(s)
     } else {
         render_page(s)
     }
 }
-fn page_info(s: &mut ReaderState) -> Result<PageInfo> {
+fn page_info(s: &mut ReaderState, persist: bool) -> Result<PageInfo> {
     let fragments = s.session.current_visible_text_fragments().map_err(error)?;
     let display = s.session.current_page();
     let regions = fragments
@@ -686,27 +807,54 @@ fn page_info(s: &mut ReaderState) -> Result<PageInfo> {
                     .any(|r| r.start.spine == a.start.spine && r.start.node == a.start.node)
             })
         })
-        .unwrap_or_else(|| {
-            if s.focus_last {
-                s.focus_units.len().saturating_sub(1)
-            } else {
-                0
-            }
-        });
-    s.focus_last = false;
-    let focus_bounds = s
-        .focus_units
-        .get(index)
-        .map_or_else(Vec::new, |u| u.bounds.clone());
+        .unwrap_or(0);
     s.focus_anchor = s
         .focus_units
         .get(index)
         .and_then(|u| u.ranges.first().cloned());
+    finish_page_info(s, regions, marks, index, false, persist)
+}
+fn finish_page_info(
+    s: &mut ReaderState,
+    regions: Vec<TextRegion>,
+    marks: Vec<Rect>,
+    index: usize,
+    is_scroll: bool,
+    persist: bool,
+) -> Result<PageInfo> {
+    let focus_bounds = s
+        .focus_units
+        .get(index)
+        .map_or_else(Vec::new, |u| u.paint_bounds());
     let state = s.session.snapshot();
-    s.store
-        .save_progress(&s.book_id, &s.session.current_locator())
-        .map_err(error)?;
+    let mut locator = s.session.current_locator();
+    if is_scroll && let Some(unit) = s.focus_units.get(index) {
+        let continuation = locator.source.as_ref().is_some_and(|leading| {
+            unit.ranges
+                .iter()
+                .any(|r| r.start.spine == leading.start.spine && r.start.node == leading.start.node)
+        });
+        if !continuation && let Some(anchor) = unit.ranges.first() {
+            locator.source = Some(anchor.clone());
+            if let Some(section) = s
+                .source
+                .book()
+                .sections
+                .iter()
+                .find(|p| p.id == anchor.start.spine)
+            {
+                locator.href = section.href.clone();
+            }
+        }
+    }
+    if persist {
+        s.store.save_progress(&s.book_id, &locator).map_err(error)?;
+    }
+    let controls=presentation::controls(s)?;
     Ok(PageInfo {
+        active_toc_id:state.active_toc_id,
+        active_toc_path:state.active_toc_path,
+        controls,
         section: state.location.section_index as u32,
         section_count: s.source.book().sections.len() as u32,
         page: state.location.page_index as u32,
@@ -715,9 +863,14 @@ fn page_info(s: &mut ReaderState) -> Result<PageInfo> {
         regions,
         marks,
         focus_bounds,
-        focus_highlight: s.options.focus_style == "highlight",
-        is_scroll: false,
+        focus_highlight: false,
+        is_scroll,
         scroll_distance: s.scroll_distance,
+        scroll_context: s.scroll_context,
+        raster_top: 0.0,
+        raster_height: s.session.viewport().height as f32,
+        previous_focus: None,
+        next_focus: None,
         focus_fade_color: {
             let paper = s.session.style().background;
             let alpha = ((1.0 - rebook_renderer::FOCUS_INACTIVE_OPACITY) * 255.0).round() as u32;
@@ -732,8 +885,10 @@ fn page_info(s: &mut ReaderState) -> Result<PageInfo> {
     })
 }
 fn render_page(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
-    s.selected = None;
-    let info = page_info(s)?;
+    render_page_with_progress(s, true)
+}
+fn render_page_with_progress(s: &mut ReaderState, persist: bool) -> Result<Arc<MobilePage>> {
+    let info = page_info(s, persist)?;
     let viewport = s.session.viewport();
     let width = (viewport.width as f32 * viewport.raster_scale).ceil() as u32;
     let height = (viewport.height as f32 * viewport.raster_scale).ceil() as u32;
@@ -743,10 +898,9 @@ fn render_page(s: &mut ReaderState) -> Result<Arc<MobilePage>> {
     rasterizer.render_to_vec(
         |scene| {
             display.paint_scaled(scene, viewport.raster_scale);
-            let color = s.session.style().foreground;
             display.paint_footnote_icons_scaled(
                 scene,
-                peniko::Color::from_rgba8(color.red, color.green, color.blue, color.alpha),
+                reference_ink(s),
                 viewport.raster_scale,
             );
         },

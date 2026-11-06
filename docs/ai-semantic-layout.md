@@ -16,11 +16,13 @@ original-image fallback and unified formula rendering.
 
 `parser → rewrite → translation → semantic layout → sentence structure → layout`
 
-Recognition reads the rewritten, untranslated publication. Only source-backed
-ordinary paragraphs and unassociated images are classification candidates. Existing semantic
-blocks are represented as protected boundaries, without their text, except for
-recognized quotes missing an attribution. Those are exposed only for credit
-completion, without reclassifying or restyling their body. Headings
+Recognition reads the rewritten, untranslated publication. Source-backed ordinary
+paragraphs, unassociated images, quotation/preformatted containers and faithful
+image-text transcriptions can be candidates. Code/quotation classification jointly
+determines complete member groups, presentation, language and explicit attachments.
+Authored figures and notes keep their outer structure; eligible children are
+classified in separate bounded scopes through the same classifier. Ordinary
+figure content remains protected from general prose reclassification. Headings
 provide read-only context. Model output contains IDs and roles, never replacement
 text or styles, except for exact source-credit suffixes copied for localization.
 Local validation rejects nonexistent IDs, overlaps, discontinuous
@@ -47,7 +49,7 @@ source-protection and relationship checks still run after parsing.
 has no attribution. It can consume the immediately following paragraph or move
 the quote's separate final body paragraph into its attribution field. The latter
 must leave at least one body paragraph. Both cases preserve source links and
-bilingual companions. Already attributed quotes stay protected. `quote_inline`
+bilingual companions. Existing explicit attributions are preserved and close a grouping run. `quote_inline`
 can also extract an explicitly written suffix from a recognized quote's final
 body paragraph without recommending alignment or changing its recognized scope. The model cannot generate new
 credit text or infer an author absent from the supplied book content.
@@ -201,10 +203,26 @@ Explicit adjacent continuations can share a chart. Reading and media previews
 provide Table/Chart buttons, initially showing the table. The original cells,
 source identities, translation inputs and text remain intact. Chart SVG generation
 runs on the layout worker and correctly uses zero as the baseline of signed bars.
+Switching either way restores the table root, whose geometry survives both
+presentations. Empty corner headers are not used as restoration anchors; they
+can lack text geometry and cause desktop background reflows to retry forever.
+The regression covers chart/table/chart switching before searching a source cell.
+macOS production-path verification uses the formal profile and the real
+*How We Read Now*, Table 1.1, with a model-generated Chinese chart. Two complete
+keyboard toggle cycles retain the same table focus. Settled logs show no repeated
+layout preparation; the existing one-second reader timer remains unchanged.
 
 Display-formula notes are generated during the same AI layout job, from nearby
 original text. A known meaning needs an exact evidence excerpt; undefined symbols
-remain explicitly undefined. Inline expressions do not receive notes. Notes are
+and unhelpful ordinary operators/constants are omitted. Meanings are concise noun
+phrases, without repeating the formula, background theory or unit text. The model
+explains base symbols once: `A`/`|A|` use `A`, and a vector and its norm share its
+base entry. Meaningful subscripts, vector/scalar differences and estimators remain
+distinct. Local validation prefers a valid base entry over redundant whole
+magnitude/norm wrappers, without stripping conditional-probability bars or changing
+an isolated derived definition. Prompt/policy fingerprints invalidate older
+verbose enhancement results; compact wire keys and target language are retained.
+Inline expressions do not receive notes. Notes are
 collapsed on each preview opening and formula change. The existing footnote
 shortcut (bare left Alt by default) toggles notes in an active formula preview;
 otherwise it keeps its normal footnote behavior. Bare-Alt combinations are not
@@ -214,3 +232,42 @@ text outside the formula image; copying the formula still copies LaTeX.
 The extra request and cache retain the compact wire-key convention. Their cache
 key includes book, original context, target language, endpoint/model and policy
 revision. Existing image transcription and semantic-window caches can be reused.
+
+## Code images and authored code containers
+
+Image recognition runs before the shared code/quotation classifier. Pure source
+code is transcribed literally, with indentation and line breaks, using the existing
+image-text result. The classifier receives that text rather than the image alt
+label and can select code, a quotation, or leave ordinary text unchanged. The same
+response jointly decides grouping and syntax language; transport retains `cqk`,
+`pr`, and `lg`. Code composition uses the original transcription, not its translation,
+then reuses the existing preformatted styling and light/dark syntax highlighting.
+The recognized language remains classification/cache metadata used for syntax
+highlighting; no language badge or extra text is inserted into the book. Unknown
+syntax remains plain code. Search and source offsets remain unchanged.
+
+Eligible code/quotation children inside figures and notes use independent scopes,
+so groups cannot cross those containers. These requests retain literal caption
+and credit text, and include up to 2,000 characters of adjacent explanations and
+enclosing context without selectable IDs. They use a code/quotation-only prompt
+and schema; formula-formatting tags never reinterpret literal example markup.
+Grouping, presentation and language are still decided together using the existing
+compact keys. The request contract invalidates earlier classification caches.
+Composition and cache validation resolve
+original source ranges recursively. Existing outer figures, captions and credits
+remain in place, without adding another wrapper around code already in a figure.
+Image recognition revision 8 refreshes legacy text-image decisions.
+
+Opt-in offline regressions accept `TORTO_ISSUE65_BOOK` (*Structured Writing*) and
+`TORTO_ISSUE70_BOOK` (*The Algorithm Design Manual*), then run
+`cargo test --locked -p rebook-app-core local_structured_writing_nested_html -- --ignored --nocapture`
+and `cargo test --locked -p rebook-app-core local_algorithm_manual_image_geometry -- --ignored --nocapture`.
+They read original EPUBs, inject deterministic classification/OCR results, and do
+not issue AI requests or alter the library. Figure 3.5's HTML and original source
+ranges survive composition; the algorithm figure keeps its 192×216 intrinsic size
+and the separate transcribed C example keeps source node `n267`.
+HTML heuristics now associate Figure 1.1's quotation-wrapped caption before AI
+classification, preserving `n263`/`n265` and keeping the separate code image out of
+the group. The same local-book regression verifies all 116 numbered captions in
+this EPUB are associated and that neither reading mode draws a quotation bar for
+the Figure 1.1 caption. Source IR revision 16 invalidates old structural caches.

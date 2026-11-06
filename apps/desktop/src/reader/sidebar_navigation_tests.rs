@@ -20,6 +20,276 @@ const PARAGRAPHS_PER_CHAPTER: usize = 20;
 const CHAPTER: &str = "chapter";
 
 #[test]
+fn issue75_programmatic_scroll_after_content_growth_does_not_acquire_rebound_velocity() {
+    let ctx = egui::Context::default();
+    let run = |height, target: Option<f32>| {
+        let mut observed = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let mut area = egui::ScrollArea::vertical()
+                    .id_salt("focus-issue75")
+                    .auto_shrink([false, false])
+                    .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR);
+                if let Some(target) = target {
+                    area = area.vertical_scroll_offset(target);
+                }
+                let result = area.show_viewport(ui, |ui, viewport| {
+                    ui.set_height(height);
+                    viewport.min.y
+                });
+                observed = Some((
+                    result.inner,
+                    result.state.unclamped_offset().y,
+                    result.state.velocity().y,
+                    result.id,
+                ));
+            },
+        );
+        output.textures_delta.clear();
+        observed.unwrap()
+    };
+    run(2_000.0, Some(0.0));
+    run(2_000.0, None);
+    let target = 15_000.0;
+    let (presented, saved, velocity, _) = run(20_000.0, Some(target));
+    assert!((presented - target).abs() < 0.01);
+    assert!(
+        (saved - target).abs() < 0.01,
+        "explicit jump drifted to {saved}, velocity={velocity}"
+    );
+    assert_eq!(velocity, 0.0);
+    for _ in 0..8 {
+        let (presented, saved, velocity, _) = run(20_000.0, None);
+        assert!((presented - target).abs() < 0.01 && (saved - target).abs() < 0.01);
+        assert_eq!(velocity, 0.0);
+    }
+    let (_, _, _, id) = run(2_000.0, Some(0.0));
+    let mut state = egui::scroll_area::State::load(&ctx, id).unwrap();
+    state.set_offset(egui::vec2(0.0, target));
+    state.store(&ctx, id);
+    let (presented, saved, velocity, _) = run(20_000.0, None);
+    assert_eq!((presented, saved, velocity), (target, target, 0.0));
+    // Real out-of-range requests still obey the new content's bounds.
+    let (_, saved, velocity, _) = run(2_000.0, Some(target));
+    assert!(saved < 2_000.0);
+    assert_eq!(velocity, 0.0);
+}
+
+#[test]
+fn issue75_shelf_resume_after_a_short_book_keeps_the_saved_paragraph_visible() {
+    let (reader, section) = chapter_book(ReadingMode::Focus);
+    let target = range_at(&section, "p219");
+    let mut locator = reader.reader.current_locator();
+    locator.source = Some(target.clone());
+    let mut short_book = reader.source.book().clone();
+    short_book.table_of_contents.clear();
+    let mut short_section = section;
+    short_section.blocks.truncate(1);
+    short_section.anchors.clear();
+    drop(reader);
+    let ctx = egui::Context::default();
+    let mut short = source_reader(
+        Arc::new(SingleSpineBook {
+            book: short_book,
+            section: short_section,
+        }),
+        ReadingMode::Focus,
+        None,
+        None,
+    );
+    for _ in 0..4 {
+        issue75_frame(&ctx, &mut short);
+    }
+    drop(short);
+    let root = std::env::temp_dir().join(format!("torto-issue75-resume-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let store =
+        crate::sync::SyncStore::open_at(root.join("sync.sqlite3"), "issue75-resume").unwrap();
+    store
+        .save_progress("sidebar-scroll-regression", &locator)
+        .unwrap();
+    let (mut resumed, _) =
+        chapter_book_with_progress(ReadingMode::Focus, Some(store.clone()), Some(target));
+    for _ in 0..12 {
+        issue75_frame(&ctx, &mut resumed);
+        assert_eq!(shown_node(&resumed).as_deref(), Some("p219"));
+        assert_focus_visible(&resumed);
+    }
+    drop(resumed);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn issue75_previous_chapter_keeps_its_last_focus_unit_visible_after_entry() {
+    let (mut reader, _) = chapter_book(ReadingMode::Focus);
+    let ctx = egui::Context::default();
+    for _ in 0..4 {
+        issue75_frame(&ctx, &mut reader);
+    }
+    toc_jump(&mut reader, "Chapter 5");
+    for _ in 0..4 {
+        issue75_frame(&ctx, &mut reader);
+    }
+    reader.go_to_adjacent_section(PageDirection::Previous);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while reader.pending_reading_unit_turn.is_some() {
+        assert!(std::time::Instant::now() < deadline);
+        reader.retry_pending_reading_unit_turn();
+        std::thread::yield_now();
+    }
+    for _ in 0..10 {
+        issue75_frame(&ctx, &mut reader);
+        assert_eq!(
+            shown_node(&reader).as_deref(),
+            Some("p99"),
+            "{}",
+            state_line(&reader)
+        );
+        let unit = &reader.focus_units[reader.focus_unit_index];
+        let viewport = reader.scroll_viewport.unwrap();
+        let center = unit.rect.center().y + reader.scroll_content_padding(viewport.size.y)
+            - viewport.offset_y;
+        assert!(
+            (0.0..viewport.size.y).contains(&center),
+            "focus is outside the viewport: {}",
+            state_line(&reader)
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires TORTO_ISSUE75_BOOK; local book only, no AI or personal settings"]
+fn issue75_local_algorithm_previous_chapter_and_shelf_resume_keep_focus_visible() {
+    let opened = rebook_formats::open_file(std::path::PathBuf::from(
+        std::env::var_os("TORTO_ISSUE75_BOOK").unwrap(),
+    ))
+    .unwrap();
+    let source = opened.source();
+    let mut reader = source_reader(source.clone(), ReadingMode::Focus, None, None);
+    let ctx = egui::Context::default();
+    ctx.set_pixels_per_point(2.0);
+    let chapter = reader
+        .reader
+        .toc_items()
+        .iter()
+        .find(|item| item.label.starts_with("1.3 "))
+        .unwrap()
+        .label
+        .clone();
+    toc_jump(&mut reader, &chapter);
+    for _ in 0..5 {
+        issue75_frame(&ctx, &mut reader);
+    }
+    reader.go_to_adjacent_section(PageDirection::Previous);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while reader.pending_reading_unit_turn.is_some() {
+        assert!(std::time::Instant::now() < deadline);
+        reader.retry_pending_reading_unit_turn();
+        std::thread::yield_now();
+    }
+    for _ in 0..12 {
+        issue75_frame(&ctx, &mut reader);
+        assert_eq!(
+            reader.focus_unit_index + 1,
+            reader.focus_units.len(),
+            "previous chapter did not select its last block: {}",
+            state_line(&reader)
+        );
+        assert_focus_visible(&reader);
+    }
+    assert!(reader.current_chapter_title().contains("1.2"));
+    let target = reader.progress_source_range().unwrap();
+    eprintln!(
+        "#75 previous chapter: {}, node={}",
+        reader.current_chapter_title(),
+        target.start.node
+    );
+    let mut locator = reader.reader.current_locator();
+    locator.source = Some(target.clone());
+    let root = std::env::temp_dir().join(format!("torto-issue75-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let store = crate::sync::SyncStore::open_at(root.join("sync.sqlite3"), "issue75").unwrap();
+    store
+        .save_progress(&source.book().id.to_string(), &locator)
+        .unwrap();
+    // Reuse the same GUI context, as the shelf does, but first display a much
+    // shorter reading unit so the old ScrollArea bounds cannot fit the resume.
+    let short = reader
+        .reader
+        .toc_items()
+        .iter()
+        .find(|item| item.label.starts_with("1.3 "))
+        .unwrap()
+        .label
+        .clone();
+    toc_jump(&mut reader, &short);
+    for _ in 0..5 {
+        issue75_frame(&ctx, &mut reader);
+    }
+    drop(reader);
+    let mut resumed = source_reader(
+        source,
+        ReadingMode::Focus,
+        Some(store.clone()),
+        Some(target.clone()),
+    );
+    for _ in 0..12 {
+        issue75_frame(&ctx, &mut resumed);
+        assert!(
+            resumed.focus_units[resumed.focus_unit_index]
+                .paint_ranges
+                .iter()
+                .any(|r| source_range_contains_anchor(r, &target.start)),
+            "resume changed the focus: {}",
+            state_line(&resumed)
+        );
+        assert_focus_visible(&resumed);
+    }
+    eprintln!(
+        "#75 shelf resume: node={} remained visible",
+        target.start.node
+    );
+    drop(resumed);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn issue75_frame(ctx: &egui::Context, reader: &mut DesktopReader) {
+    frame(ctx, reader);
+    for _ in 0..4 {
+        if reader.semantic_layout.pending_viewport.is_none() {
+            return;
+        }
+        super::semantic_layout::tests::finish_test_viewport_reflow(reader);
+        frame(ctx, reader);
+    }
+    assert!(
+        reader.semantic_layout.pending_viewport.is_none(),
+        "viewport failed to settle"
+    );
+}
+
+fn assert_focus_visible(reader: &DesktopReader) {
+    let viewport = reader.scroll_viewport.unwrap();
+    let rect = reader.focus_units[reader.focus_unit_index].rect;
+    let top = rect.top() + reader.scroll_content_padding(viewport.size.y) - viewport.offset_y;
+    let bottom = top + rect.height();
+    assert!(
+        top < viewport.size.y && bottom > 0.0,
+        "focus scrolled outside the viewport: {}",
+        state_line(reader)
+    );
+}
+
+#[test]
 fn search_jump_clears_a_previous_toc_override_and_pending_navigation() {
     let (mut reader, section) = chapter_book(ReadingMode::Focus);
     toc_jump(&mut reader, "Chapter 1");
@@ -176,6 +446,17 @@ fn chapter_book_with_progress(
         book,
         section: section.clone(),
     });
+    let reader = source_reader(source, reading_mode, progress_store, restored_source_range);
+    (reader, section)
+}
+
+fn source_reader(
+    source: Arc<dyn BookSource>,
+    reading_mode: ReadingMode,
+    progress_store: Option<crate::sync::SyncStore>,
+    restored_source_range: Option<SourceRange>,
+) -> DesktopReader {
+    let book_id = source.book().id.to_string();
     let settings = PluginSettings::default().with_test_model();
     let rewrite_source = Arc::new(RewriteBookSource::new(source.clone()));
     let translation_source = Arc::new(TranslationBookSource::new(
@@ -199,7 +480,7 @@ fn chapter_book_with_progress(
     )
     .unwrap();
     if let Some(store) = &progress_store
-        && let Some(progress) = store.load_progress("sidebar-scroll-regression").unwrap()
+        && let Some(progress) = store.load_progress(&book_id).unwrap()
     {
         session.restore_locator(&progress.locator).unwrap();
     }
@@ -217,9 +498,9 @@ fn chapter_book_with_progress(
             pdf_ocr_mode: PdfOcrViewMode::Original,
             cover: None,
             format: BookFormat::Epub,
-            book_id: "sidebar-scroll-regression".into(),
+            book_id: book_id.clone(),
             display_metadata: BookDisplayMetadata {
-                id: "sidebar-scroll-regression".into(),
+                id: book_id,
                 title: "Fixture".into(),
                 authors: vec![],
             },
@@ -246,7 +527,7 @@ fn chapter_book_with_progress(
     reader.ui.sidebar_open = true;
     reader.ui.sidebar_pinned = reading_mode == ReadingMode::Classic;
     reader.ui.sidebar_motion = Motion::settled(1.0);
-    (reader, section)
+    reader
 }
 
 fn frame(ctx: &egui::Context, reader: &mut DesktopReader) {

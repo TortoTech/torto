@@ -14,11 +14,9 @@ pub struct ReadingOptions {
     pub latin_cjk_font: String,
     pub monospace_font: String,
     pub font_weight: u16,
-    pub focus_style: String,
+    /// Legacy on-disk preference; paragraph structure is now controlled per focused unit.
     pub sentence_split: bool,
-    pub scroll_focus: bool,
     pub translated: bool,
-    pub ai_prefetch: bool,
 }
 impl Default for ReadingOptions {
     fn default() -> Self {
@@ -29,11 +27,8 @@ impl Default for ReadingOptions {
             latin_cjk_font: String::new(),
             monospace_font: "monospace".into(),
             font_weight: 400,
-            focus_style: "dim".into(),
             sentence_split: false,
-            scroll_focus: true,
             translated: false,
-            ai_prefetch: true,
         }
     }
 }
@@ -142,7 +137,6 @@ impl MobileCore {
     pub async fn save_reading_options(self: Arc<Self>, options: ReadingOptions) -> Result<()> {
         work(move || {
             if !(200..=900).contains(&options.font_weight)
-                || !matches!(options.focus_style.as_str(), "dim" | "highlight")
                 || [
                     &options.cjk_font,
                     &options.cjk_latin_font,
@@ -389,10 +383,10 @@ impl MobileReader {
                 apply_typography(&mut style, &options);
                 s.pipeline
                     .structure
-                    .set_all_active(options.sentence_split && s.focus)
+                    .set_enabled(s.focus)
                     .map_err(error)?;
                 s.options = options;
-                style.spread = if s.focus && s.options.scroll_focus {
+                style.spread = if s.focus {
                     SpreadMode::Scroll
                 } else {
                     SpreadMode::Single
@@ -416,13 +410,14 @@ impl MobileReader {
                     });
                 s.scroll_offset = 0.0;
                 s.scroll_center = true;
-                s.scroll_slices.clear();
+                scroll::invalidate(s);
                 render(s)
             })
         })
         .await
     }
     pub async fn reload_ai_options(self: Arc<Self>) -> Result<Arc<MobilePage>> {
+        self.retry_ai();
         work(move || {
             self.with(|s| {
                 let settings = PluginSettings::load_default().map_err(error)?;
@@ -438,13 +433,11 @@ impl MobileReader {
                     .translation
                     .set_mode(settings.translation_mode)
                     .map_err(error)?;
-                s.pipeline.semantic.configure(
+                s.pipeline.semantic.configure_presentation(
                     &plugins::pdf_native::cache_identity(&s.book_id, s.pipeline.rewrite.as_ref()),
-                    &settings,
+                    &settings,s.session.style().typesetting.mode==TypesettingMode::Unified,
                 );
-                s.session.refresh_source().map_err(error)?;
-                s.scroll_center = true;
-                s.scroll_slices.clear();
+                reflow::refresh(s)?;
                 render(s)
             })
         })

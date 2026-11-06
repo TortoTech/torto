@@ -12,14 +12,15 @@ const CHINESE_RELEASE_NOTES_SUMMARY: &str = "中文更新说明";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
     WindowsX64,
+    WindowsPortableX64,
     AndroidArm64,
     AndroidX64,
     MacosArm64,
     MacosX64,
 }
 impl Platform {
-    pub const ALL: [Self; 5] = [
-        Self::WindowsX64, Self::AndroidArm64, Self::AndroidX64,
+    pub const ALL: [Self; 6] = [
+        Self::WindowsX64, Self::WindowsPortableX64, Self::AndroidArm64, Self::AndroidX64,
         Self::MacosArm64, Self::MacosX64,
     ];
     pub fn is_macos(self) -> bool {
@@ -28,6 +29,7 @@ impl Platform {
     pub fn suffix(self) -> &'static str {
         match self {
             Self::WindowsX64 => "-x86_64.msi",
+            Self::WindowsPortableX64 => "-windows-x86_64-portable.zip",
             Self::AndroidArm64 => "-android-arm64-v8a.apk",
             Self::AndroidX64 => "-android-x86_64.apk",
             Self::MacosArm64 => "-macos-arm64.zip",
@@ -40,6 +42,7 @@ impl Platform {
     pub fn manifest(self) -> &'static str {
         match self {
             Self::WindowsX64 => "torto-update.json",
+            Self::WindowsPortableX64 => "torto-windows-portable-update.json",
             Self::MacosArm64 => "torto-macos-arm64-update.json",
             Self::MacosX64 => "torto-macos-x86_64-update.json",
             _ => "torto-android-update.json",

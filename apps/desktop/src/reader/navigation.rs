@@ -35,11 +35,25 @@ impl DesktopReader {
             return;
         };
         let attempt_started = std::time::Instant::now();
-        match self.reader.try_go_to_href(&pending.target) {
+        let by_id = self
+            .reader
+            .toc_items()
+            .iter()
+            .any(|row| row.id == pending.id);
+        let attempt = if by_id {
+            self.reader.try_go_to_toc(&pending.id)
+        } else {
+            self.reader.try_go_to_href(&pending.target)
+        };
+        match attempt {
             Ok(NavigationAttempt::Pending) => {}
             Ok(NavigationAttempt::Ready(result)) => {
                 self.pending_toc_navigation = None;
-                let focus_anchor = self.reader.source_anchor_for_href(&pending.target);
+                let focus_anchor = if by_id {
+                    self.reader.source_anchor_for_toc(&pending.id)
+                } else {
+                    self.reader.source_anchor_for_href(&pending.target)
+                };
                 self.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
                 crate::diagnostics::log(
                     "reader.toc_ready",
@@ -58,7 +72,7 @@ impl DesktopReader {
                 if !self.is_focus_mode() {
                     return;
                 }
-                self.focus_toc_override = Some(pending.id.clone());
+                self.focus_toc_override = by_id.then(|| pending.id.clone());
                 if let Some(item) = self
                     .reader
                     .toc_items()

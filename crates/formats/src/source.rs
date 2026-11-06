@@ -420,26 +420,8 @@ impl DirectBookSource {
     }
 }
 
-impl BookSource for DirectBookSource {
-    fn book(&self) -> &Book {
-        &self.book
-    }
-
-    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
-        self.table_of_contents_origin
-    }
-
-    fn cover_section(&self) -> Result<Option<Section>, PublicationError> {
-        let Some(href) = &self.cover_page else {
-            return Ok(None);
-        };
-        let Some(index) = descriptors_index(href, self.sections.len()) else {
-            return Ok(None);
-        };
-        self.parse_section(index).map(Some)
-    }
-
-    fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+impl DirectBookSource {
+    fn parse_section_ir(&self, index: usize, ignore_body_margins: bool) -> Result<Section, PublicationError> {
         let descriptor = self
             .book
             .sections
@@ -475,7 +457,7 @@ impl BookSource for DirectBookSource {
                         )
                     },
                     |href| self.html_context.font_traits(href, || self.resources.get(href.path()).map(|r| &r.bytes)),
-                    self.html_context.hints(descriptor),
+                    rebook_html::SectionParseHints { ignore_body_margins, ..self.html_context.hints(descriptor) },
                 )
                 .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
                 if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {
@@ -502,6 +484,34 @@ impl BookSource for DirectBookSource {
                 })
             }
         }
+    }
+}
+
+impl BookSource for DirectBookSource {
+    fn book(&self) -> &Book {
+        &self.book
+    }
+
+    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
+        self.table_of_contents_origin
+    }
+
+    fn cover_section(&self) -> Result<Option<Section>, PublicationError> {
+        let Some(href) = &self.cover_page else {
+            return Ok(None);
+        };
+        let Some(index) = descriptors_index(href, self.sections.len()) else {
+            return Ok(None);
+        };
+        self.parse_section(index).map(Some)
+    }
+
+    fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+        self.parse_section_ir(index, false)
+    }
+
+    fn parse_section_without_body_margins(&self, index: usize) -> Result<Section, PublicationError> {
+        self.parse_section_ir(index, true)
     }
 
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {

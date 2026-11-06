@@ -1,4 +1,4 @@
-use rebook_app_core::reading_text::{FocusFootnoteSource, block_source_range, text_block_focus_footnotes, block_focus_footnotes, focus_footnote_text_in_section, find_block_containing_anchor, note_definition_containing_anchor, normalize_resolved_footnote_text, text_block_focus_text, block_focus_text, focus_block_paint_ranges, source_range_contains_anchor};
+use rebook_app_core::reading_text::{FocusFootnoteSource, focus_block_structure_ranges, block_source_range, text_block_focus_footnotes, block_focus_footnotes, focus_footnote_text_in_section, find_block_containing_anchor, note_definition_containing_anchor, normalize_resolved_footnote_text, text_block_focus_text, block_focus_text, focus_block_paint_ranges, source_range_contains_anchor};
 use crate::plugins::semantic_layout::SemanticLayoutSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -40,9 +40,10 @@ const INITIAL_WIDTH: u32 = 1200;
 const INITIAL_HEIGHT: u32 = 800;
 const MOTION_DURATION: Duration = Duration::from_millis(180);
 const TOOLBAR_MOTION_DURATION: Duration = Duration::from_millis(200);
-const FOCUS_SCROLL_POINTS_PER_SECOND: f32 = 1_000.0;
-const FOCUS_SCROLL_MIN_DURATION: Duration = Duration::from_millis(160);
-const FOCUS_SCROLL_MAX_DURATION: Duration = Duration::from_millis(360);
+#[cfg(test)]
+const FOCUS_SCROLL_MIN_DURATION: Duration = rebook_app_core::focus_navigation::MIN_DURATION;
+#[cfg(test)]
+const FOCUS_SCROLL_MAX_DURATION: Duration = rebook_app_core::focus_navigation::MAX_DURATION;
 const FOCUS_UNIT_MIN_HEIGHT: f32 = 240.0;
 const FOCUS_TRAILING_SCROLL_SPACE: f32 = FOCUS_UNIT_MIN_HEIGHT / 2.0;
 const TOOLBAR_HIDE_DELAY: Duration = Duration::from_millis(500);
@@ -66,6 +67,7 @@ static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CHAT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 mod assistant;
+mod pdf_zoom;
 mod title_translations;
 #[cfg(test)]
 mod blank_lines_tests;
@@ -453,9 +455,8 @@ pub(crate) fn open_reader_staged(
         style.column_gap = 0.0;
     }
     apply_theme_colors(&mut style, crate::ui::theme());
-    semantic_source.set_unified_citations(
-        !fixed_page && style.typesetting.mode == rebook_layout::TypesettingMode::Unified,
-    );
+    semantic_source.configure_presentation(&crate::plugins::pdf_native::cache_identity(&book_id,rewrite_source.as_ref()),&plugin_settings,
+        !fixed_page && style.typesetting.mode==rebook_layout::TypesettingMode::Unified);
     let sync_settings = SyncSettings::load_default().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load WebDAV settings; using defaults");
         SyncSettings::new_device()
@@ -938,6 +939,7 @@ pub(super) struct DesktopReader {
     translation: TranslationUiState,
     pdf_toc: PdfTocUiState,
     pdf_ocr: PdfOcrUiState,
+    pdf_zoom: pdf_zoom::State,
     ui: ReaderUiState,
     canvas_size: Option<(u32, u32)>,
     scene_id: u64,
@@ -1161,34 +1163,9 @@ fn text_block_footnote_references(block: &TextBlock) -> Vec<(String, Publication
 
 
 
-fn text_block_has_link_role(block: &TextBlock, role: LinkRole) -> bool {
-    block.content.iter().any(|inline| {
-        matches!(inline, Inline::Text(run) if run.link.is_some() && run.style.link_role == role)
-    })
-}
-
 fn block_is_footnote_definition(block: &Block) -> bool {
-    if block.is_footnote_definition() {
-        return true;
-    }
-    match block {
-        Block::Note(_) => true,
-        Block::Text(block) => text_block_has_link_role(block, LinkRole::FootnoteBacklink),
-        Block::Quote(quote) => quote
-            .body
-            .iter()
-            .chain(quote.attribution.iter())
-            .any(|block| text_block_has_link_role(block, LinkRole::FootnoteBacklink)),
-        Block::Table(table) => table
-            .text_blocks()
-            .any(|text| text_block_has_link_role(text, LinkRole::FootnoteBacklink)),
-        Block::Figure(figure) => figure.text_blocks()
-            .any(|caption| text_block_has_link_role(caption, LinkRole::FootnoteBacklink)),
-        Block::Image(_) | Block::Separator(_) | Block::LineBreak | Block::PageBreak => false,
-    }
+    rebook_app_core::focus_content::is_footnote_definition(block)
 }
-
-
 
 fn focus_footnote_text(
     source: &dyn BookSource,
@@ -1217,86 +1194,9 @@ fn focus_footnote_text(
 
 
 
-fn focus_footnote_translation_ranges_in_section(
-    section: &Section,
-    target: &PublicationUrl,
-) -> Vec<SourceRange> {
-    let Some(fragment) = target.fragment() else {
-        return Vec::new();
-    };
-    let Some(anchor) = section
-        .anchors
-        .iter()
-        .find(|anchor| anchor.fragment == fragment)
-        .map(|anchor| &anchor.source)
-    else {
-        return Vec::new();
-    };
-    let target_block = section
-        .blocks
-        .iter()
-        .find_map(|block| note_definition_containing_anchor(block, anchor))
-        .or_else(|| {
-            section
-                .blocks
-                .iter()
-                .find_map(|block| find_block_containing_anchor(block, anchor))
-        });
-    let Some(target_block) = target_block else {
-        return Vec::new();
-    };
-    let mut ranges = Vec::new();
-    collect_focus_footnote_translation_ranges(target_block, &mut ranges);
-    ranges
+fn focus_footnote_translation_ranges_in_section(section: &Section, target: &PublicationUrl) -> Vec<SourceRange> {
+    rebook_app_core::reading_text::focus_footnote_translation_ranges_in_section(section, target)
 }
-
-fn collect_focus_footnote_translation_ranges(block: &Block, ranges: &mut Vec<SourceRange>) {
-    let mut push_text = |text: &TextBlock| {
-        if let Some(range) = &text.source
-            && !ranges.contains(range)
-        {
-            ranges.push(range.clone());
-        }
-    };
-    match block {
-        Block::Text(text) => push_text(text),
-        Block::Quote(quote) => {
-            for text in quote.body.iter().chain(quote.attribution.iter()) {
-                push_text(text);
-            }
-        }
-        Block::Table(table) => {
-            for text in table.text_blocks() {
-                push_text(text);
-            }
-        }
-        Block::Figure(figure) => {
-            for caption in figure.text_blocks() {
-                push_text(caption);
-            }
-        }
-        Block::Note(note) => {
-            for child in &note.blocks {
-                collect_focus_footnote_translation_ranges(child, ranges);
-            }
-        }
-        Block::Image(image) => {
-            if let Some(range) = &image.source
-                && !ranges.contains(range)
-            {
-                ranges.push(range.clone());
-            }
-        }
-        Block::Separator(_) | Block::LineBreak | Block::PageBreak => {}
-    }
-}
-
-
-
-
-
-
-
 
 
 fn markdown_table_cell(text: &str) -> String {
@@ -1443,42 +1343,6 @@ fn merge_inferred_caption_focus_unit(image: &mut FocusUnit, caption: FocusUnit) 
     image.footnotes.extend(caption.footnotes);
 }
 
-fn focus_block_structure_ranges(block: &Block) -> Vec<SourceRange> {
-    match block {
-        Block::Text(text)
-            if matches!(
-                text.kind,
-                TextBlockKind::Paragraph
-                    | TextBlockKind::Blockquote
-                    | TextBlockKind::Caption
-                    | TextBlockKind::ListItem { .. }
-            ) =>
-        {
-            text.source.iter().cloned().collect()
-        }
-        Block::Figure(figure) => figure.text_blocks()
-            .filter_map(|caption| caption.source.clone())
-            .collect(),
-        Block::Quote(quote) => quote
-            .body
-            .iter()
-            .filter(|body| {
-                matches!(
-                    body.kind,
-                    TextBlockKind::Paragraph | TextBlockKind::Blockquote
-                )
-            })
-            .filter_map(|body| body.source.clone())
-            .collect(),
-        Block::Text(_)
-        | Block::Table(_)
-        | Block::Image(_)
-        | Block::Note(_)
-        | Block::Separator(_)
-        | Block::LineBreak
-        | Block::PageBreak => Vec::new(),
-    }
-}
 
 fn focus_unit_geometry_ranges(
     is_first_unit: bool,
@@ -1882,8 +1746,7 @@ fn focus_unit_screen_center_y(
 }
 
 fn focus_scroll_duration(distance: f32) -> Duration {
-    let duration = Duration::from_secs_f32(distance.abs() / FOCUS_SCROLL_POINTS_PER_SECOND);
-    duration.clamp(FOCUS_SCROLL_MIN_DURATION, FOCUS_SCROLL_MAX_DURATION)
+    rebook_app_core::focus_navigation::duration(distance)
 }
 
 fn focus_scroll_target(
@@ -1893,35 +1756,7 @@ fn focus_scroll_target(
     step: f32,
     direction: PageDirection,
 ) -> Option<f32> {
-    let distance = (bottom - top).max(0.0);
-    let step_count = (distance / step.max(1.0)).ceil().max(1.0);
-    let balanced_step = distance / step_count;
-    let current_anchor = if balanced_step <= MOTION_EPSILON {
-        0.0
-    } else {
-        ((current - top) / balanced_step)
-            .round()
-            .clamp(0.0, step_count)
-    };
-    match direction {
-        PageDirection::Previous if current > top + FOCUS_SCROLL_BOUNDARY_EPSILON => {
-            let index = (current_anchor - 1.0).max(0.0);
-            Some(if index == 0.0 {
-                top
-            } else {
-                (top + index * balanced_step).max(top)
-            })
-        }
-        PageDirection::Next if current < bottom - FOCUS_SCROLL_BOUNDARY_EPSILON => {
-            let index = (current_anchor + 1.0).min(step_count);
-            Some(if index == step_count {
-                bottom
-            } else {
-                (top + index * balanced_step).min(bottom)
-            })
-        }
-        PageDirection::Previous | PageDirection::Next => None,
-    }
+    rebook_app_core::focus_navigation::overflow_target(current, top, bottom, step, matches!(direction, PageDirection::Next))
 }
 
 impl ScrollSectionLayout {
@@ -2686,6 +2521,14 @@ impl DesktopReader {
             } else {
                 None
             };
+            if !rebook_app_core::focus_content::is_body(block, self.reader.style().typesetting.mode == rebook_layout::TypesettingMode::Unified)
+                && !matches!(block, Block::Text(text) if text.kind.is_heading())
+            {
+                if !matches!(block, Block::Text(text) if text.source.is_none()
+                    || matches!(text.kind, TextBlockKind::ListItem {depth, ..} if depth > 0))
+                { active_list_root = None; }
+                continue;
+            }
             let (range, paint_ranges, text, is_image, is_table, rectangular_activation, list_depth) =
                 match block {
                     Block::Text(block) => {
@@ -3431,7 +3274,10 @@ impl DesktopReader {
         let visible_is_pending = visible_position.is_some_and(|position| {
             visible_was_placeholder && !ready_placeholders.contains(&position)
         });
+        let pdf_preserving=self.pdf_zoom_enabled() && self.pdf_zoom.progress_lock.is_some_and(|offset|(offset-viewport.offset_y).abs()<0.1);
+        if !pdf_preserving { self.pdf_zoom.progress_lock=None; }
         if let Some(position) = visible_position
+            && !pdf_preserving
             && position != current
             && !visible_is_pending
         {
@@ -3469,7 +3315,7 @@ impl DesktopReader {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) fn update_save_job(&mut self) -> Box<dyn FnOnce() -> Result<(), String> + Send> {
         self.statistics.flush_pending();
         let pending = self.progress_store.clone()
@@ -3578,11 +3424,7 @@ fn effective_typesetting(
     reading_mode: ReadingMode,
     configured: &ReaderTypesetting,
 ) -> ReaderTypesetting {
-    if reading_mode == ReadingMode::Focus {
-        ReaderTypesetting::unified()
-    } else {
-        configured.clone()
-    }
+    rebook_app_core::reading::effective_typesetting(reading_mode == ReadingMode::Focus, configured)
 }
 
 struct DesktopReaderResources {
@@ -4501,6 +4343,7 @@ impl DesktopReader {
             translation: TranslationUiState::default(),
             pdf_toc,
             pdf_ocr,
+            pdf_zoom: Default::default(),
             ui: ReaderUiState {
                 classic_sidebar: chrome::SidebarState::default(),
                 opening_toolbar_pending: false,
@@ -5834,6 +5677,7 @@ mod tests {
             },
             leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
+                clip: None,
                 formula_presentation: None,
                 image: RasterImage {
                     deferred: None,
@@ -5884,6 +5728,7 @@ mod tests {
                 background: Rgba::BLACK,
                 leading_gap,
                 items: vec![PageItem::Image(ImagePlacement {
+                    clip: None,
                     formula_presentation: None,
                     image: RasterImage {
                         deferred: None,

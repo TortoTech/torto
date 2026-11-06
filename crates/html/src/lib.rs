@@ -31,6 +31,7 @@ mod semantic_structures_tests;
 mod reader_regressions;
 mod media_semantics;
 mod nested_media;
+mod preceding_figures;
 mod paragraph_lists;
 mod definition_lists;
 mod paragraph_groups;
@@ -53,6 +54,8 @@ pub enum HtmlError {
 /// Publication-level semantic hints that cannot be derived reliably from one HTML resource.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SectionParseHints<'a> {
+    /// Reader-owned page spacing replaces body margins, leaving child styles intact.
+    pub ignore_body_margins: bool,
     /// The publication navigation identifies this entire resource as Notes/Endnotes.
     pub note_section: bool,
     /// Known navigation resources and ancestor chapter targets, not guessed filenames.
@@ -338,7 +341,11 @@ pub fn parse_section_with_resource_metadata(
     })?;
     #[cfg(debug_assertions)]
     let document_finished = profile_started.elapsed();
-    let styles = StyleSheet::from_document_with_fonts(&document, &descriptor.href, &mut load_stylesheet, &mut font_metadata);
+    let mut styles = StyleSheet::from_document_with_fonts(&document, &descriptor.href, &mut load_stylesheet, &mut font_metadata);
+    if hints.ignore_body_margins {
+        styles.ignore_body_margins = true;
+        styles.cascaded_cache.get_mut().clear();
+    }
     #[cfg(debug_assertions)]
     let styles_finished = profile_started.elapsed();
     let root = document
@@ -392,6 +399,13 @@ pub fn parse_section_with_resource_metadata(
     }
 
     page_markers::annotate(root, &mut parser);
+    let heading_nodes = parser
+        .anchors
+        .iter()
+        .filter(|anchor| parser.heading_fragments.contains(&anchor.fragment))
+        .map(|anchor| anchor.source.node.clone())
+        .collect();
+    media_semantics::resolve_quoted_captions(&mut parser.blocks, &heading_nodes);
     structured_figures::attach_sources(&mut parser.blocks);
 
     #[cfg(debug_assertions)]
@@ -447,7 +461,7 @@ struct ReadingIrParser<'a> {
     suppressed_content: bool,
     inside_breadcrumb: bool,
     inside_hidden_content: bool,
-    image_width_contexts: HashMap<roxmltree::NodeId, rebook_publication::ImageContainerWidth>,
+    image_width_contexts: HashMap<roxmltree::NodeId, image_context::ImageContext>,
     navigation_documents: HashSet<String>,
     ancestor_targets: HashSet<String>,
     heading_fragments: HashSet<String>,
@@ -510,6 +524,10 @@ impl<'a> ReadingIrParser<'a> {
                     continue;
                 }
                 if let Some(consumed) = self.try_parse_table_caption_group(&children[index..])? {
+                    index += consumed;
+                    continue;
+                }
+                if let Some(consumed) = self.try_parse_preceding_image_figure(&children[index..])? {
                     index += consumed;
                     continue;
                 }
@@ -737,6 +755,10 @@ impl<'a> ReadingIrParser<'a> {
                     continue;
                 }
                 if let Some(consumed) = self.try_parse_table_caption_group(&children[index..])? {
+                    index += consumed;
+                    continue;
+                }
+                if let Some(consumed) = self.try_parse_preceding_image_figure(&children[index..])? {
                     index += consumed;
                     continue;
                 }
@@ -2271,7 +2293,11 @@ impl<'a> ReadingIrParser<'a> {
             return Ok(None);
         }
         let mut style = self.styles.image_style(node);
-        style.container_width = self.image_container_width(node);
+        let geometry = self.image_geometry(node);
+        style.container_width = (geometry.width != rebook_publication::ImageContainerWidth { fraction: Some(1.0), pixels: None }).then_some(geometry.width);
+        style.container_height = geometry.height;
+        style.clip_width = geometry.clip_width;
+        style.clip_height = geometry.clip_height;
         if let Some((margin_before, margin_after)) = container_style {
             style.margin_before = style.margin_before.max(margin_before);
             style.margin_after = style.margin_after.max(margin_after);
@@ -2480,6 +2506,10 @@ fn has_caption_semantic_attribute(node: Node<'_, '_>) -> bool {
 }
 
 fn starts_with_numbered_caption_label(text: &str) -> bool {
+    caption_label_rest(text).is_some_and(starts_with_caption_identifier)
+}
+
+fn caption_label_rest(text: &str) -> Option<&str> {
     let text = text.trim_start_matches(|character: char| {
         character.is_whitespace()
             || matches!(
@@ -2490,7 +2520,7 @@ fn starts_with_numbered_caption_label(text: &str) -> bool {
 
     for label in ["图片", "图表", "插图", "图版", "表格", "图", "表"] {
         if let Some(rest) = text.strip_prefix(label) {
-            return starts_with_caption_identifier(rest.trim_start());
+            return Some(rest.trim_start());
         }
     }
 
@@ -2509,33 +2539,35 @@ fn starts_with_numbered_caption_label(text: &str) -> bool {
             if label == "fig" {
                 rest = rest.strip_prefix('.').unwrap_or(rest);
             }
-            return starts_with_caption_identifier(rest.trim_start());
+            return Some(rest.trim_start());
         }
     }
-    false
+    None
 }
 
 fn starts_with_caption_identifier(text: &str) -> bool {
-    text.chars().next().is_some_and(|character| {
-        character.is_ascii_digit()
-            || character.is_ascii_uppercase()
-            || matches!(
-                character,
-                '一' | '二'
-                    | '三'
-                    | '四'
-                    | '五'
-                    | '六'
-                    | '七'
-                    | '八'
-                    | '九'
-                    | '十'
-                    | '百'
-                    | '千'
-                    | '零'
-                    | '〇'
-            )
-    })
+    text.chars().next().is_some_and(caption_identifier_start)
+}
+
+fn caption_identifier_start(character: char) -> bool {
+    character.is_ascii_digit()
+        || character.is_ascii_uppercase()
+        || matches!(
+            character,
+            '一' | '二'
+                | '三'
+                | '四'
+                | '五'
+                | '六'
+                | '七'
+                | '八'
+                | '九'
+                | '十'
+                | '百'
+                | '千'
+                | '零'
+                | '〇'
+        )
 }
 
 fn is_note_section_heading(node: Node<'_, '_>) -> bool {
@@ -3674,6 +3706,7 @@ impl QuoteLayoutMetrics {
 
 #[derive(Default)]
 struct StyleSheet {
+    ignore_body_margins: bool,
     rules: Vec<StyleRule>,
     marker_rules: Vec<(Selector, Option<rebook_publication::ListMarkerFormat>)>,
     rule_index: RuleIndex,
@@ -4170,23 +4203,14 @@ impl StyleSheet {
     }
 
     fn image_style(&self, node: Node<'_, '_>) -> ImageStyle {
+        let properties = self.cascaded_properties(node);
         let mut style = ImageStyle {
-            width: attribute_local(node, "width").and_then(image_length),
-            height: attribute_local(node, "height").and_then(image_length),
+            width: image_context::dimension(self, node, &properties, "width"),
+            height: image_context::dimension(self, node, &properties, "height"),
             ..ImageStyle::default()
         };
-        let properties = self.cascaded_properties(node);
-        // HTML dimensions are presentational hints. CSS auto explicitly clears
-        // that hint so the missing axis can use the image's intrinsic ratio.
-        for (name, dimension) in [("width", &mut style.width), ("height", &mut style.height)] {
-            if let Some(value) = properties.get(name) {
-                if value.trim().eq_ignore_ascii_case("auto") {
-                    *dimension = None;
-                } else if let Some(value) = image_length(value) {
-                    *dimension = Some(value);
-                }
-            }
-        }
+        style.min_width = properties.get("min-width").and_then(|v| image_length(v));
+        style.min_height = properties.get("min-height").and_then(|v| image_length(v));
         if let Some(value) = properties
             .get("max-width")
             .and_then(|value| image_length(value))
@@ -4276,6 +4300,9 @@ impl StyleSheet {
             insert_declarations(&mut properties, rule.important_declarations.iter().cloned());
         }
         insert_declarations(&mut properties, inline_important);
+        if self.ignore_body_margins && node.tag_name().name().eq_ignore_ascii_case("body") {
+            properties.retain(|name, _| name != "margin" && !name.starts_with("margin-"));
+        }
         let properties = Rc::new(properties);
         self.cascaded_cache
             .borrow_mut()
@@ -4648,11 +4675,14 @@ fn declarations_with_priority(style: &str) -> impl Iterator<Item = (String, Stri
         let (value, important) = value.rsplit_once('!')
             .filter(|(_, suffix)| suffix.trim().eq_ignore_ascii_case("important"))
             .map_or((value, false), |(value, _)| (value, true));
-        Some((
-            name.trim().to_ascii_lowercase(),
-            value.trim().to_ascii_lowercase(),
-            important,
-        ))
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+        if matches!(name.as_str(), "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height")
+            && image_length(&value).is_none()
+            && !matches!(value.as_str(), "auto" | "none" | "inherit" | "initial" | "unset" | "revert" | "revert-layer" | "min-content" | "max-content" | "fit-content" | "stretch")
+            && !["calc(", "var(", "min(", "max(", "clamp(", "fit-content("].iter().any(|prefix| value.starts_with(prefix))
+        { return None; }
+        Some((name, value, important))
     })
 }
 
@@ -4740,16 +4770,14 @@ fn image_length(value: &str) -> Option<ImageLength> {
     if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("none") {
         return None;
     }
+    // Nonzero unitless dimensions are HTML hints, not valid CSS lengths.
+    if value.parse::<f32>().is_ok_and(|n| n != 0.0) { return None; }
     if let Some(percent) = value.strip_suffix('%') {
         let fraction = percent.trim().parse::<f32>().ok()? / 100.0;
-        return fraction
-            .is_finite()
-            .then_some(ImageLength::Fraction(fraction.max(0.0)));
+        return (fraction.is_finite() && fraction >= 0.0).then_some(ImageLength::Fraction(fraction));
     }
     let pixels = css_length(value)?;
-    pixels
-        .is_finite()
-        .then_some(ImageLength::Pixels(pixels.max(0.0)))
+    (pixels.is_finite() && pixels >= 0.0).then_some(ImageLength::Pixels(pixels))
 }
 
 fn inline_em_length(value: &str) -> Option<f32> {
@@ -4770,6 +4798,53 @@ fn attribute_local<'a>(node: Node<'a, '_>, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_body_margin_filter_keeps_padding_child_spacing_and_source_anchors() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        for (body_margin, start, fraction) in [
+            ("margin:2em !important", 47.0, 0.0),
+            ("margin:2em; margin-inline-start:10% !important", 15.0, 0.1),
+        ] {
+            let xml = format!(r#"<html><head/><body style="{body_margin};padding-left:3px">
+                <h2 id="title" style="margin-left:9px;margin-top:13px">Title</h2>
+                <div style="margin-left:7px"><p id="text" style="margin-left:5px;margin-top:11px;text-indent:9px">Body text</p></div>
+                <ul style="margin-left:11px"><li style="margin-left:13px">List item</li></ul>
+                </body></html>"#);
+            let parse = |ignore_body_margins| parse_section_with_hints_and_image_classifier(
+                &xml, &descriptor, |_| None, |_| false,
+                SectionParseHints { ignore_body_margins, ..Default::default() },
+            ).unwrap();
+            let original = parse(false);
+            let filtered = parse(true);
+            let text = |section: &Section| section.blocks.iter().flat_map(Block::text_blocks).cloned().collect::<Vec<_>>();
+            let before = text(&original);
+            let after = text(&filtered);
+            assert_eq!(before.len(), after.len());
+            assert_eq!(original.anchors, filtered.anchors);
+            for (before, after) in before.iter().zip(&after) {
+                assert_eq!(before.source, after.source);
+                assert_eq!(before.content, after.content);
+                assert_eq!(before.kind, after.kind);
+            }
+            assert_close(before[1].style.margin_start, start);
+            assert_close(before[1].style.margin_start_fraction, fraction);
+            assert_close(after[0].style.margin_start, 12.0);
+            assert_close(after[0].style.margin_before, 13.0);
+            assert_close(after[1].style.margin_start, 15.0);
+            assert_close(after[1].style.margin_start_fraction, 0.0);
+            assert_close(after[1].style.margin_before, 11.0);
+            assert_close(after[1].style.indent, 9.0);
+            assert_close(after[2].style.margin_start, 27.0);
+            assert_eq!(parse(false), original, "filtering one parse cannot alter the default desktop parse");
+        }
+    }
 
     #[test]
     fn failed_quote_scan_does_not_skip_a_valid_suffix_with_a_different_inset() {

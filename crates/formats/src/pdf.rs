@@ -74,6 +74,10 @@ fn render_page_region<'a>(
     settings: &PageRasterSettings,
     origin: (u16, u16),
 ) -> hayro::vello_cpu::Pixmap {
+    render_page_region_at(page, cache, interpreter_settings, settings, (f64::from(origin.0), f64::from(origin.1)))
+}
+
+fn render_page_region_at<'a>(page: &'a hayro::hayro_syntax::page::Page<'a>, cache: &RenderCache<'a>, interpreter_settings: &InterpreterSettings, settings: &PageRasterSettings, origin: (f64, f64)) -> hayro::vello_cpu::Pixmap {
     let (width, height) = page.render_dimensions();
     let width = settings
         .width
@@ -248,6 +252,68 @@ fn open_data(
 }
 
 impl BookSource for PdfPublication {
+    fn fixed_page_points(&self, index: usize) -> Option<[f32; 2]> {
+        self.pdf.pages().get(index).map(|page| {
+            let (w, h) = page.render_dimensions();
+            [w, h]
+        })
+    }
+
+    fn fixed_page_region(
+        &self,
+        index: usize,
+        region: [f32; 4],
+        pixels: [u32; 2],
+    ) -> Result<Option<RasterResource>, PublicationError> {
+        if region.iter().any(|v| !v.is_finite())
+            || region[0] < 0.
+            || region[1] < 0.
+            || region[2] <= 0.
+            || region[3] <= 0.
+            || region[0] + region[2] > 1.001
+            || region[1] + region[3] > 1.001
+            || pixels.contains(&0)
+            || pixels.iter().any(|p| *p > 4096)
+            || u64::from(pixels[0]) * u64::from(pixels[1]) > 8 * 1024 * 1024
+        {
+            return Err(PublicationError::InvalidPublication(
+                "Invalid PDF viewport raster budget".into(),
+            ));
+        }
+        let page =
+            self.pdf.pages().get(index).ok_or_else(|| {
+                PublicationError::ResourceNotFound(format!("PDF page {}", index + 1))
+            })?;
+        let (w, h) = page.render_dimensions();
+        let sx = pixels[0] as f32 / (w * region[2]);
+        let sy = pixels[1] as f32 / (h * region[3]);
+        let x = w * region[0] * sx;
+        let y = h * region[1] * sy;
+        if sx > 32. || sy > 32. || x > 65535. || y > 65535. {
+            return Err(PublicationError::InvalidPublication(
+                "PDF viewport magnification exceeds budget".into(),
+            ));
+        }
+        let settings = PageRasterSettings {
+            x_scale: sx,
+            y_scale: sy,
+            width: Some(pixels[0] as u16),
+            height: Some(pixels[1] as u16),
+            ..Default::default()
+        };
+        let raster = render_page_region_at(
+            page,
+            &RenderCache::new(),
+            &self.interpreter,
+            &settings,
+            (x as f64, y as f64),
+        );
+        Ok(Some(RasterResource {
+            width: pixels[0],
+            height: pixels[1],
+            pixels: Arc::from(raster.data_as_u8_slice()),
+        }))
+    }
     fn missing_font_resources(&self) -> bool {
         self.missing_fonts.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -849,6 +915,33 @@ mod tests {
         assert!(cover_dimensions.0 <= page_dimensions.0);
         assert!(cover_dimensions.1 <= page_dimensions.1);
         assert_ne!(cover_dimensions, (0, 0));
+    }
+
+    #[test]
+    fn viewport_raster_keeps_page_geometry_and_rejects_oversized_requests() {
+        let publication = open(minimal_pdf(), "viewport.pdf").unwrap();
+        let section = publication.parse_section(0).unwrap();
+        let [w, h] = publication.fixed_page_points(0).unwrap();
+        let region = [0.05, 0.05, 0.9, 0.9];
+        let raster = publication
+            .fixed_page_region(0, region, [720, 720])
+            .unwrap()
+            .unwrap();
+        assert_eq!(raster.pixels.len(), 720 * 720 * 4);
+        assert!(raster.pixels.chunks_exact(4).any(|p| p[3] > 100));
+        assert_eq!(publication.fixed_page_points(0), Some([w, h]));
+        assert_eq!(publication.parse_section(0).unwrap(), section);
+        assert!(
+            publication.lock_cache().unwrap().rasters.is_empty(),
+            "viewport pixels do not pollute whole-page cache"
+        );
+        for (rect, size) in [
+            ([0., 0., 1., 1.], [8000, 8000]),
+            ([f32::NAN, 0., 1., 1.], [100, 100]),
+            ([0.8, 0., 0.5, 1.], [100, 100]),
+        ] {
+            assert!(publication.fixed_page_region(0, rect, size).is_err());
+        }
     }
 
     fn png_dimensions(bytes: &[u8]) -> (u32, u32) {

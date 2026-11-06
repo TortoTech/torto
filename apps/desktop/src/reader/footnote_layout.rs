@@ -362,21 +362,7 @@ impl FootnoteRenderer {
         // Match the integer viewport used for shaping, including SVG extent and
         // cache identity. Subpixel width noise cannot change the actual layout.
         let width = width.floor();
-        let mut style = reader_style.clone();
-        style.typography.font_size = size;
-        style.typography.minimum_font_size = size;
-        // Leave room for glyph side bearings and antialiasing at the SVG edge.
-        style.horizontal_margin = 2.0;
-        // The popup owns its padding; focus-mode page constraints must not
-        // enlarge the text inset or reduce the popup's available line width.
-        style.minimum_horizontal_margin = 0.0;
-        style.minimum_content_width = 0.0;
-        style.top_margin = 0.0;
-        style.bottom_margin = 0.0;
-        style.spread = SpreadMode::Single;
-        style.website_icons = reader_style.typesetting.mode == TypesettingMode::Unified;
-        style.typesetting.mode = TypesettingMode::Book;
-        style.typesetting.line_break_strategy = rebook_layout::LineBreakStrategy::Optimized;
+        let mut style = rebook_app_core::reading::note_style(reader_style,size);
         style.foreground = rebook_publication::Rgba {
             red: color.r(),
             green: color.g(),

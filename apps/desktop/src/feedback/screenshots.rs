@@ -1,10 +1,7 @@
 use super::model::Screenshot;
 use crate::async_task::TaskResult;
-use base64::Engine;
-use std::io::Cursor;
 
-pub(super) const MAX_IMAGES: usize = 3;
-const MAX_BYTES: usize = 2 * 1024 * 1024;
+pub(super) use rebook_app_core::feedback::images::MAX_IMAGES;
 
 #[derive(Clone)]
 pub(super) enum Source {
@@ -107,65 +104,12 @@ pub(super) async fn preview(screenshot: Screenshot) -> Result<egui::ColorImage, 
     .map_err(|_| "image".to_owned())?
 }
 
-fn decode(screenshot: &Screenshot) -> Result<image::DynamicImage, String> {
-    if screenshot.data.len() > MAX_BYTES.div_ceil(3) * 4 {
-        return Err("image".into());
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&screenshot.data)
-        .map_err(|_| "image")?;
-    let format = image::guess_format(&bytes).map_err(|_| "image")?;
-    if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg) {
-        return Err("image".into());
-    }
-    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(32 * 1024 * 1024);
-    limits.max_image_width = Some(2048);
-    limits.max_image_height = Some(2048);
-    reader.limits(limits);
-    reader.decode().map_err(|_| "image".into())
+fn decode(screenshot:&Screenshot)->Result<image::DynamicImage,String> {
+    rebook_app_core::feedback::images::decode(screenshot)
 }
-
-pub(super) fn encode(image: image::DynamicImage) -> Result<Prepared, String> {
-    // Clipboard images often have an alpha channel even when every pixel is opaque.
-    let transparent = match &image {
-        image::DynamicImage::ImageLumaA8(pixels) => pixels.pixels().any(|p| p[1] < 255),
-        image::DynamicImage::ImageRgba8(pixels) => pixels.pixels().any(|p| p[3] < 255),
-        image::DynamicImage::ImageLumaA16(pixels) => pixels.pixels().any(|p| p[1] < 65535),
-        image::DynamicImage::ImageRgba16(pixels) => pixels.pixels().any(|p| p[3] < 65535),
-        image::DynamicImage::ImageRgba32F(pixels) => pixels.pixels().any(|p| p[3] != 1.0),
-        _ => image.color().has_alpha(),
-    };
-    let mut image = image.thumbnail(2048, 2048);
-    if !transparent {
-        image = image::DynamicImage::ImageRgb8(image.to_rgb8());
-    }
-    loop {
-        let mut bytes = Cursor::new(Vec::new());
-        if transparent {
-            image.write_to(&mut bytes, image::ImageFormat::Png)
-        } else {
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 92).encode_image(&image)
-        }
-        .map_err(|_| "image")?;
-        let bytes = bytes.into_inner();
-        if bytes.len() <= MAX_BYTES {
-            return Ok(Prepared {
-                screenshot: Screenshot {
-                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
-                },
-                thumbnail: thumbnail(&image),
-            });
-        }
-        if image.width().max(image.height()) <= 512 {
-            return Err("image".into());
-        }
-        image = image.thumbnail(
-            (image.width() * 3 / 4).max(1),
-            (image.height() * 3 / 4).max(1),
-        );
-    }
+pub(super) fn encode(image:image::DynamicImage)->Result<Prepared,String> {
+    let screenshot=rebook_app_core::feedback::images::encode(image)?;
+    restore(screenshot)
 }
 
 fn thumbnail(image: &image::DynamicImage) -> egui::ColorImage {

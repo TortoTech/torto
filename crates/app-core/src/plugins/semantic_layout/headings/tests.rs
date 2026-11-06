@@ -106,6 +106,7 @@ fn live_numbered_headings_and_book_page_numbers() {
                     &roles,
                     start..end,
                     lo..hi,
+                    false,
                 ))
                 .unwrap();
             assert_eq!(result.skipped_groups, 0);

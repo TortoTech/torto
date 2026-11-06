@@ -458,3 +458,276 @@ fn local_barriers_authored_code_and_prose_keep_sources_after_ai_composition() {
         "Verified 3 complete XML/JSON code examples and 2 genuine prose/specimen quotes; no live model request"
     );
 }
+
+#[test]
+fn transcribed_code_uses_the_shared_classifier_and_retains_literal_c_with_language() {
+    let html = "<html><body><img src='code.png'/></body></html>";
+    let descriptor = rebook_publication::SpineItem {
+        id: rebook_publication::SpineItemId::new("chapter").unwrap(),
+        href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+        media_type: "application/xhtml+xml".into(),
+        linear: true,
+        properties: vec![],
+    };
+    let mut s = rebook_html::parse_section(html, &descriptor, |_| None).unwrap();
+    let Block::Image(image) = &s.blocks[0] else {
+        panic!()
+    };
+    let href = image.href.clone();
+    let original = image.source.clone();
+    let literal = "int main(void) {\n\treturn 0;\n}";
+    super::super::formulas::compose_text(
+        &mut s.blocks,
+        &href,
+        &rebook_publication::ImageText {
+            text: literal.into(),
+            literal: true,
+            translated: Some("must not become code".into()),
+        },
+    );
+    let input = unified_window_input(&s, &RecognitionRoles::default(), 0..1, 0..1, &[]);
+    assert_eq!(input["targets"]["classify_code_or_quote"], json!([0]));
+    assert_eq!(input["blocks"][0]["body"][0]["text"], literal);
+    assert_eq!(wire::encode(&input)["bs"][0]["ty"], "itx");
+    let group = proposal(Presentation::Code, vec![], Some("c"));
+    validate_window(
+        &[group.clone()],
+        &s,
+        &RecognitionRoles::default(),
+        0..1,
+        0..1,
+    )
+    .unwrap();
+    let a = annotation(&group, &s);
+    assert!(cached_valid(&s, &a));
+    super::super::compose(&mut s.blocks, &a);
+    let t = s.blocks[0]
+        .text_blocks()
+        .find(|t| t.kind == TextBlockKind::Preformatted)
+        .unwrap();
+    assert_eq!(literal_text(t), literal);
+    assert_eq!(t.source, original);
+    assert!(
+        t.content
+            .iter()
+            .any(|i| matches!(i,Inline::Text(r) if r.style.syntax_colors.is_some()))
+    );
+    assert!(!t.content.iter().any(|i| matches!(i, Inline::Image(_))));
+}
+
+#[test]
+fn nested_request_keeps_literal_markup_caption_and_bounded_nonselectable_context() {
+    let descriptor = rebook_publication::SpineItem {
+        id: rebook_publication::SpineItemId::new("chapter").unwrap(),
+        href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+        media_type: "application/xhtml+xml".into(),
+        linear: true,
+        properties: vec![],
+    };
+    let s = rebook_html::parse_section(
+        "<html><body><p>This example demonstrates an HTML nested list.</p><figure><pre>&lt;ol&gt;\n  &lt;li&gt;Dogs&lt;/li&gt;\n&lt;/ol&gt;</pre><figcaption>Figure 3.5 – Nested list structure in HTML</figcaption></figure><p>The inner list belongs to the outer list item.</p></body></html>",
+        &descriptor, |_| None,
+    ).unwrap();
+    let index = s.blocks.iter().position(has_nested_candidates).unwrap();
+    let scopes = nested_sections(&s, index..index + 1);
+    let scope = &scopes[0];
+    let input = window_input(
+        &scope.section,
+        &RecognitionRoles::default(),
+        0..scope.section.blocks.len(),
+        0..scope.section.blocks.len(),
+        &[],
+        Some(&scope.context),
+    );
+    let compact = wire::encode(&input);
+    assert_eq!(compact["tg"]["cqk"], json!([0]));
+    assert_eq!(compact["tg"]["cb"], json!([]));
+    assert!(
+        compact["bs"][0]["d"][0]["t"]
+            .as_str()
+            .unwrap()
+            .contains("<li>Dogs</li>")
+    );
+    assert!(
+        compact["bs"][1]["t"]
+            .as_str()
+            .unwrap()
+            .contains("Nested list structure in HTML")
+    );
+    assert!(
+        compact["bs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b.get("mt").is_none())
+    );
+    assert!(
+        compact["cx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(Value::is_string)
+    );
+    assert!(
+        scope
+            .context
+            .iter()
+            .any(|t| t.contains("demonstrates an HTML"))
+    );
+    assert!(
+        scope
+            .context
+            .iter()
+            .any(|t| t.contains("inner list belongs"))
+    );
+    assert_eq!(scope.section.blocks.len(), 2);
+
+    // Multibyte prose cannot cause unbounded prompts or become a candidate.
+    let mut large = s.clone();
+    let Block::Text(before) = &mut large.blocks[index - 1] else {
+        panic!()
+    };
+    before.content = vec![Inline::Text(TextRun {
+        text: "说明".repeat(MAX_CONTEXT_CHARS),
+        style: Default::default(),
+        link: None,
+    })];
+    let scopes = nested_sections(&large, index..index + 1);
+    assert!(
+        scopes[0]
+            .context
+            .iter()
+            .map(|t| t.chars().count())
+            .sum::<usize>()
+            <= MAX_CONTEXT_CHARS
+    );
+}
+
+#[test]
+fn authored_figure_code_is_classified_inside_its_own_container_without_losing_caption() {
+    let descriptor = rebook_publication::SpineItem {
+        id: rebook_publication::SpineItemId::new("chapter").unwrap(),
+        href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+        media_type: "application/xhtml+xml".into(),
+        linear: true,
+        properties: vec![],
+    };
+    let mut s=rebook_html::parse_section("<html><body><figure><pre>&lt;ol&gt;\n  &lt;li&gt;Dogs&lt;/li&gt;\n&lt;/ol&gt;</pre><figcaption>Figure 3.5 HTML example</figcaption></figure></body></html>",&descriptor,|_|None).unwrap();
+    let original = s.clone();
+    assert!(has_nested_candidates(&s.blocks[0]));
+    let scopes = nested_sections(&s, 0..1);
+    assert_eq!(scopes.len(), 1);
+    let p = proposal(Presentation::Code, vec![], Some("html"));
+    validate_window(
+        &[p.clone()],
+        &scopes[0].section,
+        &RecognitionRoles::default(),
+        0..scopes[0].section.blocks.len(),
+        0..scopes[0].section.blocks.len(),
+    )
+    .unwrap();
+    let a = annotation(&p, &scopes[0].section);
+    assert!(cached_valid(&s, &a));
+    super::super::compose(&mut s.blocks, &a);
+    let Block::Figure(outer) = &s.blocks[0] else {
+        panic!()
+    };
+    let Block::Figure(before) = &original.blocks[0] else {
+        panic!()
+    };
+    assert_eq!(outer.source, before.source);
+    assert_eq!(outer.captions, before.captions);
+    let t = outer
+        .body
+        .iter()
+        .flat_map(Block::text_blocks)
+        .find(|t| t.kind == TextBlockKind::Preformatted)
+        .unwrap();
+    assert_eq!(
+        t.source,
+        before.body[0].text_blocks().next().unwrap().source
+    );
+}
+
+#[test]
+fn cached_ocr_and_nested_code_groups_are_revalidated_against_the_recognized_view() {
+    let descriptor = rebook_publication::SpineItem {
+        id: rebook_publication::SpineItemId::new("chapter").unwrap(),
+        href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+        media_type: "application/xhtml+xml".into(),
+        linear: true,
+        properties: vec![],
+    };
+    let original = rebook_html::parse_section(
+        "<html><body><img src='code.png'/></body></html>",
+        &descriptor,
+        |_| None,
+    )
+    .unwrap();
+    let Block::Image(img) = &original.blocks[0] else {
+        panic!()
+    };
+    let image = Annotation::ImageText {
+        href: img.href.clone(),
+        text: rebook_publication::ImageText {
+            text: "int value = 7;".into(),
+            literal: true,
+            translated: None,
+        },
+    };
+    let mut working = original.clone();
+    super::super::compose(&mut working.blocks, &image);
+    let code = annotation(&proposal(Presentation::Code, vec![], Some("c")), &working);
+    let result = Recognition {
+        fingerprint: fingerprint(&original),
+        image_text_revision: super::super::formulas::TEXT_REVISION,
+        formulas_checked: true,
+        annotations: vec![image, code],
+        skipped_groups: 0,
+    };
+    let identity = json!(["ocr-code-regression", uuid::Uuid::new_v4().to_string()]);
+    let path = recognition_path(&identity, &result.fingerprint).unwrap();
+    crate::persistence::write_json_atomic(&path, &result).unwrap();
+    let cached = load_recognition_inner(&original, &identity, &result.fingerprint, true)
+        .expect("code after OCR must survive cache reload");
+    let _ = std::fs::remove_file(path);
+    let mut restored = original;
+    for a in &cached.annotations {
+        super::super::compose(&mut restored.blocks, a);
+    }
+    assert!(
+        restored
+            .blocks
+            .iter()
+            .flat_map(Block::text_blocks)
+            .any(|t| t.kind == TextBlockKind::Preformatted && t.content.iter().any(|i| matches!(i, Inline::Text(r) if r.style.syntax_colors.is_some())))
+    );
+}
+
+#[test]
+fn confirmed_code_keeps_source_selection_without_a_language_label() {
+    use rebook_layout::{LayoutViewport, PageItem, ReaderStyle, ReaderTypesetting};
+    let mut s = section(vec![quote(&["int value = 7;"])]);
+    let range = anchor(&s.blocks[0]).unwrap().clone();
+    let a = annotation(&proposal(Presentation::Code, vec![], Some("c")), &s);
+    super::super::compose(&mut s.blocks, &a);
+    let source = super::super::tests::original_source(s);
+    let section = source.parse_section(0).unwrap();
+    let mut engine = rebook_layout::LayoutEngine::with_fonts(
+        crate::fonts::embedded_reader_fonts().iter().cloned(),
+    );
+    let layout = engine
+        .layout_section(
+            source.as_ref(),
+            &section,
+            LayoutViewport::new(900, 700).unwrap(),
+            &ReaderStyle {
+                typesetting: ReaderTypesetting::unified(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let page = &layout.pages[0];
+    assert!(!page.items.iter().any(|i| matches!(i, PageItem::Text(t) if t.source.is_none())));
+    assert!(page.items.iter().any(|i| matches!(i,PageItem::Text(t) if t.text.contains("int value = 7;") && t.source.as_ref()==Some(&range))));
+}

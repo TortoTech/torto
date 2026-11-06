@@ -1,0 +1,4 @@
+<!-- Torto selection action, matching the rounded outline icon system. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="@android:color/transparent" android:strokeColor="@android:color/white" android:strokeWidth="1.65" android:strokeLineCap="round" android:strokeLineJoin="round" android:pathData="M7,12 L16,3 L21,8 L12,17 Z M7,12 L4,15 L4,18 L7,18 L10,15 M14,5 L19,10"/>
+</vector>

@@ -659,7 +659,9 @@ impl DesktopReader {
     ) -> ReaderFramePlan {
         let ctx = root_ui.ctx().clone();
         let now = Instant::now();
-        self.prepare_nearby_footnotes(&ctx);
+        if self.completion.is_none() {
+            self.prepare_nearby_footnotes(&ctx);
+        }
         self.statistics.tick(
             ctx.input(|i| i.focused)
                 && self.completion.is_none()
@@ -679,16 +681,20 @@ impl DesktopReader {
             }),
             self.snapshot.total_progression,
         );
-        ctx.request_repaint_after(Duration::from_secs(1));
-        self.advance_frame(now);
+        if self.completion.is_none() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+            self.advance_frame(now);
+        }
         if self.completion.is_none() {
             self.apply_pending_focus_wheel_turn();
             self.copy_shortcut(&ctx, interaction_blocked);
             self.keyboard_shortcuts(&ctx, interaction_blocked);
         }
-        self.request_frame_repaint(&ctx);
-        if let Some(deadline) = self.next_transient_message_deadline() {
-            ctx.request_repaint_after(deadline.saturating_duration_since(now));
+        if self.completion.is_none() {
+            self.request_frame_repaint(&ctx);
+            if let Some(deadline) = self.next_transient_message_deadline() {
+                ctx.request_repaint_after(deadline.saturating_duration_since(now));
+            }
         }
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -703,7 +709,6 @@ impl DesktopReader {
                 color32(self.reader.style().background),
             );
         }
-        let (sidebar_progress, assistant_progress) = self.show_side_panels(root_ui);
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         self.window_menu(&ctx);
         if self.completion.is_some() {
@@ -713,6 +718,7 @@ impl DesktopReader {
                 .show(root_ui, |_| {});
             return self.completion_page_ui(root_ui, interaction_blocked);
         }
+        let (sidebar_progress, assistant_progress) = self.show_side_panels(root_ui);
 
         let background = self.reader.style().background;
         let background_ui = color32(background);
@@ -792,7 +798,8 @@ impl DesktopReader {
                         response
                     };
                     page_rect = response.rect;
-                    if !self.preview_is_open() {
+                    let pdf_captured = self.pdf_canvas_input(&response, interaction_blocked);
+                    if !self.preview_is_open() && !pdf_captured {
                         self.pointer_interaction(&response);
                         self.wheel_interaction(&response, interaction_blocked);
                     }
@@ -836,6 +843,7 @@ impl DesktopReader {
             self.focus_actions_overlay(&ctx, page_rect);
             self.focus_assistant_overlay(&ctx, page_rect);
         }
+        self.pdf_zoom_controls(&ctx, page_rect, interaction_blocked);
         self.table_chart_controls(&ctx, page_rect, interaction_blocked);
         self.focus_footnote_overlay(&ctx, page_rect);
         self.resize_side_panels(
@@ -908,7 +916,7 @@ impl DesktopReader {
         clippy::too_many_lines,
         reason = "scroll layout, viewport synchronization, and its controls share one egui frame"
     )]
-    fn scroll_content(
+    pub(in crate::reader) fn scroll_content(
         &mut self,
         ui: &mut egui::Ui,
         size: Vec2,
@@ -916,6 +924,8 @@ impl DesktopReader {
         background: Color32,
         interaction_blocked: bool,
     ) -> Rect {
+        let pdf_scale=if self.pdf_zoom_enabled() {self.pdf_zoom.transform.scale} else {1.0};
+        let source_height=size.y/pdf_scale;
         self.retain_viewport_reflow_anchor(size);
         let layout = match self.current_scroll_layout() {
             Ok(layout) => layout,
@@ -978,9 +988,9 @@ impl DesktopReader {
             self.ui.focus_scroll_motion = None;
         }
         if let Some(motion) = self.ui.focus_scroll_motion {
-            scroll_area = scroll_area.vertical_scroll_offset(motion.value);
+            scroll_area = scroll_area.vertical_scroll_offset(motion.value * pdf_scale);
         } else if let Some(target) = self.focus_target_offset.take() {
-            scroll_area = scroll_area.vertical_scroll_offset(target);
+            scroll_area = scroll_area.vertical_scroll_offset(target * pdf_scale);
         }
         if self.is_focus_mode() {
             self.scroll_target_position = None;
@@ -992,26 +1002,33 @@ impl DesktopReader {
                 PageDirection::Previous => layout.content_height,
                 PageDirection::Next => 0.0,
             };
-            scroll_area = scroll_area.vertical_scroll_offset(offset);
+            scroll_area = scroll_area.vertical_scroll_offset(offset * pdf_scale);
         } else if let Some(target) = self.scroll_target_source.take()
             && let Some(top) = layout.source_top(&target)
         {
             self.scroll_target_position = None;
-            scroll_area = scroll_area.vertical_scroll_offset(top);
+            scroll_area = scroll_area.vertical_scroll_offset(top * pdf_scale);
         } else if let Some(target) = self.scroll_target_position.take()
             && let Some(top) = layout.page_top(target)
         {
             let first = layout.pages.first().map(|entry| entry.position);
             let target_offset = if first == Some(target) { 0.0 } else { top };
-            scroll_area = scroll_area.vertical_scroll_offset(target_offset);
+            scroll_area = scroll_area.vertical_scroll_offset(target_offset * pdf_scale);
         }
 
-        if let Some(offset) = self.viewport_preview_offset(size.y, layout.content_height) {
-            scroll_area = scroll_area.vertical_scroll_offset(offset);
+        if let Some(offset) = self.viewport_preview_offset(source_height, layout.content_height) {
+            scroll_area = scroll_area.vertical_scroll_offset(offset * pdf_scale);
             self.focus_target_offset = None;
             self.ui.focus_scroll_motion = None;
         }
 
+        let pdf_restoring=self.pdf_zoom_enabled() && self.pdf_zoom.scroll_target.is_some();
+        let pdf_preserving=pdf_restoring && self.pdf_zoom.preserve_next_scroll;
+        if pdf_restoring {
+            let target=self.pdf_zoom.scroll_target.take().unwrap();
+            scroll_area=scroll_area.vertical_scroll_offset(target*pdf_scale);
+            self.pdf_zoom.transform.offset[1]=0.;
+        }
         let mut page_rect = Rect::NOTHING;
         let keyboard_scroll_delta = std::mem::take(&mut self.pending_keyboard_scroll_delta);
         let scroll_output = scroll_area.show_viewport(ui, |ui, viewport| {
@@ -1027,9 +1044,9 @@ impl DesktopReader {
             } else {
                 (layout.content_height + content_padding * 2.0).max(viewport_size.y)
             };
-            ui.set_height(scroll_content_height);
+            ui.set_height(scroll_content_height*pdf_scale);
             if keyboard_scroll_delta.abs() > f32::EPSILON {
-                ui.scroll_with_delta(Vec2::new(0.0, keyboard_scroll_delta));
+                ui.scroll_with_delta(Vec2::new(0.0, keyboard_scroll_delta*pdf_scale));
             }
             // ScrollArea rounds the moving content origin to physical pixels. Rebuilding
             // the viewport from that rounded origin plus the unrounded logical offset
@@ -1055,11 +1072,12 @@ impl DesktopReader {
                 ui.scope_id().with("scroll-reader-viewport"),
                 egui::Sense::click_and_drag(),
             );
+            if pdf_preserving { self.pdf_zoom.progress_lock=Some(viewport.min.y/pdf_scale); }
             self.update_scroll_viewport(
                 ui.ctx(),
                 super::ScrollViewportState {
-                    offset_y: viewport.min.y,
-                    size: viewport_size,
+                    offset_y: viewport.min.y/pdf_scale,
+                    size: Vec2::new(viewport_size.x,viewport_size.y/pdf_scale),
                 },
             );
             #[cfg(debug_assertions)]
@@ -1087,7 +1105,8 @@ impl DesktopReader {
                     );
                 }
             }
-            if !self.preview_is_open() && !interaction_blocked {
+            let pdf_captured = self.pdf_canvas_input(&response, interaction_blocked);
+            if !self.preview_is_open() && !interaction_blocked && !pdf_captured {
                 self.pointer_interaction(&response);
                 if self.is_focus_mode() {
                     self.focus_wheel_interaction(&response);
@@ -4886,13 +4905,11 @@ impl DesktopReader {
             } else {
                 0.0
             };
-            Pos2::new(
-                page_rect.left()
-                    + self.preview_offset_x(page_rect.width())
-                    + rect.x
-                    + rect.width * 0.5,
-                page_rect.top() + page_top + rect.y + rect.height + 8.0,
-            )
+            let point = Vec2::new(rect.x + rect.width * 0.5, page_top + rect.y + rect.height);
+            let point = if self.pdf_zoom_enabled() {
+                Vec2::from(self.pdf_zoom.transform.to_view(point.into()))
+            } else { point };
+            page_rect.min + point + Vec2::new(self.preview_offset_x(page_rect.width()), 8.0)
         });
         let mut copy_selection = false;
         let mut create_highlight = false;
@@ -5033,10 +5050,17 @@ impl DesktopReader {
             }
         }
         if let Some(position) = response.hover_pos() {
+            let point = self.pdf_document_point(position - response.rect.min - Vec2::new(offset_x, 0.0));
             if let Some((url, bounds)) = self.website_at_canvas(
-                position.x - response.rect.min.x - offset_x,
-                position.y - response.rect.min.y,
+                point.x,
+                point.y,
             ) {
+                let bounds = if self.pdf_zoom_enabled() {
+                    Rect::from_min_max(
+                        Pos2::from(self.pdf_zoom.transform.to_view(bounds.min.to_vec2().into())),
+                        Pos2::from(self.pdf_zoom.transform.to_view(bounds.max.to_vec2().into())),
+                    )
+                } else { bounds };
                 response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 super::footnote_layout::website_tooltip(
                     response,
@@ -5071,6 +5095,10 @@ impl DesktopReader {
                 response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
         }
+        if let Some(p)=response.hover_pos() {
+            let point=self.pdf_document_point(p-response.rect.min-Vec2::new(offset_x,0.));
+            if self.internal_link_at_canvas(point.x,point.y).is_some() {response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);}
+        }
         self.classic_footnote_hover_interaction(response);
         let Some(position) = response.interact_pointer_pos() else {
             if !response.ctx.input(|input| input.pointer.primary_down()) {
@@ -5078,8 +5106,9 @@ impl DesktopReader {
             }
             return;
         };
-        let x = position.x - response.rect.min.x - offset_x;
-        let y = position.y - response.rect.min.y;
+        let point = self.pdf_document_point(position - response.rect.min - Vec2::new(offset_x, 0.0));
+        let x = point.x;
+        let y = point.y;
         self.image_long_press_interaction(response, x, y);
         if !self.is_focus_mode() && response.drag_started() {
             self.begin_text_selection(x, y);
@@ -5129,6 +5158,10 @@ impl DesktopReader {
                 .and_then(|unit| unit.media_key.clone().map(|key| (unit.range.clone(), key)))
             {
                 self.open_media_preview(&response.ctx, origin, key);
+                return;
+            }
+            if let Some(target)=self.internal_link_at_canvas(x,y) {
+                self.go_to_toc("",&target);
                 return;
             }
             if self.try_open_image_preview(&response.ctx, x, y) {

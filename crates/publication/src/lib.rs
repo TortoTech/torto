@@ -3,6 +3,7 @@
 mod book_source;
 mod headings;
 mod toc;
+pub mod links;
 pub mod media_references;
 pub use headings::heading_ordinal_key;
 pub use toc::{TocMatch, toc_entry_for_href};
@@ -1085,11 +1086,23 @@ impl ImageLength {
 pub struct ImageStyle {
     pub width: Option<ImageLength>,
     pub height: Option<ImageLength>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_width: Option<ImageLength>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_height: Option<ImageLength>,
     pub max_width: Option<ImageLength>,
     pub max_height: Option<ImageLength>,
     /// Effective containing block retained when HTML wrappers are flattened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_width: Option<ImageContainerWidth>,
+    /// Definite containing height; absent for ordinary content-sized blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_height: Option<ImageContainerWidth>,
+    /// Authored overflow clipping, separate from percentage sizing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_width: Option<ImageContainerWidth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_height: Option<ImageContainerWidth>,
     /// Block spacing before the image, inherited from an image-only container when present.
     #[serde(default)]
     pub margin_before: f32,

@@ -25,6 +25,37 @@ const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_mins(2);
 const PROGRESS_REFRESH: Duration = Duration::from_millis(100);
 const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
 
+// Keep a bounded set of gates alive between jobs, so starting a new client
+// cannot reset an account's spacing or in-process quota deadline.
+struct RequestGate {
+    next: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+    cooldown: Arc<AtomicU64>,
+    interval: Arc<AtomicU64>,
+}
+fn account_gate(key: String) -> Arc<RequestGate> {
+    use std::collections::VecDeque;
+    use std::sync::{Mutex, OnceLock};
+    static GATES: OnceLock<Mutex<VecDeque<(String, Arc<RequestGate>)>>> = OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let gate = if let Some(index) = gates.iter().position(|(k, _)| k == &key) {
+        gates.remove(index).unwrap().1
+    } else {
+        Arc::new(RequestGate {
+            next: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
+            cooldown: Arc::new(AtomicU64::new(0)),
+            interval: Arc::new(AtomicU64::new(rate_limit::INITIAL_INTERVAL_MS)),
+        })
+    };
+    gates.push_back((key, gate.clone()));
+    while gates.len() > 32 {
+        gates.pop_front();
+    }
+    gate
+}
+
 #[derive(Clone, Debug)]
 pub struct RemoteObject {
     pub bytes: Vec<u8>,
@@ -105,7 +136,7 @@ impl WebDavClient {
             next_request: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
             cooldown_until: Arc::new(AtomicU64::new(0)),
             cooldown_loaded: Arc::new(tokio::sync::OnceCell::new()),
-            request_interval_ms: Arc::new(AtomicU64::new(1000)),
+            request_interval_ms: Arc::new(AtomicU64::new(rate_limit::INITIAL_INTERVAL_MS)),
             listings: Arc::new(std::sync::Mutex::new(
                 super::listing::ListingCache::default(),
             )),
@@ -113,6 +144,10 @@ impl WebDavClient {
     }
 
     pub fn with_store(mut self, store: SyncStore, account: String) -> Self {
+        let gate = account_gate(format!("{account}\n{}", self.root));
+        self.next_request = gate.next.clone();
+        self.cooldown_until = gate.cooldown.clone();
+        self.request_interval_ms = gate.interval.clone();
         self.cache = Some((store, account));
         self
     }
@@ -127,7 +162,7 @@ impl WebDavClient {
                     .await??;
                     if let Some(bytes) = bytes.and_then(|bytes| <[u8; 8]>::try_from(bytes).ok()) {
                         self.cooldown_until
-                            .store(u64::from_le_bytes(bytes), Ordering::Relaxed);
+                            .fetch_max(u64::from_le_bytes(bytes), Ordering::Relaxed);
                     }
                 }
                 if let Some(bytes) = self.cache_get(rate_limit::PACE_KEY)? {
@@ -204,6 +239,12 @@ impl WebDavClient {
         self.cache.as_ref().map_or(Ok(()), |(store, account)| {
             store.cache_set(account, key, value)
         })
+    }
+
+    pub fn cache_remove(&self, key: &str) -> SyncResult<()> {
+        self.cache
+            .as_ref()
+            .map_or(Ok(()), |(store, account)| store.cache_remove(account, key))
     }
 
     pub fn invalidate_object(&self, path: &str) -> SyncResult<()> {
@@ -960,10 +1001,11 @@ mod tests {
                 .unwrap()
                 .with_store(store.clone(), "other-account".into());
             assert!(other.cache_get(rate_limit::COOLDOWN_KEY).unwrap().is_none());
-            // Once expired, a legitimate 404 is still a normal missing-object response.
+            // Simulate expiry in both the persistent deadline and shared in-process gate.
             client
                 .cache_set(rate_limit::COOLDOWN_KEY, &0_u64.to_le_bytes())
                 .unwrap();
+            client.cooldown_until.store(0, Ordering::Relaxed);
             assert!(
                 make_client()
                     .get_optional("protocol.json")
@@ -974,6 +1016,35 @@ mod tests {
             );
         });
         fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn new_clients_share_the_same_accounts_half_second_request_spacing() {
+        let mut settings = SyncSettings::new_device();
+        settings.provider = CloudProviderKind::Custom;
+        settings.base_url = "http://127.0.0.1:1".into();
+        settings.username = "reader".into();
+        let database = std::env::temp_dir().join(format!(
+            "torto-shared-gate-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SyncStore::open_at(database.clone(), settings.device_id.clone()).unwrap();
+        let make = || {
+            let mut client = WebDavClient::new(&settings, "secret".into())
+                .unwrap()
+                .with_store(store.clone(), super::super::account_key(&settings));
+            client.cstcloud_compatibility = true;
+            client
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let before = tokio::time::Instant::now();
+            assert!(make().get_optional("a").await.is_err());
+            assert!(make().get_optional("b").await.is_err());
+            assert!(before.elapsed() >= Duration::from_millis(500));
+        });
+        drop(store);
+        let _ = std::fs::remove_file(database);
     }
 
     #[test]
@@ -989,7 +1060,7 @@ mod tests {
             for _ in 0..2 {
                 assert!(client.get_optional("probe").await.is_err());
             }
-            assert!(before.elapsed() >= Duration::from_secs(1));
+            assert!(before.elapsed() >= Duration::from_millis(500));
         });
     }
 

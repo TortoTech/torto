@@ -4530,6 +4530,7 @@ dependencies = [
  "rig-reqwest",
  "ring",
  "rusqlite",
+ "rustix 1.1.4",
  "rustls",
  "serde",
  "serde_json",
@@ -4592,6 +4593,7 @@ dependencies = [
  "resvg",
  "rfd",
  "rusqlite",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4717,10 +4719,12 @@ dependencies = [
 name = "rebook-reader"
 version = "0.9.0"
 dependencies = [
+ "rebook-formats",
  "rebook-layout",
  "rebook-publication",
  "rebook-renderer",
  "sentencex",
+ "serde_json",
  "thiserror 2.0.19",
  "unicode-segmentation",
 ]

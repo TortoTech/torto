@@ -4,16 +4,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 
 pub(super) const COOLDOWN_KEY: &str = "rate-limit-until-ms";
+pub(super) const INITIAL_INTERVAL_MS: u64 = 500;
 pub(super) const PACE_KEY: &str = "rate-limit-pace-v1";
 
 // Recover cautiously, one step per six quiet hours, including across app restarts.
 pub(super) fn pace_interval(bytes: &[u8], now: u64) -> u64 {
     let Ok(bytes) = <[u8; 16]>::try_from(bytes) else {
-        return 1000;
+        return INITIAL_INTERVAL_MS;
     };
-    let interval = u64::from_le_bytes(bytes[..8].try_into().unwrap()).clamp(1000, 8000);
+    let interval =
+        u64::from_le_bytes(bytes[..8].try_into().unwrap()).clamp(INITIAL_INTERVAL_MS, 8000);
     let at = u64::from_le_bytes(bytes[8..].try_into().unwrap());
-    (interval >> (now.saturating_sub(at) / (6 * 60 * 60 * 1000)).min(3)).max(1000)
+    (interval >> (now.saturating_sub(at) / (6 * 60 * 60 * 1000)).min(4)).max(INITIAL_INTERVAL_MS)
 }
 pub(super) const DEFAULT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
@@ -111,7 +113,7 @@ mod tests {
         assert_eq!(pace_interval(&bytes, at), 8000);
         assert_eq!(pace_interval(&bytes, at + 6 * 60 * 60 * 1000), 4000);
         assert_eq!(pace_interval(&bytes, at + 12 * 60 * 60 * 1000), 2000);
-        assert_eq!(pace_interval(&bytes, at + 24 * 60 * 60 * 1000), 1000);
-        assert_eq!(pace_interval(b"invalid", at), 1000);
+        assert_eq!(pace_interval(&bytes, at + 24 * 60 * 60 * 1000), 500);
+        assert_eq!(pace_interval(b"invalid", at), 500);
     }
 }

@@ -351,16 +351,8 @@ fn build_sections(
     ))
 }
 
-impl BookSource for ChmPublication {
-    fn book(&self) -> &Book {
-        &self.book
-    }
-
-    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
-        self.table_of_contents_origin
-    }
-
-    fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+impl ChmPublication {
+    fn parse_section_ir(&self, index: usize, ignore_body_margins: bool) -> Result<Section, PublicationError> {
         let descriptor = self
             .book
             .sections
@@ -380,13 +372,31 @@ impl BookSource for ChmPublication {
             },
             |href| crate::html_context::image_dimensions(resource_bytes(&self.resources, href)?),
             |href| self.html_context.font_traits(href, || resource_bytes(&self.resources, href)),
-            self.html_context.hints(descriptor),
+            rebook_html::SectionParseHints { ignore_body_margins, ..self.html_context.hints(descriptor) },
         )
         .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
         if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {
             promote_toc_headings(&mut section, hints);
         }
         Ok(section)
+    }
+}
+
+impl BookSource for ChmPublication {
+    fn book(&self) -> &Book {
+        &self.book
+    }
+
+    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
+        self.table_of_contents_origin
+    }
+
+    fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+        self.parse_section_ir(index, false)
+    }
+
+    fn parse_section_without_body_margins(&self, index: usize) -> Result<Section, PublicationError> {
+        self.parse_section_ir(index, true)
     }
 
     fn cover_section(&self) -> Result<Option<Section>, PublicationError> {

@@ -336,7 +336,8 @@ impl SemanticLayoutSource {
         Some(commit())
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    /// Blocking atomic source commit for worker-owned sessions. UI threads use
+    /// `try_commit_together` and adopt a prepared layout asynchronously.
     pub fn commit_together<T>(&self, commit: impl FnOnce() -> T) -> T {
         let started = std::time::Instant::now();
         let _guard = self.transaction.write().expect("content commit lock");
@@ -507,10 +508,20 @@ impl SemanticLayoutSource {
         }
         result.fingerprint = full_hash.to_owned();
         let changed = !result.annotations.is_empty();
-        if let Ok(mut partial) = self.partial.write() {
+        // Persist displayed scopes separately from automatic chapter requests.
+        // Reopening a book must not require a model call to restore a manual page.
+        if let Ok(identity) = self.cache_identity.read()
+            && let Ok(mut partial) = self.partial.write()
+        {
+            if !partial.contains_key(&index) {cache_section(&mut partial,index,BTreeMap::new());}
             let groups = partial.entry(index).or_default();
             groups.retain(|(start, end), _| *end <= range.start || range.end <= *start);
+            if groups.len() >= 128 { if let Some(key)=groups.keys().next().copied(){groups.remove(&key);} }
             groups.insert((range.start, range.end), result);
+            if let Some(path)=identity.as_ref().and_then(|identity|scope_presentation_path(identity,full_hash)) {
+                let stored=groups.iter().map(|(&(start,end),result)|(start,end,result.clone())).collect::<Vec<_>>();
+                if let Err(error)=crate::persistence::write_json_atomic(&path,&stored){tracing::warn!(%error,"failed to cache displayed layout scopes");}
+            }
         }
         changed
     }
@@ -526,6 +537,20 @@ impl SemanticLayoutSource {
             self.clear();
             *identity = recognition_identity(book_id, settings);
         }
+    }
+
+    /// Cached presentation is independent of whether the host schedules AI work.
+    /// This method never invokes a model. Identities still validate model,
+    /// endpoint, language and content before any cached result can be applied.
+    pub fn configure_presentation(&self, book_id: &str, settings: &PluginSettings, unified: bool) -> bool {
+        if self.original.book().metadata.layout==rebook_publication::RenditionLayout::PrePaginated { return self.set_unified_citations(false); }
+        let mut effective=settings.clone();
+        effective.semantic_layout.enabled |= unified;
+        let identity=recognition_identity(book_id,&effective);
+        let changed=self.enabled.load(std::sync::atomic::Ordering::Relaxed)!=effective.semantic_layout.enabled
+            || self.cache_identity.read().ok().is_none_or(|old| *old!=identity);
+        if changed { self.configure(book_id,&effective); }
+        self.set_unified_citations(unified) || changed
     }
 
     /// Apply only inline citation structure to original translation input.
@@ -593,6 +618,9 @@ impl SemanticLayoutSource {
 }
 
 impl BookSource for SemanticLayoutSource {
+    fn navigation_section(&self, index: usize) -> Result<Option<Section>, PublicationError> {
+        self.inner.navigation_section(index)
+    }
     fn inner_source(&self) -> Option<&dyn BookSource> {
         Some(self.inner.as_ref())
     }
@@ -647,7 +675,7 @@ impl BookSource for SemanticLayoutSource {
             .read()
             .ok()
             .and_then(|state| state.get(&index).cloned());
-        let partial = self
+        let mut partial = self
             .partial
             .read()
             .ok()
@@ -676,6 +704,16 @@ impl BookSource for SemanticLayoutSource {
                     }
                 }
             }
+        }
+        if partial.is_none()
+            && let (Some(identity),Some((original,hash)))=(self.cache_identity.read().ok().and_then(|v|v.clone()),snapshot.as_ref())
+            && let Some(restored)=load_scope_presentation(&identity,original,hash)
+            && let Ok(current)=self.cache_identity.read()
+            && current.as_ref()==Some(&identity)
+            && let Ok(mut scopes)=self.partial.write()
+        {
+            cache_section(&mut scopes,index,restored.clone());
+            partial=Some(restored);
         }
         if let Some((original, hash)) = snapshot.as_ref() {
             let full = recognition
@@ -996,6 +1034,7 @@ fn request_contract_fingerprint() -> &'static str {
                 "compact-wire-v1",
                 PROMPT,
                 code_blocks::PROMPT,
+                code_blocks::SCOPE_PROMPT,
                 citations::PROMPT,
                 formulas::CHAPTER_PROMPT,
                 formulas::TRANSCRIBE_PROMPT,
@@ -1145,6 +1184,25 @@ fn recognition_identity(book_id: &str, settings: &PluginSettings) -> Option<Valu
     ]))
 }
 
+/// Non-secret identity for host jobs. Use the same model, endpoint, language and
+/// prompt revision checks as cached semantic presentation.
+pub fn configuration_key(book_id: &str, settings: &PluginSettings) -> Option<String> {
+    recognition_identity(book_id, settings).map(|identity| digest(identity.to_string().as_bytes()))
+}
+
+fn scope_presentation_path(identity:&Value,hash:&str)->Option<PathBuf> {
+    recognition_path(&json!([identity,"displayed-scopes-v1"]),hash)
+}
+fn load_scope_presentation(identity:&Value,original:&Section,hash:&str)->Option<BTreeMap<(usize,usize),Recognition>> {
+    let path=scope_presentation_path(identity,hash)?;
+    if std::fs::metadata(&path).ok()?.len()>4*1024*1024{return None}
+    let stored:Vec<(usize,usize,Recognition)>=serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if stored.len()>128{return None}
+    let groups=stored.into_iter().filter(|(start,end,result)|*start<*end&&*end<=original.blocks.len()&&result.fingerprint==hash)
+        .map(|(start,end,result)|((start,end),result)).collect::<BTreeMap<_,_>>();
+    (!groups.is_empty()).then_some(groups)
+}
+
 fn recognition_path(identity: &Value, hash: &str) -> Option<PathBuf> {
     cache_path(&digest(format!("chapter:{identity}:{hash}").as_bytes()))
 }
@@ -1205,6 +1263,13 @@ fn load_recognition_inner(
     if result.fingerprint != hash {
         return None;
     }
+    if result.annotations.iter().any(|a| matches!(a, Annotation::CodeOrQuote { .. })) {
+        let mut classified = section.clone();
+        for a in &result.annotations {
+            if matches!(a, Annotation::ImageText { .. }) { compose(&mut classified.blocks, a); }
+        }
+        if !result.annotations.iter().all(|a| code_blocks::cached_valid(&classified, a)) { return None; }
+    }
     let locate = |range: &SourceRange| {
         section
             .blocks
@@ -1217,7 +1282,8 @@ fn load_recognition_inner(
         .filter(|a| {
             !matches!(
                 a,
-                Annotation::TableChart { .. }
+                Annotation::CodeOrQuote { .. }
+                    | Annotation::TableChart { .. }
                     | Annotation::FormulaNotes { .. }
                     | Annotation::InlineCitations { .. }
                     | Annotation::TextFormulas { .. }
@@ -1239,52 +1305,7 @@ fn load_recognition_inner(
                 | Annotation::UnreadableFormula { .. } => {
                     unreachable!()
                 }
-                Annotation::CodeOrQuote {
-                    body,
-                    presentation,
-                    language,
-                    captions,
-                    sources,
-                    credit,
-                } => {
-                    let ids = body
-                        .iter()
-                        .map(|r| {
-                            section
-                                .blocks
-                                .iter()
-                                .position(|b| code_blocks::anchor(b) == Some(r))
-                        })
-                        .collect::<Option<Vec<_>>>()?;
-                    let final_body = code_blocks::body(&section.blocks[*ids.last()?])?;
-                    let locate_attachment = |r: &SourceRange| {
-                        section
-                            .blocks
-                            .iter()
-                            .position(|b| code_blocks::attachment_anchor(b) == Some(r))
-                    };
-                    Proposal::CodeOrQuote {
-                        body: ids,
-                        presentation: *presentation,
-                        language: language.clone(),
-                        captions: captions
-                            .iter()
-                            .map(locate_attachment)
-                            .collect::<Option<Vec<_>>>()?,
-                        sources: sources
-                            .iter()
-                            .map(locate_attachment)
-                            .collect::<Option<Vec<_>>>()?,
-                        body_index: match credit {
-                            Some(range) => Some(
-                                final_body
-                                    .iter()
-                                    .position(|t| t.source.as_ref() == Some(range))?,
-                            ),
-                            None => None,
-                        },
-                    }
-                }
+                Annotation::CodeOrQuote { .. } => unreachable!(),
                 Annotation::QuoteBefore {
                     body,
                     attribution,
@@ -1412,6 +1433,15 @@ pub async fn recognize_visible(
 }
 
 /// Optional presentation metadata must never gate translation readiness.
+pub fn needs_enhancement(section: &Section, target: std::ops::Range<usize>, base: &Recognition) -> bool {
+    let mut scoped = scope_section(section, target);
+    for annotation in &base.annotations {
+        compose(&mut scoped.blocks, annotation);
+    }
+    enhancements::has_candidates(&scoped)
+}
+
+/// Optional presentation metadata must never gate translation readiness.
 pub async fn enhance_visible(
     section: &Section,
     target: std::ops::Range<usize>,
@@ -1497,7 +1527,6 @@ async fn recognize_inner(
     include_enhancements: bool,
 ) -> Result<Recognition, String> {
     let (provider, model) = settings.semantic_layout_endpoint()?;
-    let config = &RecognitionRoles::default();
     let fingerprint = fingerprint(section);
     let mut identity = recognition_identity(book_id, settings);
     if !include_enhancements {
@@ -1549,7 +1578,6 @@ async fn recognize_inner(
     }
     let mut annotations = Vec::new();
     let mut skipped_groups = 0;
-    let mut used = HashSet::new();
     let client = crate::http::builder()
         .timeout(Duration::from_secs(90))
         .build()
@@ -1574,127 +1602,13 @@ async fn recognize_inner(
         compose(&mut working.blocks, annotation);
     }
     let section = &working;
-    let mut start = target.start;
-    while start < target.end {
-        let end = if fixed_target {
-            target.end
-        } else {
-            window_end(section, start).min(target.end)
-        };
-        let lo = if fixed_target {
-            0
-        } else {
-            start.saturating_sub(OVERLAP)
-        };
-        let hi = if fixed_target {
-            section.blocks.len()
-        } else {
-            (end + OVERLAP).min(section.blocks.len())
-        };
-        let citation_candidates = citations::window_candidates(section, start..end);
-        let eligible = code_blocks::eligible_ids(section);
-        if (start..end).any(|i| {
-            let block = &section.blocks[i];
-            if code_blocks::body(block).is_some() {
-                eligible.contains(&i)
-            } else {
-                !text_formulas::input(block).is_empty()
-                    || paragraph(block).is_some()
-                    || citation_candidates.iter().any(|c| c.block == i)
-            }
-        }) {
-            let input =
-                unified_window_input(section, config, start..end, lo..hi, &citation_candidates);
-            let key = digest(
-                &serde_json::to_vec(&json!([
-                    CACHE_FORMAT_VERSION,
-                    request_contract_fingerprint(),
-                    book_id,
-                    fingerprint,
-                    provider.id,
-                    provider.base_url,
-                    model,
-                    settings.semantic_layout.reasoning_effort,
-                    config.quotes,
-                    config.captions,
-                    input
-                ]))
-                .map_err(|e| e.to_string())?,
-            );
-            let path = cache_path(&key);
-            let cached = path
-                .as_ref()
-                .and_then(|path| std::fs::read(path).ok())
-                .and_then(|bytes| serde_json::from_slice::<WindowCache>(&bytes).ok())
-                .filter(|cache| {
-                    cache.key == key
-                        && validate_citation_ids(&cache.citations, &citation_candidates).is_ok()
-                        && resolve_text_formulas(
-                            section,
-                            start..end,
-                            &cache.formulas,
-                            &cache.citations,
-                        )
-                        .1 == 0
-                        && validate_window(&cache.groups, section, config, start..end, lo..hi)
-                            .is_ok()
-                });
-            let window = if let Some(cache) = cached {
-                WindowResult {
-                    groups: cache.groups,
-                    citations: cache.citations,
-                    formulas: cache.formulas,
-                    skipped_groups: 0,
-                }
-            } else {
-                let groups = request_window_groups(
-                    &client,
-                    (provider, model, settings.semantic_layout.reasoning_effort),
-                    &input,
-                    section,
-                    config,
-                    start..end,
-                    lo..hi,
-                )
-                .await
-                .map_err(|error| format!("window {start}..{end}: {error}"))?;
-                if let Some(path) = &path
-                    && groups.skipped_groups == 0
-                    && let Err(error) = crate::persistence::write_json_atomic(
-                        path,
-                        &WindowCache {
-                            key,
-                            groups: groups.groups.clone(),
-                            citations: groups.citations.clone(),
-                            formulas: groups.formulas.clone(),
-                        },
-                    )
-                {
-                    tracing::warn!(%error, "failed to cache semantic layout");
-                }
-                groups
-            };
-            let mut window = window;
-            code_blocks::protect(&mut window, &citation_candidates);
-            skipped_groups += window.skipped_groups;
-            validate_window(&window.groups, section, config, start..end, lo..hi)?;
-            annotations.extend(citations::window_annotations(
-                &citation_candidates,
-                &window.citations,
-            ));
-            annotations.extend(
-                resolve_text_formulas(section, start..end, &window.formulas, &window.citations).0,
-            );
-            for group in &window.groups {
-                let ids = proposal_ids(group);
-                if ids.iter().any(|id| used.contains(id)) {
-                    continue;
-                }
-                used.extend(ids);
-                annotations.push(annotation(group, section));
-            }
-        }
-        start = end;
+    let (groups, failed) = recognize_windows(&client, settings, section, book_id, &fingerprint, target.clone(), fixed_target, None).await?;
+    annotations.extend(groups);
+    skipped_groups += failed;
+    for nested in code_blocks::nested_sections(section, target.clone()) {
+        let (groups, failed) = recognize_windows(&client, settings, &nested.section, book_id, &fingerprint, 0..nested.section.blocks.len(), false, Some(&nested.context)).await?;
+        annotations.extend(groups);
+        skipped_groups += failed;
     }
     let (extra, enhancements_ok) = if include_enhancements {
         let mut enhanced = working.clone();
@@ -1737,6 +1651,165 @@ async fn recognize_inner(
     Ok(result)
 }
 
+async fn recognize_windows(
+    client: &reqwest::Client,
+    settings: &PluginSettings,
+    section: &Section,
+    book_id: &str,
+    fingerprint: &str,
+    target: std::ops::Range<usize>,
+    fixed_target: bool,
+    code_context: Option<&[String]>,
+) -> Result<(Vec<Annotation>, usize), String> {
+    let code_only = code_context.is_some();
+    let (provider, model) = settings.semantic_layout_endpoint()?;
+    let config = &RecognitionRoles {
+        quotes: true,
+        captions: !code_only,
+        headings: !code_only,
+    };
+    let mut annotations = Vec::new();
+    let mut skipped_groups = 0;
+    let mut used = HashSet::new();
+    let mut start = target.start;
+    while start < target.end {
+        let end = if fixed_target {
+            target.end
+        } else {
+            window_end(section, start).min(target.end)
+        };
+        let lo = if fixed_target {
+            0
+        } else {
+            start.saturating_sub(OVERLAP)
+        };
+        let hi = if fixed_target {
+            section.blocks.len()
+        } else {
+            (end + OVERLAP).min(section.blocks.len())
+        };
+        let citation_candidates = if code_only {
+            Vec::new()
+        } else {
+            citations::window_candidates(section, start..end)
+        };
+        let eligible = code_blocks::eligible_ids(section);
+        if (start..end).any(|i| {
+            if code_only {
+                return eligible.contains(&i);
+            }
+            let block = &section.blocks[i];
+            if code_blocks::body(block).is_some() {
+                eligible.contains(&i)
+            } else {
+                !text_formulas::input(block).is_empty()
+                    || paragraph(block).is_some()
+                    || citation_candidates.iter().any(|c| c.block == i)
+            }
+        }) {
+            let input = window_input(section, config, start..end, lo..hi, &citation_candidates, code_context);
+            let key = digest(
+                &serde_json::to_vec(&json!([
+                    CACHE_FORMAT_VERSION,
+                    request_contract_fingerprint(),
+                    book_id,
+                    fingerprint,
+                    provider.id,
+                    provider.base_url,
+                    model,
+                    settings.semantic_layout.reasoning_effort,
+                    config.quotes,
+                    config.captions,
+                    code_only,
+                    input
+                ]))
+                .map_err(|e| e.to_string())?,
+            );
+            let path = cache_path(&key);
+            let cached = path
+                .as_ref()
+                .and_then(|path| std::fs::read(path).ok())
+                .and_then(|bytes| serde_json::from_slice::<WindowCache>(&bytes).ok())
+                .filter(|cache| {
+                    cache.key == key
+                        && validate_citation_ids(&cache.citations, &citation_candidates).is_ok()
+                        && resolve_text_formulas(
+                            section,
+                            start..end,
+                            &cache.formulas,
+                            &cache.citations,
+                        )
+                        .1 == 0
+                        && validate_window(&cache.groups, section, config, start..end, lo..hi)
+                            .is_ok()
+                });
+            let window = if let Some(cache) = cached {
+                WindowResult {
+                    groups: cache.groups,
+                    citations: cache.citations,
+                    formulas: cache.formulas,
+                    skipped_groups: 0,
+                }
+            } else {
+                let groups = request_window_groups(
+                    &client,
+                    (provider, model, settings.semantic_layout.reasoning_effort),
+                    &input,
+                    section,
+                    config,
+                    start..end,
+                    lo..hi,
+                    code_only,
+                )
+                .await
+                .map_err(|error| format!("window {start}..{end}: {error}"))?;
+                if let Some(path) = &path
+                    && groups.skipped_groups == 0
+                    && let Err(error) = crate::persistence::write_json_atomic(
+                        path,
+                        &WindowCache {
+                            key,
+                            groups: groups.groups.clone(),
+                            citations: groups.citations.clone(),
+                            formulas: groups.formulas.clone(),
+                        },
+                    )
+                {
+                    tracing::warn!(%error, "failed to cache semantic layout");
+                }
+                groups
+            };
+            let mut window = window;
+            code_blocks::protect(&mut window, &citation_candidates);
+            skipped_groups += window.skipped_groups;
+            validate_window(&window.groups, section, config, start..end, lo..hi)?;
+            annotations.extend(citations::window_annotations(
+                &citation_candidates,
+                &window.citations,
+            ));
+            if !code_only {
+                annotations.extend(
+                    resolve_text_formulas(section, start..end, &window.formulas, &window.citations)
+                        .0,
+                );
+            }
+            for group in &window.groups {
+                if code_only && !matches!(group, Proposal::CodeOrQuote { .. }) {
+                    continue;
+                }
+                let ids = proposal_ids(group);
+                if ids.iter().any(|id| used.contains(id)) {
+                    continue;
+                }
+                used.extend(ids);
+                annotations.push(annotation(group, section));
+            }
+        }
+        start = end;
+    }
+    Ok((annotations, skipped_groups))
+}
+
 async fn request_window_groups(
     client: &reqwest::Client,
     endpoint: (&super::AiProvider, &str, ReasoningEffort),
@@ -1745,16 +1818,29 @@ async fn request_window_groups(
     config: &RecognitionRoles,
     target: std::ops::Range<usize>,
     context: std::ops::Range<usize>,
+    code_only: bool,
 ) -> Result<WindowResult, String> {
-    request_groups(client, endpoint, input, section, config, target, context).await
+    request_groups(client, endpoint, input, section, config, target, context, code_only).await
 }
 
+#[cfg(test)]
 fn unified_window_input(
     section: &Section,
     config: &RecognitionRoles,
     target: std::ops::Range<usize>,
     context: std::ops::Range<usize>,
     candidates: &[citations::WindowCandidate],
+) -> Value {
+    window_input(section, config, target, context, candidates, None)
+}
+
+fn window_input(
+    section: &Section,
+    config: &RecognitionRoles,
+    target: std::ops::Range<usize>,
+    context: std::ops::Range<usize>,
+    candidates: &[citations::WindowCandidate],
+    code_context: Option<&[String]>,
 ) -> Value {
     let eligible = code_blocks::eligible_ids(section);
     let refs: Vec<_> = section.blocks.iter().collect();
@@ -1770,7 +1856,7 @@ fn unified_window_input(
     let blocks: Vec<_> = context
         .map(|index| {
             let mut block = section_input_block_eligible(section, index, eligible.contains(&index));
-            if target.contains(&index) {
+            if target.contains(&index) && code_context.is_none() {
                 if code_blocks::body(&section.blocks[index]).is_some() {
                     // Code classification needs the authored literal lines, not
                     // escaped formula markup in place of its body text.
@@ -1829,6 +1915,14 @@ fn unified_window_input(
             .map(|run| run.collect::<Vec<_>>())
             .collect::<Vec<_>>()
     );
+    if let Some(context) = code_context {
+        // Keep literal caption/source text rather than moving it into
+        // math_texts and subsequently clearing it for a code-only request.
+        input["context"] = json!(context);
+        for name in ["classify_headings", "classify_blocks", "complete_quote_sources", "classify_citations"] {
+            input["targets"][name] = json!([]);
+        }
+    }
     if !paragraph_groups.is_empty() {
         input["paragraph_groups"] = json!(paragraph_groups);
     }
@@ -1887,13 +1981,26 @@ async fn request_groups(
     config: &RecognitionRoles,
     target: std::ops::Range<usize>,
     context: std::ops::Range<usize>,
+    code_only: bool,
 ) -> Result<WindowResult, String> {
     crate::plugins::llm::budgeted(async {
     let (provider, model, reasoning_effort) = endpoint;
     let roles = window_roles(section, config, target.clone(), context.clone());
     let config = &roles;
+    let prompt = if code_only {
+        format!("{}{}", code_blocks::SCOPE_PROMPT, code_blocks::PROMPT)
+    } else {
+        window_prompt(section, config, target.clone(), context.clone())
+    };
+    let mut options = completion_options(config);
+    if code_only {
+        options["output_schema"]["properties"]["groups"]["items"] = code_blocks::schema();
+        for name in ["citations", "formulas"] {
+            options["output_schema"]["properties"][name]["maxItems"] = json!(0);
+        }
+    }
     let mut messages = vec![
-        json!({"role":"system","content":wire::instructions(&window_prompt(section, config, target.clone(), context.clone()), std::iter::once(input))}),
+        json!({"role":"system","content":wire::instructions(&prompt, std::iter::once(input))}),
         json!({"role":"user","content":wire::encode(input).to_string()}),
     ];
     let candidates = citations::window_candidates(section, target.clone());
@@ -1908,7 +2015,7 @@ async fn request_groups(
             None,
             Some(4096),
             reasoning_effort,
-            Some(&wire::options(&completion_options(config))),
+            Some(&wire::options(&options)),
         )
         .await?;
         let content = ai::message_content(&message).ok_or("AI排版返回了空内容")?;

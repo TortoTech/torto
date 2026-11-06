@@ -52,6 +52,11 @@ pub trait BookSource: Send + Sync {
     }
     /// Parses one section into the normalized reading IR.
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError>;
+    /// Parse with only the HTML body's authored margins suppressed. Format
+    /// adapters opt in; source identities and descendant styles stay intact.
+    fn parse_section_without_body_margins(&self, index: usize) -> Result<Section, PublicationError> {
+        self.parse_section(index)
+    }
     /// Optional SHA-256 of `serde_json::to_vec()` for the last parsed section.
     /// This is a cached lookup, never I/O. Derived sources must return `None`
     /// when their output differs; consumers also validate `content_revision`.
@@ -81,6 +86,34 @@ pub trait BookSource: Send + Sync {
     ) -> Result<Option<FixedPageDimensions>, PublicationError> {
         self.inner_source()
             .map_or(Ok(None), |inner| inner.fixed_page_dimensions(section_index))
+    }
+
+    /// Worker-only authored content for navigation recovery. View overlays
+    /// should forward this to their unmodified input. `None` reuses the already
+    /// parsed section; format/mode adapters keep that default so IDs stay in the
+    /// currently selected publication.
+    fn navigation_section(&self, _index: usize) -> Result<Option<Section>, PublicationError> {
+        Ok(None)
+    }
+
+    /// Original fixed-page size in PDF points. Memory-only; no rasterization.
+    fn fixed_page_points(&self, index: usize) -> Option<[f32; 2]> {
+        self.inner_source()
+            .and_then(|inner| inner.fixed_page_points(index))
+    }
+
+    /// Worker-only high-resolution viewport raster. `region` is normalized
+    /// page x/y/width/height; output is bounded to the requested visible pixels.
+    /// This does not replace or invalidate the ordinary whole-page resource.
+    fn fixed_page_region(
+        &self,
+        index: usize,
+        region: [f32; 4],
+        pixels: [u32; 2],
+    ) -> Result<Option<RasterResource>, PublicationError> {
+        self.inner_source().map_or(Ok(None), |inner| {
+            inner.fixed_page_region(index, region, pixels)
+        })
     }
 
     /// Dimensions of a source-owned raster, without generating its pixels.

@@ -16,7 +16,7 @@ macOS 27 compatibility build follows the same process.
 
 On Windows/MSVC, debug information is already external to the executable in a
 PDB. `collect-windows-symbols.ps1` archives the matching build's PDB and executable
-hash without modifying the PE executable or its unwind tables. MSI/MSIX staging
+hash without modifying the PE executable or its unwind tables. MSI/MSIX/portable ZIP staging
 does not include the PDB.
 
 Debug artifacts are named by platform, architecture, commit and run attempt.

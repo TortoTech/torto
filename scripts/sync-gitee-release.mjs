@@ -33,6 +33,12 @@ export function validateRelease(release) {
       return [zip, `${zip}.sha256`, `${zip}.sig.json`];
     }));
   }
+  // Keep historical releases mirrorable; new portable releases must include
+  // their checksum before the completion manifest can be published.
+  if ([...names].some(name => /-windows-x86_64-portable\.zip(?:\.|$)/.test(name))) {
+    const zip = `Torto-${release.tag_name.replace(/^v/, '')}-windows-x86_64-portable.zip`;
+    required.push(zip, `${zip}.sha256`);
+  }
   const missing = required.filter(name => !names.has(name));
   if (missing.length) return missing;
   for (const asset of release.assets) {
@@ -60,7 +66,7 @@ export function verifyAsset(asset, bytes) {
 export function artifactName(asset) {
   const mac = /^(Torto-\d+\.\d+\.\d+-macos-(?:arm64|x86_64))\.(?:dmg(?:\.sha256)?|zip(?:\.sha256|\.sig\.json)?)$/.exec(asset.name);
   if (mac) return mac[1];
-  const windows = /^(Torto-\d+\.\d+\.\d+)-x86_64\.msi$/.exec(asset.name);
+  const windows = /^(Torto-\d+\.\d+\.\d+)(?:-x86_64\.msi|-windows-x86_64-portable\.zip(?:\.sha256)?)$/.exec(asset.name);
   return windows ? `${windows[1]}-windows-x86_64` : null;
 }
 
@@ -176,15 +182,15 @@ export function planAssets(source, target) {
   });
 }
 
-export function updateManifest(release) {
-  const name = `Torto-${release.tag_name.replace(/^v/, '')}-x86_64.msi`;
+export function updateManifest(release, portable = false) {
+  const name = `Torto-${release.tag_name.replace(/^v/, '')}${portable ? '-windows-x86_64-portable.zip' : '-x86_64.msi'}`;
   const installer = release.assets.find(asset => asset.name === name);
   if (!installer) throw new Error('Missing Windows installer for update manifest');
   const bytes = Buffer.from(JSON.stringify({
     version: release.tag_name.replace(/^v/, ''), tag: release.tag_name,
     asset: { name, size: installer.size, sha256: installer.digest.replace(/^sha256:/, '') },
   }) + '\n');
-  return { bytes, asset: { name: 'torto-update.json', size: bytes.length,
+  return { bytes, asset: { name: portable ? 'torto-windows-portable-update.json' : 'torto-update.json', size: bytes.length,
     digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` } };
 }
 
@@ -381,6 +387,9 @@ export async function syncRelease(release, api, download) {
   const incomplete = validateRelease(release);
   if (incomplete.length) throw new Error(`Release is not complete: ${incomplete.join(', ')}`);
   const manifests = [updateManifest(release)];
+  if (release.assets.some(asset => asset.name.endsWith('-windows-x86_64-portable.zip'))) {
+    manifests.push(updateManifest(release, true));
+  }
   for (const arch of ['arm64', 'x86_64']) {
     const name = `Torto-${release.tag_name.replace(/^v/, '')}-macos-${arch}.zip`;
     if (!release.assets.some(asset => asset.name === name)) continue;

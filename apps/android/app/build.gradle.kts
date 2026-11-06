@@ -42,6 +42,7 @@ val notices = tasks.register<Exec>("generateOpenSourceNotices") {
     val metadataFile=layout.buildDirectory.file("generated/notices/artifacts.json")
     val outputFile=layout.buildDirectory.file("generated/notices/assets/open-source.json")
     inputs.file(repositoryRoot.resolve("scripts/android-notices.py"))
+    inputs.dir(rootProject.file("third_party/material-symbols"))
     inputs.files(repositoryRoot.resolve("Cargo.lock"),repositoryRoot.resolve("Cargo.toml"),repositoryRoot.resolve("LICENSE"),file("build.gradle.kts"))
     outputs.file(outputFile)
     workingDir(repositoryRoot)

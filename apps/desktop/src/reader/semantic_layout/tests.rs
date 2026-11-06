@@ -3,6 +3,30 @@ use crate::reader::*;
 #[path = "open_perf_tests.rs"]
 mod open_perf_tests;
 
+pub(in crate::reader) fn finish_test_viewport_reflow(reader: &mut DesktopReader) {
+    let Some(viewport) = reader.semantic_layout.pending_viewport else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let prepared = reader
+        .reader
+        .prepare_resize_request(viewport, reader.progress_source_range())
+        .prepare()
+        .unwrap();
+    let unit = reader.reader.reading_unit_location().index;
+    assert!(reader.adopt_semantic_reflow(
+        &runtime,
+        reader.semantic_layout.reflow_version,
+        unit,
+        reader.reader.style(),
+        Ok(prepared)
+    ));
+}
+
 #[test]
 #[ignore = "requires TORTO_OPEN_BOOK and optional TORTO_OPEN_LOCATOR; read-only book/progress profiling"]
 fn local_book_open_performance() {
@@ -2716,7 +2740,7 @@ fn recognized_image_table_schedules_new_cell_translation_inputs() {
 fn chart_switch_and_search_reflow_restore_the_right_source_anchor() {
     let (base, _, _) = fixture();
     let parsed = rebook_html::parse_section(
-        "<html><body><p>Intro</p><table><tr><th>Category</th><th>Value</th></tr><tr><td>Target</td><td>12</td></tr><tr><td>Other</td><td>18</td></tr></table></body></html>",
+        "<html><body><p>Intro</p><table><tr><th></th><th>Value</th></tr><tr><td>Target</td><td>12</td></tr><tr><td>Other</td><td>18</td></tr></table></body></html>",
         &base.source.book().sections[0], |_| None).unwrap();
     let (mut reader, raw, _) = fixture_with_blocks(parsed.blocks);
     let Block::Table(table) = &raw.blocks[1] else {
@@ -2737,16 +2761,26 @@ fn chart_switch_and_search_reflow_restore_the_right_source_anchor() {
     let ctx = egui::Context::default();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let adopt = |reader: &mut DesktopReader| {
-        let prepared = reader.reader.prepare_refresh_request(reader.semantic_layout.presentation_anchor.clone()).prepare();
+        let prepared = reader
+            .reader
+            .prepare_refresh_request(reader.semantic_layout.presentation_anchor.clone())
+            .prepare();
         let unit = reader.reader.reading_unit_location().index;
         let style = reader.reader.style();
         let version = reader.semantic_layout.reflow_version;
-        assert!(reader.adopt_semantic_reflow(&runtime,version,unit,style,prepared));
+        assert!(reader.adopt_semantic_reflow(&runtime, version, unit, style, prepared));
     };
     assert!(reader.toggle_table_chart(&ctx, &root));
     adopt(&mut reader);
     assert_eq!(reader.focus_anchor.as_ref().unwrap().node, root.start.node);
     assert!(reader.semantic_source.chart_control(&root).unwrap().1);
+    // The actual book has an empty top-left header: it has no text geometry
+    // to restore after a chart switches back. Both directions must be adopted.
+    assert!(reader.toggle_table_chart(&ctx, &root));
+    adopt(&mut reader);
+    assert!(!reader.semantic_source.chart_control(&root).unwrap().1);
+    assert!(reader.toggle_table_chart(&ctx, &root));
+    adopt(&mut reader);
     reader.go_to_search_result(&BookSearchResult {
         section_index: 0,
         section_title: "Chapter".into(),

@@ -67,6 +67,7 @@ fn sync_progress_log(progress: &SyncProgress) -> Option<String> {
             completed, total, ..
         } => Some(format!("sync downloaded_book progress={completed}/{total}")),
         SyncProgress::Stage { .. } => None,
+        SyncProgress::CoverDownloaded { .. } => None,
     }
 }
 
@@ -493,7 +494,7 @@ impl ShelfFeature {
             self.shelf.library.books(),
         );
         self.shelf.focus_selected_book = true;
-        self.start_sync(SyncMode::Reading);
+        self.sync.schedule.request(SyncMode::Reading);
     }
 
     fn refresh_read_activity(&mut self) {
@@ -589,16 +590,9 @@ impl ShelfFeature {
         if !self.sync.settings.enabled {
             return;
         }
-        if self
-            .sync
-            .schedule
-            .rate_limit_deadline(Instant::now())
-            .is_some()
-        {
-            self.sync.schedule.request(mode);
+        if !self.sync.schedule.start_requested(mode, Instant::now()) {
             return;
         }
-        self.sync.schedule.started(mode);
         self.sync.button = SyncButtonState::Running {
             stage: SyncStage::Preparing,
             completed: 0,
@@ -875,12 +869,14 @@ impl ShelfFeature {
         let Some(task) = self.sync.task.complete(message.id) else {
             return;
         };
-        let success = message.result.is_ok() && self.sync.import_error.is_none();
-        self.sync.schedule.completed_with_limit(
+        self.sync.schedule.finished(
             task.mode,
-            success,
+            if self.sync.import_error.is_some() {
+                Err(message.rate_limit)
+            } else {
+                message.result.as_ref().map_err(|_| message.rate_limit)
+            },
             Instant::now(),
-            message.rate_limit,
         );
         if matches!(task.mode, SyncMode::Full { .. } | SyncMode::Derived)
             || message
@@ -897,12 +893,6 @@ impl ShelfFeature {
                     return;
                 }
                 if let Some(error) = report.statistics_error {
-                    self.sync.schedule.completed_with_limit(
-                        SyncMode::Statistics,
-                        false,
-                        Instant::now(),
-                        report.statistics_rate_limit,
-                    );
                     self.sync_failed(format!(
                         "{}: {error}",
                         self.language.text(
@@ -911,11 +901,6 @@ impl ShelfFeature {
                         )
                     ));
                     return;
-                }
-                if matches!(task.mode, SyncMode::Full { .. }) {
-                    self.sync
-                        .schedule
-                        .completed(SyncMode::Statistics, true, Instant::now());
                 }
                 self.sync.button = SyncButtonState::completed(Instant::now());
             }
@@ -944,6 +929,7 @@ impl ShelfFeature {
                 cache_path,
                 completed,
                 total,
+                ..
             } => {
                 match self.shelf.library.import_remote(*book) {
                     Ok(imported) => {
@@ -965,6 +951,14 @@ impl ShelfFeature {
                     completed,
                     total,
                 };
+            }
+            SyncProgress::CoverDownloaded { book_id, bytes } => {
+                let result = self.shelf.library.update_missing_covers(&[(book_id.clone(), bytes)])
+                    .and_then(|()| crate::sync::acknowledge_downloaded_cover(&self.sync.settings, &book_id));
+                match result {
+                    Ok(()) => self.cover_textures.remove(&book_id),
+                    Err(error) => self.sync.import_error = Some(error.to_string()),
+                }
             }
         }
     }

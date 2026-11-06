@@ -448,8 +448,8 @@ impl SettingsFeature {
             self.error = Some(
                 self.draft_language
                     .text(
-                        "请先解锁安全存储，再保存设置",
-                        "Unlock secure storage before saving settings",
+                        "请先恢复凭据读取，再保存设置",
+                        "Restore credential access before saving settings",
                     )
                     .into(),
             );

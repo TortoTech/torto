@@ -11,6 +11,33 @@ use crate::source::{
 };
 
 #[test]
+#[ignore = "requires TORTO_BODY_MARGIN_BOOK pointing to a local book; read-only"]
+fn local_body_margin_filter_preserves_content_and_locations() {
+    let opened = crate::open_file(std::env::var_os("TORTO_BODY_MARGIN_BOOK").unwrap()).unwrap();
+    let source = opened.source();
+    let mut changed = 0;
+    let mut count = 0;
+    for index in 0..source.book().sections.len() {
+        let original = source.parse_section(index).unwrap();
+        let filtered = source.parse_section_without_body_margins(index).unwrap();
+        assert_eq!(original.anchors, filtered.anchors, "section {index} anchors");
+        let before = original.blocks.iter().flat_map(Block::text_blocks).collect::<Vec<_>>();
+        let after = filtered.blocks.iter().flat_map(Block::text_blocks).collect::<Vec<_>>();
+        assert_eq!(before.len(), after.len(), "section {index} text count");
+        for (a, b) in before.into_iter().zip(after) {
+            assert_eq!(a.content, b.content, "section {index} text");
+            assert_eq!(a.source, b.source, "section {index} selection identity");
+            changed += usize::from(a.style != b.style);
+            count += 1;
+        }
+        assert_eq!(source.parse_section(index).unwrap(), original,
+            "filtered parsing must not alter the desktop source");
+    }
+    println!("{}: {} sections, {count} text blocks, {changed} with body margins removed",
+        source.book().metadata.title, source.book().sections.len());
+}
+
+#[test]
 #[ignore = "requires local Kindle fixtures in test-data"]
 fn local_kindle_books_parse_every_section() {
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data");
@@ -76,6 +103,53 @@ fn direct(
         format,
     )
     .unwrap()
+}
+
+#[test]
+#[ignore = "requires TORTO_FIGURE_BOOK pointing to the local Handbook of Human Factors and Ergonomics EPUB; read-only"]
+fn local_handbook_front_captions_keep_figure_and_source_identity() {
+    use rebook_publication::CaptionPosition;
+    let opened = crate::open_file(std::env::var_os("TORTO_FIGURE_BOOK").unwrap()).unwrap();
+    let source = opened.source();
+    let index = source.book().sections.iter().position(|s|
+        s.href.path().ends_with("9781118129081c01.xhtml")).unwrap();
+    let section = source.parse_section(index).unwrap();
+    for number in 1..=14 {
+        let image = format!("c01f{number:03}.jpg");
+        let f = section.blocks.iter().find_map(|b| match b {
+            Block::Figure(f) if f.images.iter().any(|i|i.href.path().ends_with(&image)) => Some(f),
+            _ => None,
+        }).unwrap_or_else(||panic!("missing figure group: {image}"));
+        assert_eq!(f.caption_position, CaptionPosition::Before);
+        assert_eq!(f.captions.len(), 1);
+        assert_eq!(f.captions[0].kind, TextBlockKind::Caption);
+        let text: String=f.captions[0].content.iter().flat_map(Inline::text_runs).map(|r|r.text.as_str()).collect();
+        assert!(text.starts_with(&format!("Figure {number} ")), "{image}: {text}");
+        if number == 3 {
+            let caption = f.captions[0].source.as_ref().unwrap();
+            assert_eq!(caption.start.node,"n297");
+            assert_eq!(caption.start.text_offset,0);
+            assert_eq!(caption.end.node,"n297");
+            assert_eq!(caption.end.text_offset,75);
+            assert_eq!(f.images[0].source.as_ref().unwrap().start.node,"n298");
+            assert_eq!(f.source.as_ref().unwrap().start,caption.start);
+            assert!(section.anchors.iter().any(|a|a.fragment=="c01_fig_0003" && a.source==caption.start));
+        }
+    }
+    for (chapter, number, symbol) in [(3,3,false),(22,1,true),(43,1,false),(50,1,true),(51,1,false),(59,6,true),(60,15,true)] {
+        let path=format!("9781118129081c{chapter:02}.xhtml");
+        let image=format!("c{chapter:02}f{number:03}.jpg");
+        let index=source.book().sections.iter().position(|s|s.href.path().ends_with(&path)).unwrap();
+        let section=source.parse_section(index).unwrap();
+        let f=section.blocks.iter().find_map(|b|match b {
+            Block::Figure(f) if f.images.iter().any(|i|i.href.path().ends_with(&image))=>Some(f),
+            _=>None,
+        }).unwrap_or_else(||panic!("missing caption with inline symbols or narrative wording: {image}"));
+        assert_eq!(f.caption_position,CaptionPosition::Before);
+        if symbol {assert!(f.captions.iter().any(|t|t.content.iter().any(|i|matches!(i,Inline::Image(_)))), "{image}: inline symbols must stay in the caption");}
+        if chapter==50 {assert!(f.captions.iter().any(|t|t.content.iter().flat_map(Inline::text_runs).any(|r|r.style.link_role==LinkRole::FootnoteReference)));}
+    }
+    println!("HANDBOOK_FRONT_CAPTIONS chapter=1 groups=14 figure3_caption=n297:0-75 image=n298 symbols_and_long_captions=7");
 }
 
 fn section(content: &str) -> SourceSection {

@@ -10,6 +10,7 @@ struct Check {
     expects_book: bool,
     exercise_minimize: bool,
     exercise_resize: bool,
+    portable: bool,
     state: Mutex<State>,
 }
 #[derive(Default)]
@@ -51,6 +52,7 @@ pub(crate) fn start(
     output: PathBuf,
     expects_book: bool,
     exercise_minimize: bool,
+    portable: bool,
 ) -> Result<(), String> {
     if !output.is_absolute() {
         return Err("smoke output directory must be absolute".into());
@@ -65,6 +67,7 @@ pub(crate) fn start(
             expects_book,
             exercise_minimize,
             exercise_resize: std::env::var_os("TORTO_SMOKE_RESIZE").is_some(),
+            portable,
             state: Mutex::new(State::default()),
         })
         .map_err(|_| "smoke check already initialized")?;
@@ -79,6 +82,17 @@ pub(crate) fn start(
 
 pub(crate) fn enabled() -> bool {
     CHECK.get().is_some()
+}
+pub(crate) fn portable() -> bool { CHECK.get().is_some_and(|check| check.portable) }
+pub(crate) fn validate_portable_directory(root: &std::path::Path) -> Result<(), String> {
+    let Some(check) = CHECK.get().filter(|check| check.portable) else { return Ok(()); };
+    // This explicit test mode is restricted to an app/data folder alongside
+    // its freshly created report directory. Ordinary smoke tests stay isolated.
+    let expected = check.output.parent().ok_or("Missing portable fixture directory")?;
+    if std::fs::canonicalize(root).map_err(|e| e.to_string())? != std::fs::canonicalize(expected).map_err(|e| e.to_string())? {
+        return Err("Portable smoke report must be beside the fixture app and data directory".into());
+    }
+    Ok(())
 }
 
 /// Exercise the same viewport command as the caption button, then restore the
@@ -179,11 +193,15 @@ pub(crate) fn window_tick(
     Ok(())
 }
 
-pub(crate) fn project_dirs() -> Option<directories::ProjectDirs> {
+pub(crate) fn project_dirs() -> Option<rebook_app_core::environment::AppPaths> {
+    if portable() { return rebook_app_core::environment::paths(); }
     if let Some(check) = CHECK.get() {
-        directories::ProjectDirs::from_path(check.output.join("profile"))
+        directories::ProjectDirs::from_path(check.output.join("profile")).map(|dirs| rebook_app_core::environment::AppPaths {
+            data: dirs.data_local_dir().into(), roaming: dirs.data_dir().into(),
+            config: dirs.config_dir().into(), cache: dirs.cache_dir().into(),
+        })
     } else {
-        directories::ProjectDirs::from("com", "Rebook", "Rebook")
+        rebook_app_core::environment::paths()
     }
 }
 
@@ -353,6 +371,8 @@ pub(crate) fn finish(error: Option<&str>) -> Result<(), String> {
         "minimize_check": check.exercise_minimize, "minimize_restored": state.restored,
         "resize_check": check.exercise_resize, "resize_steps": state.resize_step,
         "presentation_checks": state.presentation_checks,
+        "portable_profile": crate::profile::is_portable(),
+        "data_directory": check.portable.then(rebook_app_core::environment::paths).flatten().map(|paths| paths.data),
         "elapsed_ms": check.started.elapsed().as_millis(),
     });
     std::fs::write(

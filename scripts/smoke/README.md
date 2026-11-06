@@ -1,5 +1,11 @@
 # macOS startup checks
 
+For the ordinary `.app`'s portable mode, run
+`python3 scripts/smoke/macos-portable.py APP_OR_BINARY`. It checks real portable
+data and GUI reading before/after folder/app renames, including an exFAT image.
+This uses the explicit `--smoke-test-portable` fixture mode. Existing startup
+checks below keep their independent profiles and in-memory credentials.
+
 `node scripts/smoke/macos.mjs /absolute/path/Torto.app /absolute/output/directory`
 
 Runs the bundled executable against a fresh shelf, an original generated EPUB

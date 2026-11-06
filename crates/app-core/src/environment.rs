@@ -23,6 +23,14 @@ impl AppPaths {
     }
 }
 static PATHS: OnceLock<AppPaths> = OnceLock::new();
+static PORTABLE_MACHINE: OnceLock<String> = OnceLock::new();
+/// A host-supplied opaque machine/user hash. Never persisted in cloud payloads.
+pub fn initialize_portable_machine(scope: String) -> Result<(), &'static str> {
+    if scope.len() != 64 || !scope.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err("Invalid portable machine scope"); }
+    let current = PORTABLE_MACHINE.get_or_init(|| scope.clone());
+    if current == &scope { Ok(()) } else { Err("Portable machine already configured") }
+}
+pub fn portable_machine() -> Option<&'static str> { PORTABLE_MACHINE.get().map(String::as_str) }
 pub fn initialize(paths: AppPaths) -> Result<(), &'static str> {
     let current = PATHS.get_or_init(|| paths.clone());
     if current == &paths {

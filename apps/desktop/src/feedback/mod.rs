@@ -11,9 +11,10 @@ use crate::ui::{Icon, dialog_action_button, icon_button, palette};
 pub(crate) use model::{
     Book, FocusLocation, Location, OpenContext, Reader, Translation, book_document, clipped,
 };
-use model::{Draft, Kind, Payload, character_count, valid_description};
+use model::{Draft, Kind, character_count, valid_description};
+#[cfg(test)] use model::Payload;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use transport::{Failure, Outcome};
 
 #[derive(Clone)]
@@ -893,19 +894,8 @@ fn context_row(ui: &mut egui::Ui, width: f32, label: &str, value: &str) {
     ui.add_space(2.0);
 }
 
-fn now_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-fn remaining_retry(draft: &Draft) -> Option<Duration> {
-    draft
-        .retry_until
-        .and_then(|at| at.checked_sub(now_seconds()))
-        .filter(|s| *s > 0)
-        .map(|s| Duration::from_secs(s.min(604_800)))
-}
+fn now_seconds()->u64 {rebook_app_core::feedback::store::now_seconds()}
+fn remaining_retry(draft:&Draft)->Option<Duration> {rebook_app_core::feedback::store::remaining_retry(draft)}
 
 fn draft_path() -> Result<PathBuf, String> {
     crate::smoke::project_dirs()
@@ -915,26 +905,8 @@ fn draft_path() -> Result<PathBuf, String> {
 
 fn prepare(mut seed: OpenContext, restore: bool) -> Result<Output, String> {
     if restore {
-        let path = draft_path()?;
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.len() <= 9 * 1024 * 1024 => {
-                let bytes = std::fs::read(path).map_err(|_| "storage")?;
-                let draft: Draft = serde_json::from_slice(&bytes).map_err(|_| "storage")?;
-                transport::endpoint(&draft.endpoint)?;
-                if draft.version != 1
-                    || uuid::Uuid::parse_str(&draft.payload.request_id).is_err()
-                    || !valid_description(&draft.payload.description)
-                    || draft.payload.screenshots.len() > screenshots::MAX_IMAGES
-                {
-                    return Err("storage".into());
-                }
-                for screenshot in &draft.payload.screenshots {
-                    screenshots::restore(screenshot.clone())?;
-                }
-                return Ok(Output::Ready(draft, true));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Err("storage".into()),
+        if let Some(draft)=rebook_app_core::feedback::store::load(&draft_path()?,true)? {
+            return Ok(Output::Ready(draft,true));
         }
     }
     seed.context.os = collect_os();
@@ -949,26 +921,7 @@ fn prepare(mut seed: OpenContext, restore: bool) -> Result<Output, String> {
             .into(),
         );
     }
-    let endpoint = std::env::var("TORTO_FEEDBACK_URL")
-        .ok()
-        .or_else(|| option_env!("TORTO_FEEDBACK_URL").map(str::to_owned))
-        .unwrap_or_else(|| transport::DEFAULT_ENDPOINT.into());
-    transport::endpoint(&endpoint)?;
-    Ok(Output::Ready(
-        Draft {
-            version: 1,
-            endpoint,
-            retry_until: None,
-            payload: Payload {
-                request_id: uuid::Uuid::new_v4().to_string(),
-                kind: Kind::Bug,
-                description: String::new(),
-                screenshots: Vec::new(),
-                context: seed.context,
-            },
-        },
-        false,
-    ))
+    Ok(Output::Ready(rebook_app_core::feedback::store::new_draft(seed.context)?,false))
 }
 
 fn collect_os() -> model::Os {
@@ -1020,50 +973,14 @@ async fn execute(work: Work) -> Result<Output, String> {
         Work::Prepare(seed, restore) => tokio::task::spawn_blocking(move || prepare(seed, restore))
             .await
             .map_err(|_| "storage")?,
-        Work::Send(mut draft) => {
-            let path = tokio::task::spawn_blocking(draft_path)
-                .await
-                .map_err(|_| "storage")??;
-            let saved = draft.clone();
-            let saved_path = path.clone();
-            tokio::task::spawn_blocking(move || save_draft(&saved_path, &saved))
-                .await
-                .map_err(|_| "storage")?
-                .map_err(|_| "storage")?;
-            let result = transport::submit(&draft).await;
-            let retry = match &result {
-                Outcome::Pending(wait) => Some(*wait),
-                Outcome::Failed(_, wait) => *wait,
-                _ => None,
-            };
-            draft.retry_until = retry.map(|wait| now_seconds() + wait.as_secs());
-            let saved = draft.clone();
-            let submitted = matches!(
-                result,
-                Outcome::Submitted(_) | Outcome::Failed(Failure::Invalid, _)
-            );
-            let _ = tokio::task::spawn_blocking(move || {
-                if submitted {
-                    let _ = std::fs::remove_file(path);
-                } else {
-                    let _ = save_draft(&path, &saved);
-                }
-            })
-            .await;
-            Ok(Output::Sent(draft, result))
+        Work::Send(draft) => {
+            let path=tokio::task::spawn_blocking(draft_path).await.map_err(|_|"storage")??;
+            let (draft,outcome)=rebook_app_core::feedback::store::send_saved(path,draft).await?;
+            Ok(Output::Sent(draft,outcome))
         }
     }
 }
 
-fn save_draft(path: &std::path::Path, draft: &Draft) -> std::io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("draft directory"))?;
-    std::fs::create_dir_all(parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-    }
-    crate::persistence::write_json_atomic(path, draft)
+fn save_draft(path:&std::path::Path,draft:&Draft)->std::io::Result<()> {
+    rebook_app_core::feedback::store::save(path,draft)
 }

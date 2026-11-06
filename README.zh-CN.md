@@ -91,8 +91,12 @@ Torto（中文名“小龟阅读”）是一款围绕**专注模式**设计的�
 | **平台** | **安装包** | **系统要求** |
 | --- | --- | --- |
 | Windows | `Torto-*-x86_64.msi` | 64 位 Windows 10 或 Windows 11 |
+| Windows 便携版 | `Torto-*-windows-x86_64-portable.zip` | 解压即用，设置和书库保存在程序旁的 `Data` 目录 |
 | macOS，Apple 芯片 | `Torto-*-macos-arm64.dmg` | macOS 15 或更高版本 |
 | macOS，Intel | `Torto-*-macos-x86_64.dmg` | macOS 15 或更高版本 |
+
+macOS 也支持[便携模式](docs/macos-portable.md)，直接使用普通应用：在可写文件夹中，
+于 `.app` 旁创建 `torto-portable-data`。移动整个文件夹即可携带书库和设置，外层文件夹可任意命名。
 
 安装后导入书籍即可在专注模式下阅读：
 - 使用 `↑` / `↓`、鼠标滚轮或滚动条切换阅读单元。
@@ -102,7 +106,7 @@ Torto（中文名“小龟阅读”）是一款围绕**专注模式**设计的�
 ## 数据与隐私
 
 - 导入的电子书、批注、统计及缓存的 OCR/重排数据均保存在本机应用数据目录。
-- WebDAV 密码和 AI API Key 保存在操作系统安全凭据存储中，不写入明文配置文件。
+- WebDAV 密码和 AI API Key 以明文保存在本地独立的 `credentials.json` 中，不参与书库云同步或诊断导出。
 - AI 排版、翻译、对话和云端 OCR 直连你自行配置的服务商；启用后，AI 排版与翻译会随阅读发送调度范围内的相关文字或图片。
 - WebDAV 同步由客户端直接连接你选择的网盘服务，不经过任何 Torto 中转服务器。
 - 在应用内提交反馈时，会将你填写的描述、可选截图及弹窗中展示的阅读上下文通过 TortoTech 反馈服务发布为公开的 GitHub Issue。详见[隐私政策](PRIVACY.md)。
@@ -141,7 +145,7 @@ cargo run --locked -p rebook-desktop --example generate_macos_icons
 
 ### macOS 凭据与发布签名
 
-单元测试使用内存凭据存储，不会读写系统钥匙串；正式构建使用操作系统安全凭据存储。
+单元测试使用内存凭据存储，不会读写系统钥匙串；正式构建共用本地明文凭据文件，仅迁移旧凭据时访问系统存储。
 
 macOS 打包工作流支持配置 `MACOS_SIGNING_IDENTITY`、`MACOS_CERTIFICATE_P12_BASE64` 与 `MACOS_CERTIFICATE_PASSWORD`（Bundle ID 为 `io.github.l-chris.torto`）。
 

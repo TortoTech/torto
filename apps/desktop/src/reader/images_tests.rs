@@ -239,6 +239,7 @@ fn painting_uses_only_visible_ready_blobs_and_preserves_geometry_and_hits() {
     };
     let placement = |request, y| {
         rebook_layout::PageItem::Image(rebook_layout::ImagePlacement {
+            clip: None,
             formula_presentation: None,
             image: raster(request),
             x: 20.0,
@@ -381,11 +382,16 @@ fn deferred_formulas_paint_after_loading_with_stable_blob_identity() {
         );
         request.load(source.as_ref()).unwrap();
         let mut scene = vello::Scene::new();
-        let images = page.paint_image_layer_in(&mut VelloScene::new(&mut scene), 0.0, Some(bounds));
+        let images = when_available(|| {
+            let images=page.paint_image_layer_in(&mut VelloScene::new(&mut scene),0.0,Some(bounds));
+            (images.len()==1).then_some(images)
+        });
         assert_eq!(images.len(), 1, "loaded formula must enter the paint scene");
         assert!(images[0].data.as_ref().chunks_exact(4).any(|p| p[3] != 0));
-        let repaint =
-            page.paint_image_layer_in(&mut VelloScene::new(&mut scene), 0.0, Some(bounds));
+        let repaint = when_available(|| {
+            let images=page.paint_image_layer_in(&mut VelloScene::new(&mut scene),0.0,Some(bounds));
+            (images.len()==1).then_some(images)
+        });
         assert_eq!(images[0].data.id(), repaint[0].data.id());
         assert_eq!(page.image_bounds(), Some(bounds));
     }

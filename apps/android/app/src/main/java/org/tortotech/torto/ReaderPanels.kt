@@ -18,67 +18,38 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import org.tortotech.torto.core.Annotation
 
-@Composable fun TypographyPanel(state:ScreenState,model:ReaderModel,close:()->Unit={},openLayout:()->Unit={},openTranslation:()->Unit={}) {
+@Composable fun TypographyPanel(state:ScreenState,model:ReaderModel,openLayout:()->Unit={}) {
     var size by remember(state.fontSize) { mutableFloatStateOf(state.fontSize) }
     val options=state.reading
-    var weight by remember(options?.fontWeight){mutableFloatStateOf(options?.fontWeight?.toFloat() ?: 400f)}
     LaunchedEffect(Unit){model.loadFonts();model.loadServices()}
     val families=state.fontFamilies
-    Column(Modifier.verticalScroll(rememberScrollState()).padding(24.dp).navigationBarsPadding(),verticalArrangement=Arrangement.spacedBy(12.dp)) {
-        Text(tr("字体排版","Typography"),style=MaterialTheme.typography.titleLarge)
-        Text(tr("字号","Font size")+" ${size.toInt()}")
-        Slider(size,{size=it},valueRange=12f..36f,enabled=!state.busy,onValueChangeFinished={model.configure(size,state.unified,state.dark)})
+    Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp).navigationBarsPadding(),verticalArrangement=Arrangement.spacedBy(12.dp)) {
+        if(state.active!=null&&state.focusAvailable||!state.focus)SettingsGroup {
+            if(state.active!=null&&state.focusAvailable)SettingToggle(tr("专注模式","Focus mode"),state.focus,!state.busy){model.focus(it)}
+            if(!state.focus)SettingToggle(tr("统一版式","Unified layout"),state.unified,!state.busy){model.configure(size,it,state.dark)}
+        }
         if(options!=null){
-            Text(tr("字重","Font weight")+" ${weight.toInt()}")
-            Slider(weight,{weight=it},valueRange=200f..900f,steps=27,enabled=!state.busy,onValueChangeFinished={model.saveReadingOptions(options.copy(fontWeight=weight.toInt().toUShort()))})
             SectionLabel(tr("中日韩书籍","CJK books"))
-            SettingChoice(tr("主要字体","Primary font"),options.cjkFont,families?.cjk.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(cjkFont=it))}
-            SettingChoice(tr("拉丁字体","Latin font"),options.cjkLatinFont,listOf("" to tr("跟随其他语言字体","Use other-language font"))+families?.latin.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(cjkLatinFont=it))}
+            SettingsGroup {
+                SettingChoice(tr("主要字体","Primary font"),options.cjkFont,families?.cjk.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(cjkFont=it))}
+                SettingChoice(tr("拉丁字体","Latin font"),options.cjkLatinFont,listOf("" to tr("跟随其他语言字体","Use other-language font"))+families?.latin.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(cjkLatinFont=it))}
+            }
             SectionLabel(tr("其他语言书籍","Other-language books"))
-            SettingChoice(tr("主要字体","Primary font"),options.latinFont,families?.latin.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(latinFont=it))}
-            SettingChoice(tr("中日韩字体","CJK font"),options.latinCjkFont,listOf("" to tr("跟随中日韩主要字体","Use CJK primary font"))+families?.cjk.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(latinCjkFont=it))}
-            SettingChoice(tr("等宽字体","Monospace font"),options.monospaceFont,families?.monospace.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(monospaceFont=it))}
-        }
-        OutlinedButton(onClick=model::downloadFonts,enabled=!state.busy){Text(tr("下载默认字体","Download reading fonts"))}
-        SettingToggle(tr("统一版式","Unified layout"),state.unified,!state.busy){model.configure(size,it,state.dark)}
-        if(state.active!=null)SettingToggle(tr("专注模式","Focus mode"),state.focus,!state.busy){model.focus(it)}
-        if(options!=null){
-            SettingToggle(tr("滚动专注","Scrolling focus"),options.scrollFocus,!state.busy){model.saveReadingOptions(options.copy(scrollFocus=it))}
-            SettingToggle(tr("按句分段显示","Split sentences onto separate lines"),options.sentenceSplit,!state.busy){model.saveReadingOptions(options.copy(sentenceSplit=it))}
-            SettingChoice(tr("专注样式","Focus style"),options.focusStyle,listOf("dim" to tr("周边淡化","Dim surroundings"),"highlight" to tr("突出当前内容","Highlight current content")),!state.busy){model.saveReadingOptions(options.copy(focusStyle=it))}
-        }
-        SettingToggle(tr("自动 AI 排版","Automatic AI layout"),state.autoLayout,!state.busy){model.automaticLayout(it)}
-        TextButton(onClick=openLayout){Text(tr("AI 排版设置","AI layout settings"))}
-        TextButton(onClick=openTranslation){Text(tr("翻译设置","Translation settings"))}
-        if(state.active!=null) {
-            Button(onClick={model.recognize();close()},enabled=!state.busy){AppIcon("ai");Spacer(Modifier.width(8.dp));Text(tr("AI 排版本页","AI layout for this page"))}
-            TextButton(onClick={model.markFinished();close()},enabled=!state.busy){Text(tr("标记为读完","Mark as finished"))}
-        }
-    }
-}
-@Composable fun AnnotationsPanel(state:ScreenState,model:ReaderModel,edit:(Annotation)->Unit,close:()->Unit) {
-    var deleting by remember { mutableStateOf<Annotation?>(null) }
-    Column(Modifier.fillMaxHeight(.8f).padding(top=12.dp)) {
-        Text(tr("批注与高亮","Notes and highlights"),Modifier.padding(horizontal=20.dp,vertical=12.dp),style=MaterialTheme.typography.titleLarge)
-        if(state.annotations.isEmpty()) Text(tr("长按正文，添加高亮或批注","Long press the text to add a highlight or note"),Modifier.padding(24.dp),color=MaterialTheme.colorScheme.onSurfaceVariant)
-        LazyColumn(contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
-            items(state.annotations,key={it.id}) { note ->
-                Card(onClick={model.jumpAnnotation(note);close()},colors=CardDefaults.cardColors(containerColor=MaterialTheme.colorScheme.surfaceContainerLow)) {
-                    Column(Modifier.padding(16.dp)) {
-                        Text(note.quote,maxLines=4,overflow=TextOverflow.Ellipsis)
-                        note.note?.let { Spacer(Modifier.height(8.dp));Text(it,color=MaterialTheme.colorScheme.primary) }
-                        Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.End) {
-                            ActionIcon("edit",tr("编辑批注","Edit note")){edit(note)}
-                            ActionIcon("delete",tr("删除批注","Delete annotation")){deleting=note}
-                        }
-                    }
-                }
+            SettingsGroup {
+                SettingChoice(tr("主要字体","Primary font"),options.latinFont,families?.latin.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(latinFont=it))}
+                SettingChoice(tr("中日韩字体","CJK font"),options.latinCjkFont,listOf("" to tr("跟随中日韩主要字体","Use CJK primary font"))+families?.cjk.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(latinCjkFont=it))}
             }
         }
+        SectionLabel(tr("通用","General"))
+        SettingsGroup {
+            if(options!=null)SettingChoice(tr("代码字体","Code font"),options.monospaceFont,families?.monospace.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(monospaceFont=it))}
+            SettingsSlider(tr("字号","Font size"),size.toInt().toString(),size,{size=it},valueRange=12f..36f,enabled=!state.busy,onValueChangeFinished={model.configure(size,state.unified,state.dark)})
+        }
+        SettingsGroup {SettingsItem(tr("下载默认字体","Download reading fonts"),enabled=!state.busy,onClick=model::downloadFonts)}
+        SettingsGroup {SettingsItem(tr("AI 排版","AI layout"),enabled=!state.busy,onClick=openLayout)}
+
     }
-    deleting?.let { note -> AlertDialog(onDismissRequest={deleting=null},title={Text(tr("删除批注？","Delete annotation?"))},text={Text(note.quote,maxLines=4)},confirmButton={TextButton(onClick={model.deleteAnnotation(note.id);deleting=null}){Text(tr("删除","Delete"))}},dismissButton={TextButton(onClick={deleting=null}){Text(tr("取消","Cancel"))}}) }
 }
 @Composable fun NoteEditor(quote:String,initial:String?,save:(String)->Unit) {
     var text by remember(quote,initial){mutableStateOf(initial.orEmpty())}

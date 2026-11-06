@@ -23,10 +23,15 @@ struct ParagraphAtom {
     end: usize,
 }
 
-#[derive(Default)]
 struct StructureState {
     active: HashMap<ParagraphStructureKey, bool>,
     all_active: bool,
+    enabled: bool,
+}
+impl Default for StructureState {
+    fn default() -> Self {
+        Self { active: HashMap::new(), all_active: false, enabled: true }
+    }
 }
 
 /// A derived view layered after translation. The model only chooses atom ranges;
@@ -38,6 +43,11 @@ pub struct ParagraphStructureSource {
 }
 
 impl ParagraphStructureSource {
+    /// Suspend the derived view without discarding per-paragraph choices.
+    pub fn set_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.state.write().map_err(|_| "按句分段状态已损坏".to_owned())?.enabled = enabled;
+        Ok(())
+    }
     pub fn new(inner: Arc<dyn BookSource>) -> Self {
         let language_hint = inner
             .book()
@@ -63,7 +73,7 @@ impl ParagraphStructureSource {
         self.state
             .read()
             .ok()
-            .is_some_and(|s| s.all_active || s.active.get(key) == Some(&true))
+            .is_some_and(|s| s.enabled && (s.all_active || s.active.get(key) == Some(&true)))
     }
 
     pub fn is_structured(&self, key: &ParagraphStructureKey) -> bool {
@@ -94,17 +104,21 @@ impl ParagraphStructureSource {
         }) else {
             return Ok(false);
         };
-        Ok(paragraph_atoms_for_content_mode(
-            &primary.content,
-            &self.language_hint,
-            split_semicolons,
-        )
-        .len()
-            >= 2)
+        Ok(self.can_structure_text(primary, !split_semicolons))
+    }
+
+    /// Query an already prepared reading snapshot without parsing the source again.
+    pub fn can_structure_text(&self, text: &TextBlock, in_quote: bool) -> bool {
+        text_kind_is_structurable(text.kind)
+            && paragraph_atoms_for_content_mode(&text.content, &self.language_hint,
+                !in_quote && text.kind != TextBlockKind::Blockquote).len() >= 2
     }
 }
 
 impl BookSource for ParagraphStructureSource {
+    fn navigation_section(&self, index: usize) -> Result<Option<Section>, PublicationError> {
+        self.inner.navigation_section(index)
+    }
     fn inner_source(&self) -> Option<&dyn BookSource> {
         Some(self.inner.as_ref())
     }
@@ -118,6 +132,7 @@ impl BookSource for ParagraphStructureSource {
             .state
             .read()
             .map_err(|_| PublicationError::InvalidPublication("按句分段状态已损坏".to_owned()))?;
+        if !state.enabled { return Ok(section); }
         let mut block_index = 0;
         while block_index < section.blocks.len() {
             let split_semicolons = !matches!(
@@ -1089,8 +1104,15 @@ fn apply_sentence_structure_mode(
         |inline| matches!(inline, Inline::Text(run) if !run.text.contains(['\n', '\r', '\t'])),
     );
     let mut content = Vec::new();
+    let chars = inline_text(&original).chars().collect::<Vec<_>>();
     for (index, atom) in atoms.iter().enumerate() {
-        if index > 0 {
+        let existing_break = chars[..atom.start]
+            .iter()
+            .rev()
+            .take_while(|c| c.is_whitespace())
+            .chain(chars[atom.start..].iter().take_while(|c| c.is_whitespace()))
+            .any(|c| matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}'));
+        if index > 0 && !existing_break {
             content.push(Inline::Break);
         }
         content.extend(slice_inlines(&original, atom.start, atom.end));
@@ -1156,6 +1178,71 @@ fn slice_inlines(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sentence_structure_keeps_authored_breaks_without_adding_blank_lines() {
+        let run = |text: &str| {
+            Inline::Text(TextRun {
+                text: text.into(),
+                style: Default::default(),
+                link: None,
+            })
+        };
+        for existing in [
+            vec![Inline::Break],
+            vec![run("\n")],
+            vec![Inline::Break, Inline::Break],
+        ] {
+            let expected_breaks = inline_text(&existing)
+                .chars()
+                .filter(|c| *c == '\n')
+                .count();
+            let mut original = vec![run("First sentence.")];
+            original.extend(existing);
+            original.push(run("Second sentence. Third sentence."));
+            let mut block = TextBlock {
+                kind: TextBlockKind::ListItem {
+                    ordered: false,
+                    ordinal: 1,
+                    depth: 0,
+                    marker_visible: true,
+                },
+                content: original,
+                style: Default::default(),
+                source: None,
+            };
+            let before = inline_text(&block.content);
+            apply_sentence_structure(&mut block, "en");
+            let after = inline_text(&block.content);
+            assert_eq!(
+                after.chars().filter(|c| *c == '\n').count(),
+                expected_breaks + 1
+            );
+            assert_eq!(after.replace('\n', ""), before.replace('\n', ""));
+            assert_eq!(after.contains("\n\n"), expected_breaks == 2);
+            assert!(block.style.sentence_indents);
+        }
+    }
+
+    #[test]
+    fn sentence_structure_keeps_titles_with_their_following_predicate() {
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "正如他在《为什么？如何解释？》中指出的那样，结果并不准确。下一句话。".into(),
+                style: Default::default(),
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        };
+        apply_sentence_structure(&mut block, "en");
+        assert_eq!(
+            inline_text(&block.content),
+            "正如他在《为什么？如何解释？》中指出的那样，结果并不准确。\n下一句话。"
+        );
+    }
+
 
     #[test]
     fn translated_sentences_before_years_are_structurable() {

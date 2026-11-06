@@ -76,6 +76,11 @@ pub struct State {
     /// so they don't keep pushing the content out.
     #[cfg_attr(feature = "serde", serde(skip))]
     bounced_this_momentum: Vec2b,
+
+    /// Programmatic offsets must not inherit inertia or spring against bounds
+    /// from the previous content. Consumed by the next ScrollArea pass.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    programmatic_offset: Vec2b,
 }
 
 impl Default for State {
@@ -92,6 +97,7 @@ impl Default for State {
             scroll_stuck_to_end: Vec2b::TRUE,
             interact_rect: None,
             bounced_this_momentum: Vec2b::FALSE,
+            programmatic_offset: Vec2b::FALSE,
         }
     }
 }
@@ -143,7 +149,16 @@ impl State {
     /// Set a programmatic scroll offset (e.g. selection autoscroll or TOC restore).
     /// The next ScrollArea pass applies the normal content bounds.
     pub fn set_offset(&mut self, offset: Vec2) {
-        self.offset = offset;
+        for d in 0..2 {
+            self.set_axis_offset(d, offset[d]);
+        }
+    }
+
+    fn set_axis_offset(&mut self, axis: usize, offset: f32) {
+        self.offset[axis] = offset;
+        self.vel[axis] = 0.0;
+        self.offset_target[axis] = None;
+        self.programmatic_offset[axis] = true;
     }
 
     /// How far past the edge of the content we are, in ui points.
@@ -830,8 +845,13 @@ impl ScrollArea {
         );
         let mut state = State::load(&ctx, id).unwrap_or_default();
 
-        state.offset.x = offset_x.unwrap_or(state.offset.x);
-        state.offset.y = offset_y.unwrap_or(state.offset.y);
+        for (axis, offset) in [offset_x, offset_y].into_iter().enumerate() {
+            if let Some(offset) = offset {
+                state.set_axis_offset(axis, offset);
+            }
+        }
+        let programmatic_offset = state.programmatic_offset;
+        state.programmatic_offset = Vec2b::FALSE;
 
         let show_bars: Vec2b = match scroll_bar_visibility {
             ScrollBarVisibility::AlwaysHidden => Vec2b::FALSE,
@@ -1001,6 +1021,12 @@ impl ScrollArea {
             let hold_overscroll = fingers_on_trackpad && ui.rect_contains_pointer(inner_rect);
 
             for d in 0..2 {
+                if programmatic_offset[d] {
+                    // Content and viewport sizes can both change during a jump.
+                    // Use this frame's final bounds in `end`, never spring back
+                    // toward the previous chapter's bounds in `begin`.
+                    continue;
+                }
                 let physics = &axis_physics[d];
                 if physics.step(&mut state.offset[d], &mut state.vel[d], dt, hold_overscroll) {
                     ctx.request_repaint();

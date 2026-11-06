@@ -150,6 +150,11 @@ struct FootnoteRegion {
 
 const FOOTNOTE_ICON_CENTER_ABOVE_BASELINE: f32 = 0.68;
 
+/// Shared reading-reference accent for native and desktop surfaces.
+pub fn reference_color(dark: bool) -> [u8;4] {
+    if dark {[96,165,250,255]}else{[37,99,235,255]}
+}
+
 fn footnote_activation_bar_y(
     origin_y: f32,
     metrics: rebook_layout::text_layout::LineMetrics,
@@ -399,6 +404,18 @@ impl PageDisplayList {
         offset_x: f32,
         clip: Option<Rect>,
     ) -> Vec<ImageData> {
+        self.paint_image_layer_with_patch(scene, offset_x, clip, None)
+    }
+
+    /// A worker-rendered fixed-page viewport replaces pixels before translated
+    /// masks/glyphs and interaction overlays, preserving their paint order.
+    pub fn paint_image_layer_with_patch(
+        &self,
+        scene: &mut impl PaintScene,
+        offset_x: f32,
+        clip: Option<Rect>,
+        patch: Option<(&ImageData, Rect, Color)>,
+    ) -> Vec<ImageData> {
         let transform = Affine::translate((f64::from(offset_x), 0.0));
         let mut images = Vec::new();
         for command in &self.commands {
@@ -407,6 +424,23 @@ impl PageDisplayList {
                     && let Some(data) = image.paint_ready(scene, transform)
                 {
                     images.push(data);
+                    if let Some((data, bounds, background)) = patch
+                        && image.bounds.inflate(0.5, 0.5).contains_rect(bounds)
+                    {
+                        scene.push_clip_layer(Fill::NonZero, transform, &image.bounds);
+                        scene.fill(Fill::NonZero, transform, background, None, &bounds);
+                        scene.draw_image(
+                            ImageBrush::new(data.clone()).as_ref(),
+                            transform
+                                * Affine::translate((bounds.x0, bounds.y0))
+                                * Affine::scale_non_uniform(
+                                    bounds.width() / f64::from(data.width),
+                                    bounds.height() / f64::from(data.height),
+                                ),
+                        );
+                        scene.pop_layer();
+                        images.push(data.clone());
+                    }
                 }
             } else if command.paints_below_source_overlays() {
                 command.paint(scene, transform);
@@ -1297,6 +1331,28 @@ impl PageDisplayList {
             })
     }
 
+    /// Touch hosts may enlarge a marker's hit area without changing its ink or
+    /// desktop mouse hit testing. Exact hits win; overlapping targets choose
+    /// the closest original rectangle, with a stable paint-order tie break.
+    pub fn footnote_touch_point(&self, x: f32, y: f32, minimum: f32) -> Option<(f32, f32)> {
+        let point = Point::new(x.into(), y.into());
+        let regions = || self.footnote_regions.iter().rev().filter(|r| r.website.is_none() && r.reference_owner.is_some());
+        let exact = regions().find(|r| r.bounds.contains(point));
+        let nearest = || regions().filter(|r| {
+            let dx = ((minimum as f64 - r.bounds.width()) / 2.).max(0.);
+            let dy = ((minimum as f64 - r.bounds.height()) / 2.).max(0.);
+            r.bounds.inflate(dx, dy).contains(point)
+        }).min_by(|a,b| {
+            let distance = |r: &FootnoteRegion| {
+                let dx = (point.x-r.bounds.center().x).abs()-r.bounds.width()/2.;
+                let dy = (point.y-r.bounds.center().y).abs()-r.bounds.height()/2.;
+                dx.max(0.).powi(2)+dy.max(0.).powi(2)
+            };
+            distance(a).total_cmp(&distance(b))
+        });
+        exact.or_else(nearest).map(|r| (r.bounds.center().x as f32,r.bounds.center().y as f32))
+    }
+
     pub fn footnote_reference_bounds(&self, source: &SourceRange, number: u32) -> Vec<[f32; 4]> {
         let owner = rebook_publication::source_block_identity(source);
         self.footnote_regions
@@ -1315,6 +1371,13 @@ impl PageDisplayList {
                 ]
             })
             .collect()
+    }
+
+    /// The same short baseline indicator painted by desktop popup activation.
+    pub fn footnote_indicator_at(&self,x:f32,y:f32)->Option<[f32;4]> {
+        self.footnote_regions.iter().rev().find(|r|r.website.is_none()&&r.bounds.contains(Point::new(f64::from(x),f64::from(y))))
+            .map(|r|{let width=r.bounds.width().clamp(12.0,16.0) as f32;
+                [r.bounds.center().x as f32-width/2.,r.activation_bar_y as f32,width,2.]})
     }
 
     pub fn paint_active_footnote_reference(
@@ -2402,6 +2465,7 @@ struct GlyphCommand {
 
 #[derive(Clone)]
 struct ImageCommand {
+    clip: Option<Rect>,
     origin: Option<rebook_layout::RasterOrigin>,
     formula: Option<String>,
     image: ImageBrush,
@@ -2442,10 +2506,12 @@ impl ImageCommand {
                 f64::from(self.image.image.width.max(1)) / f64::from(data.width.max(1)),
                 f64::from(self.image.image.height.max(1)) / f64::from(data.height.max(1)),
             );
+        if let Some(clip) = self.clip { scene.push_clip_layer(Fill::NonZero, page_transform, &clip); }
         scene.draw_image(
             ImageBrush::new(data.clone()).as_ref(),
             page_transform * transform,
         );
+        if self.clip.is_some() { scene.pop_layer(); }
         Some(data)
     }
 }
@@ -2621,17 +2687,18 @@ impl DisplayListCompiler {
                             f64::from(image.height) / f64::from(image.image.height.max(1)),
                         );
                     commands.push(DisplayCommand::Image(ImageCommand {
+                        clip: image.clip.map(|c| Rect::new(c.x.into(), c.y.into(), (c.x+c.width).into(), (c.y+c.height).into())),
                         origin: image.image.origin.clone(),
                         formula: image.formula_presentation.as_ref().map(|f| f.latex.clone()),
                         image: ImageBrush::new(data),
                         deferred: image.image.deferred.clone(),
                         transform,
-                        bounds: Rect::new(
+                        bounds: image.clip.map_or_else(|| Rect::new(
                             f64::from(image.x),
                             f64::from(image.y),
                             f64::from(image.x + image.width),
                             f64::from(image.y + image.height),
-                        ),
+                        ), |c| Rect::new(c.x.into(),c.y.into(),(c.x+c.width).into(),(c.y+c.height).into())),
                         width: image
                             .formula_presentation
                             .as_ref()
@@ -2729,6 +2796,7 @@ fn table_region(table: &TablePlacement) -> Option<TableRegion> {
         .cells
         .iter()
         .filter_map(|cell| cell.text.as_ref()?.source.clone())
+        .chain(table.source.iter().cloned())
         .collect();
     Some(TableRegion {
         bounds,
@@ -2794,7 +2862,7 @@ fn page_item_top(item: &PageItem) -> Option<f32> {
             .get(text.lines.start)
             .map(|line| text.origin_y + line.metrics().block_min_coord),
         PageItem::Quote(quote) => (!quote.continued_before).then_some(quote.y),
-        PageItem::Image(image) => Some(image.y),
+        PageItem::Image(image) => Some(image.visible_rect().y),
         PageItem::Table(table) => Some(table.y),
         PageItem::Separator(separator) => Some(separator.y),
     }
@@ -2810,7 +2878,7 @@ fn page_item_bottom(item: &PageItem) -> Option<f32> {
             .and_then(|line| text.layout.get(line))
             .map(|line| text.origin_y + line.metrics().block_max_coord),
         PageItem::Quote(quote) => (!quote.continued_after).then_some(quote.y + quote.height),
-        PageItem::Image(image) => Some(image.y + image.height),
+        PageItem::Image(image) => Some(image.visible_rect().y + image.visible_rect().height),
         PageItem::Table(table) => Some(table.y + table.height),
         PageItem::Separator(separator) => Some(separator.y + 1.0),
     }
@@ -3140,6 +3208,7 @@ fn compile_text_commands(
                     height: image.image.height,
                 };
                 commands.push(DisplayCommand::Image(ImageCommand {
+                    clip: None,
                     origin: image.image.origin.clone(),
                     formula: image.formula_presentation.as_ref().map(|f| f.latex.clone()),
                     image: ImageBrush::new(data),
@@ -3582,6 +3651,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
+                clip: None,
                 formula_presentation: Some(rebook_layout::FormulaPresentation {
                     original,
                     latex: r"\sigma=\sqrt{k\theta^2}".into(),
@@ -3729,6 +3799,10 @@ mod tests {
         assert_eq!(list.footnote_regions.len(), 1);
         assert_eq!(list.footnote_regions[0].source, Some(source.clone()));
         let icon_bounds = list.footnote_regions[0].bounds;
+        let marker_center = (icon_bounds.center().x as f32,icon_bounds.center().y as f32);
+        assert_eq!(list.footnote_touch_point(marker_center.0,marker_center.1,48.),Some(marker_center));
+        assert_eq!(list.footnote_touch_point(icon_bounds.x1 as f32+8.,marker_center.1,48.),Some(marker_center));
+        assert!(list.footnote_touch_point(icon_bounds.x1 as f32+48.,marker_center.1,48.).is_none());
         assert_eq!(
             list.footnote_source_at(icon_bounds.center().x as f32, icon_bounds.center().y as f32),
             Some(source.clone())
@@ -4643,6 +4717,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
+                clip: None,
                 formula_presentation: None,
                 image: RasterImage {
                     deferred: None,
@@ -4736,6 +4811,7 @@ mod tests {
             background: Rgba::BLACK,
             leading_gap: 0.0,
             items: vec![PageItem::Image(ImagePlacement {
+                clip: None,
                 formula_presentation: None,
                 image: RasterImage {
                     deferred: None,
@@ -4803,4 +4879,24 @@ mod tests {
         assert_eq!(fragment.quote, "译文");
         assert_eq!(fragment.range, source);
     }
+    #[test]
+    fn overflow_clip_limits_paint_and_hit_bounds_without_resizing_the_original_image() {
+        let page = PageLayout {
+            viewport: LayoutViewport::new(300, 300).unwrap(), background: Rgba::BLACK, leading_gap: 0.0,
+            items: vec![PageItem::Image(ImagePlacement {
+                clip: Some(rebook_publication::FixedPageTextRect { x:10.0,y:20.0,width:40.0,height:50.0 }),
+                formula_presentation: None,
+                image: RasterImage {deferred:None,origin:None,blob:None,width:100,height:100,pixels:vec![255;40000].into()},
+                x:10.0,y:20.0,width:200.0,height:200.0,source:None,text_layer:None,replacement:None,
+            })],
+        };
+        let list=DisplayListCompiler.compile(&page);
+        assert_eq!(list.image_bounds(),Some(Rect::new(10.0,20.0,50.0,70.0)));
+        assert!(list.image_at(25.0,40.0).is_some());
+        assert!(list.image_at(80.0,40.0).is_none());
+        let DisplayCommand::Image(command)=&list.commands[0] else {panic!()};
+        assert_eq!(command.clip,Some(Rect::new(10.0,20.0,50.0,70.0)));
+        assert_eq!(command.transform.as_coeffs()[0],2.0);
+    }
+
 }

@@ -3,11 +3,15 @@ pub mod credentials;
 pub mod diagnostics;
 pub mod environment;
 pub mod fonts;
+pub mod focus_navigation;
+pub mod focus_content;
+pub mod page_navigation;
 pub mod generated_metadata;
 pub mod generated_toc;
 pub mod highlights;
 pub mod http;
 pub mod library;
+pub mod media;
 pub mod persistence;
 pub mod plugins;
 pub mod preferences;
@@ -16,6 +20,7 @@ pub mod statistics;
 pub mod sync;
 
 pub mod reading;
+pub mod reading_ai;
 
 pub mod reading_text;
 
@@ -26,3 +31,5 @@ pub mod chat_markdown;
 pub mod provider_models;
 
 pub mod updates;
+
+pub mod feedback;

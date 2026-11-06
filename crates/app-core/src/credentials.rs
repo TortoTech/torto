@@ -1,6 +1,8 @@
-//! Platform credential storage. The core never writes secrets into its settings files.
+//! Shared local plaintext credential storage, separate from public settings and sync payloads.
 use std::sync::{Arc, OnceLock};
+mod file;
 mod vault;
+pub use file::{FileStore, LegacyCredentials, Migration, identity, legacy_android_identity};
 pub use vault::VaultStore;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -60,6 +62,7 @@ fn store() -> Result<&'static Arc<dyn SecretStore>> {
         })
     }
 }
+pub(crate) fn configured_store() -> Result<&'static dyn SecretStore> { Ok(store()?.as_ref()) }
 /// Ephemeral credentials for explicit isolated smoke/test profiles.
 /// Production hosts must install their platform store instead.
 #[derive(Default)]

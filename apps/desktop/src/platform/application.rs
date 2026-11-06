@@ -565,8 +565,8 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::OpenBook(path) => self.app.open_book(&path),
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             UserEvent::Update(message) => self.app.complete_update(message),
-            #[cfg(target_os = "macos")]
-            UserEvent::MacUpdatePrepared { request, result } => match result {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            UserEvent::UpdatePrepared { request, result } => match result {
                 Ok(()) => event_loop.exit(),
                 Err(error) => {
                     self.app.report_update_install_error(request, error);
@@ -812,19 +812,21 @@ impl ApplicationHandler<UserEvent> for Application {
                             let proxy = self.proxy.clone();
                             self.runtime.spawn_blocking(move || {
                                 let result = crate::updater::macos::prepare(&request.update, save);
-                                let _ = proxy.send_event(UserEvent::MacUpdatePrepared { request, result });
+                                let _ = proxy.send_event(UserEvent::UpdatePrepared { request, result });
                             });
                         }
                     }
                     #[cfg(target_os = "windows")]
-                    if let Some(request) = self.app.take_update_install_request() {
-                        match crate::updater::launch_installer_after_exit(&request) {
-                            Ok(()) => event_loop.exit(),
-                            Err(error) => {
-                                self.app.report_update_install_error(request, error);
-                                state.window.request_redraw();
+                    {
+                        crate::updater::portable::confirm_health(&self.runtime);
+                        if let Some(request) = self.app.take_update_install_request() {
+                            let save = self.app.update_save_job();
+                            let proxy = self.proxy.clone();
+                            self.runtime.spawn_blocking(move || {
+                                let result = save().and_then(|()| crate::updater::launch_installer_after_exit(&request));
+                                let _ = proxy.send_event(UserEvent::UpdatePrepared { request, result });
+                            });
                             }
-                        }
                     }
                 }
             }

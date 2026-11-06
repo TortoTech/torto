@@ -226,11 +226,8 @@ pub(crate) fn palette() -> Palette {
 }
 
 pub(crate) fn footnote_link_color() -> Color32 {
-    if palette().dark {
-        Color32::from_rgb(96, 165, 250)
-    } else {
-        Color32::from_rgb(37, 99, 235)
-    }
+    let [r,g,b,a]=rebook_renderer::reference_color(palette().dark);
+    Color32::from_rgba_unmultiplied(r,g,b,a)
 }
 
 pub(crate) fn configure(

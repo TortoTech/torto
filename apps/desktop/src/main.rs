@@ -17,6 +17,7 @@ mod persistence;
 mod platform;
 mod plugins;
 mod preferences;
+mod profile;
 mod reader;
 mod settings;
 mod shelf;
@@ -52,31 +53,37 @@ fn main() -> ExitCode {
     }
     let result = run();
     let error = result.as_ref().err().map(ToString::to_string);
-    diagnostics::log(
+    if profile::configured() { diagnostics::log(
         "app.exit",
         &[
             diagnostics::Field::Bool("success", error.is_none()),
             diagnostics::Field::Detail("error", error.as_deref().unwrap_or_default()),
         ],
-    );
+    ); }
     let smoke_result = smoke::finish(error.as_deref());
     match result.and_then(|()| smoke_result.map_err(Into::into)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("torto failed: {error}");
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            if !smoke::enabled() {
+                rfd::MessageDialog::new().set_title("Torto")
+                    .set_level(rfd::MessageLevel::Error).set_description(error.to_string()).show();
+            }
             ExitCode::FAILURE
         }
     }
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let launch = parse_arguments()?;
+    let _profile = profile::initialize()?;
     #[cfg(all(target_os = "windows", feature = "memory-profiling"))]
     if let Some(path) = env::var_os("TORTO_MEMORY_PROBE_BOOK") {
         credentials::initialize_core()?;
         return reader::probe_memory(PathBuf::from(path).as_path())
             .map_err(|error| io::Error::other(error.to_string()).into());
     }
-    let launch = parse_arguments()?;
     credentials::initialize_core()?;
     diagnostics::install_panic_hook();
     rebook_formats::set_pdf_timing_sink(|book, stage, page, hit, elapsed_ms| {
@@ -118,6 +125,13 @@ fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
     let Some(mut first) = arguments.next() else {
         return Ok(LaunchMode::Shelf);
     };
+    #[cfg(target_os = "windows")]
+    if first == "--torto-portable-health" || first == "--torto-portable-rollback" {
+        let path = arguments.next().ok_or("Missing portable update session")?;
+        updater::portable::set_health_job(PathBuf::from(path), first == "--torto-portable-rollback").map_err(io::Error::other)?;
+        let Some(next) = arguments.next() else { return Ok(LaunchMode::Shelf); };
+        first = next;
+    }
     #[cfg(target_os = "macos")]
     if first == "--torto-update-health" || first == "--torto-update-rollback" {
         let path = arguments.next().ok_or("Missing update session path")?;
@@ -132,6 +146,7 @@ fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
         first = next;
     }
     if first == "--smoke-test"
+        || first == "--smoke-test-portable"
         || first == "--smoke-test-open-event"
         || first == "--smoke-test-minimize"
     {
@@ -145,6 +160,7 @@ fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
             PathBuf::from(output),
             expects_open_event || book.is_some(),
             first == "--smoke-test-minimize",
+            first == "--smoke-test-portable",
         )?;
         return Ok(book.map_or(LaunchMode::Shelf, LaunchMode::Open));
     }

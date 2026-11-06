@@ -14,7 +14,7 @@ mod batching;
 mod enhancements;
 mod preparation;
 
-const SETTLE: Duration = Duration::from_millis(200);
+const SETTLE: Duration = rebook_app_core::reading_ai::SETTLE;
 const VIEWPORT_SETTLE: Duration = Duration::from_millis(120);
 type Key = (usize, usize, Option<usize>);
 type Demand = Vec<(usize, Vec<SourceRange>)>;
@@ -60,6 +60,7 @@ struct Group {
 }
 #[derive(Default)]
 pub(super) struct SemanticLayoutState {
+    pub(super) scheduler: rebook_app_core::reading_ai::Scheduler,
     pub(super) pending_viewport: Option<rebook_layout::LayoutViewport>,
     pub(super) viewport_reflow_at: Option<Instant>,
     pub(super) viewport_anchor: Option<super::FocusReflowAnchor>,
@@ -88,7 +89,7 @@ pub(super) struct SemanticLayoutState {
     translations: HashMap<Key, BlockTranslation>,
     failed: HashSet<Key>,
     pub(super) originals: HashMap<usize, std::sync::Arc<Section>>,
-    pub(super) title_links: HashMap<(usize,usize),Vec<String>>,
+    pub(super) title_links: HashMap<(usize, usize), Vec<String>>,
     batch_plans: std::cell::RefCell<HashMap<usize, std::sync::Arc<batching::SectionPlan>>>,
     hashes: HashMap<usize, String>,
     inputs: HashMap<usize, Vec<(crate::plugins::TranslationBlockInput, SourceRange)>>,
@@ -258,6 +259,7 @@ impl DesktopReader {
         true
     }
     pub(super) fn invalidate_semantic_plan(&mut self, reason: &str) {
+        self.semantic_layout.scheduler.invalidate();
         self.cancel_semantic_request(reason);
         self.semantic_layout.enhancements = Default::default();
         self.cancel_translation_request(reason);
@@ -356,12 +358,13 @@ impl DesktopReader {
             self.semantic_layout.groups.clear();
             self.semantic_layout.semantic_config = Some(semantic);
             if had_config {
-                self.semantic_source.configure(
+                self.semantic_source.configure_presentation(
                     &crate::plugins::pdf_native::cache_identity(
                         &self.book_id,
                         self.rewrite_source.as_ref(),
                     ),
                     &self.plugin_settings,
+                    self.reader.style().typesetting.mode == rebook_layout::TypesettingMode::Unified,
                 );
                 self.refresh_semantic_layout();
                 refreshed = true;
@@ -394,7 +397,9 @@ impl DesktopReader {
             if ready != self.media_preview.links_revision {
                 let changed = ready > 1 || source.changes_display();
                 self.media_preview.links_revision = ready;
-                if changed { self.refresh_semantic_layout(); }
+                if changed {
+                    self.refresh_semantic_layout();
+                }
             }
         }
         let revision = self.rewrite_source.revision();
@@ -421,6 +426,9 @@ impl DesktopReader {
             return;
         };
         let demand = canonical(demand);
+        self.semantic_layout
+            .scheduler
+            .update(demand.clone(), self.content_interacting());
         if demand != self.semantic_layout.demand {
             if let Some(job) = &self.semantic_layout.active {
                 job.log(
@@ -449,10 +457,19 @@ impl DesktopReader {
             self.semantic_layout.worker = None;
             self.semantic_layout.active = None;
             self.semantic_layout.receiver = None;
-            if let Ok(base) = &result {
-                self.queue_semantic_enhancements(job.clone(), base.clone());
-            }
-            let result = result.unwrap_or_else(|error| {
+            if result.as_ref().is_err_and(|e| {
+                rebook_app_core::reading_ai::failure(
+                    rebook_app_core::reading_ai::Kind::Structure,
+                    e,
+                ) == rebook_app_core::reading_ai::Failure::Interrupted
+            }) {
+                // Preemption is not a failed recognition or a negative cache entry.
+                let _ = proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO));
+            } else {
+                if let Ok(base) = &result {
+                    self.queue_semantic_enhancements(job.clone(), base.clone());
+                }
+                let result = result.unwrap_or_else(|error| {
                 tracing::warn!(%error, "AI layout batch failed; releasing successful translations");
                 self.notice_timer.show(
                     &mut self.notice,
@@ -466,7 +483,8 @@ impl DesktopReader {
                 );
                 empty_recognition(&job.section)
             });
-            self.stage_semantic_result(&job, result, true);
+                self.stage_semantic_result(&job, result, true);
+            }
         }
         if let Some(deadline) = self.semantic_layout.settled
             && Instant::now() < deadline
@@ -658,20 +676,44 @@ impl DesktopReader {
                 self.semantic_layout.active = Some(active);
                 self.semantic_layout.receiver = Some(rx);
                 let job_id = job.id.clone();
+                let scheduler = self.semantic_layout.scheduler.clone();
+                let task = rebook_app_core::reading_ai::Task {
+                    key: serde_json::json!([
+                        "structure",
+                        book,
+                        job.index,
+                        job.offset,
+                        job.target.start,
+                        job.target.end,
+                        job.hash,
+                        rebook_app_core::plugins::semantic_layout::configuration_key(
+                            &book, &settings
+                        )
+                    ])
+                    .to_string(),
+                    kind: rebook_app_core::reading_ai::Kind::Structure,
+                    section: job.index,
+                    sources: job.section.blocks[job.target.clone()]
+                        .iter()
+                        .flat_map(block_ranges)
+                        .collect(),
+                    prefetch: !batch.visible,
+                };
                 self.semantic_layout.worker = Some(runtime.spawn(
                     crate::plugins::semantic_layout::with_job(job_id, async move {
-                        let result = tokio::time::timeout(
-                            Duration::from_secs(180),
-                            recognize_visible(
-                                &job.section,
-                                job.target.clone(),
-                                &book,
-                                &settings,
-                                source.as_ref(),
-                            ),
-                        )
-                        .await
-                        .unwrap_or_else(|_| Err("AI layout batch timed out".into()));
+                        let result = scheduler
+                            .run(
+                                task,
+                                &Default::default(),
+                                recognize_visible(
+                                    &job.section,
+                                    job.target.clone(),
+                                    &book,
+                                    &settings,
+                                    source.as_ref(),
+                                ),
+                            )
+                            .await;
                         job.log(
                             "job.finished",
                             serde_json::json!({"success":result.is_ok()}),
@@ -700,16 +742,27 @@ impl DesktopReader {
                 }
             }
         }
-        let reused = missing.iter().filter_map(|((index,_,_),input)|
-            self.reuse_title_translation(*index,input).map(|translation|(*index,translation))).collect::<Vec<_>>();
-        for (index,translation) in reused { self.stage_translation_batch(index,vec![translation]); }
+        let reused = missing
+            .iter()
+            .filter_map(|((index, _, _), input)| {
+                self.reuse_title_translation(*index, input)
+                    .map(|translation| (*index, translation))
+            })
+            .collect::<Vec<_>>();
+        for (index, translation) in reused {
+            self.stage_translation_batch(index, vec![translation]);
+        }
         if self.translation.enabled && self.plugin_settings.translation_endpoint().is_ok() {
             let available = missing
                 .iter()
                 .filter(|(key, _)| {
                     !self.semantic_layout.translations.contains_key(key)
                         && !self.semantic_layout.failed.contains(key)
-                        && (!semantic || self.translation_semantics_ready(key.0, key.1))
+                        && (rebook_app_core::reading_ai::Flow {
+                            structure: semantic,
+                            translation: self.translation.enabled,
+                        })
+                        .translation_ready(self.translation_semantics_ready(key.0, key.1))
                 })
                 .collect::<Vec<_>>();
             if let Some(index) = next_translation_section(
@@ -721,9 +774,12 @@ impl DesktopReader {
                     .filter(|(key, _)| key.0 == index)
                     .map(|(_, input)| input.clone())
                     .collect::<Vec<_>>();
-                if let Some(blocks) = crate::plugins::translation_batches(inputs, 2_000)
-                    .into_iter()
-                    .next()
+                if let Some(blocks) = crate::plugins::translation_batches(
+                    inputs,
+                    rebook_app_core::reading_ai::TRANSLATION_BATCH_CHARS,
+                )
+                .into_iter()
+                .next()
                 {
                     if !self.translation_can_start(&missing, !blocks.is_empty()) {
                         if self.commit_ready_content(&demand, semantic) {
@@ -868,23 +924,59 @@ impl DesktopReader {
                 }
             }
             if self.semantic_enabled() {
-                for (block_index, raw) in original.blocks.iter().enumerate().filter(|(_, block)| matches!(block, rebook_publication::Block::Image(_) | rebook_publication::Block::Figure(_))) {
+                for (block_index, raw) in original.blocks.iter().enumerate().filter(|(_, block)| {
+                    matches!(
+                        block,
+                        rebook_publication::Block::Image(_) | rebook_publication::Block::Figure(_)
+                    )
+                }) {
                     if !self.translation_semantics_ready(index, block_index)
-                        || !block_ranges(raw).iter().any(|source| ranges.iter().any(|range| source.start.spine == range.start.spine && (source.start.node == range.start.node || source.start.node == range.end.node))) { continue; }
+                        || !block_ranges(raw).iter().any(|source| {
+                            ranges.iter().any(|range| {
+                                source.start.spine == range.start.spine
+                                    && (source.start.node == range.start.node
+                                        || source.start.node == range.end.node)
+                            })
+                        })
+                    {
+                        continue;
+                    }
                     let mut scope = scope_section(original, block_index..block_index + 1);
-                    self.semantic_source.prepare_citation_input(index, hash, &mut scope);
-                    for group in self.semantic_layout.groups.iter().filter(|group| group.index == index && group.hash == *hash) {
-                        if let Some(result) = &group.result { crate::plugins::semantic_layout::apply_translation_citations(&mut scope, result); }
+                    self.semantic_source
+                        .prepare_citation_input(index, hash, &mut scope);
+                    for group in self
+                        .semantic_layout
+                        .groups
+                        .iter()
+                        .filter(|group| group.index == index && group.hash == *hash)
+                    {
+                        if let Some(result) = &group.result {
+                            crate::plugins::semantic_layout::apply_translation_citations(
+                                &mut scope, result,
+                            );
+                        }
                     }
                     let converted = scope.blocks.iter().any(|block| match block {
                         rebook_publication::Block::Table(_) => true,
-                        rebook_publication::Block::Figure(figure) => figure.body.iter().any(|block| matches!(block, rebook_publication::Block::Table(_))),
+                        rebook_publication::Block::Figure(figure) => figure
+                            .body
+                            .iter()
+                            .any(|block| matches!(block, rebook_publication::Block::Table(_))),
                         _ => false,
                     });
-                    if !converted { continue; }
-                    self.translation_source.remember_translation_input(index, block_index, raw, &scope.blocks[0]);
+                    if !converted {
+                        continue;
+                    }
+                    self.translation_source.remember_translation_input(
+                        index,
+                        block_index,
+                        raw,
+                        &scope.blocks[0],
+                    );
                     prepared.retain(|(input, _)| input.block_index != block_index);
-                    for (mut input, range) in crate::plugins::prepare_translation_inputs(&scope, false) {
+                    for (mut input, range) in
+                        crate::plugins::prepare_translation_inputs(&scope, false)
+                    {
                         input.block_index = block_index;
                         prepared.push((input, range));
                     }
@@ -923,13 +1015,16 @@ impl DesktopReader {
                 } else {
                     Vec::new()
                 };
-                let ready = !self.translation.enabled
-                    || self.plugin_settings.translation_endpoint().is_err()
-                    || needed.iter().all(|input| {
-                        let key = (group.index, input.block_index, input.segment_index);
-                        self.semantic_layout.translations.contains_key(&key)
-                            || self.semantic_layout.failed.contains(&key)
-                    });
+                let ready = (rebook_app_core::reading_ai::Flow {
+                    structure: semantic,
+                    translation: self.translation.enabled
+                        && self.plugin_settings.translation_endpoint().is_ok(),
+                })
+                .presentation_ready(needed.iter().all(|input| {
+                    let key = (group.index, input.block_index, input.segment_index);
+                    self.semantic_layout.translations.contains_key(&key)
+                        || self.semantic_layout.failed.contains(&key)
+                }));
                 if !ready {
                     retained.push(group);
                     continue;
@@ -1000,6 +1095,7 @@ impl DesktopReader {
         false
     }
     pub(super) fn refresh_semantic_layout(&mut self) {
+        self.media_preview.invalidate_content();
         self.refresh_preview_formula_notes();
         self.semantic_layout.reflow_version += 1;
         self.semantic_layout.reflow_dirty = true;

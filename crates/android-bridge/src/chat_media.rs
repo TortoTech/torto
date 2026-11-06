@@ -194,7 +194,7 @@ impl MobileReader {
                     None
                 };
                 s.scroll_center = true;
-                s.scroll_slices.clear();
+                scroll::invalidate(s);
                 let previous = s.session.current_locator();
                 if let Some(range) = &range {
                     s.session.go_to_source(&range.start).map_err(error)?;

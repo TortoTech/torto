@@ -11,6 +11,9 @@ use crate::{TextBaseline, TextBrush};
 
 use super::knuth_plass::{self, ClusterItem, LineBreak, ParagraphOptions};
 
+mod sentences;
+pub(crate) use sentences::plan_sentences;
+
 const MIXED_SCRIPT_SPACING_EM: f32 = 0.25;
 const MIXED_SCRIPT_SHRINK_EM: f32 = 0.125;
 
@@ -332,6 +335,7 @@ impl ParagraphAnalysis {
 pub(crate) struct ReusableParagraphPlan {
     pub(crate) plan: ParagraphPlan,
     clusters: Vec<MeasuredCluster>,
+    explicit: bool,
 }
 
 impl ReusableParagraphPlan {
@@ -340,7 +344,7 @@ impl ReusableParagraphPlan {
     /// cluster, fallback size or reference attachment change triggers re-planning.
     pub(crate) fn matches(&self, layout: &mut Layout<TextBrush>) -> bool {
         let _timing = crate::timing::stage(crate::timing::TimingStage::LineBreak);
-        measured_clusters(layout).is_some_and(|clusters| clusters == self.clusters)
+        measured_prose_clusters(layout, self.explicit).is_some_and(|clusters| clusters == self.clusters)
     }
 }
 
@@ -369,23 +373,26 @@ pub(crate) fn plan_optimized_reusable(
     let plan = plan_measured_content_with_analysis(text, &clusters,
         &layout.inline_boxes().collect::<Vec<_>>(), column_width, first_line_indent,
         continuation_indent, default_em, hyphen_breaks, analysis)?;
-    Some(ReusableParagraphPlan { plan, clusters })
+    Some(ReusableParagraphPlan { plan, clusters, explicit: false })
 }
 
 fn measured_clusters(layout: &mut Layout<TextBrush>) -> Option<Vec<MeasuredCluster>> {
+    measured_prose_clusters(layout, false)
+}
+fn measured_prose_clusters(layout: &mut Layout<TextBrush>, explicit: bool) -> Option<Vec<MeasuredCluster>> {
     layout.break_all_lines(None);
-    if layout.len() != 1 {
+    if !explicit && layout.len() != 1 {
         return None;
     }
-    let line = layout.get(0)?;
     let mut clusters = Vec::new();
+    for line in layout.lines() {
     for run in line.runs() {
         if run.is_rtl() {
             return None;
         }
         let em = run.font_size();
         for cluster in run.clusters() {
-            if cluster.is_hard_line_break() {
+            if !explicit && cluster.is_hard_line_break() {
                 return None;
             }
             let range = cluster.text_range();
@@ -398,6 +405,7 @@ fn measured_clusters(layout: &mut Layout<TextBrush>) -> Option<Vec<MeasuredClust
                 footnote_reference: brush.footnote_reference,
             });
         }
+    }
     }
 
     Some(clusters)

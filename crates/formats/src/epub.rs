@@ -249,7 +249,12 @@ impl BookSource for EpubPublication {
     }
 
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
-        self.parse_section_ir(index)
+        self.parse_section_ir(index, false)
+            .map_err(EpubError::into_publication_error)
+    }
+
+    fn parse_section_without_body_margins(&self, index: usize) -> Result<Section, PublicationError> {
+        self.parse_section_ir(index, true)
             .map_err(EpubError::into_publication_error)
     }
 
@@ -273,7 +278,7 @@ impl BookSource for EpubPublication {
 }
 
 impl EpubPublication {
-    fn parse_section_ir(&self, index: usize) -> Result<Section, EpubError> {
+    fn parse_section_ir(&self, index: usize, ignore_body_margins: bool) -> Result<Section, EpubError> {
         let descriptor = self.book.sections.get(index).ok_or_else(|| {
             EpubError::InvalidArchive(format!("section index out of bounds: {index}"))
         })?;
@@ -293,7 +298,7 @@ impl EpubPublication {
             |href| self.is_decorative_separator_image(href),
             |href| crate::html_context::image_dimensions(&self.archive.read(href).ok()?),
             |href| self.font_traits(href),
-            self.html_context.hints(descriptor),
+            SectionParseHints { ignore_body_margins, ..self.html_context.hints(descriptor) },
         )?;
         self.html_context.mark_note_references(&mut section);
         if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {

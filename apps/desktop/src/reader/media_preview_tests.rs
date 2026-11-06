@@ -595,7 +595,7 @@ fn job(source: Arc<dyn BookSource>, at: usize, key: &str) -> Job {
         origin,
         key: media_references::references(key)[0].key.clone(),
         cursor: Cursor::default(),
-        style: ReaderStyle::default(),
+        width:1200, style: ReaderStyle::default(),
         ctx: egui::Context::default(),
     }
 }
@@ -652,7 +652,7 @@ fn direct_image_preview_keeps_unnumbered_caption_and_source_without_index_guessi
         origin,
         key: target.key.clone(),
         cursor: Cursor::default(),
-        style: ReaderStyle::default(),
+        width:1200, style: ReaderStyle::default(),
         ctx: egui::Context::default(),
     };
     let resolved = Index::default().resolve(&request, &|| true).unwrap();
@@ -755,7 +755,7 @@ fn local_reported_media_chapters_render_captions_and_sources() {
             let origin = super::super::block_source_range(&section.blocks[target.block]).unwrap().clone();
             let request = Job { generation: 1, source: source.clone(), catalog: None,
                 destination: Some((index, origin.start.node.clone())), origin, key: target.key.clone(),
-                cursor: Cursor::default(), style: ReaderStyle::default(), ctx: egui::Context::default() };
+                cursor: Cursor::default(), width:1200, style: ReaderStyle::default(), ctx: egui::Context::default() };
             let preview = render(&request, target, &|| true).unwrap();
             assert!(!preview.captions.is_empty());
             assert!(!preview.caption_images.is_empty());
@@ -1005,7 +1005,7 @@ fn local_book_media_preview() {
         origin,
         key: wanted,
         cursor: Cursor::default(),
-        style: ReaderStyle::default(),
+        width:1200, style: ReaderStyle::default(),
         ctx: egui::Context::default(),
     };
     // Exercise the real body's shaped click range, including neighboring note
@@ -1131,7 +1131,7 @@ fn direct_unnumbered_table_resolves_and_renders_without_caption_or_image_guessin
     let mut job = Job { generation: 1, source: source.clone(), catalog: None,
         destination: Some((0, origin.start.node.clone())), origin,
         key: MediaKey { kind: MediaKind::Table, number: String::new() },
-        cursor: Cursor::default(), style: ReaderStyle::default(), ctx: egui::Context::default() };
+        cursor: Cursor::default(), width:1200, style: ReaderStyle::default(), ctx: egui::Context::default() };
     let target = Index::default().resolve(&job, &|| true).unwrap();
     assert_eq!(target.block, at);
     let ready = render(&job, target.clone(), &|| true).unwrap();
@@ -1197,4 +1197,108 @@ fn local_book_complex_table_has_no_gap_between_continuations() {
         }
     }
     assert!(continued_cases >= 2, "exercise actual page boundaries in both modes");
+}
+
+#[test]
+fn preview_width_is_bounded_and_unversioned_translation_refresh_requeues_layout() {
+    assert_eq!(table_preview_width(2200.), 1440);
+    assert_eq!(table_preview_width(900.), 836);
+    assert_eq!(table_preview_width(220.), 156);
+    let mut reader = reference_reader("<p>See Table 2.</p>");
+    let ctx = egui::Context::default();
+    preview_key(&mut reader, &ctx, egui::Key::Num0);
+    assert_eq!(reader.source.content_revision(), None);
+    let old = reader
+        .media_preview
+        .worker
+        .as_ref()
+        .unwrap()
+        .generation
+        .load(Ordering::Acquire);
+    reader.refresh_semantic_layout();
+    assert!(
+        reader
+            .media_preview
+            .worker
+            .as_ref()
+            .unwrap()
+            .pending
+            .load()
+            .is_none()
+    );
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(2200., 900.),
+            )),
+            ..Default::default()
+        },
+        |_| reader.media_preview_overlay(&ctx),
+    );
+    output.textures_delta.clear();
+    let pending = reader
+        .media_preview
+        .worker
+        .as_ref()
+        .unwrap()
+        .pending
+        .load_full()
+        .unwrap();
+    assert!(pending.generation > old);
+    assert_eq!(pending.width, 1440);
+    assert_eq!(
+        reader.media_preview.presentation.as_ref().unwrap().0,
+        reader.media_preview.content_version
+    );
+}
+
+#[test]
+#[ignore = "requires TORTO_MEDIA_BOOK pointing to BOOKS without barriers"]
+fn local_complex_table_preview_obeys_the_wide_preview_cap() {
+    let publication =
+        rebook_formats::open_file(std::env::var("TORTO_MEDIA_BOOK").unwrap()).unwrap();
+    let source = publication.source();
+    let key = media_references::references("Figure 5.2")[0].key.clone();
+    let (at, _target) = (0..source.book().sections.len())
+        .find_map(|i| {
+            let section = source.parse_section(i).unwrap();
+            targets(&section, i)
+                .into_iter()
+                .find(|t| t.key == key)
+                .map(|t| (i, t))
+        })
+        .unwrap();
+    let mut request = job(source.clone(), at, "Figure 5.2");
+    request.width = table_preview_width(2500.);
+    let mut index = Index::default();
+    let target = index.resolve(&request, &|| true).unwrap();
+    let before = source.parse_section(at).unwrap();
+    let ready = render(&request, target, &|| true).unwrap();
+    assert!(ready.size[0] <= 1440);
+    request.width = 480;
+    let narrow_target = index.resolve(&request, &|| true).unwrap();
+    let narrow = render(&request, narrow_target, &|| true).unwrap();
+    assert!(
+        ready.size[0] > narrow.size[0],
+        "the wider container reduces unnecessary wrapping"
+    );
+    assert_eq!(source.parse_section(at).unwrap(), before);
+    if let Some(path) = std::env::var_os("TORTO_FEATURE_ARTIFACTS") {
+        std::fs::create_dir_all(&path).unwrap();
+        let pixels = ready
+            .image
+            .pixels
+            .iter()
+            .flat_map(|p| p.to_array())
+            .collect::<Vec<_>>();
+        image::save_buffer(
+            std::path::Path::new(&path).join("complex-table-preview.png"),
+            &pixels,
+            ready.size[0] as u32,
+            ready.size[1] as u32,
+            image::ColorType::Rgba8,
+        )
+        .unwrap();
+    }
 }

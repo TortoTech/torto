@@ -118,7 +118,10 @@ impl SyncSettings {
             Self::new_device()
         };
         settings.normalize();
-        if !path.exists() {
+        let changed_device = if let Some(scope) = crate::environment::portable_machine() {
+            super::portable::bind(&mut settings, scope, path.parent().ok_or_else(|| io::Error::other("Missing settings directory"))?, crate::credentials::configured_store()?)?
+        } else { false };
+        if !path.exists() || changed_device {
             settings.save_default()?;
         }
         Ok(settings)

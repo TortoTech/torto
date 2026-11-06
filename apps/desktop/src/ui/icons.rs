@@ -39,6 +39,7 @@ pub(crate) enum Icon {
     MessageSquarePlus,
     MessageSquareText,
     Minimize2,
+    Minus,
     Monitor,
     Moon,
     PanelLeft,
@@ -61,7 +62,7 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 46] = [
+    const ALL: [Self; 47] = [
         Self::Chart,
         Self::Table,
         Self::AlertCircle,
@@ -90,6 +91,7 @@ impl Icon {
         Self::MessageSquarePlus,
         Self::MessageSquareText,
         Self::Minimize2,
+        Self::Minus,
         Self::Monitor,
         Self::Moon,
         Self::PanelLeft,
@@ -140,6 +142,7 @@ impl Icon {
             Self::MessageSquarePlus => asset!("message-square-plus"),
             Self::MessageSquareText => asset!("message-square-text"),
             Self::Minimize2 => asset!("minimize-2"),
+            Self::Minus => asset!("minus"),
             Self::Monitor => asset!("monitor"),
             Self::Moon => asset!("moon"),
             Self::PanelLeft => asset!("panel-left"),

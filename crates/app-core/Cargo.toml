@@ -9,6 +9,11 @@ license.workspace = true
 [features]
 test-support = []
 
+[target.'cfg(target_os = "android")'.dependencies]
+# std::fs::File locking is unsupported on Android in Rust 1.97. Reuse the
+# existing rustix version for a safe nonblocking flock, rather than omit locks.
+rustix = { version = "=1.1.4", features = ["fs"] }
+
 [dependencies]
 rebook-layout = { path = "../layout" }
 rebook-reader = { path = "../reader" }

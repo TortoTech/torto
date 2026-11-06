@@ -2,10 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static DERIVED_REVISION: AtomicU64 = AtomicU64::new(0);
-
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
@@ -106,14 +102,34 @@ pub fn mark_derived_dirty(book_id: &str, kind: DerivedDataKind) -> io::Result<()
         )
     })?;
     fs::create_dir_all(parent)?;
-    crate::persistence::write_bytes_atomic(&path, uuid::Uuid::new_v4().to_string().as_bytes())?;
-    DERIVED_REVISION.fetch_add(1, Ordering::Relaxed);
-    Ok(())
+    let revision = uuid::Uuid::new_v4().to_string();
+    crate::persistence::write_bytes_atomic(&path, revision.as_bytes())?;
+    crate::persistence::write_bytes_atomic(&derived_revision_path()?, revision.as_bytes())
 }
 
 pub fn derived_change_token() -> io::Result<Option<String>> {
-    let revision = DERIVED_REVISION.load(Ordering::Relaxed);
-    Ok((revision > 0).then(|| revision.to_string()))
+    // A mobile process may die before its next scheduling probe. Keeping the
+    // token alongside the dirty markers makes that change observable on wake.
+    match fs::File::open(derived_revision_path()?) {
+        Ok(file) => {
+            let mut revision = String::new();
+            file.take(65).read_to_string(&mut revision)?;
+            if revision.len() > 64 {
+                return Err(io::Error::other("Invalid derived revision marker"));
+            }
+            Ok(Some(revision))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn derived_revision_path() -> io::Result<PathBuf> {
+    Ok(crate::environment::paths()
+        .ok_or_else(|| io::Error::other("Core environment unavailable"))?
+        .data
+        .join(DERIVED_SYNC_DIRECTORY)
+        .join("revision"))
 }
 
 pub async fn prepare_derived_data<F>(
@@ -979,6 +995,16 @@ fn require_unchanged(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn derived_change_token_is_persisted_with_dirty_markers() {
+        let id = format!("persistent-revision-{}", uuid::Uuid::new_v4());
+        super::mark_derived_dirty(&id, super::DerivedDataKind::Metadata).unwrap();
+        let token = super::derived_change_token().unwrap().unwrap();
+        assert!(uuid::Uuid::parse_str(&token).is_ok());
+        // Other book workers may publish another revision between reads.
+        assert!(uuid::Uuid::parse_str(&std::fs::read_to_string(super::derived_revision_path().unwrap()).unwrap()).is_ok());
+    }
+
     use super::*;
 
     #[test]

@@ -10,8 +10,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 
 @Composable
-fun ServiceSettingsPanel(state: ScreenState, model: ReaderModel, section: String, openProviders:()->Unit={}) {
-    if(section=="ai"){ProviderManager(state,model);return}
-    if(section!="sync"){AiRoleSettings(state,model,section,openProviders);return}
+fun ServiceSettingsPanel(state: ScreenState, model: ReaderModel, section: String) {
+    if(section!="sync"){AiRoleSettings(state,model,section);return}
     CloudSettingsPanel(state,model)
 }

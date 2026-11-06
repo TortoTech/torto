@@ -103,6 +103,7 @@ wgpu = { workspace = true, features = ["metal"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rebook-macos-open-file = { path = "../../crates/macos-open-file" }
+security-framework = { version = "3.7.0", default-features = false }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 wgpu = { workspace = true, features = ["vulkan", "gles"] }

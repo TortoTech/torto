@@ -9,7 +9,7 @@ pub(super) const PROMPT: &str = include_str!("formulas/prompt.md");
 pub(super) const TRANSCRIBE_PROMPT: &str = include_str!("formulas/transcribe.md");
 const SYMBOL_PROMPT: &str = include_str!("formulas/symbols.md");
 const REPLACEMENT_PROMPT: &str = include_str!("formulas/replacement.md");
-pub(super) const TEXT_REVISION: u32 = 7;
+pub(super) const TEXT_REVISION: u32 = 8;
 mod batch;
 
 // Keep the chapter/group identity stable. Image policy has its own revision and
@@ -18,8 +18,8 @@ pub(super) fn chapter_cache_options() -> Value {
     let item = json!({"type":"object","additionalProperties":false,"properties":{
         "image_id":{"type":"integer","description":"Copy an ID from requested_ids. IDs need not be consecutive."},
         "status":{"type":"string","enum":["recognized","recognized_text","not_formula","unreadable","unreadable_text"],"description":"recognized: the whole image is mathematics or a formal rule. recognized_text: the whole meaningful image is faithful Unicode text, including letters or script examples. not_formula: diagrams, plots, tables, photos, decorations or mixed visual/text images. unreadable: formula details are unclear; unreadable_text: text details are unclear or unsupported. Never infer characters from the surrounding words."},
-        "text":{"type":["string","null"],"description":"Exact visible Unicode text for recognized_text only; otherwise null. Preserve case, accents, combining characters, punctuation and meaningful spaces. No Markdown, XML/HTML, LaTeX, explanation or guessed characters."},
-        "literal":{"type":"boolean","description":"For recognized_text, true for character/script/pronunciation examples and literal symbols which must remain unchanged in translation; false for ordinary prose/words. Otherwise false."},
+        "text":{"type":["string","null"],"description":"Exact visible Unicode text for recognized_text only; otherwise null. Preserve case, accents, combining characters, punctuation and meaningful spaces. No output wrappers, Markdown fences, explanation or guessed characters. Literal source-code XML/HTML must stay exactly as seen; preserve indentation and line breaks."},
+        "literal":{"type":"boolean","description":"For recognized_text, true for source code, character/script/pronunciation examples and literal symbols which must remain unchanged in translation; false for ordinary prose/words. Otherwise false."},
         "latex":{"type":["string","null"],"description":"Transcribe faithful supported LaTeX without dollar delimiters or Markdown. For a negative status, return null. Use standard math commands, text operators and matrix/aligned environments. Exclude custom macros, packages, images, URLs and executable commands. Encode each command backslash as two JSON backslashes; encode a row separator as four. Do not drop backslashes or turn command prefixes into control characters."},
         "equation_number":{"type":["string","null"],"description":"Copy only a separate equation number visible in this image. Exclude it from latex. Do not infer it from context. If absent or the status is negative, return null."}
     },"required":["image_id","status","latex","equation_number","text","literal"]});
@@ -36,8 +36,8 @@ fn current_image_options() -> Value {
         "image_id":{"type":"integer","description":"Copy an ID from requested_ids. IDs need not be consecutive."},
         "status":{"type":"string","enum":["recognized","recognized_text","not_formula","unreadable","unreadable_text","recognized_table"],"description":"recognized: the whole image is mathematics or a formal rule. recognized_text: the whole meaningful image is faithful Unicode text, including letters or script examples. recognized_table: a complete legible data table, including merged headers and continued tables. not_formula: diagrams, plots, photos, decorations or mixed visual/text images. unreadable: formula details are unclear; unreadable_text: text details are unclear or unsupported. Never infer characters from the surrounding words."},
         "table_html":{"type":["string","null"],"description":"For recognized_table only, a complete faithful XHTML table using table/thead/tbody/tfoot/tr/th/td/caption/br with rowspan and colspan. Preserve all visible cells, merged/multilevel headers, numbers, units, notes and continuation labels. Escape XML characters; close br as <br/>. No style, images, links, scripts or Markdown. For other statuses null."},
-        "text":{"type":["string","null"],"description":"Exact visible Unicode text for recognized_text only; otherwise null. Preserve case, accents, combining characters, punctuation and meaningful spaces. No Markdown, XML/HTML, LaTeX, explanation or guessed characters."},
-        "literal":{"type":"boolean","description":"For recognized_text, true for character/script/pronunciation examples and literal symbols which must remain unchanged in translation; false for ordinary prose/words. Otherwise false."},
+        "text":{"type":["string","null"],"description":"Exact visible Unicode text for recognized_text only; otherwise null. Preserve case, accents, combining characters, punctuation and meaningful spaces. No output wrappers, Markdown fences, explanation or guessed characters. Literal source-code XML/HTML must stay exactly as seen; preserve indentation and line breaks."},
+        "literal":{"type":"boolean","description":"For recognized_text, true for source code, character/script/pronunciation examples and literal symbols which must remain unchanged in translation; false for ordinary prose/words. Otherwise false."},
         "latex":{"type":["string","null"],"description":"Transcribe faithful supported LaTeX without dollar delimiters or Markdown. For a negative status, return null. Use standard math commands, text operators and matrix/aligned environments. Exclude custom macros, packages, images, URLs and executable commands. Encode each command backslash as two JSON backslashes; encode a row separator as four. Do not drop backslashes or turn command prefixes into control characters."},
         "equation_number":{"type":["string","null"],"description":"Copy only a separate equation number visible in this image. Exclude it from latex. Do not infer it from context. If absent or the status is negative, return null."}
     },"required":["image_id","status","latex","equation_number","text","literal","table_html"]});
@@ -282,7 +282,7 @@ pub(super) fn validate_text(text: &str) -> Result<(), String> {
     if text.trim().is_empty()
         || text.len() > 4096
         || text.contains('\u{fffd}')
-        || text.chars().any(|c| c.is_control() && c != '\n')
+        || text.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
     {
         return Err("Empty, damaged or unsupported image text".into());
     }

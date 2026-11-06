@@ -15,6 +15,8 @@ use text_layout::{Layout, PositionedLayoutItem};
 mod caption_labels;
 mod formula_images;
 mod image_text;
+#[cfg(test)]
+mod image_sizing_tests;
 mod list_markers;
 #[cfg(test)]
 mod figure_typesetting_tests;
@@ -31,6 +33,8 @@ mod table_captions;
 mod media_captions;
 pub use table_captions::{Presentation as TablePresentation, presentation as table_presentation};
 mod table_shaping;
+mod table_widths;
+pub use table_widths::TableWidthStats;
 mod web_links;
 pub use raster_cache::{
     DeferredRaster, RasterCacheStats, RasterOrigin, clear_raster_cache, load_original_raster,
@@ -1045,6 +1049,7 @@ fn empty_text_source_spans() -> Arc<[TextSourceSpan]> {
 
 /// One positioned table chunk. Large tables can produce one chunk per page.
 pub struct TablePlacement {
+    pub source: Option<SourceRange>,
     pub cells: Vec<TableCellPlacement>,
     pub y: f32,
     pub height: f32,
@@ -1096,6 +1101,8 @@ pub struct FormulaPresentation {
 
 /// Positioned raster image.
 pub struct ImagePlacement {
+    /// Authored overflow clipping in page coordinates; pixels keep their scale.
+    pub clip: Option<FixedPageTextRect>,
     pub formula_presentation: Option<FormulaPresentation>,
     pub image: RasterImage,
     pub x: f32,
@@ -1105,6 +1112,12 @@ pub struct ImagePlacement {
     pub source: Option<SourceRange>,
     pub text_layer: Option<FixedPageTextLayer>,
     pub replacement: Option<FixedPageTextReplacementPlacement>,
+}
+
+impl ImagePlacement {
+    pub fn visible_rect(&self) -> FixedPageTextRect {
+        self.clip.unwrap_or(FixedPageTextRect { x:self.x, y:self.y, width:self.width, height:self.height })
+    }
 }
 
 /// Translated text repainted inside the original fixed-layout page image.
@@ -1136,6 +1149,7 @@ pub struct LayoutEngine {
     raster_target: [u32; 2],
     raster_generation: u64,
     deferred_images: bool,
+    table_widths: table_widths::Cache,
 }
 
 fn should_layout_flow_block(block: &Block, reader_style: &ReaderStyle) -> bool {
@@ -1343,6 +1357,18 @@ pub fn svg_font_database() -> Arc<resvg::usvg::fontdb::Database> {
     FONTS.get_or_init(|| {
         let mut fonts = resvg::usvg::fontdb::Database::new();
         fonts.load_system_fonts();
+        // fontdb's system discovery has no Android implementation. Body text
+        // uses fontique, but SVG text (charts/formula definitions) needs the
+        // same platform fonts registered explicitly in its own shared database.
+        #[cfg(target_os = "android")]
+        {
+            for directory in ["/system/fonts", "/product/fonts", "/system_ext/fonts", "/vendor/fonts"] {
+                fonts.load_fonts_dir(directory);
+            }
+            fonts.set_sans_serif_family("Roboto");
+            fonts.set_serif_family("Noto Serif");
+            fonts.set_monospace_family("Roboto Mono");
+        }
         Arc::new(fonts)
     }).clone()
 }
@@ -1372,6 +1398,7 @@ impl LayoutEngine {
             raster_target: [2048, 2048],
             raster_generation: raster_cache::generation(),
             deferred_images: false,
+            table_widths: table_widths::Cache::default(),
         }
     }
 
@@ -1402,6 +1429,10 @@ impl LayoutEngine {
 
     pub fn set_deferred_images(&mut self, enabled: bool) {
         self.deferred_images = enabled;
+    }
+    /// Lightweight worker-local counters for table layout performance audits.
+    pub fn table_width_stats(&self) -> TableWidthStats {
+        self.table_widths.stats()
     }
     pub fn deferred_images(&self) -> bool {
         self.deferred_images
@@ -1964,6 +1995,7 @@ impl LayoutEngine {
                     } else {
                         self.shape_table(source, table, reader_style, width)?
                     };
+                    prepared.source = table.source.clone();
                     if captions.before.is_empty() && captions.after.is_empty()
                         || prepared.row_heights.is_empty()
                     {
@@ -2073,6 +2105,10 @@ impl LayoutEngine {
                             * reader_style.typesetting.media_gap_em;
                         image_style.margin_before = gap;
                         image_style.margin_after = gap;
+                    }
+                    if paginator.image_visible_size(&raster, image_style) == (0.0,0.0) {
+                        block_index += 1;
+                        continue;
                     }
                     let replacements = paginator.push_image(
                         raster,
@@ -2223,7 +2259,7 @@ impl LayoutEngine {
         )?;
         if unified_reflow {
             let width = (content_width - media_start_offset).max(1.0);
-            let media_width = images.iter().map(|(raster, style, _)| paginator.image_display_size(raster, *style).0).fold(0.0, f32::max);
+            let media_width = images.iter().map(|(raster, style, _)| paginator.image_visible_size(raster, *style).0).fold(0.0, f32::max);
             self.align_media_sources(source, &mut before_captions, reader_style, width, media_width)?;
             self.align_media_sources(source, &mut after_captions, reader_style, width, media_width)?;
         }
@@ -2239,7 +2275,7 @@ impl LayoutEngine {
         };
         let image_height = images
             .iter()
-            .map(|(raster, style, _)| paginator.image_display_size(raster, *style).1)
+            .map(|(raster, style, _)| paginator.image_visible_size(raster, *style).1)
             .sum::<f32>();
         let caption_height = before_captions
             .iter().chain(&after_captions)
@@ -2748,6 +2784,7 @@ impl LayoutEngine {
             }
         }
         Ok(PreparedTable {
+            source: None,
             horizontal_offset: centered_table_offset(unified, content_width, &column_widths),
             column_widths,
             row_heights,
@@ -2853,10 +2890,12 @@ impl LayoutEngine {
             let reusable = table_shaping::reusable_measurement(&block, &unwrapped);
             measured_cells.push(reusable.then_some(unwrapped));
         }
-        (
-            fit_adaptive_column_widths(&preferred_widths, &minimum_widths, content_width),
-            measured_cells,
-        )
+        let baseline = fit_adaptive_column_widths(&preferred_widths, &minimum_widths, content_width);
+        let widths = table_widths::optimize(
+            &mut self.table_widths, grid_cells, &measured_cells, &baseline,
+            &minimum_widths, &preferred_widths, content_width, reader_style, table_metrics.cell_padding,
+        );
+        (widths, measured_cells)
     }
 
     fn shape_text_with_min_width(
@@ -3150,7 +3189,14 @@ impl LayoutEngine {
         if should_optimize {
             let analysis = linebreak::parley::ParagraphAnalysis::new(&text);
             for _ in 0..4 {
-                let Some(prepared) = linebreak::parley::plan_optimized_reusable(
+                let prepared = if text.contains('\n') {
+                    linebreak::parley::plan_sentences(
+                        &mut layout, &text, available_width, first_line_indent,
+                        continuation_indent, typography.font_size, &hyphen_widths,
+                        block.style.sentence_indents,
+                        sentence_reference.as_ref().map(|r|(r.layout.as_ref(),r.text.as_ref())),
+                    )
+                } else { linebreak::parley::plan_optimized_reusable(
                     &mut layout,
                     &text,
                     available_width,
@@ -3159,7 +3205,8 @@ impl LayoutEngine {
                     typography.font_size,
                     &hyphen_widths,
                     &analysis,
-                ) else {
+                ) };
+                let Some(prepared) = prepared else {
                     break;
                 };
                 let plan = &prepared.plan;
@@ -4192,10 +4239,7 @@ fn resolve_text_block_with_caption_emphasis<'a>(
             }
             TextBlockKind::ListItem { depth, .. } => {
                 resolved.style.margin_start =
-                    base_size * (profile.list_indent_em * (f32::from(depth) + 1.0)
-                        + if display_system == WritingSystem::Cjk {
-                            paragraph_indent_em(profile, display_system)
-                        } else { 0.0 });
+                    base_size * profile.list_indent_em * (f32::from(depth) + 1.0);
                 resolved.style.margin_start_fraction = 0.0;
             }
             TextBlockKind::DefinitionTerm { depth } => {
@@ -4790,6 +4834,7 @@ struct PreparedHyphen {
 }
 
 struct PreparedTable {
+    source: Option<SourceRange>,
     horizontal_offset: f32,
     column_widths: Vec<f32>,
     row_heights: Vec<f32>,
@@ -4804,6 +4849,7 @@ struct PreparedTable {
 impl Default for PreparedTable {
     fn default() -> Self {
         Self {
+            source: None,
             horizontal_offset: 0.0,
             column_widths: Vec::new(),
             row_heights: Vec::new(),
@@ -6091,6 +6137,7 @@ impl Paginator {
             })
             .collect();
         self.items.push(PageItem::Table(TablePlacement {
+            source: table.source.clone(),
             cells,
             y: table_y,
             height,
@@ -6122,32 +6169,49 @@ impl Paginator {
         let aspect_ratio = intrinsic_width / intrinsic_height;
         let content_height = self.bottom - self.top;
         let media_width = (self.width - self.media_start_offset).max(1.0);
-        let containing_width = style
-            .container_width
-            .map_or(media_width, |width| width.resolve(media_width))
-            .clamp(1.0, media_width);
-        let requested_height = style.height.map(|height| height.resolve(content_height));
-        let requested_width = style
-            .width
-            .map(|width| width.resolve(containing_width))
-            .or_else(|| requested_height.map(|height| height * aspect_ratio))
-            .unwrap_or(intrinsic_width)
-            .max(1.0);
-        let requested_height = requested_height
-            .unwrap_or(requested_width / aspect_ratio)
-            .max(1.0);
-        let max_width = style
-            .max_width
-            .map_or(containing_width, |width| width.resolve(containing_width))
-            .clamp(1.0, containing_width);
-        let max_height = style
-            .max_height
-            .map_or(content_height, |height| height.resolve(content_height))
-            .clamp(1.0, content_height);
-        let scale = (max_width / requested_width)
-            .min(max_height / requested_height)
-            .min(1.0);
-        (requested_width * scale, requested_height * scale)
+        let containing_width = style.container_width.map_or(media_width, |w| w.resolve(media_width)).max(0.0);
+        let containing_height = style.container_height.map(|h| h.resolve(content_height).max(0.0));
+        let height = |h: ImageLength| match h {
+            ImageLength::Pixels(v) => Some(v),
+            ImageLength::Fraction(v) => containing_height.map(|h| h * v),
+        };
+        let explicit_height = style.height.and_then(height);
+        let mut width = style.width.map(|w| w.resolve(containing_width))
+            .or_else(|| explicit_height.map(|h| h * aspect_ratio)).unwrap_or(intrinsic_width).max(0.0);
+        let mut height_used = explicit_height.unwrap_or(width / aspect_ratio).max(0.0);
+        // Resolve CSS constraints first. Auto axes preserve the intrinsic ratio
+        // unless simultaneous minimum/maximum constraints require distortion.
+        let min_w = style.min_width.map_or(0.0, |w| w.resolve(containing_width));
+        let min_h = style.min_height.and_then(height).unwrap_or(0.0);
+        let max_w = style.max_width.map_or(f32::MAX, |w| w.resolve(containing_width)).max(min_w);
+        let max_h = style.max_height.and_then(height).unwrap_or(f32::MAX).max(min_h);
+        {
+            if style.width.is_none() && explicit_height.is_none() {
+                let scale = (max_w / width).min(max_h / height_used).min(1.0)
+                    .max((min_w / width).max(min_h / height_used));
+                width *= scale; height_used *= scale;
+            } else if explicit_height.is_none() {
+                let next = width.clamp(min_w, max_w);
+                height_used = next / aspect_ratio; width = next;
+            } else if style.width.is_none() {
+                let next = height_used.clamp(min_h, max_h);
+                width = next * aspect_ratio; height_used = next;
+            }
+        }
+        width = width.clamp(min_w, max_w);
+        height_used = height_used.clamp(min_h, max_h);
+        if width <= 0.0 || height_used <= 0.0 { return (0.0, 0.0); }
+        // Reader page fitting is separate from authored containing-block widths.
+        // An auto image may overflow a narrow parent, as with overflow:visible.
+        let scale = (media_width / width).min(content_height / height_used).min(1.0);
+        (width * scale, height_used * scale)
+    }
+
+    fn image_visible_size(&self, image: &RasterImage, style: ImageStyle) -> (f32, f32) {
+        let (w,h) = self.image_display_size(image, style);
+        let width = style.clip_width.map_or(w, |v| v.resolve((self.width-self.media_start_offset).max(1.0)).max(0.0).min(w));
+        let height = style.clip_height.map_or(h, |v| v.resolve(self.bottom-self.top).max(0.0).min(h));
+        if width <= 0.0 || height <= 0.0 { (0.0,0.0) } else { (width,height) }
     }
 
     fn prepare_group(&mut self, content_height: f32, outer_gap: f32) {
@@ -6208,11 +6272,15 @@ impl Paginator {
         self.forced_page_break = false;
         self.previous_block_was_paragraph = false;
         let (width, height) = self.image_display_size(&image, style);
+        if width <= 0.0 || height <= 0.0 { return Vec::new(); }
+        let (visible_width, visible_height) = self.image_visible_size(&image, style);
+        if visible_width <= 0.0 || visible_height <= 0.0 { return Vec::new(); }
+
         let media_width = (self.width - self.media_start_offset).max(1.0);
         let block_gap = style.margin_before.max(minimum_before);
         let page_count_before_spacing = self.pages.len();
         self.ensure_minimum_spacing(block_gap);
-        if self.cursor_y + height > self.bottom && self.column_has_content {
+        if self.cursor_y + visible_height > self.bottom && self.column_has_content {
             self.advance_column();
         }
         if restore_gap_on_empty_page || self.pages.len() > page_count_before_spacing {
@@ -6244,6 +6312,7 @@ impl Paginator {
                 .collect()
         });
         self.items.push(PageItem::Image(ImagePlacement {
+            clip: (visible_width < width || visible_height < height).then_some(FixedPageTextRect { x, y: self.cursor_y, width: visible_width, height: visible_height }),
             formula_presentation: None,
             image,
             x,
@@ -6260,7 +6329,7 @@ impl Paginator {
             self.pending_leading_gap = trailing_gap;
         }
         self.column_has_content = true;
-        self.cursor_y += height + trailing_gap;
+        self.cursor_y += visible_height + trailing_gap;
         replacements
     }
 
@@ -6341,7 +6410,7 @@ impl Paginator {
                 }),
             PageItem::Quote(quote) => Some(quote.y + quote.height),
             PageItem::FigureBody(body) => Some(body.y + body.height),
-            PageItem::Image(image) => Some(image.y + image.height),
+            PageItem::Image(image) => Some(image.visible_rect().y + image.visible_rect().height),
             PageItem::Table(table) => Some(table.y + table.height),
             PageItem::Separator(separator) => Some(separator.y + 1.0),
         })
@@ -7523,6 +7592,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sentence_split_keeps_optimized_english_hyphenation() {
+        let sentences=["A short opening sentence. ",
+            "Extraordinary typographical considerations improve international readability and representation. ",
+            "Characteristically complicated terminology benefits from professionally balanced typography."];
+        let mut block=TextBlock {
+            kind:TextBlockKind::Paragraph,
+            content:sentences.iter().enumerate().flat_map(|(i,s)| {
+                let mut items=Vec::new();if i>0 {items.push(Inline::Break);}
+                items.push(Inline::Text(TextRun {text:(*s).into(),style:TextStyle {
+                    language:rebook_publication::TextLanguage::EnglishUs,
+                    hyphenation:rebook_publication::HyphenationMode::Auto,..Default::default()
+                },link:None}));items
+            }).collect(),
+            style:BlockStyle {sentence_indents:true,preserve_sentence_prefix:true,indent:24.0,..Default::default()},
+            source:None,
+        };
+        let style=ReaderStyle {typesetting:ReaderTypesetting::unified(),..Default::default()};
+        let mut engine=LayoutEngine::new();
+        let mut found=false;
+        for width in (120..300).step_by(10) {
+            let shaped=engine.shape_text(&block,&style,width as f32);
+            assert_eq!(shaped.text.replace('\n',""),sentences.concat());
+            assert_eq!(shaped.layout.lines().filter(|l|l.break_reason()==parley::layout::BreakReason::Explicit).count(),2);
+            for hyphen in shaped.hyphens.iter() {
+                assert_ne!(shaped.layout.get(hyphen.line_index).unwrap().break_reason(),parley::layout::BreakReason::Explicit);
+            }
+            found|=!shaped.hyphens.is_empty();
+        }
+        assert!(found,"each sentence must retain dictionary hyphenation instead of falling back to greedy wrapping");
+        block.style.preserve_sentence_prefix=false;
+        assert!(engine.shape_text(&block,&style,180.0).layout.len()>3);
     }
 
     #[test]
@@ -8716,6 +8819,117 @@ mod tests {
         let resolved = resolve_text_block(&block, &style, TextContext::Flow);
         assert!((resolved.style.margin_start - 30.0).abs() < 0.001);
         assert!(resolved.style.margin_start_fraction.abs() < 0.001);
+    }
+
+    #[test]
+    fn translated_lists_keep_the_same_level_indents_as_the_original() {
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..Default::default()
+        };
+        for depth in 0..3 {
+            let block = |display| TextBlock {
+                kind: TextBlockKind::ListItem {
+                    ordered: false,
+                    ordinal: 1,
+                    depth,
+                    marker_visible: true,
+                },
+                content: vec![Inline::Text(TextRun {
+                    text: "A list item".into(),
+                    style: TextStyle {
+                        display_writing_system: Some(display),
+                        ..Default::default()
+                    },
+                    link: None,
+                })],
+                style: Default::default(),
+                source: None,
+            };
+            let latin = block(WritingSystem::Latin);
+            let cjk = block(WritingSystem::Cjk);
+            let original = resolve_text_block(&latin, &style, TextContext::Flow);
+            let translated = resolve_text_block(&cjk, &style, TextContext::Flow);
+            assert_eq!(original.style.margin_start, translated.style.margin_start);
+            assert_eq!(original.style.indent, translated.style.indent);
+        }
+        let paragraph = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "中文正文".into(),
+                style: TextStyle {
+                    display_writing_system: Some(WritingSystem::Cjk),
+                    ..Default::default()
+                },
+                link: None,
+            })],
+            style: Default::default(),
+            source: None,
+        };
+        assert_eq!(
+            resolve_text_block(&paragraph, &style, TextContext::Flow)
+                .style
+                .indent,
+            style.typography.font_size * 2.0
+        );
+    }
+
+    #[test]
+    fn table_optimizer_reuses_widths_but_remeasures_translated_cell_text() {
+        let cell = |text: &str| TableCell {
+            text: TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: Default::default(),
+                    link: None,
+                })],
+                style: Default::default(),
+                source: None,
+            },
+            row_span: 1,
+            column_span: 1,
+            header: false,
+            authored_alignment: None,
+        };
+        let mut table = TableBlock {
+            visualization: None,
+            source: None,
+            before: vec![],
+            after: vec![],
+            rows: vec![
+                TableRow {
+                    cells: vec![
+                        cell("Label"),
+                        cell(
+                            "A description with many short words, which must wrap in a narrow table.",
+                        ),
+                    ],
+                },
+                TableRow {
+                    cells: vec![
+                        cell("Second label"),
+                        cell(
+                            "Another description with a different number of words and a longer explanation.",
+                        ),
+                    ],
+                },
+            ],
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..Default::default()
+        };
+        let mut engine = LayoutEngine::new();
+        let source = EmptySource::new("table-language");
+        let original = engine.shape_table(&source, &table, &style, 480.).unwrap();
+        assert!(original.column_widths.iter().sum::<f32>() <= 480.01);
+        let repeat = engine.shape_table(&source, &table, &style, 480.).unwrap();
+        assert_eq!(original.column_widths, repeat.column_widths);
+        table.rows[0].cells[0] = cell("翻译后的这一列现在包含很长的中文说明，需要重新分配宽度");
+        let translated = engine.shape_table(&source, &table, &style, 480.).unwrap();
+        assert_ne!(original.column_widths, translated.column_widths);
+        assert!(translated.column_widths.iter().sum::<f32>() <= 480.01);
     }
 
     #[test]
@@ -10857,8 +11071,9 @@ mod tests {
                 ..style
             },
         );
-        assert!((width - 400.0).abs() < 0.001);
-        assert!((height - 300.0).abs() < 0.001);
+        // Auto-sized replaced content can overflow a narrower containing block.
+        assert!((width - 800.0).abs() < 0.001);
+        assert!((height - 600.0).abs() < 0.001);
     }
 
     #[test]

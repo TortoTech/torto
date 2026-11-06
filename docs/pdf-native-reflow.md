@@ -1,5 +1,47 @@
 # Local PDF reflow
 
+## Original-page zoom
+
+Original PDF reading has page/width fit modes, actual size (100%), and manual
+25–400% zoom. A compact control at the bottom-right of the content area uses
+Lucide minus/plus icons and a read-only current percentage. Ctrl/Cmd +/−/0,
+pinch or Ctrl-scroll share one
+source-preserving transform. Space-drag pans; background double-click switches
+page/width fit while double-clicking text leaves zoom unchanged. Reflowed PDF text
+continues to use typography settings. Preferences are stored locally per book,
+read/written on the viewport worker; startup never overwrites a saved preference
+with a not-yet-loaded default.
+
+The renderer transforms page pixels, selection, search marks and source overlays
+together; pointer hits use the inverse transform. Continuous scrolling keeps
+scroll offsets in source coordinates and scrollbar extents in screen coordinates,
+so zoom neither multiplies wheel travel nor makes the page bottom unreachable.
+Programmatic zoom offsets preserve the current locator until the user scrolls.
+
+After 140 ms without another view change, one coalesced worker renders only the
+visible PDF region at the display density. Whole-page pixels remain immediately
+available during gestures. Region output is limited to 8 Mi pixels/4096 px per
+edge; at most two visible pages are requested. Interpretation/decoder transient
+memory is separate from that output budget. Older jobs cannot replace a newer
+view. Region pixels are painted before translated masks/glyphs and interaction
+overlays and do not enter the ordinary whole-page raster cache. Leaving original
+mode releases viewport patches. Memory-only point-size queries never open a lazy
+or retired PDF source.
+
+Local real-book checks use *Simply Logical*, *The TeXbook*, *Book Design* and
+*Reading Letters* (physical page 31), including a scan with no selectable text.
+Native Apple M6/Metal tests cover source/locator preservation, actual egui keyboard
+and pinch input without application UI scaling, selectable zoomed text, region
+painting, constant wheel distance and reachable scroll bounds. Optional tests are
+`reader::pdf_zoom::local_pdf_tests` with `TORTO_PDF_ZOOM_BOOK`; set
+`TORTO_FEATURE_ARTIFACTS` to save fit/zoom PNGs. These tests use local files and do
+not request AI or credentials. They do not establish Windows runtime behavior.
+The final macOS preview also passed a manual check with the normal application
+configuration: page/width fit, Cmd + and Cmd 0, and zoomed word selection
+with its highlight and action toolbar aligned to the original text.
+
+## Text generation
+
 The PDF toolbar has one text-generation button. A worker samples up to 12 deterministically distributed pages and chooses local reconstruction or the configured OCR provider. Existing results for the chosen source are reused. The UI does not display classification labels or reasons. Right-click to regenerate automatically or explicitly select/regenerate a local result or select existing OCR text. Sampling and local conversion can be cancelled with the same button; a running shared OCR job retains its existing background lifecycle.
 
 The preflight combines visible/hidden text, the union of clipped image rectangles (including tiled scans), Unicode mapping failures, replacement/private-use characters, abnormal whitespace, repeated text at the same coordinates, and native layout limitations. Blank and sparse illustration pages are excluded from the body vote. At least 75% of informative sampled pages must have reliable native text; otherwise the button uses OCR. Sampling inspects objects without decoding images or rendering pages, and releases each page before inspecting the next. Conversion retains page-level fallbacks and repeats text-quality checks on unsampled pages. Classification is a conservative heuristic, not proof of PDF provenance or correct reading order. No OCR request is made when recognition is disabled; the existing settings instruction is shown instead.

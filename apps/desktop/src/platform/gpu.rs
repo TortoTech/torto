@@ -687,6 +687,8 @@ impl GpuState {
         self.queue.present(frame);
         #[cfg(target_os = "macos")]
         crate::updater::macos::frame_presented();
+        #[cfg(target_os = "windows")]
+        crate::updater::portable::frame_presented();
         let presentation_finished = frame_started.elapsed();
         let reader_ready = body_submitted;
         app.record_open_presentation(reader_ready, egui_ctx);

@@ -477,7 +477,7 @@ impl DesktopApp {
         self.updater.report_install_error(request, message);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) fn update_save_job(&mut self) -> Box<dyn FnOnce() -> Result<(), String> + Send> {
         match self.reader.as_mut() {
             Some(reader) => reader.update_save_job(),

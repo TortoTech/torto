@@ -35,7 +35,7 @@ pub(super) fn abbreviation_ranges(text: &str) -> Vec<Range<usize>> {
 }
 
 pub(super) fn segmentation_text(text: &str) -> Cow<'_, str> {
-    if !text.bytes().any(|c| c.is_ascii_digit()) {
+    if !text.bytes().any(|c| c.is_ascii_digit()) && !text.contains(['《', '〈']) {
         return Cow::Borrowed(text);
     }
     let chars = text.char_indices().collect::<Vec<_>>();
@@ -114,11 +114,47 @@ pub(super) fn segmentation_text(text: &str) -> Cow<'_, str> {
         changed = true;
         i = end + 1;
     }
+    changed |= mask_title_punctuation(&chars, &mut result);
     if changed {
         Cow::Owned(String::from_utf8(result).expect("equal-width Unicode masks"))
     } else {
         Cow::Borrowed(text)
     }
+}
+
+/// A title's internal question mark is not the end of its containing sentence.
+/// Mask before segmentation: extending a boundary merely to the closing bracket
+/// would still split “在《为什么？》中指出…”. Byte and scalar offsets stay intact.
+fn mask_title_punctuation(chars: &[(usize, char)], output: &mut [u8]) -> bool {
+    let mut stack = Vec::new();
+    let mut coverage = vec![0i32; chars.len() + 1];
+    for (index, &(_, ch)) in chars.iter().enumerate() {
+        if matches!(ch, '《' | '〈') {
+            stack.push((ch, index));
+        } else if let Some(&(opener, start)) = stack.last()
+            && matches!((opener, ch), ('《', '》') | ('〈', '〉'))
+        {
+            stack.pop();
+            coverage[start] += 1;
+            coverage[index + 1] -= 1;
+        }
+    }
+    let mut depth = 0;
+    let mut changed = false;
+    for (index, &(byte, ch)) in chars.iter().enumerate() {
+        depth += coverage[index];
+        if depth > 0
+            && matches!(
+                ch,
+                '.' | '!' | '?' | ':' | ';' | '。' | '！' | '？' | '：' | '；'
+            )
+        {
+            let replacement = if ch.len_utf8() == 1 { "X" } else { "文" };
+            output[byte..byte + ch.len_utf8()].copy_from_slice(replacement.as_bytes());
+            changed = true;
+        }
+    }
+    changed
 }
 
 pub(super) fn latin_name_end(chars: &[(usize, char)], start: usize) -> Option<usize> {
@@ -157,6 +193,38 @@ pub(super) fn latin_name_end(chars: &[(usize, char)], start: usize) -> Option<us
 #[cfg(test)]
 mod tests {
     use super::super::sentence_byte_ranges_with_language;
+    #[test]
+    fn book_title_questions_do_not_end_the_containing_sentence() {
+        for (text, expected) in [
+            (
+                "他在《为什么？如何解释？》中指出这个问题。下一句。",
+                vec!["他在《为什么？如何解释？》中指出这个问题。", "下一句。"],
+            ),
+            (
+                "请阅读〈What? Why!〉再回答。下一句。",
+                vec!["请阅读〈What? Why!〉再回答。", "下一句。"],
+            ),
+            (
+                "这本书是《为什么？》。下一句。",
+                vec!["这本书是《为什么？》。", "下一句。"],
+            ),
+            (
+                "他问：“为什么？”下一句。",
+                vec!["他问：“为什么？”", "下一句。"],
+            ),
+        ] {
+            let ranges = sentence_byte_ranges_with_language(text, "en");
+            assert_eq!(
+                ranges.iter().map(|r| &text[r.clone()]).collect::<Vec<_>>(),
+                expected,
+                "{text}"
+            );
+            assert_eq!(
+                ranges.iter().map(|r| &text[r.clone()]).collect::<String>(),
+                text
+            );
+        }
+    }
     #[test]
     fn mixed_names_and_enumerators_preserve_real_sentences_and_every_source_byte() {
         for (text, expected) in [

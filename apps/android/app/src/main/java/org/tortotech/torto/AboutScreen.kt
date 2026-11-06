@@ -13,15 +13,20 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import org.tortotech.torto.core.updateReleaseNotes
 
-@Composable fun AboutScreen(state:ScreenState,model:ReaderModel,licenses:()->Unit={}){
+@Composable fun AboutScreen(state:ScreenState,model:ReaderModel,licenses:()->Unit={},feedback:()->Unit={}){
     val context=LocalContext.current
     val cache=remember{AssistantAssetCache()}
     val language=tr("zh-CN","en")
     val notes=remember(state.appUpdate?.notes,language){updateReleaseNotes(state.appUpdate?.notes.orEmpty(),language)}
-    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp).navigationBarsPadding(),verticalArrangement=Arrangement.spacedBy(16.dp)){
+    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp).navigationBarsPadding(),verticalArrangement=Arrangement.spacedBy(12.dp)){
+        SettingsGroup { Column(Modifier.fillMaxWidth().padding(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
         Image(painterResource(R.drawable.ic_torto),tr("Torto 徽标","Torto logo"),Modifier.size(64.dp));Text("Torto",style=MaterialTheme.typography.headlineLarge);Text(state.appVersion)
         Text(tr("专注阅读的开源电子书阅读器","An open-source ebook reader focused on reading"))
-        SettingChoice(tr("更新来源","Update source"),state.updateSource,listOf("automatic" to tr("自动","Automatic"),"github" to "GitHub","gitee" to "Gitee"),!state.checkingUpdate&&!state.downloadingUpdate,model::updateSource)
+        }}
+        SectionLabel(tr("更新","Updates"))
+        SettingsGroup {
+        SettingChoice(tr("更新来源","Update source"),state.updateSource,listOf("automatic" to tr("自动","Automatic"),"github" to "GitHub","gitee" to "Gitee"),!state.checkingUpdate&&!state.downloadingUpdate,choose=model::updateSource)
+        Column(Modifier.fillMaxWidth().padding(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
         Button(onClick=model::checkUpdates,enabled=!state.checkingUpdate&&!state.downloadingUpdate){Text(tr("检查更新","Check for updates"))}
         if(state.checkingUpdate)LinearProgressIndicator(Modifier.fillMaxWidth())
         if(state.updateChecked&&state.appUpdate==null)Text(tr("当前已是最新版本","You are up to date"))
@@ -36,10 +41,16 @@ import org.tortotech.torto.core.updateReleaseNotes
             }
         }
         state.updateError?.let {Text(it,color=MaterialTheme.colorScheme.error)}
-        TextButton(onClick=licenses){Text(tr("开源许可","Open-source licenses"))}
-        HorizontalDivider()
-        Text(tr("诊断与反馈","Diagnostics and feedback"),style=MaterialTheme.typography.titleMedium)
-        OutlinedButton(onClick={model.exportDiagnostics(context)},enabled=!state.busy){Text(tr("导出诊断日志","Export diagnostic log"))}
-        for((label,url)in listOf(tr("官方网站","Website") to "https://tortotech.github.io/",tr("开源项目","Source code") to "https://github.com/TortoTech/torto",tr("反馈问题","Report an issue") to "https://github.com/TortoTech/torto/issues",tr("应用许可 · AGPL-3.0-only","App license · AGPL-3.0-only") to "https://github.com/TortoTech/torto/blob/main/LICENSE"))TextButton(onClick={context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(url)))}){Text(label)}
+        }}
+        SectionLabel(tr("诊断与反馈","Diagnostics and feedback"))
+        SettingsGroup {
+            SettingsItem(tr("导出诊断日志","Export diagnostic log"),enabled=!state.busy){model.exportDiagnostics(context)}
+            SettingsItem(tr("反馈问题","Report an issue"),onClick=feedback)
+        }
+        SectionLabel(tr("相关链接","Links"))
+        SettingsGroup {
+            SettingsItem(tr("开源许可","Open-source licenses"),onClick=licenses)
+            for((label,url)in listOf(tr("官方网站","Website") to "https://tortotech.github.io/",tr("开源项目","Source code") to "https://github.com/TortoTech/torto",tr("应用许可 · AGPL-3.0-only","App license · AGPL-3.0-only") to "https://github.com/TortoTech/torto/blob/main/LICENSE"))SettingsItem(label){context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(url)))}
+        }
     }
 }

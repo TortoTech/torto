@@ -20,8 +20,17 @@ Remove this patch after upstream egui preserves cross-label selections whose end
 `ScrollArea` viewport.
 
 Torto also exposes whether the vertical scroll bar is being interacted with so focus-mode scroll bar
-input follows the same paragraph-based navigation path as mouse-wheel input. The upstream scroll interaction behavior is otherwise retained. The local `State::set_offset`
+input follows the same paragraph-based navigation path as mouse-wheel input. The local `State::set_offset`
 method preserves scroll restoration and selection autoscroll now that the offset is private.
+
+Programmatic offsets (the builder's axis offsets and `State::set_offset`) cancel
+old momentum and `scroll_to_*` animation on the affected axes. The next pass skips
+kinetic integration against the previous content's bounds once, then clamps to
+the current content's bounds normally. Without this, entering a longer chapter
+or resuming a book can generate a spurious upward rebound after the requested
+focus block was presented. User-driven scrolling retains its inertia and bounce.
+Desktop regressions cover content growth, the state setter, genuine clamping,
+reverse chapter entry and reopening a saved paragraph after a shorter book.
 
 The default image texture loader also evicts least recently used, inactive textures when its
 retained pixel data exceeds 64 MiB. Textures touched in the current or previous pass are protected;

@@ -1,8 +1,47 @@
 //! Source-based reading text and linked notes shared by native hosts.
 use rebook_publication::{
     Block, Inline, InlineRole, LinkRole, PublicationUrl, Section, SourceAnchor, SourceRange,
-    TextBlock,
+    TextBlock, TextBlockKind,
 };
+
+/// Authored text eligible for the focused paragraph structure action on every host.
+pub fn focus_block_structure_ranges(block: &Block) -> Vec<SourceRange> {
+    match block {
+        Block::Text(text)
+            if matches!(
+                text.kind,
+                TextBlockKind::Paragraph
+                    | TextBlockKind::Blockquote
+                    | TextBlockKind::Caption
+                    | TextBlockKind::ListItem { .. }
+            ) =>
+        {
+            text.source.iter().cloned().collect()
+        }
+        Block::Figure(figure) => figure.text_blocks()
+            .filter_map(|caption| caption.source.clone())
+            .collect(),
+        Block::Quote(quote) => quote
+            .body
+            .iter()
+            .filter(|body| {
+                matches!(
+                    body.kind,
+                    TextBlockKind::Paragraph | TextBlockKind::Blockquote
+                )
+            })
+            .filter_map(|body| body.source.clone())
+            .collect(),
+        Block::Text(_)
+        | Block::Table(_)
+        | Block::Image(_)
+        | Block::Note(_)
+        | Block::Separator(_)
+        | Block::LineBreak
+        | Block::PageBreak => Vec::new(),
+    }
+}
+
 
 pub enum FocusFootnoteSource {
     Citation {
@@ -497,5 +536,158 @@ mod popup_tests {
         assert!(value.contains("**Bold \\[literal\\]**"));
         assert!(value.contains("https://example.com/note"));
         assert!(value.contains(r"$\frac{1}{2}$"));
+    }
+}
+
+/// Extend visible body demand with only its linked footnote definitions.
+pub fn append_linked_footnote_translation_ranges(
+    source: &dyn rebook_publication::BookSource,
+    sections: &mut Vec<(usize, Vec<SourceRange>)>,
+) {
+    let visible_sections = sections.clone();
+    let mut parsed_sections = std::collections::HashMap::new();
+    let mut footnote_targets = Vec::new();
+    for (section_index, ranges) in &visible_sections {
+        let Ok(section) = source.parse_section(*section_index) else {
+            continue;
+        };
+        for block in &section.blocks {
+            let visible = block_source_range(block).is_some_and(|source| {
+                ranges
+                    .iter()
+                    .any(|range| translation_ranges_overlap(source, range))
+            });
+            if !visible {
+                continue;
+            }
+            for footnote in block_focus_footnotes(block) {
+                if let FocusFootnoteSource::Reference { target, .. } = footnote
+                    && !footnote_targets.contains(&target)
+                {
+                    footnote_targets.push(target);
+                }
+            }
+        }
+        parsed_sections.insert(*section_index, section);
+    }
+    for target in footnote_targets {
+        let Some(section_index) = source
+            .book()
+            .sections
+            .iter()
+            .position(|section| section.href.path() == target.path())
+        else {
+            continue;
+        };
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            parsed_sections.entry(section_index)
+        {
+            let Ok(section) = source.parse_section(section_index) else {
+                continue;
+            };
+            entry.insert(section);
+        }
+        let Some(section) = parsed_sections.get(&section_index) else {
+            continue;
+        };
+        let footnote_ranges = focus_footnote_translation_ranges_in_section(section, &target);
+        if footnote_ranges.is_empty() {
+            continue;
+        }
+        if let Some((_, ranges)) = sections
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == section_index)
+        {
+            for range in footnote_ranges {
+                if !ranges.contains(&range) {
+                    ranges.push(range);
+                }
+            }
+        } else {
+            sections.push((section_index, footnote_ranges));
+        }
+    }
+}
+
+fn translation_ranges_overlap(left: &SourceRange, right: &SourceRange) -> bool {
+    left.start.spine == right.start.spine
+        && (left.start.node == right.start.node
+            || left.start.node == right.end.node
+            || left.end.node == right.start.node
+            || left.end.node == right.end.node)
+}
+
+
+pub fn focus_footnote_translation_ranges_in_section(
+    section: &Section,
+    target: &PublicationUrl,
+) -> Vec<SourceRange> {
+    let Some(fragment) = target.fragment() else {
+        return Vec::new();
+    };
+    let Some(anchor) = section
+        .anchors
+        .iter()
+        .find(|anchor| anchor.fragment == fragment)
+        .map(|anchor| &anchor.source)
+    else {
+        return Vec::new();
+    };
+    let target_block = section
+        .blocks
+        .iter()
+        .find_map(|block| note_definition_containing_anchor(block, anchor))
+        .or_else(|| {
+            section
+                .blocks
+                .iter()
+                .find_map(|block| find_block_containing_anchor(block, anchor))
+        });
+    let Some(target_block) = target_block else {
+        return Vec::new();
+    };
+    let mut ranges = Vec::new();
+    collect_focus_footnote_translation_ranges(target_block, &mut ranges);
+    ranges
+}
+
+fn collect_focus_footnote_translation_ranges(block: &Block, ranges: &mut Vec<SourceRange>) {
+    let mut push_text = |text: &TextBlock| {
+        if let Some(range) = &text.source
+            && !ranges.contains(range)
+        {
+            ranges.push(range.clone());
+        }
+    };
+    match block {
+        Block::Text(text) => push_text(text),
+        Block::Quote(quote) => {
+            for text in quote.body.iter().chain(quote.attribution.iter()) {
+                push_text(text);
+            }
+        }
+        Block::Table(table) => {
+            for text in table.text_blocks() {
+                push_text(text);
+            }
+        }
+        Block::Figure(figure) => {
+            for caption in figure.text_blocks() {
+                push_text(caption);
+            }
+        }
+        Block::Note(note) => {
+            for child in &note.blocks {
+                collect_focus_footnote_translation_ranges(child, ranges);
+            }
+        }
+        Block::Image(image) => {
+            if let Some(range) = &image.source
+                && !ranges.contains(range)
+            {
+                ranges.push(range.clone());
+            }
+        }
+        Block::Separator(_) | Block::LineBreak | Block::PageBreak => {}
     }
 }
