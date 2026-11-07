@@ -1486,14 +1486,17 @@ async fn recognize_impl(
         "chapter.start",
         json!({"book":book_id,"section":section.id,"href":section.href,"blocks":section.blocks.len()}),
     );
-    let result = recognize_inner(
+    // Recognition retains large provider futures across awaits. Keep that state
+    // out of the enclosing future: desktop hosts create and submit it on the
+    // Windows UI thread, whose default stack is only 1 MiB.
+    let result = Box::pin(recognize_inner(
         section,
         book_id,
         settings,
         source,
         target,
         include_enhancements,
-    )
+    ))
     .await;
     let mut details = json!({"book":book_id,"section":section.id,"href":section.href,"elapsed_ms":started.elapsed().as_millis()});
     match &result {

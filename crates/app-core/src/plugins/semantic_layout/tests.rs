@@ -583,6 +583,40 @@ pub(super) fn original_source(section: Section) -> Arc<dyn BookSource> {
 }
 
 #[test]
+fn recognition_tasks_fit_the_windows_ui_thread_stack() {
+    let section = section(vec![text("a", "A paragraph to recognize.")]);
+    let source = original_source(section.clone());
+    let settings = PluginSettings::default();
+    // These entry points are embedded in scheduler and task-local futures before
+    // Tokio receives them. Their provider state must not grow every caller's stack.
+    let visible = recognize_visible(&section, 0..1, "stack-test", &settings, source.as_ref());
+    let whole = recognize_with_source(&section, "stack-test", &settings, source.as_ref());
+    for bytes in [std::mem::size_of_val(&visible), std::mem::size_of_val(&whole)] {
+        assert!(
+            bytes < 16 * 1024,
+            "recognition future retains {bytes} bytes inline"
+        );
+    }
+    drop((visible, whole));
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let task = runtime.spawn(log::with_job("stack-test".into(), async move {
+                recognize_visible(&section, 0..1, "stack-test", &settings, source.as_ref()).await
+            }));
+            // No provider is configured: exercise task creation and polling without
+            // contacting a model or sending book content over the network.
+            assert!(runtime.block_on(task).unwrap().is_err());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn translation_indices_survive_semantic_toggle_and_changed_content_is_rejected() {
     let section = section(vec![
         text("a", "Quotation"),
