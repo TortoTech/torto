@@ -99,6 +99,15 @@ fn output(tool: &str, args: &[&std::ffi::OsStr]) -> Result<String, String> {
     }
     Ok(String::from_utf8_lossy(&result.stdout).trim().to_string())
 }
+fn verify_architecture(executable: &Path, arch: &str) -> Result<(), String> {
+    // Apple's lipo consumes every argument after -verify_arch as an
+    // architecture. Keep the input before the operation (including on macOS 15).
+    output(
+        "/usr/bin/lipo",
+        &[executable.as_os_str(), "-verify_arch".as_ref(), arch.as_ref()],
+    )
+    .map(|_| ())
+}
 fn plist(app: &Path, key: &str) -> Result<String, String> {
     output(
         "/usr/libexec/PlistBuddy",
@@ -404,14 +413,7 @@ pub(crate) fn helper(dir: &Path) -> Result<(), String> {
         } else {
             "x86_64"
         };
-        output(
-            "/usr/bin/lipo",
-            &[
-                "-verify_arch".as_ref(),
-                arch_name.as_ref(),
-                source.join("Contents/MacOS/torto").as_os_str(),
-            ],
-        )?;
+        verify_architecture(&source.join("Contents/MacOS/torto"), arch_name)?;
         if other_instance(&job)? {
             return Err("请先关闭同一安装目录中运行的其他 Torto 窗口，再重试更新".into());
         }
@@ -534,6 +536,17 @@ pub(crate) fn confirm_health(runtime: &tokio::runtime::Runtime) {
 #[cfg(test)]
 mod portable_tests {
     use super::*;
+    #[test]
+    fn architecture_check_accepts_native_macho_and_rejects_another_architecture() {
+        let executable = std::env::current_exe().unwrap();
+        let (native, other) = if cfg!(target_arch = "aarch64") {
+            ("arm64", "x86_64")
+        } else {
+            ("x86_64", "arm64")
+        };
+        verify_architecture(&executable, native).unwrap();
+        assert!(verify_architecture(&executable, other).is_err());
+    }
     #[test]
     fn portable_update_sessions_are_private_and_independent_of_library_location() {
         let release = release_from_github(crate::updater::tests::github_release("v0.2.12", Some(&format!("sha256:{}", "a".repeat(64)))), "0.2.11").unwrap().unwrap();

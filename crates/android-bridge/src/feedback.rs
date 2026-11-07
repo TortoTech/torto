@@ -569,6 +569,9 @@ pub(crate) mod tests {
                         Err(e) => panic!("{e}"),
                     }
                 };
+                // Darwin inherits the listener's nonblocking flag. Restore
+                // blocking reads before applying the request read timeout.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
