@@ -6,6 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 pub mod catalog;
 pub mod download;
+pub mod service;
 pub mod store;
 
 #[derive(Clone)]

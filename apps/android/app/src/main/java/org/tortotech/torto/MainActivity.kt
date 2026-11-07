@@ -76,6 +76,13 @@ class MainActivity : ComponentActivity() {
     val snackbar=remember { SnackbarHostState() }
     val context=LocalContext.current
     val view=LocalView.current
+    LaunchedEffect(state.loaded) {
+        if(state.loaded) {
+            // Let a shelf frame finish before starting discovery or networking.
+            withFrameNanos {};withFrameNanos {}
+            ReadingFonts.start(context)
+        }
+    }
     val lifecycle=LocalLifecycleOwner.current.lifecycle
     val lifecycleState by lifecycle.currentStateFlow.collectAsState()
     val window=(context as? android.app.Activity)?.window
@@ -131,7 +138,6 @@ class MainActivity : ComponentActivity() {
         val observer=androidx.lifecycle.LifecycleEventObserver {_,event->when(event){Lifecycle.Event.ON_START->model.applicationForeground(true);Lifecycle.Event.ON_STOP->{model.cancelAi();model.cancelChat();model.applicationForeground(false)};else->{}}}
         lifecycle.addObserver(observer);onDispose{lifecycle.removeObserver(observer);model.applicationForeground(false)}
     }
-    LaunchedEffect(state.notice){state.notice?.let {snackbar.showSnackbar(it);model.clearNotice()}}
     LaunchedEffect(state.active?.id,panel,state.busy,state.chatWorking,state.interaction,state.completionPage) {
         if(state.active==null)return@LaunchedEffect
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
@@ -144,6 +150,19 @@ class MainActivity : ComponentActivity() {
         }
     }
     TortoTheme(state) {
+        val fontNotice=state.notice=="新字体已下载完成"
+        val notice=state.notice?.let {if(fontNotice)tr(it,"New fonts downloaded")else it}
+        val applyFonts=fontNotice&&state.active!=null&&state.fontApplyAvailable
+        val applyLabel=tr("应用","Apply")
+        LaunchedEffect(notice,if(fontNotice)state.fontNoticeUntil else 0,if(fontNotice)state.active?.id else null,applyFonts) {
+            notice?.let {
+                val result=if(fontNotice)withTimeoutOrNull((state.fontNoticeUntil-android.os.SystemClock.uptimeMillis()).coerceAtLeast(0)) {
+                    snackbar.showSnackbar(it,actionLabel=if(applyFonts)applyLabel else null,duration=SnackbarDuration.Indefinite)
+                }else snackbar.showSnackbar(it)
+                if(result==SnackbarResult.ActionPerformed&&fontNotice)model.applyDownloadedFonts()
+                model.clearNotice(state.notice,if(fontNotice)state.fontNoticeUntil else null)
+            }
+        }
         val safe=readerSafePadding()
         val route=routes.lastOrNull()
         val title=when(route){

@@ -46,7 +46,15 @@ import androidx.compose.ui.unit.dp
             if(options!=null)SettingChoice(tr("代码字体","Code font"),options.monospaceFont,families?.monospace.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(monospaceFont=it))}
             SettingsSlider(tr("字号","Font size"),size.toInt().toString(),size,{size=it},valueRange=12f..36f,enabled=!state.busy,onValueChangeFinished={model.configure(size,state.unified,state.dark)})
         }
-        SettingsGroup {SettingsItem(tr("下载默认字体","Download reading fonts"),enabled=!state.busy,onClick=model::downloadFonts)}
+        SettingsGroup {
+            if(state.fontApplyAvailable)SettingsItem(tr("应用已下载字体","Apply downloaded fonts"),enabled=!state.busy,onClick=model::applyDownloadedFonts)
+            SettingsItem(when {
+                state.fontsDownloading->tr("默认字体下载中","Downloading reading fonts")
+                state.fontsReady->tr("默认字体已就绪","Reading fonts ready")
+                state.fontsError!=null->tr("重试下载默认字体","Retry reading font download")
+                else->tr("下载默认字体","Download reading fonts")
+            },enabled=!state.fontsDownloading&&!state.fontsReady,onClick=model::downloadFonts)
+        }
         SettingsGroup {SettingsItem(tr("AI 排版","AI layout"),enabled=!state.busy,onClick=openLayout)}
 
     }

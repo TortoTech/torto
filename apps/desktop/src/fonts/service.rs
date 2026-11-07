@@ -1,4 +1,5 @@
-use super::{FontSet, catalog::catalog, download, store};
+use super::{FontSet, catalog::catalog, store};
+pub(super) use rebook_app_core::fonts::service::Update;
 use crate::{platform::UserEvent, preferences::AppLanguage};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -32,12 +33,6 @@ impl Status {
 pub(crate) struct Message {
     generation: u64,
     pub(super) update: Update,
-}
-pub(super) enum Update {
-    Loaded(Arc<FontSet>),
-    Progress(usize, u8),
-    Finished(usize, Result<super::Face, String>),
-    Stopped,
 }
 
 pub(crate) struct FontService {
@@ -128,47 +123,9 @@ impl FontService {
                     return;
                 }
             };
-            let load_root = root.clone();
-            let set = match tokio::task::spawn_blocking(move || store::load(&load_root, previous))
-                .await
-            {
-                Ok(set) => Arc::new(set),
-                Err(error) => {
-                    for index in 0..3 {
-                        send(Update::Finished(index, Err(error.to_string())));
-                    }
-                    send(Update::Stopped);
-                    return;
-                }
-            };
-            send(Update::Loaded(set.clone()));
-            // Smoke runs exercise isolated offline startup and must not depend
-            // on public endpoints or write the real user font directory.
-            if crate::smoke::enabled() {
-                send(Update::Stopped);
-                return;
-            }
-            let client = download::client();
-            // Small Latin faces become available before the larger CJK file.
-            for index in [1, 2, 0] {
-                if set.faces[index].is_some() {
-                    continue;
-                }
-                let result = match &client {
-                    Ok(client) => {
-                        download::fetch(
-                            client,
-                            root.clone(),
-                            catalog().fonts[index].clone(),
-                            |percent| send(Update::Progress(index, percent)),
-                        )
-                        .await
-                    }
-                    Err(error) => Err(error.clone()),
-                };
-                send(Update::Finished(index, result));
-            }
-            send(Update::Stopped);
+            rebook_app_core::fonts::service::run(
+                root, previous, !crate::smoke::enabled(), send,
+            ).await;
         }));
     }
 

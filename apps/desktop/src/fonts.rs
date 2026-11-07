@@ -6,7 +6,6 @@ pub(crate) use rebook_app_core::fonts::*;
 mod service;
 pub(crate) use service::{FontService, Message, Status, family_label, publish_labels, request_family, take_request};
 mod store {
-    pub(super) use rebook_app_core::fonts::store::*;
     pub(super) fn directory() -> Result<std::path::PathBuf, String> {
         crate::smoke::project_dirs().map(|dirs| dirs.data_local_dir().join("fonts")).ok_or_else(|| "Font directory unavailable".into())
     }

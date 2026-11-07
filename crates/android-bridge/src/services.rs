@@ -47,6 +47,12 @@ pub struct SyncSummary {
     pub progress: u32,
     pub warning: Option<String>,
 }
+#[derive(Clone, uniffi::Record)]
+pub struct ReadingFontDownload {
+    pub downloaded: u32,
+    pub ready: bool,
+    pub error: Option<String>,
+}
 #[uniffi::export]
 impl MobileCore {
     pub async fn service_settings(self: Arc<Self>) -> Result<ServiceSettings> {
@@ -137,26 +143,18 @@ impl MobileCore {
         if let Some(error_message) = run.error { return Err(error(error_message)); }
         run.summary.ok_or_else(|| error("同步已排队，等待重试期限"))
     }
-    pub async fn download_reading_fonts(self: Arc<Self>) -> Result<()> {
-        work(move || {
-            let client = rebook_app_core::fonts::download::client().map_err(error)?;
-            let root = self.root.join("fonts");
-            for asset in &rebook_app_core::fonts::catalog::catalog().fonts {
-                if rebook_app_core::fonts::store::load_cached(&root, asset).is_some() {
-                    continue;
-                }
-                runtime()
-                    .block_on(rebook_app_core::fonts::download::fetch(
-                        &client,
-                        root.clone(),
-                        asset.clone(),
-                        |_| {},
-                    ))
-                    .map_err(error)?;
-            }
-            Ok(())
-        })
-        .await
+    pub async fn download_reading_fonts(self: Arc<Self>) -> Result<ReadingFontDownload> {
+        runtime().spawn(async move {
+            // Network work never holds a reader or library lock. Calls from
+            // different hosts/activities serialize and reuse the validated cache.
+            let _guard = self.font_download_lock.lock().await;
+            let report = rebook_app_core::fonts::service::run(
+                self.root.join("fonts"), Default::default(), true, |_| {},
+            ).await;
+            let ready = report.ready();
+            rebook_app_core::fonts::install(report.fonts);
+            Ok(ReadingFontDownload { downloaded: report.downloaded, ready, error: report.error })
+        }).await.map_err(error)?
     }
 }
 #[uniffi::export]

@@ -66,7 +66,7 @@ android {
         versionCode = appVersionCode
         versionName = appVersion
         if (rustAbis.size == 1) ndk { abiFilters += rustAbis }
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunner = "org.tortotech.torto.TortoTestRunner"
     }
     if (signingFile != null) signingConfigs.create("distribution") {
         storeFile = file(signingFile)

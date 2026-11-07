@@ -185,6 +185,7 @@ impl Viewport {
 pub struct MobileCore {
     root: PathBuf,
     library_lock: Arc<Mutex<()>>,
+    font_download_lock: tokio::sync::Mutex<()>,
 }
 #[uniffi::export]
 impl MobileCore {
@@ -206,6 +207,7 @@ impl MobileCore {
         static LIBRARY_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
         Ok(Arc::new(Self {
             root,
+            font_download_lock: tokio::sync::Mutex::new(()),
             library_lock: LIBRARY_LOCK
                 .get_or_init(|| Arc::new(Mutex::new(())))
                 .clone(),
