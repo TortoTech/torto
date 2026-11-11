@@ -6,6 +6,52 @@ fn root() -> PathBuf {
     std::env::temp_dir().join(format!("torto-android-test-{}", uuid::Uuid::new_v4()))
 }
 
+async fn check_legacy_cover_backfill(source: &std::path::Path) {
+    let root = root();
+    let library_root = root.join("library");
+    let mut library = LocalLibrary::load_from(library_root.clone()).unwrap();
+    library.import_files(&[source.to_owned()]).unwrap();
+    let book = library.books()[0].clone();
+    let expected = book.cover_bytes.as_ref().expect("fixture must contain a cover");
+    // Reproduce an old import made before the format's cover extraction was fixed.
+    let manifest = library_root.join("library.json");
+    let mut stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    stored["books"][0]["cover_name"] = serde_json::Value::Null;
+    rebook_app_core::persistence::write_json_atomic(&manifest, &stored).unwrap();
+    std::fs::remove_file(library_root.join("covers").join(format!("{}.cover", book.id))).unwrap();
+    let core = Arc::new(MobileCore {
+        sync_wake: rebook_app_core::sync::SyncWake::for_path(&root.join("sync-v1.sqlite3")),
+        root: root.clone(),
+        library_lock: Arc::new(Mutex::new(())),
+        font_download_lock: tokio::sync::Mutex::new(()),
+    });
+    let thumbnail = core.clone().cover(book.id.clone()).await.unwrap().expect("visible legacy book must recover its cover");
+    let image = image::load_from_memory(&thumbnail).unwrap();
+    assert!(image.width() <= 240 && image.height() <= 360);
+    assert_eq!(LocalLibrary::load_cover_from(&library_root, &book.id).unwrap().as_ref(), Some(expected));
+    // Later requests use the persistent thumbnail, even without parsing the book.
+    std::fs::remove_file(&book.path).unwrap();
+    assert_eq!(core.clone().cover(book.id).await.unwrap(), Some(thumbnail));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn visible_legacy_book_recovers_cover_and_reuses_thumbnail() {
+    let root = root();
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("cover.fb2");
+    std::fs::write(&source, r##"<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink"><description><title-info><book-title>Legacy cover</book-title><lang>en</lang><coverpage><image l:href="#cover"/></coverpage></title-info></description><body><section><p>Text.</p></section></body><binary id="cover" content-type="image/png">iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=</binary></FictionBook>"##).unwrap();
+    runtime().block_on(check_legacy_cover_backfill(&source));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "requires TORTO_TEST_COVER_BOOK pointing to an actual library book"]
+fn real_library_legacy_cover_backfill() {
+    let source = PathBuf::from(std::env::var_os("TORTO_TEST_COVER_BOOK").expect("set TORTO_TEST_COVER_BOOK"));
+    runtime().block_on(check_legacy_cover_backfill(&source));
+}
+
 async fn focus_membership_and_heading_masks_follow_desktop_across_pages_and_resizes(core:&Arc<MobileCore>,root:&std::path::Path,
 ) {
         use std::io::Write;

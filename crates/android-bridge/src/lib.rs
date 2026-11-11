@@ -258,10 +258,27 @@ impl MobileCore {
             if let Ok(bytes) = std::fs::read(&cache) {
                 return Ok(Some(bytes));
             }
-            let Some(bytes) =
-                LocalLibrary::load_cover_from(&self.root.join("library"), &id).map_err(error)?
-            else {
-                return Ok(None);
+            let root = self.root.join("library");
+            let bytes = match LocalLibrary::load_cover_from(&root, &id).map_err(error)? {
+                Some(bytes) => bytes,
+                None => {
+                    let Some(path) = LocalLibrary::cover_source_from(&root, &id).map_err(error)? else {
+                        return Ok(None);
+                    };
+                    // Older imports may have saved an empty cover before a parser fix.
+                    // Parse only this visible book, on the blocking worker and outside
+                    // the library lock; recheck deletion/concurrent sync at commit time.
+                    let publication = rebook_formats::open_file(path).map_err(error)?;
+                    let Some(extracted) = publication.cover_bytes() else {
+                        return Ok(None);
+                    };
+                    let _guard = self.library_lock.lock().map_err(error)?;
+                    let Some(bytes) = LocalLibrary::store_missing_cover_from(&root, &id, extracted)
+                        .map_err(error)? else {
+                        return Ok(None);
+                    };
+                    bytes
+                }
             };
             let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
                 .with_guessed_format()
