@@ -18,10 +18,18 @@ struct Session {
     token: String,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 struct Revision {
     reading: Option<String>,
     derived: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    last_read: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    added_at: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]
@@ -228,12 +236,16 @@ pub(super) fn record(webdav: &WebDavClient, book: &str, derived: bool) -> SyncRe
         revision.derived = token;
     } else {
         revision.reading = token;
+        if let Some((store, _)) = &webdav.cache {
+            revision.last_read = store.reading_activity_time(book)?;
+        }
     }
     webdav.cache_set(LOCAL, &serde_json::to_vec(&index)?)?;
     webdav.cache_set(PENDING, b"1")
 }
 
 pub(super) async fn publish(webdav: &WebDavClient, initialize: bool) -> SyncResult<()> {
+    let _transaction = webdav.control_transaction();
     let pending = webdav.cache_get(PENDING)?.as_deref() == Some(b"1");
     if !pending && !initialize {
         return Ok(());
@@ -266,9 +278,42 @@ pub(super) async fn publish(webdav: &WebDavClient, initialize: bool) -> SyncResu
     webdav.cache_set(PENDING, b"0")
 }
 
+/// Publish small ordering hints with the existing device index, not one request per book.
+pub(super) fn update_priorities(
+    webdav: &WebDavClient,
+    books: &BTreeMap<String, super::LocalSyncBook>,
+) -> SyncResult<()> {
+    let Some((store, _)) = &webdav.cache else {
+        return Ok(());
+    };
+    let times = store.progress_activity_times()?;
+    let mut index = webdav
+        .cache_get(LOCAL)?
+        .and_then(|b| decode(&b, &webdav.device_id))
+        .unwrap_or_else(|| Index {
+            version: 1,
+            device: webdav.device_id.clone(),
+            books: BTreeMap::new(),
+        });
+    let mut changed = false;
+    for (id, book) in books {
+        let revision = index.books.entry(id.clone()).or_default();
+        let time = times.get(id).copied().unwrap_or(0);
+        changed |= revision.last_read != time || revision.added_at != book.added_at;
+        revision.last_read = time;
+        revision.added_at = book.added_at;
+    }
+    if changed {
+        webdav.cache_set(LOCAL, &serde_json::to_vec(&index)?)?;
+        webdav.cache_set(PENDING, b"1")?;
+    }
+    Ok(())
+}
+
 pub(super) struct Plan {
     pub reading: BTreeSet<String>,
     pub derived: BTreeSet<String>,
+    pub recent: BTreeMap<String, (u64, u64)>,
     snapshots: Vec<(String, Vec<u8>)>,
     books: BTreeSet<String>,
     repair: bool,
@@ -292,6 +337,7 @@ impl Plan {
         let mut plan = Self {
             reading: BTreeSet::new(),
             derived: BTreeSet::new(),
+            recent: BTreeMap::new(),
             snapshots: Vec::new(),
             books: books.clone(),
             repair,
@@ -324,6 +370,11 @@ impl Plan {
                 }
                 continue;
             };
+            for (book, revision) in &current.books {
+                let entry = plan.recent.entry(book.clone()).or_default();
+                entry.0 = entry.0.max(revision.last_read);
+                entry.1 = entry.1.max(revision.added_at);
+            }
             let previous = webdav
                 .cache_get(&key)?
                 .and_then(|bytes| decode(&bytes, &device));

@@ -1,9 +1,9 @@
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipReadOptions, ZipWriter};
 
@@ -104,7 +104,9 @@ pub fn mark_derived_dirty(book_id: &str, kind: DerivedDataKind) -> io::Result<()
     fs::create_dir_all(parent)?;
     let revision = uuid::Uuid::new_v4().to_string();
     crate::persistence::write_bytes_atomic(&path, revision.as_bytes())?;
-    crate::persistence::write_bytes_atomic(&derived_revision_path()?, revision.as_bytes())
+    crate::persistence::write_bytes_atomic(&derived_revision_path()?, revision.as_bytes())?;
+    super::wake::derived_changed();
+    Ok(())
 }
 
 pub fn derived_change_token() -> io::Result<Option<String>> {
@@ -253,7 +255,11 @@ impl PreparedDerivedData {
                 stage
             };
             progress(SyncProgress::Stage {
-                stage: operation_stage,
+                stage: match operation_stage {
+                    SyncStage::Uploading => SyncStage::DerivedUploading,
+                    SyncStage::Downloading => SyncStage::DerivedDownloading,
+                    other => other,
+                },
                 completed,
                 total,
             });
@@ -265,7 +271,11 @@ impl PreparedDerivedData {
                 total,
                 &mut |completed, total| {
                     progress(SyncProgress::Stage {
-                        stage: operation_stage,
+                        stage: match operation_stage {
+                            SyncStage::Uploading => SyncStage::DerivedUploading,
+                            SyncStage::Downloading => SyncStage::DerivedDownloading,
+                            other => other,
+                        },
                         completed,
                         total,
                     })
@@ -273,7 +283,11 @@ impl PreparedDerivedData {
             )
             .await?;
             progress(SyncProgress::Stage {
-                stage: operation_stage,
+                stage: match operation_stage {
+                    SyncStage::Uploading => SyncStage::DerivedUploading,
+                    SyncStage::Downloading => SyncStage::DerivedDownloading,
+                    other => other,
+                },
                 completed,
                 total,
             });
@@ -1002,7 +1016,12 @@ mod tests {
         let token = super::derived_change_token().unwrap().unwrap();
         assert!(uuid::Uuid::parse_str(&token).is_ok());
         // Other book workers may publish another revision between reads.
-        assert!(uuid::Uuid::parse_str(&std::fs::read_to_string(super::derived_revision_path().unwrap()).unwrap()).is_ok());
+        assert!(
+            uuid::Uuid::parse_str(
+                &std::fs::read_to_string(super::derived_revision_path().unwrap()).unwrap()
+            )
+            .is_ok()
+        );
     }
 
     use super::*;

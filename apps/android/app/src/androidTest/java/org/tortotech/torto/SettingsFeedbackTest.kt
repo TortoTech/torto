@@ -51,22 +51,51 @@ class SettingsFeedbackTest {
             assertTrue("Settings stays on the right edge",settings.centerX()>context.resources.displayMetrics.widthPixels*3/4)
             assertNull("The profile header has no Me title",node {n->val bounds=android.graphics.Rect().also(n::getBoundsInScreen);n.text?.toString()=="我"&&kotlin.math.abs(bounds.centerY()-report.centerY())<report.height()})
             shot("profile-envelope-header.png")
-            click("设置");await("settings opens"){label("关于 Torto")!=null}
+            click("设置");await("settings opens"){label("关于")!=null}
             for(text in listOf("通用","智能功能","数据","其他","主题与界面语言","正文样式、字号与阅读字体","服务地址、密钥与模型","模型与目标语言","WebDAV 书籍与阅读进度"))assertNull(text,label(text))
             shot("settings-home-simplified.png")
             click("云同步");await("cloud fields load"){node {it.text?.toString()?.contains("设备名称")==true}!=null}
             assertNull(label("清除已保存的密码"));assertNull(label("后台同步由系统调度，省电模式下可能延后"))
+            assertNull(label("查看云盘配置说明"));assertNull(label("立即同步"))
             val device=android.graphics.Rect().also {node {it.text?.toString()?.contains("设备名称")==true}!!.getBoundsInScreen(it)}
             val password=android.graphics.Rect().also {node {it.text?.toString()?.contains("密码")==true}!!.getBoundsInScreen(it)}
             assertTrue("Device name follows password",device.top>=password.bottom);shot("cloud-settings-device-name.png")
-            click("返回");await("settings returns"){label("关于 Torto")!=null}
-            click("关于 Torto");await("about uses the shared feedback entry"){label("反馈问题")!=null}
-            click("反馈问题");await("about feedback loads"){feedback!!.state.value.visible&&!feedback!!.state.value.loading}
-            assertEquals("shelf",org.json.JSONObject(feedback!!.state.value.context).getString("source"))
-            click("关闭反馈");await("about feedback closes"){!feedback!!.state.value.visible}
-            click("返回");await("settings returns from about"){label("关于 Torto")!=null}
+            click("返回");await("settings returns"){label("关于")!=null}
+            click("关于");await("about shows version status"){label("Torto")!=null&&label("当前已是最新版本")!=null}
+            for(text in listOf("反馈问题","开源许可","开源项目","应用许可 · AGPL-3.0-only","导出诊断日志","更新来源","检查更新"))assertNull(text,label(text))
+            shot("about-simplified.png")
+            click("返回");await("settings returns from about"){label("关于")!=null}
             click("返回");await("profile returns"){label("反馈问题")!=null}
             click("反馈问题");await("feedback loads"){feedback!!.state.value.visible&&!feedback!!.state.value.loading};assertFalse(feedback!!.state.value.valid)
+            // A blocked storage queue must never delay character counts or button feedback.
+            val native=FeedbackModel::class.java.getDeclaredField("session").apply {isAccessible=true}.get(feedback) as org.tortotech.torto.core.MobileFeedback
+            val stale=native.snapshot()
+            val storage=FeedbackModel::class.java.getDeclaredField("operations").apply {isAccessible=true}.get(feedback) as kotlinx.coroutines.sync.Mutex
+            storage.lock()
+            try {
+                instrumentation.runOnMainSync {
+                    feedback!!.edit(description="一二三四五六七八九")
+                    assertEquals(9u,feedback!!.state.value.count);assertFalse(feedback!!.state.value.valid)
+                    feedback!!.edit(description="一二三四五六七八九十")
+                    assertEquals(10u,feedback!!.state.value.count);assertTrue(feedback!!.state.value.valid)
+                }
+                fun submitEnabled()=clickable(label("提交"))?.isEnabled==true
+                await("valid input enables Submit while storage is blocked"){submitEnabled()}
+                android.os.SystemClock.sleep(700)
+                instrumentation.runOnMainSync {
+                    feedback!!.edit(description="一二三四五六七八九十一")
+                    assertTrue("More valid input never disables submission",feedback!!.state.value.valid)
+                    // Deliver the real session's older acknowledgement after the latest edit.
+                    FeedbackModel::class.java.getDeclaredMethod("apply",org.tortotech.torto.core.FeedbackState::class.java,Boolean::class.javaPrimitiveType).apply {isAccessible=true}.invoke(feedback,stale,false)
+                    assertEquals(11u,feedback!!.state.value.count);assertTrue(feedback!!.state.value.valid)
+                    feedback!!.edit(description=" \n一二三四五六七八九\u200b")
+                    assertEquals(9u,feedback!!.state.value.count);assertFalse("Deletion below ten disables immediately",feedback!!.state.value.valid)
+                    feedback!!.edit(description="👨‍👩‍👧‍👦".repeat(10))
+                    assertEquals(10u,feedback!!.state.value.count);assertTrue(feedback!!.state.value.valid)
+                    feedback!!.edit(description="x".repeat(5001))
+                    assertEquals(5001u,feedback!!.state.value.count);assertFalse(feedback!!.state.value.valid)
+                }
+            }finally {storage.unlock()}
             await("feedback text field appears"){node {it.isEditable&&!it.isPassword}!=null}
             val input=node {it.isEditable&&!it.isPassword};assertNotNull(input)
             val description="这是一次用于验证反馈草稿保存和恢复行为的测试说明"

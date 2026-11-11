@@ -11,8 +11,10 @@ fn reference_reader(body: &str) -> super::super::DesktopReader {
     let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture_with_blocks(section.blocks.clone());
     // The layout fixture accepts blocks only; retain the parsed chapter's anchors
     // in the original source used by the validated reference catalog.
-    let original = Arc::new(Source { book: reader.source.book().clone(), sections: vec![section], resources: AtomicUsize::new(0), parses: AtomicUsize::new(0) });
-    let links = Arc::new(super::super::media_links::Source::new(reader.rewrite_source.clone(), original));
+    let original = Arc::new(Source { book: reader.source.book().clone(), sections: vec![section], resources: AtomicUsize::new(0), parses: AtomicUsize::new(0),
+    });
+    let links = Arc::new(super::super::media_links::Source::new(reader.rewrite_source.clone(), original,
+    ));
     links.prepare_for_test();
     reader.media_preview.links = Some(links);
     let layout = reader.current_scroll_layout().unwrap();
@@ -21,19 +23,23 @@ fn reference_reader(body: &str) -> super::super::DesktopReader {
     reader.select_focus_unit(index);
     reader.ui.sidebar_open = false;
     let (tx, _) = mpsc::sync_channel(1);
-    reader.media_preview.worker = Some(Worker { tx, pending: Default::default(), result: Default::default(), generation: Arc::new(AtomicU64::new(0)) });
+    reader.media_preview.worker = Some(Worker { tx, pending: Default::default(), result: Default::default(), generation: Arc::new(AtomicU64::new(0)),
+    });
     reader
 }
 
 fn preview_key(reader: &mut super::super::DesktopReader, ctx: &egui::Context, key: egui::Key) {
     let mut output = ctx.run_ui(egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0,700.0))),
-        events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0,700.0),
+            )),
+        events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+            }],
         ..Default::default()
     }, |_| {
         if reader.media_preview.active.is_some() { assert!(reader.media_preview_keyboard(ctx)); }
         else { assert!(reader.focus_image_preview_shortcut(ctx, false)); }
-    });
+    },
+    );
     output.textures_delta.clear();
 }
 
@@ -69,7 +75,8 @@ fn focus_reference_shortcut_orders_deduplicates_and_keeps_navigation_inside_the_
         next: Some(Cursor { chunk: 1, page: 0 }),
         position: "1 / 2 · 1 / 1".into(),
     };
-    worker.result.store(Some(Arc::new(Completion { generation:stale_generation, revision:reader.source.content_revision(),result:Ok(ready()) })));
+    worker.result.store(Some(Arc::new(Completion { generation:stale_generation, revision:reader.source.content_revision(),result:Ok(ready()),
+    })));
     reader.accept_media_preview_completion(&ctx);
     let old_texture = reader.media_preview.active.as_ref().unwrap().texture.as_ref().unwrap().id();
     preview_key(&mut reader, &ctx, egui::Key::PageDown);
@@ -77,7 +84,8 @@ fn focus_reference_shortcut_orders_deduplicates_and_keeps_navigation_inside_the_
     assert_eq!(active.item_index,2);
     assert_eq!(active.texture.as_ref().unwrap().id(),old_texture,"keep the displayed image until the replacement is ready");
     assert_eq!(reader.media_preview.worker.as_ref().unwrap().pending.load_full().unwrap().cursor.chunk,1);
-    reader.media_preview.worker.as_ref().unwrap().result.store(Some(Arc::new(Completion { generation:stale_generation, revision:reader.source.content_revision(),result:Ok(ready()) })));
+    reader.media_preview.worker.as_ref().unwrap().result.store(Some(Arc::new(Completion { generation:stale_generation, revision:reader.source.content_revision(),result:Ok(ready()),
+        })));
     reader.accept_media_preview_completion(&ctx);
     assert!(reader.media_preview.active.as_ref().unwrap().loading,"stale pixels cannot complete the new request");
     preview_key(&mut reader, &ctx, egui::Key::Escape);
@@ -87,7 +95,8 @@ fn focus_reference_shortcut_orders_deduplicates_and_keeps_navigation_inside_the_
 
 #[test]
 fn list_reference_previews_cover_the_whole_group_and_clicks_open_the_matching_item() {
-    let mut reader = reference_reader("<ol><li><p>See Table 2.</p></li><li><p>See Figure 1.</p></li><li><p>See Figure 3.</p></li><li><p>Again Table 2.</p></li></ol>");
+    let mut reader = reference_reader("<ol><li><p>See Table 2.</p></li><li><p>See Figure 1.</p></li><li><p>See Figure 3.</p></li><li><p>Again Table 2.</p></li></ol>",
+    );
     let unit = &reader.focus_units[reader.focus_unit_index];
     let origin = unit.range.clone();
     let items = reader.focus_reference_previews(&origin);
@@ -100,7 +109,8 @@ fn list_reference_previews_cover_the_whole_group_and_clicks_open_the_matching_it
     let sections = reader.reader.current_reading_unit_content().unwrap();
     let repeated = sections.iter().flat_map(|(_,s)| &s.blocks).flat_map(Block::text_blocks).find(|t| plain(t).contains("Again")).unwrap();
     let key = media_references::references("Table 2")[0].key.clone();
-    reader.open_media_preview(&egui::Context::default(), repeated.source.clone().unwrap(), key);
+    reader.open_media_preview(&egui::Context::default(), repeated.source.clone().unwrap(), key,
+    );
     let active = reader.media_preview.active.as_ref().unwrap();
     assert_eq!(active.item_index,0);
     assert_eq!(active.items.len(),3,"clicking a duplicate keeps the complete reference group");
@@ -112,8 +122,9 @@ fn translated_reference_previews_follow_display_order_and_ignore_invented_refere
     reader.translation_source.set_mode(crate::plugins::TranslationMode::Replace).unwrap();
     reader.translation_source.set_enabled(true).unwrap();
     reader.translation_source.store_batch(0,&[crate::plugins::BlockTranslation {
-        block_index:1, segment_index:None, text:"参见表 2，再看图 1。另外提到表一。".into()
-    }]).unwrap();
+        block_index:1, segment_index:None, text:"参见表 2，再看图 1。另外提到表一。".into(),
+            }],
+        ).unwrap();
     reader.snapshot = reader.reader.refresh_source().unwrap();
     reader.scroll_section = None;
     let layout = reader.current_scroll_layout().unwrap();
@@ -130,17 +141,24 @@ fn reference_navigation_arrows_work_while_loading_and_do_not_dismiss_the_popup()
     assert!(reader.open_focus_reference_preview(&ctx));
     let frame = |reader: &mut super::super::DesktopReader, events| {
         let mut output = ctx.run_ui(egui::RawInput {
-            time:Some(1.0), screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(900.0,700.0))),
+            time:Some(1.0), screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(900.0,700.0),
+                )),
             events, ..Default::default()
-        }, |_| reader.media_preview_overlay(&ctx));
+        }, |_| reader.media_preview_overlay(&ctx),
+        );
         output.textures_delta.clear();
     };
     frame(&mut reader,vec![]);
     frame(&mut reader,vec![]); // Area's initial sizing pass is not interactive.
     let screen = crate::ui::overlay_rect(&ctx);
     let at = egui::pos2(screen.right() - 28.0, screen.center().y);
-    frame(&mut reader,vec![egui::Event::PointerMoved(at), egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,pressed:true,modifiers:egui::Modifiers::NONE}]);
-    frame(&mut reader,vec![egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,pressed:false,modifiers:egui::Modifiers::NONE}]);
+    frame(&mut reader,vec![egui::Event::PointerMoved(at), egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,pressed:true,modifiers:egui::Modifiers::NONE,
+            },
+        ],
+    );
+    frame(&mut reader,vec![egui::Event::PointerButton {pos:at,button:egui::PointerButton::Primary,pressed:false,modifiers:egui::Modifiers::NONE,
+        }],
+    );
     let active = reader.media_preview.active.as_ref().unwrap();
     assert_eq!(active.item_index,1);
     assert!(!active.motion.is_closing());
@@ -148,7 +166,8 @@ fn reference_navigation_arrows_work_while_loading_and_do_not_dismiss_the_popup()
 
 #[test]
 fn adjacent_subfigures_sharing_a_page_link_remain_separate_preview_items() {
-    let mut reader = reference_reader("<ul><li><p>See <a href='#page-103'>Figure 7.2a</a> and <a href='#page-103'>Figure 7.2b</a>.</p></li></ul><figure id='page-103'><figcaption><p>Figure 7.2 Comparison</p><p>(a) First horse.</p></figcaption><img src='first.png'/></figure><figure><figcaption><p>(b) Second horse.</p></figcaption><img src='second.png'/></figure>");
+    let mut reader = reference_reader("<ul><li><p>See <a href='#page-103'>Figure 7.2a</a> and <a href='#page-103'>Figure 7.2b</a>.</p></li></ul><figure id='page-103'><figcaption><p>Figure 7.2 Comparison</p><p>(a) First horse.</p></figcaption><img src='first.png'/></figure><figure><figcaption><p>(b) Second horse.</p></figcaption><img src='second.png'/></figure>",
+    );
     let sections = reader.reader.current_reading_unit_content().unwrap();
     let text = sections.iter().flat_map(|(_,section)| &section.blocks).flat_map(Block::text_blocks).find(|text| plain(text).contains("See")).unwrap();
     let candidates = reader.media_preview.links.as_ref().unwrap().preview_references(text.source.as_ref().unwrap(), &text.content);
@@ -172,7 +191,8 @@ fn adjacent_subfigures_sharing_a_page_link_remain_separate_preview_items() {
 
 #[test]
 fn subfigure_inference_stops_at_prose_and_does_not_split_a_combined_figure() {
-    let source = source(&["<html><body><figure><figcaption><p>Figure 7.2 Comparison</p><p>(a) First.</p></figcaption><img src='a.png'/></figure><p>Ordinary prose interrupts the group.</p><figure><figcaption>(b) Unrelated.</figcaption><img src='b.png'/></figure><figure><figcaption><p>Figure 8 Combined</p><p>(a) First.</p><p>(b) Second.</p></figcaption><img src='combined.png'/></figure></body></html>"]);
+    let source = source(&["<html><body><figure><figcaption><p>Figure 7.2 Comparison</p><p>(a) First.</p></figcaption><img src='a.png'/></figure><p>Ordinary prose interrupts the group.</p><figure><figcaption>(b) Unrelated.</figcaption><img src='b.png'/></figure><figure><figcaption><p>Figure 8 Combined</p><p>(a) First.</p><p>(b) Second.</p></figcaption><img src='combined.png'/></figure></body></html>",
+    ]);
     let targets = targets(&source.sections[0], 0);
     assert!(targets.iter().any(|target| target.key.number == "7.2a"));
     assert!(!targets.iter().any(|target| target.key.number == "7.2b" || target.key.number == "8a" || target.key.number == "8b"));
@@ -199,7 +219,8 @@ fn local_book_separate_subfigures_have_distinct_reference_destinations() {
 
 #[test]
 fn focus_shortcut_previews_a_figure_reached_through_a_document_location() {
-    let mut reader = reference_reader("<p>See <a href='#position'>Figure 8.2</a>.</p><p id='position'>Ordinary prose before the picture.</p><figure id='border'><img src='border.png'/><figcaption>Figure 8.2 Decorative border</figcaption></figure>");
+    let mut reader = reference_reader("<p>See <a href='#position'>Figure 8.2</a>.</p><p id='position'>Ordinary prose before the picture.</p><figure id='border'><img src='border.png'/><figcaption>Figure 8.2 Decorative border</figcaption></figure>",
+    );
     let ctx = egui::Context::default();
     preview_key(&mut reader, &ctx, egui::Key::Num0);
     let active = reader.media_preview.active.as_ref().unwrap();
@@ -243,14 +264,18 @@ fn worker_document_fallback_matches_catalog_scope_and_invalid_link_rules() {
 fn local_book_page_location_resolves_the_original_and_translated_figure_8_2_reference() {
     let html = std::fs::read_to_string(std::env::var("TORTO_MEDIA_CHAPTER").unwrap()).unwrap().replace("chapter-8.xhtml", "s0.xhtml");
     let original = source(&[&html]);
-    let catalog = Arc::new(super::super::media_links::Source::new(original.clone(), original.clone()));
+    let catalog = Arc::new(super::super::media_links::Source::new(original.clone(), original.clone(),
+    ));
     catalog.prepare_for_test();
-    let text = original.sections[0].blocks.iter().flat_map(Block::text_blocks).find(|text| plain(text).contains("purely decorative") && plain(text).contains("Figure 8.2")).unwrap();
+    let text = original.sections[0].blocks.iter().flat_map(Block::text_blocks).find(|text| {
+            plain(text).contains("purely decorative") && plain(text).contains("Figure 8.2")
+        }).unwrap();
     let origin = text.source.as_ref().unwrap();
     let candidates = catalog.preview_references(origin, &text.content);
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].0.number, "8.2");
-    let mut translated = vec![Inline::Text(rebook_publication::TextRun { text: "图片纯粹用作装饰，例如文字周围的边框（图8.2）。".into(), style: Default::default(), link: None })];
+    let mut translated = vec![Inline::Text(rebook_publication::TextRun { text: "图片纯粹用作装饰，例如文字周围的边框（图8.2）。".into(), style: Default::default(), link: None,
+    })];
     media_references::restrict_translated_links(&mut translated, &text.content);
     catalog.prepare_media_references(&mut translated, Some(origin));
     assert_eq!(catalog.preview_references(origin, &translated)[0].1, candidates[0].1);
@@ -285,15 +310,18 @@ fn numbered_table_shortcut_previews_itself_and_missing_references_do_not_open_a_
 #[test]
 fn preview_motion_reverses_continuously_and_stops_scheduling_when_idle_or_unfocused() {
     let ctx = egui::Context::default();
-    let mut motion = PreviewMotion { opened_at: 0.0, closing: None };
+    let mut motion = PreviewMotion { opened_at: 0.0, closing: None,
+    };
     let frame = |motion: &mut PreviewMotion, time, focused, close| {
         let mut opacity = 0.0;
         let mut output = ctx.run_ui(egui::RawInput { time: Some(time), focused, ..Default::default() }, |_| {
             if close { motion.close(&ctx); }
             opacity = motion.opacity(&ctx);
-        });
+        },
+        );
         output.textures_delta.clear();
-        (opacity, output.viewport_output[&egui::ViewportId::ROOT].repaint_delay)
+        (opacity, output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+        )
     };
     assert_eq!(frame(&mut motion, 0.0, true, false).0, 0.0);
     let halfway = frame(&mut motion, 0.09, true, false);
@@ -304,7 +332,8 @@ fn preview_motion_reverses_continuously_and_stops_scheduling_when_idle_or_unfocu
     assert_eq!(frame(&mut motion, 0.30, true, false).0, 0.0);
     frame(&mut motion, 0.5, true, false);
     assert_eq!(frame(&mut motion, 0.7, true, false).1, std::time::Duration::MAX);
-    motion = PreviewMotion { opened_at: 0.7, closing: None };
+    motion = PreviewMotion { opened_at: 0.7, closing: None,
+    };
     frame(&mut motion, 0.72, false, false);
     assert_eq!(frame(&mut motion, 0.74, false, false).1, std::time::Duration::MAX);
     assert_eq!(frame(&mut motion, 1.0, true, false).0, 1.0);
@@ -398,8 +427,7 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    viewport.get(),
-                )),
+                    viewport.get())),
                 events,
                 ..Default::default()
             },
@@ -462,10 +490,14 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
         (image, caption)
     };
     let normal_shapes = frame(&mut reader, vec![]);
-    let alpha = |id| normal_shapes.iter().find_map(|shape| match &shape.shape {
-        egui::Shape::Mesh(mesh) if mesh.texture_id == id => Some(mesh.vertices[0].color.a()),
-        _ => None,
-    }).unwrap();
+    let alpha = |id| {
+        normal_shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Mesh(mesh) if mesh.texture_id == id => {
+                    Some(mesh.vertices[0].color.a())
+                }
+                _ => None,
+    }).unwrap()
+    };
     assert_eq!(alpha(image_id), alpha(caption_id), "media and caption fade together");
     assert!((1..255).contains(&alpha(image_id)), "async media content fades in when ready");
     let normal = geometry(normal_shapes);
@@ -511,7 +543,8 @@ fn media_modal_rejects_stale_pixels_and_restores_parent_state_on_escape() {
     assert!(reader.media_preview.active.as_ref().unwrap().motion.is_closing());
     assert!(reader.preview_is_open(), "retain input ownership during fade-out");
     let now = ctx.input(|i| i.time);
-    let mut output = ctx.run_ui(egui::RawInput { time: Some(now + 0.2), ..Default::default() }, |_| reader.media_preview_overlay(&ctx));
+    let mut output = ctx.run_ui(egui::RawInput { time: Some(now + 0.2), ..Default::default() }, |_| reader.media_preview_overlay(&ctx),
+    );
     assert!(reader.media_preview.active.is_none());
     assert!(!output.textures_delta.free.is_empty(), "release preview and caption textures after fading");
     output.textures_delta.clear();
@@ -621,7 +654,8 @@ fn lookup_uses_links_and_local_scope_without_loading_images() {
 
 #[test]
 fn structured_figures_preview_text_and_tables_with_caption_and_source() {
-    let source=source(&["<html><body><p>See Figure 4.3.</p><div><ol start='6'><li><p>Solve x = 2</p></li></ol><table><tr><td>Text cell</td></tr></table></div><p>Figure 4.3 Nested example</p><p>Source: Authors.</p></body></html>"]);
+    let source=source(&["<html><body><p>See Figure 4.3.</p><div><ol start='6'><li><p>Solve x = 2</p></li></ol><table><tr><td>Text cell</td></tr></table></div><p>Figure 4.3 Nested example</p><p>Source: Authors.</p></body></html>",
+    ]);
     let request=job(source.clone(),0,"Figure 4.3");
     let selected=Index::default().resolve(&request,&||true).unwrap();
     assert_eq!(source.resources.load(Ordering::Relaxed),0);
@@ -639,7 +673,8 @@ fn direct_image_preview_keeps_unnumbered_caption_and_source_without_index_guessi
         "<html><body><p>Introduction.</p><figure><img src='photo.png'/><figcaption>An unnumbered photograph.</figcaption><p>Source: The photographer.</p></figure><p>Unrelated prose.</p></body></html>",
     ]);
     let section = &source.sections[0];
-    let target = image_target(section, 0, &PublicationUrl::parse("photo.png").unwrap(), None).unwrap();
+    let target = image_target(section, 0, &PublicationUrl::parse("photo.png").unwrap(), None,
+    ).unwrap();
     assert!(target.key.number.is_empty());
     let origin = super::super::block_source_range(&section.blocks[target.block])
         .unwrap()
@@ -755,7 +790,8 @@ fn local_reported_media_chapters_render_captions_and_sources() {
             let origin = super::super::block_source_range(&section.blocks[target.block]).unwrap().clone();
             let request = Job { generation: 1, source: source.clone(), catalog: None,
                 destination: Some((index, origin.start.node.clone())), origin, key: target.key.clone(),
-                cursor: Cursor::default(), width:1200, style: ReaderStyle::default(), ctx: egui::Context::default() };
+                cursor: Cursor::default(), width:1200, style: ReaderStyle::default(), ctx: egui::Context::default(),
+            };
             let preview = render(&request, target, &|| true).unwrap();
             assert!(!preview.captions.is_empty());
             assert!(!preview.caption_images.is_empty());
@@ -769,7 +805,8 @@ fn local_reported_media_chapters_render_captions_and_sources() {
 
 #[test]
 fn short_text_figure_preview_fits_its_padded_body() {
-    let source = source(&["<html><body><p>See Figure 2.1.</p><figure><div><p>Short diagram</p><p style='text-align:right'>Right aligned</p></div><figcaption>Figure 2.1 Text example</figcaption></figure></body></html>"]);
+    let source = source(&["<html><body><p>See Figure 2.1.</p><figure><div><p>Short diagram</p><p style='text-align:right'>Right aligned</p></div><figcaption>Figure 2.1 Text example</figcaption></figure></body></html>",
+    ]);
     let request = job(source.clone(), 0, "Figure 2.1");
     let selected = Index::default().resolve(&request, &|| true).unwrap();
     let result = render(&request, selected, &|| true).unwrap();
@@ -914,11 +951,13 @@ fn adjacent_superscript_note_preserves_media_hit_number_source_and_authored_targ
     style.website_icons = true;
     for focus in [false, true] {
         style.focus_footnote_icons = focus;
-        let layout = LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned()).layout_section(source.as_ref(), &source.sections[0], LayoutViewport::new(600, 400).unwrap(), &style).unwrap();
+        let layout = LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned()).layout_section(source.as_ref(), &source.sections[0], LayoutViewport::new(600, 400).unwrap(), &style,
+                ).unwrap();
         let display = rebook_renderer::DisplayListCompiler.compile(&layout.pages[0]);
         let mut found = 0;
         for item in &layout.pages[0].items {
-            let rebook_layout::PageItem::Text(text) = item else { continue };
+            let rebook_layout::PageItem::Text(text) = item else { continue;
+            };
             for (rect, key) in rebook_renderer::text_media_reference_rects(text) {
                 assert_eq!(key.number, "11.13", "the superscript is a separate note, not part of the figure number");
                 let at = rect.center();
@@ -938,7 +977,8 @@ fn adjacent_superscript_note_preserves_media_hit_number_source_and_authored_targ
 
 #[test]
 fn unverified_translation_reference_cannot_borrow_a_nearby_links_shaped_run() {
-    let source = source(&["<html><body><p>See Figure 1. This original paragraph has enough ordinary prose to keep all translated source offsets within its range and does not mention any tables.</p></body></html>"]);
+    let source = source(&["<html><body><p>See Figure 1. This original paragraph has enough ordinary prose to keep all translated source offsets within its range and does not mention any tables.</p></body></html>",
+    ]);
     let mut section = source.sections[0].clone();
     let Block::Text(block) = &mut section.blocks[0] else { panic!("paragraph") };
     let original = block.content.clone();
@@ -951,12 +991,15 @@ fn unverified_translation_reference_cannot_borrow_a_nearby_links_shaped_run() {
     let mut style = ReaderStyle::default();
     style.typesetting.mode = rebook_layout::TypesettingMode::Unified;
     style.spread = SpreadMode::Single;
-    let layout = LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned()).layout_section(source.as_ref(), &section, LayoutViewport::new(600, 400).unwrap(), &style).unwrap();
+    let layout = LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned()).layout_section(source.as_ref(), &section, LayoutViewport::new(600, 400).unwrap(), &style,
+        ).unwrap();
     let mut keys = Vec::new();
     for page in &layout.pages {
         for item in &page.items {
-            let rebook_layout::PageItem::Text(text) = item else { continue };
-            keys.extend(rebook_renderer::text_media_reference_rects(text).into_iter().map(|(_, key)| key));
+            let rebook_layout::PageItem::Text(text) = item else { continue;
+            };
+            keys.extend(rebook_renderer::text_media_reference_rects(text).into_iter().map(|(_, key)| key),
+            );
         }
     }
     assert!(!keys.is_empty());
@@ -968,7 +1011,8 @@ fn local_book_media_preview() {
     let publication =
         rebook_formats::open_file(std::env::var("TORTO_MEDIA_BOOK").unwrap()).unwrap();
     let original = publication.source();
-    let catalog = Arc::new(super::super::media_links::Source::new(original.clone(), original));
+    let catalog = Arc::new(super::super::media_links::Source::new(original.clone(), original,
+    ));
     catalog.prepare_for_test();
     let source: Arc<dyn BookSource> = catalog.clone();
     let wanted = media_references::references(
@@ -1021,17 +1065,20 @@ fn local_book_media_preview() {
         style.typesetting.mode = rebook_layout::TypesettingMode::Unified;
         style.focus_footnote_icons = true;
         style.spread = SpreadMode::Single;
-        let layout = LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned()).layout_section(request.source.as_ref(), &click_section, LayoutViewport::new(900, 600).unwrap(), &style).unwrap();
+        let layout = LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned()).layout_section(request.source.as_ref(), &click_section, LayoutViewport::new(900, 600).unwrap(), &style,
+                ).unwrap();
         let mut hits = Vec::new();
         for page in &layout.pages {
             let display = rebook_renderer::DisplayListCompiler.compile(page);
             for item in &page.items {
-                let rebook_layout::PageItem::Text(text) = item else { continue };
+                let rebook_layout::PageItem::Text(text) = item else { continue;
+                };
                 for (rect, key) in rebook_renderer::text_media_reference_rects(text) {
                     println!("actual body media hit: {key:?}");
                     if key == request.key {
                         let at = rect.center();
-                        hits.push(display.media_reference_at(at.x as f32, at.y as f32).unwrap());
+                        hits.push(display.media_reference_at(at.x as f32, at.y as f32).unwrap(),
+                        );
                     }
                 }
             }
@@ -1125,13 +1172,16 @@ fn unnumbered_table_and_text_figure_preview_use_source_identity_with_sidebar_ope
 
 #[test]
 fn direct_unnumbered_table_resolves_and_renders_without_caption_or_image_guessing() {
-    let source = source(&["<html><body><p>Intro.</p><table><tr><td>Alpha</td><td>42</td></tr></table></body></html>"]);
+    let source = source(&["<html><body><p>Intro.</p><table><tr><td>Alpha</td><td>42</td></tr></table></body></html>",
+    ]);
     let (at, block) = source.sections[0].blocks.iter().enumerate().find(|(_, b)| matches!(b, Block::Table(_))).unwrap();
     let origin = super::super::block_source_range(block).unwrap().clone();
     let mut job = Job { generation: 1, source: source.clone(), catalog: None,
         destination: Some((0, origin.start.node.clone())), origin,
-        key: MediaKey { kind: MediaKind::Table, number: String::new() },
-        cursor: Cursor::default(), width:1200, style: ReaderStyle::default(), ctx: egui::Context::default() };
+        key: MediaKey { kind: MediaKind::Table, number: String::new(),
+        },
+        cursor: Cursor::default(), width:1200, style: ReaderStyle::default(), ctx: egui::Context::default(),
+    };
     let target = Index::default().resolve(&job, &|| true).unwrap();
     assert_eq!(target.block, at);
     let ready = render(&job, target.clone(), &|| true).unwrap();
@@ -1158,14 +1208,16 @@ fn local_book_complex_table_has_no_gap_between_continuations() {
     let mut expected: Vec<_> = block.text_blocks().filter(|t| !plain(t).is_empty()).filter_map(|t| t.source.clone()).collect();
     expected.sort_by_key(|s| s.start.node.clone());
     let mut continued_cases = 0;
-    for mode in [rebook_layout::TypesettingMode::Unified, rebook_layout::TypesettingMode::Book] {
+    for mode in [rebook_layout::TypesettingMode::Unified, rebook_layout::TypesettingMode::Book,
+    ] {
         for (width, height) in [(900, 500), (1200, 800), (1500, 900)] {
             let mut style = ReaderStyle::default();
             style.typesetting.mode = mode;
             style.spread = SpreadMode::Single;
             let layout = LayoutEngine::with_fonts(crate::fonts::embedded_reader_fonts().iter().cloned())
                 .layout_blocks(source.as_ref(), std::slice::from_ref(block),
-                    LayoutViewport::new(width, height).unwrap(), &style).unwrap();
+                    LayoutViewport::new(width, height).unwrap(), &style,
+                    ).unwrap();
             let mut chunks = Vec::new();
             let mut actual = Vec::new();
             let pages = layout.pages.iter().enumerate().map(|(index, page)| {
@@ -1173,14 +1225,17 @@ fn local_book_complex_table_has_no_gap_between_continuations() {
                     if let rebook_layout::PageItem::Table(table) = item {
                         let left = table.cells.iter().map(|c| c.x).reduce(f32::min).unwrap();
                         chunks.push((index, table.y, table.y + table.height, left,
-                            table.continued_before, table.continued_after));
+                            table.continued_before, table.continued_after,
+                            ));
                     }
                 }
                 let display = rebook_renderer::DisplayListCompiler.compile(page);
                 actual.extend(display.geometry_sources().cloned());
                 super::super::ReaderSectionPage { position: rebook_reader::ReaderPosition {
-                    section_index: target.section, segment_index: 0, page_index: index },
-                    page: Arc::new(display), placeholder: false, visible_top: None, visible_bottom: None }
+                    section_index: target.section, segment_index: 0, page_index: index,
+                        },
+                    page: Arc::new(display), placeholder: false, visible_top: None, visible_bottom: None,
+                    }
             }).collect();
             let scroll = super::super::ScrollSectionLayout::new(target.section, 0, pages, false);
             for pair in chunks.windows(2) {
@@ -1300,5 +1355,33 @@ fn local_complex_table_preview_obeys_the_wide_preview_cap() {
             image::ColorType::Rgba8,
         )
         .unwrap();
+    }
+}
+
+#[test]
+fn preview_crop_remains_centered_at_all_supported_container_widths() {
+    let source = source(&[
+        "<html><body><p>See Table 1.</p><table><caption>Table 1 Results</caption><tr><td>MMMMMMMM</td><td>MMMMMMMM</td></tr></table></body></html>",
+    ]);
+    let mut request = job(source, 0, "Table 1");
+    let target = Index::default().resolve(&request, &|| true).unwrap();
+    for width in [800, 1200, 1440] {
+        request.width = width;
+        let ready = render(&request, target.clone(), &|| true).unwrap();
+        let xs: Vec<_> = ready
+            .image
+            .pixels
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.a() > 200 && p.r() < 64 && p.g() < 64 && p.b() < 64)
+            .map(|(i, _)| i % ready.size[0])
+            .collect();
+        let left = xs.iter().min().expect("table ink is rendered");
+        let right = xs.iter().max().unwrap();
+        assert!(
+            ((*left + *right + 1) as f32 / 2. - ready.size[0] as f32 / 2.).abs() < 2.,
+            "width={width}, ink bounds={left}..{right}, texture={:?}",
+            ready.size
+        );
     }
 }

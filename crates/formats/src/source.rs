@@ -177,7 +177,8 @@ fn heading_candidate(
         return Some(HeadingCandidate::Single(index));
     }
 
-    let title_index = index.checked_add(1)?;
+    let title_index = (index.checked_add(1)?..blocks.len().min(index + 5))
+        .find(|&i| !rebook_publication::is_heading_separator(&blocks[i]))?;
     let title = heading_text_block(blocks.get(title_index)?)?;
     let ordinal = normalized_text_block(block);
     let title_text = normalized_text_block(title);
@@ -421,7 +422,8 @@ impl DirectBookSource {
 }
 
 impl DirectBookSource {
-    fn parse_section_ir(&self, index: usize, ignore_body_margins: bool) -> Result<Section, PublicationError> {
+    fn parse_section_ir(&self, index: usize, ignore_body_margins: bool,
+    ) -> Result<Section, PublicationError> {
         let descriptor = self
             .book
             .sections
@@ -456,7 +458,9 @@ impl DirectBookSource {
                             &self.resources.get(href.path())?.bytes,
                         )
                     },
-                    |href| self.html_context.font_traits(href, || self.resources.get(href.path()).map(|r| &r.bytes)),
+                    |href| {
+                        self.html_context.font_traits(href, || self.resources.get(href.path()).map(|r| &r.bytes))
+                    },
                     rebook_html::SectionParseHints { ignore_body_margins, ..self.html_context.hints(descriptor) },
                 )
                 .map_err(|error| PublicationError::InvalidPublication(error.to_string()))?;
@@ -510,7 +514,8 @@ impl BookSource for DirectBookSource {
         self.parse_section_ir(index, false)
     }
 
-    fn parse_section_without_body_margins(&self, index: usize) -> Result<Section, PublicationError> {
+    fn parse_section_without_body_margins(&self, index: usize,
+    ) -> Result<Section, PublicationError> {
         self.parse_section_ir(index, true)
     }
 
@@ -709,6 +714,26 @@ mod tests {
         .unwrap()
         .parse_section(0)
         .unwrap()
+    }
+
+    #[test]
+    fn split_heading_crosses_a_decorative_rule_but_never_body_text() {
+        let section = heading_fixture(
+            "<h1 id='chapter'>PART IV</h1><hr/><h1>PROFICIENT READERS</h1>",
+            "Part IV: Proficient Readers",
+        );
+        assert!(
+            matches!(&section.blocks[0],Block::Text(t) if t.kind==TextBlockKind::HeadingOrdinal(1))
+        );
+        assert!(rebook_publication::is_heading_separator(&section.blocks[1]));
+        assert!(matches!(&section.blocks[2],Block::Text(t) if t.kind==TextBlockKind::Heading(1)));
+        let section = heading_fixture(
+            "<h1 id='chapter'>PART IV</h1><p>Intervening body text.</p><h1>PROFICIENT READERS</h1>",
+            "Part IV: Proficient Readers",
+        );
+        assert!(
+            !matches!(&section.blocks[0],Block::Text(t) if t.kind==TextBlockKind::HeadingOrdinal(1))
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
-<!-- Google Material Symbols Rounded, Apache-2.0. Source: symbols/web/undo/materialsymbolsrounded/undo_24px.svg -->
+<!-- Google Material Symbols Rounded, wght 300, Apache-2.0. Source: symbols/web/undo/materialsymbolsrounded/undo_wght300_24px.svg -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="960" android:viewportHeight="960">
     <group android:translateX="-0" android:translateY="960">
-        <path android:fillColor="@android:color/white" android:pathData="M320-200q-17 0-28.5-11.5T280-240q0-17 11.5-28.5T320-280h244q63 0 109.5-40T720-420q0-60-46.5-100T564-560H312l76 76q11 11 11 28t-11 28q-11 11-28 11t-28-11L188-572q-6-6-8.5-13t-2.5-15q0-8 2.5-15t8.5-13l144-144q11-11 28-11t28 11q11 11 11 28t-11 28l-76 76h252q97 0 166.5 63T800-420q0 94-69.5 157T564-200H320Z"/>
+        <path android:fillColor="@android:color/white" android:pathData="M318.08-220q-12.77 0-21.39-8.62-8.61-8.61-8.61-21.38t8.61-21.38q8.62-8.62 21.39-8.62h257.07q62.62 0 107.77-41.35 45.16-41.34 45.16-102.11 0-60.77-45.16-101.93-45.15-41.15-107.77-41.15H294.31l90.23 90.23q8.69 8.7 8.69 21.08 0 12.38-8.69 21.08-8.69 8.69-21.27 8.5-12.58-.2-20.88-8.5L205.31-571.23q-5.62-5.62-7.92-11.85-2.31-6.23-2.31-13.46t2.31-13.46q2.3-6.23 7.92-11.85l137.08-137.07q8.69-8.69 21.07-8.69 12.39 0 21.08 8.69 8.69 8.69 8.5 21.27-.19 12.57-8.5 20.88l-90.23 90.23h280.84q87.77 0 150.35 58.58t62.58 144.5q0 85.92-62.58 144.69Q662.92-220 575.15-220H318.08Z"/>
     </group>
 </vector>

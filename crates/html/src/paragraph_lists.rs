@@ -168,6 +168,36 @@ fn text_marker(value: &str) -> Option<(Family, u32, u32)> {
     ))
 }
 
+fn small_image_marker(styles: &StyleSheet, node: Node<'_, '_>, size: [u32; 2]) -> bool {
+    let [w, h] = size;
+    if w == 0 || h == 0 {
+        return false;
+    }
+    let ratio = w as f32 / h as f32;
+    let style = styles.image_style(node);
+    let pixels = |v| {
+        if let Some(rebook_publication::ImageLength::Pixels(p)) = v {
+            Some(p)
+        } else {
+            None
+        }
+    };
+    let (w, h) = match (pixels(style.width), pixels(style.height)) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, w / ratio),
+        (None, Some(h)) => (h * ratio, h),
+        _ => (w as f32, h as f32),
+    };
+    w.is_finite()
+        && h.is_finite()
+        && w > 0.0
+        && h > 0.0
+        && w <= 32.0
+        && h <= 32.0
+        && w <= h * 3.0
+        && h <= w * 3.0
+}
+
 fn candidate<'a, 'input>(
     node: Node<'a, 'input>,
     styles: &StyleSheet,
@@ -219,14 +249,7 @@ fn candidate<'a, 'input>(
         let size = *dimensions
             .entry(image_href.clone())
             .or_insert_with(|| image_dimensions(&image_href));
-        let [width, height] = size?;
-        if width == 0
-            || height == 0
-            || width > 32
-            || height > 32
-            || width > height * 3
-            || height > width * 3
-        {
+        if !small_image_marker(styles, leading, size?) {
             return None;
         }
         (Family::Image(image_href.to_string()), 1, 0)
@@ -256,9 +279,12 @@ pub(super) fn detect(
     // leading images are marker evidence; an isolated content glyph is not.
     let native_lists = root.descendants().filter(|n| n.is_element() && matches!(n.tag_name().name(), "ul" | "ol")).map(|list| {
         let items = list.children().filter(|n| n.has_tag_name("li")).collect::<Vec<_>>();
-        let leading = items.iter().map(|item| item.descendants().skip(1).find(|n|
-            n.is_text() && n.text().is_some_and(|s| !s.trim().is_empty())
-                || n.is_element() && matches!(n.tag_name().name(), "img" | "math")))
+        let leading = items.iter().map(|item| {
+                    item.descendants().skip(1).find(|n| {
+                        n.is_text() && n.text().is_some_and(|s| !s.trim().is_empty())
+                || n.is_element() && matches!(n.tag_name().name(), "img" | "math")
+                    })
+                })
             .collect::<Vec<_>>();
         (list, items, leading)
     }).collect::<Vec<_>>();
@@ -269,17 +295,24 @@ pub(super) fn detect(
     }
     for (list, items, leading) in native_lists {
         for (ordinal, (item, first)) in items.iter().zip(&leading).enumerate() {
-            let Some(image) = first.filter(|n| n.has_tag_name("img")) else { continue };
-            let Some(src) = image.attribute("src") else { continue };
-            let numbered = image.attribute("alt").is_some_and(|s|
-                !s.trim().is_empty() && s.trim().chars().all(|c| c.is_ascii_digit() || ".()、".contains(c)));
+            let Some(image) = first.filter(|n| n.has_tag_name("img")) else { continue;
+            };
+            let Some(src) = image.attribute("src") else { continue;
+            };
+            let numbered = image.attribute("alt").is_some_and(|s| {
+                !s.trim().is_empty() && s.trim().chars().all(|c| c.is_ascii_digit() || ".()、".contains(c))
+            });
             if (!numbered && repeats.get(src).copied().unwrap_or(0) < 2)
-                || styles.visually_hidden(image) || !text(*item).chars().any(char::is_alphabetic) { continue }
+                || styles.visually_hidden(image) || !text(*item).chars().any(char::is_alphabetic) { continue;
+            }
             let Ok(url) = href.resolve(src) else { continue };
             let size = *dimensions.entry(url.clone()).or_insert_with(|| image_dimensions(&url));
-            if !size.is_some_and(|[w,h]| w > 0 && h > 0 && w <= 32 && h <= 32 && w <= h*3 && h <= w*3) { continue }
+            if !size.is_some_and(|size| small_image_marker(styles, image, size)) { continue;
+            }
             result.insert(item.id(), ListItem { group: list.range().start as u64,
-                ordered: list.has_tag_name("ol"), ordinal: ordinal as u32 + 1, depth: 0, prefix_chars: 0 });
+                ordered: list.has_tag_name("ol"), ordinal: ordinal as u32 + 1, depth: 0, prefix_chars: 0,
+                },
+            );
         }
     }
     let mut reference_nodes = HashSet::new();
@@ -460,6 +493,23 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn high_resolution_bullets_use_css_display_size_but_content_images_do_not() {
+        for width in ["16px", "1em"] {
+            let body = format!(
+                "<p>Consider these examples:</p><p style='margin-left:24px;text-indent:-16px'><img style='width:{width}' src='bullet.jpg'/> First item.</p><p style='margin-left:24px;text-indent:-16px'><img style='width:{width}' src='bullet.jpg'/> Second item.</p>"
+            );
+            let section = parse(&body, Some([156, 141]));
+            assert_eq!(items(&section).len(), 2, "{width}");
+            assert_eq!(
+                items(&section)[0].style.list_group,
+                items(&section)[1].style.list_group
+            );
+            let large = parse(&body.replace(width, "128px"), Some([156, 141]));
+            assert!(items(&large).is_empty());
+        }
     }
 
     #[test]

@@ -48,7 +48,7 @@ class MigrationServicesTest {
         CloudRuntime.foreground(context,false);CloudRuntime.cancel()
         try {
             assertTrue(core.cloudPresets().any {it.id=="jianguoyun"&&it.url.startsWith("https://")})
-            val temporary=original.copy(enabled=true,provider="custom",url="http://127.0.0.1:1/dav",username="scheduler-test",deviceName="Android scheduler test",foreground=false,background=true)
+            val temporary=original.copy(enabled=true,provider="custom",url="http://127.0.0.1:1/dav",username="scheduler-test",deviceName="Android scheduler test")
             core.saveCloudOptions(temporary,null)
             assertEquals("Android scheduler test",core.cloudOptions().deviceName)
             val manager=WorkManager.getInstance(context)

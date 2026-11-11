@@ -77,25 +77,7 @@ pub(super) fn leaf<'a, 'input>(mut node: Node<'a, 'input>) -> Option<Node<'a, 'i
 }
 
 pub(super) fn note_prefix(text: &str) -> bool {
-    let lower = text.trim_start().to_lowercase();
-    [
-        "source",
-        "sources",
-        "note",
-        "notes",
-        "abbreviations",
-        "来源",
-        "资料来源",
-        "注",
-        "注释",
-        "缩写",
-    ]
-    .iter()
-    .any(|prefix| {
-        lower
-            .strip_prefix(prefix)
-            .is_some_and(|tail| tail.trim_start().starts_with([':', '：']))
-    })
+    rebook_publication::media_notes::is_annotation(text)
 }
 
 /// Multiple unmarked continuations require a dedicated, text-only container

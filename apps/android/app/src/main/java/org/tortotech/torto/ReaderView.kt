@@ -29,6 +29,7 @@ import kotlin.math.roundToInt
 /** Touch previews translate retained content; committed focus stops update native state. */
 class ReaderView(context: Context) : View(context) {
     var onMotion: ((Boolean) -> Unit)? = null
+    var onContentLoading: ((Boolean) -> Unit)? = null
     var onReadingGesture: (() -> Unit)? = null
     private var reportedGesture=false
     var onSize: ((Int, Int, Float) -> Unit)? = null
@@ -86,6 +87,9 @@ class ReaderView(context: Context) : View(context) {
     private var previousPage:ReaderFrame?=null
     private var nextPage:ReaderFrame?=null
     private var navigationPending=false
+    private var boundaryTransition=false
+    private var boundaryOffset=0f
+    private var contentLoading=false
     private var lastTurnCompletion=0L
     private var blockedGesture=false
     private var reportedMotion=false
@@ -130,6 +134,25 @@ class ReaderView(context: Context) : View(context) {
     private fun reportMotion() {
         val active = draggingFocus || draggingUnit || draggingPage || draggingHandle || motion != null || navigationPending
         if (active != reportedMotion) { reportedMotion = active; onMotion?.invoke(active) }
+    }
+    private fun reportContentLoading(active:Boolean){
+        if(contentLoading!=active){contentLoading=active;onContentLoading?.invoke(active)}
+    }
+    private fun animateBoundaryTurn(forward:Boolean){
+        cancelAnimation();boundaryTransition=true;boundaryOffset=0f
+        reportContentLoading(true)
+        if(!isShown||!hasWindowFocus()){onTurn?.invoke(forward);reportMotion();return}
+        val extent=height/density
+        val animator=ValueAnimator.ofFloat(0f,if(forward)-extent else extent)
+        motion=animator
+        animator.duration=readerTurnDuration(extent,extent)
+        animator.interpolator=android.view.animation.PathInterpolator(.215f,.61f,.355f,1f)
+        animator.addUpdateListener {boundaryOffset=it.animatedValue as Float;invalidate()}
+        animator.addListener(object:AnimatorListenerAdapter(){override fun onAnimationEnd(animation:Animator){
+            if(motion!==animator)return
+            motion=null;onTurn?.invoke(forward);reportMotion()
+        }})
+        reportMotion();animator.start()
     }
     private fun cancelAnimation() { val old=motion;motion=null;motionTarget=null;motionClipped=false;motionVelocity=0f;old?.cancel() }
     private fun afterSlop(delta:Float)=Math.signum(delta)*(abs(delta)-touchSlop).coerceAtLeast(0f)
@@ -185,7 +208,7 @@ class ReaderView(context: Context) : View(context) {
         if(target==null){
             // At a semantic unit edge, release commits a separate unit turn.
             // No adjacent-unit text is included in the retained drag strip.
-            animateTo(current.info.scrollDistance);onTurn?.invoke(forward);reportMotion();return
+            animateBoundaryTurn(forward);return
         }
         focusPreview=current.info.scrollDistance to target.bounds
         pendingFocusTarget=current.info.scrollDistance+target.delta
@@ -200,18 +223,24 @@ class ReaderView(context: Context) : View(context) {
         val destination=if(cancelled)null else focusDragDestination(dragDistance,velocity,current?.previousFocus?.delta,current?.nextFocus?.delta)
         if(deferredFocusGesture&&navigationPending){
             queuedFocusRelease=true;queuedFocusTurn=destination;queuedFocusVelocity=velocity
-            animateTo(pendingFocusTarget ?: displayPosition,velocity)
+            if(pendingFocusTarget!=null)animateTo(pendingFocusTarget!!,velocity)
         }else if(destination!=null)stepFocus(destination,velocity)
         else animateTo(frame?.info?.scrollDistance ?: displayPosition,velocity)
         reportMotion()
+    }
+    private fun requestQueuedUnitTurn(forward:Boolean){
+        val navigate=onUnitTurn ?: return
+        navigationPending=true;boundaryTransition=true
+        boundaryOffset=if(forward)-height/density else height/density
+        reportContentLoading(true);invalidate();navigate(forward);reportMotion()
     }
     private fun finishUnitDrag(velocity:Float,cancelled:Boolean) {
         if(!draggingUnit)return
         draggingUnit=false
         if(!cancelled&&pageTurnCommit(unitDistance,width/density,velocity)) {
-            if(navigationPending&&pendingFocusTarget!=null){
+            if(navigationPending){
                 queuedUnitTurn=unitDistance<0;queuedFocusRelease=false;queuedFocusTurn=null
-            }else if(!navigationPending)onUnitTurn?.let {navigate->navigationPending=true;navigate(unitDistance<0)}
+            }else if(!navigationPending)requestQueuedUnitTurn(unitDistance<0)
         }
         reportMotion()
     }
@@ -234,7 +263,8 @@ class ReaderView(context: Context) : View(context) {
         val commit=!cancelled&&pageTurnCommit(pageDistance,width/density,velocity)
         cancelAnimation()
         val start=pageOffset
-        val target=if(commit&&pageNeighbour()!=null)pageDirection*width/density else 0f
+        val target=if(commit&&(pageNeighbour()!=null||pageIsUnit))pageDirection*width/density else 0f
+        if(commit&&pageIsUnit&&pageNeighbour()==null)reportContentLoading(true)
         val forward=pageDirection<0
         val unit=pageIsUnit
         val animator=ValueAnimator.ofFloat(start,target)
@@ -266,7 +296,7 @@ class ReaderView(context: Context) : View(context) {
                 dragHorizontal(b.x-a.x,-dx,false);return true
             }
             if(gestureAxis==1){
-                if(navigationPending&&pendingFocusTarget!=null){
+                if(draggingUnit||navigationPending){
                     draggingUnit=true;unitDistance=(b.x-a.x)/density
                     parent?.requestDisallowInterceptTouchEvent(true);reportMotion()
                 }else dragHorizontal(b.x-a.x,-dx,true)
@@ -276,6 +306,7 @@ class ReaderView(context: Context) : View(context) {
             val starting=!draggingFocus
             draggingFocus=true
             dragDistance+=(if(starting)afterSlop(a.y-b.y)else dy)/density
+            if(deferredFocusGesture&&navigationPending&&pendingFocusTarget==null){reportMotion();return true}
             val low=if(deferredFocusGesture)minOf(dragStart,current.info.scrollDistance)else minOf(dragStart,current.info.scrollDistance+(current.info.previousFocus?.delta ?: 0f))
             val high=if(deferredFocusGesture)maxOf(dragStart,pendingFocusTarget ?: dragStart)else maxOf(dragStart,current.info.scrollDistance+(current.info.nextFocus?.delta ?: 0f))
             parent?.requestDisallowInterceptTouchEvent(true)
@@ -293,14 +324,23 @@ class ReaderView(context: Context) : View(context) {
     init {isFocusable=true;ViewCompat.setAccessibilityDelegate(this,accessibility)}
     fun present(next:ReaderFrame?,selection:SelectedText?,previous:ReaderFrame?=null,following:ReaderFrame?=null,turnCompletion:Long=0){
         val old=frame
+        var replayFocus:Boolean?=null
+        var replayUnit:Boolean?=null
+        var replayVelocity=0f
         val completed=turnCompletion!=lastTurnCompletion
         lastTurnCompletion=turnCompletion
         val confirmed=completed&&navigationPending
         if(old!==next||confirmed){
             val continuous=old?.info?.isScroll==true&&next?.info?.isScroll==true&&old.info.scrollContext==next.info.scrollContext
             val pending=navigationPending
-            if(!continuous||confirmed&&pageDirection!=0){
-                stopMotion();displayPosition=next?.info?.scrollDistance ?: 0.0
+            if(!continuous||confirmed&&pageDirection!=0||pending&&boundaryTransition&&(old!==next||confirmed)){
+                val continuing=next?.info?.isScroll==true&&deferredFocusGesture&&(draggingFocus||draggingUnit)
+                if(next?.info?.isScroll==true&&pending){
+                    replayUnit=queuedUnitTurn
+                    if(queuedFocusRelease){replayFocus=queuedFocusTurn;replayVelocity=queuedFocusVelocity}
+                }
+                stopMotion(continuing);displayPosition=next?.info?.scrollDistance ?: 0.0
+                if(continuing)dragStart=displayPosition
                 previousFrame=null;frame=next
             }else{
                 if(old.rasterId!=next.rasterId&&(motion!=null||pending||draggingFocus))previousFrame=old
@@ -308,8 +348,7 @@ class ReaderView(context: Context) : View(context) {
                 if(pending)focusPreview=null
                 if(queuedUnitTurn!=null){
                     val forward=queuedUnitTurn!!;queuedUnitTurn=null
-                    onUnitTurn?.let {navigate->navigationPending=true;navigate(forward)}
-                    if(!draggingFocus&&!draggingHandle)animateTo(next.info.scrollDistance)
+                    requestQueuedUnitTurn(forward)
                 }else if(queuedFocusRelease){
                     val turn=queuedFocusTurn;val velocity=queuedFocusVelocity
                     queuedFocusRelease=false;queuedFocusTurn=null;queuedFocusVelocity=0f
@@ -324,6 +363,8 @@ class ReaderView(context: Context) : View(context) {
         val changed=old!==next||confirmed||selected!=selection
         selected=selection
         if(changed)invalidate()
+        if(replayUnit!=null)requestQueuedUnitTurn(replayUnit!!)
+        else if(replayFocus!=null)stepFocus(replayFocus!!,replayVelocity)
     }
     override fun onSizeChanged(w:Int,h:Int,oldw:Int,oldh:Int){stopMotion();onSize?.invoke(w,h,density)}
     fun presentReference(bounds:org.tortotech.torto.core.Rect?,color:UInt){
@@ -370,6 +411,11 @@ class ReaderView(context: Context) : View(context) {
             page(current,x)
             canvas.restoreToCount(clipped);return
         }
+        if(boundaryTransition){
+            canvas.drawColor((current.info.focusFadeColor.toInt() and 0xFFFFFF) or 0xFF000000.toInt())
+            canvas.translate(0f,boundaryOffset*density)
+            canvas.clipRect(0,0,width,height)
+        }
         if(current.info.isScroll){canvas.drawColor((current.info.focusFadeColor.toInt() and 0xFFFFFF) or 0xFF000000.toInt());previousFrame?.let {drawRaster(canvas,it)};drawRaster(canvas,current)}
         else canvas.drawBitmap(current.bitmap,null,Rect(0,0,width,height),paint)
         canvas.save();canvas.translate(0f,-pendingOffset)
@@ -390,12 +436,14 @@ class ReaderView(context: Context) : View(context) {
     override fun onTouchEvent(event:MotionEvent):Boolean {
         if(event.actionMasked==MotionEvent.ACTION_DOWN){
             // Complete the stable endpoint before accepting a rapid subsequent drag.
-            if(pageDirection!=0&&motion!=null)motion?.end()
-            val canDefer=navigationPending&&pendingFocusTarget!=null&&frame?.info?.isScroll==true
+            if((pageDirection!=0||boundaryTransition)&&motion!=null)motion?.end()
+            val canDefer=navigationPending&&frame?.info?.isScroll==true
             blockedGesture=(navigationPending&&!canDefer)||!isEnabled
             if(blockedGesture)return true
             deferredFocusGesture=canDefer;queuedFocusRelease=false;queuedFocusTurn=null;queuedFocusVelocity=0f;queuedUnitTurn=null
-            cancelAnimation();selecting=false;draggingFocus=false;draggingUnit=false;unitDistance=0f;draggingPage=false;pageDirection=0;pageDistance=0f;pageOffset=0f;pageIsUnit=false;turnNeighbour=null;reportedGesture=false;dragDistance=0f;dragStart=displayPosition
+            cancelAnimation();selecting=false;draggingFocus=false;draggingUnit=false;unitDistance=0f;draggingPage=false
+            if(!canDefer||pageDirection==0){pageDirection=0;pageDistance=0f;pageOffset=0f;pageIsUnit=false;turnNeighbour=null}
+            reportedGesture=false;dragDistance=0f;dragStart=displayPosition
             gestureAxis=0;releaseVelocityX=0f;releaseVelocityY=0f;lastMoveTime=0L
             velocity?.recycle();velocity=VelocityTracker.obtain()
             val hit=handlePoints().indexOfFirst {(x,y)->hypot(event.x-x,event.y-y-6*density)<26*density}
@@ -429,15 +477,20 @@ class ReaderView(context: Context) : View(context) {
         }
         return true
     }
-    private fun stopMotion(){
+    private fun stopMotion(preserveGesture:Boolean=false){
         val hadHandle=draggingHandle
-        cancelAnimation();navigationPending=false;blockedGesture=false;draggingFocus=false;draggingPage=false;pageDirection=0;pageDistance=0f;pageOffset=0f;draggingHandle=false;selecting=false
+        cancelAnimation();navigationPending=false;blockedGesture=false;pageDirection=0;pageDistance=0f;pageOffset=0f;draggingHandle=false;selecting=false
+        boundaryTransition=false;boundaryOffset=0f;reportContentLoading(false)
         previousPage=null;nextPage=null;turnNeighbour=null;pageIsUnit=false
-        pendingFocusTarget=null;deferredFocusGesture=false;queuedFocusRelease=false;queuedFocusTurn=null;queuedFocusVelocity=0f;queuedUnitTurn=null;gestureAxis=0;motionClipped=false;motionVelocity=0f;draggingUnit=false;unitDistance=0f
+        pendingFocusTarget=null;deferredFocusGesture=false;queuedFocusRelease=false;queuedFocusTurn=null;queuedFocusVelocity=0f;queuedUnitTurn=null;motionClipped=false;motionVelocity=0f
+        if(!preserveGesture){
+            draggingFocus=false;draggingPage=false;draggingUnit=false;unitDistance=0f;gestureAxis=0
+            velocity?.recycle();velocity=null
+        }
         previousFrame=null;focusPreview=null;displayPosition=frame?.info?.scrollDistance ?: 0.0
-        velocity?.recycle();velocity=null;removeCallbacks(edgeScroll);if(hadHandle)onHandleEnd?.invoke();reportMotion()
+        removeCallbacks(edgeScroll);if(hadHandle)onHandleEnd?.invoke();reportMotion()
     }
-    fun cancelPendingNavigation(){if(navigationPending){stopMotion();invalidate()}}
+    fun cancelPendingNavigation(){if(navigationPending||contentLoading){stopMotion();invalidate()}}
     override fun onDetachedFromWindow(){stopMotion();super.onDetachedFromWindow()}
     override fun onWindowFocusChanged(hasWindowFocus:Boolean){super.onWindowFocusChanged(hasWindowFocus);if(!hasWindowFocus)stopMotion()}
     override fun performClick():Boolean {super.performClick();return true}

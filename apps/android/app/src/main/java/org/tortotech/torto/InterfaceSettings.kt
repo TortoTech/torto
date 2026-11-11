@@ -14,17 +14,13 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
-@Composable fun SystemScreen(state:ScreenState,open:(String)->Unit){
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)){
-        SettingsGroup {
-            SettingsItem(tr("深色模式","Dark mode"),value=when(state.appTheme){
-                "dark"->tr("已开启","On");"light"->tr("未开启","Off");else->tr("跟随系统","Follow system")
-            }){open("dark-mode")}
-            SettingsItem(tr("界面语言","Interface language"),value=when(state.language){
-                "zh-CN"->"中文";"en"->"English";else->tr("跟随系统","Follow system")
-            }){open("language")}
-        }
-    }
+@Composable internal fun InterfaceSettingsRows(state:ScreenState,open:(String)->Unit){
+    SettingsItem(tr("深色模式","Dark mode"),icon="moon",value=when(state.appTheme){
+        "dark"->tr("已开启","On");"light"->tr("未开启","Off");else->tr("跟随系统","Follow system")
+    }){open("dark-mode")}
+    SettingsItem(tr("界面语言","Interface language"),icon="translate",value=when(state.language){
+        "zh-CN"->"中文";"en"->"English";else->tr("跟随系统","Follow system")
+    }){open("language")}
 }
 
 @Composable fun DarkModeScreen(state:ScreenState,model:ReaderModel){
@@ -57,7 +53,7 @@ import androidx.compose.ui.unit.sp
                     val selected=value==key
                     Row(Modifier.fillMaxWidth().heightIn(min=56.dp).selectable(selected,enabled,Role.RadioButton){onSelect(key)}.padding(horizontal=16.dp,vertical=16.dp),verticalAlignment=Alignment.CenterVertically){
                         Text(label,Modifier.weight(1f),fontSize=16.sp,color=if(selected)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
-                        if(selected)AppIcon("check",size=16.667.dp,tint=MaterialTheme.colorScheme.primary)
+                        if(selected)AppIcon("check",size=IconSizes.Small,tint=MaterialTheme.colorScheme.primary)
                     }
                 }
             }

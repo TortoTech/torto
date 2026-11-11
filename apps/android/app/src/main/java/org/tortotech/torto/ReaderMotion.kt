@@ -41,7 +41,9 @@ internal fun focusDragDestination(distance:Float,velocity:Float,previous:Float?,
     val forward=if(abs(distance)>.01f)distance>0 else velocity>0
     val fling=abs(velocity)>=500f
     if(fling&&(velocity>0)!=forward)return null
-    val span=if(forward)next else previous
-    val threshold=span?.let {(abs(it)*.5f).coerceIn(8f,36f)} ?: 36f
+    // Retain the neighbouring stop's gesture scale at a section edge. A
+    // one-block section has no neighbouring measurement, so use 16dp.
+    val span=if(forward)next ?: previous else previous ?: next
+    val threshold=span?.let {(abs(it)*.5f).coerceIn(8f,36f)} ?: 16f
     return if(abs(distance)>=threshold||fling)forward else null
 }

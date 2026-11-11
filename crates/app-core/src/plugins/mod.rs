@@ -64,14 +64,9 @@ const PDF_OCR_CREDENTIAL_SERVICE: &str = "Rebook PDF OCR";
 const DEFAULT_PROVIDER_ID: &str = "openai";
 #[cfg(any(test, feature = "test-support"))]
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
-const DEFAULT_CHAT_MAX_TOOL_STEPS: u16 = 24;
-const CHAT_TOOL_DEFAULTS_VERSION: u8 = 1;
+pub const DEFAULT_CHAT_MAX_TOOL_STEPS: u16 = 24;
 const OCR_SELECTION_DEFAULTS_VERSION: u8 = 1;
-const DEFAULT_CHAT_HISTORY_TURNS: u16 = 10;
-pub const CHAT_TOOL_STEPS_MIN: u16 = 1;
-pub const CHAT_TOOL_STEPS_MAX: u16 = 24;
-pub const CHAT_HISTORY_TURNS_MIN: u16 = 1;
-pub const CHAT_HISTORY_TURNS_MAX: u16 = 50;
+pub const DEFAULT_CHAT_HISTORY_TURNS: u16 = 10;
 pub const TARGET_LANGUAGE_SYSTEM: &str = "system";
 pub const TARGET_LANGUAGE_SIMPLIFIED_CHINESE: &str = "zh-CN";
 pub const TARGET_LANGUAGE_ENGLISH: &str = "en";
@@ -342,8 +337,6 @@ pub struct PluginSettings {
     pub chat_model: String,
     #[serde(default)]
     pub chat_reasoning_effort: ReasoningEffort,
-    pub chat_max_tool_steps: u16,
-    pub chat_history_turns: u16,
     pub web_search: web_search::SearchSettings,
     pub ocr_enabled: bool,
     pub ocr_provider: String,
@@ -368,8 +361,6 @@ pub struct PluginSettings {
     pub translation_mode: TranslationMode,
     pub translate_toc: bool,
     #[serde(default)]
-    chat_tool_defaults_version: u8,
-    #[serde(default)]
     ocr_selection_defaults_version: u8,
     #[serde(default, rename = "base_url", skip_serializing)]
     legacy_base_url: Option<String>,
@@ -385,8 +376,6 @@ impl Default for PluginSettings {
             chat_provider: DEFAULT_PROVIDER_ID.into(),
             chat_model: String::new(),
             chat_reasoning_effort: ReasoningEffort::Default,
-            chat_max_tool_steps: DEFAULT_CHAT_MAX_TOOL_STEPS,
-            chat_history_turns: DEFAULT_CHAT_HISTORY_TURNS,
             web_search: web_search::SearchSettings::default(),
             ocr_enabled: true,
             ocr_provider: DEFAULT_PROVIDER_ID.into(),
@@ -405,7 +394,6 @@ impl Default for PluginSettings {
             target_language: TARGET_LANGUAGE_SYSTEM.into(),
             translation_mode: TranslationMode::Replace,
             translate_toc: true,
-            chat_tool_defaults_version: CHAT_TOOL_DEFAULTS_VERSION,
             ocr_selection_defaults_version: 0,
             legacy_base_url: None,
             legacy_api_key: None,
@@ -514,12 +502,6 @@ impl PluginSettings {
 
     pub fn normalize(&mut self) {
         self.migrate_legacy();
-        if self.chat_tool_defaults_version < CHAT_TOOL_DEFAULTS_VERSION {
-            if self.chat_max_tool_steps == 5 {
-                self.chat_max_tool_steps = DEFAULT_CHAT_MAX_TOOL_STEPS;
-            }
-            self.chat_tool_defaults_version = CHAT_TOOL_DEFAULTS_VERSION;
-        }
         if self.ocr_selection_defaults_version < OCR_SELECTION_DEFAULTS_VERSION {
             self.ocr_provider.clone_from(&self.chat_provider);
             self.ocr_model.clone_from(&self.chat_model);
@@ -562,12 +544,6 @@ impl PluginSettings {
             &mut self.translation_provider,
             &mut self.translation_model,
         );
-        self.chat_max_tool_steps = self
-            .chat_max_tool_steps
-            .clamp(CHAT_TOOL_STEPS_MIN, CHAT_TOOL_STEPS_MAX);
-        self.chat_history_turns = self
-            .chat_history_turns
-            .clamp(CHAT_HISTORY_TURNS_MIN, CHAT_HISTORY_TURNS_MAX);
         self.target_language = normalize_target_language(&self.target_language);
         if self.paddle_ocr_model.trim().is_empty() {
             self.paddle_ocr_model = "PaddleOCR-VL-1.6".into();
@@ -1021,27 +997,16 @@ mod tests {
     }
 
     #[test]
-    fn ai_chat_limits_are_normalized_to_supported_ranges() {
-        let mut settings = PluginSettings {
-            chat_max_tool_steps: 0,
-            chat_history_turns: u16::MAX,
-            ..PluginSettings::default()
-        };
-
-        settings.normalize();
-
-        assert_eq!(settings.chat_max_tool_steps, CHAT_TOOL_STEPS_MIN);
-        assert_eq!(settings.chat_history_turns, CHAT_HISTORY_TURNS_MAX);
-    }
-
-    #[test]
-    fn legacy_default_tool_limit_migrates_to_web_parity() {
+    fn retired_chat_limits_are_ignored_and_no_longer_saved() {
         let mut settings: PluginSettings =
-            serde_json::from_str(r#"{ "chat_max_tool_steps": 5 }"#).unwrap();
+            serde_json::from_str(r#"{ "chat_max_tool_steps": 5, "chat_history_turns": 50, "chat_tool_defaults_version": 1 }"#).unwrap();
 
         settings.normalize();
 
-        assert_eq!(settings.chat_max_tool_steps, 24);
+        let saved = serde_json::to_value(settings).unwrap();
+        assert!(saved.get("chat_max_tool_steps").is_none());
+        assert!(saved.get("chat_history_turns").is_none());
+        assert!(saved.get("chat_tool_defaults_version").is_none());
     }
 
     #[test]

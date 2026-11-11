@@ -2,10 +2,11 @@
 
 mod book_source;
 mod headings;
-mod toc;
 pub mod links;
+pub mod media_notes;
 pub mod media_references;
-pub use headings::heading_ordinal_key;
+mod toc;
+pub use headings::{heading_ordinal_key, is_heading_separator};
 pub use toc::{TocMatch, toc_entry_for_href};
 
 use std::fmt;
@@ -498,7 +499,9 @@ impl Block {
     pub fn text_blocks_mut(&mut self) -> Box<dyn Iterator<Item = &mut TextBlock> + '_> {
         match self {
             Self::Text(text) => Box::new(std::iter::once(text)),
-            Self::Quote(quote) => Box::new(quote.body.iter_mut().chain(quote.attribution.iter_mut())),
+            Self::Quote(quote) => {
+                Box::new(quote.body.iter_mut().chain(quote.attribution.iter_mut()))
+            }
             Self::Table(table) => Box::new(table.text_blocks_mut()),
             Self::Figure(figure) => Box::new(figure.text_blocks_mut()),
             Self::Note(note) => Box::new(note.blocks.iter_mut().flat_map(Self::text_blocks_mut)),
@@ -996,8 +999,11 @@ impl FigureBlock {
     /// Outer captions/credits only; captions inside a grid stay in the grid.
     pub fn caption_blocks(&self) -> impl Iterator<Item = &TextBlock> {
         self.captions.iter().chain(self.body.iter().filter_map(|block| match block {
-            Block::Text(text) if matches!(text.kind, TextBlockKind::Caption | TextBlockKind::QuoteAttribution) => Some(text),
-            _ => None,
+            Block::Text(text) if matches!(text.kind, TextBlockKind::Caption | TextBlockKind::QuoteAttribution) =>
+                {
+                    Some(text)
+                }
+                _ => None,
         }))
     }
 }
@@ -1365,7 +1371,8 @@ pub enum TextDirection {
 
 /// Portable block style subset, expressed in CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ListMarkerFormat { LowerAlpha, UpperAlpha }
+pub enum ListMarkerFormat { LowerAlpha, UpperAlpha,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BlockStyle {

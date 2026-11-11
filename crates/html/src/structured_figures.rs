@@ -3,21 +3,7 @@ use super::*;
 use rebook_publication::media_references::{self, MediaKind};
 
 fn source_text(text: &str) -> bool {
-    let text = text.trim_start().to_lowercase();
-    [
-        "source:",
-        "sources:",
-        "source：",
-        "credit:",
-        "credits:",
-        "credit：",
-        "来源:",
-        "来源：",
-        "图片来源:",
-        "图片来源：",
-    ]
-    .iter()
-    .any(|prefix| text.starts_with(prefix))
+    rebook_publication::media_notes::is_annotation(text)
 }
 
 pub(super) fn annotation_kind(text: &TextBlock) -> TextBlockKind {
@@ -423,7 +409,8 @@ mod tests {
 
     #[test]
     fn numbered_heading_beside_figure_image_is_a_caption_not_a_heading() {
-        let section = parse("<style>div.figure h6 {font-weight:normal; font-style:italic}</style><figure><div class='figure'><img src='chart.png'/><h6 id='caption'><span>Figure 2-1. </span>Binary search</h6></div></figure><h6 id='heading'>A real subsection</h6>");
+        let section = parse("<style>div.figure h6 {font-weight:normal; font-style:italic}</style><figure><div class='figure'><img src='chart.png'/><h6 id='caption'><span>Figure 2-1. </span>Binary search</h6></div></figure><h6 id='heading'>A real subsection</h6>",
+        );
         let Block::Figure(figure) = &section.blocks[0] else { panic!("figure"); };
         assert_eq!(figure.images.len(), 1);
         assert!(figure.body.is_empty());
@@ -437,9 +424,13 @@ mod tests {
 
     #[test]
     fn table_descendant_weight_override_keeps_headers_and_inline_emphasis() {
-        let section = parse("<style>figure {font-weight:bold} table p {font-weight:normal}</style><figure><figcaption>Figure 5.1 Example</figcaption><p>Explanation</p><table><tr><th><p>Header</p></th><td><p><em>x</em> + <strong>important</strong></p></td></tr></table></figure>");
+        let section = parse("<style>figure {font-weight:bold} table p {font-weight:normal}</style><figure><figcaption>Figure 5.1 Example</figcaption><p>Explanation</p><table><tr><th><p>Header</p></th><td><p><em>x</em> + <strong>important</strong></p></td></tr></table></figure>",
+        );
         let Block::Figure(figure) = &section.blocks[0] else { panic!(); };
-        let table = figure.body.iter().find_map(|b| if let Block::Table(t) = b {Some(t)} else {None}).unwrap();
+        let table = figure.body.iter().find_map(|b| {
+                if let Block::Table(t) = b {Some(t)} else {None
+                }
+            }).unwrap();
         assert!(table.rows[0].cells[0].header);
         assert!(table.rows[0].cells[0].text.content.iter().flat_map(Inline::text_runs).all(|r| !r.style.bold));
         let runs: Vec<_> = table.rows[0].cells[1].text.content.iter().flat_map(Inline::text_runs).collect();

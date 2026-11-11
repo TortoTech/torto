@@ -188,7 +188,9 @@ class ReadingIntegrationTest {
         assertEquals(true,focusDragDestination(8f,800f,-32f,32f))
         assertNull("Long paragraphs retain the existing confirmation distance",focusDragDestination(18f,0f,-200f,200f))
         assertEquals(true,focusDragDestination(36f,0f,-200f,200f))
-        assertNull("A real section edge keeps its deliberate gesture threshold",focusDragDestination(18f,0f,null,null))
+        assertEquals("A short unit edge keeps the same confirmation scale",true,focusDragDestination(18f,0f,null,null))
+        assertNull("Touch noise still cannot turn a section",focusDragDestination(6f,0f,null,null))
+        assertEquals(true,focusDragDestination(18f,0f,-32f,null))
         for(distance in listOf(4f,-4f,32f,-32f)){
             val curve=focusSettle(distance,0f)
             for(t in 0..40)assertTrue("Short settling cannot cross the chosen stop",abs(curve.getValueFromNanos(curve.durationNanos*t/40))<=abs(distance)+.01f)
@@ -327,9 +329,13 @@ class ReadingIntegrationTest {
                 event(3,200f,start+80)
                 assertEquals("Cancelling an edge drag keeps the current unit",1,turns.get())
                 event(0,280f,start+100);event(2,200f,start+140);event(1,200f,start+180)
-                assertEquals("Release commits exactly one separate unit turn",2,turns.get())
-                assertFalse("Replacing the unit settles the pending navigation",moving.get())
+                assertEquals("Release starts the outgoing animation before requesting the unit",1,turns.get())
                 assertEquals("Edge dragging never requests scroll/raster work",0,nativeScrolls.get())
+            }
+            val edgeDeadline=android.os.SystemClock.uptimeMillis()+2000
+            while(turns.get()!=2||moving.get()){
+                assertTrue("The unit turn completes after its outgoing animation",android.os.SystemClock.uptimeMillis()<edgeDeadline)
+                android.os.SystemClock.sleep(10)
             }
             val queuedTurns=java.util.concurrent.atomic.AtomicInteger()
             instrumentation.runOnMainSync {

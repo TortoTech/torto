@@ -303,6 +303,7 @@ impl DesktopReader {
         }
         self.error = None;
         if matches!(effects.progress, ProgressChange::Persist) {
+            if let Some(store)=&self.progress_store {store.wake().allow_progress(&self.book_id);}
             self.persist_progress();
         }
         if matches!(effects.prefetch, FollowUp::Run) {

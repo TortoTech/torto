@@ -312,7 +312,7 @@ fn bounds(unit: &interactions::FocusUnit) -> (f32, f32) {
     let rect=unit.navigation_bounds().expect("focus body geometry");
     (rect.y,rect.y+rect.height)
 }
-fn active(s: &ReaderState) -> usize {
+pub(crate) fn active(s: &ReaderState) -> usize {
     s.focus_anchor
         .as_ref()
         .and_then(|a| {
@@ -764,7 +764,7 @@ fn scroll(s: &mut ReaderState, delta: f32, follow_center: bool) -> Result<Arc<Mo
 #[uniffi::export]
 impl MobileReader {
     pub async fn scroll_by(self: Arc<Self>, delta: f32) -> Result<Arc<MobilePage>> {
-        work(move || self.with(|s| scroll(s, delta, true))).await
+        work(move || self.with(|s| {s.store.wake().allow_progress(&s.book_id);scroll(s, delta, true)})).await
     }
     pub async fn selection(self: Arc<Self>) -> Result<Option<SelectedText>> {
         work(move || self.with(|s| Ok(selected(s)))).await

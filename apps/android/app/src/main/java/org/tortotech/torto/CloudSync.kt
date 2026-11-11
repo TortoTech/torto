@@ -22,7 +22,6 @@ data class CloudStatus(val running:Boolean=false,val stage:String="",val complet
 internal object CloudRuntime {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutex = Mutex()
-    private val wake = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
     private val mutable = MutableStateFlow(CloudStatus())
     val state = mutable.asStateFlow()
     @Volatile var foreground = false; private set
@@ -40,8 +39,23 @@ internal object CloudRuntime {
         mutable.update { it.copy(running = false, revision = it.revision + 1) }
     }
     // Rust queued the library change in the same transaction as the import/remove.
-    fun libraryChanged() { mutable.update { it.copy(revision = it.revision + 1) }; wake.trySend(Unit) }
-    fun initialize(context: Context) { scope.launch { runCatching {
+    fun libraryChanged() { mutable.update { it.copy(revision = it.revision + 1) } }
+    private val networkRegistered = java.util.concurrent.atomic.AtomicBoolean()
+    private val disconnected = java.util.concurrent.atomic.AtomicBoolean(true)
+    fun initialize(context: Context) {
+        if (networkRegistered.compareAndSet(false, true)) {
+            val app = context.applicationContext
+            app.getSystemService(android.net.ConnectivityManager::class.java)
+                .registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
+                    override fun onLost(network: android.net.Network) { disconnected.set(true) }
+                    override fun onAvailable(network: android.net.Network) {
+                        if (disconnected.getAndSet(false)) scope.launch {
+                            runCatching { NativeRuntime.core(app).syncNetworkAvailable() }
+                        }
+                    }
+                })
+        }
+        scope.launch { runCatching {
         val last = context.getSharedPreferences("cloud-status", 0).getLong("success", 0)
         if (mutable.value.lastSuccess == 0L) mutable.value = mutable.value.copy(lastSuccess = last)
         schedule(context)
@@ -49,11 +63,11 @@ internal object CloudRuntime {
     suspend fun schedule(context: Context) {
         val options = NativeRuntime.core(context).cloudOptions()
         val manager = WorkManager.getInstance(context)
-        if (options.enabled && options.background) {
-            val work = PeriodicWorkRequestBuilder<CloudWorker>(15, TimeUnit.MINUTES)
-                .setInitialDelay(15, TimeUnit.MINUTES)
+        if (options.enabled) {
+            val work = PeriodicWorkRequestBuilder<CloudWorker>(20, TimeUnit.MINUTES)
+                .setInitialDelay(20, TimeUnit.MINUTES)
                 .setConstraints(networkConstraint()).build()
-            manager.enqueueUniquePeriodicWork(PERIODIC, ExistingPeriodicWorkPolicy.KEEP, work)
+            manager.enqueueUniquePeriodicWork(PERIODIC, ExistingPeriodicWorkPolicy.UPDATE, work)
         } else {
             manager.cancelUniqueWork(PERIODIC)
             manager.cancelUniqueWork(EXIT)
@@ -63,26 +77,31 @@ internal object CloudRuntime {
     fun foreground(context: Context, value: Boolean) {
         foreground = value
         timer?.cancel(); timer = null
-        if (!value) return
+        if (!value) {
+            runCatching { request?.cancel() }
+            scope.launch { NativeRuntime.core(context).syncBackground() }
+            return
+        }
         val manager = WorkManager.getInstance(context)
         manager.cancelUniqueWork(EXIT)
         manager.cancelUniqueWork(RETRY)
         timer = scope.launch {
+            NativeRuntime.core(context).syncForeground()
             val options = runCatching { NativeRuntime.core(context).cloudOptions() }.getOrNull()
                 ?: return@launch
-            if (!options.enabled || !options.foreground) return@launch
+            if (!options.enabled) return@launch
             while (isActive && foreground) {
                 val run = runCatching { perform(context, CloudSyncTrigger.AUTOMATIC, options = options) }.getOrNull()
                     ?: break
                 if (run.nextPollMs == 0uL) break
-                withTimeoutOrNull(run.nextPollMs.toLong().coerceAtLeast(1)) { wake.receive() }
+                NativeRuntime.core(context).waitForSyncChange(run.wakeRevision,run.nextPollMs)
             }
         }
     }
     suspend fun exit(context: Context) {
         if (foreground) return
         val options = NativeRuntime.core(context).cloudOptions()
-        if (!options.enabled || !options.background) return
+        if (!options.enabled) return
         val work = OneTimeWorkRequestBuilder<CloudWorker>().setInitialDelay(2, TimeUnit.SECONDS)
             .setInputData(workDataOf("flushReading" to true))
             .setConstraints(networkConstraint()).build()
@@ -117,9 +136,14 @@ internal object CloudRuntime {
         val token = generation.get()
         val core = NativeRuntime.core(context)
         val config = options ?: core.cloudOptions()
-        if (!config.enabled || worker != null && !config.background) return@withLock null
-        if (worker != null && foreground && config.foreground) return@withLock null
+        if (!config.enabled) return@withLock null
+        if (worker != null && foreground) return@withLock null
         val control = ChatRequest(); request = control; worker?.control = control
+        // Finish below WorkManager's execution limit; native journals the mode
+        // and retains validated per-book checkpoints when this budget expires.
+        val budget = if (worker != null) scope.launch {
+            delay(TimeUnit.MINUTES.toMillis(8)); control.cancel()
+        } else null
         if (worker?.isStopped == true) control.cancel()
         val changed = java.util.concurrent.atomic.AtomicBoolean()
         control.observeAi(object: AiProgressListener {
@@ -128,6 +152,7 @@ internal object CloudRuntime {
                 if (token != generation.get()) return
                 mutable.update { status -> when (stage) {
                     "library_changed" -> status.copy(running = true, revision = status.revision + 1, booksCompleted = completed, booksTotal = total, error = null, retryAt = 0)
+                    "reading_changed" -> status.copy(revision=status.revision+1)
                     "cover_changed" -> status.copy(revision = status.revision + 1, coverRevision = status.coverRevision + 1)
                     "books" -> status.copy(running = true, booksCompleted = completed, booksTotal = total, stage = "downloading", error = null, retryAt = 0)
                     "preparing" -> status.copy(running = true, stage = stage, booksCompleted = 0u, booksTotal = 0u, completed = 0u, total = 0u, error = null, retryAt = 0)
@@ -147,13 +172,14 @@ internal object CloudRuntime {
             } else {
                 mutable.update { it.copy(running = false, error = run.error ?: it.error, retryAt = run.retryAfterMs?.let { ms -> System.currentTimeMillis() + ms.toLong() } ?: 0) }
             }
-            if (!foreground && config.background) retry(context, run.retryAfterMs)
+            if (!foreground) retry(context, run.retryAfterMs)
             run
         } catch (e: Exception) {
-            if (token == generation.get()) mutable.value = mutable.value.copy(running = false, error = if (e is CancellationException) null else e.message?.take(500))
+            if (token == generation.get()) mutable.value = mutable.value.copy(running = false, error = if (e is CancellationException || e.message.orEmpty().contains("已停止处理")) null else e.message?.take(500))
             throw e
         } finally {
             if (changed.get()) mutable.update { it.copy(revision = it.revision + 1) }
+            budget?.cancel()
             request = null; worker?.control = null; control.close()
         }
     }
@@ -166,7 +192,7 @@ class CloudWorker(context: Context, parameters: WorkerParameters): CoroutineWork
         CloudRuntime.launchWorker(applicationContext, this) { error ->
             // Domain errors already carry a Rust-computed retry wake. Unexpected
             // platform/bridge failures do not invent a second backoff policy.
-            if (continuation.isActive) continuation.resume(if (error == null) Result.success() else Result.failure())
+            if (continuation.isActive) continuation.resume(if (error == null) Result.success() else Result.retry())
         }
     }
 }

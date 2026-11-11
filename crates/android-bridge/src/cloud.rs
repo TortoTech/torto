@@ -10,8 +10,6 @@ pub struct CloudOptions {
     pub url: String,
     pub username: String,
     pub device_name: String,
-    pub foreground: bool,
-    pub background: bool,
     pub password_saved: bool,
     pub account: String,
 }
@@ -23,8 +21,6 @@ impl Default for CloudOptions {
             url: String::new(),
             username: String::new(),
             device_name: "Torto Android".into(),
-            foreground: true,
-            background: true,
             password_saved: false,
             account: String::new(),
         }
@@ -139,7 +135,7 @@ impl MobileCore {
         request: Arc<chat::ChatRequest>,
     ) -> Result<CloudSyncRun> {
         work(move || {
-            let _guard = self.library_lock.lock().map_err(error)?;
+            let observed = self.sync_wake.snapshot().revision;
             if request.cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(error("已停止处理"));
             }
@@ -153,6 +149,7 @@ impl MobileCore {
             let now = Instant::now();
             let mut schedule = load_schedule(&self, &settings, now)?;
             let previous = schedule.clone();
+            schedule.observe_signal(&self.sync_wake.snapshot(), now);
             let store = services::store()?;
             let latest = store
                 .pending_reading(&account)
@@ -161,6 +158,11 @@ impl MobileCore {
                 .map(|(_, _, changed)| changed)
                 .max();
             schedule.observe_derived(sync::derived_change_token().map_err(error)?);
+            schedule.observe_annotations(
+                store.pending_annotation_time(&account).map_err(error)?,
+                now,
+                wall_ms(),
+            );
             let mode = match trigger {
                 CloudSyncTrigger::Manual => {
                     let mode = SyncMode::Full {
@@ -168,10 +170,10 @@ impl MobileCore {
                     };
                     schedule.start_requested(mode, now).then_some(mode)
                 }
-                CloudSyncTrigger::Automatic | CloudSyncTrigger::FlushReading => {
-                    if matches!(trigger, CloudSyncTrigger::FlushReading) {
-                        schedule.request(SyncMode::Reading);
-                    }
+                CloudSyncTrigger::FlushReading => schedule
+                    .start_requested(SyncMode::Reading, now)
+                    .then_some(SyncMode::Reading),
+                CloudSyncTrigger::Automatic => {
                     let mode = schedule.next(now, wall_ms(), latest);
                     if let Some(mode) = mode {
                         schedule.started(mode);
@@ -183,7 +185,9 @@ impl MobileCore {
                 if schedule != previous {
                     save_schedule(&self, &settings, &schedule)?;
                 }
-                return Ok(CloudSyncRun::waiting(&schedule, now));
+                let mut waiting = CloudSyncRun::waiting(&schedule, now);
+                waiting.wake_revision = observed;
+                return Ok(waiting);
             };
             // Journal the intent before IO. A killed worker must not lose the
             // selected mode or restart a full library scan in its place.
@@ -206,6 +210,7 @@ impl MobileCore {
             );
             save_schedule(&self, &settings, &schedule)?;
             let mut outcome = CloudSyncRun::waiting(&schedule, finished);
+            outcome.wake_revision = observed;
             match result {
                 Ok(report) => {
                     rebook_app_core::statistics::flush();
@@ -226,6 +231,115 @@ impl MobileCore {
     }
 }
 
+#[derive(uniffi::Record)]
+pub struct CloudResumeOffer {
+    pub token: String,
+}
+#[derive(Serialize, Deserialize)]
+struct ResumeToken {
+    account: String,
+    offer: sync::ResumeOffer,
+}
+#[uniffi::export]
+impl MobileReader {
+    pub async fn cloud_resume_offer(self: Arc<Self>) -> Result<Option<CloudResumeOffer>> {
+        work(move || {
+            self.with(|s| {
+                let index = scroll::active(s);
+                let baseline = sync_locator(s, index, s.focus);
+                let offer = s.store.resume_offer(&s.book_id, &baseline).map_err(error)?;
+                let settings = SyncSettings::load_default().map_err(error)?;
+                if !settings.enabled {
+                    return Ok(None);
+                }
+                offer
+                    .map(|offer| {
+                        serde_json::to_string(&ResumeToken {
+                            account: sync::account_key(&settings),
+                            offer,
+                        })
+                        .map(|token| CloudResumeOffer { token })
+                        .map_err(error)
+                    })
+                    .transpose()
+            })
+        })
+        .await
+    }
+    pub async fn resume_cloud_progress(
+        self: Arc<Self>,
+        token: String,
+    ) -> Result<Option<Arc<MobilePage>>> {
+        work(move || {
+            self.with(|s| {
+                let token: ResumeToken = serde_json::from_str(&token).map_err(error)?;
+                let settings = SyncSettings::load_default().map_err(error)?;
+                if !settings.enabled || token.account != sync::account_key(&settings) {
+                    return Ok(None);
+                }
+                let offer = token.offer;
+                let baseline = sync_locator(s, scroll::active(s), s.focus);
+                if offer.book_id != s.book_id
+                    || !s
+                        .store
+                        .resume_offer_current(&offer, &baseline)
+                        .map_err(error)?
+                {
+                    return Ok(None);
+                }
+                s.session
+                    .restore_locator(&offer.remote.locator)
+                    .map_err(error)?;
+                s.focus_anchor = offer.remote.locator.source;
+                s.scroll_center = true;
+                scroll::invalidate(s);
+                render(s).map(Some)
+            })
+        })
+        .await
+    }
+}
+
+struct WakeWait(tokio::task::AbortHandle);
+impl Drop for WakeWait {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+#[uniffi::export]
+impl MobileCore {
+    pub async fn wait_for_sync_change(
+        self: Arc<Self>,
+        revision: u64,
+        timeout_ms: u64,
+    ) -> Result<u64> {
+        let wake = self.sync_wake.clone();
+        let handle = runtime().spawn(async move {
+            let mut changes = wake.subscribe();
+            if changes.borrow().revision == revision {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms.clamp(1, 1_200_000)),
+                    changes.changed(),
+                )
+                .await;
+            }
+            let result = changes.borrow().revision;
+            result
+        });
+        let _abort = WakeWait(handle.abort_handle());
+        handle.await.map_err(error)
+    }
+    pub fn sync_background(&self) {
+        self.sync_wake.changed(sync::SyncChange::Flush);
+    }
+    pub fn sync_network_available(&self) {
+        self.sync_wake.changed(sync::SyncChange::Network);
+    }
+    pub fn sync_foreground(&self) {
+        self.sync_wake.active(self.sync_wake.snapshot().active);
+    }
+}
+
 #[derive(Clone, Copy, uniffi::Enum)]
 pub enum CloudSyncTrigger {
     Automatic,
@@ -239,6 +353,7 @@ pub struct CloudSyncRun {
     pub error: Option<String>,
     pub next_poll_ms: u64,
     pub retry_after_ms: Option<u64>,
+    pub wake_revision: u64,
 }
 impl CloudSyncRun {
     fn disabled() -> Self {
@@ -247,6 +362,7 @@ impl CloudSyncRun {
             error: None,
             next_poll_ms: 0,
             retry_after_ms: None,
+            wake_revision: 0,
         }
     }
     fn waiting(schedule: &SyncSchedule, now: Instant) -> Self {
@@ -254,6 +370,7 @@ impl CloudSyncRun {
             summary: None,
             error: None,
             next_poll_ms: schedule.poll_delay(now).as_millis() as u64,
+            wake_revision: 0,
             retry_after_ms: schedule
                 .retry_delay(now)
                 .map(|d| d.as_millis().max(1_000) as u64),
@@ -315,7 +432,8 @@ fn load_schedule(core: &MobileCore, settings: &SyncSettings, now: Instant) -> Re
         && saved.version == 1
         && saved.account == sync::account_key(settings)
     {
-        let schedule = SyncSchedule::restore(saved.snapshot, now, wall_ms());
+        let mut schedule = SyncSchedule::restore(saved.snapshot, now, wall_ms());
+        schedule.attach_signal(&core.sync_wake.snapshot());
         remember_schedule(core, settings, &schedule)?;
         return Ok(schedule);
     }
@@ -369,10 +487,17 @@ fn execute(
     request: &chat::ChatRequest,
 ) -> sync::SyncResult<sync::SyncReport> {
     let password = settings.load_password()?;
-    let mut library = LocalLibrary::load_from(core.root.join("library"))?;
-    let books = if matches!(mode, SyncMode::Reading | SyncMode::Statistics) {
+    let books = if matches!(
+        mode,
+        SyncMode::Reading | SyncMode::Current | SyncMode::Statistics
+    ) {
         Vec::new()
     } else {
+        let _guard = core
+            .library_lock
+            .lock()
+            .map_err(|_| "Library lock poisoned")?;
+        let library = LocalLibrary::load_from(core.root.join("library"))?;
         library
             .books()
             .iter()
@@ -414,23 +539,48 @@ fn execute(
                             "downloading"
                         }
                         sync::SyncStage::Statistics => "statistics",
+                        sync::SyncStage::DerivedUploading | sync::SyncStage::DerivedDownloading => {
+                            "derived"
+                        }
+                        sync::SyncStage::ReadingApplied => "reading_changed",
                         _ => "merging",
                     },
                     completed as usize,
                     total as usize,
                 ),
                 sync::SyncProgress::Downloaded {
-                    book, cache_path, books_completed, books_total, ..
-                } => match library.import_remote(*book) {
+                    book,
+                    cache_path,
+                    books_completed,
+                    books_total,
+                    ..
+                } => match (|| -> sync::SyncResult<_> {
+                    let _guard = core
+                        .library_lock
+                        .lock()
+                        .map_err(|_| "Library lock poisoned")?;
+                    LocalLibrary::load_from(core.root.join("library"))?.import_remote(*book)
+                })() {
                     Ok(_) => {
                         let _ = std::fs::remove_file(cache_path);
-                        request.report("library_changed", books_completed as usize, books_total as usize);
+                        request.report(
+                            "library_changed",
+                            books_completed as usize,
+                            books_total as usize,
+                        );
                     }
                     Err(e) => import_error = Some(e),
                 },
                 sync::SyncProgress::CoverDownloaded { book_id, bytes } => {
-                    match library.update_missing_covers(&[(book_id.clone(), bytes)])
-                        .and_then(|()| sync::acknowledge_downloaded_cover(settings, &book_id)) {
+                    match (|| -> sync::SyncResult<_> {
+                        let _guard = core
+                            .library_lock
+                            .lock()
+                            .map_err(|_| "Library lock poisoned")?;
+                        LocalLibrary::load_from(core.root.join("library"))?
+                            .update_missing_covers(&[(book_id.clone(), bytes)])?;
+                        sync::acknowledge_downloaded_cover(settings, &book_id)
+                    })() {
                         Ok(()) => request.report("cover_changed", 0, 0),
                         Err(e) => import_error = Some(e),
                     }

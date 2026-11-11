@@ -22,6 +22,11 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.tortotech.torto.core.*
 import org.tortotech.torto.core.Annotation
+import kotlin.math.roundToInt
+
+internal val readingFontSizeRange=16f..40f
+internal const val readingFontSizeSteps=11
+internal fun readingFontSize(value:Float)=((if(value.isFinite())value else 20f).coerceIn(readingFontSizeRange)/2f).roundToInt()*2f
 
 data class ReaderInteraction(val kind:String,val text:String,val target:String,val frame:ReaderFrame?=null,val markup:String="",val marker:String="",val indicator:Rect?=null,val revision:ULong=0u)
 data class ReaderFrame(val bitmap: Bitmap, val info: PageInfo, val rasterId: ULong = 0uL)
@@ -29,7 +34,9 @@ data class DocumentFrame(val id:String,val index:UInt,val total:UInt,val frame:R
 data class ReadingCompletion(val statistics:BookStatistics,val finishedBooks:UInt)
 data class ScreenState(
     val books: List<BookSummary> = emptyList(), val loaded: Boolean = false, val active: BookSummary? = null,
-    val frame: ReaderFrame? = null, val turnCompletion:Long=0, val toc: List<TocItem> = emptyList(),
+    val bookLanguages:List<String> = emptyList(),
+    val cloudResume:CloudResumeOffer?=null,
+    val frame: ReaderFrame? = null, val openingBook:Boolean=false, val readerContentLoading:Boolean=false, val turnCompletion:Long=0, val toc: List<TocItem> = emptyList(),
     val previousPage:ReaderFrame?=null,val nextPage:ReaderFrame?=null,
     val completionPage:Boolean=false,val completion:ReadingCompletion?=null,val completionLoading:Boolean=false,val completionError:String?=null,
     val hits: List<SearchHit> = emptyList(), val selected: SelectedText? = null,
@@ -37,7 +44,7 @@ data class ScreenState(
     val services: ServiceSettings? = null,
     val cloud:CloudOptions?=null,val cloudPresets:List<CloudPreset> = emptyList(),val cloudStatus:CloudStatus=CloudStatus(),
     val statsPeriod:StatisticsPeriod?=null,val statsKind:String="week",val statsOffset:Int=0,val statsLoading:Boolean=false,val bookStatistics:BookStatistics?=null,val statsBookId:String?=null,
-    val appVersion:String="",val updateSource:String="automatic",val checkingUpdate:Boolean=false,val appUpdate:AppUpdate?=null,val updateChecked:Boolean=false,val downloadingUpdate:Boolean=false,val updateProgress:UInt=0u,val updateError:String?=null,val downloadedUpdate:String?=null,val diagnosticFile:String?=null,
+    val appVersion:String="",val checkingUpdate:Boolean=false,val appUpdate:AppUpdate?=null,val updateChecked:Boolean=false,val downloadingUpdate:Boolean=false,val updateProgress:UInt=0u,val updateError:String?=null,val downloadedUpdate:String?=null,val diagnosticFile:String?=null,
     val monoTypeface:android.graphics.Typeface=android.graphics.Typeface.MONOSPACE,
     val reading:ReadingOptions?=null,val fontFamilies:FontFamilies?=null,val aiOptions:AiOptions?=null,
     val fontsDownloading:Boolean=false,val fontsReady:Boolean=false,val fontsError:String?=null,val fontApplyAvailable:Boolean=false,
@@ -50,7 +57,7 @@ data class ScreenState(
     val chatDraft:String="",val draftImages:List<ChatAttachment> = emptyList(),val sendingImages:List<ChatAttachment> = emptyList(),
     val chatContent: String = "", val chatReasoning: String = "", val chatActivity: String = "", val chatQuestion: String = "",
     val changes: List<ChatChange> = emptyList(), val translated: Boolean = false,
-    val selectionMode: String = "word",
+    val selectionMode: String = "free",
     val interaction:ReaderInteraction?=null,val focus:Boolean=false,val focusAvailable:Boolean=false,val chromeVisible:Boolean=true,val readerMoving:Boolean=false,val quietUpdate:Boolean=false,
     val processing:Boolean=false,val enhancing:Boolean=false,val autoLayout:Boolean=false,
     val appTheme: String = "system", val language: String = "system",
@@ -70,9 +77,12 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     private var searchGeneration=0L
     private var statsGeneration=0L
     private var updateGeneration=0L
+    private var updateCheckStarted=false
     private var updateRequest:ChatRequest?=null
     private var reader: MobileReader? = null
     private var readerBook: String? = null
+    // A book that cannot focus (for example a native PDF) must not replace the preference.
+    private var preferredFocus=false
     private var documentGeneration=0L
     private var documentId:String?=null
     @Volatile private var generation = 0L
@@ -132,21 +142,31 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             runCatching { core.books() }.onSuccess { books ->
                 missingCovers.evictAll()
                 mutable.update { it.copy(books = books) }
+                checkCloudResume()
             }
         } }
         runOperation {
-        val preferences=withContext(Dispatchers.IO) { application.getSharedPreferences("reading",0).let { Triple(it.getFloat("size",20f),it.getBoolean("unified",false),it.getBoolean("dark",false)) } }
+        val preferences=withContext(Dispatchers.IO) { application.getSharedPreferences("reading",0).let {
+            val savedSize=it.getFloat("size",20f);val size=readingFontSize(savedSize)
+            if(savedSize!=size)check(it.edit().putFloat("size",size).commit())
+            Triple(size,it.getBoolean("unified",false),it.getBoolean("dark",false))
+        } }
         val system=withContext(Dispatchers.IO) { application.getSharedPreferences("interface",0).let { it.getString("theme","system")!! to it.getString("language","system")!! } }
         mutable.update { it.copy(appTheme=system.first,language=system.second) }
         val automatic=withContext(Dispatchers.IO){application.getSharedPreferences("reading",0).let {it.getBoolean("autoLayout",false) to it.getBoolean("focus",false)}}
+        preferredFocus=automatic.second
         mutable.update {it.copy(autoLayout=automatic.first,focus=automatic.second)}
-        val maintenance=withContext(Dispatchers.IO){application.packageManager.getPackageInfo(application.packageName,0).versionName.orEmpty() to application.getSharedPreferences("interface",0).getString("updateSource","automatic").orEmpty()}
-        val cloud=core.cloudOptions();mutable.update {it.copy(cloud=cloud,appVersion=maintenance.first,updateSource=maintenance.second)}
+        val version=withContext(Dispatchers.IO){
+            application.getSharedPreferences("interface",0).edit().remove("updateSource").apply()
+            application.packageManager.getPackageInfo(application.packageName,0).versionName.orEmpty()
+        }
+        val cloud=core.cloudOptions();mutable.update {it.copy(cloud=cloud,appVersion=version)}
         val reading=core.readingOptions();var ai=core.aiOptions()
+        val selection=withContext(Dispatchers.IO){application.getSharedPreferences("reading",0).getString("selection","free").orEmpty().takeIf {it in listOf("free","word","sentence","paragraph")}?:"free"}
         val migrated=withContext(Dispatchers.IO){application.getSharedPreferences("reading",0).getBoolean("aiSettingsMigrated",false)}
         if(!migrated){ai=core.saveAiOptions(ai.copy(layoutEnabled=automatic.first&&ai.layoutEnabled));withContext(Dispatchers.IO){application.getSharedPreferences("reading",0).edit().putBoolean("aiSettingsMigrated",true).commit()}}
         updateMonospace(reading.monospaceFont)
-        mutable.update {it.copy(reading=reading,aiOptions=ai,autoLayout=ai.layoutEnabled,translated=reading.translated)}
+        mutable.update {it.copy(reading=reading,aiOptions=ai,autoLayout=ai.layoutEnabled,translated=reading.translated,selectionMode=selection)}
         val books = core.books(); val services = runCatching { core.serviceSettings() }.getOrNull(); mutable.update { it.copy(books = books,services=services,loaded=true,fontSize=preferences.first,unified=preferences.second,dark=preferences.third) }
     } }
 
@@ -169,7 +189,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         if(expected!=null&&it.notice!=expected||fontUntil!=null&&it.fontNoticeUntil!=fontUntil)it else it.copy(notice=null)
     }}
     private suspend fun reloadSettings(){
-        val providers=core.providers();val kinds=core.providerKinds();val ai=core.aiOptions();val reading=core.readingOptions();val services=core.serviceSettings();val cloud=core.cloudOptions();val presets=core.cloudPresets()
+        val providers=core.providers();val kinds=core.providerKinds();val ai=core.aiOptions();val reading=core.readingOptions().copy(translated=state.value.translated);val services=core.serviceSettings();val cloud=core.cloudOptions();val presets=core.cloudPresets()
         mutable.update {it.copy(providers=providers,providerKinds=kinds,cloud=cloud,cloudPresets=presets,aiOptions=ai,reading=reading,autoLayout=ai.layoutEnabled,services=services)}
     }
     fun loadServices() = runOperation {reloadSettings()}
@@ -242,10 +262,13 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             catch(e:Exception){if(token==statsGeneration)mutable.update {it.copy(error=e.message)}}
             finally{if(token==statsGeneration)mutable.update {it.copy(statsLoading=false)}}}
     }
-    fun updateSource(source:String){updateRequest?.cancel();updateGeneration++;mutable.update {it.copy(updateSource=source,appUpdate=null,updateChecked=false,downloadedUpdate=null,updateError=null)};viewModelScope.launch(Dispatchers.IO){getApplication<Application>().getSharedPreferences("interface",0).edit().putString("updateSource",source).apply()}}
+    fun checkUpdatesIfNeeded(){if(!updateCheckStarted)checkUpdates()}
     fun checkUpdates(){
+        if(!state.value.loaded||state.value.appVersion.isBlank()||state.value.checkingUpdate||state.value.downloadingUpdate||state.value.downloadedUpdate!=null)return
+        updateCheckStarted=true
         val token=++updateGeneration;val snapshot=state.value;mutable.update {it.copy(checkingUpdate=true,updateChecked=false,updateError=null,appUpdate=null,downloadedUpdate=null)}
-        viewModelScope.launch {try{val update=core.checkUpdate(snapshot.appVersion,android.os.Build.SUPPORTED_ABIS.first(),snapshot.updateSource);if(token==updateGeneration)mutable.update {it.copy(appUpdate=update,updateChecked=true)}}
+        viewModelScope.launch {try{val update=UpdateChecks.load(core,snapshot.appVersion,android.os.Build.SUPPORTED_ABIS.first(),"automatic");if(token==updateGeneration)mutable.update {it.copy(appUpdate=update,updateChecked=true)}}
+            catch(e:CancellationException){throw e}
             catch(e:Exception){if(token==updateGeneration)mutable.update {it.copy(updateError=e.message)}}
             finally{if(token==updateGeneration)mutable.update {it.copy(checkingUpdate=false)}}}
     }
@@ -281,8 +304,12 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         cancelAi()
         val token=generation
         runOperation(quietUpdate=true) {
-            val options=core.readingOptions().copy(translated=enabled);core.saveReadingOptions(options)
-            if(token==generation){mutable.update {it.copy(reading=options,translated=enabled,aiError=null)};reader?.selectionMode(if(enabled)"paragraph" else state.value.selectionMode)}
+            val options=core.readingOptions().copy(translated=enabled)
+            if(token==generation){
+                reader?.setTranslationEnabled(enabled)
+                mutable.update {it.copy(reading=options,translated=enabled,aiError=null)}
+                reader?.selectionMode(if(enabled)"paragraph" else state.value.selectionMode)
+            }
         }
     }
     fun recognize(){cancelAi();manualLayout=true;reader?.retryAi();mutable.update {it.copy(aiError=null)};processVisible()}
@@ -368,12 +395,30 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         try { val books = core.importBook(imported.absolutePath); mutable.update { it.copy(books = books) };CloudRuntime.libraryChanged() }
         finally { withContext(Dispatchers.IO) { imported.delete() } }
     }
+    private suspend fun checkCloudResume(){
+        val session=reader ?: return;val token=generation
+        operations.withLock {
+            if(token!=generation||reader!==session)return@withLock
+            runCatching {session.cloudResumeOffer()}.getOrNull()?.let {offer->
+                if(token==generation&&reader===session&&state.value.cloudResume?.token!=offer.token)
+                    mutable.update {it.copy(cloudResume=offer,notice="发现其他设备进度")}
+            }
+        }
+    }
+    fun resumeCloudProgress(){
+        val offer=state.value.cloudResume ?: return;val token=generation
+        runOperation(quietUpdate=true){
+            if(token!=generation)return@runOperation
+            reader?.resumeCloudProgress(offer.token)?.let {publish(it,token)}
+            if(token==generation)mutable.update {it.copy(cloudResume=null,notice=null)}
+        }
+    }
     fun open(book: BookSummary) {
         completionJob?.cancel();completionJob=null
         clearTurnPreviews()
         cancelChat();cancelAi();aiVersion=0uL;manualLayout=false;scrollPending=0f;selectionPending=null;selectionHandle=false
         generation++
-        mutable.update { it.copy(active = book, frame = null, fontApplyAvailable=false, focusAvailable=false, focus=false, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=false,processing=false, hits = emptyList(), selected = null, messages=emptyList(),changes=emptyList(),annotations=emptyList(),translated=state.value.reading?.translated?:false,aiError=null,chatWorking=false,chatQuestion="",chatContent="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList()) }
+        mutable.update { it.copy(active = book, cloudResume=null, bookLanguages=emptyList(), frame = null, openingBook=true, readerContentLoading=false, error=null, fontApplyAvailable=false, focusAvailable=false, focus=preferredFocus, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=false,processing=false, hits = emptyList(), selected = null, messages=emptyList(),changes=emptyList(),annotations=emptyList(),translated=false,reading=it.reading?.copy(translated=false),aiError=null,chatWorking=false,chatQuestion="",chatContent="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList()) }
         viewport = null
     }
     fun measure(width: Int, height: Int, density: Float) {
@@ -401,20 +446,23 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
                             if (token != generation) { opened.shutdown(); opened.close(); return@withContext }
                             reader = opened; readerBook = book.id
                             val focusAvailable=opened.focusModeAvailable()
-                            val focus=focusAvailable&&withContext(Dispatchers.IO){getApplication<Application>().getSharedPreferences("reading",0).getBoolean("focus",false)}
+                            val focus=focusAvailable&&preferredFocus
                             opened.focusMode(focus).close()
                             if(token!=generation){opened.shutdown();opened.close();if(reader===opened){reader=null;readerBook=null};return@withContext}
                             val downloadedDuringOpen=ReadingFonts.state.value.let {it.revision!=fontRevision&&it.downloaded>0u}
                             mutable.update {it.copy(focusAvailable=focusAvailable,focus=focus,fontApplyAvailable=downloadedDuringOpen)}
                             opened.selectionMode(state.value.selectionMode)
                             val toc = opened.toc()
-                            mutable.update { it.copy(toc = toc) }
-                            publish(opened.configure(state.value.fontSize,state.value.unified,state.value.dark), token)
+                            val languages=opened.bookLanguages()
+                            if(token!=generation)return@withContext
+                            mutable.update { it.copy(toc = toc,bookLanguages=languages) }
+                            publish(opened.configure(state.value.fontSize,state.value.unified,state.value.dark), token,next)
                             prepareReferences(opened,token)
-                        } else publish(current.resize(next), token)
+                            viewModelScope.launch {checkCloudResume()}
+                        } else publish(current.resize(next), token,next)
                     }
-                } catch (e: Exception) { mutable.update { it.copy(error = e.message) } }
-                finally { mutable.update { it.copy(busy = false) } }
+                } catch (e: Exception) { if(token==generation)mutable.update { it.copy(error = e.message) } }
+                finally { mutable.update { it.copy(busy = false,openingBook=if(token==generation&&(it.frame!=null||it.error!=null))false else it.openingBook) } }
             }
         }
     }
@@ -430,9 +478,11 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             ReaderFrame(bitmap,page.info(),rasterId)
         }
     }
-    private suspend fun publish(page: MobilePage, token: Long = generation) {
+    private suspend fun publish(page: MobilePage, token: Long = generation,expectedViewport:Viewport?=null) {
         val frame=nativeFrame(page)
-        if(token==generation){
+        // Insets or orientation may finish changing while native rendering is in flight.
+        // Keep opening feedback until the queued resize supplies the matching frame.
+        if(token==generation&&(expectedViewport==null||expectedViewport==viewport)){
             val old=state.value.frame
             val sameUnit=old?.info?.isScroll==true&&frame.info.isScroll&&old.info.scrollContext==frame.info.scrollContext
             if(!sameUnit)clearTurnPreviews()
@@ -486,7 +536,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     }
     private fun prepareReferences(session:MobileReader,token:Long){viewModelScope.launch {
         runCatching {if(session.prepareMediaReferences()){
-            state.map { !it.readerMoving&&it.interaction==null }.first {it}
+            state.first {token!=generation||it.frame!=null&&!it.openingBook&&!it.readerMoving&&it.interaction==null}
             operations.withLock {withContext(NonCancellable){if(token==generation&&reader===session)publish(session.refreshMediaReferences(),token)}}
         }}
     }}
@@ -538,6 +588,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         val token=generation
         readerOperation { session->session.focusMode(enabled).also {
             withContext(Dispatchers.IO){check(getApplication<Application>().getSharedPreferences("reading",0).edit().putBoolean("focus",enabled).commit())}
+            preferredFocus=enabled
             if(token==generation)mutable.update {it.copy(focus=enabled)}
         } }
     }
@@ -584,6 +635,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             }
         } }
     }
+    fun readerContentLoading(active:Boolean){mutable.update {it.copy(readerContentLoading=active&&it.active!=null)}}
     fun readerMotion(active: Boolean) {
         if(active)cancelAi()
         mutable.update { it.copy(readerMoving=active) }
@@ -653,12 +705,13 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     fun navigate(href: String) = readerOperation(hideControls=true) { it.navigate(href) }
     fun configure(size: Float, unified: Boolean, dark: Boolean) {
         cancelAi()
+        val fontSize=readingFontSize(size)
         val token=generation
         runOperation {
             if(token!=generation) return@runOperation
-            reader?.let { publish(it.configure(size,unified,dark),token) }
-            withContext(Dispatchers.IO) { check(getApplication<Application>().getSharedPreferences("reading",0).edit().putFloat("size",size).putBoolean("unified",unified).putBoolean("dark",dark).commit()) }
-            mutable.update { it.copy(fontSize=size,unified=unified,dark=dark) }
+            reader?.let { publish(it.configure(fontSize,unified,dark),token) }
+            withContext(Dispatchers.IO) { check(getApplication<Application>().getSharedPreferences("reading",0).edit().putFloat("size",fontSize).putBoolean("unified",unified).putBoolean("dark",dark).commit()) }
+            mutable.update { it.copy(fontSize=fontSize,unified=unified,dark=dark) }
         }
     }
     fun search(query: String) {
@@ -690,7 +743,10 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     fun selectionMode(mode: String) {
         if(state.value.translated)return
         val token=generation
-        runOperation { if(token==generation) { reader?.selectionMode(mode);if(token==generation)mutable.update { it.copy(selectionMode=mode) } } }
+        runOperation { if(token==generation) { reader?.selectionMode(mode);if(token==generation){
+            withContext(Dispatchers.IO){getApplication<Application>().getSharedPreferences("reading",0).edit().putString("selection",mode).apply()}
+            mutable.update { it.copy(selectionMode=mode) }
+        } } }
     }
     fun clearSelection() {
         selectionPending=null;selectionHandle=false
@@ -704,7 +760,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         cancelChat();cancelAi();aiVersion=0uL;manualLayout=false;scrollPending=0f;selectionPending=null;selectionHandle=false
         generation++
         resizeJob?.cancel(); viewport = null
-        mutable.update { it.copy(active = null, frame = null, fontApplyAvailable=false, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=true,processing=false, selected = null, toc = emptyList(),chatWorking=false,chatQuestion="",chatContent="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList()) }
+        mutable.update { it.copy(active = null, cloudResume=null, bookLanguages=emptyList(), frame = null, openingBook=false, readerContentLoading=false, fontApplyAvailable=false, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=true,processing=false, selected = null, toc = emptyList(),chatWorking=false,chatQuestion="",chatContent="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList()) }
         runOperation { reader?.shutdown(); reader?.close(); reader = null; readerBook = null; val books=core.books(); mutable.update { it.copy(books=books) } }
     }
     fun interfaceSettings(theme: String, language: String) = runOperation {

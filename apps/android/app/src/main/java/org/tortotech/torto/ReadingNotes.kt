@@ -110,7 +110,7 @@ private fun LazyListScope.noteEntries(notes:List<Annotation>,jump:(Annotation)->
             val content=buildAnnotatedString {appendInlineContent("marker", "\uFFFC");append(annotation ?: note.quote)}
             val inline=mapOf("marker" to InlineTextContent(Placeholder(1.55.em,1.25.em,PlaceholderVerticalAlign.TextCenter)){
                 Box(Modifier.fillMaxSize(),contentAlignment=Alignment.CenterStart){
-                    AppIcon(if(annotation==null)"highlight"else"note",size=16.667.dp,tint=MaterialTheme.colorScheme.onSurfaceVariant)
+                    AppIcon(if(annotation==null)"highlight"else"note",size=IconSizes.Small,tint=defaultIconColor())
                 }
             })
             Text(content,modifier=Modifier.clearAndSetSemantics {text=AnnotatedString(annotation ?: note.quote)},fontSize=16.sp,maxLines=if(annotation==null)4 else Int.MAX_VALUE,overflow=TextOverflow.Ellipsis,inlineContent=inline)

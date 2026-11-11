@@ -446,6 +446,7 @@ impl MobileReader {
                                     .with_markup(rich_note(s, &target, &marker)));
                             }
                         }
+                        s.store.wake().allow_progress(&s.book_id);
                         let page = follow(s, &target)?;
                         return Ok(TouchAction {
                             kind: "page".into(),
@@ -482,6 +483,7 @@ impl MobileReader {
                     if s.focus_anchor.as_ref().is_some_and(|anchor|s.focus_units[index].ranges.iter().any(|range|range==anchor)) {
                         return Ok(TouchAction::new("none",String::new(),String::new()));
                     }
+                    s.store.wake().allow_progress(&s.book_id);
                     s.scroll_center = true;
                     s.focus_anchor = s.focus_units[index].ranges.first().cloned();
                     let page = render(s)?;
@@ -535,13 +537,14 @@ impl MobileReader {
         .await
     }
     pub async fn follow_link(self: Arc<Self>, target: String) -> Result<Arc<MobilePage>> {
-        work(move || self.with(|s| follow(s, &PublicationUrl::parse(&target).map_err(error)?)))
+        work(move || self.with(|s| {s.store.wake().allow_progress(&s.book_id);follow(s, &PublicationUrl::parse(&target).map_err(error)?) }))
             .await
     }
     pub async fn go_back(self: Arc<Self>) -> Result<Arc<MobilePage>> {
         work(move || {
             self.with(|s| {
                 if let Some(locator) = s.history.last().cloned() {
+                    s.store.wake().allow_progress(&s.book_id);
                     s.scroll_center = true;
                     scroll::invalidate(s);
                     s.session.restore_locator(&locator).map_err(error)?;

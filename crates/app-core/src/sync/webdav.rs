@@ -28,6 +28,7 @@ const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
 // Keep a bounded set of gates alive between jobs, so starting a new client
 // cannot reset an account's spacing or in-process quota deadline.
 struct RequestGate {
+    control: Arc<tokio::sync::watch::Sender<usize>>,
     next: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
     cooldown: Arc<AtomicU64>,
     interval: Arc<AtomicU64>,
@@ -44,6 +45,7 @@ fn account_gate(key: String) -> Arc<RequestGate> {
         gates.remove(index).unwrap().1
     } else {
         Arc::new(RequestGate {
+            control: Arc::new(tokio::sync::watch::channel(0).0),
             next: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
             cooldown: Arc::new(AtomicU64::new(0)),
             interval: Arc::new(AtomicU64::new(rate_limit::INITIAL_INTERVAL_MS)),
@@ -71,12 +73,20 @@ pub struct WebDavClient {
     password: String,
     pub(super) device_id: String,
     cstcloud_compatibility: bool,
-    cache: Option<(SyncStore, String)>,
+    pub(super) cache: Option<(SyncStore, String)>,
     next_request: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
     cooldown_until: Arc<AtomicU64>,
     cooldown_loaded: Arc<tokio::sync::OnceCell<()>>,
     request_interval_ms: Arc<AtomicU64>,
     listings: Arc<std::sync::Mutex<super::listing::ListingCache>>,
+    control: Arc<tokio::sync::watch::Sender<usize>>,
+}
+
+pub(super) struct ControlGuard(Arc<tokio::sync::watch::Sender<usize>>);
+impl Drop for ControlGuard {
+    fn drop(&mut self) {
+        self.0.send_modify(|depth| *depth = depth.saturating_sub(1));
+    }
 }
 
 impl WebDavClient {
@@ -125,6 +135,7 @@ impl WebDavClient {
             }))
             .build()?;
         Ok(Self {
+            control: Arc::new(tokio::sync::watch::channel(0).0),
             client,
             download_client,
             root,
@@ -145,11 +156,30 @@ impl WebDavClient {
 
     pub fn with_store(mut self, store: SyncStore, account: String) -> Self {
         let gate = account_gate(format!("{account}\n{}", self.root));
+        self.control = gate.control.clone();
         self.next_request = gate.next.clone();
         self.cooldown_until = gate.cooldown.clone();
         self.request_interval_ms = gate.interval.clone();
         self.cache = Some((store, account));
         self
+    }
+
+    // A small urgent exchange can interrupt a file transfer, but never an
+    // in-flight snapshot/index write: that would let an older write win later.
+    pub(super) fn control_transaction(&self) -> ControlGuard {
+        self.control.send_modify(|depth| *depth += 1);
+        ControlGuard(self.control.clone())
+    }
+    pub(super) fn control_busy(&self) -> bool {
+        *self.control.borrow() > 0
+    }
+    pub(super) async fn wait_for_control(&self) {
+        let mut changes = self.control.subscribe();
+        while *changes.borrow_and_update() > 0 {
+            if changes.changed().await.is_err() {
+                break;
+            }
+        }
     }
 
     async fn send(&self, request: reqwest::RequestBuilder) -> SyncResult<reqwest::Response> {

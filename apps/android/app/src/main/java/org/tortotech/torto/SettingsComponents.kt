@@ -26,7 +26,8 @@ import androidx.compose.ui.unit.sp
     BoxWithConstraints(Modifier.fillMaxWidth()){
     val valueWidth=(maxWidth-32.dp)*.52f
     Row(Modifier.fillMaxWidth().heightIn(min=56.dp).clickable(enabled=enabled,onClick=onClick).padding(horizontal=16.dp,vertical=16.dp),verticalAlignment=Alignment.CenterVertically){
-        if(icon!=null){AppIcon(icon,size=18.dp,tint=secondary);Spacer(Modifier.width(12.dp))}
+        val iconInk=defaultIconColor().copy(alpha=if(enabled)1f else .38f)
+        if(icon!=null){AppIcon(icon,size=IconSizes.Compact,tint=iconInk);Spacer(Modifier.width(12.dp))}
         Column(Modifier.weight(1f)){
             Text(title,fontSize=16.sp,color=ink)
             if(description!=null){Spacer(Modifier.height(4.dp));Text(description,fontSize=14.sp,color=secondary)}
@@ -36,8 +37,8 @@ import androidx.compose.ui.unit.sp
             Text(value,fontSize=14.sp,color=secondary,maxLines=2,overflow=TextOverflow.Ellipsis,modifier=Modifier.widthIn(max=valueWidth),textAlign=androidx.compose.ui.text.style.TextAlign.End)
         }
         Spacer(Modifier.width(4.dp))
-        // AppIcon scales its requested size by 1.2; this is an actual 18dp glyph.
-        AppIcon("next",size=15.dp,tint=secondary)
+        // Disclosure arrows use their actual rendered size.
+        AppIcon("next",size=IconSizes.Chevron,tint=iconInk)
     }
     }
 }

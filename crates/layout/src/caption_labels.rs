@@ -94,6 +94,22 @@ pub(super) fn table_label_only(text: &str) -> bool {
     })
 }
 
+pub(super) fn standalone_label(content: &[Inline]) -> bool {
+    if has_hard_break(content) || content.iter().any(|i| !matches!(i, Inline::Text(_))) {
+        return false;
+    }
+    let text: String = content
+        .iter()
+        .flat_map(Inline::text_runs)
+        .map(|r| r.text.as_str())
+        .collect();
+    label(&text).is_some_and(|(_, end)| {
+        text[end..]
+            .chars()
+            .all(|c| c.is_whitespace() || ".:：．。–—-".contains(c))
+    })
+}
+
 pub(super) fn normalize(content: &mut Vec<Inline>) {
     // Stop at media: only an authored textual prefix can be a caption label.
     let leading = content

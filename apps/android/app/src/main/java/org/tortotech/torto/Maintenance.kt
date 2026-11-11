@@ -9,6 +9,10 @@ import androidx.core.content.FileProvider
 import java.io.File
 import kotlinx.coroutines.*
 
+internal object UpdateChecks {
+    var load:suspend (org.tortotech.torto.core.MobileCore,String,String,String)->org.tortotech.torto.core.AppUpdate?={core,version,abi,source->core.checkUpdate(version,abi,source)}
+}
+
 internal object DiagnosticLog {
     private val scope=CoroutineScope(SupervisorJob()+Dispatchers.IO)
     private val lock=Any()

@@ -439,6 +439,25 @@ class ReadingNavigationTest {
             await("long operations still disable conflicting controls"){!button("Reading assistant").isEnabled}
             instrumentation.runOnMainSync {screen.value=screen.value.copy(busy=false,processing=false,enhancing=false)}
             await("controls restore after work"){button("Reading assistant").isEnabled}
+            val systemLanguage=instrumentation.targetContext.resources.configuration.locales[0].toLanguageTag()
+            instrumentation.runOnMainSync {screen.value=screen.value.copy(bookLanguages=listOf(systemLanguage))}
+            await("same-language books hide translation"){label("Turn translation on")==null}
+            assertNotNull(label("Reading assistant"));assertNotNull(label("Split current paragraph"))
+            instrumentation.runOnMainSync {screen.value=screen.value.copy(translated=true)}
+            await("active translation stays reachable"){label("Turn translation off")!=null}
+            android.os.SystemClock.sleep(250)
+            val activeTranslation=bounds("Turn translation off")
+            val activeBitmap=instrumentation.uiAutomation.takeScreenshot()!!
+            var greenPixels=0
+            for(y in activeTranslation.top until activeTranslation.bottom)for(x in activeTranslation.left until activeTranslation.right){
+                val pixel=activeBitmap.getPixel(x,y)
+                if(android.graphics.Color.green(pixel)>100&&android.graphics.Color.green(pixel)>android.graphics.Color.red(pixel)*1.5&&android.graphics.Color.green(pixel)>android.graphics.Color.blue(pixel)*1.2)greenPixels++
+            }
+            activeBitmap.recycle()
+            assertTrue("Enabled translation visibly highlights the icon",greenPixels>25)
+            screenshot("reading-floating-actions-active.png")
+            instrumentation.runOnMainSync {screen.value=screen.value.copy(translated=false,bookLanguages=listOf(if(systemLanguage.startsWith("zh"))"en"else"zh-CN"))}
+            await("foreign-language books retain translation"){label("Turn translation on")!=null}
         }finally {instrumentation.runOnMainSync {activity?.finish()};instrumentation.removeMonitor(monitor)}
     }
 
@@ -544,7 +563,10 @@ class ReadingNavigationTest {
             instrumentation.runOnMainSync {model!!.hideChrome();model!!.focus(originalFocus)}
             await("original reading mode restores"){model!!.state.value.focus==originalFocus&&!model!!.state.value.busy}
             instrumentation.runOnMainSync {model!!.toggleChrome()}
-            await("floating translation control is visible"){label("开启翻译","Turn translation on")!=null}
+            await("floating controls are visible"){label("阅读助手","Reading assistant")!=null}
+            assertEquals(listOf("en"),model!!.state.value.bookLanguages)
+            val systemLanguage=instrumentation.targetContext.resources.configuration.locales[0]
+            assertEquals("Translation follows the original book language",systemLanguage.language!="en",label("开启翻译","Turn translation on")!=null)
             assertNull("Reading progress labels were removed",node {it.text?.toString()?.let {s->s.contains('%')&&s.contains('/')}==true})
             instrumentation.runOnMainSync {model!!.toggleChrome()}
             await("controls hide together"){label("目录与搜索","Contents and search")==null&&label("开启翻译","Turn translation on")==null}
@@ -573,10 +595,19 @@ class ReadingNavigationTest {
                 val up=android.view.MotionEvent.obtain(clock,clock+60,1,bounds.exactCenterX(),bounds.exactCenterY(),0)
                 instrumentation.sendPointerSync(down);instrumentation.sendPointerSync(up);down.recycle();up.recycle()
             }
+            tapFooter("目录与搜索","Contents and search")
+            await("contents closes"){label("搜本书","Search book")==null}
+            tapFooter("目录与搜索","Contents and search")
+            await("reopening expands ancestors of the active chapter"){label("Chapter One")!=null&&label("当前读到","Reading here")!=null}
+            click(label("收起章节","Collapse chapter"))
+            await("ancestor can still be collapsed manually"){label("Chapter One")==null}
+            click(label("搜本书","Search book"))
+            await("search opens"){label("取消","Cancel")!=null}
+            click(label("取消","Cancel"))
+            await("returning from search locates the active chapter again"){label("Chapter One")!=null&&label("当前读到","Reading here")!=null}
             val footer=footerBounds("目录与搜索","Contents and search")
             for((names,paneNames,shot) in listOf(
                 Triple(arrayOf("字体排版","Typography"),setOf("字体排版面板","Typography panel"),"panel-typography.png"),
-                Triple(arrayOf("文字选择模式","Selection mode"),setOf("选择模式面板","Selection mode panel"),"panel-selection.png"),
                 Triple(arrayOf("批注与高亮","Notes and highlights"),setOf("批注与高亮面板","Notes and highlights panel"),"panel-annotations.png")
             )){
                 tapFooter(*names)
@@ -602,13 +633,22 @@ class ReadingNavigationTest {
             }
             tapFooter("批注与高亮","Notes and highlights")
             await("tapping the active footer action closes its panel"){node {it.paneTitle?.toString() in setOf("批注与高亮面板","Notes and highlights panel")}==null}
+            val originalSelection=model!!.state.value.selectionMode
+            val beforeChoice=model!!.state.value.frame!!.info
+            tapFooter("文字选择模式","Selection mode")
+            await("selection mode opens a full screen page"){node {it.paneTitle?.toString() in setOf("文字选择模式","Selection mode")}!=null}
+            assertNull("Choice pages hide the reading footer",label("目录与搜索","Contents and search"))
+            click(label("单词","Word"))
+            await("choosing returns to the same reader"){model!!.state.value.selectionMode=="word"&&!model!!.state.value.busy&&label("目录与搜索","Contents and search")!=null}
+            assertEquals(beforeChoice.section,model!!.state.value.frame!!.info.section)
+            assertEquals(beforeChoice.page,model!!.state.value.frame!!.info.page)
+            instrumentation.runOnMainSync {model!!.selectionMode(originalSelection)}
+            await("selection preference restores"){model!!.state.value.selectionMode==originalSelection&&!model!!.state.value.busy}
             tapFooter("目录与搜索","Contents and search")
-            await("directory fold state survives a round trip through other panels"){label("展开章节","Expand chapter")!=null&&label("Chapter One")==null}
+            await("directory locates the active chapter after a round trip through other panels"){label("收起章节","Collapse chapter")!=null&&label("Chapter One")!=null}
             await("the full-height drawer finishes its entrance before testing IME motion"){
                 node {it.paneTitle?.toString() in setOf("目录与搜索","Contents and search")}?.let {Rect().also(it::getBoundsInScreen).top==0}==true
             }
-            click(label("展开章节","Expand chapter"))
-            await("parent expands its children"){label("收起章节","Collapse chapter")!=null}
             val paneBefore=Rect().also {node {it.paneTitle?.toString() in setOf("目录与搜索","Contents and search")}!!.getBoundsInScreen(it)}
             val headerBefore=Rect().also {label("目录与搜索栏","Navigation header")!!.getBoundsInScreen(it)}
             fun assertFixedDuringKeyboard(action:()->Unit){

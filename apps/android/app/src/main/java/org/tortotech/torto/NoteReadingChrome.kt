@@ -33,8 +33,8 @@ import androidx.compose.ui.unit.sp
                 }
             }
         }
-        ActionIcon("toc",tr("返回笔记列表","Back to notes"),!state.busy,modifier=Modifier.align(Alignment.CenterStart).padding(start=4.dp),iconSize=16.667.dp,onClick=onList)
-        ActionIcon("close",tr("退出笔记查看","Exit note view"),modifier=Modifier.align(Alignment.CenterEnd).padding(end=4.dp),iconSize=15.dp,onClick=onClose)
+        ActionIcon("toc",tr("返回笔记列表","Back to notes"),!state.busy,modifier=Modifier.align(Alignment.CenterStart).padding(start=4.dp),iconSize=IconSizes.Compact,onClick=onList)
+        ActionIcon("close",tr("退出笔记查看","Exit note view"),modifier=Modifier.align(Alignment.CenterEnd).padding(end=4.dp),iconSize=IconSizes.Compact,onClick=onClose)
     }
     Box(Modifier.align(Alignment.BottomCenter).padding(start=16.dp,end=16.dp,bottom=safe.calculateBottomPadding()+12.dp).fillMaxWidth().heightIn(min=maxOf(48.dp,bottomHeight))){
         Surface(Modifier.align(Alignment.Center).fillMaxWidth().height(bottomHeight),shape=RoundedCornerShape(10.dp),color=MaterialTheme.colorScheme.surface.copy(alpha=.97f),border=border){}
@@ -51,7 +51,7 @@ import androidx.compose.ui.unit.sp
 @Composable private fun RowScope.NoteNavigationAction(icon:String,label:String,enabled:Boolean,action:()->Unit){
     val color=MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=if(enabled)1f else .38f)
     Column(Modifier.weight(1f).heightIn(min=48.dp).clickable(enabled=enabled,role=Role.Button,onClick=action).padding(horizontal=8.dp,vertical=2.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center){
-        AppIcon(if(icon=="next")"back"else icon,description=label,modifier=if(icon=="next")Modifier.graphicsLayer(rotationZ=180f)else Modifier,size=15.dp,tint=color)
+        AppIcon(if(icon=="next")"back"else icon,description=label,modifier=if(icon=="next")Modifier.graphicsLayer(rotationZ=180f)else Modifier,size=IconSizes.Compact,tint=defaultIconColor().copy(alpha=if(enabled)1f else .38f))
         Text(label,fontSize=10.sp,lineHeight=12.sp,color=color,textAlign=TextAlign.Center,maxLines=1,overflow=TextOverflow.Ellipsis)
     }
 }

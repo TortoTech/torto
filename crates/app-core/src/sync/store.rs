@@ -25,6 +25,7 @@ pub struct SyncStore {
     path: PathBuf,
     device_id: String,
     access: Arc<Mutex<()>>,
+    wake: Arc<super::SyncWake>,
 }
 
 // Coordinate the complete connection lifetime, including the final WAL
@@ -77,10 +78,17 @@ fn database_access(path: &std::path::Path) -> SyncResult<Arc<Mutex<()>>> {
     Ok(access)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredProgress {
     pub locator: LocatorV1,
     pub updated_at: HybridTimestamp,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ResumeOffer {
+    pub book_id: String,
+    pub baseline: LocatorV1,
+    pub remote: StoredProgress,
 }
 
 impl SyncStore {
@@ -96,6 +104,7 @@ impl SyncStore {
         }
         let access = database_access(&path)?;
         let store = Self {
+            wake: super::SyncWake::for_path(&path),
             path,
             device_id: device_id.into(),
             access,
@@ -106,6 +115,9 @@ impl SyncStore {
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+    pub fn wake(&self) -> Arc<super::SyncWake> {
+        self.wake.clone()
     }
 
     pub fn create_annotation(
@@ -134,8 +146,9 @@ impl SyncStore {
             conflict_of: None,
         };
         write_annotation(&transaction, &annotation)?;
-        mark_reading_changed(&transaction, &self.device_id, &annotation.book_id)?;
+        mark_annotation_changed(&transaction, &self.device_id, &annotation.book_id)?;
         transaction.commit()?;
+        self.wake.changed(super::SyncChange::Annotations);
         Ok(annotation)
     }
 
@@ -178,8 +191,9 @@ impl SyncStore {
         annotation.deleted_at = Some(updated_at);
         annotation.origin_device.clone_from(&self.device_id);
         write_annotation(&transaction, &annotation)?;
-        mark_reading_changed(&transaction, &self.device_id, &annotation.book_id)?;
+        mark_annotation_changed(&transaction, &self.device_id, &annotation.book_id)?;
         transaction.commit()?;
+        self.wake.changed(super::SyncChange::Annotations);
         Ok(true)
     }
 
@@ -202,8 +216,9 @@ impl SyncStore {
         annotation.updated_at = updated_at;
         annotation.origin_device.clone_from(&self.device_id);
         write_annotation(&transaction, &annotation)?;
-        mark_reading_changed(&transaction, &self.device_id, &annotation.book_id)?;
+        mark_annotation_changed(&transaction, &self.device_id, &annotation.book_id)?;
         transaction.commit()?;
+        self.wake.changed(super::SyncChange::Annotations);
         Ok(true)
     }
 
@@ -224,25 +239,60 @@ impl SyncStore {
     }
 
     pub fn save_progress(&self, book_id: &str, locator: &LocatorV1) -> SyncResult<()> {
-        self.write_progress(book_id, locator, false)
+        let Some(ticket) = self.wake.progress_ticket(book_id) else {
+            return Ok(());
+        };
+        let result = self.write_progress(book_id, locator);
+        if result.is_ok() {
+            self.wake.finish_progress(book_id, ticket);
+        }
+        result
     }
 
-    /// Refreshes activity without replacing an existing precise locator. The
-    /// supplied locator is only used for a book with no progress yet.
+    /// Opening a book changes its recent-reading order, never the version of its locator.
     pub fn record_reading_activity(&self, book_id: &str, locator: &LocatorV1) -> SyncResult<()> {
-        self.write_progress(book_id, locator, true)
-    }
-
-    fn write_progress(
-        &self,
-        book_id: &str,
-        locator: &LocatorV1,
-        refresh_activity: bool,
-    ) -> SyncResult<()> {
         locator.validate()?;
         let mut connection = self.connection()?;
         let transaction = write_transaction(&mut connection)?;
-        if !refresh_activity {
+        transaction.execute(
+            "INSERT INTO reading_activity VALUES (?1,?2) ON CONFLICT(book_id)
+            DO UPDATE SET at_ms=MAX(at_ms,excluded.at_ms)",
+            params![book_id, unix_timestamp_millis() as i64],
+        )?;
+        mark_reading_changed(&transaction, &self.device_id, book_id)?;
+        transaction.commit()?;
+        self.wake.changed(super::SyncChange::Reading);
+        Ok(())
+    }
+    pub fn merge_activity_times(&self, times: &BTreeMap<String, u64>) -> SyncResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = write_transaction(&mut connection)?;
+        for (book, time) in times {
+            transaction.execute(
+                "INSERT INTO reading_activity VALUES (?1,?2) ON CONFLICT(book_id)
+                DO UPDATE SET at_ms=MAX(at_ms,excluded.at_ms)",
+                params![book, (*time).min(i64::MAX as u64) as i64],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+    pub fn pending_annotation_time(&self, account: &str) -> SyncResult<Option<u64>> {
+        let value: Option<i64> = self.connection()?.query_row(
+            "SELECT MAX(n.changed_ms) FROM annotation_changes n
+            LEFT JOIN reading_ack a ON a.account=?1 AND a.book_id=n.book_id
+            WHERE n.device_id=?2 AND n.revision>COALESCE(a.revision,0)",
+            params![account, self.device_id],
+            |r| r.get(0),
+        )?;
+        Ok(value.map(|v| v.max(0) as u64))
+    }
+
+    fn write_progress(&self, book_id: &str, locator: &LocatorV1) -> SyncResult<()> {
+        locator.validate()?;
+        let mut connection = self.connection()?;
+        let transaction = write_transaction(&mut connection)?;
+        {
             let current: Option<String> = transaction
                 .query_row(
                     "SELECT locator_json FROM progress WHERE book_id = ?1",
@@ -260,20 +310,16 @@ impl SyncStore {
         }
         let locator_json = serde_json::to_string(locator)?;
         let updated_at = tick(&transaction, &self.device_id, None)?;
-        let sql = if refresh_activity {
-            "INSERT INTO progress(book_id, locator_json, updated_hlc) VALUES (?1, ?2, ?3) \
-             ON CONFLICT(book_id) DO UPDATE SET updated_hlc = excluded.updated_hlc"
-        } else {
-            "INSERT INTO progress(book_id, locator_json, updated_hlc) VALUES (?1, ?2, ?3) \
+        let sql = "INSERT INTO progress(book_id, locator_json, updated_hlc) VALUES (?1, ?2, ?3) \
              ON CONFLICT(book_id) DO UPDATE SET locator_json = excluded.locator_json, \
-             updated_hlc = excluded.updated_hlc"
-        };
+             updated_hlc = excluded.updated_hlc";
         transaction.execute(
             sql,
             params![book_id, locator_json, serde_json::to_string(&updated_at)?],
         )?;
         mark_reading_changed(&transaction, &self.device_id, book_id)?;
         transaction.commit()?;
+        self.wake.changed(super::SyncChange::Reading);
         Ok(())
     }
 
@@ -299,6 +345,61 @@ impl SyncStore {
             .transpose()
     }
 
+    pub fn resume_offer(
+        &self,
+        book: &str,
+        baseline: &LocatorV1,
+    ) -> SyncResult<Option<ResumeOffer>> {
+        let Some(remote) = self.load_progress(book)? else {
+            return Ok(None);
+        };
+        if remote.updated_at.device_id == self.device_id || remote.locator == *baseline {
+            return Ok(None);
+        }
+        if baseline.source.is_some()
+            && baseline.source == remote.locator.source
+            && baseline.href == remote.locator.href
+        {
+            return Ok(None);
+        }
+        Ok(Some(ResumeOffer {
+            book_id: book.to_owned(),
+            baseline: baseline.clone(),
+            remote,
+        }))
+    }
+    pub fn resume_offer_current(
+        &self,
+        offer: &ResumeOffer,
+        baseline: &LocatorV1,
+    ) -> SyncResult<bool> {
+        Ok(offer.baseline == *baseline
+            && self
+                .load_progress(&offer.book_id)?
+                .is_some_and(|p| p == offer.remote))
+    }
+    pub fn reading_activity_time(&self, book: &str) -> SyncResult<u64> {
+        let connection = self.connection()?;
+        let activity: Option<i64> = connection
+            .query_row(
+                "SELECT at_ms FROM reading_activity WHERE book_id=?1",
+                [book],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let legacy: Option<String> = connection
+            .query_row(
+                "SELECT updated_hlc FROM progress WHERE book_id=?1",
+                [book],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok((activity.unwrap_or(0).max(0) as u64).max(
+            legacy
+                .and_then(|value| HybridTimestamp::parse(&value).ok())
+                .map_or(0, |value| value.wall_time_ms),
+        ))
+    }
     pub fn progress_activity_times(&self) -> SyncResult<HashMap<String, u64>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare("SELECT book_id, updated_hlc FROM progress")?;
@@ -318,6 +419,12 @@ impl SyncStore {
                     tracing::warn!(%error, %book_id, "skipping unreadable progress activity row");
                 }
             }
+        }
+        let mut activity = connection.prepare("SELECT book_id,at_ms FROM reading_activity")?;
+        for row in activity.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            let (book, time) = row?;
+            let at = activity_times.entry(book).or_default();
+            *at = (*at).max(time.max(0) as u64);
         }
         Ok(activity_times)
     }
@@ -386,6 +493,7 @@ impl SyncStore {
             params![book_id, present, serde_json::to_string(&changed_at)?],
         )?;
         transaction.commit()?;
+        self.wake.changed(super::SyncChange::Library);
         Ok(())
     }
 
@@ -465,7 +573,7 @@ impl SyncStore {
             "SELECT c.book_id, c.revision, c.changed_ms FROM reading_changes c
              LEFT JOIN reading_ack a ON a.account = ?1 AND a.book_id = c.book_id
              WHERE c.device_id = ?2 AND c.revision > COALESCE(a.revision, 0)
-             ORDER BY c.changed_ms, c.book_id",
+             ORDER BY c.changed_ms DESC, c.book_id",
         )?;
         Ok(query
             .query_map(params![account, self.device_id], |row| {
@@ -621,6 +729,9 @@ impl SyncStore {
              CREATE TABLE IF NOT EXISTS reading_changes(
                 device_id TEXT NOT NULL, book_id TEXT NOT NULL, revision INTEGER NOT NULL,
                 changed_ms INTEGER NOT NULL, PRIMARY KEY(device_id, book_id));
+             CREATE TABLE IF NOT EXISTS reading_activity(book_id TEXT PRIMARY KEY, at_ms INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS annotation_changes(device_id TEXT NOT NULL, book_id TEXT NOT NULL,
+                revision INTEGER NOT NULL, changed_ms INTEGER NOT NULL, PRIMARY KEY(device_id,book_id));
              CREATE TABLE IF NOT EXISTS reading_ack(
                 account TEXT NOT NULL, book_id TEXT NOT NULL, revision INTEGER NOT NULL,
                 PRIMARY KEY(account, book_id));
@@ -678,6 +789,19 @@ fn mark_reading_changed(
     transaction.execute("INSERT INTO reading_changes(device_id,book_id,revision,changed_ms) VALUES (?1,?2,1,?3)
         ON CONFLICT(device_id,book_id) DO UPDATE SET revision = revision + 1, changed_ms = excluded.changed_ms",
         params![device, book_id, i64::try_from(unix_timestamp_millis())?])?;
+    Ok(())
+}
+
+fn mark_annotation_changed(
+    transaction: &Transaction<'_>,
+    device: &str,
+    book: &str,
+) -> SyncResult<()> {
+    mark_reading_changed(transaction, device, book)?;
+    transaction.execute("INSERT INTO annotation_changes(device_id,book_id,revision,changed_ms)
+        SELECT device_id,book_id,revision,changed_ms FROM reading_changes WHERE device_id=?1 AND book_id=?2
+        ON CONFLICT(device_id,book_id) DO UPDATE SET revision=excluded.revision,changed_ms=excluded.changed_ms",
+        params![device,book])?;
     Ok(())
 }
 
@@ -806,10 +930,13 @@ impl HighlightRepository for SyncStore {
             *counter = counter.saturating_add(1);
             annotation.origin_device.clone_from(&self.device_id);
             write_annotation(&transaction, &annotation)?;
-            mark_reading_changed(&transaction, &self.device_id, &annotation.book_id)?;
+            mark_annotation_changed(&transaction, &self.device_id, &annotation.book_id)?;
             repaired.push(true);
         }
         transaction.commit()?;
+        if repaired.iter().any(|value| *value) {
+            self.wake.changed(super::SyncChange::Annotations);
+        }
         Ok(repaired)
     }
 
@@ -1402,14 +1529,45 @@ mod tests {
     }
 
     #[test]
+    fn layout_and_opening_do_not_overwrite_foreign_progress_but_navigation_does() {
+        let store = test_store("remote-resume-guard");
+        let initial = locator("book", 0.2);
+        let remote = ProgressState {
+            locator: locator("book", 0.8),
+            updated_at: HybridTimestamp {
+                wall_time_ms: unix_timestamp_millis() as u64,
+                counter: 0,
+                device_id: "peer".into(),
+            },
+        };
+        store.merge_progress(&remote).unwrap();
+        store.wake().protect_progress("book");
+        store.record_reading_activity("book", &initial).unwrap();
+        store.save_progress("book", &initial).unwrap();
+        assert_eq!(
+            store.load_progress("book").unwrap().unwrap().locator,
+            remote.locator
+        );
+        let offer = store.resume_offer("book", &initial).unwrap().unwrap();
+        assert!(store.resume_offer_current(&offer, &initial).unwrap());
+        let moved = locator("book", 0.3);
+        assert!(!store.resume_offer_current(&offer, &moved).unwrap());
+        store.wake().allow_progress("book");
+        store.save_progress("book", &moved).unwrap();
+        assert!(!store.resume_offer_current(&offer, &initial).unwrap());
+        assert!(store.resume_offer("book", &initial).unwrap().is_none());
+        // Later reflow saves still cannot turn derived positions into user edits.
+        store.save_progress("book", &initial).unwrap();
+        assert_eq!(store.load_progress("book").unwrap().unwrap().locator, moved);
+        cleanup(&store);
+    }
+
+    #[test]
     fn delayed_reading_activity_preserves_the_complete_latest_locator() {
         let store = test_store("activity-precise-position");
         let initial = locator("book", 0.2);
         store.record_reading_activity("book", &initial).unwrap();
-        assert_eq!(
-            store.load_progress("book").unwrap().unwrap().locator,
-            initial
-        );
+        assert!(store.load_progress("book").unwrap().is_none());
 
         let mut precise = locator("book", 0.6);
         let mut range = source_range();
@@ -1422,7 +1580,7 @@ mod tests {
         store.record_reading_activity("book", &initial).unwrap();
         let saved = store.load_progress("book").unwrap().unwrap();
         assert_eq!(saved.locator, precise);
-        assert!(saved.updated_at > previous_time);
+        assert_eq!(saved.updated_at, previous_time);
         cleanup(&store);
     }
 

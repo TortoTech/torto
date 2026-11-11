@@ -20,7 +20,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
 @Composable fun TypographyPanel(state:ScreenState,model:ReaderModel,openLayout:()->Unit={}) {
-    var size by remember(state.fontSize) { mutableFloatStateOf(state.fontSize) }
+    var size by remember(state.fontSize) { mutableFloatStateOf(readingFontSize(state.fontSize)) }
     val options=state.reading
     LaunchedEffect(Unit){model.loadFonts();model.loadServices()}
     val families=state.fontFamilies
@@ -32,30 +32,29 @@ import androidx.compose.ui.unit.dp
         if(options!=null){
             SectionLabel(tr("中日韩书籍","CJK books"))
             SettingsGroup {
-                SettingChoice(tr("主要字体","Primary font"),options.cjkFont,families?.cjk.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(cjkFont=it))}
-                SettingChoice(tr("拉丁字体","Latin font"),options.cjkLatinFont,listOf("" to tr("跟随其他语言字体","Use other-language font"))+families?.latin.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(cjkLatinFont=it))}
+                SettingChoice(tr("主要字体","Primary font"),options.cjkFont,families?.cjk.orEmpty().map {it to it},!state.busy,pageTitle=tr("中日韩主要字体","CJK primary font"),searchable=true){model.saveReadingOptions(options.copy(cjkFont=it))}
+                SettingChoice(tr("拉丁字体","Latin font"),options.cjkLatinFont,listOf("" to tr("跟随其他语言字体","Use other-language font"))+families?.latin.orEmpty().map {it to it},!state.busy,searchable=true){model.saveReadingOptions(options.copy(cjkLatinFont=it))}
             }
             SectionLabel(tr("其他语言书籍","Other-language books"))
             SettingsGroup {
-                SettingChoice(tr("主要字体","Primary font"),options.latinFont,families?.latin.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(latinFont=it))}
-                SettingChoice(tr("中日韩字体","CJK font"),options.latinCjkFont,listOf("" to tr("跟随中日韩主要字体","Use CJK primary font"))+families?.cjk.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(latinCjkFont=it))}
+                SettingChoice(tr("主要字体","Primary font"),options.latinFont,families?.latin.orEmpty().map {it to it},!state.busy,pageTitle=tr("其他语言主要字体","Other-language primary font"),searchable=true){model.saveReadingOptions(options.copy(latinFont=it))}
+                SettingChoice(tr("中日韩字体","CJK font"),options.latinCjkFont,listOf("" to tr("跟随中日韩主要字体","Use CJK primary font"))+families?.cjk.orEmpty().map {it to it},!state.busy,searchable=true){model.saveReadingOptions(options.copy(latinCjkFont=it))}
             }
         }
         SectionLabel(tr("通用","General"))
         SettingsGroup {
-            if(options!=null)SettingChoice(tr("代码字体","Code font"),options.monospaceFont,families?.monospace.orEmpty().map {it to it},!state.busy){model.saveReadingOptions(options.copy(monospaceFont=it))}
-            SettingsSlider(tr("字号","Font size"),size.toInt().toString(),size,{size=it},valueRange=12f..36f,enabled=!state.busy,onValueChangeFinished={model.configure(size,state.unified,state.dark)})
+            if(options!=null)SettingChoice(tr("代码字体","Code font"),options.monospaceFont,families?.monospace.orEmpty().map {it to it},!state.busy,searchable=true){model.saveReadingOptions(options.copy(monospaceFont=it))}
+            SettingsSlider(tr("字号","Font size"),size.toInt().toString(),size,{size=readingFontSize(it)},valueRange=readingFontSizeRange,steps=readingFontSizeSteps,enabled=!state.busy,onValueChangeFinished={model.configure(size,state.unified,state.dark)})
         }
-        SettingsGroup {
+        SettingsGroup {SettingsItem(tr("AI 排版","AI layout"),enabled=!state.busy,onClick=openLayout)}
+        if(state.fontApplyAvailable||!state.fontsReady)SettingsGroup {
             if(state.fontApplyAvailable)SettingsItem(tr("应用已下载字体","Apply downloaded fonts"),enabled=!state.busy,onClick=model::applyDownloadedFonts)
-            SettingsItem(when {
+            if(!state.fontsReady)SettingsItem(when {
                 state.fontsDownloading->tr("默认字体下载中","Downloading reading fonts")
-                state.fontsReady->tr("默认字体已就绪","Reading fonts ready")
                 state.fontsError!=null->tr("重试下载默认字体","Retry reading font download")
                 else->tr("下载默认字体","Download reading fonts")
             },enabled=!state.fontsDownloading&&!state.fontsReady,onClick=model::downloadFonts)
         }
-        SettingsGroup {SettingsItem(tr("AI 排版","AI layout"),enabled=!state.busy,onClick=openLayout)}
 
     }
 }

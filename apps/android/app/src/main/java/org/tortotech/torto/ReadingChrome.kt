@@ -17,16 +17,29 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import androidx.compose.foundation.shape.RoundedCornerShape
 import kotlinx.coroutines.delay
 
 internal val ReaderBarHeight=56.dp
+
+/** Opening and uncached turns belong to the content plane; quick loads stay quiet. */
+@Composable internal fun ReaderOpeningIndicator(state:ScreenState){
+    val visible=key(state.active?.id){loadingVisible(state.active!=null&&state.error==null&&(state.openingBook&&state.frame==null||state.readerContentLoading))}
+    if(visible){
+        val label=if(state.openingBook)tr("正在打开书籍","Opening book")else tr("正在加载内容","Loading content")
+        Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){
+            CircularProgressIndicator(Modifier.size(28.dp).semantics {contentDescription=label},strokeWidth=2.dp)
+        }
+    }
+}
 
 /** Same safe area whether Android's system bars are visible or hidden. */
 @OptIn(ExperimentalLayoutApi::class)
@@ -50,8 +63,8 @@ internal val ReaderBarHeight=56.dp
                 val interaction=remember {MutableInteractionSource()}
                 Column(Modifier.weight(1f).heightIn(min=56.dp).semantics {this.selected=active}.clickable(role=Role.Tab,interactionSource=interaction,indication=null,onClick={onSelect(index)}).padding(vertical=6.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center){
                     val pressed by interaction.collectIsPressedAsState()
-                    val ink by animateColorAsState(if(active||pressed)brandControlColor() else MaterialTheme.colorScheme.onSurfaceVariant,tween(100),label="home icon ink")
-                    Box(Modifier.size(44.dp,26.dp),contentAlignment=Alignment.Center){AppIcon(icon,size=22.dp,tint=ink)}
+                    val ink by animateColorAsState(if(active||pressed)brandControlColor() else defaultIconColor(),tween(100),label="home icon ink")
+                    Box(Modifier.size(44.dp,IconSizes.Standard),contentAlignment=Alignment.Center){AppIcon(icon,tint=ink)}
                     Spacer(Modifier.height(2.dp))
                     Text(label,fontSize=11.sp,lineHeight=14.sp,color=if(active)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
@@ -67,8 +80,10 @@ internal val ReaderBarHeight=56.dp
 ){
     val safe=readerSafePadding()
     val bottomPanel=readingBottomPanel(panel)
+    // Both bars paint the same surface through their system-bar safe areas.
+    val toolbarBackground=MaterialTheme.colorScheme.surface
     AnimatedVisibility(visible=state.chromeVisible&&!bottomPanel,enter=fadeIn(tween(180)),exit=fadeOut(tween(180)),modifier=Modifier.align(Alignment.TopCenter)){
-        Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background).padding(top=safe.calculateTopPadding()).height(ReaderBarHeight)){
+        Column(Modifier.fillMaxWidth().background(toolbarBackground).padding(top=safe.calculateTopPadding()).height(ReaderBarHeight)){
             Row(Modifier.fillMaxWidth().weight(1f).padding(horizontal=8.dp),verticalAlignment=Alignment.CenterVertically){
                 ActionIcon("back",tr("返回","Back"),onClick=onBack)
                 Spacer(Modifier.weight(1f))
@@ -78,7 +93,7 @@ internal val ReaderBarHeight=56.dp
         }
     }
     AnimatedVisibility(visible=state.chromeVisible||bottomPanel,enter=fadeIn(tween(180))+slideInVertically(tween(180)){it/5},exit=fadeOut(tween(180))+slideOutVertically(tween(180)){it/5},modifier=Modifier.align(Alignment.BottomCenter)){
-        Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(bottom=safe.calculateBottomPadding())){
+        Column(Modifier.fillMaxWidth().background(toolbarBackground).padding(bottom=safe.calculateBottomPadding())){
             HorizontalDivider(color=MaterialTheme.colorScheme.outlineVariant.copy(alpha=.45f),thickness=.5.dp)
             Row(Modifier.fillMaxWidth().height(ReaderBarHeight),horizontalArrangement=Arrangement.SpaceEvenly,verticalAlignment=Alignment.CenterVertically){
                 ActionIcon("toc",tr("目录与搜索","Contents and search"),selected=panel=="navigation"){onPanel("navigation")}
@@ -86,7 +101,7 @@ internal val ReaderBarHeight=56.dp
                 var selectionHint by remember {mutableStateOf(false)}
                 LaunchedEffect(selectionHint){if(selectionHint){delay(2000);selectionHint=false}}
                 Box {
-                    ActionIcon("select",tr("文字选择模式","Selection mode"),selected=panel=="selection"){
+                    ActionIcon("select",tr("文字选择模式","Selection mode")){
                         if(state.translated)selectionHint=true else onPanel("selection")
                     }
                     if(selectionHint){
@@ -105,21 +120,22 @@ internal val ReaderBarHeight=56.dp
     }
     AnimatedVisibility(visible=state.chromeVisible&&panel==null&&state.interaction==null&&state.selected==null,enter=fadeIn(tween(180))+slideInVertically(tween(180)){it/5},exit=fadeOut(tween(180))+slideOutVertically(tween(180)){it/5},modifier=Modifier.align(Alignment.BottomEnd).padding(end=16.dp,bottom=safe.calculateBottomPadding()+ReaderBarHeight+16.dp)){
         val split=state.frame?.info?.controls?.find {it.kind=="sentences"}
+        val showTranslation=showReadingTranslation(state.bookLanguages,LocalConfiguration.current.locales[0],state.translated)
         Row(horizontalArrangement=Arrangement.spacedBy(10.dp)){
             ReadingFloatingAction("ai",tr("阅读助手","Reading assistant"),!blocked){onPanel("chat")}
             ReadingFloatingAction("sentences",if(split?.active==true)tr("取消当前段落分句","Restore current paragraph")else tr("当前段落按句分段","Split current paragraph"),!blocked&&split!=null,split?.active==true,onSplit)
-            ReadingFloatingAction("translate",if(state.translated)tr("关闭翻译","Turn translation off")else tr("开启翻译","Turn translation on"),!blocked,state.translated,onTranslate)
+            if(showTranslation)ReadingFloatingAction("translate",if(state.translated)tr("关闭翻译","Turn translation off")else tr("开启翻译","Turn translation on"),!blocked,state.translated,onTranslate)
         }
     }
 }
 
-/** These actions float above the page; their circular dark surface is intentional. */
+/** Slate circles remain visible over both light and dark reading content. */
 @Composable internal fun ReadingFloatingAction(icon:String,label:String,enabled:Boolean,active:Boolean=false,onClick:()->Unit){
     val interaction=remember {MutableInteractionSource()}
     val pressed by interaction.collectIsPressedAsState()
-    val ink by animateColorAsState(Color.White.copy(alpha=if(!enabled).38f else if(pressed).7f else 1f),tween(100),label="floating action ink")
-    Box(Modifier.size(48.dp).clip(CircleShape).background(Color(0xff202124)).semantics {selected=active}
+    val ink by animateColorAsState((if(active||pressed)brandControlColor() else Color.White).copy(alpha=if(!enabled).38f else 1f),tween(100),label="floating action ink")
+    Box(Modifier.size(IconSizes.TouchTarget).clip(CircleShape).background(Color(0xff5e646e)).semantics {selected=active}
         .clickable(enabled=enabled,role=Role.Button,interactionSource=interaction,indication=null,onClick=onClick),contentAlignment=Alignment.Center){
-        AppIcon(icon,description=label,tint=ink,size=22.dp)
+        AppIcon(icon,description=label,tint=ink)
     }
 }

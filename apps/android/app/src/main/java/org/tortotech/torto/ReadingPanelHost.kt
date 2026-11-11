@@ -4,6 +4,7 @@ import androidx.compose.animation.*
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.*
@@ -56,8 +57,13 @@ internal fun readingBottomPanel(panel:String?)=panel!=null&&panel!="chat"
         var drag by remember {mutableFloatStateOf(0f)}
         var settle by remember {mutableStateOf<Job?>(null)}
         val scope=rememberCoroutineScope()
-        LaunchedEffect(panel){settle?.cancel();drag=0f}
-        AnimatedVisibility(open,enter=fadeIn(tween(160))+slideInVertically(tween(200)){it/10},exit=fadeOut(tween(140))+slideOutVertically(tween(180)){it/10},modifier=Modifier.fillMaxSize().windowInsetsPadding(footer).clipToBounds()){
+        val visibility=remember {MutableTransitionState(false)}
+        visibility.targetState=open
+        LaunchedEffect(panel){if(open){settle?.cancel();drag=0f}}
+        LaunchedEffect(visibility.isIdle,visibility.currentState){
+            if(visibility.isIdle&&!visibility.currentState){settle?.cancel();drag=0f}
+        }
+        AnimatedVisibility(visibility,enter=fadeIn(tween(160))+slideInVertically(tween(200)){it/10},exit=fadeOut(tween(140))+slideOutVertically(tween(180)){it/10},modifier=Modifier.fillMaxSize().windowInsetsPadding(footer).clipToBounds()){
             BoxWithConstraints(Modifier.fillMaxSize()){
                 val full=displayed in setOf("navigation","marks","marks-search","layout-settings","translation-settings")
                 val limit=if(full)maxHeight else maxHeight*.88f

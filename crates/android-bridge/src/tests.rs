@@ -6,7 +6,8 @@ fn root() -> PathBuf {
     std::env::temp_dir().join(format!("torto-android-test-{}", uuid::Uuid::new_v4()))
 }
 
-async fn focus_membership_and_heading_masks_follow_desktop_across_pages_and_resizes(core:&Arc<MobileCore>,root:&std::path::Path) {
+async fn focus_membership_and_heading_masks_follow_desktop_across_pages_and_resizes(core:&Arc<MobileCore>,root:&std::path::Path,
+) {
         use std::io::Write;
         let path=root.join("focus-parity.epub");
         let body="<h1>Chapter title</h1><p>Earlier paragraph.</p><h2>Topic title</h2><h3>Subtopic title</h3><p>Following paragraph.</p><p>Later paragraph.</p><div><p>Grouped one.</p><p>Grouped two.</p><p>Grouped three.</p></div><p>After container.</p><ul><li>Parent item.<ul><li>Nested child.</li><li>Other child.</li></ul></li><li>Last root item.</li></ul><p>Final paragraph.</p>";
@@ -20,18 +21,26 @@ async fn focus_membership_and_heading_masks_follow_desktop_across_pages_and_resi
         ] {zip.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(text.as_bytes()).unwrap();}
         zip.finish().unwrap();
         let book=core.clone().import_book(path.to_string_lossy().into_owned()).await.unwrap().into_iter().find(|b|b.title=="Focus parity").unwrap();
-        let reader=core.clone().open_book(book.id,Viewport {width:360,height:640,scale:1.0}).await.unwrap();
+        let reader=core.clone().open_book(book.id,Viewport {width:360,height:640,scale:1.0,
+            },
+        ).await.unwrap();
         let mut options=core.clone().reading_options().await.unwrap();
+        assert_eq!(reader.clone().book_languages().await.unwrap(), vec!["en"]);
         options.sentence_split=false;options.translated=false;
         reader.clone().apply_reading_options(options).await.unwrap();
         reader.clone().configure(20.0,true,false).await.unwrap();
         let following=reader.clone().search("Following paragraph".into()).await.unwrap().remove(0).source;
         reader.clone().focus_mode(true).await.unwrap();
         for height in [640,180] {
-            reader.clone().resize(Viewport {width:360,height,scale:1.0}).await.unwrap();
+            reader.clone().resize(Viewport {width:360,height,scale:1.0,
+            }).await.unwrap();
             reader.clone().go_to_source(following.clone()).await.unwrap();
             let (body,headings)=reader.with(|s| {
-                let unit=s.focus_units.iter().find(|u|u.ranges.iter().any(|r|serde_json::from_str::<SourceRange>(&following).unwrap().start.node==r.start.node)).unwrap();
+                let unit=s.focus_units.iter().find(|u| {
+                        u.ranges.iter().any(|r| {
+                            serde_json::from_str::<SourceRange>(&following).unwrap().start.node==r.start.node
+                        })
+                    }).unwrap();
                 assert!(!unit.leading);
                 assert!(!unit.headings.is_empty(),"both headings must survive retained logical-page assembly");
                 assert_eq!(unit.paint_bounds().len(),2,"dim style clears the body and its preceding titles separately");
@@ -51,17 +60,26 @@ async fn focus_membership_and_heading_masks_follow_desktop_across_pages_and_resi
         }
         let grouped=reader.clone().search("Grouped two".into()).await.unwrap().remove(0).source;
         for (height,expected) in [(640,3),(120,1)] {
-            reader.clone().resize(Viewport {width:360,height,scale:1.0}).await.unwrap();
+            reader.clone().resize(Viewport {width:360,height,scale:1.0,
+            }).await.unwrap();
             reader.clone().go_to_source(grouped.clone()).await.unwrap();
             reader.with(|s| {
-                let group=s.focus_units.iter().find(|u|u.ranges.iter().any(|r|r.start.node==serde_json::from_str::<SourceRange>(&grouped).unwrap().start.node)).unwrap();
+                let group=s.focus_units.iter().find(|u| {
+                        u.ranges.iter().any(|r| {
+                            r.start.node==serde_json::from_str::<SourceRange>(&grouped).unwrap().start.node
+                        })
+                    }).unwrap();
                 assert_eq!(group.ranges.len(),expected,"only a fully visible group fitting the viewport forms one stop");Ok(())
             }).unwrap();
         }
         let child=reader.clone().search("Nested child".into()).await.unwrap().remove(0).source;
         reader.clone().go_to_source(child.clone()).await.unwrap();
         reader.with(|s| {
-            let unit=s.focus_units.iter().find(|u|u.ranges.iter().any(|r|r.start.node==serde_json::from_str::<SourceRange>(&child).unwrap().start.node)).unwrap();
+            let unit=s.focus_units.iter().find(|u| {
+                    u.ranges.iter().any(|r| {
+                        r.start.node==serde_json::from_str::<SourceRange>(&child).unwrap().start.node
+                    })
+                }).unwrap();
             assert_eq!(unit.ranges.len(),3,"a tall list splits by root items, retaining both nested children with their parent");Ok(())
         }).unwrap();
         reader.shutdown().await.unwrap();
@@ -71,16 +89,19 @@ fn fixture(path: &std::path::Path) {
     let paragraphs = (0..60).map(|i| format!("<p>Paragraph {i}: readers share stable source locations across devices. 中文搜索与选择。</p>")).collect::<String>();
     std::fs::write(path,format!(r#"<?xml version="1.0" encoding="UTF-8"?><FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0"><description><title-info><book-title>Android reader fixture</book-title><lang>en</lang></title-info></description><body><section id="one"><title><p>One</p></title>{paragraphs}</section></body></FictionBook>"#)).unwrap();
 }
-async fn classic_previews_preserve_progress_and_focus_restores_the_saved_layout(reader: &Arc<MobileReader>) {
+async fn classic_previews_preserve_progress_and_focus_restores_the_saved_layout(reader: &Arc<MobileReader>,
+) {
     let original = reader.clone().configure(20.0, false, false).await.unwrap();
     let locator = reader.with(|s| Ok(s.session.current_locator())).unwrap();
-    let progress = reader.with(|s| Ok(s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator)).unwrap();
+    let progress = reader.with(|s| {
+            Ok(s.store.load_progress(&s.book_id).map_err(error)?.map(|progress|progress.locator))
+        }).unwrap();
     assert!(reader.clone().preview_turn(false).await.unwrap().is_none());
     let preview = reader.clone().preview_turn(true).await.unwrap().unwrap();
     assert_ne!(preview.info().regions[0].source, original.info().regions[0].source);
     reader.with(|s| {
         assert_eq!(s.session.current_locator(), locator);
-        assert_eq!(s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator, progress);
+        assert_eq!(s.store.load_progress(&s.book_id).map_err(error)?.map(|progress|progress.locator), progress);
         assert!(s.history.is_empty());
         Ok(())
     }).unwrap();
@@ -712,7 +733,8 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
     let mut legacy = serde_json::to_value(&options).unwrap();
     legacy["focus_style"] = "highlight".into();
     legacy["ai_prefetch"] = false.into();
-    rebook_app_core::persistence::write_json_atomic(&core.root.join("android-reading.json"), &legacy).unwrap();
+    rebook_app_core::persistence::write_json_atomic(&core.root.join("android-reading.json"), &legacy,
+    ).unwrap();
     let reader = core
         .clone()
         .open_book(
@@ -932,11 +954,15 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
     ai.chat_history = 11;
     let saved = core.clone().save_ai_options(ai).await.unwrap();
     assert!(saved.show_original && saved.translate_toc && saved.expert_translation);
-    assert_eq!(saved.chat_steps, 13);
+    assert_eq!(saved.chat_steps, plugins::DEFAULT_CHAT_MAX_TOOL_STEPS);
+    assert_eq!(saved.chat_history, plugins::DEFAULT_CHAT_HISTORY_TURNS);
     let mut options = core.clone().reading_options().await.unwrap();
     options.translated = true;
     core.clone().save_reading_options(options).await.unwrap();
-    assert!(core.clone().reading_options().await.unwrap().translated);
+    assert!(
+        !core.clone().reading_options().await.unwrap().translated,
+        "saved translation is not a default for a new book"
+    );
     let reader = core
         .clone()
         .open_book(
@@ -947,6 +973,16 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
                 scale: 1.0,
             },
         )
+        .await
+        .unwrap();
+    reader
+        .with(|s| {
+            assert!(!s.options.translated);
+            assert_eq!(s.selection_mode, SelectionGranularity::Free);
+            Ok(())
+        })
+        .unwrap();
+    reader.clone().set_translation_enabled(true)
         .await
         .unwrap();
     let mut resolved = rebook_app_core::plugins::PluginSettings::load_default().unwrap();
@@ -1151,8 +1187,6 @@ async fn statistics_cloud_and_diagnostics(
     o.url = server.base_url();
     o.username = "test-user".into();
     o.device_name = "Native test device".into();
-    o.background = true;
-    o.foreground = true;
     let saved = core
         .clone()
         .save_cloud_options(o, Some("cloud-test-secret".into()))
@@ -1311,6 +1345,39 @@ async fn statistics_cloud_and_diagnostics(
     let report = std::fs::read_to_string(exported).unwrap();
     assert!(!report.contains("hidden-secret") && !report.contains("cloud-test-secret"));
     assert!(report.contains("healthy event"));
+    // A native wait is woken by a local lifecycle event, without polling the
+    // database or sending another cloud request.
+    let revision=core.sync_wake.snapshot().revision;
+    let count=server.requests.lock().unwrap().len();
+    let wait=core.clone().wait_for_sync_change(revision,10_000);
+    let change=async {tokio::time::sleep(std::time::Duration::from_millis(20)).await;core.sync_background();};
+    let (woken,_)=futures_util::future::join(wait,change).await;
+    assert_ne!(woken.unwrap(),revision);
+    assert_eq!(server.requests.lock().unwrap().len(),count);
+
+    // Progress arriving after opening remains foreign across a reflow. A
+    // resume action is bound to both its original book position and account.
+    let settings=core.clone().cloud_options().await.unwrap();
+    let reader=core.clone().open_book(book.into(),Viewport {width:360,height:640,scale:1.0}).await.unwrap();
+    let baseline=reader.with(|s|Ok(sync_locator(s,scroll::active(s),s.focus))).unwrap();
+    let store=services::store().unwrap();
+    let mut remote=baseline.clone();remote.source=None;remote.total_progression=Some(0.8);remote.progression=Some(0.8);
+    let mut updated=store.tick().unwrap();updated.device_id="remote-resume-peer".into();
+    let progress=serde_json::from_value(serde_json::json!({"locator":remote,"updated_at":updated})).unwrap();
+    store.merge_progress(&progress).unwrap();
+    let offered=reader.clone().cloud_resume_offer().await.unwrap().unwrap();
+    reader.clone().configure(22.0,true,false).await.unwrap();
+    assert_eq!(store.load_progress(book).unwrap().unwrap().updated_at,updated);
+    // Reflow may change the visible anchor, so ask for a fresh offer.
+    let offered=reader.clone().cloud_resume_offer().await.unwrap().unwrap_or(offered);
+    let mut another=settings.clone();another.username.push_str("-other");
+    core.clone().save_cloud_options(another,None).await.unwrap();
+    assert!(reader.clone().resume_cloud_progress(offered.token.clone()).await.unwrap().is_none());
+    core.clone().save_cloud_options(settings,None).await.unwrap();
+    let offered=reader.clone().cloud_resume_offer().await.unwrap().unwrap();
+    assert!(reader.clone().resume_cloud_progress(offered.token).await.unwrap().is_some());
+    reader.shutdown().await.unwrap();
+
     core.clone()
         .save_cloud_options(original, Some(String::new()))
         .await
@@ -1322,7 +1389,9 @@ async fn retained_focus_chapter_boundaries(core: &Arc<MobileCore>, root: &std::p
     use std::io::Write;
     let path=root.join("focus-boundaries.epub");
     let mut zip=zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
-    let paragraphs=|prefix:&str| (0..10).map(|i|format!("<p>{prefix} block {i}: focus moves one paragraph at a time.</p>")).collect::<String>();
+    let paragraphs=|prefix:&str| {
+        (0..10).map(|i|format!("<p>{prefix} block {i}: focus moves one paragraph at a time.</p>")).collect::<String>()
+    };
     let files=[
         ("mimetype","application/epub+zip".to_owned()),
         ("META-INF/container.xml",r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="book.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#.into()),
@@ -1336,7 +1405,9 @@ async fn retained_focus_chapter_boundaries(core: &Arc<MobileCore>, root: &std::p
     for (name,content) in files { zip.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(content.as_bytes()).unwrap(); }
     zip.finish().unwrap();
     let book=core.clone().import_book(path.to_string_lossy().into()).await.unwrap().into_iter().find(|b|b.title=="Focus boundaries").unwrap();
-    let reader=core.clone().open_book(book.id.clone(),Viewport {width:360,height:640,scale:1.0}).await.unwrap();
+    let reader=core.clone().open_book(book.id.clone(),Viewport {width:360,height:640,scale:1.0,
+            },
+        ).await.unwrap();
     reader.clone().focus_mode(true).await.unwrap();
     reader.with(|s| {
         let expected=s.session.current_reading_unit_pages().map_err(error)?.iter().map(|p|p.position).collect::<Vec<_>>();
@@ -1347,7 +1418,10 @@ async fn retained_focus_chapter_boundaries(core: &Arc<MobileCore>, root: &std::p
     let middle=reader.clone().search("A block 3:".into()).await.unwrap()[0].source.clone();
     let from=reader.clone().go_to_source(middle).await.unwrap().info();
     let original=reader.clone().page().await.unwrap();
-    let saved=reader.with(|s|Ok(serde_json::to_vec(&s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator).map_err(error)?)).unwrap();
+    let saved=reader.with(|s| {
+            Ok(serde_json::to_vec(&s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator,
+            ).map_err(error)?)
+        }).unwrap();
     let prepared=reader.clone().preview_turn(true).await.unwrap().expect("focus prepares an adjacent semantic unit");
     assert_eq!((prepared.width(),prepared.height()),(360,640),"a chapter preview retains only one viewport");
     assert!(prepared.info().regions.iter().any(|r|r.text.contains("C block 0:")));
@@ -1398,9 +1472,13 @@ async fn retained_focus_chapter_boundaries(core: &Arc<MobileCore>, root: &std::p
         reader.with(|s| {assert_eq!(s.session.current_reading_unit_anchor(),unit);Ok(())}).unwrap();
         assert!(back.regions.iter().any(|r|r.text.contains(&format!("{from} block 9:"))));
     }
-    let saved=reader.with(|s|Ok(s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator.source.unwrap())).unwrap();
+    let saved=reader.with(|s| {
+            Ok(s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator.source.unwrap())
+        }).unwrap();
     reader.shutdown().await.unwrap();
-    let reopened=core.clone().open_book(book.id.clone(),Viewport {width:360,height:640,scale:1.0}).await.unwrap();
+    let reopened=core.clone().open_book(book.id.clone(),Viewport {width:360,height:640,scale:1.0,
+            },
+        ).await.unwrap();
     reopened.clone().focus_mode(true).await.unwrap();
     reopened.with(|s| {
         let active=s.focus_anchor.as_ref().unwrap();
@@ -1413,7 +1491,9 @@ async fn retained_focus_chapter_boundaries(core: &Arc<MobileCore>, root: &std::p
         Ok(())
     }).unwrap();
     reopened.shutdown().await.unwrap();
-    let fallback=core.clone().open_book(book.id.clone(),Viewport {width:360,height:640,scale:1.0}).await.unwrap();
+    let fallback=core.clone().open_book(book.id.clone(),Viewport {width:360,height:640,scale:1.0,
+            },
+        ).await.unwrap();
     assert!(!fallback.clone().focus_mode(true).await.unwrap().info().regions.is_empty(),"an obsolete bookmark must still use the core locator fallback");
     fallback.shutdown().await.unwrap();
 }
@@ -1421,15 +1501,21 @@ async fn retained_focus_chapter_boundaries(core: &Arc<MobileCore>, root: &std::p
 
 async fn native_document_pages(reader:&Arc<MobileReader>) {
     let before=reader.clone().page().await.unwrap().info();
-    let markup=(0..45).map(|n|format!("Paragraph {n}: footnotes inherit the reader font and optimized composition.\n\n")).collect::<String>();
-    let viewport=Viewport {width:300,height:240,scale:1.0};
-    let first=reader.clone().note_page(markup.clone(),1,String::new(),String::new(),24.,0,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
+    let markup=(0..45).map(|n| {
+            format!("Paragraph {n}: footnotes inherit the reader font and optimized composition.\n\n")
+        }).collect::<String>();
+    let viewport=Viewport {width:300,height:240,scale:1.0,
+    };
+    let first=reader.clone().note_page(markup.clone(),1,String::new(),String::new(),24.,0,viewport.clone(),0xff000000,0xfff8f5ee,
+        ).await.unwrap();
     assert!(first.total>2,"long notes must remain scrollable");
     assert!(first.page.info().regions.iter().any(|r|r.text.contains("Paragraph 0")));
     let rect=first.page.info().regions.iter().flat_map(|r|&r.bounds).next().unwrap().clone();
-    let selection=reader.clone().document_select(first.id.clone(),0,rect.x+2.0,rect.y+rect.height/2.0,rect.x+50.0,rect.y+rect.height/2.0,None).await.unwrap().unwrap();
+    let selection=reader.clone().document_select(first.id.clone(),0,rect.x+2.0,rect.y+rect.height/2.0,rect.x+50.0,rect.y+rect.height/2.0,None,
+        ).await.unwrap().unwrap();
     assert!(!selection.text.is_empty());assert!(!selection.bounds.is_empty());
-    let last=reader.clone().note_page(markup,1,String::new(),String::new(),24.,first.total-1,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
+    let last=reader.clone().note_page(markup,1,String::new(),String::new(),24.,first.total-1,viewport.clone(),0xff000000,0xfff8f5ee,
+        ).await.unwrap();
     assert_eq!(last.id,first.id);
     assert!(last.page.info().regions.iter().any(|r|r.text.contains("44:")));
     assert_eq!(reader.clone().page().await.unwrap().info().progress,before.progress,"preview must not move book progress");
@@ -1438,20 +1524,23 @@ async fn native_document_pages(reader:&Arc<MobileReader>) {
 }
 
 async fn media_and_presentation(core:&Arc<MobileCore>,root:&std::path::Path) {
-    use std::io::Write;
     use rebook_publication::{Block,Inline};
+    use std::io::Write;
     let path=root.join("media-controls.epub");
     let body=r##"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Media</title></head><body><p>See Table 1.1 for measurements.</p><table id="t"><caption>Table 1.1 Measurements</caption><tr><th>Name</th><th>Value</th></tr><tr><td>A</td><td>2</td></tr><tr><td>B</td><td>4</td></tr></table><p><span class="math math-display">x</span></p><p>x is the position.</p></body></html>"##;
     let mut zip=zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
     for(name,content)in [
         ("mimetype","application/epub+zip"),
-        ("META-INF/container.xml",r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="package.opf"/></rootfiles></container>"#),
-        ("package.opf",r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">mobile-media-controls</dc:identifier><dc:title>Media controls</dc:title><dc:language>en</dc:language></metadata><manifest><item id="body" href="body.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="body"/></spine></package>"#),
-        ("body.xhtml",body)
+        ("META-INF/container.xml",r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="package.opf"/></rootfiles></container>"#,
+        ),
+        ("package.opf",r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">mobile-media-controls</dc:identifier><dc:title>Media controls</dc:title><dc:language>en</dc:language></metadata><manifest><item id="body" href="body.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="body"/></spine></package>"#,
+        ),
+        ("body.xhtml",body),
     ]{zip.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(content.as_bytes()).unwrap();}zip.finish().unwrap();
     let books=core.clone().import_book(path.to_string_lossy().into()).await.unwrap();
     let book=books.iter().find(|b|b.title=="Media controls").unwrap();
-    let viewport=Viewport{width:360,height:640,scale:1.0};
+    let viewport=Viewport{width:360,height:640,scale:1.0,
+    };
     let reader=core.clone().open_book(book.id.clone(),viewport.clone()).await.unwrap();
     reader.clone().configure(20.0,true,false).await.unwrap();
     assert!(reader.clone().prepare_media_references().await.unwrap());
@@ -1460,12 +1549,14 @@ async fn media_and_presentation(core:&Arc<MobileCore>,root:&std::path::Path) {
     let (origin,key)=reader.with(|s|{
         let section=s.source.parse_section(0).map_err(error)?;
         let text=section.blocks.iter().flat_map(Block::text_blocks).next().unwrap();
-        let key=rebook_publication::media_references::MediaKey{kind:rebook_publication::media_references::MediaKind::Table,number:"1.1".into()};
+        let key=rebook_publication::media_references::MediaKey{kind:rebook_publication::media_references::MediaKind::Table,number:"1.1".into(),
+            };
         Ok((text.source.clone().unwrap(),key))
     }).unwrap();
     let action=reader.with(|s|{let target=s.media.resolve(&origin,&key).unwrap();documents::reference(s,target)}).unwrap();
     assert_eq!(action.kind,"reference");
-    let preview=reader.clone().reference_page(action.target.clone(),0,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
+    let preview=reader.clone().reference_page(action.target.clone(),0,viewport.clone(),0xff000000,0xfff8f5ee,
+        ).await.unwrap();
     assert!(preview.page.info().regions.iter().any(|r|r.text.contains("Measurements")));
     reader.with(|s|{
         let original=s.pipeline.rewrite.parse_section(0).map_err(error)?;
@@ -1486,7 +1577,8 @@ async fn media_and_presentation(core:&Arc<MobileCore>,root:&std::path::Path) {
     assert!(!chart.active);
     let updated=reader.clone().toggle_document_control(action.target.clone(),chart).await.unwrap();
     assert!(updated.info().controls.iter().any(|c|c.kind=="chart"&&c.active));
-    let preview=reader.clone().reference_page(action.target.clone(),0,viewport.clone(),0xff000000,0xfff8f5ee).await.unwrap();
+    let preview=reader.clone().reference_page(action.target.clone(),0,viewport.clone(),0xff000000,0xfff8f5ee,
+        ).await.unwrap();
     assert!(preview.controls.iter().any(|c|c.kind=="chart"&&c.active));
     let formula=reader.clone().page().await.unwrap().info().controls.into_iter().find(|c|c.kind=="formula").unwrap();
     let updated=reader.clone().toggle_reading_control(formula).await.unwrap();

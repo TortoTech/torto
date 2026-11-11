@@ -1,8 +1,8 @@
 //! Renderer-independent pagination for normalized reading IR.
 #[cfg(test)]
-mod ruby_tests;
-#[cfg(test)]
 mod reader_regressions;
+#[cfg(test)]
+mod ruby_tests;
 
 #[cfg(test)]
 mod deferred_tests;
@@ -13,24 +13,24 @@ pub mod timing;
 use text_layout::{Layout, PositionedLayoutItem};
 
 mod caption_labels;
-mod formula_images;
-mod image_text;
-#[cfg(test)]
-mod image_sizing_tests;
-mod list_markers;
 #[cfg(test)]
 mod figure_typesetting_tests;
-mod formula_raster;
+mod formula_images;
 pub mod formula_notes;
+mod formula_raster;
 mod headings;
-mod text_figures;
 mod hyphen_cache;
+#[cfg(test)]
+mod image_sizing_tests;
+mod image_text;
+mod list_markers;
+mod media_captions;
 mod note_spacing;
 mod raster_cache;
 mod semantic_lists;
 mod semantic_paragraphs;
 mod table_captions;
-mod media_captions;
+mod text_figures;
 pub use table_captions::{Presentation as TablePresentation, presentation as table_presentation};
 mod table_shaping;
 mod table_widths;
@@ -1116,7 +1116,8 @@ pub struct ImagePlacement {
 
 impl ImagePlacement {
     pub fn visible_rect(&self) -> FixedPageTextRect {
-        self.clip.unwrap_or(FixedPageTextRect { x:self.x, y:self.y, width:self.width, height:self.height })
+        self.clip.unwrap_or(FixedPageTextRect { x:self.x, y:self.y, width:self.width, height:self.height,
+        })
     }
 }
 
@@ -1362,7 +1363,8 @@ pub fn svg_font_database() -> Arc<resvg::usvg::fontdb::Database> {
         // same platform fonts registered explicitly in its own shared database.
         #[cfg(target_os = "android")]
         {
-            for directory in ["/system/fonts", "/product/fonts", "/system_ext/fonts", "/vendor/fonts"] {
+            for directory in ["/system/fonts", "/product/fonts", "/system_ext/fonts", "/vendor/fonts",
+                ] {
                 fonts.load_fonts_dir(directory);
             }
             fonts.set_sans_serif_family("Roboto");
@@ -1762,7 +1764,8 @@ impl LayoutEngine {
             let block = layout_blocks[block_index];
             match block {
                 Block::Text(block) => {
-                    if unified_reflow && self.push_noted_formula(&mut paginator, source, block, reader_style, content_width)? {
+                    if unified_reflow && self.push_noted_formula(&mut paginator, source, block, reader_style, content_width,
+                        )? {
                         block_index += 1;
                         continue;
                     }
@@ -1991,7 +1994,8 @@ impl LayoutEngine {
                     let mut prepared = if captions.skip_title || captions.skip_sources > 0 {
                         self.shape_table_rows(source,
                             &table.rows[usize::from(captions.skip_title)..table.rows.len() - captions.skip_sources],
-                            reader_style, width)?
+                            reader_style, width,
+                        )?
                     } else {
                         self.shape_table(source, table, reader_style, width)?
                     };
@@ -2040,8 +2044,10 @@ impl LayoutEngine {
                     };
                     if unified_reflow {
                         let media_width = prepared.column_widths.iter().sum();
-                        self.align_media_sources(source, &mut before, reader_style, width, media_width)?;
-                        self.align_media_sources(source, &mut after, reader_style, width, media_width)?;
+                        self.align_media_sources(source, &mut before, reader_style, width, media_width,
+                        )?;
+                        self.align_media_sources(source, &mut after, reader_style, width, media_width,
+                        )?;
                     }
                     let before_gap = if before.is_empty() {
                         chart_gap
@@ -2125,9 +2131,10 @@ impl LayoutEngine {
                         paginator.push_fixed_page_replacement(&prepared, replacement)?;
                     }
                 }
-                Block::Figure(figure) if !figure.body.is_empty() => self.push_text_figure(
-                    &mut paginator, source, figure, reader_style,
-                )?,
+                Block::Figure(figure) if !figure.body.is_empty() => {
+                    self.push_text_figure(
+                    &mut paginator, source, figure, reader_style)?
+                }
                 Block::Figure(figure) => self.push_figure(
                     &mut paginator,
                     source,
@@ -2260,8 +2267,10 @@ impl LayoutEngine {
         if unified_reflow {
             let width = (content_width - media_start_offset).max(1.0);
             let media_width = images.iter().map(|(raster, style, _)| paginator.image_visible_size(raster, *style).0).fold(0.0, f32::max);
-            self.align_media_sources(source, &mut before_captions, reader_style, width, media_width)?;
-            self.align_media_sources(source, &mut after_captions, reader_style, width, media_width)?;
+            self.align_media_sources(source, &mut before_captions, reader_style, width, media_width,
+            )?;
+            self.align_media_sources(source, &mut after_captions, reader_style, width, media_width,
+            )?;
         }
         let outer_gap = if unified_reflow {
             reader_style.typography.font_size * reader_style.typesetting.media_gap_em
@@ -2496,6 +2505,61 @@ impl LayoutEngine {
         content_width: f32,
         unified_reflow: bool,
     ) -> Result<Vec<(PreparedText, Cow<'a, TextBlock>)>, LayoutError> {
+        // Translation inserts each companion after its original. Compose a
+        // split label/title within each language, never across the two.
+        if unified_reflow {
+            let companion = |original: &TextBlock, candidate: &TextBlock| {
+                candidate.source.is_none()
+                    && candidate.kind == original.kind
+                    && original.source.as_ref().is_some_and(|source| {
+                        candidate.style.reference_owner
+                            == Some(rebook_publication::source_block_identity(source))
+                    })
+            };
+            let mut ordered = Vec::with_capacity(captions.len());
+            let mut changed = false;
+            let mut i = 0;
+            while i < captions.len() {
+                if let Some(parts) = captions.get(i..i + 4)
+                    && caption_labels::standalone_label(&parts[0].content)
+                    && !parts[0].style.hard_break_after
+                    && parts[0].kind == TextBlockKind::Caption
+                    && parts[2].kind == TextBlockKind::Caption
+                    && !caption_labels::standalone_label(&parts[2].content)
+                    && companion(&parts[0], &parts[1])
+                    && companion(&parts[2], &parts[3])
+                {
+                    ordered.extend([
+                        parts[0].clone(),
+                        parts[2].clone(),
+                        parts[1].clone(),
+                        parts[3].clone(),
+                    ]);
+                    i += 4;
+                    changed = true;
+                } else {
+                    ordered.push(captions[i].clone());
+                    i += 1;
+                }
+            }
+            if changed {
+                return self
+                    .shape_captions_with_join(
+                        source,
+                        &ordered,
+                        reader_style,
+                        content_width,
+                        true,
+                        None,
+                    )
+                    .map(|group| {
+                        group
+                            .into_iter()
+                            .map(|(text, block)| (text, Cow::Owned(block.into_owned())))
+                            .collect()
+                    });
+            }
+        }
         self.shape_captions_with_join(
             source,
             captions,
@@ -2534,7 +2598,15 @@ impl LayoutEngine {
                 caption.kind == TextBlockKind::Caption
                     && caption_authored_alignment(caption, compound_caption).is_none(),
             );
-            if join == Some(index)
+            let inline_label = caption.kind == TextBlockKind::Caption
+                && !caption.style.hard_break_after
+                && caption_labels::standalone_label(&caption.content)
+                && captions.get(index + 1).is_some_and(|next| {
+                    next.kind == TextBlockKind::Caption
+                        && caption.source.is_some() == next.source.is_some()
+                        && !caption_labels::standalone_label(&next.content)
+                });
+            if (join == Some(index) || join.is_none() && inline_label)
                 && unified_reflow
                 && captions.get(index + 1).is_some_and(|title| {
                     // Joining must not erase either block's authored alignment,
@@ -3009,7 +3081,8 @@ impl LayoutEngine {
             None
         };
         let typography = &reader_style.typography;
-        let (text, mut spans, inline_images, source_text_start, citations, ruby_specs, image_text_ranges) =
+        let (text, mut spans, inline_images, source_text_start, citations, ruby_specs, image_text_ranges,
+        ) =
             prepare_inline_content(
                 block,
                 reader_style.foreground,
@@ -3146,8 +3219,7 @@ impl LayoutEngine {
             &mut layout,
             block,
             marker_width,
-            first_line_indent,
-        );
+            first_line_indent);
         let should_optimize = optimize_line_breaks
             && reader_style.typesetting.line_break_strategy == LineBreakStrategy::Optimized
             && ruby.is_empty()
@@ -3230,8 +3302,7 @@ impl LayoutEngine {
                         &mut layout,
                         block,
                         marker_width,
-                        first_line_indent,
-                    );
+                        first_line_indent);
                     let reusable = prepared.matches(&mut layout);
                     #[cfg(test)]
                     let reusable = reusable && !DISABLE_BREAK_PLAN_REUSE.with(|disabled| disabled.get());
@@ -3259,8 +3330,7 @@ impl LayoutEngine {
                         &mut adjusted,
                         block,
                         marker_width,
-                        first_line_indent,
-                    );
+                        first_line_indent);
                     if linebreak::parley::apply_breaks(
                         &mut adjusted,
                         &text,
@@ -3305,8 +3375,7 @@ impl LayoutEngine {
                 &mut layout,
                 block,
                 marker_width,
-                first_line_indent,
-            );
+                first_line_indent);
         }
         if !optimized {
             break_text_lines(&mut layout, Some(available_width));
@@ -3371,7 +3440,8 @@ impl LayoutEngine {
             let mut original = block.clone();
             for index in missing_images { if let Inline::Image(run) = &mut original.content[index] { run.image.ocr_text = None; } }
             return self.shape_text_with_sources(&original, reader_style, content_width, minimum_width,
-                inline_rasters, original_source_spans, optimize_line_breaks, formula_context);
+                inline_rasters, original_source_spans, optimize_line_breaks, formula_context,
+            );
         }
         let alignment = table_shaping::resolved_text_alignment(&layout, block, optimized);
         layout.align(alignment, AlignmentOptions::default());
@@ -4102,17 +4172,37 @@ fn resolve_text_block_with_caption_emphasis<'a>(
         && preserve_caption_bold
             .unwrap_or_else(|| caption_labels::preserve_single_bold(&block.content));
     let body_runs: Vec<_> = block.content.iter().flat_map(Inline::text_runs)
-        .filter(|run| !run.text.trim().is_empty()
+        .filter(|run| {
+            !run.text.trim().is_empty()
             && run.style.inline_role == InlineRole::Normal
-            && run.style.link_role == LinkRole::Normal).collect();
+            && run.style.link_role == LinkRole::Normal
+        }).collect();
     let body_paragraph = context == TextContext::Flow && block.kind == TextBlockKind::Paragraph;
     let uniform_bold = body_paragraph && !body_runs.is_empty()
         && body_runs.iter().all(|run| run.style.bold);
     let uniform_italic = body_paragraph && !body_runs.is_empty()
-        && body_runs.iter().all(|run| run.style.italic
+        && body_runs.iter().all(|run| {
+            run.style.italic
             && run.link.is_none()
-            && !run.style.emphasis && !run.style.alternate_voice && !run.style.citation);
+            && !run.style.emphasis && !run.style.alternate_voice && !run.style.citation
+        });
     let mut resolved = block.clone();
+    if block.kind.is_heading() {
+        for inline in &mut resolved.content {
+            if matches!(inline, Inline::Image(run) if run.presentation && run.image.alt.trim().is_empty()
+                && matches!(run.image.style.height, Some(rebook_publication::ImageLength::Pixels(h)) if h > 0.0 && h <= 4.0)
+                && matches!(run.image.style.width, Some(rebook_publication::ImageLength::Fraction(w)) if w >= 0.1))
+            {
+                // Preserve the image's one source character without drawing a
+                // publisher's decorative rule in unified headings.
+                *inline = Inline::Text(TextRun {
+                    text: "\u{2060}".into(),
+                    style: Default::default(),
+                    link: None,
+                });
+            }
+        }
+    }
     headings::normalize_internal(&mut resolved);
     let generated_display = matches!(block.content.as_slice(),[Inline::Math(run)] if run.original.is_some() && run.display);
     let typography = &reader_style.typography;
@@ -4209,7 +4299,21 @@ fn resolve_text_block_with_caption_emphasis<'a>(
     resolved.style.margin_after = margin_after;
     resolved.style.indent = if context == TextContext::Flow {
         match block.kind {
-            TextBlockKind::Paragraph => {
+            TextBlockKind::Paragraph => base_size * paragraph_indent_em(profile, display_system),
+            TextBlockKind::Blockquote
+                if matches!(
+                    resolved.style.align,
+                    TextAlignment::Center | TextAlignment::End
+                ) =>
+            {
+                0.0
+            }
+            TextBlockKind::Blockquote
+                if block
+                    .content
+                    .iter()
+                    .flat_map(Inline::text_runs)
+                    .any(|r| r.style.display_writing_system.is_some()) => {
                 base_size * paragraph_indent_em(profile, display_system)
             }
             TextBlockKind::Blockquote if block.style.indent > f32::EPSILON => base_size * 2.0,
@@ -4384,8 +4488,10 @@ fn resolve_text_block_with_caption_emphasis<'a>(
     if block.kind != TextBlockKind::Caption {
     rebook_publication::media_references::style_links(
         &mut resolved.content,
-        if reader_style.foreground.red > 128 { Rgba { red: 140, green: 180, blue: 245, alpha: 255 } }
-        else { Rgba { red: 45, green: 104, blue: 210, alpha: 255 } },
+        if reader_style.foreground.red > 128 { Rgba { red: 140, green: 180, blue: 245, alpha: 255,
+                } }
+        else { Rgba { red: 45, green: 104, blue: 210, alpha: 255,
+                } },
     );
     }
     web_links::detect(&mut resolved.content);
@@ -4446,7 +4552,33 @@ fn resolve_semantic_inline_presentation(
     fallback_writing_system: WritingSystem,
 ) {
     let original = std::mem::take(content);
+    let mut titles = Vec::new();
+    let mut opening = None;
+    let mut offset = 0;
+    for inline in &original {
+        if let Inline::Text(run) = inline {
+            for (at, ch) in run.text.char_indices() {
+                if ch == '《' {
+                    opening = Some(offset + at);
+                }
+                if ch == '》'
+                    && let Some(start) = opening.take()
+                {
+                    titles.push(start..offset + at + ch.len_utf8());
+                }
+            }
+            offset += run.text.len();
+        } else {
+            offset += '\u{fffc}'.len_utf8();
+        }
+    }
+    let mut offset = 0;
     for inline in original {
+        let base = offset;
+        offset += match &inline {
+            Inline::Text(r) => r.text.len(),
+            _ => '\u{fffc}'.len_utf8(),
+        };
         let Inline::Text(run) = inline else {
             content.push(inline);
             continue;
@@ -4465,14 +4597,27 @@ fn resolve_semantic_inline_presentation(
             continue;
         }
         for (range, script) in spans {
-            let mut style = run.style;
+            let mut cuts = vec![range.start, range.end];
+            for title in &titles {
+                for at in [title.start, title.end] {
+                    if at > base + range.start && at < base + range.end {
+                        cuts.push(at - base);
+                    }
+                }
+            }
+            cuts.sort_unstable();
+            cuts.dedup();
+            for cut in cuts.windows(2) {
+                let range = cut[0]..cut[1];
+                let book_title = titles.iter().any(|t| t.contains(&(base + range.start)));
+                let mut style = run.style;
             // CSS-only italics carry visual emphasis too. Adapt CJK spans to
             // bold, while semantic citations retain their existing neutral rule.
             let emphasized =
                 style.emphasis || style.alternate_voice || (style.italic && !style.citation);
             match script {
                 SemanticScriptClass::Cjk => {
-                    if emphasized {
+                    if emphasized && !book_title {
                         style.bold = true;
                     }
                     style.italic = false;
@@ -4488,6 +4633,7 @@ fn resolve_semantic_inline_presentation(
                 style,
                 link: run.link.clone(),
             }));
+            }
         }
     }
 }
@@ -5013,7 +5159,10 @@ fn consecutive_captions(blocks: &[&Block]) -> Vec<TextBlock> {
         .iter()
         .map_while(|block| match block {
             Block::Text(caption) if caption.kind == TextBlockKind::Caption
-                || caption.kind == TextBlockKind::QuoteAttribution && is_media_source(caption) => Some(caption.clone()),
+                || caption.kind == TextBlockKind::QuoteAttribution && is_media_source(caption) =>
+            {
+                Some(caption.clone())
+            }
             _ => None,
         })
         .collect()
@@ -5021,9 +5170,7 @@ fn consecutive_captions(blocks: &[&Block]) -> Vec<TextBlock> {
 
 pub fn is_media_source(caption: &TextBlock) -> bool {
     let text: String = caption.content.iter().flat_map(Inline::text_runs).map(|run| run.text.as_str()).collect();
-    let text = text.trim_start().to_lowercase();
-    ["source:", "sources:", "source：", "credit:", "credits:", "credit：", "来源:", "来源：", "图片来源:", "图片来源："]
-        .iter().any(|prefix| text.starts_with(prefix))
+    rebook_publication::media_notes::is_source(&text)
 }
 
 fn caption_authored_alignment(
@@ -5512,8 +5659,10 @@ fn prepare_inline_content(
                     text.push_str(ocr.display_text());
                     image_text_ranges.push((inline_index, start..text.len()));
                     spans.push(StyledRange { ruby: None, range: start..text.len(),
-                        style: image_text::style(block, inline_index, run.size_scale, fallback_color),
-                        footnote_reference_group: 0, hyphenation_suppressed: ocr.literal });
+                        style: image_text::style(block, inline_index, run.size_scale, fallback_color,
+                        ),
+                        footnote_reference_group: 0, hyphenation_suppressed: ocr.literal,
+                    });
                     continue;
                 }
                 let Some(image) = inline_rasters.get(inline_index).and_then(Clone::clone) else {
@@ -6209,7 +6358,9 @@ impl Paginator {
 
     fn image_visible_size(&self, image: &RasterImage, style: ImageStyle) -> (f32, f32) {
         let (w,h) = self.image_display_size(image, style);
-        let width = style.clip_width.map_or(w, |v| v.resolve((self.width-self.media_start_offset).max(1.0)).max(0.0).min(w));
+        let width = style.clip_width.map_or(w, |v| {
+            v.resolve((self.width-self.media_start_offset).max(1.0)).max(0.0).min(w)
+        });
         let height = style.clip_height.map_or(h, |v| v.resolve(self.bottom-self.top).max(0.0).min(h));
         if width <= 0.0 || height <= 0.0 { (0.0,0.0) } else { (width,height) }
     }
@@ -6312,7 +6463,8 @@ impl Paginator {
                 .collect()
         });
         self.items.push(PageItem::Image(ImagePlacement {
-            clip: (visible_width < width || visible_height < height).then_some(FixedPageTextRect { x, y: self.cursor_y, width: visible_width, height: visible_height }),
+            clip: (visible_width < width || visible_height < height).then_some(FixedPageTextRect { x, y: self.cursor_y, width: visible_width, height: visible_height,
+            }),
             formula_presentation: None,
             image,
             x,
@@ -6575,16 +6727,21 @@ pub enum LayoutError {
 
 #[cfg(test)]
 mod tests {
+    mod reading_regressions {
+        include!("reading_regressions.rs");
+    }
     include!("shaping_reuse_tests.rs");
 
     #[test]
     fn code_and_quote_urls_keep_their_visible_text_and_click_targets() {
         let url = "https://example.com/source";
         let mut engine = LayoutEngine::new();
-        for kind in [TextBlockKind::Preformatted, TextBlockKind::Blockquote, TextBlockKind::QuoteAttribution, TextBlockKind::Caption] {
+        for kind in [TextBlockKind::Preformatted, TextBlockKind::Blockquote, TextBlockKind::QuoteAttribution, TextBlockKind::Caption,
+        ] {
             let block = TextBlock {
                 kind, style: rebook_publication::BlockStyle { literal_links: true, ..Default::default() },
-                content: vec![Inline::Text(TextRun { text: url.into(), link: Some(PublicationUrl::website(url).unwrap()), style: TextStyle::default() })],
+                content: vec![Inline::Text(TextRun { text: url.into(), link: Some(PublicationUrl::website(url).unwrap()), style: TextStyle::default(),
+                })],
                 source: None,
             };
             for unified in [false, true] {
@@ -6602,15 +6759,21 @@ mod tests {
     #[test]
     fn syntax_colors_follow_theme_while_code_spacing_and_sources_are_unchanged() {
         let colors = rebook_publication::SyntaxColors {
-            light: Rgba { red: 180, green: 20, blue: 90, alpha: 255 },
-            dark: Rgba { red: 230, green: 150, blue: 210, alpha: 255 },
+            light: Rgba { red: 180, green: 20, blue: 90, alpha: 255,
+            },
+            dark: Rgba { red: 230, green: 150, blue: 210, alpha: 255,
+            },
         };
         let block = TextBlock {
             kind: TextBlockKind::Preformatted,
-            content: vec![Inline::Text(TextRun { text: "  let x = 1;\n".into(), link: None, style: TextStyle { syntax_colors: Some(colors), ..Default::default() } })],
+            content: vec![Inline::Text(TextRun { text: "  let x = 1;\n".into(), link: None, style: TextStyle { syntax_colors: Some(colors), ..Default::default() },
+            })],
             style: rebook_publication::BlockStyle { literal_links: true, margin_start: 16.0, margin_after: 0.0, ..Default::default() }, source: None,
         };
-        for (foreground, expected) in [(Rgba::BLACK, colors.light), (Rgba { red: 255, green: 255, blue: 255, alpha: 255 }, colors.dark)] {
+        for (foreground, expected) in [(Rgba::BLACK, colors.light), (Rgba { red: 255, green: 255, blue: 255, alpha: 255,
+                }, colors.dark,
+            ),
+        ] {
             let style = ReaderStyle { foreground, typesetting: ReaderTypesetting::unified(), ..Default::default() };
             let resolved = resolve_text_block(&block, &style, TextContext::Flow);
             assert_eq!(resolved.style.margin_start, 16.0);
@@ -7598,7 +7761,8 @@ mod tests {
     fn sentence_split_keeps_optimized_english_hyphenation() {
         let sentences=["A short opening sentence. ",
             "Extraordinary typographical considerations improve international readability and representation. ",
-            "Characteristically complicated terminology benefits from professionally balanced typography."];
+            "Characteristically complicated terminology benefits from professionally balanced typography.",
+        ];
         let mut block=TextBlock {
             kind:TextBlockKind::Paragraph,
             content:sentences.iter().enumerate().flat_map(|(i,s)| {
@@ -7606,7 +7770,8 @@ mod tests {
                 items.push(Inline::Text(TextRun {text:(*s).into(),style:TextStyle {
                     language:rebook_publication::TextLanguage::EnglishUs,
                     hyphenation:rebook_publication::HyphenationMode::Auto,..Default::default()
-                },link:None}));items
+                },link:None,
+                    }));items
             }).collect(),
             style:BlockStyle {sentence_indents:true,preserve_sentence_prefix:true,indent:24.0,..Default::default()},
             source:None,
@@ -7987,11 +8152,13 @@ mod tests {
     #[test]
     fn authored_group_alignment_survives_ai_quote_and_attribution_alignment() {
         let style=ReaderStyle {typesetting:ReaderTypesetting::unified(),..Default::default()};
-        for kind in [TextBlockKind::Paragraph,TextBlockKind::Blockquote,TextBlockKind::QuoteAttribution] {
+        for kind in [TextBlockKind::Paragraph,TextBlockKind::Blockquote,TextBlockKind::QuoteAttribution,
+        ] {
             for alignment in [TextAlignment::Center,TextAlignment::End] {
                 let block=TextBlock {kind,content:vec![],source:None,style:rebook_publication::BlockStyle {
                     paragraph_group:Some(7),authored_alignment:Some(alignment),semantic_alignment:Some(TextAlignment::Start),indent:32.0,..Default::default()
-                }};
+                },
+                };
                 let resolved=resolve_text_block(&block,&style,TextContext::Flow);
                 assert_eq!(resolved.style.align,alignment,"{kind:?}");
                 assert_eq!(resolved.style.indent,0.0);
@@ -10087,13 +10254,22 @@ mod tests {
 
     #[test]
     fn printed_page_numbers_hide_in_unified_prose_and_keep_source_positions() {
-        let source = EmptySource { book: Book { id: PublicationId::new("print-page-test").unwrap(), metadata: Metadata::default(), cover: None, sections: vec![], table_of_contents: vec![] } };
-        let runs = [("Before ", InlineRole::Normal), ("42", InlineRole::PageMarker), ("after.", InlineRole::Normal)];
-        let blocks = vec![Block::Text(TextBlock { kind: TextBlockKind::Paragraph, content: runs.into_iter().map(|(text, role)| Inline::Text(TextRun { text: text.into(), link: None, style: TextStyle { inline_role: role, ..Default::default() } })).collect(), style: Default::default(), source: None })];
+        let source = EmptySource { book: Book { id: PublicationId::new("print-page-test").unwrap(), metadata: Metadata::default(), cover: None, sections: vec![], table_of_contents: vec![],
+            },
+        };
+        let runs = [("Before ", InlineRole::Normal), ("42", InlineRole::PageMarker), ("after.", InlineRole::Normal),
+        ];
+        let blocks = vec![Block::Text(TextBlock { kind: TextBlockKind::Paragraph, content: runs.into_iter().map(|(text, role)| {
+                    Inline::Text(TextRun { text: text.into(), link: None, style: TextStyle { inline_role: role, ..Default::default() },
+                    })
+                }).collect(), style: Default::default(), source: None,
+        })];
         for unified in [false, true] {
             let style = ReaderStyle { typesetting: if unified { ReaderTypesetting::unified() } else { ReaderTypesetting::default() }, ..Default::default() };
-            let layout = LayoutEngine::new().layout_blocks(&source, &blocks, LayoutViewport::new(600, 600).unwrap(), &style).unwrap();
-            let text: String = layout.pages.iter().flat_map(|page| &page.items).filter_map(|item| match item { PageItem::Text(text) => Some(text.text.as_ref()), _ => None }).collect();
+            let layout = LayoutEngine::new().layout_blocks(&source, &blocks, LayoutViewport::new(600, 600).unwrap(), &style,
+                ).unwrap();
+            let text: String = layout.pages.iter().flat_map(|page| &page.items).filter_map(|item| match item { PageItem::Text(text) => Some(text.text.as_ref()), _ => None,
+                }).collect();
             assert_eq!(text.contains("42"), !unified);
             assert_eq!(text.replace('\u{2060}', "").replace("42", ""), "Before after.");
             assert_eq!(text.chars().count(), "Before 42after.".chars().count());
@@ -11223,7 +11399,8 @@ mod tests {
         };
         let text = |value: &str, kind| TextBlock {
             kind,
-            content: vec![Inline::Text(TextRun { text: value.into(), style: TextStyle::default(), link: None })],
+            content: vec![Inline::Text(TextRun { text: value.into(), style: TextStyle::default(), link: None,
+            })],
             style: BlockStyle::default(), source: None,
         };
         let block = Block::Figure(rebook_publication::FigureBlock {
@@ -11233,13 +11410,16 @@ mod tests {
                 href: PublicationUrl::parse("table.png").unwrap(), alt: "Table".into(),
                 style: ImageStyle::default(), source: None, text_layer: None,
             }],
-            captions: vec![text("Table 1. Results", TextBlockKind::Caption), text("Source: First author.", TextBlockKind::Paragraph)],
+            captions: vec![text("Table 1. Results", TextBlockKind::Caption), text("Source: First author.", TextBlockKind::Paragraph),
+            ],
             caption_position: CaptionPosition::Split(1), style: BlockStyle::default(), source: None,
         });
         for typesetting in [ReaderTypesetting::default(), ReaderTypesetting::unified()] {
             let style = ReaderStyle { typesetting, ..Default::default() };
-            let result = LayoutEngine::new().layout_blocks(&source, std::slice::from_ref(&block), LayoutViewport::new(800, 600).unwrap(), &style).unwrap();
-            let [PageItem::Text(before), PageItem::Image(image), PageItem::Text(after)] = result.pages[0].items.as_slice() else { panic!("caption / image / source"); };
+            let result = LayoutEngine::new().layout_blocks(&source, std::slice::from_ref(&block), LayoutViewport::new(800, 600).unwrap(), &style,
+                ).unwrap();
+            let [PageItem::Text(before), PageItem::Image(image), PageItem::Text(after),
+            ] = result.pages[0].items.as_slice() else { panic!("caption / image / source"); };
             assert!(before.text.contains("Table 1"));
             assert!(after.text.contains("Source:"));
             assert!(before.origin_y < image.y && image.y + image.height < after.origin_y);
@@ -11335,24 +11515,36 @@ mod tests {
         let style = ReaderStyle { typesetting: ReaderTypesetting::unified(), ..Default::default() };
         let source_block = |text: &str| TextBlock {
             kind: TextBlockKind::QuoteAttribution,
-            content: vec![Inline::Text(TextRun { text: text.into(), style: Default::default(), link: None })],
+            content: vec![Inline::Text(TextRun { text: text.into(), style: Default::default(), link: None,
+            })],
             style: BlockStyle { authored_alignment: Some(TextAlignment::Center), align: TextAlignment::Center, ..Default::default() }, source: None,
         };
         let short = source_block("Source: A.");
-        let long = source_block("Source: A very long photograph credit with authors, publisher and licensing information that needs several lines.");
+        let long = source_block("Source: A very long photograph credit with authors, publisher and licensing information that needs several lines.",
+        );
         let mut forced = short.clone();
-        forced.content.extend([Inline::Break, Inline::Text(TextRun { text: "A second credit.".into(), style: Default::default(), link: None })]);
-        for (text, expected) in [(&short, TextAlignment::End), (&long, TextAlignment::Start), (&forced, TextAlignment::Start)] {
+        forced.content.extend([Inline::Break, Inline::Text(TextRun { text: "A second credit.".into(), style: Default::default(), link: None,
+            }),
+        ]);
+        for (text, expected) in [(&short, TextAlignment::End), (&long, TextAlignment::Start), (&forced, TextAlignment::Start),
+        ] {
             let (_, resolved) = engine.shape_figure_caption(&source, text, &style, 200.0, true, false).unwrap();
             assert_eq!(resolved.style.align, expected);
         }
-        let (_, authored) = engine.shape_figure_caption(&source, &short, &ReaderStyle::default(), 200.0, false, false).unwrap();
+        let (_, authored) = engine.shape_figure_caption(&source, &short, &ReaderStyle::default(), 200.0, false, false,
+            ).unwrap();
         assert_eq!(authored.style.align, TextAlignment::Center);
         let blocks = [Block::Text(short.clone()), Block::Text(long.clone())];
-        let layout = engine.layout_blocks(&source, &blocks, LayoutViewport::new(500, 1000).unwrap(), &style).unwrap();
-        let texts: Vec<_> = layout.pages.iter().flat_map(|page| &page.items).filter_map(|item| if let PageItem::Text(t)=item {Some(t)}else{None}).collect();
+        let layout = engine.layout_blocks(&source, &blocks, LayoutViewport::new(500, 1000).unwrap(), &style,
+            ).unwrap();
+        let texts: Vec<_> = layout.pages.iter().flat_map(|page| &page.items).filter_map(|item| {
+                if let PageItem::Text(t)=item {Some(t)}else{None
+                }
+            }).collect();
         // A multi-paragraph source uses left alignment as one multi-line group.
-        assert!(texts.iter().all(|text| text.layout.get(text.lines.start).unwrap().metrics().offset.abs() < 0.01));
+        assert!(texts.iter().all(|text| {
+            text.layout.get(text.lines.start).unwrap().metrics().offset.abs() < 0.01
+        }));
         let caption = TextBlock { kind: TextBlockKind::Caption, ..source_block("Figure 1 Short caption") };
         let parts = [caption, short];
         let group = engine.shape_figure_captions(&source, &parts, &style, 500.0, true).unwrap();

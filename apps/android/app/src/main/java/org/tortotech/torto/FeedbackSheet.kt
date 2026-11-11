@@ -63,7 +63,7 @@ import org.json.JSONObject
                                 if(!state.locked)TextButton({model.removeImage(image.index)},enabled=!disabled){Text(tr("移除","Remove"))}
                             }
                         }}
-                        if(state.images.size<3&&!state.locked)OutlinedButton(onClick={picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))},enabled=!disabled){AppIcon("image",size=18.dp);Spacer(Modifier.width(8.dp));Text(tr("添加截图","Add screenshots"))}
+                        if(state.images.size<3&&!state.locked)OutlinedButton(onClick={picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))},enabled=!disabled){AppIcon("image",size=IconSizes.Compact);Spacer(Modifier.width(8.dp));Text(tr("添加截图","Add screenshots"))}
                     }
                     if(state.working)LinearProgressIndicator(Modifier.fillMaxWidth())
                     var expanded by rememberSaveable {mutableStateOf(false)}

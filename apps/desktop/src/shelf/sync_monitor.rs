@@ -1,7 +1,7 @@
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use std::time::Duration;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::sync_schedule::SyncSchedule;
 use crate::sync::{SyncMode, SyncStore};
@@ -38,6 +38,8 @@ pub(super) struct SyncDecision {
 struct Probe {
     reading: Result<Option<u64>, String>,
     derived: Result<Option<String>, String>,
+    annotations: Option<u64>,
+    signal: Option<rebook_app_core::sync::SyncSignal>,
 }
 
 struct MonitorState {
@@ -48,6 +50,15 @@ struct MonitorState {
 impl MonitorState {
     fn observe(&mut self, probe: Probe, now: Instant, now_ms: u64) -> Option<SyncDecision> {
         let mut refresh = false;
+        let signal_changed = if let Some(signal) = &probe.signal {
+            let previous = self.schedule.clone();
+            self.schedule.observe_signal(signal, now);
+            previous != self.schedule
+        } else {
+            false
+        };
+        self.schedule
+            .observe_annotations(probe.annotations, now, now_ms);
         if let Ok(token) = probe.derived {
             refresh = self.schedule.observe_derived(token);
         }
@@ -62,7 +73,7 @@ impl MonitorState {
                 }
             }
         };
-        (refresh || mode.is_some()).then(|| SyncDecision {
+        (signal_changed || refresh || mode.is_some()).then(|| SyncDecision {
             schedule: self.schedule.clone(),
             mode,
             refresh,
@@ -103,12 +114,29 @@ impl SyncMonitor {
                 schedule: key.schedule,
                 running: key.running,
             };
+            let wake = store.wake();
+            let mut changes = wake.subscribe();
             let mut first = true;
             loop {
                 if !first {
-                    tokio::time::sleep(state.schedule.poll_delay(Instant::now())).await;
+                    if state.running {
+                        if changes.changed().await.is_err() {
+                            return;
+                        }
+                    } else {
+                        let timer = std::pin::pin!(tokio::time::sleep(
+                            state.schedule.poll_delay(Instant::now())
+                        ));
+                        let changed = std::pin::pin!(changes.changed());
+                        if let futures_util::future::Either::Right((Err(_), _)) =
+                            futures_util::future::select(timer, changed).await
+                        {
+                            return;
+                        }
+                    }
                 }
                 first = false;
+                let signal = changes.borrow_and_update().clone();
                 let store = store.clone();
                 let account = key.account.clone();
                 let running = key.running;
@@ -124,6 +152,8 @@ impl SyncMonitor {
                             .map_err(|error| error.to_string())
                     },
                     derived: crate::sync::derived_change_token().map_err(|error| error.to_string()),
+                    annotations: store.pending_annotation_time(&account).ok().flatten(),
+                    signal: Some(signal),
                 })
                 .await;
                 let probe = match result {
@@ -172,6 +202,8 @@ mod tests {
         Probe {
             reading: Ok(reading),
             derived: Ok(derived.map(str::to_owned)),
+            annotations: None,
+            signal: None,
         }
     }
 
@@ -215,8 +247,8 @@ mod tests {
             state
                 .observe(
                     probe(Some(60_000), None),
-                    now + Duration::from_secs(70),
-                    70_000
+                    now + Duration::from_secs(75),
+                    75_000
                 )
                 .unwrap()
                 .mode,
@@ -322,9 +354,9 @@ mod tests {
             running: false,
         };
         let now = Instant::now();
-        let later = now + Duration::from_secs(15 * 60);
+        let later = now + Duration::from_secs(20 * 60);
         let mode = state
-            .observe(probe(None, None), later, 900_000)
+            .observe(probe(None, None), later, 1_200_000)
             .unwrap()
             .mode
             .unwrap();

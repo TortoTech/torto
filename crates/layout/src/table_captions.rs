@@ -157,19 +157,7 @@ pub fn presentation(table: &TableBlock, unified: bool) -> Presentation<'_> {
         if width < 2
             || cell.row_span != 1
             || usize::from(cell.column_span) < width
-            || ![
-                "source:",
-                "sources:",
-                "source：",
-                "note:",
-                "notes:",
-                "来源:",
-                "来源：",
-                "注:",
-                "注：",
-            ]
-            .iter()
-            .any(|prefix| lower.starts_with(prefix))
+            || !rebook_publication::media_notes::is_annotation(&lower)
         {
             break;
         }

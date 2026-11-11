@@ -88,7 +88,7 @@ import org.tortotech.torto.core.StatisticsPeriod
     val cover by produceState<Bitmap?>(null,id){value=model.cover(id)}
     Box(Modifier.width(width.dp).height((width*1.4f).dp).clip(RoundedCornerShape(5.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest),contentAlignment=Alignment.Center) {
         cover?.let {Image(it.asImageBitmap(),null,Modifier.fillMaxSize(),contentScale=ContentScale.Crop)}
-            ?: AppIcon("book",tint=MaterialTheme.colorScheme.onSurfaceVariant)
+            ?: AppIcon("book",tint=defaultIconColor())
     }
 }
 private fun statisticsDate(ms:ULong?):String=if(ms==null||ms==0uL)"—" else Instant.ofEpochMilli(ms.toLong()).atZone(ZoneId.systemDefault()).toLocalDate().toString().replace('-','/')
@@ -147,7 +147,7 @@ private fun statisticsDate(ms:ULong?):String=if(ms==null||ms==0uL)"—" else Ins
                             StatisticsTime(book.milliseconds,20)
                             Text(book.title.ifEmpty {tr("未知书籍","Unknown book")},style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=1,overflow=TextOverflow.Ellipsis)
                         }
-                        Spacer(Modifier.width(8.dp));AppIcon("next",size=18.dp,tint=MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.width(8.dp));AppIcon("next",size=IconSizes.Chevron,tint=defaultIconColor())
                     }
                 }
             }

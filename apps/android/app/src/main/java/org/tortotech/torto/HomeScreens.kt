@@ -32,7 +32,7 @@ import org.tortotech.torto.core.*
             val cover by produceState<Bitmap?>(model.cachedCover(book.id),book.id,state.cloudStatus.coverRevision){value=model.cover(book.id)}
             Column(Modifier.combinedClickable(onClick={model.open(book)},onLongClick={onActions(book)})) {
                 Box(Modifier.fillMaxWidth().aspectRatio(.7f).shadow(3.dp,RoundedCornerShape(6.dp)).clip(RoundedCornerShape(6.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest),contentAlignment=Alignment.Center) {
-                    cover?.let { Image(it.asImageBitmap(),null,Modifier.fillMaxSize(),contentScale=ContentScale.Crop) } ?: AppIcon("book",size=32.dp,tint=MaterialTheme.colorScheme.onSurfaceVariant)
+                    cover?.let { Image(it.asImageBitmap(),null,Modifier.fillMaxSize(),contentScale=ContentScale.Crop) } ?: AppIcon("book",size=40.dp,tint=defaultIconColor())
                 }
                 Spacer(Modifier.height(8.dp));Text(book.title,style=MaterialTheme.typography.titleSmall,fontSize=12.sp,maxLines=1,overflow=TextOverflow.Ellipsis)
             }
@@ -60,14 +60,14 @@ import org.tortotech.torto.core.*
                 Spacer(Modifier.height(12.dp));Text(state.statistics?.let { durationLabel(it.today) } ?: "—",style=MaterialTheme.typography.headlineMedium)
                 Text(tr("今日阅读","Today"));Spacer(Modifier.height(8.dp))
                 Text(tr("本周","This week")+" ${state.statistics?.let { durationLabel(it.week) } ?: "—"} · ${state.statistics?.days ?: 0u} "+tr("天","days"),style=MaterialTheme.typography.bodyMedium)
-            };AppIcon("next")}
+            };AppIcon("next",size=IconSizes.Chevron)}
         } }
     }
 }
-@Composable fun SettingsScreen(open:(String)->Unit) {
+@Composable fun SettingsScreen(state:ScreenState,open:(String)->Unit) {
     LazyColumn(contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
         item { SettingsGroup {
-            SettingsRow("settings",tr("系统","System")){open("system")}
+            InterfaceSettingsRows(state,open)
             SettingsRow("type",tr("排版","Typesetting")){open("typography")}
         } }
         item { SettingsGroup {
@@ -77,7 +77,7 @@ import org.tortotech.torto.core.*
         } }
         item { SettingsGroup {
             SettingsRow("cloud",tr("云同步","Cloud sync")){open("sync")}
-            SettingsRow("info",tr("关于 Torto","About Torto")){open("about")}
+            SettingsRow("info",tr("关于","About")){open("about")}
         } }
     }
 }

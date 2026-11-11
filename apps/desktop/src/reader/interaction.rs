@@ -510,6 +510,7 @@ impl DesktopReader {
                 );
                 if focus {
                     self.focus_anchor = Some(anchor);
+                    if let Some(store)=&self.progress_store {store.wake().allow_progress(&self.book_id);}
                     self.persist_progress();
                 }
                 self.selected_highlight_id = Some(id.to_owned());

@@ -54,7 +54,8 @@ internal class FeedbackModel(application:Application):AndroidViewModel(applicati
         mutable.update {old->if(old.loading&&!restore)return@update old
             old.copy(loading=false,
             kind=if(restore||result.locked)result.kind else old.kind,description=if(restore||result.locked)result.description else old.description,
-            count=result.count,valid=result.valid&&(restore||result.locked||old.kind==result.kind&&old.description==result.description),locked=result.locked,
+            count=if(restore||result.locked)result.count else old.count,
+            valid=if(restore||result.locked)result.valid else old.valid,locked=result.locked,
             images=if(!restore&&old.images.size==result.images.size)old.images else result.images,
             context=result.context,status=result.status,error=result.error,retryUntil=result.retryUntil,
             issueUrl=result.issueUrl,issueNumber=result.issueNumber)
@@ -62,16 +63,22 @@ internal class FeedbackModel(application:Application):AndroidViewModel(applicati
     }
     fun edit(kind:String=state.value.kind,description:String=state.value.description){
         if(state.value.loading||state.value.locked||state.value.working||state.value.sending)return
-        mutable.update {it.copy(kind=kind,description=description,valid=false,error=null)}
+        val validation=validateFeedbackDescription(description)
+        mutable.update {it.copy(kind=kind,description=description,count=validation.count,valid=validation.valid,error=null)}
         editJob?.cancel()
         editJob=viewModelScope.launch {delay(600);operations.withLock {flush()}}
     }
-    private suspend fun flush(){
-        val current=session ?: return
+    private suspend fun flush():Boolean {
+        val current=session ?: return false
         val draft=state.value
-        if(draft.loading||draft.locked||draft.status=="submitted")return
-        try {withContext(NonCancellable){val result=current.edit(draft.kind,draft.description);if(session===current)apply(result)}}
-        catch(e:CancellationException){throw e}catch(_:Exception){mutable.update {it.copy(error="storage")}}
+        if(draft.loading||draft.status=="submitted")return false
+        if(draft.locked)return true
+        return try {withContext(NonCancellable){
+            val result=current.edit(draft.kind,draft.description)
+            if(session===current)apply(result)
+            session===current&&result.kind==draft.kind&&result.description==draft.description
+        }}
+        catch(e:CancellationException){throw e}catch(_:Exception){mutable.update {it.copy(error="storage")};false}
     }
     fun close(){
         generation++;previewGeneration++
@@ -80,10 +87,10 @@ internal class FeedbackModel(application:Application):AndroidViewModel(applicati
         viewModelScope.launch {operations.withLock {flush()}}
     }
     fun submit(){
-        if(state.value.working||state.value.sending||state.value.loading)return
+        if(state.value.working||state.value.sending||state.value.loading||!state.value.valid)return
         editJob?.cancel();mutable.update {it.copy(sending=true,error=null)}
         viewModelScope.launch {
-            val current=operations.withLock {flush();session} ?: run {mutable.update {it.copy(sending=false,error="storage")};return@launch}
+            val current=operations.withLock {if(flush())session else null} ?: run {mutable.update {it.copy(sending=false,error="storage")};return@launch}
             try {val result=current.submit();if(session===current)apply(result)}
             catch(e:CancellationException){throw e}catch(_:Exception){mutable.update {it.copy(error="network")}}
             finally {if(session===current)mutable.update {it.copy(sending=false)}}

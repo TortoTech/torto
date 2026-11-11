@@ -25,6 +25,11 @@ pub(crate) struct State {
     error_serial: u64,
     error_kind: String,
 }
+impl State {
+    pub(crate) fn mark_view_dirty(&mut self) {
+        self.view_dirty = true;
+    }
+}
 struct Running {
     request: Arc<chat::ChatRequest>,
     kind: Kind,
@@ -107,24 +112,14 @@ async fn update(
         return Ok(());
     }
     let r = reader.clone();
-    let (target, source, book, toc, settings, translated, revision, changed, popup) =
+    let (target, source, book, toc, settings, translated, revision, popup) =
         work(move || {
             r.with(|s| {
                 let mut settings = PluginSettings::load_default().map_err(error)?;
                 settings.target_language = settings.resolved_target_language(
                     rebook_app_core::preferences::AppLanguage::system_translation_target(),
                 );
-                let reading = settings::load_reading(&s.root);
-                let changed = s.options.translated != reading.translated;
-                s.options.translated = reading.translated;
-                s.pipeline
-                    .translation
-                    .set_enabled(reading.translated)
-                    .map_err(error)?;
-                if changed {
-                    s.enhancements.dirty = true;
-                }
-                let popup = s.document.is_some();
+            let popup = s.document.is_some();
                 let target = documents::translation_target(s).map(Ok).unwrap_or_else(|| requests::target(s))?;
                 Ok((
                     target,
@@ -132,9 +127,8 @@ async fn update(
                     s.book_id.clone(),
                     s.session.toc_items().to_vec(),
                     settings,
-                    reading.translated,
+                s.options.translated,
                     s.pipeline.rewrite.revision(),
-                    changed,
                     popup,
                 ))
             })
@@ -150,7 +144,8 @@ async fn update(
         let source = source.clone();
         let mut demand = original_demand.clone();
         work(move || {
-            rebook_app_core::reading_text::append_linked_footnote_translation_ranges(source.as_ref(), &mut demand);
+            rebook_app_core::reading_text::append_linked_footnote_translation_ranges(source.as_ref(), &mut demand,
+            );
             Ok(demand)
         }).await?
     } else { original_demand.clone() };
@@ -170,7 +165,7 @@ async fn update(
         }
         let resume =
             (state.interacting && !activity.interacting) || state.epoch != activity.ui_epoch || state.popup != popup;
-        state.view_dirty |= resume || changed;
+        state.view_dirty |= resume;
         state.listener = Some(listener);
         state.active = true;
         state.interacting = activity.interacting;
@@ -178,7 +173,9 @@ async fn update(
         state.manual_layout = activity.manual_layout;
         state.epoch = activity.ui_epoch;
         state.demand = demand.clone();
-        let obsolete = state.requests.iter().filter(|(key,work)| !activity.interacting && key.contains("\"linked-note\"") && !reading_ai::relevant(work.index,&work.sources,&demand)).map(|(key,_)|key.clone()).collect::<Vec<_>>();
+        let obsolete = state.requests.iter().filter(|(key,work)| {
+                !activity.interacting && key.contains("\"linked-note\"") && !reading_ai::relevant(work.index,&work.sources,&demand)
+            }).map(|(key,_)|key.clone()).collect::<Vec<_>>();
         for key in obsolete {if let Some(work)=state.requests.remove(&key){work.request.cancel();}}
         reset
     };
@@ -195,9 +192,6 @@ async fn update(
     reader.scheduler.update(demand.clone(), activity.interacting);
     // Resuming interaction may publish results already marked dirty by a
     // worker; it must not invent a source change and redraw unchanged pixels.
-    if changed {
-        content_changed(&reader).await;
-    }
     if activity.interacting {
         emit(&reader, None, None);
         return Ok(());
@@ -211,10 +205,14 @@ async fn update(
     if translated {
         for (index, ranges) in &demand {
             let linked = if popup { ranges.clone() } else {
-                ranges.iter().filter(|range| !original_demand.iter().any(|(i,rs)| i==index && rs.contains(range))).cloned().collect()
+                ranges.iter().filter(|range| {
+                        !original_demand.iter().any(|(i,rs)| i==index && rs.contains(range))
+                    }).cloned().collect()
             };
             if !linked.is_empty() {
-                start_note_translation(&reader, &context, requests::Target {index:*index, ranges:linked, prefetch:false, defer:false});
+                start_note_translation(&reader, &context, requests::Target {index:*index, ranges:linked, prefetch:false, defer:false,
+                    },
+                );
             }
         }
     }
@@ -435,7 +433,9 @@ fn start_note_translation(reader: &Arc<MobileReader>, context: &str, target: req
         if !state.active || state.context != context || state.done.contains(&key) || state.requests.contains_key(&key) {return;}
         if state.requests.len() >= reading_ai::MAX_QUEUED {state.replan=true;return;}
         let request = chat::ChatRequest::new();
-        state.requests.insert(key.clone(), Running {request:request.clone(),kind:Kind::Translation,index:target.index,sources:target.ranges.clone()});
+        state.requests.insert(key.clone(), Running {request:request.clone(),kind:Kind::Translation,index:target.index,sources:target.ranges.clone(),
+            },
+        );
         request
     };
     let reader=reader.clone();let context=context.to_owned();

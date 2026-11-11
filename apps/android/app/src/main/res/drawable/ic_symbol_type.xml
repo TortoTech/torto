@@ -1,6 +1,6 @@
-<!-- Google Material Symbols Rounded, Apache-2.0. Source: symbols/web/text_fields/materialsymbolsrounded/text_fields_24px.svg -->
+<!-- Google Material Symbols Rounded, wght 300, Apache-2.0. Source: symbols/web/text_fields/materialsymbolsrounded/text_fields_wght300_24px.svg -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="960" android:viewportHeight="960">
     <group android:translateX="-0" android:translateY="960">
-        <path android:fillColor="@android:color/white" android:pathData="M340-160q-25 0-42.5-17.5T280-220v-460H140q-25 0-42.5-17.5T80-740q0-25 17.5-42.5T140-800h400q25 0 42.5 17.5T600-740q0 25-17.5 42.5T540-680H400v460q0 25-17.5 42.5T340-160Zm360 0q-25 0-42.5-17.5T640-220v-260h-60q-25 0-42.5-17.5T520-540q0-25 17.5-42.5T580-600h240q25 0 42.5 17.5T880-540q0 25-17.5 42.5T820-480h-60v260q0 25-17.5 42.5T700-160Z"/>
+        <path android:fillColor="@android:color/white" android:pathData="M341.11-180q-17.65 0-30.15-12.34t-12.5-29.97V-695H142.69q-17.79 0-30.24-12.43T100-737.62q0-17.76 12.34-30.07Q124.68-780 142.31-780h396.92q17.79 0 30.24 12.35 12.45 12.36 12.45 30 0 17.65-12.34 30.15T539.62-695H383.46v472.31q0 17.79-12.35 30.24t-30 12.45Zm357.31 0q-17.65 0-29.96-12.34-12.3-12.34-12.3-29.97v-274.61h-76.54q-17.79 0-30.24-12.44-12.46-12.43-12.46-30.19t12.34-30.06q12.34-12.31 29.97-12.31h238.08q17.79 0 30.24 12.35t12.45 30q0 17.65-12.34 30.15t-29.97 12.5h-76.92v274.61q0 17.63-12.35 29.97-12.36 12.34-30 12.34Z"/>
     </group>
 </vector>
