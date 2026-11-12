@@ -144,7 +144,7 @@ pub(super) fn scoped(parent: Node<'_, '_>) -> bool {
             }
         } else if let Some(leaf) = leaf(child) {
             let text = node_text(leaf);
-            if table_label(&text) {
+            if table_label(&text) || has_table_caption_semantics(leaf) {
                 numbered = true;
             } else if !note_prefix(&text) {
                 plain += 1;
@@ -201,6 +201,39 @@ pub(super) fn previous_number(block: &Block) -> Option<String> {
             .collect();
         number(&value)
     })
+}
+
+pub(super) fn previous_media(blocks: &[Block]) -> bool {
+    // Notes and a caption may intervene, but ordinary prose and headings are
+    // hard boundaries. Bound this local look-back independently of book size.
+    for block in blocks.iter().rev().take(12) {
+        match block {
+            Block::Image(_) | Block::Figure(_) | Block::Table(_) => return true,
+            Block::Note(note) if note.kind == super::super::NoteBlockKind::Definition => {}
+            Block::Text(text)
+                if !matches!(
+                    text.kind,
+                    TextBlockKind::Heading(_) | TextBlockKind::HeadingOrdinal(_)
+                ) =>
+            {
+                let value: String = text
+                    .content
+                    .iter()
+                    .flat_map(|inline| inline.text_runs())
+                    .map(|run| run.text.as_str())
+                    .collect();
+                if text.kind != TextBlockKind::Caption
+                    && !table_label(&value)
+                    && !super::super::structured_figures::numbered_caption_text(&value)
+                    && !rebook_publication::media_notes::is_annotation(&value)
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// A superscript definition belongs to a table only when its marker also

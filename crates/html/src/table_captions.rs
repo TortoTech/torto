@@ -110,28 +110,45 @@ fn annotation(node: Node<'_, '_>, scoped: bool) -> Option<bool> {
 // Only transparent wrappers may be traversed. Never steal a caption from a
 // neighboring table group or infer a grid from a layout table's cell contents.
 fn carrier(node: Node<'_, '_>) -> bool {
+    carrier_images(node, &mut 64).is_some()
+}
+
+// Zero denotes one native table; positive values count a pure image bundle.
+// Reject mixed media, prose and oversized wrappers rather than swallowing them.
+fn carrier_images(node: Node<'_, '_>, budget: &mut usize) -> Option<usize> {
+    *budget = budget.checked_sub(1)?;
     if node.has_tag_name("table") {
-        return true;
+        return Some(0);
     }
     if matches!(node.tag_name().name(), "img" | "image") {
-        return true;
+        return Some(1);
     }
     if !matches!(
         node.tag_name().name(),
         "div" | "p" | "figure" | "section" | "article" | "html" | "body"
     ) {
-        return false;
+        return None;
     }
-    let elements = node
+    if node
+        .children()
+        .any(|child| child.is_text() && !child.text().unwrap_or_default().trim().is_empty())
+    {
+        return None;
+    }
+    let mut elements = node
         .children()
         .filter(Node::is_element)
         .filter(|child| !ignorable(*child))
-        .collect::<Vec<_>>();
-    !node
-        .children()
-        .any(|child| child.is_text() && !child.text().unwrap_or_default().trim().is_empty())
-        && elements.len() == 1
-        && carrier(elements[0])
+        .take(9);
+    let mut images = carrier_images(elements.next()?, budget)?;
+    for child in elements {
+        let next = carrier_images(child, budget)?;
+        if images == 0 || next == 0 || images + next > 8 {
+            return None;
+        }
+        images += next;
+    }
+    Some(images)
 }
 
 fn ignorable(node: Node<'_, '_>) -> bool {
@@ -171,8 +188,7 @@ impl ReadingIrParser<'_> {
         if !text.chars().any(char::is_alphabetic) || text.chars().count() > 1024 {
             return;
         }
-        if rebook_publication::media_notes::is_annotation(&text)
-        {
+        if rebook_publication::media_notes::is_annotation(&text) {
             return;
         }
         let mut source_rows = table.descendants().filter(|node| {
@@ -248,11 +264,9 @@ impl ReadingIrParser<'_> {
                     })
             });
         // Repeated spanning rows usually denote data groups, not one table title.
-        let repeated_groups = rows
-            .iter()
-            .skip(2)
-            .any(|row| {
-            row.cells.len() == 1 && usize::from(row.cells[0].column_span) >= width
+        let repeated_groups = rows.iter().skip(2).any(|row| {
+            row.cells.len() == 1
+                && usize::from(row.cells[0].column_span) >= width
                 && !table_note_text(&row.cells[0].text)
         });
         let question = text.trim_end().ends_with(['?', '？']);
@@ -365,6 +379,20 @@ impl ReadingIrParser<'_> {
             }
         }
         if index == nodes.len() || !carrier(nodes[index]) {
+            return Ok(None);
+        }
+        if !scoped
+            && before_nodes.first().is_some_and(|(_, note)| *note)
+            && before_nodes.iter().any(|(_, note)| !note)
+            && structure::previous_media(&self.blocks)
+            && !before_nodes
+                .iter()
+                .take_while(|(_, note)| *note)
+                .any(|(note, _)| structure::targets(*note, nodes[index]))
+        {
+            // A new title starts the next group. Leading notes still belong
+            // to the preceding media, even when its caption intervenes.
+            // Parsing them normally also preserves their original source IDs.
             return Ok(None);
         }
         if !scoped
@@ -506,10 +534,8 @@ impl ReadingIrParser<'_> {
             table.before = before;
             table.after.extend(after);
             self.blocks.push(Block::Table(table));
-        } else if parsed.len() == 1 && matches!(parsed[0], Block::Image(_)) {
-            let Block::Image(image) = parsed.remove(0) else {
-                unreachable!()
-            };
+        } else if !parsed.is_empty() && parsed.iter().all(|block| matches!(block, Block::Image(_)))
+        {
             let position = if before.is_empty() {
                 CaptionPosition::After
             } else if !after.is_empty() {
@@ -517,12 +543,35 @@ impl ReadingIrParser<'_> {
             } else {
                 CaptionPosition::Before
             };
+            let source = before
+                .first()
+                .and_then(|text| text.source.as_ref())
+                .or_else(|| parsed.first().and_then(super::block_source_range))
+                .zip(
+                    after
+                        .last()
+                        .and_then(|text| text.source.as_ref())
+                        .or_else(|| parsed.last().and_then(super::block_source_range)),
+                )
+                .map(|(first, last)| super::SourceRange {
+                    start: first.start.clone(),
+                    end: last.end.clone(),
+                });
+            let images = parsed
+                .into_iter()
+                .map(|block| {
+                    let Block::Image(image) = block else {
+                        unreachable!()
+                    };
+                    image
+                })
+                .collect();
             before.extend(after);
             self.blocks.push(Block::Figure(FigureBlock {
                 body: Vec::new(),
-                source: image.source.clone(),
+                source,
                 style: BlockStyle::default(),
-                images: vec![image],
+                images,
                 captions: before,
                 caption_position: position,
             }));
@@ -536,8 +585,12 @@ impl ReadingIrParser<'_> {
 }
 
 fn table_note_text(text: &TextBlock) -> bool {
-    let value: String = text.content.iter().flat_map(|inline| inline.text_runs())
-        .map(|run| run.text.as_str()).collect();
+    let value: String = text
+        .content
+        .iter()
+        .flat_map(|inline| inline.text_runs())
+        .map(|run| run.text.as_str())
+        .collect();
     rebook_publication::media_notes::is_annotation(&value)
 }
 

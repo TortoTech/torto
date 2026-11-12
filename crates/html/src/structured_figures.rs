@@ -401,6 +401,15 @@ pub(super) fn attach_sources(blocks: &mut Vec<Block>) {
                     }
                     continue;
                 }
+                if matches!(text.kind, TextBlockKind::Paragraph | TextBlockKind::QuoteAttribution)
+                    && let Some(Block::Table(table)) = result.last_mut()
+                {
+                    // A table wrapper may end before its authored source.
+                    // Keep this trailing note with that grid, just as when
+                    // both are siblings inside the wrapper.
+                    table.after.push(text);
+                    continue;
+                }
             }
             result.push(Block::Text(text));
         } else {
