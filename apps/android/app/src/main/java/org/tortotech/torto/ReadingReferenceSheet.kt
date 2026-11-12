@@ -26,13 +26,6 @@ import org.tortotech.torto.core.referenceColor
     val pane=tr("脚注内容","Footnote content")
     ModalBottomSheet(onDismissRequest=model::dismissInteraction,sheetState=rememberModalBottomSheetState(skipPartiallyExpanded=true),containerColor=MaterialTheme.colorScheme.surfaceContainerLow){
         Column(Modifier.fillMaxWidth().padding(horizontal=20.dp).navigationBarsPadding().padding(bottom=12.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
-            if(!note){
-                Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically){
-                    Text(interaction.text,Modifier.weight(1f),style=MaterialTheme.typography.titleMedium,fontWeight=FontWeight.SemiBold)
-                    ActionIcon("close",tr("关闭引用","Close reference")){model.dismissInteraction()}
-                }
-                HorizontalDivider(color=MaterialTheme.colorScheme.outlineVariant.copy(alpha=.45f),thickness=.5.dp)
-            }
             val size=(fontSize*.8f).coerceAtLeast(14f)/LocalDensity.current.fontScale
             val style=TextStyle(fontSize=size.sp,lineHeight=(size*1.5f).sp,fontWeight=FontWeight.Medium)
             val measurer=rememberTextMeasurer()

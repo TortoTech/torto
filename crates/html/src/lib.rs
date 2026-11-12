@@ -23,6 +23,8 @@ pub use recognized_tables::{parse_recognized_table, validate_recognized_table};
 mod font_faces;
 pub use font_faces::FontTraits;
 mod image_context;
+mod image_sources;
+mod css_imports;
 #[cfg(test)]
 mod media_context_tests;
 #[cfg(test)]
@@ -101,6 +103,10 @@ fn classify_footnote_links(
     }
 
     for (index, node) in anchors.iter().copied().enumerate() {
+        if media_return_link(node) {
+            roles.insert(node.range().start, LinkRole::Normal);
+            continue;
+        }
         let Some(source_fragment) = footnote_reference_fragment(node) else {
             continue;
         };
@@ -129,6 +135,7 @@ fn classify_footnote_links(
                 if !candidate.is_element()
                     || !candidate.tag_name().name().eq_ignore_ascii_case("a")
                     || candidate.range().start == node.range().start
+                    || media_return_link(*candidate)
                     || !matching_footnote_markers(node, *candidate)
                 {
                     return false;
@@ -182,6 +189,11 @@ fn footnote_reference_fragment<'a>(node: Node<'a, '_>) -> Option<&'a str> {
 }
 
 fn explicit_link_role(node: Node<'_, '_>) -> Option<LinkRole> {
+    // doc-backlink also returns from a figure/table caption to its mention.
+    // Such a link must not turn a complete media container into a footnote.
+    if media_return_link(node) {
+        return Some(LinkRole::Normal);
+    }
     let tokens = [
         attribute_local(node, "type"),
         attribute_local(node, "role"),
@@ -199,6 +211,16 @@ fn explicit_link_role(node: Node<'_, '_>) -> Option<LinkRole> {
         }
     }
     None
+}
+
+fn media_return_link(node: Node<'_, '_>) -> bool {
+    if node.ancestors().any(is_semantic_footnote_definition) {
+        return false;
+    }
+    let label = rebook_publication::media_references::caption_label(&node_text(node));
+    label.is_some() && node.ancestors().skip(1).any(|parent| {
+        matches!(parent.tag_name().name(), "figcaption" | "figure" | "caption" | "table")
+    })
 }
 
 fn is_semantic_footnote_definition(node: Node<'_, '_>) -> bool {
@@ -1274,7 +1296,11 @@ impl<'a> ReadingIrParser<'a> {
             "table" => self.parse_table(node),
             "figure" => self.parse_figure(node)?,
             "nav" => self.parse_block_container(node)?,
-            name if is_generic_block_container(name) => self.parse_block_container(node)?,
+            name if is_generic_block_container(name) => {
+                if !self.try_parse_media_container(node)? {
+                    self.parse_block_container(node)?;
+                }
+            }
             "ul" => self.parse_list(node, false, 0)?,
             "ol" => self.parse_list(node, true, 0)?,
             "dl" => self.parse_definition_list(node, 0)?,
@@ -2081,16 +2107,24 @@ impl<'a> ReadingIrParser<'a> {
         }
 
         let mut captions = Vec::new();
+        let has_numbered_title = caption_nodes.iter().any(|node| structured_figures::numbered_caption_text(&node_text(*node)));
         for caption in caption_nodes {
             if caption_position == CaptionPosition::Before && caption.range().start > first_image_position {
                 caption_position = CaptionPosition::Split(captions.len());
             }
             self.queue_node_anchors(caption);
+            let explicit_title = caption.has_tag_name("figcaption") || has_caption_semantic_attribute(caption);
             let block_start = self.blocks.len();
             self.parse_block_container(caption)?;
             for block in self.blocks.drain(block_start..) {
                 if let Block::Text(mut caption) = block {
                     caption.kind = structured_figures::annotation_kind(&caption);
+                    let value: String = caption.content.iter().flat_map(Inline::text_runs).map(|run|run.text.as_str()).collect();
+                    if has_numbered_title && !explicit_title && caption.kind == TextBlockKind::Caption
+                        && !structured_figures::numbered_caption_text(&value) {
+                        caption.kind = TextBlockKind::QuoteAttribution;
+                        caption.style.authored_alignment = Some(TextAlignment::Start);
+                    }
                     captions.push(caption);
                 }
             }
@@ -2277,9 +2311,7 @@ impl<'a> ReadingIrParser<'a> {
         container_style: Option<(f32, f32)>,
         source: Option<SourceRange>,
     ) -> Result<Option<ImageBlock>, HtmlError> {
-        let Some(src) = attribute_local(node, "src")
-            .or_else(|| attribute_local(node, "href"))
-            .filter(|value| !value.trim().is_empty())
+        let Some(src) = image_sources::source(node)
         else {
             return Ok(None);
         };
@@ -3007,9 +3039,7 @@ fn inline_image(
     if !image_should_be_inline(node, context) || (!context.include_hidden && context.styles.visually_hidden(node)) {
         return None;
     }
-    let src = attribute_local(node, "src")
-        .or_else(|| attribute_local(node, "href"))?
-        .trim();
+    let src = image_sources::source(node)?;
     if src.is_empty() {
         return None;
     }
@@ -3205,7 +3235,10 @@ fn collect_inline_node_with_block_boundaries(
 
     let mut style = inherited;
     match name.as_str() {
-        "strong" | "b" => style.bold = true,
+        "strong" | "b" => {
+            style.bold = true;
+            style.bold_emphasis |= local_bold_span(node);
+        }
         "em" => {
             style.italic = true;
             style.emphasis = true;
@@ -3646,6 +3679,18 @@ fn has_only_math_content(node: Node<'_, '_>) -> bool {
     })
 }
 
+// A complete paragraph wrapper may be the publisher's default typeface.
+// Nested/local emphasis remains independent even when the whole paragraph is bold.
+fn local_bold_span(node: Node<'_, '_>) -> bool {
+    if is_block_boundary(node.tag_name().name()) { return false; }
+    let Some(block) = node.ancestors().skip(1).find(|n| n.is_element() && is_block_boundary(n.tag_name().name())) else { return true; };
+    let count = |n: Node<'_, '_>| n.descendants().filter(Node::is_text)
+        .filter_map(|n| n.text()).flat_map(str::chars).filter(|c| !c.is_whitespace()).count();
+    let nested = node.ancestors().skip(1).take_while(|n| *n != block)
+        .any(|n| n.is_element() && matches!(n.tag_name().name(), "b" | "strong"));
+    nested || count(node) < count(block)
+}
+
 fn is_block_boundary(name: &str) -> bool {
     is_generic_block_container(name)
         || matches!(
@@ -3776,6 +3821,7 @@ impl StyleSheet {
         font_metadata: &mut impl FnMut(&PublicationUrl) -> Option<FontTraits>,
     ) -> Self {
         let mut sheet = Self::default();
+        let mut css_budget = css_imports::Budget::default();
         for node in document.descendants().filter(Node::is_element) {
             match node.tag_name().name().to_ascii_lowercase().as_str() {
                 "style" => {
@@ -3784,7 +3830,7 @@ impl StyleSheet {
                         .filter(Node::is_text)
                         .filter_map(|text| text.text())
                         .collect::<String>();
-                    sheet.add_css_with_base(&css, base);
+                    css_imports::add(&mut sheet, &css, base, load_stylesheet, &mut css_budget, 0);
                 }
                 "link"
                     if attribute_local(node, "rel").is_some_and(|rel| {
@@ -3798,8 +3844,8 @@ impl StyleSheet {
                     let Ok(href) = base.resolve(href).map(|url| url.resource_url()) else {
                         continue;
                     };
-                    if let Some(css) = load_stylesheet(&href) {
-                        sheet.add_css_with_base(&css, &href);
+                    if let Some(css) = css_budget.load(&href, load_stylesheet) {
+                        css_imports::add(&mut sheet, &css, &href, load_stylesheet, &mut css_budget, 0);
                     }
                 }
                 _ => {}
@@ -4239,6 +4285,7 @@ impl StyleSheet {
     }
 
     fn apply_text_node(&self, node: Node<'_, '_>, style: &mut TextStyle, inherited_size: f32) {
+        let was_bold = style.bold;
         let properties = self.cascaded_properties(node);
         let root_size = if node.parent().is_some_and(|parent| parent.is_root()) {
             1.0
@@ -4250,6 +4297,10 @@ impl StyleSheet {
             style.bold = traits.bold;
             style.italic = traits.italic;
         }
+        if style.bold && !was_bold && properties.get("font-weight").is_some_and(|v| v == "bold" || v == "bolder" || v.parse::<u16>().is_ok_and(|w| w >= 600)) {
+            style.bold_emphasis |= local_bold_span(node);
+        }
+        if !style.bold { style.bold_emphasis = false; }
         if let Some(language) = attribute_local(node, "lang") {
             style.language = TextLanguage::from_bcp47(language);
         }
@@ -5060,10 +5111,9 @@ mod tests {
             |_| None,
         ).unwrap();
         assert!(
-            matches!(&section.blocks[1], Block::Image(image) if image.href.path()=="OPS/typewriter.jpg")
-        );
-        assert!(
-            matches!(&section.blocks[2], Block::Text(text) if text.kind==TextBlockKind::Caption)
+            matches!(&section.blocks[1], Block::Figure(figure)
+                if figure.images.len()==1 && figure.images[0].href.path()=="OPS/typewriter.jpg"
+                && figure.captions.len()==1 && figure.captions[0].kind==TextBlockKind::Caption)
         );
         assert!(
             !section

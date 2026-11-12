@@ -680,6 +680,17 @@ pub(super) fn load(
     // PDF text coordinates and formulas require exact pixels; they still reuse
     // decoded data and its upload identity.
     let exact = block.text_layer.is_some() || block.formula_image || block.formula.is_some();
+    let owned_dimensions = source.raster_resource_dimensions(&block.href)?;
+    if owned_dimensions.is_some() {
+        let prepared = prepare(source, block, target, generation)?;
+        if let Some(request) = prepared.deferred.as_ref() {
+            let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(image) = request.ready_in_cache(&mut cache) {
+                cache.stats.hits += 1;
+                return Ok(image);
+            }
+        }
+    }
     let (decoded, encoded) = {
         let _timing = timing::stage(timing::TimingStage::ImageSource);
         let decoded = source.raster_resource(&block.href)?;
@@ -714,7 +725,12 @@ pub(super) fn load(
         target.hash(&mut hash);
     }
     let key = hash.finish();
-    let (resource_key, key) = if let Some(dimensions) = immutable_dimensions {
+    let (resource_key, key) = if let Some(dimensions) = owned_dimensions {
+        if decoded.as_ref().is_none_or(|image| [image.width, image.height] != dimensions) {
+            return Err(PublicationError::InvalidPublication("Source raster dimensions changed during rendering".into()).into());
+        }
+        owned_keys(source, block, dimensions, if exact { [u32::MAX; 2] } else { target })
+    } else if let Some(dimensions) = immutable_dimensions {
         immutable_encoded_keys(
             source,
             block,
@@ -816,6 +832,28 @@ fn sufficient_detail(image: &RasterImage, target: [u32; 2]) -> bool {
 mod tests {
     use super::*;
     use rebook_publication::{Book, Metadata, PublicationId};
+
+    #[test]
+    fn immutable_source_owned_images_reuse_pixels_before_rasterizing_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Owned { book: Book, calls: AtomicUsize }
+        impl BookSource for Owned {
+            fn book(&self) -> &Book { &self.book }
+            fn parse_section(&self, _: usize) -> Result<Section, PublicationError> { unreachable!() }
+            fn resource(&self, _: &PublicationUrl) -> Result<rebook_publication::Resource, PublicationError> { panic!("source-owned pixels require no encoded resource") }
+            fn raster_resource_dimensions(&self, _: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> { Ok(Some([4, 4])) }
+            fn raster_resource(&self, _: &PublicationUrl) -> Result<Option<rebook_publication::RasterResource>, PublicationError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(rebook_publication::RasterResource {width:4,height:4,pixels:vec![255;64].into()}))
+            }
+        }
+        let source = Owned { book: Book { id: PublicationId::new("owned-compat-cache").unwrap(), metadata:Metadata::default(), cover:None,sections:vec![],table_of_contents:vec![] }, calls:AtomicUsize::new(0) };
+        let image = ImageBlock { href:PublicationUrl::parse("cover.svg").unwrap(),alt:String::new(),style:ImageStyle::default(),source:None,text_layer:None,ocr_text:None,formula_image:false,formula:None };
+        let a = load(&source, &image, [400,600], generation()).unwrap();
+        let b = load(&source, &image, [400,600], generation()).unwrap();
+        assert_eq!(source.calls.load(Ordering::Relaxed),1);
+        assert!(Arc::ptr_eq(&a.pixels,&b.pixels));
+    }
 
     #[test]
     fn resident_pixels_can_be_temporarily_unavailable_to_nonblocking_lookup() {

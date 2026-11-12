@@ -2,12 +2,13 @@ mod changes;
 mod derived;
 mod engine;
 mod listing;
-mod protocol;
 mod portable;
+mod protocol;
 mod rate_limit;
 mod schedule;
 mod settings;
 mod store;
+mod wake;
 #[cfg(any(test, feature = "test-support"))]
 pub use engine::tests::FakeWebDav;
 pub mod webdav;
@@ -18,11 +19,15 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use engine::{LocalSyncBook, SyncMode, SyncProgress, SyncReport, SyncStage, run_sync, acknowledge_downloaded_cover};
+pub use engine::{
+    LocalSyncBook, SyncMode, SyncProgress, SyncReport, SyncStage, acknowledge_downloaded_cover,
+    run_sync,
+};
 pub use rate_limit::RateLimited;
-pub use schedule::{ScheduleSnapshot, SyncSchedule, SYNC_CHECK_INTERVAL};
+pub use schedule::{ScheduleSnapshot, SyncSchedule};
 pub use settings::{CloudProviderKind, SyncSettings};
-pub use store::SyncStore;
+pub use store::{ResumeOffer, SyncStore};
+pub use wake::{SyncChange, SyncSignal, SyncWake};
 
 pub type SyncResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

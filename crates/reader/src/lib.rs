@@ -5817,6 +5817,7 @@ mod tests {
                         authors: Vec::new(),
                         languages: Vec::new(),
                         layout: RenditionLayout::PrePaginated,
+                        ..Metadata::default()
                     },
                     sections,
                     table_of_contents: vec![TocEntry {

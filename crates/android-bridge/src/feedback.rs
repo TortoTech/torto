@@ -21,6 +21,17 @@ pub struct FeedbackImage {
     pub thumbnail: Vec<u8>,
 }
 #[derive(uniffi::Record)]
+pub struct FeedbackValidation {
+    pub count: u32,
+    pub valid: bool,
+}
+/// Pure, bounded form validation: no session lock, draft writes or worker queue.
+#[uniffi::export]
+pub fn validate_feedback_description(description: String) -> FeedbackValidation {
+    let (count, valid) = data::description_validation(&description);
+    FeedbackValidation { count: count as u32, valid }
+}
+#[derive(uniffi::Record)]
 pub struct FeedbackState {
     pub kind: String,
     pub description: String,
@@ -71,6 +82,7 @@ fn thumbnail(image: &data::Screenshot) -> Result<Vec<u8>> {
     Ok(bytes.into_inner())
 }
 fn record(s: &State) -> FeedbackState {
+    let (count, valid) = data::description_validation(&s.draft.payload.description);
     FeedbackState {
         kind: if s.draft.payload.kind == data::Kind::Bug {
             "bug"
@@ -79,8 +91,8 @@ fn record(s: &State) -> FeedbackState {
         }
         .into(),
         description: s.draft.payload.description.clone(),
-        count: data::character_count(&s.draft.payload.description) as u32,
-        valid: data::valid_description(&s.draft.payload.description),
+        count: count as u32,
+        valid,
         locked: s.locked,
         images: s
             .thumbnails
@@ -448,6 +460,22 @@ impl MobileFeedback {
 pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, Read, Write};
+    #[test]
+    fn immediate_validation_counts_visible_graphemes_and_enforces_both_limits() {
+        for (description, count, valid) in [
+            ("  \n\u{200b}\u{0301}".into(), 0, false),
+            ("一二三四五六七八九".into(), 9, false),
+            ("一二三四五六七八九十".into(), 10, true),
+            ("a\u{0301}".repeat(10), 10, true),
+            ("👨‍👩‍👧‍👦".repeat(10), 10, true),
+            ("x".repeat(5000), 5000, true),
+            ("x".repeat(5001), 5001, false),
+            (format!("{}{}", "x".repeat(10), " ".repeat(9991)), 10, false),
+        ] {
+            let result = validate_feedback_description(description);
+            assert_eq!((result.count, result.valid), (count, valid));
+        }
+    }
     pub async fn verify(core: &Arc<MobileCore>, book_id: &str, root: &std::path::Path) {
         let env = FeedbackEnvironment {
             os_version: "Android 16 (API 36)".into(),

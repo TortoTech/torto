@@ -115,7 +115,23 @@ pub(super) fn sync_progress_text(
 ) -> String {
     let direction = match stage {
         SyncStage::Uploading => language.text("上传", "Uploading"),
-        SyncStage::Downloading => language.text("下载", "Downloading"),
+        SyncStage::Downloading => {
+            return language.text("正在下载书籍…", "Downloading books…").into();
+        }
+        SyncStage::Books => {
+            return format!(
+                "{} {completed}/{total} {}",
+                language.text("书籍已就绪", "Books ready"),
+                language.text("本", "books")
+            );
+        }
+        SyncStage::DerivedUploading
+        | SyncStage::DerivedDownloading
+        | SyncStage::CheckingDerivedData => {
+            return language
+                .text("正在同步 PDF 处理数据…", "Syncing PDF processing data…")
+                .into();
+        }
         _ => return language.text("正在同步…", "Syncing…").into(),
     };
     if total == 0 {
@@ -131,6 +147,23 @@ pub(super) fn sync_progress_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn book_readiness_and_pdf_processing_have_distinct_progress_labels() {
+        assert_eq!(
+            sync_progress_text(AppLanguage::English, SyncStage::Books, 8, 11),
+            "Books ready 8/11 books"
+        );
+        for stage in [
+            SyncStage::DerivedUploading,
+            SyncStage::DerivedDownloading,
+            SyncStage::CheckingDerivedData,
+        ] {
+            let label = sync_progress_text(AppLanguage::English, stage, 300, 400);
+            assert!(label.contains("PDF"));
+            assert!(!label.contains('%'));
+        }
+    }
 
     #[test]
     fn running_sync_schedules_a_timer_after_layout_settles() {
@@ -292,7 +325,7 @@ mod tests {
             total: 100,
         };
         let (text, _, _) = frame(&ctx, &state, 4.0, Vec::new());
-        assert!(text.iter().any(|text| text == "Syncing · Downloading 62%"));
+        assert!(text.iter().any(|text| text == "Downloading books…"));
         for (index, pressed) in [true, false].into_iter().enumerate() {
             frame(
                 &ctx,

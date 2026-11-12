@@ -21,7 +21,9 @@ const PIXEL_BUDGET: usize = 32 * 1024 * 1024;
 
 pub(super) use crate::ui::image_preview::PreviewMotion;
 
-pub(super) use rebook_app_core::media::{Target, targets, target_has_anchor, chapter_scope, select, plain, caption_text, adjacent_captions, image_target, text_blocks, authored_link, target_has_node};
+pub(super) use rebook_app_core::media::{Target, adjacent_captions, authored_link, caption_text, chapter_scope, image_target, plain,
+    select, target_has_anchor, target_has_node, targets, text_blocks,
+};
 
 #[cfg(test)]
 #[path = "media_preview_tests.rs"]
@@ -58,19 +60,25 @@ impl Index {
         let source = job.source.as_ref();
         // Reuse the validated catalog and stable source identity, even when AI
         // layout or translation has shifted the displayed block ordinals.
-        if let Some((index, node)) = job.destination.clone().or_else(|| job.catalog.as_ref().and_then(|catalog| catalog.target_node(&job.origin, &job.key))) {
+        if let Some((index, node)) = job.destination.clone().or_else(|| {
+            job.catalog.as_ref().and_then(|catalog| catalog.target_node(&job.origin, &job.key))
+        }) {
             if !needed() { return Err("Cancelled".into()); }
             let section = source.parse_section(index).map_err(|e| e.to_string())?;
             if job.key.number.is_empty() {
-                if let Some((at, block)) = section.blocks.iter().enumerate().find(|(_, block)| matches!(block, Block::Figure(_) | Block::Image(_) | Block::Table(_)) && super::block_source_range(block).is_some_and(|source| source.start.node == node)) {
+                if let Some((at, block)) = section.blocks.iter().enumerate().find(|(_, block)| {
+                    matches!(block, Block::Figure(_) | Block::Image(_) | Block::Table(_)) && super::block_source_range(block).is_some_and(|source| source.start.node == node)
+                }) {
                     return Ok(Target { section: index, block: at,
                         images: if matches!(block, Block::Image(_)) { vec![at] } else { vec![] },
-                        captions: adjacent_captions(&section, at), group: None, key: job.key.clone() });
+                        captions: adjacent_captions(&section, at), group: None, key: job.key.clone(),
+                    });
                 }
                 return Err("The image changed. Please reopen the preview.".into());
             }
             self.add(&section, index)?;
-            if let Some(target) = select(self.entries[&index].iter().filter(|t| target_has_node(&section, t, &node)).cloned(), &job.key)? {
+            if let Some(target) = select(self.entries[&index].iter().filter(|t| target_has_node(&section, t, &node)).cloned(), &job.key,
+            )? {
                 return Ok(target);
             }
             if job.destination.is_some() { return Err("The figure/table changed. Please reopen the preview.".into()); }
@@ -119,9 +127,11 @@ impl Index {
             .map(|(index, _)| index).collect();
         for index in &local {
             if !needed() { return Err("Cancelled".into()); }
-            if !self.entries.contains_key(index) { self.add(&source.parse_section(*index).map_err(|e| e.to_string())?, *index)?; }
+            if !self.entries.contains_key(index) { self.add(&source.parse_section(*index).map_err(|e| e.to_string())?, *index,
+                )?; }
         }
-        if let Some(target) = select(local.iter().flat_map(|index| &self.entries[index]).cloned(), &job.key)? {
+        if let Some(target) = select(local.iter().flat_map(|index| &self.entries[index]).cloned(), &job.key,
+        )? {
             return Ok(target);
         }
         let scope = chapter_scope(source, origin_index);
@@ -250,9 +260,10 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     // Sources without a revision can still receive semantic/translation updates
     // between lookup and rendering. Never reuse a shifted block ordinal.
     let direct = job.key.number.is_empty() && job.destination.as_ref().is_some_and(|(index, node)| {
-        *index == target.section && section.blocks.get(target.block).is_some_and(|block|
-            matches!(block, Block::Figure(_) | Block::Image(_) | Block::Table(_))
-            && super::block_source_range(block).is_some_and(|source| &source.start.node == node))
+        *index == target.section && section.blocks.get(target.block).is_some_and(|block| {
+                    matches!(block, Block::Figure(_) | Block::Image(_) | Block::Table(_))
+            && super::block_source_range(block).is_some_and(|source| &source.start.node == node)
+                })
     });
     if !direct && !targets(&section, target.section).contains(&target) {
         return Err("The figure/table changed. Please reopen the preview.".into());
@@ -290,12 +301,14 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     if matches!(block, Block::Figure(_) | Block::Table(_)) {
         caption_blocks.extend(target.captions.iter().filter(|i| **i < target.block).filter_map(|i| match &section.blocks[*i] {
             Block::Text(text) => Some(text.clone()), _ => None,
-        }));
+        }),
+        );
     }
     let (chunk, chunk_count, blocks) = match block {
         Block::Figure(figure) => {
             if let Some(Block::Figure(parent)) = target.group.and_then(|at| section.blocks.get(at)) {
-                caption_blocks.extend(parent.caption_blocks().filter(|text| media_references::caption_label(&plain(text)).is_some()).cloned());
+                caption_blocks.extend(parent.caption_blocks().filter(|text| media_references::caption_label(&plain(text)).is_some()).cloned(),
+                );
             }
             caption_blocks.extend(figure.caption_blocks().cloned());
             if !figure.body.is_empty() {
@@ -317,7 +330,8 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
                     caption_position: figure.caption_position,
                     style: figure.style,
                     source: figure.source.clone(),
-                })])
+                })],
+                )
             } else {
                 let at = job.cursor.chunk.min(figure.images.len().saturating_sub(1));
                 (
@@ -334,7 +348,8 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
         }
         Block::Table(table) => {
             let presentation = rebook_layout::table_presentation(table, true);
-            caption_blocks.extend(presentation.before.iter().chain(presentation.after.iter()).cloned());
+            caption_blocks.extend(presentation.before.iter().chain(presentation.after.iter()).cloned(),
+            );
             let rows = &table.rows[usize::from(presentation.skip_title)..table.rows.len() - presentation.skip_sources];
             let ranges = table_chunks_rows(rows)?;
             let at = job.cursor.chunk.min(ranges.len().saturating_sub(1));
@@ -398,7 +413,8 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     if matches!(block, Block::Figure(_) | Block::Table(_)) {
         caption_blocks.extend(target.captions.iter().filter(|i| **i > target.block).filter_map(|i| match &section.blocks[*i] {
             Block::Text(text) => Some(text.clone()), _ => None,
-        }));
+        }),
+        );
     }
     let mut seen = Vec::new();
     caption_blocks.retain(|text| {
@@ -455,16 +471,21 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
         return Err("Cancelled".into());
     }
     let surface = matches!(block, Block::Figure(figure) if !figure.body.is_empty())
-        .then(|| page.items.iter().find_map(|item| match item {
+        .then(|| {
+            page.items.iter().find_map(|item| match item {
             rebook_layout::PageItem::FigureBody(body) => Some(body), _ => None,
-        })).flatten();
+        })
+        }).flatten();
     // Fit the preview to the actual figure surface, including its padding,
     // rather than retaining an entire reading column around a short diagram.
     let top = surface.map_or(0.0, |body| body.y);
-    let height = surface.map_or_else(|| display.content_bottom().unwrap_or(100.0) + 8.0, |body| body.height)
+    let height = surface.map_or_else(|| display.content_bottom().unwrap_or(100.0) + 8.0, |body| body.height,
+        )
         .ceil().clamp(1.0, height as f32) as usize;
-    let width = surface.map_or_else(|| rebook_layout::reading_content_width(job.width as f32, &style).ceil() as usize + 32, |body| body.width.ceil() as usize);
-    let left = surface.map_or_else(|| rebook_layout::reading_content_left(1200.0, &style) - 16.0, |body| body.x);
+    let width = surface.map_or_else(|| rebook_layout::reading_content_width(job.width as f32, &style).ceil() as usize + 32, |body| body.width.ceil() as usize,
+    );
+    let left = surface.map_or_else(|| rebook_layout::reading_content_left(job.width as f32, &style) - 16.0, |body| body.x,
+    );
     if width * height * 4 > PIXEL_BUDGET {
         return Err("The preview exceeds the image memory limit.".into());
     }
@@ -494,8 +515,7 @@ fn render(job: &Job, target: Target, needed: &impl Fn() -> bool) -> Result<Ready
     caption_style.bottom_margin = 8.0;
     for caption in &mut caption_blocks {
         let text = caption_text(caption).trim_start().to_lowercase();
-        if ["source:", "sources:", "source：", "credit:", "credits:", "credit：", "来源:", "来源：", "图片来源:", "图片来源："]
-            .iter().any(|prefix| text.starts_with(prefix))
+        if rebook_publication::media_notes::is_annotation(&text)
         {
             caption.kind = rebook_publication::TextBlockKind::QuoteAttribution;
         } else if caption.kind != rebook_publication::TextBlockKind::QuoteAttribution {
@@ -741,16 +761,25 @@ impl super::DesktopReader {
         let mut items = self.focus_reference_previews(&origin);
         let destination = self.media_preview.links.as_ref().and_then(|links| links.target_node(&origin, &key));
         let index = items.iter().position(|item| item.key == key && item.origin.start.node == origin.start.node)
-            .or_else(|| destination.as_ref().and_then(|destination| items.iter().position(|item| item.key == key && item.destination.as_ref() == Some(destination))))
-            .or_else(|| destination.as_ref().and_then(|destination| {
+            .or_else(|| {
+                destination.as_ref().and_then(|destination| {
+                    items.iter().position(|item| {
+                        item.key == key && item.destination.as_ref() == Some(destination)
+                    })
+                })
+            })
+            .or_else(|| {
+                destination.as_ref().and_then(|destination| {
                 let mut matches = items.iter().enumerate().filter(|(_,item)| item.destination.as_ref() == Some(destination));
                 let first = matches.next()?;
                 matches.next().is_none().then_some(first.0)
-            }));
+            })
+            });
         let index = match index {
             Some(index) => index,
             None => {
-                items = vec![PreviewItem { origin, key, destination: None }];
+                items = vec![PreviewItem { origin, key, destination: None,
+                }];
                 0
             }
         };
@@ -762,17 +791,22 @@ impl super::DesktopReader {
     pub(super) fn open_current_media_preview(&mut self, ctx: &egui::Context) -> bool {
         let Some(unit) = self.focus_units.get(self.focus_unit_index) else { return false; };
         let Some(sections) = self.reader.cached_reading_unit_content() else { return false; };
-        let found = sections.iter().find_map(|(index, section)| section.blocks.iter().find_map(|block| {
+        let found = sections.iter().find_map(|(index, section)| {
+            section.blocks.iter().find_map(|block| {
             if !matches!(block, Block::Figure(_) | Block::Table(_)) { return None; }
             let origin = super::block_source_range(block)?;
             if origin.start.spine != unit.range.start.spine || origin.start.node != unit.range.start.node { return None; }
             let kind = if matches!(block, Block::Table(_)) { MediaKind::Table } else { MediaKind::Figure };
             Some((*index, origin.clone(), kind))
-        }));
+        })
+        });
         let Some((index, origin, kind)) = found else { return false; };
         let destination = Some((index, origin.start.node.clone()));
-        let key = unit.media_key.clone().unwrap_or(MediaKey { kind, number: String::new() });
-        self.open_media_items(ctx, vec![PreviewItem { origin, key, destination }], 0);
+        let key = unit.media_key.clone().unwrap_or(MediaKey { kind, number: String::new(),
+        });
+        self.open_media_items(ctx, vec![PreviewItem { origin, key, destination,
+            }], 0,
+        );
         true
     }
 
@@ -813,34 +847,47 @@ impl super::DesktopReader {
 
     fn focus_reference_previews(&self, origin: &SourceRange) -> Vec<PreviewItem> {
         if !self.is_focus_mode() { return vec![]; }
-        let Some(unit) = self.focus_units.iter().find(|unit| unit.paint_ranges.iter()
-            .any(|range| super::source_range_contains_anchor(range, &origin.start))) else { return vec![] };
+        let Some(unit) = self.focus_units.iter().find(|unit| {
+            unit.paint_ranges.iter()
+            .any(|range| super::source_range_contains_anchor(range, &origin.start))
+        }) else { return vec![];
+        };
         if unit.is_image || unit.is_table || unit.media_key.is_some() { return vec![]; }
-        let ranges = unit.list_group.as_ref().map_or(unit.paint_ranges.as_slice(), |group| group.paint_ranges.as_slice());
-        let Some(links) = &self.media_preview.links else { return vec![] };
-        let Ok(sections) = self.reader.current_reading_unit_content() else { return vec![] };
+        let ranges = unit.list_group.as_ref().map_or(unit.paint_ranges.as_slice(), |group| {
+                group.paint_ranges.as_slice()
+            });
+        let Some(links) = &self.media_preview.links else { return vec![];
+        };
+        let Ok(sections) = self.reader.current_reading_unit_content() else { return vec![];
+        };
         let mut seen = Vec::new();
         let mut items = Vec::new();
         let mut bytes = 0;
         for text in sections.iter().flat_map(|(_, s)| &s.blocks).flat_map(Block::text_blocks) {
             let Some(source) = &text.source else { continue };
-            if !ranges.iter().any(|range| super::source_range_contains_anchor(range, &source.start)
-                || super::source_range_contains_anchor(source, &range.start)) { continue; }
+            if !ranges.iter().any(|range| {
+                super::source_range_contains_anchor(range, &source.start)
+                || super::source_range_contains_anchor(source, &range.start)
+            }) { continue; }
             for (key, target, node) in links.preview_references(source, &text.content) {
-                if seen.iter().any(|old: &Target| old.section == target.section && old.block == target.block
-                    && old.images == target.images && old.captions == target.captions) { continue; }
+                if seen.iter().any(|old: &Target| {
+                    old.section == target.section && old.block == target.block
+                    && old.images == target.images && old.captions == target.captions
+                }) { continue; }
                 bytes += target.retained_bytes() + key.number.len() + node.as_ref().map_or(0, String::len) + 256;
                 if bytes > INDEX_BUDGET { return items; }
                 let destination = node.map(|node| (target.section, node));
                 seen.push(target);
-                items.push(PreviewItem { origin: source.clone(), key, destination });
+                items.push(PreviewItem { origin: source.clone(), key, destination,
+                });
             }
         }
         items
     }
 
     pub(super) fn open_focus_reference_preview(&mut self, ctx: &egui::Context) -> bool {
-        let Some(unit) = self.focus_units.get(self.focus_unit_index) else { return false };
+        let Some(unit) = self.focus_units.get(self.focus_unit_index) else { return false;
+        };
         let items = self.focus_reference_previews(&unit.range);
         if items.is_empty() { return false; }
         self.open_media_items(ctx, items, 0);
@@ -886,7 +933,8 @@ impl super::DesktopReader {
     fn request_media_page(&mut self, ctx: &egui::Context, cursor: Cursor) {
         let width = table_preview_width(ctx.content_rect().width());
         let style = self.reader.style();
-        self.media_preview.presentation = Some((self.media_preview.content_version, self.source.content_revision(), style.clone(), width));
+        self.media_preview.presentation = Some((self.media_preview.content_version, self.source.content_revision(), style.clone(), width,
+        ));
         let worker = self.media_preview.worker.get_or_insert_with(Worker::new);
         // One pending request and one result slot bound rapid close/reopen cycles.
         worker.result.store(None);
@@ -920,15 +968,18 @@ impl super::DesktopReader {
     }
 
     fn step_media_item(&mut self, ctx: &egui::Context, direction: isize) {
-        let Some(active) = &mut self.media_preview.active else { return };
-        let Some(index) = active.item_index.checked_add_signed(direction).filter(|i| *i < active.items.len()) else { return };
+        let Some(active) = &mut self.media_preview.active else { return;
+        };
+        let Some(index) = active.item_index.checked_add_signed(direction).filter(|i| *i < active.items.len()) else { return;
+        };
         active.item_index = index;
         active.origin = active.items[index].origin.clone();
         active.key = active.items[index].key.clone();
         self.request_media_page(ctx, Cursor::default());
     }
     pub(super) fn close_media_preview(&mut self, ctx: &egui::Context) {
-        let Some(active) = &mut self.media_preview.active else { return };
+        let Some(active) = &mut self.media_preview.active else { return;
+        };
         if active.motion.is_closing() { return; }
         self.ui.focus_footnote_modifier_tap = super::egui_view::ModifierTapState::Idle;
         active.motion.close(ctx);
@@ -960,8 +1011,10 @@ impl super::DesktopReader {
         if self.media_preview.active.as_ref().is_some_and(|active| active.motion.is_closing()) {
             return true;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
-            || i.consume_shortcut(&self.shortcuts.focus_image_preview)) {
+        if ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            || i.consume_shortcut(&self.shortcuts.focus_image_preview)
+        }) {
             self.close_media_preview(ctx);
             return true;
         }
@@ -1042,8 +1095,9 @@ impl super::DesktopReader {
                                 self.semantic_source.formula_notes(source, latex)
                             })
                             .unwrap_or_default();
-                        active.notes_open = ready.formula.as_ref().is_some_and(|(source, latex)|
-                            !self.semantic_source.visible_formula_notes(source, latex).is_empty());
+                        active.notes_open = ready.formula.as_ref().is_some_and(|(source, latex)| {
+                                !self.semantic_source.visible_formula_notes(source, latex).is_empty()
+                            });
                         active.formula = ready.formula;
                         active.table = ready.table;
                         active.content_motion =
@@ -1092,7 +1146,8 @@ impl super::DesktopReader {
         // current content and reject older worker results, preserving the old
         // texture until its replacement is ready. No parsing on the UI thread.
         if self.media_preview.active.as_ref().is_some_and(|a| !a.motion.is_closing()) {
-            let stamp = (self.media_preview.content_version, self.source.content_revision(), self.reader.style(), table_preview_width(ctx.content_rect().width()));
+            let stamp = (self.media_preview.content_version, self.source.content_revision(), self.reader.style(), table_preview_width(ctx.content_rect().width()),
+            );
             if self.media_preview.presentation.as_ref().is_some_and(|previous| previous != &stamp) {
                 self.request_media_page(ctx, Cursor::default());
             }
@@ -1244,17 +1299,23 @@ impl super::DesktopReader {
                 if active.items.len() > 1 {
                     for (direction, x, glyph, hint) in [
                         (-1_isize, screen.left() + 28.0, crate::ui::Icon::ChevronLeft,
-                            language.text("上一个引用（←）", "Previous reference (←)")),
+                            language.text("上一个引用（←）", "Previous reference (←)"),
+                        ),
                         (1, screen.right() - 28.0, crate::ui::Icon::ChevronRight,
-                            language.text("下一个引用（→）", "Next reference (→)")),
+                            language.text("下一个引用（→）", "Next reference (→)"),
+                        ),
                     ] {
                         if active.item_index.checked_add_signed(direction).is_none_or(|i| i >= active.items.len()) { continue; }
-                        let rect = egui::Rect::from_center_size(egui::pos2(x, screen.center().y), egui::vec2(40.0, 56.0));
-                        let response = ui.interact(rect, ui.scope_id().with(("reference", direction)), egui::Sense::click())
+                        let rect = egui::Rect::from_center_size(egui::pos2(x, screen.center().y), egui::vec2(40.0, 56.0),
+                        );
+                        let response = ui.interact(rect, ui.scope_id().with(("reference", direction)), egui::Sense::click(),
+                            )
                             .on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint);
-                        ui.painter().rect_filled(rect, 20.0, egui::Color32::from_black_alpha(if response.hovered() { 110 } else { 55 }));
+                        ui.painter().rect_filled(rect, 20.0, egui::Color32::from_black_alpha(if response.hovered() { 110 } else { 55 }),
+                        );
                         crate::ui::paint_icon(ui, egui::Rect::from_center_size(rect.center(), egui::vec2(26.0, 26.0)), glyph,
-                            egui::Color32::from_white_alpha(if response.hovered() { 255 } else { 180 }));
+                            egui::Color32::from_white_alpha(if response.hovered() { 255 } else { 180 }),
+                        );
                         over_navigation |= response.hovered() || response.clicked();
                         if response.clicked() { item_direction = direction; }
                     }
@@ -1267,32 +1328,40 @@ impl super::DesktopReader {
                         };
                         ui.painter().text(egui::pos2(screen.center().x, screen.bottom() - 42.0), egui::Align2::CENTER_CENTER,
                             format!("{kind} {} · {} / {}", shown.key.number, active.displayed_index + 1, active.items.len()),
-                            egui::FontId::proportional(14.0), egui::Color32::from_white_alpha(210));
+                            egui::FontId::proportional(14.0), egui::Color32::from_white_alpha(210),
+                        );
                     }
                 }
                 if active.multipart {
                     let y = screen.bottom() - 18.0;
                     ui.painter().text(egui::pos2(screen.center().x, y), egui::Align2::CENTER_CENTER,
                         format!("{} {}", language.text("部分／页", "Part / page"), active.position),
-                        egui::FontId::proportional(12.0), egui::Color32::from_white_alpha(190));
+                        egui::FontId::proportional(12.0), egui::Color32::from_white_alpha(190),
+                    );
                     for (cursor, x, glyph, hint) in [
                         (active.previous, screen.center().x - 145.0, crate::ui::Icon::ChevronLeft,
-                            language.text("上一部分（PageUp）", "Previous part (PageUp)")),
+                            language.text("上一部分（PageUp）", "Previous part (PageUp)"),
+                        ),
                         (active.next, screen.center().x + 145.0, crate::ui::Icon::ChevronRight,
-                            language.text("下一部分（PageDown）", "Next part (PageDown)")),
+                            language.text("下一部分（PageDown）", "Next part (PageDown)"),
+                        ),
                     ] {
-                        let Some(cursor) = cursor.filter(|_| !active.loading) else { continue };
+                        let Some(cursor) = cursor.filter(|_| !active.loading) else { continue;
+                        };
                         let rect = egui::Rect::from_center_size(egui::pos2(x, y), egui::vec2(32.0, 24.0));
-                        let response = ui.interact(rect, ui.scope_id().with(("part", x.to_bits())), egui::Sense::click())
+                        let response = ui.interact(rect, ui.scope_id().with(("part", x.to_bits())), egui::Sense::click(),
+                            )
                             .on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint);
-                        crate::ui::paint_icon(ui, rect.shrink2(egui::vec2(6.0, 2.0)), glyph, egui::Color32::WHITE);
+                        crate::ui::paint_icon(ui, rect.shrink2(egui::vec2(6.0, 2.0)), glyph, egui::Color32::WHITE,
+                        );
                         over_navigation |= response.hovered() || response.clicked();
                         if response.clicked() { navigate = Some(cursor); }
                     }
                 }
                 if active.loading && active.texture.is_some() {
                     ui.painter().text(egui::pos2(screen.center().x, screen.top() + 18.0), egui::Align2::CENTER_CENTER,
-                        language.text("正在加载…", "Loading…"), egui::FontId::proportional(13.0), egui::Color32::WHITE);
+                        language.text("正在加载…", "Loading…"), egui::FontId::proportional(13.0), egui::Color32::WHITE,
+                    );
                 }
                 if let Some((_, selected)) = &chart {
                     ui.scope_builder(

@@ -31,9 +31,11 @@ pub(super) fn group<'a>(blocks: &[&'a Block]) -> Option<Group<'a>> {
     let TextBlockKind::HeadingOrdinal(level) = ordinal.kind else {
         return None;
     };
-    let next = text(blocks.get(1)?)?;
-    let translated_ordinal = companion(ordinal, next).then_some(next);
-    let title_index = 1 + usize::from(translated_ordinal.is_some());
+    let next = blocks.get(1).and_then(text);
+    let translated_ordinal = next.filter(|next| companion(ordinal, next));
+    let start = 1 + usize::from(translated_ordinal.is_some());
+    let title_index = (start..blocks.len().min(start + 4))
+        .find(|&i| !rebook_publication::is_heading_separator(blocks[i]))?;
     let title = text(blocks.get(title_index)?)?;
     if title.kind != TextBlockKind::Heading(level) {
         return None;

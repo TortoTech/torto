@@ -86,6 +86,8 @@ pub struct DocumentPage {
     pub id: String,
     pub index: u32,
     pub total: u32,
+    /// Total measured height of all slices, without decoding their bitmaps.
+    pub content_height: f32,
     pub controls: Vec<ReadingControl>,
     pub first_text_baseline: Option<f32>,
     pub page: Arc<MobilePage>,
@@ -190,7 +192,13 @@ fn page(
     foreground: u32,
     background: u32,
 ) -> Result<DocumentPage> {
-    let logical = viewport.validate()?;
+    let mut logical = viewport.validate()?;
+    // A sheet's visible height is a scroll window, not a new image fit area.
+    // Paginate references with the body's height so tall images retain the
+    // same 80% height cap; the host scrolls the resulting native slices.
+    if id.starts_with("document-") {
+        logical = Viewport { height: s.session.viewport().height, ..viewport.clone() }.validate()?;
+    }
     let document = s
         .document
         .as_mut()
@@ -198,22 +206,28 @@ fn page(
         .ok_or_else(|| error("Preview is no longer open"))?;
     let key = (
         viewport.width,
-        viewport.height,
+        logical.height,
         viewport.scale.to_bits(),
         foreground,
         background,
     );
     if document.viewport != Some(key) {
-        let mut style = rebook_app_core::reading::note_style(
-            &document.style,
-            if id.starts_with("note-") {(document.style.typography.font_size*0.8).max(14.0)}else{document.style.typography.font_size},
-        );
-        if id.starts_with("document-") {
-            style.typesetting =
-                rebook_app_core::reading::typesetting(&style.typesetting, TypesettingMode::Unified);
-            style.top_margin = 8.0;
-            style.bottom_margin = 8.0;
-        }
+        let mut style = if id.starts_with("document-") {
+            // Keep the body's full typography, including its smaller caption
+            // font floor and actual Book/Unified mode. The sheet already owns
+            // the same 20dp horizontal inset as the body.
+            let mut style = document.style.clone();
+            style.horizontal_margin = 0.0;
+            style.minimum_horizontal_margin = 0.0;
+            style.minimum_content_width = 0.0;
+            style.spread = rebook_layout::SpreadMode::Single;
+            style
+        } else {
+            rebook_app_core::reading::note_style(
+                &document.style,
+                (document.style.typography.font_size*0.8).max(14.0),
+            )
+        };
         let color = |argb: u32| rebook_publication::Rgba {
             red: (argb >> 16) as u8,
             green: (argb >> 8) as u8,
@@ -258,7 +272,7 @@ fn page(
     }
     let height = (display.content_bottom().unwrap_or(1.0) + 4.0)
         .ceil()
-        .clamp(1.0, viewport.height as f32) as f32;
+        .clamp(1.0, logical.height as f32) as f32;
     let width = (viewport.width as f32 * viewport.scale).ceil() as u32;
     let pixels_height = (height * viewport.scale).ceil() as u32;
     let mut renderer = anyrender_vello_cpu::VelloCpuImageRenderer::new(width, pixels_height);
@@ -293,6 +307,10 @@ fn page(
         })
         .collect();
     let total = document.pages.len() as u32;
+    let content_height = document.pages.iter().map(|page| {
+        let height = (page.content_bottom().unwrap_or(1.0) + 4.0).ceil().clamp(1.0, logical.height as f32);
+        (height * viewport.scale).ceil() / viewport.scale
+    }).sum();
     let ranges = document
         .section
         .blocks
@@ -314,6 +332,7 @@ fn page(
         id: id.into(),
         index,
         total,
+        content_height,
         controls,
         first_text_baseline,
         page: MobilePage::new(
@@ -439,7 +458,7 @@ impl MobileReader {
                     .ok_or_else(|| error("Preview is not ready"))?;
                 session.set_visible_position(pos).map_err(error)?;
                 let Some(hit) = session
-                    .hit_test_current_spread(end_x, end_y, true)
+                    .hit_test_current_spread(end_x, end_y, false)
                     .map_err(error)?
                 else {
                     return Ok(None);
@@ -473,6 +492,7 @@ impl MobileReader {
                     .selection_between_with_granularity(&a, &b, SelectionGranularity::Word)
                     .map_err(error)?
                     .map(|selection| SelectedText {
+                        highlighted: false,
                         text: selection.text,
                         bounds: selection
                             .rects
@@ -552,3 +572,6 @@ impl MobileReader {
         .await
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests;

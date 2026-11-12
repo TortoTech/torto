@@ -4,6 +4,7 @@ use anyrender::PaintScene;
 use kurbo::{Affine, Rect as KRect};
 use peniko::{Color, Fill};
 use rebook_reader::ReaderPosition;
+use rebook_app_core::highlights::HighlightRepository;
 use rebook_renderer::PageDisplayList;
 #[derive(Clone)]
 pub(crate) struct Slice {
@@ -202,33 +203,34 @@ pub(crate) fn map_touch(s: &mut ReaderState, x: f32, y: f32) -> Result<(f32, f32
         Ok((x, y + s.scroll_offset + current_extent(s).0))
     }
 }
+/// Selection coordinates snap to text in the visible strip, including its
+/// padding and inter-page whitespace. Exact activation/link taps stay separate.
 pub(crate) fn hit(
     s: &mut ReaderState,
     x: f32,
     y: f32,
-    nearest: bool,
+    exact: bool,
 ) -> Result<Option<rebook_reader::ReaderTextHit>> {
-    if s.focus {
-        if let Some(slice) = s
-            .scroll_slices
-            .iter()
-            .find(|p| y >= p.top && y <= p.top + p.height)
-            .cloned()
-        {
-            return s
-                .session
-                .hit_test_page(slice.position, x, y - slice.top + slice.origin, nearest)
-                .map_err(error);
-        }
-        Ok(None)
-    } else {
-        s.session
-            .hit_test_current_spread(x, y, nearest)
-            .map_err(error)
+    if !s.focus {
+        return s.session.hit_test_current_spread(x, y, exact).map_err(error);
     }
+    let height=s.session.viewport().height as f32;
+    let mut slices=s.scroll_slices.iter()
+        .filter(|p| if exact {y>=p.top&&y<=p.top+p.height} else {p.top<height&&p.top+p.height>0.0})
+        .cloned().collect::<Vec<_>>();
+    let distance=|p:&Slice| (p.top-y).max(y-p.top-p.height).max(0.0);
+    slices.sort_by(|a,b|distance(a).total_cmp(&distance(b)));
+    for slice in slices {
+        let local_y=(y-slice.top+slice.origin).clamp(slice.origin,slice.origin+slice.height);
+        if let Some(hit)=s.session.hit_test_page(slice.position,x,local_y,exact).map_err(error)? {
+            return Ok(Some(hit));
+        }
+    }
+    Ok(None)
 }
-pub(crate) fn selected(s: &ReaderState) -> Option<SelectedText> {
-    let selected = s.selected.as_ref()?;
+
+pub(crate) fn selected(s: &ReaderState) -> Result<Option<SelectedText>> {
+    let Some(selected) = s.selected.as_ref() else {return Ok(None)};
     let bounds = if s.focus {
         s.scroll_slices
             .iter()
@@ -257,10 +259,12 @@ pub(crate) fn selected(s: &ReaderState) -> Option<SelectedText> {
             })
             .collect()
     };
-    Some(SelectedText {
+    let saved=s.store.highlights_for_book(&s.book_id).map_err(error)?;
+    Ok(Some(SelectedText {
         text: selected.text.clone(),
         bounds,
-    })
+        highlighted: rebook_app_core::highlights::selection::contains_highlight(&saved,&selected.ranges),
+    }))
 }
 pub(crate) fn visible_ranges(s: &ReaderState) -> Vec<SourceRange> {
     if !s.focus {
@@ -312,7 +316,7 @@ fn bounds(unit: &interactions::FocusUnit) -> (f32, f32) {
     let rect=unit.navigation_bounds().expect("focus body geometry");
     (rect.y,rect.y+rect.height)
 }
-fn active(s: &ReaderState) -> usize {
+pub(crate) fn active(s: &ReaderState) -> usize {
     s.focus_anchor
         .as_ref()
         .and_then(|a| {
@@ -643,20 +647,7 @@ pub(crate) fn turn(s: &mut ReaderState, forward: bool) -> Result<Arc<MobilePage>
         s.focus_anchor = None;
         s.scroll_center = true;
     } else {
-        let result = s.session.go_to_adjacent_reading_unit(if forward { PageDirection::Next } else { PageDirection::Previous }).map_err(error)?;
-        if result.outcome == rebook_reader::NavigationOutcome::Moved {
-            if !forward {
-                if let Some(last) = s.session.current_reading_unit_pages().map_err(error)?.last() {
-                    s.session.set_visible_position(last.position).map_err(error)?;
-                }
-            }
-            let units = interactions::focus_units(s)?;
-            let target = if forward { units.first() } else { units.last() };
-            s.focus_anchor = target.and_then(|u| u.ranges.first().cloned());
-            s.scroll_offset = 0.0;
-            invalidate(s);
-            s.scroll_center = true;
-        }
+        move_unit(s, forward, true)?;
     }
     render(s)
 }
@@ -667,12 +658,21 @@ pub(crate) fn turn_unit(s: &mut ReaderState, forward: bool) -> Result<Arc<Mobile
     turn_unit_result(s,forward).map(|(page,_)|page)
 }
 pub(crate) fn turn_unit_result(s: &mut ReaderState, forward: bool) -> Result<(Arc<MobilePage>,bool)> {
-    let moved=move_unit(s,forward)?;
+    let moved=move_unit(s,forward,true)?;
     render(s).map(|page|(page,forward&&!moved))
 }
-fn move_unit(s:&mut ReaderState,forward:bool)->Result<bool> {
+fn move_unit(s:&mut ReaderState,forward:bool,remember:bool)->Result<bool> {
+    use rebook_app_core::focus_navigation::UnitKey;
+    let outgoing = remember.then(|| reflow::Anchor::capture(s)).flatten()
+        .map(|anchor| (UnitKey::capture(&mut s.session), anchor));
     let result=s.session.go_to_adjacent_reading_unit(if forward {PageDirection::Next}else{PageDirection::Previous}).map_err(error)?;
     if result.outcome==rebook_reader::NavigationOutcome::Moved {
+        if let Some((key, anchor)) = outgoing { s.focus_history.remember(key, anchor); }
+        let target = UnitKey::capture(&mut s.session);
+        if let Some(anchor) = s.focus_history.get(&target).cloned() {
+            invalidate(s);
+            if anchor.restore(s) { return Ok(true); }
+        }
         if !forward && let Some(last)=s.session.current_reading_unit_pages().map_err(error)?.last() {
             s.session.set_visible_position(last.position).map_err(error)?;
         }
@@ -696,7 +696,7 @@ pub(crate) fn preview_unit(s:&mut ReaderState,forward:bool)->Result<Option<Arc<M
     let cache=s.scroll_cache.take();let slices=std::mem::take(&mut s.scroll_slices);
     let units=std::mem::take(&mut s.focus_units);let anchor=s.focus_anchor.take();
     let result=(||{
-        if !move_unit(s,forward)? {return Ok(None);}
+        if !move_unit(s,forward,false)? {return Ok(None);}
         let strip=render_with_progress(s,false)?;
         let mut info=strip.info();let viewport=s.session.viewport();
         let width=strip.width();let height=(viewport.height as f32*viewport.raster_scale).ceil() as u32;
@@ -764,10 +764,10 @@ fn scroll(s: &mut ReaderState, delta: f32, follow_center: bool) -> Result<Arc<Mo
 #[uniffi::export]
 impl MobileReader {
     pub async fn scroll_by(self: Arc<Self>, delta: f32) -> Result<Arc<MobilePage>> {
-        work(move || self.with(|s| scroll(s, delta, true))).await
+        work(move || self.with(|s| {s.store.wake().allow_progress(&s.book_id);scroll(s, delta, true)})).await
     }
     pub async fn selection(self: Arc<Self>) -> Result<Option<SelectedText>> {
-        work(move || self.with(|s| Ok(selected(s)))).await
+        work(move || self.with(|s| selected(s))).await
     }
     pub async fn begin_selection_handle(self: Arc<Self>, start: bool) -> Result<()> {
         work(move || {
@@ -791,8 +791,8 @@ impl MobileReader {
                 let Some(anchor) = s.selection_drag_anchor.clone() else {
                     return Ok(None);
                 };
-                let Some(focus) = hit(s, x, y, true)? else {
-                    return Ok(selected(s));
+                let Some(focus) = hit(s, x, y, false)? else {
+                    return selected(s);
                 };
                 s.selected = s
                     .session
@@ -805,7 +805,7 @@ impl MobileReader {
                     s.selection_start = Some(focus);
                     s.selection_end = Some(anchor);
                 }
-                Ok(selected(s))
+                selected(s)
             })
         })
         .await

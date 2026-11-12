@@ -3,8 +3,7 @@ use rebook_layout::{ReaderDefaultFont, ReaderFontChoice, SpreadMode, Typesetting
 
 use super::{ProviderModelsRequest, SettingsFeature, SettingsTab, ShortcutAction};
 use crate::plugins::{
-    AiModelConfig, AiProviderKind, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN,
-    CHAT_TOOL_STEPS_MAX, CHAT_TOOL_STEPS_MIN, PdfOcrProviderKind, PluginSettings, ReasoningEffort,
+    AiModelConfig, AiProviderKind, PdfOcrProviderKind, PluginSettings, ReasoningEffort,
     TARGET_LANGUAGE_ENGLISH, TARGET_LANGUAGE_SIMPLIFIED_CHINESE, TARGET_LANGUAGE_SYSTEM,
     TranslationMode,
 };
@@ -420,7 +419,7 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
             ),
             (
                 ShortcutAction::FocusFootnotes,
-                language.text("脚注／公式备注开关", "Toggle footnotes / formula notes"),
+                language.text("预览注释", "Preview annotations"),
             ),
             (
                 ShortcutAction::FocusExtendSelectionPrevious,
@@ -942,12 +941,12 @@ fn reader_layout_settings(
                     settings_row_control_sized(ui, 300.0, |ui| {
                         for (style, label) in [
                             (
-                                FocusStyle::BackgroundHighlight,
-                                language.text("背景高亮", "Background highlight"),
-                            ),
-                            (
                                 FocusStyle::SurroundingDim,
                                 language.text("周边淡化", "Dim surroundings"),
+                            ),
+                            (
+                                FocusStyle::BackgroundHighlight,
+                                language.text("背景高亮", "Background highlight"),
                             ),
                         ] {
                             if choice_button(ui, label, *focus_style == style).clicked() {
@@ -1410,23 +1409,6 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     );
                 });
                 ui.end_row();
-
-                settings_u16_slider_row(
-                    ui,
-                    language.text("工具调用轮数", "Tool call steps"),
-                    &mut settings.chat_max_tool_steps,
-                    CHAT_TOOL_STEPS_MIN,
-                    CHAT_TOOL_STEPS_MAX,
-                    1,
-                );
-                settings_u16_slider_row(
-                    ui,
-                    language.text("历史记录轮数", "History turns"),
-                    &mut settings.chat_history_turns,
-                    CHAT_HISTORY_TURNS_MIN,
-                    CHAT_HISTORY_TURNS_MAX,
-                    1,
-                );
                 let official = settings.prepare_search_selection();
                 settings_row_label(
                     ui,

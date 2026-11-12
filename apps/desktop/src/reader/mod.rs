@@ -90,6 +90,7 @@ mod footnotes;
 mod images;
 mod media_preview;
 mod media_links;
+mod annotation_edits;
 mod interaction;
 mod navigation;
 pub(super) mod render;
@@ -187,7 +188,7 @@ pub(crate) fn open_viewport(ui: &egui::Ui) -> LayoutViewport {
     LayoutViewport::new(
         logical_dimension(f64::from(rect.width())).max(1),
         logical_dimension(f64::from(
-            rect.height() - egui_view::TOOLBAR_HEIGHT - ui.spacing().item_spacing.y - 3.0,
+            rect.height() - egui_view::TOOLBAR_HEIGHT + egui_view::HEADER_EDGE_FADE_HEIGHT,
         ))
         .max(1),
     )
@@ -909,6 +910,7 @@ pub(super) struct DesktopReader {
     pdf_metadata_missing: PdfMetadataMissing,
     highlight_store: HighlightStore,
     highlights: Vec<StoredHighlight>,
+    annotation_edits: annotation_edits::AnnotationEdits,
     progress_store: Option<SyncStore>,
     selection_anchor: Option<ReaderTextHit>,
     selection: Option<ReaderSelection>,
@@ -964,6 +966,7 @@ pub(super) struct DesktopReader {
     focus_selection_anchor: Option<usize>,
     focus_target_offset: Option<f32>,
     focus_reflow_anchor: Option<FocusReflowAnchor>,
+    focus_history: rebook_app_core::focus_navigation::UnitHistory<FocusUnitBookmark>,
     focus_anchor: Option<SourceAnchor>,
     focus_toc_override: Option<String>,
     pending_page_turn: Option<PageDirection>,
@@ -1965,6 +1968,7 @@ struct ScrollViewportState {
     size: egui::Vec2,
 }
 
+#[derive(Clone)]
 struct FocusReflowAnchor {
     viewport: ScrollViewportState,
     section_index: usize,
@@ -1978,6 +1982,12 @@ struct FocusReflowAnchor {
     #[cfg(debug_assertions)]
     previous_offset: f32,
     image_progress: Option<f32>,
+}
+
+#[derive(Clone)]
+struct FocusUnitBookmark {
+    focus: SourceAnchor,
+    viewport: Option<FocusReflowAnchor>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3034,6 +3044,7 @@ impl DesktopReader {
             self.animate_focus_scroll_to(target);
         }
         self.bump_scene_revision();
+        if let Some(store)=&self.progress_store {store.wake().allow_progress(&self.book_id);}
         self.persist_progress();
     }
 
@@ -3284,6 +3295,8 @@ impl DesktopReader {
             match self.reader.set_visible_position(position) {
                 Ok(snapshot) => {
                     self.install_snapshot(snapshot);
+                    if previous_viewport.is_some_and(|previous| previous.size==viewport.size&&(previous.offset_y-viewport.offset_y).abs()>0.1)
+                        && let Some(store)=&self.progress_store {store.wake().allow_progress(&self.book_id);}
                     self.persist_progress();
                 }
                 Err(error) => self.error = Some(format!("更新滑动阅读位置失败：{error}")),
@@ -3315,7 +3328,6 @@ impl DesktopReader {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) fn update_save_job(&mut self) -> Box<dyn FnOnce() -> Result<(), String> + Send> {
         self.statistics.flush_pending();
         let pending = self.progress_store.clone()
@@ -3328,8 +3340,24 @@ impl DesktopReader {
         })
     }
 
+    pub(crate) fn activate_sync_reader(&self) {
+        if let Some(store)=&self.progress_store {store.wake().active(Some(self.book_id.clone()));}
+    }
+    pub(crate) fn cloud_resume_check(&self)->Option<(SyncStore,String,rebook_publication::LocatorV1)> {
+        Some((self.progress_store.clone()?,self.book_id.clone(),self.progress_locator()))
+    }
+    pub(crate) fn cloud_resume_matches(&self,offer:&rebook_app_core::sync::ResumeOffer)->bool {
+        self.book_id==offer.book_id&&self.progress_locator()==offer.baseline
+    }
+    pub(crate) fn resume_cloud_progress(&mut self,offer:&rebook_app_core::sync::ResumeOffer) {
+        if self.cloud_resume_matches(offer) {
+            self.reopen_font_locator=Some(offer.remote.locator.clone());
+            self.reopen_requested=Some(self.source_path.clone());
+        }
+    }
     pub(crate) fn prepare_for_shutdown(&self) {
         self.persist_progress();
+        if let Some(store)=&self.progress_store {let wake=store.wake();if wake.snapshot().active.as_deref()==Some(&self.book_id){wake.active(None);wake.changed(rebook_app_core::sync::SyncChange::Flush);}}
     }
 
     pub(crate) fn uses_fonts(&self, fonts: &[Blob<u8>]) -> bool {
@@ -4227,6 +4255,8 @@ impl DesktopReader {
             sync_password,
             source_path,
         } = resources;
+        if let Some(store)=&progress_store {store.wake().protect_progress(&book_id);}
+
         // Adjacent pages are speculative. Start them only after the current
         // body has been presented, so preparation never competes with handoff.
         let error = None;
@@ -4322,6 +4352,7 @@ impl DesktopReader {
             pdf_metadata_missing,
             highlight_store,
             highlights,
+            annotation_edits: Default::default(),
             progress_store,
             selection_anchor: None,
             selection: None,
@@ -4414,6 +4445,7 @@ impl DesktopReader {
             focus_selection_anchor: None,
             focus_target_offset: None,
             focus_reflow_anchor: None,
+            focus_history: Default::default(),
             focus_anchor: restored_focus_anchor,
             focus_toc_override: None,
             pending_page_turn: None,

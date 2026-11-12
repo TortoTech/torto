@@ -5,6 +5,8 @@ use rebook_publication::SourceRange;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod selection;
+
 pub type HighlightResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +49,20 @@ pub trait HighlightRepository: Send + Sync {
     fn insert_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<()>;
     fn update_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<bool>;
     fn remove_highlight(&self, id: &str) -> HighlightResult<bool>;
+    /// Compare the live book snapshot and apply one selection edit. Persistent
+    /// repositories override this to commit replacement and tombstones atomically.
+    fn apply_selection_edit(&self, book: &str, expected: &[StoredHighlight], removed: &[String], replacement: Option<&StoredHighlight>) -> HighlightResult<bool> {
+        let mut current = self.highlights_for_book(book)?; current.sort_by(|a,b|a.id.cmp(&b.id));
+        let mut expected = expected.to_vec(); expected.sort_by(|a,b|a.id.cmp(&b.id));
+        if current != expected { return Ok(false); }
+        for id in removed { self.remove_highlight(id)?; }
+        if let Some(value) = replacement {
+            if current.iter().any(|row| row.id == value.id) && !removed.contains(&value.id) { self.update_highlight(value)?; }
+            else { self.insert_highlight(value)?; }
+        }
+        Ok(true)
+    }
+
     fn range_checks(
         &self,
         _book_id: &str,
@@ -74,6 +90,7 @@ pub trait HighlightRepository: Send + Sync {
     }
 }
 
+#[derive(Clone)]
 pub struct HighlightStore {
     repository: Arc<dyn HighlightRepository>,
 }

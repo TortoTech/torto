@@ -199,6 +199,7 @@ fn table_measurement_reuse_matches_fresh_shaping_including_bidi_and_hard_breaks(
                         Vec::new(),
                         false,
                         None,
+                        TextContext::Table,
                     );
                     assert_eq!(
                         reuse_test_geometry(&actual),
@@ -260,7 +261,7 @@ fn empty_table_cells_skip_shaping_without_consuming_whitespace_or_breaks() {
     assert!(actual.lines.is_empty());
     assert_eq!(prepared_text_height(&actual).to_bits(), 0.0_f32.to_bits());
     let expected =
-        engine.shape_text_with_sources(&empty, &style, 100.0, 8.0, &[], Vec::new(), false, None);
+        engine.shape_text_with_sources(&empty, &style, 100.0, 8.0, &[], Vec::new(), false, None, TextContext::Table);
     assert!(edge_content_lines(&expected).is_empty());
     assert_eq!(
         actual.available_width.to_bits(),

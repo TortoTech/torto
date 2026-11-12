@@ -33,7 +33,7 @@ val rustTasks = listOf("debug", "release").associateWith { variant ->
     }
 }
 val brandResources = tasks.register<Copy>("prepareBrandResources") {
-    from(repositoryRoot.resolve("assets/macos/torto-128.png"))
+    from(repositoryRoot.resolve("assets/macos/torto-512.png"))
     into(layout.buildDirectory.dir("generated/brand/drawable"))
     rename { "ic_torto.png" }
 }

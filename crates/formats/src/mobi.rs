@@ -37,6 +37,7 @@ fn convert(
         authors,
         languages,
         cover_path: metadata_cover_path,
+        details,
     } = kf8::metadata(bytes, format)?;
 
     let mut sections = Vec::new();
@@ -126,6 +127,7 @@ fn convert(
                 authors,
                 languages,
                 layout: RenditionLayout::Reflowable,
+                details,
             },
             sections,
             table_of_contents,

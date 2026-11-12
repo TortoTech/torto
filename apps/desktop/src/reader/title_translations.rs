@@ -78,6 +78,7 @@ fn split_title(section: &Section, row: &rebook_reader::TocViewItem) -> Option<us
             .skip(index + 1)
             .find(|(_, block)| {
                 !matches!(block, Block::Image(_) | Block::LineBreak | Block::PageBreak)
+                    && !rebook_publication::is_heading_separator(block)
             })?;
         if heading_text(next.1).is_some_and(|text| normalize(&text) == normalize(title)) {
             return Some(next.0);
@@ -369,6 +370,22 @@ mod tests {
             run.text = "Accessible design".into();
             section.blocks = vec![ordinal, title];
             let row = reader.reader.toc_items()[0].clone();
+            let mut separated = section.clone();
+            separated.blocks.insert(
+                1,
+                Block::Separator(rebook_publication::SeparatorBlock {
+                    text: None,
+                    kind: rebook_publication::SeparatorKind::Rule,
+                    in_quote: false,
+                    image: None,
+                    style: Default::default(),
+                }),
+            );
+            assert!(linked_rows(&separated, 0, std::slice::from_ref(&row)).is_empty());
+            assert_eq!(
+                linked_rows(&separated, 2, std::slice::from_ref(&row)),
+                vec![row.id.clone()]
+            );
             assert!(linked_rows(&section, 0, std::slice::from_ref(&row)).is_empty());
             assert_eq!(
                 linked_rows(&section, 1, std::slice::from_ref(&row)),

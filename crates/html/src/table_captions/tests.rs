@@ -28,6 +28,146 @@ fn plain(text: &TextBlock) -> String {
 }
 
 #[test]
+fn figure_notes_are_not_stolen_by_the_next_table_title() {
+    for notes in [
+        "<p id='note'>数据说明：CEIC，安信证券。</p>",
+        "<p id='source'>数据来源：国家统计局，安信证券。</p><p id='note'>数据说明：横轴为城市常住人口。</p>",
+    ] {
+        let section = parse(&format!(
+            "<p><img src='figure.png'/></p><p>图2-3 重工业增加值占比</p>{notes}<p id='title'>表2-2 工业行业增加值变化</p>{GRID}"
+        ));
+        let [Block::Figure(figure), Block::Table(table)] = &section.blocks[..] else {
+            panic!("{:?}", section.blocks);
+        };
+        assert_eq!(figure.caption_position, CaptionPosition::After);
+        assert_eq!(plain(&figure.captions[0]), "图2-3 重工业增加值占比");
+        assert!(plain(figure.captions.last().unwrap()).starts_with("数据说明："));
+        assert_eq!(
+            figure.captions.len(),
+            if notes.contains("id='source'") { 3 } else { 2 }
+        );
+        assert_eq!(table.before.len(), 1);
+        assert_eq!(plain(&table.before[0]), "表2-2 工业行业增加值变化");
+        for anchor in &section.anchors {
+            assert!(figure.captions.iter().chain(&table.before).any(|text| {
+                text.source
+                    .as_ref()
+                    .is_some_and(|range| range.start == anchor.source)
+            }));
+        }
+        assert_eq!(
+            figure.source.as_ref().unwrap().end,
+            figure.captions.last().unwrap().source.as_ref().unwrap().end
+        );
+    }
+}
+
+#[test]
+fn notes_after_a_wrapped_table_stay_with_it_before_the_next_title() {
+    let section = parse(&format!(
+        "<div><p>Table 1. First results</p>{GRID}</div><p id='source'>Source: First author.</p><p id='note'>Note: Rounded values.</p><p>Table 2. Next results</p>{GRID}"
+    ));
+    let [Block::Table(first), Block::Table(second)] = &section.blocks[..] else {
+        panic!("{:?}", section.blocks);
+    };
+    assert_eq!(
+        first.after.iter().map(plain).collect::<Vec<_>>(),
+        ["Source: First author.", "Note: Rounded values."]
+    );
+    assert_eq!(
+        second.before.iter().map(plain).collect::<Vec<_>>(),
+        ["Table 2. Next results"]
+    );
+    for (anchor, text) in section.anchors.iter().zip(&first.after) {
+        assert_eq!(anchor.source, text.source.as_ref().unwrap().start);
+    }
+}
+
+#[test]
+fn authored_upper_sources_and_explicit_targets_override_previous_media() {
+    for group in [
+        format!("<p>Table 1. Individual differences</p><p id='source'>Source: Lewis (2002).</p>{GRID}"),
+        format!("<div><p id='source'>Source: Lewis (2002).</p><p>Table 1. Individual differences</p>{GRID}</div>"),
+        "<p id='source'>Source: <a href='#next'>Lewis (2002).</a></p><p>Table 1. Individual differences</p><table id='next'><tr><td>42</td></tr></table>".to_owned(),
+    ] {
+        let section = parse(&format!(
+            "<p><img src='figure.png'/></p><p>Figure 1. Earlier results</p>{group}"
+        ));
+        let Some(Block::Table(table)) = section.blocks.last() else {
+            panic!("{:?}", section.blocks);
+        };
+        assert_eq!(table.before.len(), 2);
+        let source = table.before.iter().find(|text| plain(text).starts_with("Source:")).unwrap();
+        assert_eq!(section.anchors.iter().find(|anchor| anchor.fragment == "source").unwrap().source,
+            source.source.as_ref().unwrap().start);
+    }
+}
+
+#[test]
+fn ordinary_prose_and_headings_separate_upper_notes_from_previous_figures() {
+    for barrier in ["<p>New discussion.</p>", "<h2>New chapter</h2>"] {
+        let section = parse(&format!(
+            "<p><img src='figure.png'/></p><p>Figure 1. Earlier results</p>{barrier}<p>Source: WHO, 2008.</p><p>Table 1. Results</p>{GRID}"
+        ));
+        let Some(Block::Table(table)) = section.blocks.last() else {
+            panic!()
+        };
+        assert_eq!(table.before.len(), 2);
+        assert_eq!(plain(&table.before[0]), "Source: WHO, 2008.");
+    }
+}
+
+#[test]
+fn two_image_table_keeps_upper_source_images_and_anchors_in_authored_order() {
+    let section = parse(
+        "<p id='title' class='tablecaption'>Stages of ISO Standardization Process</p><p id='source' class='tablesource'>Source: ISO.</p><div class='graphic'><img id='first' src='part1.jpg'/><img id='second' src='part2.jpg'/></div>",
+    );
+    let [Block::Figure(figure)] = &section.blocks[..] else {
+        panic!("{:?}", section.blocks);
+    };
+    assert_eq!(figure.images.len(), 2);
+    assert_eq!(figure.caption_position, CaptionPosition::Before);
+    assert_eq!(
+        figure.captions.iter().map(plain).collect::<Vec<_>>(),
+        ["Stages of ISO Standardization Process", "Source: ISO."]
+    );
+    assert_eq!(
+        figure.source.as_ref().unwrap().start,
+        figure.captions[0].source.as_ref().unwrap().start
+    );
+    assert_eq!(
+        figure.source.as_ref().unwrap().end,
+        figure.images[1].source.as_ref().unwrap().end
+    );
+    for (index, fragment) in ["title", "source", "first", "second"].iter().enumerate() {
+        assert_eq!(&section.anchors[index].fragment, fragment);
+        let range = if index < 2 {
+            &figure.captions[index].source
+        } else {
+            &figure.images[index - 2].source
+        };
+        assert_eq!(section.anchors[index].source, range.as_ref().unwrap().start);
+    }
+}
+
+#[test]
+fn image_bundle_carriers_are_bounded_and_do_not_consume_mixed_content() {
+    for body in [
+        "<div><img src='first.jpg'/><p>Ordinary prose.</p><img src='second.jpg'/></div>".to_owned(),
+        format!("<div><img src='first.jpg'/>{GRID}</div>"),
+        format!("<div>{}</div>", "<img src='part.jpg'/>".repeat(9)),
+    ] {
+        let document = roxmltree::Document::parse(&body).unwrap();
+        assert!(!carrier(document.root_element()));
+    }
+    let document = roxmltree::Document::parse(
+        "<div><p><img src='first.jpg'/></p><div><img src='second.jpg'/></div></div>",
+    )
+    .unwrap();
+    assert!(carrier(document.root_element()));
+}
+
+#[test]
 fn consecutive_numbered_tables_keep_their_titles_and_trailing_notes_without_classes() {
     for class in ["", "unexpected-publisher-name", "tablecaption"] {
         let section = parse(&format!(

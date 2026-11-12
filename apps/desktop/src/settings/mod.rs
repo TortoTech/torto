@@ -805,18 +805,18 @@ mod tests {
         assert!(!settings_close_needs_apply(&applied, &applied));
 
         let mut changed = applied.clone();
-        changed.focus_style = FocusStyle::SurroundingDim;
+        changed.focus_style = FocusStyle::BackgroundHighlight;
         assert!(settings_close_needs_apply(&changed, &applied));
         let mut state = SettingsFeature::from_applied(
             applied.clone(),
             LayoutEngine::with_fonts(std::iter::empty()).available_reader_font_families(),
             Vec::new(),
         );
-        state.draft_focus_style = FocusStyle::SurroundingDim;
+        state.draft_focus_style = FocusStyle::BackgroundHighlight;
         state.draft_reading_mode = ReadingMode::Classic;
         assert_eq!(
             state.draft_settings().focus_style,
-            FocusStyle::SurroundingDim
+            FocusStyle::BackgroundHighlight
         );
 
         // A denied unlock must not persist empty draft keys or alter the

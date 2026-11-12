@@ -117,6 +117,7 @@ struct SyncUiState {
     password: String,
     task: TaskSlot<SyncTask>,
     button: SyncButtonState,
+    ready_books: (u64,u64),
     schedule: SyncSchedule,
     import_error: Option<String>,
     monitor: sync_monitor::SyncMonitor,
@@ -303,6 +304,7 @@ impl ShelfFeature {
                 password,
                 task: TaskSlot::default(),
                 button: SyncButtonState::default(),
+                ready_books: (0,0),
                 schedule: SyncSchedule::default(),
                 import_error: None,
                 monitor: sync_monitor::SyncMonitor::default(),
@@ -484,6 +486,20 @@ impl ShelfFeature {
         self.opening.restart(settings, self.local_store.clone());
     }
 
+    pub(crate) fn shutdown_sync(&mut self)->Option<SyncTask> {
+        self.sync.monitor.invalidate();self.sync.task.cancel();
+        self.sync.settings.enabled.then(||SyncTask {
+            settings:self.sync.settings.clone(),password:self.sync.password.clone(),books:Vec::new(),mode:SyncMode::Reading,
+        })
+    }
+    pub(crate) fn sync_lifecycle(&mut self,foreground:bool) {
+        if foreground {
+            if let Some(store)=&self.local_store {let wake=store.wake();wake.active(wake.snapshot().active);}
+        }else{
+            self.sync.schedule.request(SyncMode::Reading);
+            if let Some(store)=&self.local_store {store.wake().changed(rebook_app_core::sync::SyncChange::Flush);}
+        }
+    }
     pub(crate) fn resume(&mut self) {
         if let Ok(language) = preferences::load_app_language() {
             self.language = language;
@@ -583,6 +599,9 @@ impl ShelfFeature {
     }
 
     fn start_sync(&mut self, mode: SyncMode) {
+        if matches!(mode,SyncMode::Full {..}) && let Some(store)=&self.local_store {
+            self.sync.schedule.attach_signal(&store.wake().snapshot());
+        }
         if self.sync.task.is_pending() {
             self.sync.schedule.request(mode);
             return;
@@ -593,6 +612,7 @@ impl ShelfFeature {
         if !self.sync.schedule.start_requested(mode, Instant::now()) {
             return;
         }
+        self.sync.ready_books=(0,0);
         self.sync.button = SyncButtonState::Running {
             stage: SyncStage::Preparing,
             completed: 0,
@@ -624,7 +644,7 @@ impl ShelfFeature {
             mode,
             settings: self.sync.settings.clone(),
             password: self.sync.password.clone(),
-            books: if matches!(mode, SyncMode::Reading | SyncMode::Statistics) {
+            books: if matches!(mode, SyncMode::Reading | SyncMode::Current | SyncMode::Statistics) {
                 Vec::new()
             } else {
                 self.shelf
@@ -918,17 +938,18 @@ impl ShelfFeature {
                 completed,
                 total,
             } => {
-                self.sync.button = SyncButtonState::Running {
-                    stage,
-                    completed,
-                    total,
-                };
+                if stage==SyncStage::ReadingApplied {return;}
+                if stage==SyncStage::Books {self.sync.ready_books=(completed,total);}
+                let (stage,completed,total)=if stage==SyncStage::Downloading&&self.sync.ready_books.1>0 {
+                    (SyncStage::Books,self.sync.ready_books.0,self.sync.ready_books.1)
+                }else{(stage,completed,total)};
+                self.sync.button = SyncButtonState::Running {stage,completed,total};
             }
             SyncProgress::Downloaded {
                 book,
                 cache_path,
-                completed,
-                total,
+                books_completed,
+                books_total,
                 ..
             } => {
                 match self.shelf.library.import_remote(*book) {
@@ -946,10 +967,9 @@ impl ShelfFeature {
                         ));
                     }
                 }
+                self.sync.ready_books=(books_completed,books_total);
                 self.sync.button = SyncButtonState::Running {
-                    stage: SyncStage::Downloading,
-                    completed,
-                    total,
+                    stage: SyncStage::Books,completed:books_completed,total:books_total,
                 };
             }
             SyncProgress::CoverDownloaded { book_id, bytes } => {
@@ -1028,7 +1048,7 @@ impl ShelfFeature {
                         left: SHELF_CONTENT_LEFT_MARGIN,
                         right: 16,
                         top: 12,
-                        bottom: 28,
+                        bottom: 0,
                     }),
             )
             .show(root_ui, |ui| {
@@ -1100,6 +1120,7 @@ impl ShelfFeature {
                             search_response.has_focus(),
                             interaction_blocked,
                         );
+                        ui.add_space(28.0);
                     });
                 }
             });

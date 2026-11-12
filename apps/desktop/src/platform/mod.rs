@@ -16,6 +16,9 @@ pub(crate) use clipboard::images_without_text;
 pub(crate) use clipboard::feedback_images;
 
 pub(crate) enum UserEvent {
+    ExitReady,
+    CloudResumeAccepted {account:String,offer:Option<rebook_app_core::sync::ResumeOffer>},
+    CloudResume {account:String,offer:Option<rebook_app_core::sync::ResumeOffer>},
     Fonts(crate::fonts::Message),
     Feedback(crate::feedback::Message),
     RepaintAfter(std::time::Duration),

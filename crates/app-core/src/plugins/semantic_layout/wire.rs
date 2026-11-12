@@ -65,13 +65,10 @@ const KEYS: &[(&str, &str)] = &[
     ("target_end_exclusive", "te"),
     ("quotes_enabled", "qe"),
     ("captions_enabled", "ce"),
-    ("headings_enabled", "he"),
     ("targets", "tg"),
-    ("classify_headings", "ch"),
     ("classify_blocks", "cb"),
     ("complete_quote_sources", "cq"),
     ("classify_citations", "ci"),
-    ("numbered_candidates", "nc"),
     ("results", "r"),
     ("image_id", "ii"),
     ("status", "ss"),
@@ -367,13 +364,13 @@ mod tests {
 
     #[test]
     fn input_instructions_only_explain_present_fields_and_values() {
-        let input = json!({"blocks":[{"id":4,"type":"paragraph","text":"groups recognized latex < x"}],"targets":{"classify_headings":[4]}});
+        let input = json!({"blocks":[{"id":4,"type":"paragraph","text":"groups recognized latex < x"}],"targets":{"classify_blocks":[4]}});
         let text = instructions("Read `blocks`; follow the output schema.", [&input]);
         assert!(text.contains("Read `bs`"));
         assert!(
             text.contains("i=id")
                 && text.contains("t=text")
-                && text.contains("ch=classify_headings")
+                && text.contains("cb=classify_blocks")
         );
         assert!(text.contains("ty: p=paragraph"));
         assert!(

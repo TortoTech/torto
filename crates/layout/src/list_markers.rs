@@ -3,18 +3,37 @@ use std::borrow::Cow;
 
 use rebook_publication::{Inline, TextBlock, TextBlockKind, TextRun};
 
+pub(super) fn hanging_body(block: &TextBlock) -> bool {
+    matches!(block.kind, TextBlockKind::ListItem { .. })
+        && block.style.direction != rebook_publication::TextDirection::Rtl
+}
+
 pub(super) fn prefix(block: &TextBlock) -> Option<String> {
+    formatted_prefix(block, false)
+}
+
+pub(super) fn visible_prefix(block: &TextBlock) -> String {
+    formatted_prefix(block, true).unwrap_or_else(|| {
+        let mut kind = block.kind;
+        if let TextBlockKind::ListItem { marker_visible, .. } = &mut kind {
+            *marker_visible = true;
+        }
+        super::list_marker_prefix(kind)
+    })
+}
+
+fn formatted_prefix(block: &TextBlock, force_visible: bool) -> Option<String> {
     let TextBlockKind::ListItem {
         ordered: true,
         ordinal,
-        marker_visible: true,
+        marker_visible,
         ..
     } = block.kind
     else {
         return None;
     };
     let format = block.style.list_marker_format?;
-    if ordinal == 0 {
+    if ordinal == 0 || !marker_visible && !force_visible {
         return None;
     }
     let mut number = ordinal;
@@ -84,4 +103,12 @@ pub(super) fn normalize(block: &TextBlock, unified: bool) -> Cow<'_, TextBlock> 
         *marker_visible = true;
     }
     Cow::Owned(result)
+}
+
+pub(super) fn body_indent_em(block: &TextBlock, style: &super::ReaderStyle) -> f32 {
+    let TextBlockKind::ListItem { depth, .. } = block.kind else { return 0.0; };
+    let display = block.content.iter().flat_map(Inline::text_runs)
+        .find_map(|run| run.style.display_writing_system).unwrap_or(style.writing_system);
+    super::paragraph_indent_em(&style.typesetting, display)
+        + f32::from(depth) * style.typesetting.list_indent_em
 }

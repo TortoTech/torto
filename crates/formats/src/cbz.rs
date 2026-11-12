@@ -51,11 +51,7 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, Fo
             });
         }
     }
-    images.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-    });
+    images.sort_by(|left, right| natural_path_cmp(&left.name, &right.name));
     if images.is_empty() {
         return Err(conversion_error(BookFormat::Cbz, "压缩包中没有支持的图片"));
     }
@@ -111,6 +107,7 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, Fo
                 authors: metadata.authors,
                 languages: metadata.language.into_iter().collect(),
                 layout: RenditionLayout::PrePaginated,
+                ..Metadata::default()
             },
             sections,
             table_of_contents: Vec::new(),
@@ -119,6 +116,53 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, Fo
         },
         BookFormat::Cbz,
     )
+}
+
+fn natural_path_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn segment(left: &str, right: &str) -> Ordering {
+        let left = left.to_lowercase();
+        let right = right.to_lowercase();
+        let (mut a, mut b) = (left.as_bytes(), right.as_bytes());
+        while !a.is_empty() && !b.is_empty() {
+            if a[0].is_ascii_digit() && b[0].is_ascii_digit() {
+                let an = a.iter().take_while(|c| c.is_ascii_digit()).count();
+                let bn = b.iter().take_while(|c| c.is_ascii_digit()).count();
+                let av = &a[..an];
+                let bv = &b[..bn];
+                let av = &av[av.iter().take_while(|c| **c == b'0').count()..];
+                let bv = &bv[bv.iter().take_while(|c| **c == b'0').count()..];
+                let order = av.len().cmp(&bv.len()).then_with(|| av.cmp(bv));
+                if order != Ordering::Equal { return order; }
+                a = &a[an..]; b = &b[bn..];
+            } else {
+                let order = a[0].cmp(&b[0]);
+                if order != Ordering::Equal { return order; }
+                a = &a[1..]; b = &b[1..];
+            }
+        }
+        a.len().cmp(&b.len())
+    }
+    // Compare each directory first, so "Chapter 6" precedes "Chapter 6 (2)".
+    let mut a = left.split('/');
+    let mut b = right.split('/');
+    loop {
+        match (a.next(), b.next()) {
+            (Some(a), Some(b)) => {
+                let order = segment(a, b);
+                if order != Ordering::Equal { return order; }
+            }
+            (a, b) => return a.is_some().cmp(&b.is_some()).then_with(|| left.cmp(right)),
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn page_order_is_numeric_per_directory_without_integer_overflow() {
+    let mut paths = ["Chapter 6 (2)/1.png", "Chapter 6/10.png", "Chapter 6/2.png", "Chapter 6/1.png", "Chapter 60/9999999999999999999999999999999.png"];
+    paths.sort_by(|a,b| natural_path_cmp(a,b));
+    assert_eq!(paths[..4],["Chapter 6/1.png","Chapter 6/2.png","Chapter 6/10.png","Chapter 6 (2)/1.png"]);
 }
 
 fn read_comic_info(

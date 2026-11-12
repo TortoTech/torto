@@ -4,7 +4,7 @@ use rebook_reader::{NavigationAttempt, PageDirection, ReaderSnapshot};
 
 use super::{
     DesktopReader, FollowUp, MarkRetention, PendingTocNavigation, ProgressChange, SceneChange,
-    SnapshotEffects, logical_dimension,
+    SnapshotEffects, FocusUnitBookmark, FocusReflowKind, logical_dimension,
 };
 
 pub(super) const fn snapshot_reanchors_focus(effects: SnapshotEffects) -> bool {
@@ -120,6 +120,14 @@ impl DesktopReader {
         self.ui.focus_footnote_scroll_delta = 0.0;
         self.focus_toc_override = None;
         self.pending_toc_navigation = None;
+        if self.is_focus_mode() && let Some(focus) = self.focus_anchor.clone() {
+            let bookmark = FocusUnitBookmark {
+                focus,
+                viewport: self.capture_focus_reflow_anchor(FocusReflowKind::DocumentLayout),
+            };
+            let key = rebook_app_core::focus_navigation::UnitKey::capture(&mut self.reader);
+            self.focus_history.remember(key, bookmark);
+        }
         self.pending_reading_unit_turn = Some(direction);
         self.retry_pending_reading_unit_turn();
     }
@@ -151,7 +159,14 @@ impl DesktopReader {
                 self.focus_unit_index = 0;
                 self.focus_target_offset = None;
                 self.ui.focus_scroll_motion = None;
-                self.pending_reading_unit_entry = Some(direction);
+                let key = rebook_app_core::focus_navigation::UnitKey::capture(&mut self.reader);
+                if self.is_focus_mode() && let Some(bookmark) = self.focus_history.get(&key).cloned() {
+                    self.focus_anchor = Some(bookmark.focus);
+                    self.focus_reflow_anchor = bookmark.viewport;
+                    self.pending_reading_unit_entry = None;
+                } else {
+                    self.pending_reading_unit_entry = Some(direction);
+                }
             }
             Ok(NavigationAttempt::Ready(_)) => {
                 self.pending_reading_unit_turn = None;
@@ -303,6 +318,7 @@ impl DesktopReader {
         }
         self.error = None;
         if matches!(effects.progress, ProgressChange::Persist) {
+            if let Some(store)=&self.progress_store {store.wake().allow_progress(&self.book_id);}
             self.persist_progress();
         }
         if matches!(effects.prefetch, FollowUp::Run) {
@@ -367,7 +383,4 @@ impl DesktopReader {
             .or_else(|| page.leading_source_range())
     }
 
-    pub(in crate::reader) fn progress(&self) -> f64 {
-        self.snapshot.total_progression
-    }
 }

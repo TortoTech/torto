@@ -100,7 +100,12 @@ internal class ZoomImageView(context:Context,private val bitmap:Bitmap,private v
         }
         override fun onDoubleTap(e:MotionEvent):Boolean{zoom=if(zoom>1f)1f else 2.5f;panX=0f;panY=0f;invalidate();return true}
     })
-    init {contentDescription="Image preview. Pinch to zoom; double tap to reset.";isFocusable=true}
+    init {
+        contentDescription="Image preview. Pinch to zoom; double tap to reset."
+        isFocusable=true
+        // Native focus feedback would tint the entire photograph.
+        setDefaultFocusHighlightEnabled(false)
+    }
     override fun onDraw(canvas:Canvas){super.onDraw(canvas);val size=base*zoom;canvas.save();canvas.translate(width/2f+panX,height/2f+panY);canvas.scale(size,size);canvas.drawBitmap(bitmap,-bitmap.width/2f,-bitmap.height/2f,paint);canvas.restore()}
     override fun onTouchEvent(event:MotionEvent):Boolean{
         scale.onTouchEvent(event);gestures.onTouchEvent(event)

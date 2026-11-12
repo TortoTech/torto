@@ -88,7 +88,7 @@ import org.tortotech.torto.core.StatisticsPeriod
     val cover by produceState<Bitmap?>(null,id){value=model.cover(id)}
     Box(Modifier.width(width.dp).height((width*1.4f).dp).clip(RoundedCornerShape(5.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest),contentAlignment=Alignment.Center) {
         cover?.let {Image(it.asImageBitmap(),null,Modifier.fillMaxSize(),contentScale=ContentScale.Crop)}
-            ?: AppIcon("book",tint=MaterialTheme.colorScheme.onSurfaceVariant)
+            ?: AppIcon("book",tint=defaultIconColor())
     }
 }
 private fun statisticsDate(ms:ULong?):String=if(ms==null||ms==0uL)"—" else Instant.ofEpochMilli(ms.toLong()).atZone(ZoneId.systemDefault()).toLocalDate().toString().replace('-','/')
@@ -113,13 +113,13 @@ private fun statisticsDate(ms:ULong?):String=if(ms==null||ms==0uL)"—" else Ins
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(bottom=8.dp)) {
                 periods.forEachIndexed {index,(id,label)->SegmentedButton(
                     selected=state.statsKind==id,onClick={model.loadStatisticsPeriod(id,0)},
-                    shape=SegmentedButtonDefaults.itemShape(index,periods.size),icon={},enabled=!state.statsLoading) {Text(label,maxLines=1)} }
+                    shape=SegmentedButtonDefaults.itemShape(index,periods.size),icon={}) {Text(label,maxLines=1)} }
             }
             if(state.statsKind!="all")FlowRow(Modifier.fillMaxWidth().padding(bottom=8.dp)) {
-                IconButton(onClick={model.loadStatisticsPeriod(state.statsKind,state.statsOffset-1)},enabled=!state.statsLoading&&state.statsOffset> -200){AppIcon("previous",tr("上一周期","Previous period"))}
+                IconButton(onClick={model.loadStatisticsPeriod(state.statsKind,state.statsOffset-1)},enabled=state.statsOffset> -200){AppIcon("previous",tr("上一周期","Previous period"))}
                 Text(stats?.let {statisticsRange(it)}.orEmpty(),Modifier.padding(vertical=14.dp),style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                ActionIcon("next",tr("下一周期","Next period"),!state.statsLoading&&state.statsOffset<0){model.loadStatisticsPeriod(state.statsKind,state.statsOffset+1)}
-                if(state.statsOffset<0)TextButton(onClick={model.loadStatisticsPeriod(state.statsKind,0)},enabled=!state.statsLoading) {
+                ActionIcon("next",tr("下一周期","Next period"),state.statsOffset<0){model.loadStatisticsPeriod(state.statsKind,state.statsOffset+1)}
+                if(state.statsOffset<0)TextButton(onClick={model.loadStatisticsPeriod(state.statsKind,0)}) {
                     Text(when(state.statsKind){"month"->tr("本月","This month");"year"->tr("今年","This year");else->tr("本周","This week")})
                 }
             }
@@ -147,7 +147,7 @@ private fun statisticsDate(ms:ULong?):String=if(ms==null||ms==0uL)"—" else Ins
                             StatisticsTime(book.milliseconds,20)
                             Text(book.title.ifEmpty {tr("未知书籍","Unknown book")},style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=1,overflow=TextOverflow.Ellipsis)
                         }
-                        Spacer(Modifier.width(8.dp));AppIcon("next",size=18.dp,tint=MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.width(8.dp));AppIcon("next",size=IconSizes.Chevron,tint=defaultIconColor())
                     }
                 }
             }
@@ -159,6 +159,7 @@ private fun statisticsDate(ms:ULong?):String=if(ms==null||ms==0uL)"—" else Ins
     LaunchedEffect(state.statsBookId){state.statsBookId?.let {model.loadBookStatistics(it)}}
     val detail=state.bookStatistics?.takeIf {it.id==state.statsBookId}
     if(detail==null)return
+    val book=state.books.firstOrNull {it.id==detail.id}
     val days=remember(detail.distribution){detail.distribution.filter {it.milliseconds>=60000uL}.sortedByDescending {it.day}}
     val measurer=rememberTextMeasurer()
     val textStyle=MaterialTheme.typography.bodyMedium.copy(fontFeatureSettings="tnum")
@@ -166,7 +167,7 @@ private fun statisticsDate(ms:ULong?):String=if(ms==null||ms==0uL)"—" else Ins
     val hourWidth=with(density){measurer.measure(days.maxByOrNull {(it.milliseconds/3600000uL).toString().length}?.let {(it.milliseconds/3600000uL).toString()} ?: "0",textStyle).size.width.toDp()}
     val minuteWidth=with(density){measurer.measure("00",textStyle).size.width.toDp()}
     LazyColumn(contentPadding=PaddingValues(16.dp)) {
-        item {StatisticsCard(Modifier.padding(bottom=12.dp)) {Row(verticalAlignment=Alignment.Top) {
+        item {StatisticsCard(Modifier.padding(bottom=12.dp).clickable(enabled=book!=null&&!state.busy,role=androidx.compose.ui.semantics.Role.Button){book?.let(model::open)}) {Row(verticalAlignment=Alignment.Top) {
             StatisticsCover(detail.id,model,76);Spacer(Modifier.width(16.dp))
             Column(Modifier.weight(1f)) {
                 Text(detail.title,style=MaterialTheme.typography.titleMedium.copy(fontSize=18.sp),maxLines=2,overflow=TextOverflow.Ellipsis)
@@ -208,6 +209,5 @@ private fun statisticsDate(ms:ULong?):String=if(ms==null||ms==0uL)"—" else Ins
                 }
             }
         }
-        state.books.firstOrNull {it.id==detail.id}?.let {book->item{TextButton(onClick={model.open(book)}){Text(tr("继续阅读","Continue reading"))}}}
     }
 }

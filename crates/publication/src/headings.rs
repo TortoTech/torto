@@ -123,3 +123,9 @@ mod tests {
         assert_ne!(heading_ordinal_key("1.1"), heading_ordinal_key("11"));
     }
 }
+
+/// Presentation-only separators may sit between an ordinal and its title.
+pub fn is_heading_separator(block: &crate::Block) -> bool {
+    matches!(block, crate::Block::Separator(s) if !s.in_quote
+        && matches!(s.kind, crate::SeparatorKind::Rule | crate::SeparatorKind::Ornament))
+}

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
@@ -19,6 +20,7 @@ use super::webdav::WebDavClient;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SyncMode {
     Reading,
+    Current,
     Derived,
     Statistics,
     Full { force_statistics: bool },
@@ -55,7 +57,10 @@ pub enum SyncStage {
     Discovering,
     PreparingDownload,
     Downloading,
+    DerivedUploading,
+    DerivedDownloading,
     ReadingData,
+    ReadingApplied,
     CheckingDerivedData,
     Statistics,
 }
@@ -113,6 +118,19 @@ async fn download_in_batches(
             missing.push(id.clone());
         }
     }
+    let activity = store.progress_activity_times()?;
+    let active = store.wake().snapshot().active;
+    missing.sort_by(|a, b| {
+        let key = |id: &String| {
+            let remote = plan.recent.get(id).copied().unwrap_or_default();
+            (
+                active.as_ref() == Some(id),
+                activity.get(id).copied().unwrap_or(0).max(remote.0),
+                remote.1,
+            )
+        };
+        key(b).cmp(&key(a)).then(a.cmp(b))
+    });
     let total = present + missing.len() as u64;
     progress(SyncProgress::Stage {
         stage: SyncStage::Books,
@@ -124,8 +142,15 @@ async fn download_in_batches(
     }
     for (index, batch) in missing.chunks(DOWNLOAD_BATCH_SIZE).enumerate() {
         let ids = batch.iter().cloned().collect();
-        let manifests =
+        let mut manifests =
             prepare_downloads(webdav, store, &BTreeMap::new(), &ids, cache, progress).await?;
+        // Manifest discovery uses a set; restore reading priority before transfer.
+        manifests.sort_by_key(|(id, _)| {
+            batch
+                .iter()
+                .position(|book| book == id)
+                .unwrap_or(usize::MAX)
+        });
         let bytes = manifests.iter().map(|(_, m)| m.content_length).sum();
         let context = DownloadContext {
             store,
@@ -192,6 +217,168 @@ pub async fn run_sync<F>(
     password: String,
     local_books: Vec<LocalSyncBook>,
     mode: SyncMode,
+    progress: F,
+) -> SyncResult<SyncReport>
+where
+    F: FnMut(SyncProgress) + Send,
+{
+    if !matches!(mode, SyncMode::Full { .. } | SyncMode::Derived) {
+        return run_sync_inner(settings, password, local_books, mode, progress).await;
+    }
+    let store = SyncStore::open_default(settings.device_id.clone())?;
+    let sink = std::sync::Mutex::new(progress);
+    let main = run_sync_inner(
+        settings.clone(),
+        password.clone(),
+        local_books,
+        mode,
+        |event| {
+            if let Ok(mut sink) = sink.lock() {
+                sink(event);
+            }
+        },
+    );
+    let webdav = WebDavClient::new(&settings, password)?
+        .with_store(store.clone(), super::account_key(&settings));
+    prioritize_reading(&settings, store, webdav, main, &sink).await
+}
+
+async fn prioritize_reading<F>(
+    settings: &SyncSettings,
+    store: SyncStore,
+    webdav: WebDavClient,
+    main: impl std::future::Future<Output = SyncResult<SyncReport>>,
+    sink: &std::sync::Mutex<F>,
+) -> SyncResult<SyncReport>
+where
+    F: FnMut(SyncProgress) + Send,
+{
+    let wake = store.wake();
+    let mut changes = wake.subscribe();
+    tokio::pin!(main);
+    let account = super::account_key(&settings);
+    let mut due: Option<Instant> = None;
+    let mut pending_since: Option<Instant> = None;
+    let mut check_current = Instant::now() + std::time::Duration::from_secs(60);
+    let mut urgent = SyncReport::default();
+    let mut activation = changes.borrow().activation;
+    let mut active_book = changes.borrow().active.clone();
+    let mut flush = changes.borrow().flush;
+    let mut last_current_check = Instant::now();
+    loop {
+        let deadline = due.unwrap_or(check_current).min(check_current);
+        let event = {
+            let pulse = async {
+                webdav.wait_for_control().await;
+                let changed = std::pin::pin!(changes.changed());
+                let timer = std::pin::pin!(tokio::time::sleep_until(deadline.into()));
+                match futures_util::future::select(changed, timer).await {
+                    futures_util::future::Either::Left((result, _)) => Some(result.is_ok()),
+                    futures_util::future::Either::Right(_) => None,
+                }
+            };
+            let pulse = std::pin::pin!(pulse);
+            match futures_util::future::select(main.as_mut(), pulse).await {
+                futures_util::future::Either::Left((result, _)) => Ok(result),
+                futures_util::future::Either::Right((event, _)) => Err(event),
+            }
+        };
+        match event {
+            Ok(result) => {
+                let mut report = result?;
+                report.updated_progress += urgent.updated_progress;
+                report.merged_annotations += urgent.merged_annotations;
+                return Ok(report);
+            }
+            Err(Some(changed)) => {
+                if !changed {
+                    return main.await;
+                }
+                let signal = changes.borrow_and_update().clone();
+                if signal.activation != activation {
+                    activation = signal.activation;
+                    if signal.active.is_some()
+                        && (signal.active != active_book
+                            || last_current_check.elapsed() >= std::time::Duration::from_secs(10))
+                    {
+                        check_current = Instant::now();
+                    }
+                    active_book = signal.active.clone();
+                }
+                let (store, account) = (store.clone(), account.clone());
+                let pending = tokio::task::spawn_blocking(move || -> SyncResult<_> {
+                    Ok((
+                        store
+                            .pending_reading(&account)?
+                            .into_iter()
+                            .map(|(_, _, at)| at)
+                            .max(),
+                        store.pending_annotation_time(&account)?,
+                    ))
+                })
+                .await??;
+                let now = Instant::now();
+                let wall = super::rate_limit::now_ms();
+                due = pending.0.map(|last| {
+                    let since = *pending_since.get_or_insert(now);
+                    let quiet = if pending.1.is_some() {
+                        3000u64
+                    } else {
+                        15000u64
+                    };
+                    let at = pending.1.unwrap_or(last);
+                    (now + std::time::Duration::from_millis(
+                        quiet.saturating_sub(wall.saturating_sub(at)),
+                    ))
+                    .min(since + std::time::Duration::from_secs(60))
+                });
+                if signal.flush != flush {
+                    flush = signal.flush;
+                    due = Some(now);
+                }
+                if due.is_none() {
+                    pending_since = None;
+                }
+            }
+            Err(None) => {
+                if webdav.control_busy() {
+                    continue;
+                }
+                let current = Instant::now() >= check_current;
+                let report = if current {
+                    sync_current_reading(&webdav, &store, &settings, &mut |_| {}).await?
+                } else {
+                    sync_changed_reading(&webdav, &store, &settings, &mut |_| {}).await?
+                };
+                super::changes::publish(&webdav, false).await?;
+                if report.updated_progress > 0 || report.merged_annotations > 0 {
+                    if let Ok(mut sink) = sink.lock() {
+                        sink(SyncProgress::Stage {
+                            stage: SyncStage::ReadingApplied,
+                            completed: report.updated_progress as u64,
+                            total: report.merged_annotations as u64,
+                        });
+                    }
+                }
+                urgent.updated_progress += report.updated_progress;
+                urgent.merged_annotations += report.merged_annotations;
+                if current {
+                    last_current_check = Instant::now();
+                    check_current = last_current_check + std::time::Duration::from_secs(60);
+                } else {
+                    due = None;
+                    pending_since = None;
+                }
+            }
+        }
+    }
+}
+
+async fn run_sync_inner<F>(
+    settings: SyncSettings,
+    password: String,
+    local_books: Vec<LocalSyncBook>,
+    mode: SyncMode,
     mut progress: F,
 ) -> SyncResult<SyncReport>
 where
@@ -202,11 +389,18 @@ where
     let webdav = WebDavClient::new(&settings, password)?
         .with_store(store.clone(), super::account_key(&settings));
     if crate::environment::portable_machine().is_some() && mode != SyncMode::Statistics {
-        let config = crate::environment::paths().ok_or_else(|| io::Error::other("Missing portable configuration"))?.config;
+        let config = crate::environment::paths()
+            .ok_or_else(|| io::Error::other("Missing portable configuration"))?
+            .config;
         let previous = super::portable::previous_devices(&config, &settings.device_id)?;
         sync_portable_previous_devices(&webdav, &store, &settings, previous).await?;
     }
     let device = settings.device_id.clone();
+    if mode == SyncMode::Current {
+        let report = sync_current_reading(&webdav, &store, &settings, &mut progress).await?;
+        super::changes::publish(&webdav, false).await?;
+        return Ok(report);
+    }
     if mode == SyncMode::Statistics {
         progress(SyncProgress::Stage {
             stage: SyncStage::Statistics,
@@ -310,14 +504,21 @@ where
 
 /// Flush pending changes under their original actor, with their original HLC
 /// and vector clocks. Moving a profile must not turn old notes into new edits.
-async fn sync_portable_previous_devices(webdav: &WebDavClient, store: &SyncStore, settings: &SyncSettings, previous: Vec<String>) -> SyncResult<()> {
+async fn sync_portable_previous_devices(
+    webdav: &WebDavClient,
+    store: &SyncStore,
+    settings: &SyncSettings,
+    previous: Vec<String>,
+) -> SyncResult<()> {
     for device in previous {
         let previous_store = SyncStore::open_at(store.path().into(), device.clone())?;
-        let mut previous_settings = settings.clone(); previous_settings.device_id = device;
+        let mut previous_settings = settings.clone();
+        previous_settings.device_id = device;
         let account = super::account_key(&previous_settings);
         for (book, _, _) in previous_store.pending_reading(&account)? {
             validate_book_id(&book)?;
-            let revision = push_reading_state(webdav, &previous_store, &previous_settings, &book).await?;
+            let revision =
+                push_reading_state(webdav, &previous_store, &previous_settings, &book).await?;
             previous_store.acknowledge_reading(&account, &book, revision)?;
         }
     }
@@ -367,7 +568,10 @@ where
         total: 0,
     });
     // Reading changes are small and must not wait behind an OCR archive or library scan.
-    let mut report = sync_changed_reading(&webdav, &store, &settings, &mut progress).await?;
+    let mut report = sync_current_reading(&webdav, &store, &settings, &mut progress).await?;
+    let pending = sync_changed_reading(&webdav, &store, &settings, &mut progress).await?;
+    report.updated_progress += pending.updated_progress;
+    report.merged_annotations += pending.merged_annotations;
     super::changes::publish(&webdav, false).await?;
     webdav.ensure_base_layout().await?;
     if webdav.get_optional("protocol.json").await?.is_none() {
@@ -401,6 +605,24 @@ where
     )?);
     // Make original books useful before scanning OCR/PDF archives for the
     // whole library. Immutable manifests and per-book checkpoints survive retries.
+    let activity = store.progress_activity_times()?;
+    let active = store.wake().snapshot().active;
+    let mut pending_uploads = pending_uploads;
+    pending_uploads.sort_by_key(|(_, book)| {
+        std::cmp::Reverse((
+            active.as_ref() == Some(&book.id),
+            activity.get(&book.id).copied().unwrap_or(0),
+            book.added_at,
+        ))
+    });
+    super::changes::update_priorities(&webdav, &local_by_id)?;
+    store.merge_activity_times(
+        &change_plan
+            .recent
+            .iter()
+            .map(|(book, (at, _))| (book.clone(), *at))
+            .collect(),
+    )?;
     let upload_total = pending_uploads.iter().map(|(size, _)| *size).sum();
     upload_books(
         &webdav,
@@ -630,7 +852,7 @@ where
             total: manifest_total,
         });
     }
-    manifests.sort_by_key(|(_, manifest)| manifest.content_length);
+
     Ok(manifests)
 }
 
@@ -715,6 +937,7 @@ async fn push_reading_state(
     settings: &SyncSettings,
     book_id: &str,
 ) -> SyncResult<u64> {
+    let _transaction = webdav.control_transaction();
     let (revision, state) = store.reading_snapshot(book_id)?;
     webdav
         .put_mutable_json(
@@ -760,6 +983,48 @@ async fn merge_remote_reading(
     Ok(())
 }
 
+async fn sync_current_reading(
+    webdav: &WebDavClient,
+    store: &SyncStore,
+    settings: &SyncSettings,
+    progress: &mut impl FnMut(SyncProgress),
+) -> SyncResult<SyncReport> {
+    let mut report = SyncReport::default();
+    let Some(book) = store.wake().snapshot().active else {
+        return Ok(report);
+    };
+    validate_book_id(&book)?;
+    let files = webdav
+        .list_json_files(&format!("state/{book}/devices/"))
+        .await?;
+    merge_remote_reading(webdav, store, settings, &book, files, &mut report).await?;
+    if store
+        .pending_reading(&super::account_key(settings))?
+        .iter()
+        .any(|(id, _, _)| id == &book)
+    {
+        let revision = push_reading_state(webdav, store, settings, &book).await?;
+        store.acknowledge_reading(&super::account_key(settings), &book, revision)?;
+    }
+    progress(SyncProgress::Stage {
+        stage: SyncStage::ReadingData,
+        completed: 1,
+        total: 1,
+    });
+    notify_reading_applied(&report, progress);
+    Ok(report)
+}
+
+fn notify_reading_applied(report: &SyncReport, progress: &mut impl FnMut(SyncProgress)) {
+    if report.updated_progress > 0 || report.merged_annotations > 0 {
+        progress(SyncProgress::Stage {
+            stage: SyncStage::ReadingApplied,
+            completed: report.updated_progress as u64,
+            total: report.merged_annotations as u64,
+        });
+    }
+}
+
 async fn sync_changed_reading(
     webdav: &WebDavClient,
     store: &SyncStore,
@@ -778,11 +1043,11 @@ async fn sync_changed_reading(
     }
     for (index, (book_id, _, _)) in pending.into_iter().enumerate() {
         validate_book_id(&book_id)?;
-        let revision = push_reading_state(webdav, store, settings, &book_id).await?;
         let files = webdav
             .list_json_files(&format!("state/{book_id}/devices/"))
             .await?;
         merge_remote_reading(webdav, store, settings, &book_id, files, &mut report).await?;
+        let revision = push_reading_state(webdav, store, settings, &book_id).await?;
         store.acknowledge_reading(&super::account_key(settings), &book_id, revision)?;
         progress(SyncProgress::Stage {
             stage: SyncStage::ReadingData,
@@ -790,6 +1055,7 @@ async fn sync_changed_reading(
             total,
         });
     }
+    notify_reading_applied(&report, progress);
     Ok(report)
 }
 
@@ -1180,32 +1446,72 @@ pub mod tests {
         let old = SyncStore::open_at(database.clone(), old_device.clone()).unwrap();
         let id = "c".repeat(64);
         old.save_progress(&id, &reading_locator(&id, 0.37)).unwrap();
-        let start = rebook_publication::SourceAnchor { spine: rebook_publication::SpineItemId::new("chapter").unwrap(), node: "p".into(), text_offset: 0 };
-        let mut end = start.clone(); end.text_offset = 5;
-        old.create_annotation("note".into(), id.clone(), vec![rebook_publication::SourceRange { start, end }], "quote".into(), Some("unsent note".into()), 1).unwrap();
+        let start = rebook_publication::SourceAnchor {
+            spine: rebook_publication::SpineItemId::new("chapter").unwrap(),
+            node: "p".into(),
+            text_offset: 0,
+        };
+        let mut end = start.clone();
+        end.text_offset = 5;
+        old.create_annotation(
+            "note".into(),
+            id.clone(),
+            vec![rebook_publication::SourceRange { start, end }],
+            "quote".into(),
+            Some("unsent note".into()),
+            1,
+        )
+        .unwrap();
         let (_, before) = old.reading_snapshot(&id).unwrap();
         let current = SyncStore::open_at(database.clone(), settings.device_id.clone()).unwrap();
-        let client = WebDavClient::new(&settings, "secret".into()).unwrap().with_store(current.clone(), super::super::account_key(&settings));
-        let mut previous_settings = settings.clone(); previous_settings.device_id = old_device.clone();
+        let client = WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(current.clone(), super::super::account_key(&settings));
+        let mut previous_settings = settings.clone();
+        previous_settings.device_id = old_device.clone();
         let account = super::super::account_key(&previous_settings);
         server.fail_next_put.store(true, Ordering::Relaxed);
-        assert!(runtime.block_on(sync_portable_previous_devices(&client, &current, &settings, vec![old_device.clone()])).is_err());
+        assert!(
+            runtime
+                .block_on(sync_portable_previous_devices(
+                    &client,
+                    &current,
+                    &settings,
+                    vec![old_device.clone()]
+                ))
+                .is_err()
+        );
         assert_eq!(old.pending_reading(&account).unwrap().len(), 1);
-        runtime.block_on(sync_portable_previous_devices(&client, &current, &settings, vec![old_device.clone()])).unwrap();
+        runtime
+            .block_on(sync_portable_previous_devices(
+                &client,
+                &current,
+                &settings,
+                vec![old_device.clone()],
+            ))
+            .unwrap();
         assert!(old.pending_reading(&account).unwrap().is_empty());
         let path = format!("/dav/Rebook/v1/state/{id}/devices/{old_device}.json");
         let objects = server.objects.lock().unwrap();
-        let uploaded: DeviceBookState = serde_json::from_slice(&objects.get(&path).unwrap().0).unwrap();
+        let uploaded: DeviceBookState =
+            serde_json::from_slice(&objects.get(&path).unwrap().0).unwrap();
         assert_eq!(uploaded.device_id, old_device);
         assert_eq!(uploaded.progress, before.progress);
         assert_eq!(uploaded.annotations, before.annotations);
-        assert!(!objects.keys().any(|path| path.ends_with(&format!("{}.json", settings.device_id))));
-        drop(objects); server.stop();
-        drop(old); drop(current); let _ = fs::remove_file(database);
+        assert!(
+            !objects
+                .keys()
+                .any(|path| path.ends_with(&format!("{}.json", settings.device_id)))
+        );
+        drop(objects);
+        server.stop();
+        drop(old);
+        drop(current);
+        let _ = fs::remove_file(database);
     }
 
     #[test]
-    fn bootstrap_publishes_first_batch_before_scanning_later_manifests_and_resumes_after_429() {
+    fn bootstrap_prioritizes_recent_reading_before_scanning_later_batches_and_resumes_after_429() {
         let server = FakeWebDav::start();
         let settings = test_settings(server.base_url(), "Bootstrap receiver");
         let directory = test_download_cache("bootstrap-429");
@@ -1267,7 +1573,16 @@ pub mod tests {
             format!("/dav/Rebook/v1/library/devices/{peer}.json"),
             (serde_json::to_vec(&catalog).unwrap(), "\"catalog\"".into()),
         );
-        let index = serde_json::json!({"version":1,"device":peer,"books":{}});
+        let hints=ids.iter().enumerate().map(|(i,id)|(id.clone(),serde_json::json!({
+            "reading":null,"derived":null,"last_read":if i<3 {0}else{1000+i},"added_at":i
+        }))).collect::<BTreeMap<_,_>>();
+        let index = serde_json::json!({"version":1,"device":peer,"books":hints});
+        // The currently requested book wins, followed by last reading activity;
+        // never-read books use their added time instead of size or hash order.
+        let active = ids.remove(0);
+        store.wake().active(Some(active.clone()));
+        ids.reverse();
+        ids.insert(0, active);
         server.objects.lock().unwrap().insert(
             format!("/dav/Rebook/v1/library/changes/{peer}.json"),
             (serde_json::to_vec(&index).unwrap(), "\"index\"".into()),
@@ -1365,10 +1680,10 @@ pub mod tests {
         );
         assert!(
             !requests.iter().any(|(m, p, _)| m == "PROPFIND"
-                && ids[..8]
+                && ids[1..8]
                     .iter()
                     .any(|id| p == &format!("/dav/Rebook/v1/state/{id}/devices/"))),
-            "completed reading-state checks must not be repeated"
+            "completed reading-state checks must not be repeated except for the active-book check"
         );
         assert!(
             !requests
@@ -1506,6 +1821,119 @@ pub mod tests {
     }
 
     #[test]
+    fn pending_reading_preempts_bulk_work_only_after_snapshot_writes_finish() {
+        let server = FakeWebDav::start();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let settings = test_settings(server.base_url(), "Priority lane");
+        let database = test_database("priority-lane");
+        let store = SyncStore::open_at(database.clone(), settings.device_id.clone()).unwrap();
+        let client = WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(store.clone(), super::super::account_key(&settings));
+        let book = "f".repeat(64);
+        let path = format!(
+            "/dav/Rebook/v1/state/{book}/devices/{}.json",
+            settings.device_id
+        );
+        runtime.block_on(async {
+            let guard = client.control_transaction();
+            let main = async {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                assert!(
+                    !server.objects.lock().unwrap().contains_key(&path),
+                    "never interrupt an in-flight state write"
+                );
+                drop(guard);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                assert!(
+                    server.objects.lock().unwrap().contains_key(&path),
+                    "a progress flush must not wait for bulk work to finish"
+                );
+                Ok(SyncReport::default())
+            };
+            let edit = async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                store
+                    .save_progress(&book, &reading_locator(&book, 0.4))
+                    .unwrap();
+                store.wake().changed(super::super::SyncChange::Flush);
+            };
+            let sink = std::sync::Mutex::new(|_| {});
+            let sync = prioritize_reading(&settings, store.clone(), client.clone(), main, &sink);
+            let (result, _) = futures_util::future::join(sync, edit).await;
+            result.unwrap();
+        });
+        assert!(
+            store
+                .pending_reading(&super::super::account_key(&settings))
+                .unwrap()
+                .is_empty()
+        );
+        server.stop();
+        drop(client);
+        drop(store);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn current_book_check_pulls_remote_progress_without_pending_local_changes() {
+        let server = FakeWebDav::start();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let settings = test_settings(server.base_url(), "Current book");
+        let database = test_database("current-book");
+        let store = SyncStore::open_at(database.clone(), settings.device_id.clone()).unwrap();
+        let client = WebDavClient::new(&settings, "secret".into())
+            .unwrap()
+            .with_store(store.clone(), super::super::account_key(&settings));
+        let book = "e".repeat(64);
+        let remote = DeviceBookState {
+            version: PROTOCOL_VERSION,
+            device_id: "peer".into(),
+            book_id: book.clone(),
+            updated_at: store.tick().unwrap(),
+            progress: Some(super::super::protocol::ProgressState {
+                locator: reading_locator(&book, 0.8),
+                updated_at: super::super::protocol::HybridTimestamp {
+                    wall_time_ms: super::super::rate_limit::now_ms(),
+                    counter: 0,
+                    device_id: "peer".into(),
+                },
+            }),
+            annotations: Vec::new(),
+        };
+        server.objects.lock().unwrap().insert(
+            format!("/dav/Rebook/v1/state/{book}/devices/peer.json"),
+            (serde_json::to_vec(&remote).unwrap(), "\"peer\"".into()),
+        );
+        store.wake().active(Some(book.clone()));
+        let report = runtime
+            .block_on(sync_current_reading(
+                &client,
+                &store,
+                &settings,
+                &mut |_| {},
+            ))
+            .unwrap();
+        assert_eq!(report.updated_progress, 1);
+        assert_eq!(
+            store.load_progress(&book).unwrap().unwrap().locator,
+            remote.progress.unwrap().locator
+        );
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, path, _)| path.contains(&format!("/state/{book}/devices/")))
+        );
+        server.stop();
+        drop(client);
+        drop(store);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
     fn progress_only_sync_uses_two_requests_and_failed_uploads_remain_pending() {
         let server = FakeWebDav::start();
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1557,8 +1985,8 @@ pub mod tests {
                 .iter()
                 .all(|(_, path, _)| path.starts_with(&format!("/dav/Rebook/v1/state/{id}/")))
         );
-        assert_eq!(requests[0].0, "PUT");
-        assert_eq!(requests[1].0, "PROPFIND");
+        assert_eq!(requests[0].0, "PROPFIND");
+        assert_eq!(requests[1].0, "PUT");
         runtime
             .block_on(sync_changed_reading(
                 &client,
@@ -1804,7 +2232,7 @@ pub mod tests {
                 cache.clone(),
                 |event| {
                     if let SyncProgress::Stage {
-                        stage: SyncStage::Uploading,
+                        stage: SyncStage::Uploading | SyncStage::DerivedUploading,
                         completed,
                         total,
                     } = event
@@ -1844,7 +2272,7 @@ pub mod tests {
                 cache.clone(),
                 |event| match event {
                     SyncProgress::Stage {
-                        stage: SyncStage::Downloading,
+                        stage: SyncStage::Downloading | SyncStage::DerivedDownloading,
                         completed,
                         total,
                     }

@@ -35,6 +35,12 @@ class InterfaceSettingsTest {
         assertNotNull("The displayed control must be clickable",target)
         assertTrue(target!!.performAction(AccessibilityNodeInfo.ACTION_CLICK))
     }
+    private fun fill(value:String,vararg labels:String){
+        var target=label(*labels)
+        while(target!=null&&!target.isEditable)target=target.parent
+        assertNotNull("The field must be editable",target)
+        assertTrue(target!!.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,android.os.Bundle().apply {putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,value)}))
+    }
     private fun toggle():AccessibilityNodeInfo?{
         var target=label("跟随系统","Follow system")
         while(target!=null&&!target.isClickable)target=target.parent
@@ -53,9 +59,9 @@ class InterfaceSettingsTest {
         }
     }
 
-    @Test fun darkModeAndLanguagePagesSaveChoicesAndUpdateSystemSummaries(){
+    @Test fun darkModeAndLanguagePagesSaveChoicesFromSettingsHome(){
         val monitor=instrumentation.addMonitor(MainActivity::class.java.name,null,false)
-        var activity:MainActivity?=null;var model:ReaderModel?=null;var original:ScreenState?=null
+        var activity:MainActivity?=null;var model:ReaderModel?=null;var original:ScreenState?=null;var fixtureProvider:String?=null
         val preferences=instrumentation.targetContext.getSharedPreferences("interface",0)
         try {
             android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand("am start -W -f 0x10008000 -n org.tortotech.torto.debug/org.tortotech.torto.MainActivity")).use {it.readBytes()}
@@ -67,11 +73,13 @@ class InterfaceSettingsTest {
             await("Chinese light interface applies"){model!!.state.value.language=="zh-CN"&&model!!.state.value.appTheme=="light"&&!model!!.state.value.busy}
             await("profile tab is visible"){label("我")!=null};click(label("我"))
             await("settings entry is visible"){label("设置")!=null};click(label("设置"))
-            await("system entry is visible"){label("系统")!=null}
+            await("settings home shows direct interface choices"){label("深色模式")!=null&&label("界面语言")!=null&&label("排版")!=null&&label("未开启")!=null&&label("中文")!=null}
+            assertNull("No intermediate system page",label("系统"))
+            val darkBounds=android.graphics.Rect().also(label("深色模式")!!::getBoundsInScreen)
+            val languageBounds=android.graphics.Rect().also(label("界面语言")!!::getBoundsInScreen)
+            val typesettingBounds=android.graphics.Rect().also(label("排版")!!::getBoundsInScreen)
+            assertTrue("Both interface choices precede typesetting",darkBounds.bottom<languageBounds.top&&languageBounds.bottom<typesettingBounds.top)
             screenshot("interface-settings-grouped.png")
-            click(label("系统"))
-            await("system shows compact summaries"){label("未开启")!=null&&label("中文")!=null}
-            screenshot("interface-system-light.png")
             click(label("深色模式"))
             await("dark mode opens its own choice page"){toggle()!=null&&label("浅色")!=null}
             screenshot("interface-dark-mode-light.png")
@@ -87,7 +95,7 @@ class InterfaceSettingsTest {
             assertEquals("system",preferences.getString("theme",null))
             assertNull(label("手动选择"))
             click(label("返回"))
-            await("system summary shows follow system"){label("跟随系统")!=null&&label("系统")!=null&&label("界面语言")!=null}
+            await("settings summary shows follow system"){label("跟随系统")!=null&&label("界面语言")!=null&&label("排版")!=null}
             click(label("界面语言"))
             await("language opens its own choice page"){label("English")!=null&&toggle()!=null}
             click(label("English"))
@@ -102,8 +110,7 @@ class InterfaceSettingsTest {
             assertEquals("system",preferences.getString("language",null))
             assertNull(label("Manual selection","手动选择"))
             click(label("Back","返回"))
-            await("system page remains reachable after the language change"){label("Dark mode","深色模式")!=null}
-            click(label("Back","返回"))
+            await("settings home remains reachable after the language change"){label("Dark mode","深色模式")!=null}
             await("provider settings entry is visible"){label("AI providers","AI 提供商")!=null}
             click(label("AI providers","AI 提供商"))
             await("provider creation is available in the header"){label("Add provider","添加提供商")!=null}
@@ -111,12 +118,31 @@ class InterfaceSettingsTest {
             screenshot("interface-providers-header.png")
             click(label("Add provider","添加提供商"))
             await("the header action opens the provider editor"){label("Name","名称")!=null&&label("Base URL")!=null}
-            click(label("Close","关闭"))
+            screenshot("interface-provider-add-page.png")
+            assertNotNull(label("Add AI provider","添加 AI 提供商"))
+            assertNull(label("Close","关闭"))
+            click(label("Back","返回"))
             await("closing discards the new provider draft"){label("Name","名称")==null}
             click(label("Back","返回"))
-            await("settings returns after dismissing the editor"){label("AI providers","AI 提供商")!=null}
+            await("settings returns after dismissing the editor"){label("Settings","设置")!=null&&label("Dark mode","深色模式")!=null}
             click(label("AI providers","AI 提供商"))
             await("reopening providers has no pending add request"){label("Add provider","添加提供商")!=null&&label("Name","名称")==null}
+            click(label("Add provider","添加提供商"))
+            await("add page opens again"){label("Name","名称")!=null}
+            fill("Interface provider page fixture","Name","名称")
+            fill("http://127.0.0.1:1/v1","Base URL")
+            await("valid provider enables saving"){
+                var target=label("Save","保存")
+                while(target!=null&&!target.isClickable)target=target.parent
+                target?.isEnabled==true
+            }
+            click(label("Save","保存"))
+            await("saving returns to the provider list"){!model!!.state.value.busy&&label("Add provider","添加提供商")!=null&&label("Interface provider page fixture")!=null}
+            fixtureProvider=model!!.state.value.providers.single {it.name=="Interface provider page fixture"}.id
+            click(label("Interface provider page fixture"))
+            await("editing also opens a page"){label("Edit AI provider","编辑 AI 提供商")!=null&&label("Base URL")!=null}
+            click(label("Cancel","取消"))
+            await("cancel returns to the provider list"){label("Add provider","添加提供商")!=null&&label("Name","名称")==null}
         }catch(error:Throwable){
             screenshot("interface-settings-failure.png")
             val nodes=mutableListOf<String>()
@@ -124,6 +150,7 @@ class InterfaceSettingsTest {
             File(instrumentation.targetContext.cacheDir,"interface-settings-failure.txt").writeText(nodes.joinToString("\n"))
             throw error
         }finally {
+            fixtureProvider?.let {id->instrumentation.runOnMainSync {model!!.deleteProvider(id)};await("provider fixture is removed"){!model!!.state.value.busy&&model!!.state.value.providers.none {it.id==id}}}
             original?.let {saved->instrumentation.runOnMainSync {model!!.interfaceSettings(saved.appTheme,saved.language)};await("original settings restore"){!model!!.state.value.busy&&model!!.state.value.appTheme==saved.appTheme&&model!!.state.value.language==saved.language}}
             activity?.let {instrumentation.runOnMainSync {it.finish()}}
             instrumentation.removeMonitor(monitor)

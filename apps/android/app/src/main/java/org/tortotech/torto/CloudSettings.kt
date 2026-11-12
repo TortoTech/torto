@@ -1,13 +1,10 @@
 package org.tortotech.torto
-import android.content.Intent
-import android.net.Uri
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import java.time.Instant
@@ -18,10 +15,8 @@ internal fun localDateTime(ms:Long):String=if(ms<=0)"—" else DateTimeFormatter
 @Composable internal fun CloudSettingsPanel(state:ScreenState,model:ReaderModel){
     val saved=state.cloud ?: return
     var draft by remember(saved){mutableStateOf(saved.copy())};var password by remember{mutableStateOf("")}
-    val context=LocalContext.current
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp).imePadding(),verticalArrangement=Arrangement.spacedBy(12.dp)){
         SettingsGroup {SettingToggle(tr("启用云同步","Enable cloud sync"),draft.enabled,!state.busy){draft=draft.copy(enabled=it)}}
-        SectionLabel(tr("账号配置","Account"))
         SettingsGroup {
         SettingChoice(tr("云盘提供商","Cloud provider"),draft.provider,state.cloudPresets.map {it.id to it.name},!state.busy){id->val preset=state.cloudPresets.first {it.id==id};draft=draft.copy(provider=id,url=preset.url)}
         Column(Modifier.padding(horizontal=16.dp,vertical=12.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
@@ -31,20 +26,13 @@ internal fun localDateTime(ms:Long):String=if(ms<=0)"—" else DateTimeFormatter
         OutlinedTextField(draft.deviceName,{draft=draft.copy(deviceName=it.take(160))},label={Text(tr("设备名称","Device name"))},singleLine=true,modifier=Modifier.fillMaxWidth())
         }
         }
-        SectionLabel(tr("同步策略","Sync preferences"))
-        SettingsGroup {
-        SettingToggle(tr("前台自动同步","Sync automatically in foreground"),draft.foreground,!state.busy){draft=draft.copy(foreground=it)}
-        SettingToggle(tr("后台自动同步","Sync automatically in background"),draft.background,!state.busy){draft=draft.copy(background=it)}
-        }
-        SectionLabel(tr("同步状态","Sync status"))
         SettingsGroup { Column(Modifier.padding(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
         val status=state.cloudStatus
         CloudSyncSummary(status)
         if(status.running)TextButton(onClick={CloudRuntime.cancel()}){Text(tr("停止同步","Stop sync"))}
         else Text(tr("上次同步：","Last sync: ")+localDateTime(status.lastSuccess),style=MaterialTheme.typography.bodySmall)
-        Row(horizontalArrangement=Arrangement.spacedBy(12.dp)){Button(onClick={model.saveCloud(draft,password,false){password=""}},enabled=!state.busy){Text(tr("保存","Save"))};OutlinedButton(onClick=model::synchronize,enabled=saved.enabled&&!status.running){Text(tr("立即同步","Sync now"))}}
+        Row(horizontalArrangement=Arrangement.spacedBy(12.dp)){Button(onClick={model.saveCloud(draft,password,false){password=""}},enabled=!state.busy){Text(tr("保存","Save"))};OutlinedButton(onClick=model::synchronize,enabled=saved.enabled&&!status.running){Text(tr("同步","Sync"))}}
         }}
-        state.cloudPresets.firstOrNull {it.id==draft.provider}?.let {preset->TextButton(onClick={context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(preset.helpUrl)))}){Text(tr("查看云盘配置说明","Cloud setup guide"))}}
     }
 }
 
@@ -63,4 +51,4 @@ internal fun localDateTime(ms:Long):String=if(ms<=0)"—" else DateTimeFormatter
         }
     }
 }
-@Composable private fun cloudStage(stage:String)=when(stage){"preparing"->tr("准备同步","Preparing sync");"checking"->tr("检查云端变更","Checking cloud changes");"uploading"->tr("上传书籍","Uploading books");"downloading"->tr("下载书籍","Downloading books");"statistics"->tr("同步阅读统计","Syncing reading statistics");else->tr("同步进度与批注","Syncing progress and annotations")}
+@Composable private fun cloudStage(stage:String)=when(stage){"preparing"->tr("准备同步","Preparing sync");"checking"->tr("检查云端变更","Checking cloud changes");"uploading"->tr("上传书籍","Uploading books");"downloading"->tr("下载书籍","Downloading books");"derived"->tr("同步 PDF 处理数据","Syncing PDF processing data");"statistics"->tr("同步阅读统计","Syncing reading statistics");else->tr("同步进度与批注","Syncing progress and annotations")}

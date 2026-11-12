@@ -254,7 +254,6 @@ fn unified_request_uses_one_formatted_paragraph_for_all_roles() {
     let roles = RecognitionRoles {
         quotes: true,
         captions: true,
-        headings: true,
     };
     let request = unified_window_input(&section, &roles, 0..1, 0..1, &[]);
     let block = &request["blocks"][0];

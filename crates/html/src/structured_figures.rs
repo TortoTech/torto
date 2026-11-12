@@ -3,21 +3,7 @@ use super::*;
 use rebook_publication::media_references::{self, MediaKind};
 
 fn source_text(text: &str) -> bool {
-    let text = text.trim_start().to_lowercase();
-    [
-        "source:",
-        "sources:",
-        "source：",
-        "credit:",
-        "credits:",
-        "credit：",
-        "来源:",
-        "来源：",
-        "图片来源:",
-        "图片来源：",
-    ]
-    .iter()
-    .any(|prefix| text.starts_with(prefix))
+    rebook_publication::media_notes::is_annotation(text)
 }
 
 pub(super) fn annotation_kind(text: &TextBlock) -> TextBlockKind {
@@ -34,7 +20,170 @@ pub(super) fn annotation_kind(text: &TextBlock) -> TextBlockKind {
     }
 }
 
+fn normalize_image_figure(figure: &mut FigureBlock) {
+    if !figure.body.iter().any(|b| matches!(b, Block::Image(_)))
+        || !figure.body.iter().all(|b| matches!(b, Block::Image(_))
+            || matches!(b, Block::Text(t) if matches!(t.kind,
+                TextBlockKind::Paragraph | TextBlockKind::Caption | TextBlockKind::QuoteAttribution)))
+    { return; }
+    for text in figure.body.iter_mut().flat_map(Block::text_blocks_mut) {
+        let value: String = text
+            .content
+            .iter()
+            .flat_map(Inline::text_runs)
+            .map(|r| r.text.as_str())
+            .collect();
+        let title = !source_text(&value)
+            && (text.kind == TextBlockKind::Caption || numbered_caption_text(&value));
+        text.kind = if title {
+            TextBlockKind::Caption
+        } else {
+            TextBlockKind::QuoteAttribution
+        };
+        if !title && !source_text(&value) {
+            // Only unified presentation consults this hint; authored
+            // alignment/size/weight remain intact in book style.
+            text.style.authored_alignment = Some(TextAlignment::Start);
+        }
+    }
+    // A pure image with leading/trailing text uses the normal figure
+    // renderer, without the panel padding reserved for live text/code.
+    let first = figure
+        .body
+        .iter()
+        .position(|b| matches!(b, Block::Image(_)));
+    let last = figure
+        .body
+        .iter()
+        .rposition(|b| matches!(b, Block::Image(_)));
+    if let (Some(first), Some(last)) = (first, last)
+        && figure
+            .body
+            .iter()
+            .all(|b| matches!(b, Block::Image(_) | Block::Text(_)))
+        && figure.body[first..=last]
+            .iter()
+            .all(|b| matches!(b, Block::Image(_)))
+    {
+        let captions = figure.body.len() - (last - first + 1);
+        figure.caption_position = if first == 0 {
+            CaptionPosition::After
+        } else if first == captions {
+            CaptionPosition::Before
+        } else {
+            CaptionPosition::Split(first)
+        };
+        for block in std::mem::take(&mut figure.body) {
+            match block {
+                Block::Image(image) => figure.images.push(image),
+                Block::Text(text) => figure.captions.push(text),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
 impl ReadingIrParser<'_> {
+    /// A small, authored image wrapper is stronger evidence than adjacency.
+    /// Do not promote chapter wrappers or scan unbounded descendant trees.
+    pub(super) fn try_parse_media_container(
+        &mut self,
+        node: Node<'_, '_>,
+    ) -> Result<bool, HtmlError> {
+        if self.inside_quote
+            || self.inside_note_definition
+            || self.inside_nested_media
+            || !matches!(node.tag_name().name(), "div" | "aside" | "section")
+        {
+            return Ok(false);
+        }
+        let children = node.children().filter(Node::is_element).take(13).count();
+        if !(2..=12).contains(&children) {
+            return Ok(false);
+        }
+        let descendants = node
+            .descendants()
+            .filter(Node::is_element)
+            .take(257)
+            .collect::<Vec<_>>();
+        if descendants.len() > 256
+            || media_semantics::protected(node, &self.heading_fragments)
+            || descendants.iter().any(|n| {
+                matches!(
+                    n.tag_name().name(),
+                    "table" | "figure" | "pre" | "math" | "ul" | "ol" | "blockquote" | "nav"
+                ) || self.styles.visually_hidden(*n)
+                    || self
+                        .footnote_links
+                        .get(&n.range().start)
+                        .is_some_and(|r| *r != LinkRole::Normal)
+            })
+        {
+            return Ok(false);
+        }
+        let images = descendants
+            .iter()
+            .filter(|n| matches!(n.tag_name().name(), "img" | "image"))
+            .count();
+        if !(1..=8).contains(&images) {
+            return Ok(false);
+        }
+        let first_image = descendants
+            .iter()
+            .find(|n| matches!(n.tag_name().name(), "img" | "image"))
+            .unwrap()
+            .range()
+            .start;
+        let mut paragraphs = 0;
+        let mut labels = 0;
+        let mut total = 0;
+        for paragraph in descendants.iter().copied().filter(|n| {
+            matches!(n.tag_name().name(), "p" | "figcaption" | "div")
+                && !n
+                    .descendants()
+                    .skip(1)
+                    .any(|c| c.is_element() && is_block_boundary(c.tag_name().name()))
+                && node_has_visible_text(*n)
+        }) {
+            // Mixed prose and an inline image are not a standalone figure.
+            if has_descendant_image(paragraph) {
+                return Ok(false);
+            }
+            let value: String = paragraph
+                .descendants()
+                .filter(Node::is_text)
+                .filter_map(|n| n.text())
+                .flat_map(str::chars)
+                .take(513)
+                .collect();
+            let length = value.chars().count();
+            total += length;
+            paragraphs += 1;
+            if length > 512 || total > 2048 || paragraphs > 8 {
+                return Ok(false);
+            }
+            if paragraph.range().start < first_image
+                && !numbered_caption_text(&value)
+                && !source_text(&value)
+                && !paragraph.has_tag_name("figcaption")
+                && !has_caption_semantic_attribute(paragraph)
+            {
+                return Ok(false);
+            }
+            if numbered_caption_text(&value)
+                || paragraph.has_tag_name("figcaption")
+                || has_caption_semantic_attribute(paragraph)
+            {
+                labels += 1;
+            }
+        }
+        if paragraphs == 0 || labels != 1 {
+            return Ok(false);
+        }
+        self.parse_structured_figure(node)?;
+        Ok(true)
+    }
+
     pub(super) fn parse_structured_figure(&mut self, node: Node<'_, '_>) -> Result<(), HtmlError> {
         let start = self.blocks.len();
         if node
@@ -79,14 +228,16 @@ impl ReadingIrParser<'_> {
         } else {
             CaptionPosition::After
         };
-        self.blocks.push(Block::Figure(FigureBlock {
+        let mut figure = FigureBlock {
             body,
             images: Vec::new(),
             captions: Vec::new(),
             caption_position,
             style: self.styles.block_style(node, BlockStyle::default()),
             source,
-        }));
+        };
+        normalize_image_figure(&mut figure);
+        self.blocks.push(Block::Figure(figure));
     }
 
     pub(super) fn try_parse_text_figure(
@@ -248,6 +399,15 @@ pub(super) fn attach_sources(blocks: &mut Vec<Block>) {
                     } else {
                         figure.body.push(Block::Text(text));
                     }
+                    continue;
+                }
+                if matches!(text.kind, TextBlockKind::Paragraph | TextBlockKind::QuoteAttribution)
+                    && let Some(Block::Table(table)) = result.last_mut()
+                {
+                    // A table wrapper may end before its authored source.
+                    // Keep this trailing note with that grid, just as when
+                    // both are siblings inside the wrapper.
+                    table.after.push(text);
                     continue;
                 }
             }
@@ -423,27 +583,73 @@ mod tests {
 
     #[test]
     fn numbered_heading_beside_figure_image_is_a_caption_not_a_heading() {
-        let section = parse("<style>div.figure h6 {font-weight:normal; font-style:italic}</style><figure><div class='figure'><img src='chart.png'/><h6 id='caption'><span>Figure 2-1. </span>Binary search</h6></div></figure><h6 id='heading'>A real subsection</h6>");
-        let Block::Figure(figure) = &section.blocks[0] else { panic!("figure"); };
+        let section = parse(
+            "<style>div.figure h6 {font-weight:normal; font-style:italic}</style><figure><div class='figure'><img src='chart.png'/><h6 id='caption'><span>Figure 2-1. </span>Binary search</h6></div></figure><h6 id='heading'>A real subsection</h6>",
+        );
+        let Block::Figure(figure) = &section.blocks[0] else {
+            panic!("figure");
+        };
         assert_eq!(figure.images.len(), 1);
         assert!(figure.body.is_empty());
         let caption = &figure.captions[0];
         assert_eq!(caption.kind, TextBlockKind::Caption);
-        assert!(caption.content.iter().flat_map(Inline::text_runs).all(|r| !r.style.bold && r.style.italic));
+        assert!(
+            caption
+                .content
+                .iter()
+                .flat_map(Inline::text_runs)
+                .all(|r| !r.style.bold && r.style.italic)
+        );
         assert_eq!(caption.source.as_ref().unwrap().start.node, "n1");
-        assert!(section.anchors.iter().any(|a| a.fragment == "caption" && a.source.node == "n1"));
-        assert!(matches!(&section.blocks[1], Block::Text(text) if text.kind == TextBlockKind::Heading(6)));
+        assert!(
+            section
+                .anchors
+                .iter()
+                .any(|a| a.fragment == "caption" && a.source.node == "n1")
+        );
+        assert!(
+            matches!(&section.blocks[1], Block::Text(text) if text.kind == TextBlockKind::Heading(6))
+        );
     }
 
     #[test]
     fn table_descendant_weight_override_keeps_headers_and_inline_emphasis() {
-        let section = parse("<style>figure {font-weight:bold} table p {font-weight:normal}</style><figure><figcaption>Figure 5.1 Example</figcaption><p>Explanation</p><table><tr><th><p>Header</p></th><td><p><em>x</em> + <strong>important</strong></p></td></tr></table></figure>");
-        let Block::Figure(figure) = &section.blocks[0] else { panic!(); };
-        let table = figure.body.iter().find_map(|b| if let Block::Table(t) = b {Some(t)} else {None}).unwrap();
+        let section = parse(
+            "<style>figure {font-weight:bold} table p {font-weight:normal}</style><figure><figcaption>Figure 5.1 Example</figcaption><p>Explanation</p><table><tr><th><p>Header</p></th><td><p><em>x</em> + <strong>important</strong></p></td></tr></table></figure>",
+        );
+        let Block::Figure(figure) = &section.blocks[0] else {
+            panic!();
+        };
+        let table = figure
+            .body
+            .iter()
+            .find_map(|b| {
+                if let Block::Table(t) = b {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
         assert!(table.rows[0].cells[0].header);
-        assert!(table.rows[0].cells[0].text.content.iter().flat_map(Inline::text_runs).all(|r| !r.style.bold));
-        let runs: Vec<_> = table.rows[0].cells[1].text.content.iter().flat_map(Inline::text_runs).collect();
-        assert!(runs.iter().any(|r| r.text == "x" && r.style.emphasis && !r.style.bold));
+        assert!(
+            table.rows[0].cells[0]
+                .text
+                .content
+                .iter()
+                .flat_map(Inline::text_runs)
+                .all(|r| !r.style.bold)
+        );
+        let runs: Vec<_> = table.rows[0].cells[1]
+            .text
+            .content
+            .iter()
+            .flat_map(Inline::text_runs)
+            .collect();
+        assert!(
+            runs.iter()
+                .any(|r| r.text == "x" && r.style.emphasis && !r.style.bold)
+        );
         assert!(runs.iter().any(|r| r.text == "important" && r.style.bold));
     }
 

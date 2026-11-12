@@ -52,6 +52,7 @@ class AiSettingsAutosaveTest {
     }
     private fun screenshot(name:String){
         instrumentation.waitForIdleSync()
+        android.os.SystemClock.sleep(120)
         instrumentation.uiAutomation.takeScreenshot()?.let {bitmap->
             File(instrumentation.targetContext.cacheDir,name).outputStream().use {bitmap.compress(Bitmap.CompressFormat.PNG,100,it)}
             bitmap.recycle()
@@ -76,7 +77,7 @@ class AiSettingsAutosaveTest {
             await("English interface and provider models load"){model!!.state.value.language=="en"&&!model!!.state.value.busy&&model!!.state.value.providers.any {it.id==provider.id&&"model-b" in it.models}}
             instrumentation.runOnMainSync {activity!!.setContent {
                 val state by model!!.state.collectAsState()
-                TortoTheme(state){Surface(Modifier.fillMaxSize()){if(show.value)AiRoleSettings(state,model!!,section.value)}}
+                TortoTheme(state){ChoicePageHost {Surface(Modifier.fillMaxSize()){if(show.value)AiRoleSettings(state,model!!,section.value)}}}
             }}
             await("layout controls render"){label("Layout model")!=null}
             screenshot("settings-layout-grouped.png")
@@ -84,7 +85,16 @@ class AiSettingsAutosaveTest {
             assertNull(label("Manage providers and models"))
             click(node {it.isClickable&&it.isCheckable})
             clickLabel("Reasoning effort");clickLabel("Low")
-            clickLabel("Layout model");clickLabel("model-b")
+            clickLabel("Layout model")
+            await("model selection is a searchable page"){node {it.paneTitle?.toString()=="Layout model"}!=null&&node {it.isEditable}!=null}
+            assertNull("The parent cannot be focused while choosing",label("AI layout"))
+            assertEquals("Opening a child page does not commit its parent","model-a",core.aiOptions().layoutModel)
+            assertTrue(node {it.isEditable}!!.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,Bundle().apply {putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,"model-b")}))
+            await("models filter by the search query"){label("model-b")!=null&&label("model-a")==null}
+            screenshot("settings-model-choice-page.png")
+            val result=node {it.text?.toString()=="model-b"&&!it.isEditable&&it.parent?.isCheckable==true}
+            assertNotNull("The matching option is distinct from the search input",result)
+            click(result)
             assertFalse("Editing does not apply layout before returning",core.aiOptions().layoutEnabled)
             assertEquals("none",core.aiOptions().layoutReasoning)
             assertEquals("model-a",core.aiOptions().layoutModel)
@@ -100,9 +110,8 @@ class AiSettingsAutosaveTest {
             assertTrue(input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,Bundle().apply {putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,"Deutsch")}))
             android.os.SystemClock.sleep(350)
             assertEquals("Typing remains a draft until returning","system",core.aiOptions().targetLanguage)
-            val history=if(original.chatHistory==50u.toUShort())49u.toUShort()else 50u.toUShort()
-            instrumentation.runOnMainSync {model!!.updateAiOptions {it.copy(showOriginal=true,chatHistory=history)}}
-            await("independent edits finish"){!model!!.state.value.busy&&model!!.state.value.aiOptions!!.chatHistory==history}
+            instrumentation.runOnMainSync {model!!.updateAiOptions {it.copy(showOriginal=true,expertTranslation=true)}}
+            await("independent edits finish"){!model!!.state.value.busy&&model!!.state.value.aiOptions!!.expertTranslation}
             val latestInput=node {it.className?.toString()=="android.widget.EditText"}!!
             assertTrue(latestInput.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,Bundle().apply {putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,"Français")}))
             // Return before another composition; the final keystroke must survive.
@@ -112,6 +121,7 @@ class AiSettingsAutosaveTest {
             await("assistant settings render"){label("Chat model")!=null}
             screenshot("settings-assistant-grouped.png")
             assertNull("Assistant has no save button",label("Save"));assertNull(label("Manage providers and models"))
+            assertNull(label("Tool call steps"));assertNull(label("History turns"))
             clickLabel("Chat model");clickLabel("model-b")
             clickLabel("Reasoning effort");clickLabel("Low")
             assertEquals("Assistant changes remain staged","model-a",core.aiOptions().chatModel)
@@ -120,7 +130,7 @@ class AiSettingsAutosaveTest {
             val saved=core.aiOptions()
             assertEquals("Français",saved.targetLanguage);assertEquals("model-b",saved.layoutModel);assertEquals("low",saved.layoutReasoning)
             assertTrue("A return must not overwrite newer untouched fields",saved.showOriginal)
-            assertEquals(history,saved.chatHistory)
+            assertTrue(saved.expertTranslation)
             assertNull(model!!.state.value.error)
         }finally {
             instrumentation.runOnMainSync {show.value=false}

@@ -1,5 +1,5 @@
 use crate::*;
-use rebook_app_core::highlights::{HighlightRepository, StoredHighlight};
+use rebook_app_core::highlights::StoredHighlight;
 
 #[derive(Clone, uniffi::Record)]
 pub struct Annotation {
@@ -54,21 +54,10 @@ impl MobileReader {
         work(move || self.with(|s| list(s))).await
     }
     pub async fn save_annotation(self: Arc<Self>, note: Option<String>) -> Result<Vec<Annotation>> {
-        work(move || {
-            self.with(|s| {
-                let selected = s.selected.as_ref().ok_or_else(|| error("请先选择正文"))?;
-                let annotation = StoredHighlight::with_note(
-                    s.book_id.clone(),
-                    selected.ranges.clone(),
-                    selected.text.clone(),
-                    note,
-                );
-                s.store.insert_highlight(&annotation).map_err(error)?;
-                s.selected = None;
-                list(s)
-            })
-        })
-        .await
+        work(move || self.with(|s| save_selection(s,note,rebook_app_core::highlights::selection::SelectionAction::Add))).await
+    }
+    pub async fn toggle_selection_highlight(self: Arc<Self>, remove: bool) -> Result<Vec<Annotation>> {
+        work(move || self.with(|s| save_selection(s,None,if remove {rebook_app_core::highlights::selection::SelectionAction::Remove}else{rebook_app_core::highlights::selection::SelectionAction::Add}))).await
     }
     pub async fn edit_annotation(
         self: Arc<Self>,
@@ -77,16 +66,15 @@ impl MobileReader {
     ) -> Result<Vec<Annotation>> {
         work(move || {
             self.with(|s| {
-                if !s
-                    .store
-                    .annotations_for_book(&s.book_id)
-                    .map_err(error)?
-                    .iter()
-                    .any(|a| a.id == id)
-                {
-                    return Err(error("Annotation not found"));
-                }
-                s.store.update_annotation_note(&id, note).map_err(error)?;
+                let rows=s.store.annotations_for_book(&s.book_id).map_err(error)?;
+                let old=rows.iter().find(|a|a.id==id).ok_or_else(||error("Annotation not found"))?;
+                if old.note.is_none() && note.as_ref().is_some_and(|n|!n.trim().is_empty()) {
+                    // A thought attached to a highlight is independently editable;
+                    // removing that highlight must never erase the user's note.
+                    let requested=StoredHighlight::with_note(s.book_id.clone(),old.ranges.clone(),old.quote.clone(),note);
+                    rebook_app_core::highlights::HighlightStore::from_repository(s.store.clone())
+                        .save_selection(s.pipeline.rewrite.as_ref(),requested,rebook_app_core::highlights::selection::SelectionAction::Add).map_err(error)?;
+                } else {s.store.update_annotation_note(&id, note).map_err(error)?;}
                 list(s)
             })
         })
@@ -110,4 +98,13 @@ impl MobileReader {
         })
         .await
     }
+}
+
+fn save_selection(s:&mut ReaderState,note:Option<String>,action:rebook_app_core::highlights::selection::SelectionAction)->Result<Vec<Annotation>> {
+    let selected=s.selected.as_ref().ok_or_else(||error("请先选择正文"))?;
+    let requested=StoredHighlight::with_note(s.book_id.clone(),selected.ranges.clone(),selected.text.clone(),note);
+    let store=rebook_app_core::highlights::HighlightStore::from_repository(s.store.clone());
+    store.save_selection(s.pipeline.rewrite.as_ref(),requested,action).map_err(error)?;
+    clear_selection_state(s);
+    list(s)
 }

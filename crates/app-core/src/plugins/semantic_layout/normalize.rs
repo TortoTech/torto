@@ -1,6 +1,16 @@
 use super::*;
 
-// Only remove proposals that provably do not change existing semantics.
+// Strip retired heading objects before typed deserialization as even malformed
+// legacy fields must not discard independent quotes, captions or formulas.
+pub(super) fn decode_response(value: &Value) -> Result<Response, String> {
+    let mut value = wire::decode(value);
+    if let Some(groups) = value.get_mut("groups").and_then(Value::as_array_mut) {
+        groups.retain(|group| group.get("kind").and_then(Value::as_str) != Some("section_heading"));
+    }
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+// Remove retired headings and proposals that provably do not change existing semantics.
 // All remaining IDs, associations and conflicts still go through validation.
 pub(super) fn response(
     response: &mut Response,
@@ -10,6 +20,7 @@ pub(super) fn response(
     let before = response.groups.len() + response.citations.len() + response.formulas.len();
     let mut seen = HashSet::new();
     response.groups.retain(|group| {
+        if matches!(group, Proposal::SectionHeading { .. }) { return false; }
         if !seen.insert(serde_json::to_string(group).expect("serializable proposal")) {
             return false;
         }
@@ -18,7 +29,7 @@ pub(super) fn response(
             return true;
         }
         let unchanged = match group {
-            Proposal::SectionHeading { block } => matches!(&section.blocks[*block], Block::Text(t) if t.kind.is_heading()),
+            Proposal::SectionHeading { .. } => unreachable!(),
             Proposal::Figure { images, captions } => {
                 consecutive(images) && consecutive(captions)
                     && images.iter().all(|id| matches!(&section.blocks[*id], Block::Image(_)))
@@ -45,7 +56,7 @@ mod tests {
     use crate::plugins::semantic_layout::tests::{image, section, text};
 
     #[test]
-    fn ignores_known_semantics_but_keeps_invalid_ids_and_reclassification() {
+    fn ignores_known_semantics_and_retired_headings_but_keeps_invalid_figures() {
         let mut s = section(vec![text("h", "Heading"), image("i"), text("c", "Caption")]);
         let Block::Text(h) = &mut s.blocks[0] else {
             unreachable!()
@@ -59,14 +70,15 @@ mod tests {
             {"kind":"section_heading","block":0},
             {"kind":"figure","images":[1],"captions":[2]},
             {"kind":"section_heading","block":2},
-            {"kind":"section_heading","block":99}
+            {"kind":"section_heading","block":99},
+            {"kind":"figure","images":[99],"captions":[2]}
         ],"citations":[],"formulas":[]}))
         .unwrap();
-        assert_eq!(response(&mut r, &s, 0..3), 2);
-        assert_eq!(r.groups.len(), 2);
+        assert_eq!(response(&mut r, &s, 0..3), 4);
+        assert_eq!(r.groups.len(), 1);
         assert!(validate_window(&r.groups, &s, &RecognitionRoles::default(), 0..3, 0..3).is_err());
-        // Even an authored heading outside the supplied context remains invalid.
+        // Retired heading proposals are ignored regardless of their context or ID.
         r.groups = vec![Proposal::SectionHeading { block: 0 }];
-        assert_eq!(response(&mut r, &s, 1..3), 0);
+        assert_eq!(response(&mut r, &s, 1..3), 1);
     }
 }

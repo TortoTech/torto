@@ -18,6 +18,15 @@ use crate::{BookFormat, FormatError, conversion_error};
 
 const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 
+#[cfg(test)]
+#[test]
+fn an_unused_damaged_attachment_does_not_discard_readable_prose() {
+    use rebook_publication::BookSource;
+    let xml = br#"<FictionBook><description><title-info><book-title>Test</book-title></title-info></description><body><section><p>Readable content.</p></section></body><binary id="unused" content-type="image/png">!INVALID!</binary></FictionBook>"#;
+    let source = open(xml,"test.fb2").unwrap();
+    assert!(!source.parse_section(0).unwrap().blocks.is_empty());
+}
+
 struct ImageReference {
     path: String,
 }
@@ -41,6 +50,19 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, Fo
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| title_from_file_name(file_name));
     let authors = title_info.map(extract_authors).unwrap_or_default();
+    let sequence = title_info.and_then(|n| n.descendants().find(|n| is_element(*n, "sequence")));
+    let publish_info = root.descendants().find(|n| is_element(*n, "publish-info"));
+    let details = rebook_publication::MetadataDetails {
+        contributors: authors.iter().map(|name| rebook_publication::Contributor {
+            name: name.clone(), roles: vec!["aut".into()], sort_as: None,
+        }).collect(),
+        publisher: publish_info.and_then(|n| first_descendant_text(n, "publisher")),
+        description: title_info.and_then(|n| first_descendant_text(n, "annotation")),
+        identifiers: publish_info.and_then(|n| first_descendant_text(n, "isbn")).into_iter().collect(),
+        series: sequence.and_then(|n| attribute_local(n, "name")).map(str::to_owned),
+        series_position: sequence.and_then(|n| attribute_local(n, "number")).map(str::to_owned),
+        ..Default::default()
+    };
     let languages = title_info
         .and_then(|node| first_descendant_text(node, "lang"))
         .filter(|value| !value.is_empty())
@@ -99,6 +121,7 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<DirectBookSource, Fo
                 authors,
                 languages,
                 layout: RenditionLayout::Reflowable,
+                details,
             },
             sections,
             table_of_contents: Vec::new(),
@@ -169,9 +192,11 @@ fn extract_images(
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
-        let decoded = BASE64
-            .decode(encoded.as_bytes())
-            .map_err(|error| conversion_error(BookFormat::Fb2, error))?;
+        // A damaged attachment must not discard otherwise readable prose.
+        // Missing references retain their existing text/alt fallback.
+        let Ok(decoded) = BASE64.decode(encoded.as_bytes()) else {
+            continue;
+        };
         let declared = attribute_local(binary, "content-type").unwrap_or_default();
         let Some((extension, media_type)) = image_type(declared, &decoded) else {
             continue;

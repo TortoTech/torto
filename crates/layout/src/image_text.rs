@@ -56,6 +56,7 @@ mod tests {
             vec![],
             false,
             None,
+            crate::TextContext::Flow,
         );
         assert!(prepared.text.contains("Recognized"));
         assert!(!prepared.text.contains('\u{f0000}'));

@@ -221,7 +221,12 @@ pub fn character_count(value: &str) -> usize {
 }
 
 pub fn valid_description(value: &str) -> bool {
-    (10..=5000).contains(&character_count(value)) && value.encode_utf16().count() <= 10_000
+    description_validation(value).1
+}
+
+pub fn description_validation(value: &str) -> (usize, bool) {
+    let count = character_count(value);
+    (count, (10..=5000).contains(&count) && value.encode_utf16().count() <= 10_000)
 }
 
 pub fn clipped(value: &str, max: usize) -> String {

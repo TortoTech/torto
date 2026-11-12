@@ -71,7 +71,7 @@ fn local_semantic_phase_probe() {
             timed!("ai_compose_ms", {
                 if let Some(recognition) = recognition {
                     for annotation in recognition.annotations {
-                        if headings::annotation_eligible(&canonical, &annotation) {
+                        if heading_policy::annotation_supported(&annotation) {
                             compose(&mut section.blocks, &annotation);
                         }
                     }

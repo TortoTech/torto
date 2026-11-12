@@ -3,12 +3,11 @@ use std::time::{Duration, Instant};
 use super::{SyncMode, SyncReport};
 use serde::{Deserialize, Serialize};
 
-const FULL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
-const READING_QUIET_MS: u64 = 10_000;
+const FULL_CHECK_INTERVAL: Duration = Duration::from_secs(20 * 60);
+const READING_QUIET_MS: u64 = 15_000;
 const MAX_READING_DELAY: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30 * 60);
-pub const SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Portable deadlines for hosts whose process can be reclaimed between wakes.
 /// No credentials or book contents are stored here.
@@ -24,6 +23,10 @@ pub struct ScheduleSnapshot {
     statistics_retry_in_ms: Option<u64>,
     statistics_failures: u32,
     derived_token: Option<String>,
+    #[serde(default)]
+    current_age_ms: u64,
+    #[serde(default)]
+    current_requested: bool,
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -41,6 +44,16 @@ pub struct SyncSchedule {
     rate_limited_until: Option<Instant>,
     statistics_retry: Option<Instant>,
     statistics_failures: u32,
+    reading_deadline: Option<Instant>,
+    annotations_deadline: Option<Instant>,
+    last_current: Instant,
+    current_requested: bool,
+    current_active: bool,
+    current_book: Option<String>,
+    seen_network: u64,
+    seen_flush: u64,
+    seen_activation: u64,
+    seen_library: u64,
 }
 
 impl Default for SyncSchedule {
@@ -61,6 +74,16 @@ impl SyncSchedule {
             rate_limited_until: None,
             statistics_retry: None,
             statistics_failures: 0,
+            reading_deadline: None,
+            annotations_deadline: None,
+            last_current: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
+            current_requested: false,
+            current_active: false,
+            current_book: None,
+            seen_network: 0,
+            seen_flush: 0,
+            seen_activation: 0,
+            seen_library: 0,
         }
     }
 
@@ -110,17 +133,85 @@ impl SyncSchedule {
         }
     }
 
+    /// Bind process-local counters after restoring durable deadlines. These
+    /// counters restart with the process and are not durable change versions.
+    pub fn attach_signal(&mut self, signal: &super::SyncSignal) {
+        self.current_active = signal.active.is_some();
+        self.current_book = signal.active.clone();
+        self.seen_activation = signal.activation;
+        self.seen_library = signal.library;
+        self.seen_network = signal.network;
+        self.seen_flush = signal.flush;
+    }
+    pub fn observe_signal(&mut self, signal: &super::SyncSignal, now: Instant) {
+        let changed_book = self.current_book != signal.active;
+        self.current_book = signal.active.clone();
+        self.current_active = signal.active.is_some();
+        if signal.flush != self.seen_flush {
+            self.seen_flush = signal.flush;
+            self.request(SyncMode::Reading);
+        }
+        if signal.network != self.seen_network {
+            self.seen_network = signal.network;
+            self.request(if self.current_active {
+                SyncMode::Current
+            } else {
+                SyncMode::Full {
+                    force_statistics: false,
+                }
+            });
+        }
+        if signal.activation != self.seen_activation {
+            self.seen_activation = signal.activation;
+            if self.current_active
+                && (changed_book
+                    || now.saturating_duration_since(self.last_current) >= Duration::from_secs(10))
+            {
+                self.current_requested = true;
+            }
+        }
+        if signal.library != self.seen_library {
+            self.seen_library = signal.library;
+            self.request(SyncMode::Full {
+                force_statistics: false,
+            });
+        }
+    }
+    pub fn observe_annotations(&mut self, latest: Option<u64>, now: Instant, now_ms: u64) {
+        self.annotations_deadline = latest.map(|at| {
+            now + Duration::from_millis(3000u64.saturating_sub(now_ms.saturating_sub(at)))
+        });
+    }
+    /// Sleep until the next real deadline. Local commits wake the host earlier.
     pub fn poll_delay(&self, now: Instant) -> Duration {
-        self.retry_after
+        if now < self.retry_after {
+            return self.retry_after - now;
+        }
+        if self.queued.is_some() || self.current_requested {
+            return Duration::from_millis(1);
+        }
+        let mut deadline = self.last_full + FULL_CHECK_INTERVAL;
+        for at in [
+            self.reading_deadline,
+            self.annotations_deadline,
+            self.statistics_retry,
+            self.current_active
+                .then_some(self.last_current + Duration::from_secs(60)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            deadline = deadline.min(at);
+        }
+        deadline
             .saturating_duration_since(now)
-            .max(SYNC_CHECK_INTERVAL)
+            .max(Duration::from_millis(1))
     }
 
     /// The platform may schedule a background wake at or after this deadline.
     pub fn retry_delay(&self, now: Instant) -> Option<Duration> {
-        let ordinary = self
-            .queued
-            .map(|_| self.retry_after.saturating_duration_since(now));
+        let ordinary = (self.queued.is_some() || self.current_requested)
+            .then(|| self.retry_after.saturating_duration_since(now));
         let statistics = self
             .statistics_retry
             .map(|at| at.max(self.retry_after).saturating_duration_since(now));
@@ -145,6 +236,8 @@ impl SyncSchedule {
                 .map(|at| millis(at.saturating_duration_since(now))),
             statistics_failures: self.statistics_failures,
             derived_token: self.derived_token.clone(),
+            current_age_ms: millis(now.saturating_duration_since(self.last_current)),
+            current_requested: self.current_requested,
         }
     }
 
@@ -175,6 +268,21 @@ impl SyncSchedule {
                 .map(deadline),
             statistics_retry: snapshot.statistics_retry_in_ms.map(deadline),
             statistics_failures: snapshot.statistics_failures,
+            reading_deadline: None,
+            annotations_deadline: None,
+            last_current: now
+                .checked_sub(
+                    Duration::from_millis(snapshot.current_age_ms.saturating_add(elapsed))
+                        .min(Duration::from_secs(60)),
+                )
+                .unwrap_or(now),
+            current_requested: snapshot.current_requested,
+            current_active: false,
+            current_book: None,
+            seen_network: 0,
+            seen_flush: 0,
+            seen_activation: 0,
+            seen_library: 0,
         };
         if age >= FULL_CHECK_INTERVAL {
             schedule.request(SyncMode::Full {
@@ -189,18 +297,27 @@ impl SyncSchedule {
     }
 
     pub fn started(&mut self, mode: SyncMode) {
+        if mode == SyncMode::Current {
+            self.current_requested = false;
+        }
         if matches!(mode, SyncMode::Full { .. })
             || mode != SyncMode::Statistics && self.queued == Some(SyncMode::Reading)
             || mode == SyncMode::Derived && self.queued == Some(SyncMode::Derived)
         {
             self.queued = None;
         }
-        if mode != SyncMode::Statistics {
+        if !matches!(mode, SyncMode::Statistics | SyncMode::Current) {
             self.pending_since = None;
+            self.reading_deadline = None;
+            self.annotations_deadline = None;
         }
     }
 
     pub fn request(&mut self, mode: SyncMode) {
+        if mode == SyncMode::Current {
+            self.current_requested = true;
+            return;
+        }
         if mode == SyncMode::Statistics {
             self.statistics_retry.get_or_insert_with(Instant::now);
             return;
@@ -232,14 +349,37 @@ impl SyncSchedule {
         if now < self.retry_after {
             return None;
         }
-        // A stream of local derived changes must not postpone remote discovery.
-        if now.duration_since(self.last_full) >= FULL_CHECK_INTERVAL
-            && self.queued == Some(SyncMode::Derived)
+        self.reading_deadline = latest_change_ms.map(|latest| {
+            let since = *self.pending_since.get_or_insert(now);
+            (now + Duration::from_millis(
+                READING_QUIET_MS.saturating_sub(now_ms.saturating_sub(latest)),
+            ))
+            .min(since + MAX_READING_DELAY)
+        });
+        // Full sync already starts with the current-book exchange. Do not
+        // admit a second job ahead of the initial/overdue library check.
+        if matches!(self.queued, Some(SyncMode::Full { .. }))
+            || (now.duration_since(self.last_full) >= FULL_CHECK_INTERVAL && self.queued!=Some(SyncMode::Reading))
         {
-            self.queued = None;
-            return Some(SyncMode::Full {
-                force_statistics: false,
+            self.current_requested = false;
+            return Some(match self.queued.take() {
+                Some(full @ SyncMode::Full { .. }) => full,
+                _ => SyncMode::Full {
+                    force_statistics: false,
+                },
             });
+        }
+        if self.current_requested
+            || self.current_active
+                && now.duration_since(self.last_current) >= Duration::from_secs(60)
+        {
+            self.current_requested = false;
+            self.last_current = now;
+            return Some(SyncMode::Current);
+        }
+        if latest_change_ms.is_some() && self.annotations_deadline.is_some_and(|at| now >= at) {
+            self.annotations_deadline = None;
+            return Some(SyncMode::Reading);
         }
         if let Some(mode) = self.queued.take() {
             return Some(mode);
@@ -300,6 +440,9 @@ impl SyncSchedule {
             if matches!(mode, SyncMode::Full { .. }) {
                 self.last_full = now;
             }
+            if matches!(mode, SyncMode::Full { .. } | SyncMode::Current) {
+                self.last_current = now;
+            }
             self.retry_after = now;
             self.failures = 0;
             self.rate_limited_until = None;
@@ -326,6 +469,102 @@ impl SyncSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_deadlines_are_fifteen_seconds_twenty_minutes_and_three_seconds() {
+        let now = Instant::now();
+        let mut schedule = SyncSchedule::new(now);
+        assert_eq!(schedule.poll_delay(now), Duration::from_secs(1200));
+        assert_eq!(schedule.next(now, 10_000, Some(10_000)), None);
+        assert_eq!(schedule.poll_delay(now), Duration::from_secs(15));
+        assert_eq!(
+            schedule.next(now + Duration::from_millis(14999), 24999, Some(10_000)),
+            None
+        );
+        assert_eq!(
+            schedule.next(now + Duration::from_secs(15), 25000, Some(10_000)),
+            Some(SyncMode::Reading)
+        );
+        let mut schedule = SyncSchedule::new(now);
+        schedule.observe_annotations(Some(10_000), now, 10_000);
+        assert_eq!(schedule.poll_delay(now), Duration::from_secs(3));
+        assert_eq!(
+            schedule.next(now + Duration::from_millis(2999), 12999, Some(10000)),
+            None
+        );
+        assert_eq!(
+            schedule.next(now + Duration::from_secs(3), 13000, Some(10000)),
+            Some(SyncMode::Reading)
+        );
+        let mut schedule = SyncSchedule::new(now);
+        assert_eq!(
+            schedule.next(now + Duration::from_secs(1199), 0, None),
+            None
+        );
+        assert_eq!(
+            schedule.next(now + Duration::from_secs(1200), 0, None),
+            Some(SyncMode::Full {
+                force_statistics: false
+            })
+        );
+    }
+
+    #[test]
+    fn opening_switching_and_current_retry_do_not_rescan_the_library() {
+        let now = Instant::now();
+        let mut schedule = SyncSchedule::new(now);
+        let mut signal = super::super::SyncSignal::default();
+        signal.active = Some("a".into());
+        signal.activation = 1;
+        schedule.observe_signal(&signal, now);
+        assert_eq!(schedule.next(now, 0, None), Some(SyncMode::Current));
+        schedule.completed(SyncMode::Current, true, now);
+        signal.activation += 1;
+        schedule.observe_signal(&signal, now);
+        assert_eq!(schedule.next(now, 0, None), None);
+        signal.active = Some("b".into());
+        signal.activation += 1;
+        schedule.observe_signal(&signal, now);
+        assert_eq!(schedule.next(now, 0, None), Some(SyncMode::Current));
+        schedule.completed(SyncMode::Current, false, now);
+        assert_eq!(schedule.retry_delay(now), Some(Duration::from_secs(30)));
+        let restored_at = now + Duration::from_secs(5);
+        let mut restored = SyncSchedule::restore(schedule.snapshot(now, 10000), restored_at, 15000);
+        assert_eq!(restored.next(restored_at, 15000, None), None);
+        assert_eq!(
+            restored.next(now + Duration::from_secs(30), 40000, None),
+            Some(SyncMode::Current)
+        );
+    }
+
+    #[test]
+    fn restoring_process_counters_does_not_duplicate_a_full_sync_and_exit_flush_keeps_it_queued() {
+        let now = Instant::now();
+        let mut schedule = SyncSchedule::new(now);
+        let signal = super::super::SyncSignal {
+            library: 8,
+            activation: 9,
+            flush: 3,
+            network: 2,
+            active: Some("a".into()),
+            ..Default::default()
+        };
+        schedule.completed(SyncMode::Full {force_statistics:false},true,now);
+        schedule.attach_signal(&signal);
+        schedule.observe_signal(&signal, now);
+        assert_eq!(schedule.next(now, 0, None), None);
+        schedule.request(SyncMode::Full {
+            force_statistics: false,
+        });
+        assert!(schedule.start_requested(SyncMode::Reading, now));
+        schedule.completed(SyncMode::Reading, true, now);
+        assert_eq!(
+            schedule.next(now, 0, None),
+            Some(SyncMode::Full {
+                force_statistics: false
+            })
+        );
+    }
 
     #[test]
     fn snapshot_preserves_long_quota_and_queued_work_across_process_wakes() {
@@ -420,7 +659,7 @@ mod tests {
         assert!(schedule.observe_derived(Some("revision-1".into())));
         assert!(!schedule.observe_derived(Some("revision-1".into())));
         let snapshot = schedule.snapshot(now, 10_000);
-        let mut restored = SyncSchedule::restore(snapshot, now, 910_000);
+        let mut restored = SyncSchedule::restore(snapshot, now, 1_210_000);
         assert_eq!(
             restored.next(now, 0, None),
             Some(SyncMode::Full {
@@ -466,15 +705,15 @@ mod tests {
             None
         );
         assert_eq!(
-            schedule.next(now + Duration::from_secs(11), 12_000, Some(1_800)),
+            schedule.next(now + Duration::from_secs(16), 17_000, Some(1_800)),
             Some(SyncMode::Reading)
         );
         assert_eq!(
-            schedule.next(now + Duration::from_secs(12), 13_000, Some(13_000)),
+            schedule.next(now + Duration::from_secs(17), 18_000, Some(18_000)),
             None
         );
         assert_eq!(
-            schedule.next(now + Duration::from_secs(72), 73_000, Some(73_000)),
+            schedule.next(now + Duration::from_secs(77), 78_000, Some(78_000)),
             Some(SyncMode::Reading)
         );
     }

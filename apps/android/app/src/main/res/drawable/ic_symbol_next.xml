@@ -1,6 +1,6 @@
-<!-- Google Material Symbols Rounded, Apache-2.0. Source: symbols/web/chevron_right/materialsymbolsrounded/chevron_right_24px.svg -->
+<!-- Google Material Symbols Rounded, wght 300, Apache-2.0. Source: symbols/web/chevron_right/materialsymbolsrounded/chevron_right_wght300_24px.svg -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="960" android:viewportHeight="960">
     <group android:translateX="-0" android:translateY="960">
-        <path android:fillColor="@android:color/white" android:pathData="M504-480 348-636q-11-11-11-28t11-28q11-11 28-11t28 11l184 184q6 6 8.5 13t2.5 15q0 8-2.5 15t-8.5 13L404-268q-11 11-28 11t-28-11q-11-11-11-28t11-28l156-156Z"/>
+        <path android:fillColor="@android:color/white" android:pathData="M517.85-480 354.92-642.92q-8.3-8.31-8.5-20.89-.19-12.57 8.5-21.27 8.7-8.69 21.08-8.69 12.38 0 21.08 8.69l179.77 179.77q5.61 5.62 7.92 11.85 2.31 6.23 2.31 13.46t-2.31 13.46q-2.31 6.23-7.92 11.85L397.08-274.92q-8.31 8.3-20.89 8.5-12.57.19-21.27-8.5-8.69-8.7-8.69-21.08 0-12.38 8.69-21.08L517.85-480Z"/>
     </group>
 </vector>

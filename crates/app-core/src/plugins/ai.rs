@@ -25,9 +25,8 @@ use super::rewrite::{BlockRewrite, RewriteBookSource, RewriteTransaction};
 use super::search::{search_book, search_section, section_title, text_block_kind, text_block_text};
 use super::translation::{validate_translation_citations, validate_translation_math_placeholders};
 use super::{
-    AiProvider, BlockTranslation, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN,
-    CHAT_TOOL_STEPS_MAX, CHAT_TOOL_STEPS_MIN, PluginSettings, ReasoningEffort,
-    TranslationBlockInput,
+    AiProvider, BlockTranslation, DEFAULT_CHAT_HISTORY_TURNS, DEFAULT_CHAT_MAX_TOOL_STEPS,
+    PluginSettings, ReasoningEffort, TranslationBlockInput,
 };
 
 const MAX_TRANSLATION_CHARS: usize = 2_000;
@@ -213,16 +212,8 @@ pub async fn chat_with_book(
         && kind == ChatRequestKind::ChapterSummary;
     let reasoning_effort = settings.chat_reasoning_effort;
     let (provider, model) = settings.chat_endpoint()?;
-    let max_tool_steps = usize::from(
-        settings
-            .chat_max_tool_steps
-            .clamp(CHAT_TOOL_STEPS_MIN, CHAT_TOOL_STEPS_MAX),
-    );
-    let max_history_turns = usize::from(
-        settings
-            .chat_history_turns
-            .clamp(CHAT_HISTORY_TURNS_MIN, CHAT_HISTORY_TURNS_MAX),
-    );
+    let max_tool_steps = usize::from(DEFAULT_CHAT_MAX_TOOL_STEPS);
+    let max_history_turns = usize::from(DEFAULT_CHAT_HISTORY_TURNS);
     let mut messages = vec![json!({
         "role": "system",
         "content": if direct_pdf_summary { build_system_prompt_for_task(source.as_ref(), &current, &response_language, true) } else { build_system_prompt(source.as_ref(), &current, &response_language) },
@@ -245,7 +236,7 @@ pub async fn chat_with_book(
         }
         result.push(json!({"role":"user", "content":super::chat_media::message_content(&current_question, &current_images)?}));
         if has_images && result.iter().map(|message| message.to_string().len()).sum::<usize>() > 28 * 1024 * 1024 {
-            return Err("本次对话图片和历史记录过大，请减少设置中的历史对话轮数后重试。".into());
+            return Err("本次对话图片和历史记录过大，请清空对话或减少图片后重试。".into());
         }
         Ok::<_, String>(result)
     }).await.map_err(|e| format!("准备聊天图片失败：{e}"))??;
@@ -1001,7 +992,8 @@ Translate inlinefootnote contents; retain each complete group and ID exactly onc
 Move complete inline style tags around the corresponding translated words. Keep nesting; do not expand style ranges.
 For Chinese translations, decide from context whether each t-size variation has semantic meaning. Ordinary Latin typographic size changes (small capitals, enlarged initial letters, or locally enlarged/reduced prose) need not survive in Chinese: translate the complete content naturally and omit unnecessary t-size wrappers. Keep or adapt size tags when necessary for meaningful symbols, formulas or examples. Superscripts, subscripts, footnote references and structural placeholders retain their meaning. Input size tags are context for this decision, not instructions to preserve Latin text verbatim.
 For other target languages, retain style attributes unless their typographic conventions require adaptation.
-Style tags include strong, em, i, cite, t-italic, t-size, u, sup, sub, noteref and noteback.
+Style tags include b, strong, em, i, cite, t-italic, t-size, u, sup, sub, noteref and noteback.
+Keep b and strong distinct: b carries the source paragraph's default bold face, while strong marks local emphasis.
 For code and preformatted examples, preserve indentation, tabs, line breaks, blank lines and repeated spaces. Keep code syntax and identifiers unchanged; translate only human-language content and comments. Do not add Markdown fences.
 
 # Citation structure
@@ -2762,6 +2754,7 @@ mod tests {
                     authors: Vec::new(),
                     languages: Vec::new(),
                     layout: RenditionLayout::PrePaginated,
+                    ..Metadata::default()
                 },
                 cover: None,
                 sections: spine,

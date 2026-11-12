@@ -2,6 +2,7 @@ package org.tortotech.torto
 
 import android.graphics.Rect
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.view.accessibility.AccessibilityNodeInfo
@@ -414,12 +415,11 @@ class ReadingNavigationTest {
             fun button(name:String):AccessibilityNodeInfo {var found=label(name);while(found!=null&&!found.isClickable&&found.className!="android.widget.Button")found=found.parent;return found!!}
             fun bounds(name:String)=Rect().also {button(name).getBoundsInScreen(it)}
             val chat=bounds("Reading assistant")
-            val split=bounds("Split current paragraph")
             val translation=bounds("Turn translation on")
-            assertTrue("Floating actions are AI / sentences / translation",chat.right<split.left&&split.right<translation.left)
-            assertEquals(chat.top,split.top);assertEquals(split.top,translation.top)
+            assertTrue("Floating actions are AI / translation",chat.right<translation.left)
+            assertEquals(chat.top,translation.top)
             assertEquals("Circular controls have square bounds",chat.width(),chat.height())
-            assertFalse("No current focus means sentence action is disabled",button("Split current paragraph").isEnabled)
+            assertNull("Sentence splitting has no floating entry",label("Split current paragraph"))
             android.os.SystemClock.sleep(350)
             screenshot("reading-floating-actions.png")
             instrumentation.runOnMainSync {screen.value=screen.value.copy(busy=true)}
@@ -427,7 +427,7 @@ class ReadingNavigationTest {
             assertTrue("The first button stays usable during a short operation",button("Reading assistant").isEnabled)
             instrumentation.runOnMainSync {screen.value=screen.value.copy(busy=false)}
             instrumentation.waitForIdleSync()
-            for(name in listOf("Reading assistant","Contents and search","Notes and highlights","Selection mode","Typography","Toggle light/dark","Turn translation on"))assertTrue("Short reading updates keep $name enabled",button(name).isEnabled)
+            for(name in listOf("Reading assistant","Contents and search","Notes and highlights","Selection mode","Typography","Theme","Turn translation on"))assertTrue("Short reading updates keep $name enabled",button(name).isEnabled)
             instrumentation.runOnMainSync {screen.value=screen.value.copy(busy=false,processing=true)}
             android.os.SystemClock.sleep(350)
             assertNull("AI processing has no header pause/stop entry",label("Stop processing"))
@@ -439,6 +439,25 @@ class ReadingNavigationTest {
             await("long operations still disable conflicting controls"){!button("Reading assistant").isEnabled}
             instrumentation.runOnMainSync {screen.value=screen.value.copy(busy=false,processing=false,enhancing=false)}
             await("controls restore after work"){button("Reading assistant").isEnabled}
+            val systemLanguage=instrumentation.targetContext.resources.configuration.locales[0].toLanguageTag()
+            instrumentation.runOnMainSync {screen.value=screen.value.copy(bookLanguages=listOf(systemLanguage))}
+            await("same-language books hide translation"){label("Turn translation on")==null}
+            assertNotNull(label("Reading assistant"));assertNull(label("Split current paragraph"))
+            instrumentation.runOnMainSync {screen.value=screen.value.copy(translated=true)}
+            await("active translation stays reachable"){label("Turn translation off")!=null}
+            android.os.SystemClock.sleep(250)
+            val activeTranslation=bounds("Turn translation off")
+            val activeBitmap=instrumentation.uiAutomation.takeScreenshot()!!
+            var greenPixels=0
+            for(y in activeTranslation.top until activeTranslation.bottom)for(x in activeTranslation.left until activeTranslation.right){
+                val pixel=activeBitmap.getPixel(x,y)
+                if(android.graphics.Color.green(pixel)>100&&android.graphics.Color.green(pixel)>android.graphics.Color.red(pixel)*1.5&&android.graphics.Color.green(pixel)>android.graphics.Color.blue(pixel)*1.2)greenPixels++
+            }
+            activeBitmap.recycle()
+            assertTrue("Enabled translation visibly highlights the icon",greenPixels>25)
+            screenshot("reading-floating-actions-active.png")
+            instrumentation.runOnMainSync {screen.value=screen.value.copy(translated=false,bookLanguages=listOf(if(systemLanguage.startsWith("zh"))"en"else"zh-CN"))}
+            await("foreign-language books retain translation"){label("Turn translation on")!=null}
         }finally {instrumentation.runOnMainSync {activity?.finish()};instrumentation.removeMonitor(monitor)}
     }
 
@@ -491,9 +510,15 @@ class ReadingNavigationTest {
                 bounds.top==0&&bounds.bottom==activity!!.window.decorView.height&&!model!!.state.value.busy
             }
             val fullScreen=immersiveBounds()
-            // Wait for the debounced native resize before comparing retained rasters.
-            android.os.SystemClock.sleep(250)
-            await("the full-screen native resize finishes"){!model!!.state.value.busy}
+            // Reference preparation and adjacent previews can still be queued
+            // after the first frame. Compare chrome only after those settle.
+            var stableRaster=model!!.state.value.frame!!.rasterId
+            var stableSince=SystemClock.uptimeMillis()
+            await("the full-screen resize, references and previews settle"){
+                val state=model!!.state.value;val raster=state.frame!!.rasterId
+                if(raster!=stableRaster||state.busy){stableRaster=raster;stableSince=SystemClock.uptimeMillis()}
+                state.nextPage!=null&&!state.busy&&SystemClock.uptimeMillis()-stableSince>=500
+            }
             val active=model!!.state.value.frame!!.info.focusBounds.first()
             val raster=model!!.state.value.frame!!.rasterId
             instrumentation.runOnMainSync {model!!.tap(active.x+2f,active.y+active.height/2)}
@@ -502,15 +527,7 @@ class ReadingNavigationTest {
             assertEquals("Showing controls must not reserve top or bottom bands",fullScreen,immersiveBounds())
             assertEquals("Toggling chrome reuses native page pixels",raster,model!!.state.value.frame!!.rasterId)
             assertTrue("Native focus exposes a local sentence control",model!!.state.value.frame!!.info.controls.any {it.kind=="sentences"})
-            await("current paragraph can be split"){label("当前段落按句分段","Split current paragraph")!=null}
-            click(label("当前段落按句分段","Split current paragraph"))
-            await("only current paragraph is split"){!model!!.state.value.busy&&model!!.state.value.frame!!.info.controls.any {it.kind=="sentences"&&it.active}}
-            await("action switches to restore"){label("取消当前段落分句","Restore current paragraph")!=null}
-            instrumentation.waitForIdleSync()
-            android.os.SystemClock.sleep(250)
-            screenshot("reading-focused-sentences.png")
-            click(label("取消当前段落分句","Restore current paragraph"))
-            await("paragraph is restored"){!model!!.state.value.busy&&model!!.state.value.frame!!.info.controls.any {it.kind=="sentences"&&!it.active}}
+            assertNull("Sentence splitting remains a gesture without a floating entry",label("当前段落按句分段","Split current paragraph"))
             instrumentation.runOnMainSync {model!!.tap(active.x+2f,active.y+active.height/2)}
             await("tapping it again hides chrome"){!model!!.state.value.chromeVisible&&!model!!.state.value.busy}
             await("status bar hides again"){!statusVisible()}
@@ -532,19 +549,26 @@ class ReadingNavigationTest {
             assertFalse("Android does not highlight the focused block",model!!.state.value.frame!!.info.focusHighlight)
             assertNull("Focus always uses unified layout",label("统一版式","Unified layout"))
             assertNull("Focus always scrolls",label("滚动专注","Scrolling focus"))
-            assertNull("Sentence splitting is a local floating action",label("按句分段显示","Split sentences onto separate lines"))
+            assertNull("Sentence splitting is gesture-only",label("按句分段显示","Split sentences onto separate lines"))
             assertTrue(model!!.state.value.frame!!.info.isScroll)
+            click(label("专注模式","Focus mode"))
+            await("mode details open"){label("阅读模式","Reading mode")!=null}
             instrumentation.runOnMainSync {model!!.focus(false)}
             await("classic offers the layout choice"){label("统一版式","Unified layout")!=null&&!model!!.state.value.busy}
             assertNull("Classic does not offer focus styles",label("专注样式","Focus style"))
             assertNull("Classic does not offer focus scrolling",label("滚动专注","Scrolling focus"))
             assertEquals("Switching modes preserves the classic choice",classicLayout,model!!.state.value.unified)
             android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand("input keyevent 4")).use {it.readBytes()}
+            await("back returns to compact typography"){label("字体样式","Font styles")!=null}
+            android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand("input keyevent 4")).use {it.readBytes()}
             await("typography closes"){label("专注模式","Focus mode")==null}
             instrumentation.runOnMainSync {model!!.hideChrome();model!!.focus(originalFocus)}
             await("original reading mode restores"){model!!.state.value.focus==originalFocus&&!model!!.state.value.busy}
             instrumentation.runOnMainSync {model!!.toggleChrome()}
-            await("floating translation control is visible"){label("开启翻译","Turn translation on")!=null}
+            await("floating controls are visible"){label("阅读助手","Reading assistant")!=null}
+            assertEquals(listOf("en"),model!!.state.value.bookLanguages)
+            val systemLanguage=instrumentation.targetContext.resources.configuration.locales[0]
+            assertEquals("Translation follows the original book language",systemLanguage.language!="en",label("开启翻译","Turn translation on")!=null)
             assertNull("Reading progress labels were removed",node {it.text?.toString()?.let {s->s.contains('%')&&s.contains('/')}==true})
             instrumentation.runOnMainSync {model!!.toggleChrome()}
             await("controls hide together"){label("目录与搜索","Contents and search")==null&&label("开启翻译","Turn translation on")==null}
@@ -557,7 +581,12 @@ class ReadingNavigationTest {
             click(label("目录与搜索","Contents and search"))
             await("combined navigation drawer opens"){label("搜本书","Search book")!=null}
             await("Footer remains available"){label("目录与搜索","Contents and search")!=null}
-            await("current chapter is identified by the core"){label("当前读到","Reading here")!=null}
+            fun activeContents():AccessibilityNodeInfo? {
+                val title=model!!.state.value.toc.firstOrNull {entry->entry.id==model!!.state.value.frame?.info?.activeTocId}?.title ?: return null
+                return node {(it.isSelected||it.isChecked)&&it.text?.toString()==title}
+            }
+            await("current chapter is selected in place"){activeContents()!=null}
+            assertNull("Current location has no extra row",label("当前读到","Reading here"))
             android.os.SystemClock.sleep(250)
             screenshot("navigation-contents.png")
             click(label("收起章节","Collapse chapter"))
@@ -573,10 +602,19 @@ class ReadingNavigationTest {
                 val up=android.view.MotionEvent.obtain(clock,clock+60,1,bounds.exactCenterX(),bounds.exactCenterY(),0)
                 instrumentation.sendPointerSync(down);instrumentation.sendPointerSync(up);down.recycle();up.recycle()
             }
+            tapFooter("目录与搜索","Contents and search")
+            await("contents closes"){label("搜本书","Search book")==null}
+            tapFooter("目录与搜索","Contents and search")
+            await("reopening expands ancestors of the active chapter"){label("Chapter One")!=null&&activeContents()!=null}
+            click(label("收起章节","Collapse chapter"))
+            await("ancestor can still be collapsed manually"){label("Chapter One")==null}
+            click(label("搜本书","Search book"))
+            await("search opens"){label("取消","Cancel")!=null}
+            click(label("取消","Cancel"))
+            await("returning from search locates the active chapter again"){label("Chapter One")!=null&&activeContents()!=null}
             val footer=footerBounds("目录与搜索","Contents and search")
             for((names,paneNames,shot) in listOf(
                 Triple(arrayOf("字体排版","Typography"),setOf("字体排版面板","Typography panel"),"panel-typography.png"),
-                Triple(arrayOf("文字选择模式","Selection mode"),setOf("选择模式面板","Selection mode panel"),"panel-selection.png"),
                 Triple(arrayOf("批注与高亮","Notes and highlights"),setOf("批注与高亮面板","Notes and highlights panel"),"panel-annotations.png")
             )){
                 tapFooter(*names)
@@ -589,26 +627,45 @@ class ReadingNavigationTest {
                 val previousDark=model!!.state.value.dark
                 for(dark in listOf(false,true)){
                     if(model!!.state.value.dark!=dark){
-                        tapFooter("切换明暗模式","Toggle light/dark")
+                        tapFooter("主题","Theme")
+                        await("theme choices open"){label("颜色","Color")!=null}
+                        click(label(if(dark)"深色"else "浅色",if(dark)"Dark"else "Light"))
                         await("the visible footer can change the theme with a panel open"){model!!.state.value.dark==dark&&!model!!.state.value.busy}
+                        tapFooter(*names)
                     }
                     android.os.SystemClock.sleep(220)
                     screenshot(shot.removeSuffix(".png")+if(dark)"-dark.png"else"-light.png")
                 }
                 if(model!!.state.value.dark!=previousDark){
-                    tapFooter("切换明暗模式","Toggle light/dark")
+                    tapFooter("主题","Theme")
+                    await("theme choices open"){label("颜色","Color")!=null}
+                    click(label(if(previousDark)"深色"else "浅色",if(previousDark)"Dark"else "Light"))
                     await("theme preference is restored"){model!!.state.value.dark==previousDark&&!model!!.state.value.busy}
+                    tapFooter(*names)
                 }
             }
             tapFooter("批注与高亮","Notes and highlights")
             await("tapping the active footer action closes its panel"){node {it.paneTitle?.toString() in setOf("批注与高亮面板","Notes and highlights panel")}==null}
+            val originalSelection=model!!.state.value.selectionMode
+            val beforeChoice=model!!.state.value.frame!!.info
+            tapFooter("文字选择模式","Selection mode")
+            await("selection opens as a compact reading panel"){node {it.paneTitle?.toString() in setOf("选择模式面板","Selection mode panel")}!=null&&label("单词","Word")!=null}
+            assertNotNull("The selection panel retains the footer",label("目录与搜索","Contents and search"))
+            val choicePane=Rect().also {node {it.paneTitle?.toString() in setOf("选择模式面板","Selection mode panel")}!!.getBoundsInScreen(it)}
+            assertTrue("Selection keeps the book visible above and the footer below",choicePane.top>0&&choicePane.bottom<=footer.top+2)
+            screenshot("reading-selection-panel.png")
+            click(label("单词","Word"))
+            await("choosing returns to the same reader"){model!!.state.value.selectionMode=="word"&&!model!!.state.value.busy&&label("目录与搜索","Contents and search")!=null}
+            assertEquals(beforeChoice.section,model!!.state.value.frame!!.info.section)
+            assertEquals(beforeChoice.page,model!!.state.value.frame!!.info.page)
+            await("Selecting a mode closes its settings panel"){node {it.paneTitle?.toString() in setOf("选择模式面板","Selection mode panel")}==null}
+            instrumentation.runOnMainSync {model!!.selectionMode(originalSelection)}
+            await("selection preference restores"){model!!.state.value.selectionMode==originalSelection&&!model!!.state.value.busy}
             tapFooter("目录与搜索","Contents and search")
-            await("directory fold state survives a round trip through other panels"){label("展开章节","Expand chapter")!=null&&label("Chapter One")==null}
+            await("directory locates the active chapter after a round trip through other panels"){label("收起章节","Collapse chapter")!=null&&label("Chapter One")!=null}
             await("the full-height drawer finishes its entrance before testing IME motion"){
                 node {it.paneTitle?.toString() in setOf("目录与搜索","Contents and search")}?.let {Rect().also(it::getBoundsInScreen).top==0}==true
             }
-            click(label("展开章节","Expand chapter"))
-            await("parent expands its children"){label("收起章节","Collapse chapter")!=null}
             val paneBefore=Rect().also {node {it.paneTitle?.toString() in setOf("目录与搜索","Contents and search")}!!.getBoundsInScreen(it)}
             val headerBefore=Rect().also {label("目录与搜索栏","Navigation header")!!.getBoundsInScreen(it)}
             fun assertFixedDuringKeyboard(action:()->Unit){

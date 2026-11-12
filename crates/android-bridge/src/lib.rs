@@ -104,6 +104,7 @@ pub struct TextRegion {
 pub struct SelectedText {
     pub text: String,
     pub bounds: Vec<Rect>,
+    pub highlighted: bool,
 }
 #[derive(Clone, uniffi::Record)]
 pub struct FocusTarget {
@@ -184,6 +185,7 @@ impl Viewport {
 #[derive(uniffi::Object)]
 pub struct MobileCore {
     root: PathBuf,
+    sync_wake: Arc<rebook_app_core::sync::SyncWake>,
     library_lock: Arc<Mutex<()>>,
     font_download_lock: tokio::sync::Mutex<()>,
 }
@@ -206,6 +208,7 @@ impl MobileCore {
         HOOK.call_once(rebook_app_core::diagnostics::install_panic_hook);
         static LIBRARY_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
         Ok(Arc::new(Self {
+            sync_wake:rebook_app_core::sync::SyncWake::for_path(&root.join("sync-v1.sqlite3")),
             root,
             font_download_lock: tokio::sync::Mutex::new(()),
             library_lock: LIBRARY_LOCK
@@ -256,10 +259,27 @@ impl MobileCore {
             if let Ok(bytes) = std::fs::read(&cache) {
                 return Ok(Some(bytes));
             }
-            let Some(bytes) =
-                LocalLibrary::load_cover_from(&self.root.join("library"), &id).map_err(error)?
-            else {
-                return Ok(None);
+            let root = self.root.join("library");
+            let bytes = match LocalLibrary::load_cover_from(&root, &id).map_err(error)? {
+                Some(bytes) => bytes,
+                None => {
+                    let Some(path) = LocalLibrary::cover_source_from(&root, &id).map_err(error)? else {
+                        return Ok(None);
+                    };
+                    // Older imports may have saved an empty cover before a parser fix.
+                    // Parse only this visible book, on the blocking worker and outside
+                    // the library lock; recheck deletion/concurrent sync at commit time.
+                    let publication = rebook_formats::open_file(path).map_err(error)?;
+                    let Some(extracted) = publication.cover_bytes() else {
+                        return Ok(None);
+                    };
+                    let _guard = self.library_lock.lock().map_err(error)?;
+                    let Some(bytes) = LocalLibrary::store_missing_cover_from(&root, &id, extracted)
+                        .map_err(error)? else {
+                        return Ok(None);
+                    };
+                    bytes
+                }
             };
             let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
                 .with_guessed_format()
@@ -325,7 +345,9 @@ impl MobileCore {
                 .iter()
                 .find(|book| book.id == id)
                 .ok_or_else(|| error("Book not found"))?;
-            let publication = rebook_formats::open_file(&book.path).map_err(error)?;
+            let publication = rebook_formats::open_file_for_reading_cached(
+                &book.path, Some(&book.id), self.root.join("cache/source-ir"),
+            ).map_err(error)?;
             let canonical = mobile_source::for_reading(publication.source());
             let options = settings::load_reading(&self.root);
             let mut style = ReaderStyle::default();
@@ -336,7 +358,7 @@ impl MobileCore {
             style.typography.monospace_font = "monospace".into();
             style.typography.sans_serif_font = "sans-serif".into();
             settings::apply_typography(&mut style, &options);
-            apply_mobile_page_margins(&mut style);
+            apply_mobile_page_style(&mut style);
             let fonts =
                 rebook_app_core::fonts::store::load(&self.root.join("fonts"), Default::default());
             rebook_app_core::fonts::install(Arc::new(fonts.clone()));
@@ -353,7 +375,8 @@ impl MobileCore {
                 .translation
                 .set_enabled(options.translated)
                 .map_err(error)?;
-            let media=Arc::new(rebook_app_core::media::MediaReferenceSource::new(pipeline.structure.clone(),original));
+            let media=Arc::new(rebook_app_core::media::MediaReferenceSource::new(pipeline.structure.clone(),original,
+            ));
             let source: Arc<dyn BookSource> = media.clone();
             let mut session = ReaderSession::open_with_fonts(
                 source.clone(),
@@ -373,12 +396,16 @@ impl MobileCore {
                 session.restore_locator(&progress.locator).map_err(error)?;
                 progress.locator.source
             } else { None };
+            store.wake().protect_progress(&id);
+            store.wake().active(Some(id.clone()));
             store
                 .record_reading_activity(&id, &session.current_locator())
                 .map_err(error)?;
             rebook_app_core::statistics::register_book(book);
-            let chat_path = self.root.join("chat").join(format!("{id}.json"));
-            let messages = chat::load_messages(&chat_path);
+            // Conversation belongs to this reader instance; only transient book
+            // image pixels use a session-scoped cache, never a transcript file.
+            let chat_path = self.root.join("cache/chat").join(uuid::Uuid::new_v4().to_string());
+            let messages = Vec::new();
             let session_typesetting = session.style().typesetting;
             Ok(Arc::new(MobileReader {
                 scheduler: Default::default(),
@@ -395,7 +422,7 @@ impl MobileCore {
                     media,
                     document: None,
                     selected: None,
-                    selection_mode: SelectionGranularity::Word,
+                    selection_mode: SelectionGranularity::Free,
                     tracker: rebook_app_core::statistics::Tracker::new(&book.id),
                     format: publication.format(),
                     chat_path,
@@ -421,6 +448,7 @@ impl MobileCore {
                     focus: false,
                     focus_units: vec![],
                     focus_anchor: restored_anchor,
+                    focus_history: Default::default(),
                     history: vec![],
                 })),
             }))
@@ -463,6 +491,7 @@ struct ReaderState {
     classic_typesetting: rebook_layout::ReaderTypesetting,
     focus_units: Vec<interactions::FocusUnit>,
     focus_anchor: Option<SourceRange>,
+    focus_history: rebook_app_core::focus_navigation::UnitHistory<reflow::Anchor>,
     history: Vec<rebook_publication::LocatorV1>,
 }
 #[derive(uniffi::Object)]
@@ -482,13 +511,15 @@ pub struct ReaderTurn {
 }
 
 fn turn_result(s: &mut ReaderState, forward: bool, whole_unit: bool) -> Result<ReaderTurn> {
+    s.store.wake().allow_progress(&s.book_id);
     if whole_unit {
         return scroll::turn_unit_result(s,forward).map(|(page,reached_end)|ReaderTurn {page,reached_end});
     }
     clear_selection_state(s);
     if s.focus {
         // Vertical focus stops are not synthetic book-completion pages.
-        return scroll::turn(s,forward).map(|page|ReaderTurn {page,reached_end:false});
+        return scroll::turn(s,forward).map(|page|ReaderTurn {page,reached_end:false,
+        });
     }
     let result=s.session.turn_page(if forward {PageDirection::Next}else{PageDirection::Previous}).map_err(error)?;
     let reached_end=forward&&result.outcome==rebook_reader::NavigationOutcome::Boundary;
@@ -506,6 +537,8 @@ impl MobileReader {
         self.stop_ai();
         work(move || {
             let state = self.state.lock().map_err(error)?.take();
+            if let Some(s)=&state {let _=std::fs::remove_dir_all(s.chat_path.with_extension("images"));}
+            if let Some(s)=&state {let wake=s.store.wake();if wake.snapshot().active.as_deref()==Some(&s.book_id){wake.active(None);wake.changed(rebook_app_core::sync::SyncChange::Flush);}}
             drop(state);
             Ok(())
         })
@@ -514,13 +547,17 @@ impl MobileReader {
     pub async fn toc(self: Arc<Self>) -> Result<Vec<TocItem>> {
         work(move || self.with(|s| Ok(services::toc_items(s)))).await
     }
+    pub async fn book_languages(self: Arc<Self>) -> Result<Vec<String>> {
+        work(move || self.with(|s| Ok(s.source.book().metadata.languages.clone()))).await
+    }
     pub async fn page(self: Arc<Self>) -> Result<Arc<MobilePage>> {
         work(move || self.with(render)).await
     }
     /// Render one neighbour without publishing progress, selection or navigation.
     /// Hosts retain at most the preceding and following viewport bitmaps.
     pub async fn preview_turn(self: Arc<Self>, forward: bool) -> Result<Option<Arc<MobilePage>>> {
-        work(move || self.with(|s| {
+        work(move || {
+            self.with(|s| {
             if s.focus { return scroll::preview_unit(s,forward); }
             let locator = s.session.current_locator();
             let position = scroll::position(s);
@@ -532,17 +569,19 @@ impl MobileReader {
             // Restoration also runs when parsing/rendering the neighbouring chapter fails.
             scroll::restore_position(s, &locator, position)?;
             result
-        })).await
+        })
+        }).await
     }
     pub async fn turn(self: Arc<Self>, forward: bool) -> Result<Arc<MobilePage>> {
         work(move ||self.with(|s|turn_result(s,forward,false).map(|result|result.page))).await
     }
     /// Distinguish an actual forward book boundary from an unavailable preview.
-    pub async fn turn_with_result(self: Arc<Self>, forward: bool, whole_unit: bool) -> Result<ReaderTurn> {
+    pub async fn turn_with_result(self: Arc<Self>, forward: bool, whole_unit: bool,
+    ) -> Result<ReaderTurn> {
         work(move ||self.with(|s|turn_result(s,forward,whole_unit))).await
     }
     pub async fn turn_reading_unit(self: Arc<Self>, forward: bool) -> Result<Arc<MobilePage>> {
-        work(move ||self.with(|s|scroll::turn_unit(s,forward))).await
+        work(move ||self.with(|s|{s.store.wake().allow_progress(&s.book_id);scroll::turn_unit(s,forward)})).await
     }
     pub async fn resize(self: Arc<Self>, viewport: Viewport) -> Result<Arc<MobilePage>> {
         work(move || {
@@ -603,13 +642,14 @@ impl MobileReader {
     }
     pub async fn navigate(self: Arc<Self>, href: String) -> Result<Arc<MobilePage>> {
         work(move || {
-            self.with(|s| interactions::follow(s, &PublicationUrl::parse(&href).map_err(error)?))
+            self.with(|s| {s.store.wake().allow_progress(&s.book_id);interactions::follow(s, &PublicationUrl::parse(&href).map_err(error)?)})
         })
         .await
     }
     pub async fn navigate_toc(self: Arc<Self>, id: String) -> Result<Arc<MobilePage>> {
         work(move || {
             self.with(|s| {
+                s.store.wake().allow_progress(&s.book_id);
                 let locator = s.session.current_locator();
                 s.session.go_to_toc(&id).map_err(error)?;
                 s.history.push(locator);
@@ -651,6 +691,7 @@ impl MobileReader {
     pub async fn go_to_source(self: Arc<Self>, source: String) -> Result<Arc<MobilePage>> {
         work(move || {
             self.with(|s| {
+                s.store.wake().allow_progress(&s.book_id);
                 let range: SourceRange = serde_json::from_str(&source).map_err(error)?;
                 s.scroll_center = true;
                 scroll::invalidate(s);
@@ -709,7 +750,7 @@ impl MobileReader {
                 let Some(a) = scroll::hit(s, x, y, false)? else {
                     return Ok(None);
                 };
-                let Some(b) = scroll::hit(s, end_x, end_y, true)? else {
+                let Some(b) = scroll::hit(s, end_x, end_y, false)? else {
                     return Ok(None);
                 };
                 if a.ordering_key() <= b.ordering_key() {
@@ -724,7 +765,7 @@ impl MobileReader {
                     .selection_between_with_granularity(&a, &b, s.selection_mode)
                     .map_err(error)?;
                 s.selected = selected.clone();
-                Ok(scroll::selected(s))
+                scroll::selected(s)
             })
         })
         .await
@@ -738,16 +779,23 @@ fn clear_selection_state(s: &mut ReaderState) {
 }
 fn apply_presentation_mode(s: &mut ReaderState, style: &mut ReaderStyle) -> Result<()> {
     style.typesetting = rebook_app_core::reading::effective_typesetting(s.focus, &s.classic_typesetting);
-    apply_mobile_page_margins(style);
+    apply_mobile_page_style(style);
     let settings = rebook_app_core::plugins::PluginSettings::load_default().map_err(error)?;
     s.pipeline.semantic.configure_presentation(
-        &rebook_app_core::plugins::pdf_native::cache_identity(&s.book_id, s.pipeline.rewrite.as_ref()),
+        &rebook_app_core::plugins::pdf_native::cache_identity(&s.book_id, s.pipeline.rewrite.as_ref(),
+        ),
         &settings,
         style.typesetting.mode == TypesettingMode::Unified,
     );
     Ok(())
 }
-fn apply_mobile_page_margins(style: &mut ReaderStyle) {
+// Body reflows and reference previews share the same mobile presentation.
+fn apply_mobile_typesetting(typesetting: &mut rebook_layout::ReaderTypesetting) {
+    typesetting.quote_style = rebook_layout::QuoteStyle::Filled;
+    typesetting.fit_block_images = true;
+}
+fn apply_mobile_page_style(style: &mut ReaderStyle) {
+    apply_mobile_typesetting(&mut style.typesetting);
     // All mobile reading modes share the same app frame; authored block spacing
     // remains part of the book's own layout.
     style.horizontal_margin = 20.0;
@@ -816,19 +864,7 @@ fn page_info(s: &mut ReaderState, persist: bool) -> Result<PageInfo> {
         .and_then(|u| u.ranges.first().cloned());
     finish_page_info(s, regions, marks, index, false, persist)
 }
-fn finish_page_info(
-    s: &mut ReaderState,
-    regions: Vec<TextRegion>,
-    marks: Vec<Rect>,
-    index: usize,
-    is_scroll: bool,
-    persist: bool,
-) -> Result<PageInfo> {
-    let focus_bounds = s
-        .focus_units
-        .get(index)
-        .map_or_else(Vec::new, |u| u.paint_bounds());
-    let state = s.session.snapshot();
+fn sync_locator(s:&ReaderState,index:usize,is_scroll:bool)->rebook_publication::LocatorV1 {
     let mut locator = s.session.current_locator();
     if is_scroll && let Some(unit) = s.focus_units.get(index) {
         let continuation = locator.source.as_ref().is_some_and(|leading| {
@@ -849,6 +885,22 @@ fn finish_page_info(
             }
         }
     }
+    locator
+}
+fn finish_page_info(
+    s: &mut ReaderState,
+    regions: Vec<TextRegion>,
+    marks: Vec<Rect>,
+    index: usize,
+    is_scroll: bool,
+    persist: bool,
+) -> Result<PageInfo> {
+    let focus_bounds = s
+        .focus_units
+        .get(index)
+        .map_or_else(Vec::new, |u| u.paint_bounds());
+    let state = s.session.snapshot();
+    let locator=sync_locator(s,index,is_scroll);
     if persist {
         s.store.save_progress(&s.book_id, &locator).map_err(error)?;
     }
@@ -903,8 +955,7 @@ fn render_page_with_progress(s: &mut ReaderState, persist: bool) -> Result<Arc<M
             display.paint_footnote_icons_scaled(
                 scene,
                 reference_ink(s),
-                viewport.raster_scale,
-            );
+                viewport.raster_scale);
         },
         &mut pixels,
     );

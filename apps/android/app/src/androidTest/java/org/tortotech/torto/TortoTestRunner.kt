@@ -9,6 +9,7 @@ import org.tortotech.torto.core.ReadingFontDownload
 class TortoTestRunner:AndroidJUnitRunner() {
     override fun onCreate(arguments:Bundle?) {
         ReadingFonts.loader={ReadingFontDownload(0u,false,null)}
+        UpdateChecks.load={_,_,_,_->null}
         super.onCreate(arguments)
     }
 }

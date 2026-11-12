@@ -44,6 +44,51 @@ fn paragraph(source: &Source) -> &TextBlock {
     };
     text
 }
+
+#[test]
+fn translated_image_marker_lists_follow_the_target_paragraph_indent_in_both_modes() {
+    use rebook_layout::{LayoutEngine, LayoutViewport, PageItem, ReaderFontBlob, ReaderStyle, ReaderTypesetting, SpreadMode};
+    let mut base = source();
+    let source = Arc::get_mut(&mut base).unwrap();
+    let mut block = paragraph(source).clone();
+    let image = block.content.iter().find(|inline| matches!(inline, Inline::Image(_))).unwrap().clone();
+    block.kind = TextBlockKind::ListItem { ordered: false, ordinal: 1, depth: 0, marker_visible: false };
+    block.style.authored_list_marker = Some(1);
+    block.content = vec![image, Inline::Text(TextRun { text: "\u{00a0}more intensive.".into(),
+        style: Default::default(), link: None })];
+    source.1.blocks = vec![Block::Text(block)];
+    let translated = format!("<t-img-0/>{}", "更具针对性与强化性。".repeat(20));
+    for mode in [TranslationMode::Replace, TranslationMode::Bilingual] {
+        let overlay = TranslationBookSource::new(base.clone(), mode);
+        overlay.set_target_language("简体中文").unwrap();
+        overlay.set_enabled(true).unwrap();
+        overlay.store_batch(0, &[BlockTranslation { block_index: 0, segment_index: None, text: translated.clone() }]).unwrap();
+        let section = overlay.parse_section(0).unwrap();
+        let translated_block = section.blocks.last().unwrap();
+        let Block::Text(text) = translated_block else { panic!("list text") };
+        assert!(text.content.iter().flat_map(Inline::text_runs).any(|run|run.text.contains("更具针对性")),
+            "missing image placeholders must not silently turn this into an original-text test");
+        assert!(matches!(text.kind, TextBlockKind::ListItem { ordered: false, .. }));
+        let mut engine = LayoutEngine::with_fonts([
+            ReaderFontBlob::new(Arc::new(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/Literata-opsz-wght.ttf")).as_slice())),
+            ReaderFontBlob::new(Arc::new(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/LXGWWenKaiGBScreen.ttf")).as_slice())),
+        ]);
+        let style = ReaderStyle { typesetting: ReaderTypesetting::unified(),
+            writing_system: rebook_publication::WritingSystem::Latin, spread: SpreadMode::Single,
+            horizontal_margin: 20.0, ..Default::default() };
+        let layout = engine.layout_section(&overlay, &section, LayoutViewport::new(390, 1200).unwrap(), &style).unwrap();
+        let placed = layout.pages.iter().flat_map(|p|&p.items).find_map(|item| match item {
+            PageItem::Text(text) if text.text.contains("更具针对性") => Some(text), _ => None,
+        }).unwrap();
+        let left = rebook_layout::reading_content_left(390.0, &style);
+        let body = placed.origin_x - left + placed.layout.get(1).unwrap().metrics().offset;
+        assert!((body - style.typography.font_size * 2.0).abs() < 0.01);
+        let first = rebook_layout::text_layout::Cursor::from_byte_index(&placed.layout, placed.source_text_start,
+            rebook_layout::text_layout::Affinity::Downstream).geometry(&placed.layout,0.0).x0 as f32 + placed.origin_x - left;
+        assert!((first-body).abs()<0.05,"first and continuation text must share one column");
+        assert!(placed.origin_x >= left);
+    }
+}
 fn flatten(content: &[Inline]) -> String {
     content
         .iter()

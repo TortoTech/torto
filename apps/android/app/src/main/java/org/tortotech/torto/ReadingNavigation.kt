@@ -54,7 +54,6 @@ internal fun visibleContents(items:List<TocItem>,collapsed:Set<String>)=items.fi
     var submitted by rememberSaveable(book){mutableStateOf(false)}
     var collapsed by rememberSaveable(book,stateSaver=androidx.compose.runtime.saveable.listSaver<Set<String>,String>(save={it.toList()},restore={it.toSet()})){mutableStateOf<Set<String>>(emptySet())}
     var initialized by rememberSaveable(book){mutableStateOf(false)}
-    var locatedCurrent by rememberSaveable(book){mutableStateOf<String?>(null)}
     val contentsScroll=rememberLazyListState()
     val searchScroll=rememberLazyListState()
     val current=state.frame?.info?.activeTocId
@@ -62,20 +61,19 @@ internal fun visibleContents(items:List<TocItem>,collapsed:Set<String>)=items.fi
     val visible=remember(state.toc,collapsed){visibleContents(state.toc,collapsed)}
     val keyboard=LocalSoftwareKeyboardController.current
     val focusManager=LocalFocusManager.current
-    val focus=remember {FocusRequester()}
+    val focus=rememberInputFocus(open&&search)
     val pillHeight=with(LocalDensity.current){maxOf(40.dp,24.sp.toDp()+8.dp)}
-    LaunchedEffect(open,book,state.toc.isNotEmpty(),current){
-        if(open&&(!initialized||current!=locatedCurrent)){
+    LaunchedEffect(open,book,search,state.toc,current){
+        if(open&&!search&&current!=null&&state.toc.isNotEmpty()){
             collapsed=(if(initialized)collapsed else state.toc.filter {it.hasChildren}.map {it.id}.toSet())-ancestors.toSet()
-            initialized=true;locatedCurrent=current
+            initialized=true
             val at=visibleContents(state.toc,collapsed).indexOfFirst {it.id==current}
-            if(!search&&at>=0){withFrameNanos {};contentsScroll.scrollToItem(at)}
+            if(at>=0){withFrameNanos {};contentsScroll.requestScrollToItem(at)}
         }
     }
     DisposableEffect(Unit){onDispose {focusManager.clearFocus();keyboard?.hide()}}
     LaunchedEffect(open,search){
-        if(open&&search){withFrameNanos {};focus.requestFocus()}
-        else {focusManager.clearFocus();keyboard?.hide()}
+        if(!open||!search){focusManager.clearFocus();keyboard?.hide()}
     }
     Column(Modifier.fillMaxSize()) {
         fun submit(){if(query.isNotBlank()&&!state.busy){submitted=true;focusManager.clearFocus();keyboard?.hide();model.search(query.trim())}}
@@ -88,7 +86,7 @@ internal fun visibleContents(items:List<TocItem>,collapsed:Set<String>)=items.fi
                     listOf(tr("搜本书","Search book"),tr("目录","Contents")).forEachIndexed {index,label->
                         val selected=index==1
                         Row(Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(20.dp)).background(if(selected)MaterialTheme.colorScheme.surface else Color.Transparent,RoundedCornerShape(20.dp)).semantics {this.selected=selected}.clickable(role=Role.Tab){search=index==0},horizontalArrangement=Arrangement.Center,verticalAlignment=Alignment.CenterVertically){
-                            if(index==0){AppIcon("search",size=19.dp,tint=MaterialTheme.colorScheme.onSurfaceVariant);Spacer(Modifier.width(6.dp))}
+                            if(index==0){AppIcon("search",size=IconSizes.Compact,tint=defaultIconColor());Spacer(Modifier.width(6.dp))}
                             Text(label,style=MaterialTheme.typography.labelLarge,color=if(selected)MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
@@ -119,12 +117,8 @@ internal fun visibleContents(items:List<TocItem>,collapsed:Set<String>)=items.fi
                     Row(Modifier.fillMaxWidth().heightIn(min=52.dp).padding(start=indent.dp,end=24.dp),verticalAlignment=Alignment.CenterVertically){
                         if(entry.hasChildren)ActionIcon(if(entry.id in collapsed)"next"else"expand",if(entry.id in collapsed)tr("展开章节","Expand chapter")else tr("收起章节","Collapse chapter")){collapsed=if(entry.id in collapsed)collapsed-entry.id else collapsed+entry.id}
                         else Spacer(Modifier.width(48.dp))
-                        Text(entry.title,Modifier.weight(1f).clickable(enabled=entry.href.isNotBlank()){keyboard?.hide();model.navigateToc(entry.id);onClose()}.padding(vertical=14.dp),
-                        style=MaterialTheme.typography.bodyLarge.copy(fontSize=17.sp),fontWeight=if(active)FontWeight.SemiBold else FontWeight.Normal,color=MaterialTheme.colorScheme.onSurface,maxLines=2,overflow=TextOverflow.Ellipsis)
-                    }
-                    if(active)Row(Modifier.fillMaxWidth().padding(start=(indent+64).dp,end=24.dp,top=8.dp,bottom=20.dp),verticalAlignment=Alignment.CenterVertically){
-                        AppIcon("book",size=16.dp,tint=MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(8.dp));Text(tr("当前读到","Reading here"),style=MaterialTheme.typography.labelLarge,color=MaterialTheme.colorScheme.primary)
+                        Text(entry.title,Modifier.weight(1f).semantics {selected=active}.clickable(enabled=entry.href.isNotBlank()){keyboard?.hide();model.navigateToc(entry.id);onClose()}.padding(vertical=14.dp),
+                        style=MaterialTheme.typography.bodyLarge.copy(fontSize=16.sp),fontWeight=if(active)FontWeight.SemiBold else FontWeight.Normal,color=if(active)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,maxLines=2,overflow=TextOverflow.Ellipsis)
                     }
                     HorizontalDivider(Modifier.padding(horizontal=20.dp),color=MaterialTheme.colorScheme.outlineVariant.copy(alpha=.35f),thickness=.5.dp)
                 }

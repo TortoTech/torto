@@ -166,6 +166,40 @@ fn issue75_previous_chapter_keeps_its_last_focus_unit_visible_after_entry() {
 }
 
 #[test]
+fn focus_section_round_trip_restores_each_units_paragraph_and_screen_position() {
+    let (mut reader, section) = chapter_book(ReadingMode::Focus);
+    let ctx = egui::Context::default();
+    for _ in 0..4 { issue75_frame(&ctx, &mut reader); }
+    click_highlight(&mut reader, range_at(&section, "p107"));
+    for _ in 0..4 { issue75_frame(&ctx, &mut reader); }
+    assert_eq!(shown_node(&reader).as_deref(), Some("p107"));
+    let original = reader.scroll_viewport.unwrap().offset_y;
+    let turn = |reader: &mut DesktopReader, direction| {
+        reader.go_to_adjacent_section(direction);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while reader.pending_reading_unit_turn.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            reader.retry_pending_reading_unit_turn();
+            std::thread::yield_now();
+        }
+        for _ in 0..4 { issue75_frame(&ctx, reader); }
+    };
+    turn(&mut reader, PageDirection::Next);
+    reader.highlights.clear();
+    click_highlight(&mut reader, range_at(&section, "p132"));
+    for _ in 0..4 { issue75_frame(&ctx, &mut reader); }
+    let next = reader.scroll_viewport.unwrap().offset_y;
+    turn(&mut reader, PageDirection::Previous);
+    assert_eq!(shown_node(&reader).as_deref(), Some("p107"));
+    assert!((reader.scroll_viewport.unwrap().offset_y - original).abs() < 0.1);
+    assert_focus_visible(&reader);
+    turn(&mut reader, PageDirection::Next);
+    assert_eq!(shown_node(&reader).as_deref(), Some("p132"));
+    assert!((reader.scroll_viewport.unwrap().offset_y - next).abs() < 0.1);
+    assert_focus_visible(&reader);
+}
+
+#[test]
 #[ignore = "requires TORTO_ISSUE75_BOOK; local book only, no AI or personal settings"]
 fn issue75_local_algorithm_previous_chapter_and_shelf_resume_keep_focus_visible() {
     let opened = rebook_formats::open_file(std::path::PathBuf::from(

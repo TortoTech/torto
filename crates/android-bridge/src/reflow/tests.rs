@@ -1,6 +1,31 @@
 use super::*;
 use rebook_app_core::plugins::{self, TranslationMode};
 
+pub(crate) async fn stable_mobile_image_presentation(reader: &Arc<MobileReader>) {
+    reader.clone().configure(20.0,false,false).await.unwrap();
+    for focus in [true,false] {
+        reader.clone().focus_mode(focus).await.unwrap();
+        let before=reader.with(|s|Ok(s.session.current_page().image_bounds().expect("fixture image is visible"))).unwrap();
+        assert!((before.width()-320.0).abs()<0.1,"The first frame fills the content width");
+        // Reproduce the real background catalog delivery immediately after open.
+        reader.clone().prepare_media_references().await.unwrap();
+        reader.clone().refresh_media_references().await.unwrap();
+        for dirty in [false,true] {
+            reader.with(|s| {
+                if dirty {s.enhancements.dirty=true;render(s)?;}
+                let after=s.session.current_page().image_bounds().expect("image survives refresh");
+                assert!((after.width()-before.width()).abs()<0.1,
+                    "focus={focus}, dirty={dirty}: refresh must not shrink the image: {before:?} -> {after:?}");
+                assert!((after.height()-before.height()).abs()<0.1);
+                assert_eq!(s.session.style().typesetting.quote_style,rebook_layout::QuoteStyle::Filled,
+                    "Refresh must retain mobile quotation presentation too");
+                Ok(())
+            }).unwrap();
+        }
+    }
+    reader.clone().focus_mode(false).await.unwrap();
+}
+
 fn screen_y(s: &ReaderState, anchor: &Anchor) -> f32 {
     s.scroll_slices
         .iter()

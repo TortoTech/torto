@@ -1343,7 +1343,6 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
             &RecognitionRoles {
                 quotes: true,
                 captions: false,
-                headings: false,
             },
             0..1,
             0..1,
@@ -1354,7 +1353,6 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
     let figure = completion_options(&RecognitionRoles {
         quotes: false,
         captions: true,
-        headings: false,
     });
     assert_eq!(
         figure
@@ -1745,7 +1743,7 @@ fn layout_reasoning_defaults_roundtrips_and_changes_cache_identity() {
 fn window_schema_only_allows_roles_with_eligible_blocks() {
     let s = section(vec![image("img")]);
     let roles = window_roles(&s, &RecognitionRoles::default(), 0..1, 0..1);
-    assert!(!roles.headings && !roles.quotes && roles.captions);
+    assert!(!roles.quotes && roles.captions);
     let schema = completion_options(&roles)["output_schema"].clone();
     assert_eq!(
         schema["properties"]["groups"]["items"]["properties"]["kind"]["enum"],
@@ -1758,7 +1756,6 @@ fn window_schema_only_allows_roles_with_eligible_blocks() {
     let roles = window_roles(
         &s,
         &RecognitionRoles {
-            headings: true,
             quotes: true,
             captions: false,
         },

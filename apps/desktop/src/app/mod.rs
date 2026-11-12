@@ -28,6 +28,9 @@ pub(crate) struct DesktopApp {
     applied_settings_revision: u64,
     pending_reader_notice: Option<String>,
     pending_reader_error: Option<String>,
+    cloud_resume:Option<(rebook_app_core::sync::ResumeOffer,std::time::Instant)>,
+    cloud_resume_check:bool,
+    cloud_resume_accept:Option<rebook_app_core::sync::ResumeOffer>,
     fullscreen_toggle_requested: bool,
     memory_sample: Option<(std::time::Instant, bool)>,
     memory_peak: usize,
@@ -50,6 +53,20 @@ impl DesktopApp {
     pub(crate) fn complete_feedback_preview(&mut self, message: crate::feedback::screenshots::PreviewMessage) {
         self.feedback.complete_preview(message);
     }
+    pub(crate) fn sync_lifecycle(&mut self,foreground:bool) { self.shelf.sync_lifecycle(foreground); }
+    pub(crate) fn begin_exit(&mut self)->(Box<dyn FnOnce()->Result<(),String>+Send>,Option<crate::shelf::SyncTask>) {
+        (self.update_save_job(),self.shelf.shutdown_sync())
+    }
+    pub(crate) fn complete_cloud_resume(&mut self,account:String,offer:Option<rebook_app_core::sync::ResumeOffer>) {
+        if !self.settings.applied().sync_settings.enabled||account!=crate::sync::account_key(&self.settings.applied().sync_settings){return;}
+        if let Some(offer)=offer&&self.reader.as_ref().is_some_and(|reader|reader.cloud_resume_matches(&offer)) {
+            self.cloud_resume=Some((offer,std::time::Instant::now()+std::time::Duration::from_secs(5)));
+        }
+    }
+    pub(crate) fn accept_cloud_resume(&mut self,account:String,offer:Option<rebook_app_core::sync::ResumeOffer>) {
+        if !self.settings.applied().sync_settings.enabled||account!=crate::sync::account_key(&self.settings.applied().sync_settings){return;}
+        if let Some(offer)=offer&&let Some(reader)=&mut self.reader {reader.resume_cloud_progress(&offer);}
+    }
     pub(crate) fn startup_error(&self) -> Option<&str> {
         self.pending_reader_error
             .as_deref()
@@ -70,6 +87,7 @@ impl DesktopApp {
             applied_settings_revision: 0,
             pending_reader_notice: None,
             pending_reader_error: None,
+            cloud_resume:None,cloud_resume_check:false,cloud_resume_accept:None,
             fullscreen_toggle_requested: false,
             memory_sample: None,
             memory_peak: 0,
@@ -228,7 +246,22 @@ impl DesktopApp {
         }
         self.feedback
             .overlay(ui.ctx(), self.settings.applied().language);
-        self.font_notice(ui.ctx());
+        if let Some((offer,until))=&self.cloud_resume {
+            if *until<=std::time::Instant::now()||!self.reader.as_ref().is_some_and(|r|r.cloud_resume_matches(offer)) {
+                self.cloud_resume=None;
+            }
+        }
+        if let Some((offer,until))=self.cloud_resume.clone() {
+            ui.ctx().request_repaint_after(until.saturating_duration_since(std::time::Instant::now()));
+            if !self.settings.is_open()&&!self.feedback.is_open() {
+                let l=self.settings.applied().language;let mut resume=false;
+                let dismissed=crate::ui::show_toast_with_actions(ui.ctx(),"cloud-resume",
+                    l.text("发现其他设备进度","Reading progress found on another device"),crate::ui::ToastKind::Success,
+                    egui::vec2(-18.0,62.0),|ui| {resume=crate::ui::dialog_action_button(ui,l.text("跳转","Go to"),true).clicked();});
+                if resume {self.cloud_resume_accept=Some(offer);}
+                if resume||dismissed {self.cloud_resume=None;}
+            }
+        }else{self.font_notice(ui.ctx());}
         if ui.ctx().input_mut(|input| {
             input.consume_shortcut(&self.settings.applied().shortcuts.fullscreen)
         }) {
@@ -374,6 +407,20 @@ impl DesktopApp {
     ) {
         let started = std::time::Instant::now();
         self.fonts.spawn(runtime, proxy);
+        if let Some(offer)=self.cloud_resume_accept.take()
+            && let Some((store,_,baseline))=self.reader.as_ref().and_then(DesktopReader::cloud_resume_check) {
+            let account=crate::sync::account_key(&self.settings.applied().sync_settings);let wake=proxy.clone();
+            runtime.spawn_blocking(move||{
+                let offer=store.resume_offer_current(&offer,&baseline).ok().filter(|ok|*ok).map(|_|offer);
+                let _=wake.send_event(UserEvent::CloudResumeAccepted {account,offer});
+            });
+        }
+        if std::mem::take(&mut self.cloud_resume_check) {
+            if let Some((store,book,baseline))=self.reader.as_ref().and_then(DesktopReader::cloud_resume_check) {
+                let account=crate::sync::account_key(&self.settings.applied().sync_settings);let wake=proxy.clone();
+                runtime.spawn_blocking(move||{let offer=store.resume_offer(&book,&baseline).ok().flatten();let _=wake.send_event(UserEvent::CloudResume {account,offer});});
+            }
+        }
         // A pending open waits only for local discovery, never for a download.
         // Cached fonts therefore apply on the first open after a restart.
         if self.fonts.initialized { self.shelf.spawn_pending_tasks(runtime, proxy); }
@@ -425,12 +472,14 @@ impl DesktopApp {
     pub(crate) fn complete_shelf_sync(&mut self, message: SyncTaskMessage) {
         let succeeded = message.result.is_ok();
         self.shelf.complete_sync(message);
+        self.cloud_resume_check=true;
         if succeeded && let Some(reader) = self.reader.as_mut() {
             reader.refresh_synced_pdf_ocr();
         }
     }
 
     pub(crate) fn update_shelf_sync_progress(&mut self, message: SyncProgressMessage) {
+        if matches!(&message.progress,crate::sync::SyncProgress::Stage {stage:crate::sync::SyncStage::ReadingApplied,..}) {self.cloud_resume_check=true;}
         self.shelf.update_sync_progress(message);
     }
 
@@ -477,7 +526,6 @@ impl DesktopApp {
         self.updater.report_install_error(request, message);
     }
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) fn update_save_job(&mut self) -> Box<dyn FnOnce() -> Result<(), String> + Send> {
         match self.reader.as_mut() {
             Some(reader) => reader.update_save_job(),
@@ -621,6 +669,7 @@ impl DesktopApp {
             if let Some(current) = &self.reader {
                 current.prepare_for_shutdown();
             }
+            next_reader.activate_sync_reader();
             let applied = self.settings.applied().clone();
             next_reader.apply_global_settings(&applied);
             if let Some(error) = self.pending_reader_error.take() {
@@ -630,6 +679,7 @@ impl DesktopApp {
                 next_reader.show_notice(notice);
             }
             self.reader = Some(next_reader);
+            self.cloud_resume_check=true;
         }
     }
 
@@ -648,6 +698,8 @@ impl DesktopApp {
         let revision_changed = revision != self.applied_settings_revision;
         let applied = self.settings.applied().clone();
         if revision_changed {
+            self.cloud_resume=None;
+            self.cloud_resume_accept=None;
             crate::ui::apply_interface_typography(
                 ctx,
                 &applied.interface_typography,

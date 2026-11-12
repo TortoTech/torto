@@ -33,11 +33,14 @@ impl Default for ReadingOptions {
     }
 }
 pub(crate) fn load_reading(root: &std::path::Path) -> ReadingOptions {
-    std::fs::read(root.join("android-reading.json"))
+    let mut options: ReadingOptions = std::fs::read(root.join("android-reading.json"))
         .ok()
         .filter(|v| v.len() < 16384)
         .and_then(|v| serde_json::from_slice(&v).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Translation belongs to the current reader session, as on desktop.
+    options.translated = false;
+    options
 }
 pub(crate) fn apply_typography(style: &mut ReaderStyle, options: &ReadingOptions) {
     use rebook_layout::{ReaderDefaultFont, ReaderFontChoice};
@@ -91,6 +94,8 @@ pub struct AiOptions {
     pub chat_provider: String,
     pub chat_model: String,
     pub chat_reasoning: String,
+    // Retained in the wire record for binding compatibility; fixed defaults,
+    // ignored on save. These are no longer user settings.
     pub chat_steps: u16,
     pub chat_history: u16,
 }
@@ -122,8 +127,8 @@ fn dto(s: &PluginSettings) -> AiOptions {
         chat_provider: s.chat_provider.clone(),
         chat_model: s.chat_model.clone(),
         chat_reasoning: wire(&s.chat_reasoning_effort),
-        chat_steps: s.chat_max_tool_steps,
-        chat_history: s.chat_history_turns,
+        chat_steps: plugins::DEFAULT_CHAT_MAX_TOOL_STEPS,
+        chat_history: plugins::DEFAULT_CHAT_HISTORY_TURNS,
     }
 }
 fn validate_url(url: &str) -> Result<()> {
@@ -362,8 +367,6 @@ impl MobileCore {
             s.chat_provider = options.chat_provider;
             s.chat_model = options.chat_model;
             s.chat_reasoning_effort = effort(&options.chat_reasoning)?;
-            s.chat_max_tool_steps = options.chat_steps.clamp(1, 64);
-            s.chat_history_turns = options.chat_history.clamp(1, 50);
             s.save_default().map_err(error)?;
             Ok(dto(&s))
         })
@@ -372,6 +375,25 @@ impl MobileCore {
 }
 #[uniffi::export]
 impl MobileReader {
+    /// Translation is a live reader choice, independent of saved typography.
+    pub async fn set_translation_enabled(self: Arc<Self>, enabled: bool) -> Result<()> {
+        work(move || {
+            let changed = self.with(|s| {
+                if s.options.translated == enabled {
+                    return Ok(false);
+                }
+                s.pipeline.translation.set_enabled(enabled).map_err(error)?;
+                s.options.translated = enabled;
+                s.enhancements.dirty = true;
+                Ok(true)
+            })?;
+            if changed {
+                self.ai.lock().map_err(error)?.mark_view_dirty();
+            }
+            Ok(())
+        })
+        .await
+    }
     pub async fn apply_reading_options(
         self: Arc<Self>,
         options: ReadingOptions,
@@ -383,7 +405,10 @@ impl MobileReader {
                 apply_typography(&mut style, &options);
                 s.pipeline
                     .structure
-                    .set_enabled(s.focus)
+                    .set_enabled(s.focus).map_err(error)?;
+                s.pipeline
+                    .translation
+                    .set_enabled(options.translated)
                     .map_err(error)?;
                 s.options = options;
                 style.spread = if s.focus {
@@ -471,5 +496,30 @@ impl MobileCore {
             )
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod reading_tests {
+    use super::*;
+    #[test]
+    fn legacy_translation_toggle_does_not_leak_into_new_readers() {
+        let root =
+            std::env::temp_dir().join(format!("torto-reading-options-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let options = ReadingOptions {
+            translated: true,
+            cjk_font: "Existing font".into(),
+            ..Default::default()
+        };
+        std::fs::write(
+            root.join("android-reading.json"),
+            serde_json::to_vec(&options).unwrap(),
+        )
+        .unwrap();
+        let loaded = load_reading(&root);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!loaded.translated);
+        assert_eq!(loaded.cjk_font, "Existing font");
     }
 }

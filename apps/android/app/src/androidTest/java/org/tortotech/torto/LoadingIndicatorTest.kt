@@ -75,6 +75,12 @@ class LoadingIndicatorTest {
             if(node.isVisibleToUser&&(node.className=="android.widget.ProgressBar"||node.rangeInfo!=null))return true
             return (0 until node.childCount).any {progress(node.getChild(it))}
         }
+        fun period(node:android.view.accessibility.AccessibilityNodeInfo?,label:String):android.view.accessibility.AccessibilityNodeInfo? {
+            if(node==null)return null
+            if(node.text?.toString()==label||node.contentDescription?.toString()==label)return node
+            for(i in 0 until node.childCount)period(node.getChild(i),label)?.let {return it}
+            return null
+        }
         try {
             android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand("am start -W -f 0x10008000 -n org.tortotech.torto.debug/org.tortotech.torto.MainActivity")).use {it.readBytes()}
             activity=monitor.waitForActivityWithTimeout(5000) as? MainActivity;assertNotNull(activity)
@@ -89,6 +95,12 @@ class LoadingIndicatorTest {
                 instrumentation.waitForIdleSync();android.os.SystemClock.sleep(250)
                 if(android.os.Build.VERSION.SDK_INT>=33)instrumentation.uiAutomation.clearCache()
                 assertFalse("Loading $period statistics cannot display a progress indicator",progress(instrumentation.uiAutomation.rootInActiveWindow))
+                for((label,localized) in listOf("Week" to "周","Month" to "月","Year" to "年","All" to "总")) {
+                    var control=period(instrumentation.uiAutomation.rootInActiveWindow,label)?:period(instrumentation.uiAutomation.rootInActiveWindow,localized)
+                    while(control!=null&&!control.isClickable&&!control.isCheckable)control=control.parent
+                    assertNotNull("Period switch remains present while loading: $label",control)
+                    assertTrue("Read-only refresh never disables or dims period switches: $label",control!!.isEnabled)
+                }
             }
             instrumentation.runOnMainSync {detail.value=true}
             instrumentation.waitForIdleSync();android.os.SystemClock.sleep(250)

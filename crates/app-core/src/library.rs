@@ -144,6 +144,40 @@ impl LocalLibrary {
             .and_then(|name| fs::read(root.join(COVERS_DIRECTORY).join(name)).ok()))
     }
 
+    /// Locate one source without loading the covers or TOCs of the whole library.
+    pub fn cover_source_from(root: &Path, id: &str) -> LibraryResult<Option<PathBuf>> {
+        Ok(read_manifest(root)?
+            .books
+            .into_iter()
+            .find(|book| book.id == id)
+            .map(|book| root.join(BOOKS_DIRECTORY).join(book.storage_name)))
+    }
+
+    /// Commit a worker's extracted cover against the latest manifest. The caller must
+    /// serialize this short commit with imports/removals, after parsing outside the lock.
+    pub fn store_missing_cover_from(
+        root: &Path,
+        id: &str,
+        bytes: &[u8],
+    ) -> LibraryResult<Option<Vec<u8>>> {
+        let mut stored = read_manifest(root)?;
+        let Some(book) = stored.books.iter_mut().find(|book| book.id == id) else {
+            return Ok(None);
+        };
+        if let Some(existing) = book
+            .cover_name
+            .as_ref()
+            .and_then(|name| fs::read(root.join(COVERS_DIRECTORY).join(name)).ok())
+        {
+            return Ok(Some(existing));
+        }
+        let name = format!("{id}.cover");
+        write_bytes_atomic(&root.join(COVERS_DIRECTORY).join(&name), bytes)?;
+        book.cover_name = Some(name);
+        write_json_atomic(&root.join(MANIFEST_FILE), &stored)?;
+        Ok(Some(bytes.to_vec()))
+    }
+
     /// In-memory adoption only; metadata I/O is performed by the opening worker.
     pub fn adopt_cached_toc(&mut self, id: &str, toc: Arc<[TocEntry]>) {
         if let Some(book) = self.books.iter_mut().find(|book| book.id == id) {
@@ -464,6 +498,41 @@ mod tests {
 
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
+
+    #[test]
+    fn visible_cover_backfill_rechecks_latest_metadata_and_removal() {
+        let root = test_directory("visible-cover-backfill");
+        let mut library = LocalLibrary::load_from(root.clone()).unwrap();
+        library.books.push(LibraryBook {
+            cached_toc: None,
+            id: "missing".into(),
+            title: "Original title".into(),
+            authors: Vec::new(),
+            file_name: "source.epub".into(),
+            path: root.join(BOOKS_DIRECTORY).join("missing.epub"),
+            cover_bytes: None,
+            added_at: 1,
+        });
+        library.persist().unwrap();
+        assert_eq!(LocalLibrary::cover_source_from(&root, "missing").unwrap(),
+            Some(root.join(BOOKS_DIRECTORY).join("missing.epub")));
+        // A sync/import can update the manifest while the worker extracts the image.
+        library.books[0].title = "Updated by sync".into();
+        library.persist().unwrap();
+        assert_eq!(LocalLibrary::store_missing_cover_from(&root, "missing", b"generated").unwrap(),
+            Some(b"generated".to_vec()));
+        assert_eq!(LocalLibrary::load_from(root.clone()).unwrap().books()[0].title, "Updated by sync");
+        assert_eq!(LocalLibrary::store_missing_cover_from(&root, "missing", b"stale").unwrap(),
+            Some(b"generated".to_vec()));
+        // Recover a manifest entry whose named image file went missing as well.
+        fs::remove_file(root.join(COVERS_DIRECTORY).join("missing.cover")).unwrap();
+        assert_eq!(LocalLibrary::store_missing_cover_from(&root, "missing", b"recovered").unwrap(),
+            Some(b"recovered".to_vec()));
+        LocalLibrary::load_from(root.clone()).unwrap().remove("missing").unwrap();
+        assert!(LocalLibrary::store_missing_cover_from(&root, "missing", b"orphan").unwrap().is_none());
+        assert!(!root.join(COVERS_DIRECTORY).join("missing.cover").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn missing_cover_backfill_persists_without_overwriting_existing_covers() {

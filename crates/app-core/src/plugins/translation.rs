@@ -1592,8 +1592,11 @@ fn push_translation_style_markup(output: &mut String, run: &TextRun) {
         }
     }
     if run.style.bold {
-        output.push_str("<strong>");
-        closing.push("</strong>");
+        if run.style.body_bold && !run.style.bold_emphasis {
+            output.push_str("<b>"); closing.push("</b>");
+        } else {
+            output.push_str("<strong>"); closing.push("</strong>");
+        }
     }
     if run.style.emphasis {
         output.push_str("<em>");
@@ -1645,7 +1648,9 @@ fn translation_size_scale(style: TextStyle) -> Option<f32> {
 /// A translated RTL paragraph uses LTR left alignment; other source styles stay intact.
 fn normalize_rtl_translation(block: &mut TextBlock) {
     use rebook_publication::{TextAlignment, TextDirection};
-    if block.style.authored_list_marker.is_some() {
+    if block.style.authored_list_marker.is_some()
+        || matches!(block.kind, TextBlockKind::ListItem { marker_visible: true, .. })
+    {
         let text: String = block
             .content
             .iter()
@@ -1684,7 +1689,21 @@ fn normalize_rtl_translation(block: &mut TextBlock) {
                             .contains(&label.to_ascii_lowercase().as_str())
                         || ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
                             .contains(&label);
-                    valid.then_some(value[..end].chars().count() + 1)
+                    // Native list numbering belongs to the source, not the
+                    // model. A body abbreviation such as "i.e." is not a
+                    // replacement for the generated item number.
+                    let native_number = matches!(block.kind,
+                        TextBlockKind::ListItem { ordinal, .. }
+                            if label.parse::<u32>().ok() == Some(ordinal));
+                    let native_alpha = block.style.list_marker_format.is_some()
+                        && !label.is_empty() && label.len() <= 7
+                        && label.bytes().all(|byte| byte.is_ascii_alphabetic())
+                        && matches!(block.kind, TextBlockKind::ListItem { ordinal, .. }
+                            if label.bytes().try_fold(0_u32, |number, byte| {
+                                number.checked_mul(26)?.checked_add(u32::from(byte.to_ascii_lowercase() - b'a' + 1))
+                            }) == Some(ordinal));
+                    ((valid && block.style.authored_list_marker.is_some()) || native_number || native_alpha)
+                        .then_some(value[..end].chars().count() + 1)
                 })
         } else {
             None
@@ -1863,6 +1882,11 @@ fn replacement_content_with_whitespace(
     let mut styled = parse_inline_style_markup(&text, style)
         .unwrap_or_else(|| restore_original_baselines(&text, style, original));
     restore_source_sizes(&mut styled, original);
+    if style.body_bold && !original.iter().flat_map(Inline::text_runs).any(|r| r.style.bold_emphasis) {
+        // A model may alias <b> to <strong>; it cannot invent emphasis absent
+        // from a uniformly styled source paragraph.
+        for (_, run) in &mut styled { run.body_bold = true; run.bold_emphasis = false; }
+    }
     let mut content = Vec::new();
     for (text, style) in styled {
         append_translated_span(&mut content, &text, style, original, &math, &images);
@@ -2083,7 +2107,10 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
     // authored ratios. Do not silently put an omitted inline variation back.
     style.inline_size_scale = None;
     style.size_scale = style.keyword_size_scale.unwrap_or(1.0);
-    style.bold = false;
+    let body_bold = original.iter().flat_map(Inline::text_runs).any(|r| r.style.body_bold);
+    style.bold = body_bold;
+    style.bold_emphasis = false;
+    style.body_bold = body_bold;
     style.italic = false;
     style.emphasis = false;
     style.alternate_voice = false;
@@ -2192,6 +2219,7 @@ fn is_cjk(character: char) -> bool {
 enum TranslationStyleTag {
     KeywordSize,
     Bold,
+    BodyBold,
     Emphasis,
     AlternateVoice,
     Citation,
@@ -2266,8 +2294,8 @@ fn next_translation_style_tag(text: &str) -> Option<(usize, TranslationStyleTag,
         ("</t-size>", TranslationStyleTag::KeywordSize, false),
         ("<strong>", TranslationStyleTag::Bold, true),
         ("</strong>", TranslationStyleTag::Bold, false),
-        ("<b>", TranslationStyleTag::Bold, true),
-        ("</b>", TranslationStyleTag::Bold, false),
+        ("<b>", TranslationStyleTag::BodyBold, true),
+        ("</b>", TranslationStyleTag::BodyBold, false),
         ("<em>", TranslationStyleTag::Emphasis, true),
         ("</em>", TranslationStyleTag::Emphasis, false),
         ("<i>", TranslationStyleTag::AlternateVoice, true),
@@ -2342,7 +2370,8 @@ fn next_translation_style_tag(text: &str) -> Option<(usize, TranslationStyleTag,
 fn apply_translation_style_tag(mut style: TextStyle, tag: TranslationStyleTag) -> TextStyle {
     match tag {
         TranslationStyleTag::KeywordSize | TranslationStyleTag::InlineCitation => {}
-        TranslationStyleTag::Bold => style.bold = true,
+        TranslationStyleTag::Bold => { style.bold = true; style.bold_emphasis = true; }
+        TranslationStyleTag::BodyBold => style.bold = true,
         TranslationStyleTag::Emphasis => {
             style.italic = true;
             style.emphasis = true;
@@ -2510,6 +2539,23 @@ fn best_marker_match(
 mod tests {
 
     #[test]
+    fn translations_keep_default_bold_separate_from_local_emphasis_in_both_layouts() {
+        let run = |text:&str, local:bool| Inline::Text(TextRun{text:text.into(),link:None,
+            style:TextStyle{bold:true,body_bold:!local,bold_emphasis:local,..Default::default()}});
+        let original=vec![run("Default face ",false),run("important",true),run(" rest",false)];
+        let block=TextBlock{kind:TextBlockKind::Paragraph,content:original.clone(),style:Default::default(),source:None};
+        assert_eq!(translation_text(&block),"<b>Default face </b><strong>important</strong><b> rest</b>");
+        let translated=replacement_content("<b>正文</b><strong>重点</strong><b>其余</b>",TextStyle::default(),Some(&original));
+        let runs:Vec<_>=translated.iter().flat_map(Inline::text_runs).collect();
+        assert!(runs.iter().all(|r|r.style.bold),"Classic translation keeps the authored default face");
+        assert!(runs.iter().filter(|r|r.text=="重点").all(|r|r.style.bold_emphasis));
+        assert!(runs.iter().filter(|r|r.text!="重点").all(|r|r.style.body_bold&&!r.style.bold_emphasis));
+        let plain=vec![run("Default face",false)];
+        let aliased=replacement_content("<strong>正文</strong>",TextStyle::default(),Some(&plain));
+        assert!(aliased.iter().flat_map(Inline::text_runs).all(|r|r.style.body_bold&&!r.style.bold_emphasis));
+    }
+
+    #[test]
     fn translated_prose_cannot_invent_media_links_but_keeps_source_references() {
         let original = vec![Inline::Text(TextRun {
             text: "Each kana represents a sound. See Figure 11.1.".into(),
@@ -2644,6 +2690,39 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn translated_native_lists_deduplicate_model_markers_without_stripping_body_symbols() {
+        for (text, ordered, expected) in [
+            ("• 译文", false, Some(2)),
+            ("●译文", false, Some(1)),
+            ("12. 译文", true, Some(4)),
+            ("译文", false, None),
+            ("-5 is a negative number", false, None),
+            ("|A| is a magnitude", false, None),
+            ("i.e. an explanation", true, None),
+            ("2024. Historical context", true, None),
+            ("L. 译文", true, Some(3)),
+        ] {
+            let mut block = TextBlock {
+                kind: TextBlockKind::ListItem { ordered, ordinal: 12, depth: 0, marker_visible: true },
+                content: vec![Inline::Text(TextRun { text: text.into(), style: Default::default(), link: None })],
+                style: BlockStyle { list_group: Some(10),
+                    list_marker_format: text.starts_with("L. ").then_some(rebook_publication::ListMarkerFormat::UpperAlpha),
+                    ..Default::default() },
+                source: None,
+            };
+            normalize_rtl_translation(&mut block);
+            assert_eq!(block.style.authored_list_marker, expected, "{text}");
+            assert_eq!(block.style.list_group, Some(10));
+            assert_eq!(block.content[0].text_runs()[0].text, text);
+        }
+        let mut paragraph = TextBlock { kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun { text: "• actual prose".into(), style: Default::default(), link: None })],
+            style: Default::default(), source: None };
+        normalize_rtl_translation(&mut paragraph);
+        assert_eq!(paragraph.style.authored_list_marker, None);
     }
 
     #[test]
@@ -4295,6 +4374,29 @@ mod tests {
             text_block_text(&bilingual.captions[0]),
             "Original caption\n翻译图注"
         );
+    }
+
+    #[test]
+    fn inferred_media_roles_and_table_focus_survive_replace_and_bilingual_translation() {
+        let base=source();
+        let section=rebook_html::parse_section("<html><body><div><img src='x.png'/><p>Figure 1. Diagram</p><p>Explanation inside the figure.</p><p>© Original author</p></div><figure><figcaption><p><a href='#mention' role='doc-backlink'>TABLE 2.1</a> Results</p></figcaption><table><tr><td>Value</td><td>42</td></tr></table></figure><p id='mention'>After.</p></body></html>",&base.book().sections[0],|_|None).unwrap();
+        for mode in [TranslationMode::Replace,TranslationMode::Bilingual] {
+            let overlay=TranslationBookSource::new(Arc::new(TestSource {book:base.book().clone(),section:section.clone()}),mode);
+            overlay.set_enabled(true).unwrap();overlay.set_target_language("简体中文").unwrap();
+            let inputs=overlay.translatable_blocks(0).unwrap();
+            let translations=inputs.iter().enumerate().map(|(i,input)|BlockTranslation {
+                block_index:input.block_index,segment_index:input.segment_index,
+                text:if input.text.starts_with('©') {"© 译者".into()} else {format!("译文{i}")},
+            }).collect::<Vec<_>>();
+            overlay.store_batch(0,&translations).unwrap();
+            let translated=overlay.parse_section(0).unwrap();
+            for (original,translated) in section.blocks.iter().zip(&translated.blocks) {
+                let original=original.text_blocks().map(|t|(t.kind,t.source.clone())).collect::<Vec<_>>();
+                assert_eq!(original,translated.text_blocks().map(|t|(t.kind,t.source.clone())).collect::<Vec<_>>());
+            }
+            assert_eq!(crate::focus_content::units(&translated.blocks,true).len(),3);
+            assert!(crate::focus_content::is_body(&translated.blocks[1],true));
+        }
     }
 
     #[test]

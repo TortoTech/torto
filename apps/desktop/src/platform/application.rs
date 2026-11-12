@@ -176,7 +176,7 @@ const fn native_window_theme(theme: AppTheme) -> Option<Theme> {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn native_shortcut_modifiers_match(
     modifiers: ModifiersState,
     shortcut: egui::KeyboardShortcut,
@@ -191,7 +191,7 @@ fn native_shortcut_modifiers_match(
     modifiers.matches_logically(shortcut.modifiers)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn native_open_settings_key_matches(
     key_code: KeyCode,
     repeat: bool,
@@ -297,6 +297,8 @@ struct WindowedPlacement {
 }
 
 struct Application {
+    closing: bool,
+    exit_requested: bool,
     app: DesktopApp,
     egui_ctx: egui::Context,
     window: Option<WindowState>,
@@ -310,6 +312,20 @@ struct Application {
 }
 
 impl Application {
+    fn begin_exit(&mut self) {
+        if self.closing{return;}self.closing=true;
+        let (save,task)=self.app.begin_exit();let proxy=self.proxy.clone();
+        self.runtime.spawn(async move {
+            let saved=tokio::task::spawn_blocking(save).await;
+            if matches!(saved,Ok(Ok(()))) {
+                if let Some(task)=task {
+                    // Persisted quota gates still apply; never wait for a file download on exit.
+                    let _=tokio::time::timeout(Duration::from_secs(3),crate::sync::run_sync(task.settings,task.password,Vec::new(),task.mode,|_|{})).await;
+                }
+            }
+            let _=proxy.send_event(UserEvent::ExitReady);
+        });
+    }
     fn new(
         app: DesktopApp,
         proxy: EventLoopProxy<UserEvent>,
@@ -335,6 +351,22 @@ impl Application {
                 });
             }
         });
+        if crate::smoke::enabled() {
+            let smoke_proxy = proxy.clone();
+            runtime.spawn(async move {
+                let mut ticks = tokio::time::interval(Duration::from_millis(100));
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Startup observation needs real frames after the UI becomes
+                // idle. A finite external wake also survives unrelated egui
+                // passes and native events that cancel a WaitUntil timer.
+                for _ in 0..=600 {
+                    ticks.tick().await;
+                    if smoke_proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         Self {
             app,
             egui_ctx,
@@ -344,6 +376,7 @@ impl Application {
             proxy,
             runtime,
             modifiers: ModifiersState::default(),
+            closing:false,exit_requested:false,
             #[cfg(target_os = "windows")]
             open_settings_modifiers_released_at: None,
         }
@@ -518,11 +551,6 @@ impl ApplicationHandler<UserEvent> for Application {
     }
 
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-        if crate::smoke::enabled() && matches!(cause, StartCause::ResumeTimeReached { .. }) {
-            if let Some(window) = &self.window {
-                window.window.request_redraw();
-            }
-        }
         if matches!(cause, StartCause::ResumeTimeReached { .. }) {
             self.update_repaint_schedule(event_loop);
         }
@@ -556,6 +584,9 @@ impl ApplicationHandler<UserEvent> for Application {
                 }
                 return;
             }
+            UserEvent::ExitReady=>{event_loop.exit();return;}
+            UserEvent::CloudResume {account,offer}=>self.app.complete_cloud_resume(account,offer),
+            UserEvent::CloudResumeAccepted {account,offer}=>self.app.accept_cloud_resume(account,offer),
             UserEvent::ShelfSyncCheck(message) => {
                 if !self.app.complete_shelf_sync_check(message) {
                     return;
@@ -621,6 +652,8 @@ impl ApplicationHandler<UserEvent> for Application {
                 ],
             );
         }
+        // Worker admission is independent of rendering: minimized windows do not draw.
+        if !self.closing {self.app.spawn_pending_tasks(&self.runtime,&self.proxy);}
         if let Some(window) = &self.window {
             window.window.request_redraw();
         }
@@ -701,8 +734,9 @@ impl ApplicationHandler<UserEvent> for Application {
             state.window.request_redraw();
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.exit_requested=true,
             WindowEvent::Focused(focused) => {
+                self.app.sync_lifecycle(focused);
                 #[cfg(target_os = "windows")]
                 if let Some(native) = &mut state.native_input { native.set_focused(focused); }
                 let size = state.window.inner_size();
@@ -789,7 +823,7 @@ impl ApplicationHandler<UserEvent> for Application {
                     {
                         sync_window_chrome(state, &self.egui_ctx);
                         if crate::app::window_chrome::take_close_request(&self.egui_ctx) {
-                            event_loop.exit();
+                            self.exit_requested=true;
                         }
                     }
                     // A theme switch lands during render; keep the surface
@@ -803,7 +837,7 @@ impl ApplicationHandler<UserEvent> for Application {
                     state
                         .gpu
                         .prewarm_reader(&self.app, &self.runtime, &self.proxy);
-                    self.app.spawn_pending_tasks(&self.runtime, &self.proxy);
+                    if !self.closing { self.app.spawn_pending_tasks(&self.runtime, &self.proxy); }
                     #[cfg(target_os = "macos")]
                     {
                         crate::updater::macos::confirm_health(&self.runtime);
@@ -835,6 +869,8 @@ impl ApplicationHandler<UserEvent> for Application {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.exit_requested&&!self.closing {self.begin_exit();}
+        if !self.closing { self.app.spawn_pending_tasks(&self.runtime, &self.proxy); }
         if crate::smoke::enabled() {
             if let Some(state) = &self.window
                 && let Err(error) = crate::smoke::window_tick(&self.egui_ctx, &state.window)
@@ -855,10 +891,6 @@ impl ApplicationHandler<UserEvent> for Application {
                 }
                 Ok(false) => {}
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(100),
-            ));
-            return;
         }
         self.update_repaint_schedule(event_loop);
     }
@@ -938,7 +970,6 @@ mod tests {
         assert_eq!(native_window_theme(AppTheme::Dark), Some(Theme::Dark));
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn native_comma_shortcut_bypasses_ime_processed_logical_keys() {
         let shortcut = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Comma);

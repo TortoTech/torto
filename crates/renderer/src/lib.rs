@@ -2628,15 +2628,26 @@ impl DisplayListCompiler {
                         sources: quote.sources.clone(),
                         continued_before: quote.continued_before,
                         continued_after: quote.continued_after,
-                        accent_x: quote.x + 6.0,
-                        accent_width: 4.0,
-                        accent: color(quote.accent),
+                        accent_x: if quote.fill.alpha > 0 { quote.x } else { quote.x + 6.0 },
+                        accent_width: if quote.fill.alpha > 0 { quote.width } else { 4.0 },
+                        accent: color(if quote.fill.alpha > 0 { quote.fill } else { quote.accent }),
                     });
                     if quote.fill.alpha > 0 {
                         commands.push(DisplayCommand::FillRoundedRect(FillRoundedRectCommand {
                             rect: RoundedRect::from_rect(bounds, 7.0),
                             color: color(quote.fill),
                         }));
+                        // Continuous-page joins have square edges; only the
+                        // actual quotation ends keep the card's rounded corners.
+                        for (continued, top, bottom) in [
+                            (quote.continued_before, bounds.y0, (bounds.y0 + 7.0).min(bounds.y1)),
+                            (quote.continued_after, (bounds.y1 - 7.0).max(bounds.y0), bounds.y1),
+                        ] {
+                            if continued { commands.push(DisplayCommand::FillRoundedRect(FillRoundedRectCommand {
+                                rect: RoundedRect::from_rect(Rect::new(bounds.x0, top, bounds.x1, bottom), 0.0),
+                                color: color(quote.fill),
+                            })); }
+                        }
                     }
                     let accent_inset = 8.0_f64.min(bounds.height() * 0.2);
                     let accent_top = if quote.continued_before {
@@ -4508,7 +4519,16 @@ mod tests {
                             continue;
                         };
                         let visible = region.visible_byte_range().unwrap();
-                        copied.push_str(&region.selection_fragment(visible).unwrap().quote);
+                        let fragment = region.selection_fragment(visible).unwrap();
+                        let body_left = rebook_layout::reading_content_left(width as f32, &style)
+                            + (f32::from(depth) + 1.0) * style.typography.font_size * style.typesetting.list_indent_em;
+                        assert!(fragment.rects.iter().all(|rect| rect.x0 >= f64::from(body_left) - 0.1),
+                            "source highlights must exclude the outdented marker");
+                        if let Some(marker) = region.marker_bounds_for_sources(std::slice::from_ref(&range)) {
+                            assert!(marker.x0 < f64::from(body_left));
+                            assert!(marker.x0 >= -0.1, "outdented markers must stay on the page");
+                        }
+                        copied.push_str(&fragment.quote);
                         for hyphen in &region.discretionary_hyphens {
                             hyphen_count += 1;
                             continuation_hyphen |= hyphen.line_index > 0;

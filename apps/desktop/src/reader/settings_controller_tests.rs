@@ -198,7 +198,14 @@ fn unchanged_settings_keep_prepared_pages_focus_units_and_restore_target() {
     let cached = reader.page_scenes.clone();
     assert!(!cached.is_empty());
     let revision = reader.scene_revision;
-    settings.focus_style = crate::preferences::FocusStyle::SurroundingDim;
+    settings.focus_style = match reader.focus_style {
+        crate::preferences::FocusStyle::SurroundingDim => {
+            crate::preferences::FocusStyle::BackgroundHighlight
+        }
+        crate::preferences::FocusStyle::BackgroundHighlight => {
+            crate::preferences::FocusStyle::SurroundingDim
+        }
+    };
     reader.apply_global_settings(&settings);
     assert_eq!(reader.focus_style, settings.focus_style);
     assert_ne!(reader.scene_revision, revision);

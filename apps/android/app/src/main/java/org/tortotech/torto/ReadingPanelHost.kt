@@ -4,6 +4,7 @@ import androidx.compose.animation.*
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.*
@@ -33,12 +34,18 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
-internal fun readingPanelOwner(panel:String?):String?=when(panel){
-    "layout-settings","translation-settings"->"typography"
-    "note","marks-search"->"marks"
+internal fun readingTypographyParent(panel:String?):String?=when {
+    panel?.startsWith("font-choice-")==true->"font-style"
+    panel in listOf("font-style","reading-mode","layout-settings","translation-settings")->"typography"
+    else->null
+}
+internal fun readingPanelOwner(panel:String?):String?=when {
+    readingTypographyParent(panel)!=null->"typography"
+    panel in listOf("note","marks-search")->"marks"
     else->panel
 }
-internal fun readingBottomPanel(panel:String?)=panel!=null&&panel!="chat"
+internal fun readingBottomPanel(panel:String?)=panel!=null&&panel!="chat"&&panel!="note"
+private fun flatReadingPanel(panel:String)=readingPanelOwner(panel)=="typography"||panel in listOf("theme","selection")
 
 /** Lives in the reading window, above the book and below the independent footer. */
 @Composable internal fun BoxScope.ReadingPanelHost(book:String?,panel:String?,onClose:()->Unit,content:@Composable (String)->Unit){
@@ -56,10 +63,15 @@ internal fun readingBottomPanel(panel:String?)=panel!=null&&panel!="chat"
         var drag by remember {mutableFloatStateOf(0f)}
         var settle by remember {mutableStateOf<Job?>(null)}
         val scope=rememberCoroutineScope()
-        LaunchedEffect(panel){settle?.cancel();drag=0f}
-        AnimatedVisibility(open,enter=fadeIn(tween(160))+slideInVertically(tween(200)){it/10},exit=fadeOut(tween(140))+slideOutVertically(tween(180)){it/10},modifier=Modifier.fillMaxSize().windowInsetsPadding(footer).clipToBounds()){
+        val visibility=remember {MutableTransitionState(false)}
+        visibility.targetState=open
+        LaunchedEffect(panel){if(open){settle?.cancel();drag=0f}}
+        LaunchedEffect(visibility.isIdle,visibility.currentState){
+            if(visibility.isIdle&&!visibility.currentState){settle?.cancel();drag=0f}
+        }
+        AnimatedVisibility(visibility,enter=fadeIn(tween(160))+slideInVertically(tween(200)){it/10},exit=fadeOut(tween(140))+slideOutVertically(tween(180)){it/10},modifier=Modifier.fillMaxSize().windowInsetsPadding(footer).clipToBounds()){
             BoxWithConstraints(Modifier.fillMaxSize()){
-                val full=displayed in setOf("navigation","marks","marks-search","layout-settings","translation-settings")
+                val full=displayed in setOf("navigation","marks","marks-search","translation-settings")
                 val limit=if(full)maxHeight else maxHeight*.88f
                 val closeLabel=tr("关闭阅读面板","Close reading panel")
                 if(!full)Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha=.12f)).clickable(interactionSource=remember {MutableInteractionSource()},indication=null,onClickLabel=closeLabel,onClick=onClose))
@@ -94,10 +106,10 @@ internal fun readingBottomPanel(panel:String?)=panel!=null&&panel!="chat"
                     drag=(drag+delta).coerceAtLeast(0f)
                 },Orientation.Vertical,onDragStarted={settle?.cancel()},onDragStopped={finishDrag(it)})
                 Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth().animateContentSize(tween(180),alignment=Alignment.BottomCenter).then(if(full)Modifier.fillMaxHeight()else Modifier.heightIn(max=limit)).offset{IntOffset(0,drag.roundToInt())}.semantics {paneTitle=paneLabel}.then(bodyDrag).pointerInput(Unit){detectTapGestures {}},
-                    shape=if(full)RectangleShape else RoundedCornerShape(topStart=20.dp,topEnd=20.dp),color=MaterialTheme.colorScheme.surfaceContainerLow){
+                    shape=if(full||flatReadingPanel(displayed))RectangleShape else RoundedCornerShape(topStart=20.dp,topEnd=20.dp),color=if(flatReadingPanel(displayed))MaterialTheme.colorScheme.surfaceContainerLowest else MaterialTheme.colorScheme.surfaceContainerLow){
                     Column(Modifier.fillMaxWidth().then(if(full)Modifier.fillMaxHeight()else Modifier).imePadding()){
                         if(full)Spacer(Modifier.height(safe.calculateTopPadding()+24.dp))
-                        Box(Modifier.fillMaxWidth().height(28.dp),contentAlignment=Alignment.Center){Box(Modifier.size(32.dp,3.dp).background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.22f),RoundedCornerShape(2.dp)))}
+                        if(!flatReadingPanel(displayed))Box(Modifier.fillMaxWidth().height(28.dp),contentAlignment=Alignment.Center){Box(Modifier.size(32.dp,3.dp).background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.22f),RoundedCornerShape(2.dp)))}
                         Box(Modifier.weight(1f,fill=full).fillMaxWidth().graphicsLayer {alpha=opacity.value}){
                             holder.SaveableStateProvider(displayed){content(displayed)}
                         }
@@ -108,12 +120,12 @@ internal fun readingBottomPanel(panel:String?)=panel!=null&&panel!="chat"
     }
 }
 
-@Composable internal fun ReadingPanelPage(title:String,onBack:()->Unit,content:@Composable ()->Unit){
-    Column(Modifier.fillMaxSize()){
+@Composable internal fun ReadingPanelPage(title:String,onBack:()->Unit,fill:Boolean=true,content:@Composable ()->Unit){
+    Column(if(fill)Modifier.fillMaxSize()else Modifier.fillMaxWidth()){
         Box(Modifier.fillMaxWidth().heightIn(min=48.dp).padding(horizontal=8.dp)){
             Text(title,Modifier.fillMaxWidth().padding(horizontal=48.dp).align(Alignment.Center),fontSize=16.sp,textAlign=TextAlign.Center)
-            ActionIcon("back",tr("返回字体排版","Back to typography"),modifier=Modifier.align(Alignment.CenterStart),onClick=onBack)
+            ActionIcon("back",tr("返回","Back"),modifier=Modifier.align(Alignment.CenterStart),onClick=onBack)
         }
-        Box(Modifier.weight(1f)){content()}
+        Box(Modifier.weight(1f,fill=fill)){content()}
     }
 }

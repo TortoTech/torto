@@ -1,6 +1,41 @@
 //! Platform-independent timing and stops for focused reading.
 use std::time::Duration;
 
+/// A semantic unit can span spine files or share one with other units. Layout
+/// pages are deliberately excluded: typography changes must not lose history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnitKey {
+    sections: std::ops::Range<usize>,
+    index: usize,
+}
+impl UnitKey {
+    pub fn capture(reader: &mut rebook_reader::ReaderSession) -> Self {
+        Self {
+            sections: reader.current_reading_unit_sections(),
+            index: reader.reading_unit_location().index,
+        }
+    }
+}
+
+/// Per-open-book memory only. Peeking/preloading must only read this history.
+/// Retain the most recently left units without keeping their rendered pages.
+pub struct UnitHistory<T>(std::collections::VecDeque<(UnitKey, T)>);
+impl<T> Default for UnitHistory<T> {
+    fn default() -> Self { Self(std::collections::VecDeque::new()) }
+}
+impl<T> UnitHistory<T> {
+    pub fn remember(&mut self, key: UnitKey, value: T) {
+        if let Some(index) = self.0.iter().position(|(k, _)| *k == key) {
+            self.0.remove(index);
+        }
+        self.0.push_back((key, value));
+        if self.0.len() > 128 { self.0.pop_front(); }
+    }
+    pub fn get(&self, key: &UnitKey) -> Option<&T> {
+        self.0.iter().rev().find(|(k, _)| k == key).map(|(_, value)| value)
+    }
+}
+
 pub const MIN_DURATION: Duration = Duration::from_millis(160);
 pub const MAX_DURATION: Duration = Duration::from_millis(360);
 
@@ -63,6 +98,20 @@ pub fn line_aligned_overflow_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unit_history_is_bounded_replaces_old_positions_and_distinguishes_units() {
+        let mut history = UnitHistory::default();
+        for index in 0..129 {
+            history.remember(UnitKey { sections: 0..2, index }, index);
+        }
+        assert!(history.get(&UnitKey { sections: 0..2, index: 0 }).is_none());
+        let key = UnitKey { sections: 0..2, index: 1 };
+        history.remember(key.clone(), 500);
+        history.remember(UnitKey { sections: 2..3, index: 1 }, 900);
+        assert_eq!(history.get(&key), Some(&500));
+        assert_eq!(history.get(&UnitKey { sections: 2..3, index: 1 }), Some(&900));
+        assert_eq!(history.0.len(), 128);
+    }
     #[test]
     fn oversized_stops_are_balanced_and_reversible() {
         let middle = overflow_target(0.0, 0.0, 900.0, 600.0, true).unwrap();

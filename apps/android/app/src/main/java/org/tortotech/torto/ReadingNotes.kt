@@ -11,7 +11,6 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
@@ -67,11 +66,10 @@ import org.tortotech.torto.core.Annotation
     var query by rememberSaveable(state.active?.id){mutableStateOf("")}
     val term=query.trim()
     val results=remember(state.annotations,term){if(term.isEmpty())emptyList()else state.annotations.filter {it.quote.contains(term,true)||it.note.orEmpty().contains(term,true)}}
-    val focus=remember {FocusRequester()}
+    val focus=rememberInputFocus()
     val keyboard=LocalSoftwareKeyboardController.current
     val manager=LocalFocusManager.current
     val height=with(LocalDensity.current){maxOf(40.dp,24.sp.toDp()+8.dp)}
-    LaunchedEffect(Unit){withFrameNanos {};focus.requestFocus()}
     DisposableEffect(Unit){onDispose {manager.clearFocus();keyboard?.hide()}}
     Column(Modifier.fillMaxSize()){
         Box(Modifier.padding(horizontal=16.dp).fillMaxWidth().height(height+8.dp),contentAlignment=Alignment.Center){
@@ -110,7 +108,7 @@ private fun LazyListScope.noteEntries(notes:List<Annotation>,jump:(Annotation)->
             val content=buildAnnotatedString {appendInlineContent("marker", "\uFFFC");append(annotation ?: note.quote)}
             val inline=mapOf("marker" to InlineTextContent(Placeholder(1.55.em,1.25.em,PlaceholderVerticalAlign.TextCenter)){
                 Box(Modifier.fillMaxSize(),contentAlignment=Alignment.CenterStart){
-                    AppIcon(if(annotation==null)"highlight"else"note",size=16.667.dp,tint=MaterialTheme.colorScheme.onSurfaceVariant)
+                    AppIcon(if(annotation==null)"highlight"else"note",size=IconSizes.Small,tint=defaultIconColor())
                 }
             })
             Text(content,modifier=Modifier.clearAndSetSemantics {text=AnnotatedString(annotation ?: note.quote)},fontSize=16.sp,maxLines=if(annotation==null)4 else Int.MAX_VALUE,overflow=TextOverflow.Ellipsis,inlineContent=inline)

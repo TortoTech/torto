@@ -78,6 +78,18 @@ private val DarkColors=darkColorScheme(
     CompositionLocalProvider(Chinese provides chinese,ReaderMonospace provides state.monoTypeface) { MaterialTheme(colorScheme=scheme,content=content) }
 }
 
+/** Neutral icon ink is independent of secondary text and action colours. */
+@Composable internal fun defaultIconColor()=if(MaterialTheme.colorScheme.background.luminance()>.5f)Color(0xFF707781)else Color(0xFFA9AFB8)
+
+/** Rendered icon boxes in dp; vector artwork keeps its own optical padding. */
+internal object IconSizes {
+    val Standard=28.dp
+    val Compact=24.dp
+    val Small=20.dp
+    val Chevron=18.dp
+    val TouchTarget=48.dp
+}
+
 /** Individually bundled, optically sized Material Symbols Rounded vectors. */
 private val symbolResources=mapOf(
     "back" to R.drawable.ic_symbol_back,
@@ -112,11 +124,17 @@ private val symbolResources=mapOf(
     "stop" to R.drawable.ic_symbol_stop,
     "copy" to R.drawable.ic_symbol_copy,
     "highlight" to R.drawable.ic_symbol_highlight,
+    "underline" to R.drawable.ic_symbol_underline,
+    "remove-underline" to R.drawable.ic_symbol_remove_underline,
+    "thought" to R.drawable.ic_symbol_thought,
     "edit-note" to R.drawable.ic_symbol_edit_note,
     "edit" to R.drawable.ic_symbol_edit,
     "check" to R.drawable.ic_symbol_check,
     "undo" to R.drawable.ic_symbol_undo,
-    "expand" to R.drawable.ic_symbol_expand
+    "expand" to R.drawable.ic_symbol_expand,
+    "more" to R.drawable.ic_symbol_more,
+    "up" to R.drawable.ic_symbol_up,
+    "clear" to R.drawable.ic_symbol_clear
 )
 private val filledSymbolResources=mapOf(
     "library" to R.drawable.ic_symbol_library_filled,
@@ -124,22 +142,22 @@ private val filledSymbolResources=mapOf(
     "person" to R.drawable.ic_symbol_person_filled,
     "toc" to R.drawable.ic_symbol_toc_filled
 )
-@Composable fun AppIcon(name:String,description:String?=null,modifier:Modifier=Modifier,tint:Color=LocalContentColor.current,filled:Boolean=false,size:Dp=24.dp) {
+@Composable fun AppIcon(name:String,description:String?=null,modifier:Modifier=Modifier,tint:Color=defaultIconColor().copy(alpha=LocalContentColor.current.alpha),filled:Boolean=false,size:Dp=IconSizes.Standard) {
     val resource=(if(filled)filledSymbolResources[name] else null) ?: symbolResources[name] ?: R.drawable.ic_symbol_info
-    Box(modifier.size(size*1.2f)){
+    Box(modifier.size(size)){
         Icon(androidx.compose.ui.res.painterResource(resource),description,Modifier.matchParentSize(),tint=tint)
         if(name=="highlight")androidx.compose.foundation.Canvas(Modifier.matchParentSize()){
-            drawLine(BrandGreen,androidx.compose.ui.geometry.Offset(this.size.width*.125f,this.size.height*.9f),androidx.compose.ui.geometry.Offset(this.size.width*.875f,this.size.height*.9f),strokeWidth=this.size.width/10f,cap=StrokeCap.Round)
+            drawLine(BrandGreen,androidx.compose.ui.geometry.Offset(this.size.width*.125f,this.size.height*.9f),androidx.compose.ui.geometry.Offset(this.size.width*.875f,this.size.height*.9f),strokeWidth=this.size.width/16f,cap=StrokeCap.Round)
         }
     }
 }
 /** A transparent 48dp target; only the unchanged icon's ink reacts to input. */
-@Composable fun ActionIcon(name:String,label:String,enabled:Boolean=true,selected:Boolean=false,modifier:Modifier=Modifier,iconSize:Dp=22.dp,onClick:()->Unit) {
+@Composable fun ActionIcon(name:String,label:String,enabled:Boolean=true,selected:Boolean=false,modifier:Modifier=Modifier,iconSize:Dp=IconSizes.Standard,onClick:()->Unit) {
     val interaction=remember {androidx.compose.foundation.interaction.MutableInteractionSource()}
     val pressed by interaction.collectIsPressedAsState()
-    val target=when { !enabled->MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.38f);selected||pressed->brandControlColor();else->MaterialTheme.colorScheme.onSurfaceVariant }
+    val target=when { !enabled->defaultIconColor().copy(alpha=.38f);selected||pressed->brandControlColor();else->defaultIconColor() }
     val ink by androidx.compose.animation.animateColorAsState(target,androidx.compose.animation.core.tween(100),label="icon ink")
-    Box(modifier.size(48.dp).semantics {this.selected=selected}
+    Box(modifier.size(IconSizes.TouchTarget).semantics {this.selected=selected}
         .clickable(interactionSource=interaction,indication=null,enabled=enabled,role=Role.Button,onClick=onClick),contentAlignment=Alignment.Center){
         AppIcon(name,label,size=iconSize,tint=ink)
     }

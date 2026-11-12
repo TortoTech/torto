@@ -12,6 +12,9 @@ mod cover;
 mod epub;
 mod fb2;
 mod font_metadata;
+mod font_data;
+mod svg;
+mod typography;
 #[cfg(test)]
 mod font_size_tests;
 mod html_context;
@@ -234,19 +237,13 @@ fn finish_open(
     source: Arc<dyn BookSource>,
     load_cover: bool,
 ) -> OpenedPublication {
-    let cover_bytes = source
-        .book()
-        .cover
-        .as_ref()
-        .filter(|_| load_cover)
-        .and_then(|href| source.resource(href).ok())
-        .filter(|resource| resource.media_type.starts_with("image/"))
-        .map(|resource| resource.bytes.to_vec())
-        .or_else(|| {
-            load_cover
-                .then(|| cover::page_thumbnail(source.as_ref()))
-                .flatten()
-        });
+    let source = typography::wrap(source);
+    let cover_bytes = load_cover.then(|| {
+        source.cover_candidates().into_iter().find_map(|href| {
+            let resource = source.resource(&href).ok()?;
+            cover::image_bytes(source.as_ref(), &resource)
+        }).or_else(|| cover::page_thumbnail(source.as_ref()))
+    }).flatten();
     OpenedPublication {
         format,
         source,
