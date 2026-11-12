@@ -24,7 +24,8 @@ mod batching;
 mod citations;
 pub mod enhancements;
 mod formulas;
-mod headings;
+mod heading_policy;
+use heading_policy::{presentation_cache_paths, read_presentation_cache};
 mod image_tables;
 mod log;
 mod normalize;
@@ -61,19 +62,17 @@ impl Default for SemanticLayoutSettings {
     }
 }
 
-// Internal request roles, not user settings. All recognizers are always enabled.
+// Internal request roles, not user settings. Headings come only from the publication parser.
 #[derive(Clone)]
 struct RecognitionRoles {
     quotes: bool,
     captions: bool,
-    headings: bool,
 }
 impl Default for RecognitionRoles {
     fn default() -> Self {
         Self {
             quotes: true,
             captions: true,
-            headings: true,
         }
     }
 }
@@ -102,6 +101,7 @@ enum Proposal {
         credit: String,
         alignment: Option<QuoteAlignment>,
     },
+    // Legacy cache compatibility only; never requested or applied.
     SectionHeading {
         block: usize,
     },
@@ -187,6 +187,7 @@ enum Annotation {
         credit: String,
         alignment: Option<QuoteAlignment>,
     },
+    // Legacy cache compatibility only; never requested or applied.
     SectionHeading {
         source: SourceRange,
     },
@@ -243,7 +244,7 @@ pub struct Recognition {
 
 impl Recognition {
     pub fn has_annotations(&self) -> bool {
-        !self.annotations.is_empty()
+        self.annotations.iter().any(heading_policy::annotation_supported)
     }
 }
 
@@ -283,7 +284,7 @@ pub struct SemanticLayoutSource {
 struct RecognitionMiss {
     hash: String,
     identity: Value,
-    path: PathBuf,
+    paths: Vec<PathBuf>,
 }
 
 const DERIVED_SECTION_CACHE_CAPACITY: usize = 16;
@@ -417,15 +418,15 @@ impl SemanticLayoutSource {
         hash: &str,
         identity: &Value,
     ) -> Option<Recognition> {
-        let missing_path = self.recognition_misses.read().ok().and_then(|cache| {
+        let missing_paths = self.recognition_misses.read().ok().and_then(|cache| {
             cache
                 .get(&index)
                 .filter(|miss| miss.hash == hash && &miss.identity == identity)
-                .map(|miss| miss.path.clone())
+                .map(|miss| miss.paths.clone())
         });
         // A cloud sync or another worker can create a previously absent file.
         // Check its existence cheaply without serializing the section again.
-        if missing_path.is_some_and(|path| !path.try_exists().unwrap_or(true)) {
+        if missing_paths.is_some_and(|paths| paths.iter().all(|path| !path.try_exists().unwrap_or(true))) {
             return None;
         }
         let recognition = load_recognition_inner(original, identity, hash, false);
@@ -434,9 +435,9 @@ impl SemanticLayoutSource {
             && let Ok(mut misses) = self.recognition_misses.write()
         {
             misses.remove(&index);
-            if recognition.is_none()
-                && let Some(path) = recognition_path(identity, hash)
-                && !path.try_exists().unwrap_or(true)
+            let paths = presentation_cache_paths(identity, hash, false);
+            if recognition.is_none() && !paths.is_empty()
+                && paths.iter().all(|path| !path.try_exists().unwrap_or(true))
             {
                 cache_section(
                     &mut misses,
@@ -444,7 +445,7 @@ impl SemanticLayoutSource {
                     RecognitionMiss {
                         hash: hash.into(),
                         identity: identity.clone(),
-                        path,
+                        paths,
                     },
                 );
             }
@@ -497,6 +498,7 @@ impl SemanticLayoutSource {
         range: std::ops::Range<usize>,
         mut result: Recognition,
     ) -> bool {
+        heading_policy::discard(&mut result);
         if result.annotations.is_empty() {
             return false;
         }
@@ -602,7 +604,8 @@ impl SemanticLayoutSource {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn install(&self, index: usize, result: Recognition) -> bool {
+    pub fn install(&self, index: usize, mut result: Recognition) -> bool {
+        heading_policy::discard(&mut result);
         let Ok(original) = self.original.parse_section(index) else {
             return false;
         };
@@ -715,14 +718,14 @@ impl BookSource for SemanticLayoutSource {
             cache_section(&mut scopes,index,restored.clone());
             partial=Some(restored);
         }
-        if let Some((original, hash)) = snapshot.as_ref() {
+        if let Some((_, hash)) = snapshot.as_ref() {
             let full = recognition
                 .as_ref()
                 .filter(|result| result.fingerprint == *hash);
             if let Some(recognition) = full {
                 for annotation in &recognition.annotations {
                     if image_policy_allows(&recognition, annotation)
-                        && headings::annotation_eligible(&original, annotation)
+                        && heading_policy::annotation_supported(annotation)
                     {
                         compose(&mut section.blocks, annotation);
                     }
@@ -740,7 +743,7 @@ impl BookSource for SemanticLayoutSource {
                             continue;
                         }
                         if image_policy_allows(&recognition, annotation)
-                            && headings::annotation_eligible(&original, annotation)
+                            && heading_policy::annotation_supported(annotation)
                         {
                             compose(&mut section.blocks, annotation);
                         }
@@ -975,10 +978,6 @@ fn window_roles(
     context: std::ops::Range<usize>,
 ) -> RecognitionRoles {
     RecognitionRoles {
-        headings: roles.headings
-            && target
-                .clone()
-                .any(|i| headings::candidate(&section.blocks[i]).is_some()),
         quotes: roles.quotes
             && target.clone().any(|i| {
                 paragraph(&section.blocks[i]).is_some()
@@ -998,9 +997,7 @@ fn window_prompt(
     let roles = window_roles(section, roles, target.clone(), context);
     let mut out = String::new();
     for part in PROMPT.split("\n## ") {
-        let enabled = if part.starts_with("Headings") {
-            roles.headings
-        } else if part.starts_with("Quotations") {
+        let enabled = if part.starts_with("Quotations") {
             roles.quotes
         } else if part.starts_with("Captions") {
             roles.captions
@@ -1041,22 +1038,14 @@ fn request_contract_fingerprint() -> &'static str {
                 formulas::chapter_cache_options(),
                 completion_options(&RecognitionRoles {
                     quotes: true,
-                    captions: false,
-                    headings: false
+                    captions: false
                 }),
                 completion_options(&RecognitionRoles {
                     quotes: false,
-                    captions: true,
-                    headings: false
-                }),
-                completion_options(&RecognitionRoles {
-                    quotes: false,
-                    captions: false,
-                    headings: true
+                    captions: true
                 }),
                 batching::BATCH_CHARS,
                 code_blocks::MAX_RUN_CHARS,
-                headings::MAX_CHARS,
                 OVERLAP
             ]))
             .expect("request contract serializes"),
@@ -1095,14 +1084,6 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
         },
         "required":["kind","quote","attribution","body_index"]
     });
-    let heading = json!({
-        "type":"object", "additionalProperties":false,
-        "properties":{
-            "kind":{"type":"string","enum":["section_heading"]},
-            "block":{"type":"integer","description":"An ID from targets.classify_headings."}
-        },
-        "required":["kind","block"]
-    });
     let mut items = Vec::new();
     if roles.quotes {
         let mut before = quote.clone();
@@ -1123,9 +1104,6 @@ fn completion_options(roles: &RecognitionRoles) -> Value {
     }
     if roles.captions {
         items.push(figure);
-    }
-    if roles.headings {
-        items.push(heading);
     }
     let no_groups = items.is_empty();
     let item = if no_groups {
@@ -1194,12 +1172,11 @@ fn scope_presentation_path(identity:&Value,hash:&str)->Option<PathBuf> {
     recognition_path(&json!([identity,"displayed-scopes-v1"]),hash)
 }
 fn load_scope_presentation(identity:&Value,original:&Section,hash:&str)->Option<BTreeMap<(usize,usize),Recognition>> {
-    let path=scope_presentation_path(identity,hash)?;
-    if std::fs::metadata(&path).ok()?.len()>4*1024*1024{return None}
-    let stored:Vec<(usize,usize,Recognition)>=serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let bytes = read_presentation_cache(identity, hash, true)?;
+    let stored:Vec<(usize,usize,Recognition)>=serde_json::from_slice(&bytes).ok()?;
     if stored.len()>128{return None}
     let groups=stored.into_iter().filter(|(start,end,result)|*start<*end&&*end<=original.blocks.len()&&result.fingerprint==hash)
-        .map(|(start,end,result)|((start,end),result)).collect::<BTreeMap<_,_>>();
+        .map(|(start,end,mut result)| {heading_policy::discard(&mut result); ((start,end),result)}).collect::<BTreeMap<_,_>>();
     (!groups.is_empty()).then_some(groups)
 }
 
@@ -1243,7 +1220,7 @@ fn load_recognition_inner(
     hash: &str,
     current_images: bool,
 ) -> Option<Recognition> {
-    let bytes = std::fs::read(recognition_path(identity, hash)?).ok()?;
+    let bytes = read_presentation_cache(identity, hash, false)?;
     let mut result: Recognition = serde_json::from_slice(&bytes).ok()?;
     if current_images
         && result.image_text_revision < formulas::TEXT_REVISION
@@ -1251,9 +1228,7 @@ fn load_recognition_inner(
     {
         return None;
     }
-    result
-        .annotations
-        .retain(|annotation| headings::annotation_eligible(section, annotation));
+    heading_policy::discard(&mut result);
     if !result.formulas_checked
         || !formulas::validate_annotations(section, &result.annotations)
         || !text_formulas::validate_annotations(section, &result.annotations)
@@ -1669,7 +1644,6 @@ async fn recognize_windows(
     let config = &RecognitionRoles {
         quotes: true,
         captions: !code_only,
-        headings: !code_only,
     };
     let mut annotations = Vec::new();
     let mut skipped_groups = 0;
@@ -1872,11 +1846,6 @@ fn window_input(
                     text_formulas::attach_input(&mut block, &section.blocks[index]);
                 }
             }
-            if headings::candidate(&section.blocks[index]).is_some()
-                && let Some(text) = paragraph(&section.blocks[index])
-            {
-                block["style"] = headings::style(text);
-            }
             let available: Vec<_> = candidates.iter().filter(|c| c.block == index).collect();
             block["citation_candidates"] = json!(
                 available
@@ -1905,9 +1874,9 @@ fn window_input(
         })
         .collect();
     let mut input = json!({"target_start":target.start,"target_end_exclusive":target.end,
-        "quotes_enabled":config.quotes,"captions_enabled":config.captions,"headings_enabled":config.headings,
+        "quotes_enabled":config.quotes,"captions_enabled":config.captions,
         "blocks":blocks,
-        "targets":{"classify_headings":target.clone().filter(|i|headings::candidate(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),"classify_blocks":target.clone().filter(|i|paragraph(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
+        "targets":{"classify_blocks":target.clone().filter(|i|paragraph(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
             "classify_code_or_quote":target.clone().filter(|i|eligible.contains(i)).collect::<Vec<_>>(),
             "complete_quote_sources":target.clone().filter(|i|unattributed_quote_body(&section.blocks[*i]).is_some()).collect::<Vec<_>>(),
             "classify_citations":candidates.iter().map(|c|&c.id).collect::<Vec<_>>()}});
@@ -1922,19 +1891,12 @@ fn window_input(
         // Keep literal caption/source text rather than moving it into
         // math_texts and subsequently clearing it for a code-only request.
         input["context"] = json!(context);
-        for name in ["classify_headings", "classify_blocks", "complete_quote_sources", "classify_citations"] {
+        for name in ["classify_blocks", "complete_quote_sources", "classify_citations"] {
             input["targets"][name] = json!([]);
         }
     }
     if !paragraph_groups.is_empty() {
         input["paragraph_groups"] = json!(paragraph_groups);
-    }
-    if config.headings
-        && target
-            .clone()
-            .any(|i| headings::number(&section.blocks[i]).is_some())
-    {
-        input["numbered_candidates"] = headings::context(section, target.start);
     }
     input
 }
@@ -2022,7 +1984,7 @@ async fn request_groups(
         )
         .await?;
         let content = ai::message_content(&message).ok_or("AI排版返回了空内容")?;
-        let parsed = llm_json::parse::<Value>(&content).and_then(|value| serde_json::from_value::<Response>(wire::decode(&value)).map_err(|error| error.to_string()))
+        let parsed = llm_json::parse::<Value>(&content).and_then(|value| normalize::decode_response(&value))
             .map_err(|e| format!("AI排版格式无效：{e}"))
             .and_then(|mut response| {
                 log::event(provider, model, "window.proposals", json!({"section":section.id,"start":target.start,"end":target.end,"attempt":attempt+1,"groups":response.groups,"citations":response.citations}));
@@ -2259,9 +2221,7 @@ fn validate_window(
                             })
                     }
             }
-            Proposal::SectionHeading { block } => {
-                config.headings && headings::candidate(&section.blocks[*block]).is_some()
-            }
+            Proposal::SectionHeading { .. } => false,
             Proposal::Quote {
                 body, attribution, ..
             } => {
@@ -2501,8 +2461,7 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
     if quote_sources::compose(blocks, annotation) {
         return;
     }
-    if let Annotation::SectionHeading { source } = annotation {
-        headings::compose(blocks, source);
+    if !heading_policy::annotation_supported(annotation) {
         return;
     }
     if let Annotation::QuoteAttribution {

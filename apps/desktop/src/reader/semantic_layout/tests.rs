@@ -1581,7 +1581,7 @@ href:PublicationUrl::parse("image.png").unwrap(),alt:String::new(),style:Default
 }
 
 #[test]
-fn recognized_numbered_heading_is_visible_but_not_a_focus_stop() {
+fn legacy_ai_heading_does_not_change_focus_stops() {
     let (mut reader, original, target) = fixture_with_numbered_heading(true);
     let layout = reader.current_scroll_layout().unwrap();
     reader.rebuild_focus_units(&layout);
@@ -1591,7 +1591,7 @@ fn recognized_numbered_heading_is_visible_but_not_a_focus_stop() {
         "annotations":[{"SectionHeading":{"source":block_source_range(&original.blocks[1]).unwrap()}}],
         "skipped_groups":0
     })).unwrap();
-    assert!(reader.semantic_source.install(0, recognition));
+    assert!(!reader.semantic_source.install(0, recognition));
     reader.refresh_semantic_layout_sync();
     let layout = reader.current_scroll_layout().unwrap();
     assert!(
@@ -1600,9 +1600,14 @@ fn recognized_numbered_heading_is_visible_but_not_a_focus_stop() {
             .is_some()
     );
     reader.rebuild_focus_units(&layout);
-    assert_eq!(reader.focus_units.len(), 3);
+    assert_eq!(reader.focus_units.len(), 4);
+    reader.move_focus_unit(PageDirection::Next);
+    let number = block_source_range(&original.blocks[1]).unwrap();
+    assert_eq!(reader.focus_anchor.as_ref(), Some(&number.start));
     reader.move_focus_unit(PageDirection::Next);
     assert_eq!(reader.focus_anchor.as_ref(), Some(&target.start));
+    reader.move_focus_unit(PageDirection::Previous);
+    assert_eq!(reader.focus_anchor.as_ref(), Some(&number.start));
     reader.move_focus_unit(PageDirection::Previous);
     assert_eq!(reader.focus_unit_index, 0);
     assert!(reader.pending_reading_unit_turn.is_none());

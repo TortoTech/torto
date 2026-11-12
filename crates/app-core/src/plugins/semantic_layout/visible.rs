@@ -24,6 +24,7 @@ pub fn block_ranges(block: &Block) -> Vec<SourceRange> {
 
 fn annotation_blocks(section: &Section, annotation: &Annotation) -> Vec<usize> {
     let ranges = match annotation {
+        Annotation::SectionHeading { .. } => return Vec::new(),
         Annotation::TableChart { members, .. } => members.iter().collect(),
         Annotation::FormulaNotes { source, .. } => vec![source],
         Annotation::CodeOrQuote {
@@ -39,8 +40,7 @@ fn annotation_blocks(section: &Section, annotation: &Annotation) -> Vec<usize> {
             .chain(credit.iter())
             .collect(),
         Annotation::InlineCitations { source, .. }
-        | Annotation::TextFormulas { source, .. }
-        | Annotation::SectionHeading { source } => {
+        | Annotation::TextFormulas { source, .. } => {
             vec![source]
         }
         Annotation::QuoteBefore {
@@ -110,7 +110,7 @@ pub fn merge_recognition(
     let mut merged = empty_recognition(&scope_section(section, range));
     for result in results {
         for annotation in result.annotations {
-            if !merged.annotations.contains(&annotation) {
+            if heading_policy::annotation_supported(&annotation) && !merged.annotations.contains(&annotation) {
                 merged.annotations.push(annotation);
             }
         }
@@ -128,6 +128,7 @@ pub fn recognition_groups(
     let entries = result
         .annotations
         .into_iter()
+        .filter(heading_policy::annotation_supported)
         .map(|annotation| {
             let mut ids = annotation_blocks(section, &annotation);
             if matches!(
@@ -193,7 +194,6 @@ pub fn needs_recognition(section: &Section, target: Range<usize>) -> bool {
             || paragraph(block).is_some()
             || unattributed_quote_body(block).is_some()
             || code_blocks::body(block).is_some()
-            || headings::candidate(block).is_some()
         {
             return true;
         }
