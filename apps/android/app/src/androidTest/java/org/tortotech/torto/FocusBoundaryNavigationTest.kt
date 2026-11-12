@@ -94,7 +94,7 @@ class FocusBoundaryNavigationTest {
             }}finally {bitmap.recycle()}
         }
     }
-    @Test fun sectionEdgeSlidesToAPlaceholderAndClearsLoadingAfterConfirmation(){
+    @Test fun sectionEdgeFadesToPaperAndClearsLoadingAfterConfirmation(){
         val monitor=instrumentation.addMonitor(MainActivity::class.java.name,null,false)
         var activity:MainActivity?=null;var bitmap:Bitmap?=null
         try {
@@ -113,17 +113,22 @@ class FocusBoundaryNavigationTest {
                 val start=SystemClock.uptimeMillis();val y=view.height*.6f;val delta=72*density+ViewConfiguration.get(view.context).scaledTouchSlop
                 event(view,start,0,y,0);event(view,start,2,y-delta,140);event(view,start,1,y-delta,320)
                 assertTrue("Loading begins immediately after confirmation",loading.get())
-                assertEquals("The outgoing animation precedes the native turn",0,turns.get())
+                assertEquals("The native turn starts alongside the outgoing fade",1,turns.get())
             }
             val until=SystemClock.uptimeMillis()+2000
             while(turns.get()==0){assertTrue(SystemClock.uptimeMillis()<until);SystemClock.sleep(10)}
+            SystemClock.sleep(180)
             assertTrue(loading.get());assertTrue(moving.get())
             instrumentation.runOnMainSync {
                 val output=Bitmap.createBitmap(view.width,view.height,Bitmap.Config.ARGB_8888)
                 try {view.draw(Canvas(output));assertEquals("Retained overscan must not leak into the loading placeholder",Color.BLACK,output.getPixel(view.width/2,view.height/2))}finally {output.recycle()}
                 bitmap!!.eraseColor(Color.GREEN)
                 view.present(ReaderFrame(bitmap!!,first.copy(scrollContext=334uL,nextFocus=FocusTarget(32f,emptyList())),334uL),null,turnCompletion=1)
-                assertFalse(loading.get());assertFalse(moving.get())
+                assertFalse(loading.get());assertTrue("Incoming content is still fading",moving.get())
+            }
+            val settled=SystemClock.uptimeMillis()+2000
+            while(moving.get()){assertTrue(SystemClock.uptimeMillis()<settled);SystemClock.sleep(10)}
+            instrumentation.runOnMainSync {
                 val result=Bitmap.createBitmap(view.width,view.height,Bitmap.Config.ARGB_8888)
                 try {view.draw(Canvas(result));assertEquals(Color.GREEN,result.getPixel(view.width/2,view.height/2))}finally {result.recycle()}
             }

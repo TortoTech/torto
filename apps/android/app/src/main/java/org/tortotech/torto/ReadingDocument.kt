@@ -45,18 +45,20 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
         BoxWithConstraints(Modifier.fillMaxWidth().heightIn(min=56.dp,max=520.dp)){
             val density=LocalDensity.current.density
             val width=maxWidth.value.toUInt().coerceAtLeast(100u)
-            val first by produceState<DocumentFrame?>(null,interaction,width,density,revision,foreground,background,firstLineIndent){
-                try {value=model.documentPage(interaction,0u,width,density,foreground,background,firstLineIndent).also {model.processVisible()}}
+            val height=maxHeight.value.toUInt().coerceAtLeast(80u)
+            val first by produceState<DocumentFrame?>(null,interaction,width,height,density,revision,foreground,background,firstLineIndent){
+                value=null
+                try {value=model.documentPage(interaction,0u,width,height,density,foreground,background,firstLineIndent).also {model.processVisible()}}
                 catch(e:CancellationException){throw e}catch(e:Exception){failure=e.message ?: unavailable}
             }
             val initial=first
             if(initial==null){if(failure==null)LinearProgressIndicator(Modifier.fillMaxWidth());return@BoxWithConstraints}
             LaunchedEffect(initial.id,initial.firstTextBaseline){onBaseline(initial.firstTextBaseline ?: 0f)}
             val list=rememberLazyListState()
-            val naturalHeight=if(initial.total==1u)(initial.frame.bitmap.height/density+(if(initial.controls.isEmpty())0 else 48)).dp else maxHeight
+            val naturalHeight=(initial.contentHeight+(if(initial.controls.isEmpty())0 else 48)).dp
             LazyColumn(Modifier.fillMaxWidth().height(naturalHeight.coerceIn(1.dp,maxHeight)),state=list){
                 item {
-                    if(initial.controls.isNotEmpty())Row(Modifier.fillMaxWidth()){
+                    if(initial.controls.isNotEmpty())Row(Modifier.fillMaxWidth().height(48.dp)){
                         initial.controls.forEach {control->TextButton(onClick={scope.launch {
                             try {if(model.toggleDocumentControl(initial,control))revision++}
                             catch(e:CancellationException){throw e}catch(e:Exception){failure=e.message}
@@ -65,8 +67,8 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
                     }
                 }
                 items(initial.total.toInt(),key={"${initial.id}:$revision:$it"}){index->
-                    val page by produceState(if(index==0)initial else null,initial.id,index,width,density,revision,foreground,background,firstLineIndent){
-                        if(index!=0)try {value=model.documentPage(interaction,index.toUInt(),width,density,foreground,background,firstLineIndent)}
+                    val page by produceState(if(index==0)initial else null,initial.id,index,width,height,density,revision,foreground,background,firstLineIndent){
+                        if(index!=0)try {value=model.documentPage(interaction,index.toUInt(),width,height,density,foreground,background,firstLineIndent)}
                         catch(e:CancellationException){throw e}catch(e:Exception){failure=e.message}
                     }
                     page?.let {document->
@@ -84,11 +86,11 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
                         },modifier=Modifier.fillMaxSize())
                         selected?.takeIf {it.page==document.index&&handle==null}?.let {selection->
                             SelectionToolbar(selection.text,
-                                onCopy={context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("",selection.text.text))},
+                                onCopy={context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("",selection.text.text));selected=null},
                                 onDismiss={selected=null},outsideClip=true)
                         }
                         }
-                    } ?: Spacer(Modifier.fillMaxWidth().height(320.dp))
+                    } ?: Spacer(Modifier.fillMaxWidth().height(height.toInt().dp))
                 }
             }
         }

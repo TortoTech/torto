@@ -5,18 +5,39 @@ use std::io::Cursor;
 use anyrender::ImageRenderer;
 use anyrender_vello_cpu::VelloCpuImageRenderer;
 use rebook_layout::{LayoutEngine, LayoutViewport, ReaderStyle, SpreadMode};
-use rebook_publication::{Block, BookSource, ImageLength, Rgba};
+use rebook_publication::{Block, BookSource, ImageLength, Rgba, Resource, Section};
 use rebook_renderer::DisplayListCompiler;
 
 pub(super) fn page_thumbnail(source: &dyn BookSource) -> Option<Vec<u8>> {
-    let mut section = source.cover_section().ok()??;
+    render_section(source, source.cover_section().ok()??)
+}
+
+pub(super) fn image_bytes(source: &dyn BookSource, resource: &Resource) -> Option<Vec<u8>> {
+    if resource.media_type == "image/svg+xml" {
+        let descriptor = rebook_publication::SpineItem {
+            id: rebook_publication::SpineItemId::new("cover-image").ok()?,
+            href: resource.href.clone(), media_type: "application/xhtml+xml".into(),
+            linear: false, properties: Vec::new(),
+        };
+        let section = rebook_html::parse_section("<html><body><img src=\"#\"/></body></html>", &descriptor, |_| None).ok()?;
+        return render_section(source, section);
+    }
+    if !resource.media_type.starts_with("image/") { return None; }
+    let mut decoder = image::ImageReader::new(Cursor::new(resource.bytes.as_ref())).with_guessed_format().ok()?;
+    let mut limits = image::Limits::default(); limits.max_alloc = Some(64 * 1024 * 1024);
+    decoder.limits(limits);
+    decoder.decode().ok()?;
+    Some(resource.bytes.to_vec())
+}
+
+fn render_section(source: &dyn BookSource, mut section: Section) -> Option<Vec<u8>> {
     // A single-image cover page should retain its original quality. Never pick
     // one image from a composed title/portrait/logo page.
     if let [Block::Image(image)] = section.blocks.as_slice()
         && let Ok(resource) = source.resource(&image.href)
-        && resource.media_type.starts_with("image/")
+        && resource.media_type != "image/svg+xml"
     {
-        return Some(resource.bytes.to_vec());
+        return image_bytes(source, &resource);
     }
     if section.blocks.is_empty() || section.blocks.len() > 128 {
         return None;
@@ -37,7 +58,11 @@ pub(super) fn page_thumbnail(source: &dyn BookSource) -> Option<Vec<u8>> {
             }
         }
     }
-    constrain_images(&mut section.blocks);
+    if let [Block::Image(image)] = section.blocks.as_mut_slice() {
+        image.style.max_height = Some(ImageLength::Pixels(560.0));
+    } else {
+        constrain_images(&mut section.blocks);
+    }
     // Raster dimensions, parsed content, and worker concurrency are bounded.
     let viewport = LayoutViewport {
         width: 420,

@@ -13,6 +13,11 @@ pub trait BookSource: Send + Sync {
         None
     }
 
+    /// Memory-only typography analysis prepared on the publication-open worker.
+    fn body_bold_profile(&self) -> Option<bool> {
+        self.inner_source().and_then(BookSource::body_bold_profile)
+    }
+
     /// Memory-only, already validated notes currently visible for this formula.
     fn visible_formula_notes(&self, source: &SourceRange, latex: &str) -> Vec<FormulaNote> {
         self.inner_source()
@@ -37,6 +42,18 @@ pub trait BookSource: Send + Sync {
     }
     /// Lightweight descriptor available immediately after opening.
     fn book(&self) -> &Book;
+
+    fn navigation_metadata(&self) -> Option<&crate::NavigationMetadata> {
+        self.inner_source().and_then(BookSource::navigation_metadata)
+    }
+
+    /// Ordered cover candidates. Resource I/O stays on the import/open worker.
+    fn cover_candidates(&self) -> Vec<PublicationUrl> {
+        self.inner_source().map_or_else(
+            || self.book().cover.iter().cloned().collect(),
+            BookSource::cover_candidates,
+        )
+    }
     /// Optional generation for the parsed content. A source returning `Some`
     /// must advance it whenever its section output changes; `None` requires
     /// consumers to validate derived caches against the content itself.
@@ -250,6 +267,7 @@ mod tests {
                 authors: vec![],
                 languages: vec![],
                 layout: RenditionLayout::Reflowable,
+                ..Metadata::default()
             },
             cover: None,
             sections: vec![],

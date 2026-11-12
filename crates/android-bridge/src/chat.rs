@@ -3,9 +3,10 @@ use rebook_app_core::{
     highlights::HighlightRepository,
     plugins::{self, ChatRole, ChatStreamEvent, ChatTurn},
 };
-use serde::{Deserialize, Serialize};
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
+mod history;
+pub use history::ChatSource;
+use history::{StreamState, append_turn};
 
 pub(crate) struct PendingChanges {
     pub response: plugins::ChatResponse,
@@ -13,12 +14,16 @@ pub(crate) struct PendingChanges {
     pub replace_rewrites: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Default, uniffi::Record)]
 pub struct ChatMessage {
+    pub id: String,
     pub user: bool,
     pub content: String,
-    #[serde(default)]
     pub images: Vec<crate::chat_media::ChatAttachment>,
+    pub progress: Vec<String>,
+    pub thinking_seconds: Option<u64>,
+    pub stopped: bool,
+    pub citations: Vec<String>,
 }
 #[derive(Clone, uniffi::Record)]
 pub struct ChatChange {
@@ -32,6 +37,7 @@ pub struct ChatReply {
 }
 #[derive(uniffi::Object)]
 pub struct ChatRequest {
+    id: String,
     pub(crate) scheduling: rebook_app_core::reading_ai::Cancellation,
     pub(crate) cancelled: AtomicBool,
     pub(crate) notify: Arc<tokio::sync::Notify>,
@@ -42,6 +48,7 @@ impl ChatRequest {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            id: uuid::Uuid::new_v4().to_string(),
             scheduling: Default::default(),
             cancelled: AtomicBool::new(false),
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -52,6 +59,9 @@ impl ChatRequest {
         self.scheduling.cancel();
         self.cancelled.store(true, Ordering::Release);
         self.notify.notify_one();
+    }
+    pub fn id(&self) -> String {
+        self.id.clone()
     }
 }
 #[uniffi::export(with_foreign)]
@@ -80,26 +90,6 @@ impl ChatRequest {
 pub trait ChatListener: Send + Sync {
     fn update(&self, content: String, reasoning: String, activity: String);
 }
-pub(crate) fn load_messages(path: &std::path::Path) -> Vec<ChatMessage> {
-    std::fs::File::open(path)
-        .ok()
-        .and_then(|file| {
-            let mut bytes = Vec::new();
-            file.take(4 * 1024 * 1024 + 1)
-                .read_to_end(&mut bytes)
-                .ok()?;
-            (bytes.len() <= 4 * 1024 * 1024).then_some(bytes)
-        })
-        .and_then(|b| serde_json::from_slice::<Vec<ChatMessage>>(&b).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .rev()
-        .take(60)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
 #[uniffi::export]
 impl MobileReader {
     pub async fn chat_history(self: Arc<Self>) -> Result<Vec<ChatMessage>> {
@@ -110,8 +100,6 @@ impl MobileReader {
             self.with(|s| {
                 s.messages.clear();
                 s.pending = None;
-                rebook_app_core::persistence::write_json_atomic(&s.chat_path, &s.messages)
-                    .map_err(error)?;
                 let images = s.chat_path.with_extension("images");
                 if images.exists() {
                     std::fs::remove_dir_all(images).map_err(error)?;
@@ -221,8 +209,8 @@ impl MobileReader {
                     .iter()
                     .zip(history_images)
                     .map(|(m, images)| ChatTurn {
-                        thinking_seconds: None,
-                        progress: vec![],
+                        thinking_seconds: m.thinking_seconds,
+                        progress: m.progress.clone(),
                         images,
                         role: if m.user {
                             ChatRole::User
@@ -233,35 +221,52 @@ impl MobileReader {
                         display_content: None,
                     })
                     .collect();
-                let mut content = String::new();
-                let mut reasoning = String::new();
-                let mut activity = String::new();
+                let mut stream = StreamState::default();
                 let before = s.pipeline.rewrite.list_rewrites(None).map_err(error)?;
-                let mut response = runtime()
-                    .block_on(plugins::chat_with_book(
-                        s.source.clone(),
-                        s.format,
-                        plugins::ChatRequestKind::Normal,
-                        s.pipeline.rewrite.clone(),
-                        s.book_id.clone(),
-                        selection,
-                        s.store.highlights_for_book(&s.book_id).map_err(error)?,
-                        settings,
-                        history,
-                        question.clone(),
-                        context,
-                        language,
-                        request.notify.clone(),
-                        |event| {
-                            match event {
-                                ChatStreamEvent::Content(v) => content = v,
-                                ChatStreamEvent::Reasoning(v) => reasoning = v,
-                                ChatStreamEvent::Tool { text, .. } => activity = text,
-                            }
-                            listener.update(content.clone(), reasoning.clone(), activity.clone());
-                        },
-                    ))
-                    .map_err(error)?;
+                let result = runtime().block_on(plugins::chat_with_book(
+                    s.source.clone(),
+                    s.format,
+                    plugins::ChatRequestKind::Normal,
+                    s.pipeline.rewrite.clone(),
+                    s.book_id.clone(),
+                    selection,
+                    s.store.highlights_for_book(&s.book_id).map_err(error)?,
+                    settings,
+                    history,
+                    question.clone(),
+                    context,
+                    language,
+                    request.notify.clone(),
+                    |event| {
+                        stream.update(event);
+                        listener.update(
+                            stream.content.clone(),
+                            stream.reasoning.clone(),
+                            stream.activity.clone(),
+                        );
+                    },
+                ));
+                let mut response = match result {
+                    Ok(response) => response,
+                    Err(e) if request.cancelled.load(Ordering::Acquire) || e.contains("已停止") =>
+                    {
+                        let content = stream.content.clone();
+                        append_turn(
+                            s,
+                            &request.id,
+                            question,
+                            attachments,
+                            content,
+                            &stream,
+                            true,
+                        )?;
+                        return Ok(ChatReply {
+                            messages: s.messages.clone(),
+                            changes: vec![],
+                        });
+                    }
+                    Err(e) => return Err(error(e)),
+                };
                 let after = s.pipeline.rewrite.list_rewrites(None).map_err(error)?;
                 let replace_rewrites = before != after;
                 // Tools may temporarily stage rewrites to inspect their own output.
@@ -273,7 +278,19 @@ impl MobileReader {
                     s.pipeline.rewrite.rollback(transaction).map_err(error)?;
                 }
                 if request.cancelled.load(Ordering::Acquire) {
-                    return Err(error("已停止生成"));
+                    append_turn(
+                        s,
+                        &request.id,
+                        question,
+                        attachments,
+                        response.content,
+                        &stream,
+                        true,
+                    )?;
+                    return Ok(ChatReply {
+                        messages: s.messages.clone(),
+                        changes: vec![],
+                    });
                 }
                 let mut changes = after
                     .iter()
@@ -315,21 +332,15 @@ impl MobileReader {
                         text: format!("将以下临时改写还原为原文：\n{}", removed.text),
                     });
                 }
-                s.messages.push(ChatMessage {
-                    user: true,
-                    content: question,
-                    images: attachments,
-                });
-                s.messages.push(ChatMessage {
-                    user: false,
-                    content: response.content.clone(),
-                    images: vec![],
-                });
-                if s.messages.len() > 60 {
-                    s.messages.drain(..s.messages.len() - 60);
-                }
-                rebook_app_core::persistence::write_json_atomic(&s.chat_path, &s.messages)
-                    .map_err(error)?;
+                append_turn(
+                    s,
+                    &request.id,
+                    question,
+                    attachments,
+                    response.content.clone(),
+                    &stream,
+                    false,
+                )?;
                 if !changes.is_empty() {
                     s.pending = Some(PendingChanges {
                         response,

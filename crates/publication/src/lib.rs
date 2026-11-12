@@ -10,6 +10,7 @@ pub use headings::{heading_ordinal_key, is_heading_separator};
 pub use toc::{TocMatch, toc_entry_for_href};
 
 use std::fmt;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use percent_encoding::percent_decode_str;
@@ -151,6 +152,12 @@ impl PublicationUrl {
         Self::resolve_from_segments(&[], value)
     }
 
+    /// An archive entry name is a decoded path, not a URI reference. In
+    /// particular, a literal `%20` in a ZIP filename must remain `%20`.
+    pub fn from_archive_path(value: &str) -> Result<Self, PublicationError> {
+        Self::parse(&escape_path_delimiters(value))
+    }
+
     /// Resolves a relative reference against this resource URL.
     pub fn resolve(&self, reference: &str) -> Result<Self, PublicationError> {
         if self.external_web.is_some() {
@@ -241,12 +248,20 @@ impl fmt::Display for PublicationUrl {
         if let Some(url) = &self.external_web {
             return formatter.write_str(url);
         }
-        formatter.write_str(&self.path)?;
+        formatter.write_str(&escape_path_delimiters(&self.path))?;
         if let Some(fragment) = &self.fragment {
-            write!(formatter, "#{fragment}")?;
+            formatter.write_str("#")?;
+            if fragment.contains('%') { formatter.write_str(&fragment.replace('%', "%25"))?; }
+            else { formatter.write_str(fragment)?; }
         }
         Ok(())
     }
+}
+
+fn escape_path_delimiters(value: &str) -> Cow<'_, str> {
+    if value.bytes().any(|b| matches!(b, b'%' | b'#' | b'?')) {
+        Cow::Owned(value.replace('%', "%25").replace('#', "%23").replace('?', "%3F"))
+    } else { Cow::Borrowed(value) }
 }
 
 /// Normalized metadata used by the shelf and reader.
@@ -260,6 +275,52 @@ pub struct Metadata {
     pub languages: Vec<String>,
     /// Package-level rendition layout.
     pub layout: RenditionLayout,
+    /// Optional package metadata, retained without changing the display title.
+    #[serde(default, skip_serializing_if = "MetadataDetails::is_empty")]
+    pub details: MetadataDetails,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataDetails {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub titles: Vec<MetadataTitle>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributors: Vec<Contributor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identifiers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_position: Option<String>,
+}
+impl MetadataDetails {
+    pub fn is_empty(&self) -> bool { self == &Self::default() }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataTitle {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Contributor {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_as: Option<String>,
 }
 
 impl Metadata {
@@ -359,6 +420,24 @@ pub struct TocEntry {
     pub href: Option<PublicationUrl>,
     /// Nested entries.
     pub children: Vec<Self>,
+}
+
+/// Navigation beyond the chapter TOC, retained independently of reader UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NavigationMetadata {
+    #[serde(default)]
+    pub page_list: Vec<TocEntry>,
+    #[serde(default)]
+    pub landmarks: Vec<Landmark>,
+    #[serde(default)]
+    pub page_progression: Option<TextDirection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Landmark {
+    pub kinds: Vec<String>,
+    pub label: String,
+    pub href: PublicationUrl,
 }
 
 /// Describes where the currently exposed table of contents came from.
@@ -1197,6 +1276,12 @@ pub struct TextStyle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_writing_system: Option<WritingSystem>,
     pub bold: bool,
+    /// Explicit local emphasis, distinct from a book's default bold typography.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bold_emphasis: bool,
+    /// Derived from a bounded source-wide typography profile; authored bold stays intact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub body_bold: bool,
     pub italic: bool,
     /// Semantic stress emphasis originating from HTML `<em>`.
     #[serde(default)]
@@ -1249,6 +1334,8 @@ impl Default for TextStyle {
             footnote_number: 0,
             display_writing_system: None,
             bold: false,
+            bold_emphasis: false,
+            body_bold: false,
             italic: false,
             emphasis: false,
             alternate_voice: false,
@@ -1727,6 +1814,17 @@ mod tests {
 
         assert_eq!(resolved.path(), "OPS/Images/cover image.jpg");
         assert_eq!(resolved.fragment(), Some("hero"));
+    }
+
+    #[test]
+    fn literal_archive_delimiters_round_trip_without_a_second_uri_decode() {
+        for name in ["Images/cover%20literal.png", "Images/cover#1.png", "Images/question?.png"] {
+            let href = PublicationUrl::from_archive_path(name).unwrap();
+            assert_eq!(href.path(), name);
+            assert_eq!(PublicationUrl::parse(&href.to_string()).unwrap(), href);
+        }
+        assert!(PublicationUrl::from_archive_path("../escape").is_err());
+        assert_ne!(PublicationUrl::from_archive_path("%2e%2e/file").unwrap().path(), "../file");
     }
 
     #[test]

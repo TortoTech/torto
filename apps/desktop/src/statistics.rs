@@ -253,7 +253,7 @@ impl Page {
                         left: 24,
                         right: 24,
                         top: 28,
-                        bottom: 28,
+                        bottom: 0,
                     }),
             )
             .show(root, |ui| {
@@ -291,6 +291,7 @@ impl Page {
                                 } else {
                                     self.overview(ui, language, cover_texture);
                                 }
+                                ui.add_space(28.0);
                             });
                     });
                 });

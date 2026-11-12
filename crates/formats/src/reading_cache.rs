@@ -25,7 +25,7 @@ use image_dimensions::ImageDimensions;
 
 // Bump when source parsing, structural heuristics, or the stored model changes.
 // Release versions additionally isolate caches from older executables.
-const REVISION: u32 = 17;
+const REVISION: u32 = 20;
 const MAGIC: &[u8; 8] = b"TRDIR\x02\0\0";
 const HEADER_BYTES: usize = 84;
 const MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
@@ -193,6 +193,18 @@ impl CachedSource {
 }
 
 impl BookSource for CachedSource {
+    fn navigation_metadata(&self) -> Option<&rebook_publication::NavigationMetadata> {
+        self.index.epub.as_ref().map(|e| &e.navigation)
+    }
+    fn raster_resource(&self, href: &PublicationUrl) -> Result<Option<rebook_publication::RasterResource>, PublicationError> {
+        self.original()?.raster_resource(href)
+    }
+    fn raster_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
+        if href.path().to_ascii_lowercase().ends_with(".svg")
+            || self.index.epub.as_ref().is_some_and(|e| e.is_svg(href)) {
+            self.original()?.raster_resource_dimensions(href)
+        } else { Ok(None) }
+    }
     fn book(&self) -> &Book {
         &self.index.book
     }

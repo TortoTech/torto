@@ -28,6 +28,7 @@ pub(crate) struct MobiMetadata {
     pub authors: Vec<String>,
     pub languages: Vec<String>,
     pub cover_path: Option<String>,
+    pub details: rebook_publication::MetadataDetails,
 }
 
 pub(crate) struct Mobi6Book {
@@ -116,6 +117,7 @@ fn metadata_inner(data: &[u8]) -> Result<MobiMetadata, String> {
     let mut languages = Vec::new();
     let mut cover_offset = None;
     let mut thumbnail_offset = None;
+    let mut details = rebook_publication::MetadataDetails::default();
     if optional_u32(record, 128).unwrap_or_default() & 0x40 != 0 {
         let exth_start = 16usize
             .checked_add(header_length)
@@ -123,6 +125,15 @@ fn metadata_inner(data: &[u8]) -> Result<MobiMetadata, String> {
         for entry in parse_exth(record, exth_start)? {
             match entry.kind {
                 100 => push_metadata_text(&mut authors, entry.data, context.header.encoding),
+                101 => details.publisher = Some(decode_html_entities(decode_text(entry.data, context.header.encoding).trim())),
+                103 => details.description = Some(decode_text(entry.data, context.header.encoding)),
+                104 | 113 => push_metadata_text(&mut details.identifiers, entry.data, context.header.encoding),
+                105 => push_metadata_text(&mut details.subjects, entry.data, context.header.encoding),
+                106 => details.published = Some(decode_text(entry.data, context.header.encoding)),
+                108 => details.contributors.push(rebook_publication::Contributor {
+                    name: decode_html_entities(decode_text(entry.data, context.header.encoding).trim()),
+                    roles: Vec::new(), sort_as: None,
+                }),
                 201 => cover_offset = uint_from_bytes(entry.data).ok(),
                 202 => thumbnail_offset = uint_from_bytes(entry.data).ok(),
                 503 => {
@@ -144,8 +155,12 @@ fn metadata_inner(data: &[u8]) -> Result<MobiMetadata, String> {
     let invalid_index = INVALID_INDEX as usize;
     let cover_path = cover_offset
         .filter(|offset| *offset != invalid_index)
-        .or_else(|| thumbnail_offset.filter(|offset| *offset != invalid_index))
-        .and_then(|offset| resource_path(&context, offset + 1).ok().flatten());
+        .and_then(|offset| resource_path(&context, offset + 1).ok().flatten())
+        .or_else(|| thumbnail_offset.filter(|offset| *offset != invalid_index)
+            .and_then(|offset| resource_path(&context, offset + 1).ok().flatten()));
+    details.contributors.extend(authors.iter().map(|name| rebook_publication::Contributor {
+        name: decode_html_entities(name.trim()), roles: vec!["aut".into()], sort_as: None,
+    }));
     Ok(MobiMetadata {
         title: title.map(|value| decode_html_entities(value.trim())),
         authors: authors
@@ -155,6 +170,7 @@ fn metadata_inner(data: &[u8]) -> Result<MobiMetadata, String> {
             .collect(),
         languages,
         cover_path,
+        details,
     })
 }
 
@@ -285,7 +301,7 @@ fn parse_inner(bytes: &[u8]) -> Result<Kf8Book, String> {
 
     let mut resources = Vec::new();
     let mut resource_paths = HashMap::new();
-    load_embedded_images(&context, &mut resources, &mut resource_paths)?;
+    load_embedded_resources(&context, &mut resources, &mut resource_paths)?;
     load_flow_resources(
         &raw,
         &flow_table,
@@ -1300,7 +1316,7 @@ fn required_tag<'a>(
     Ok(values)
 }
 
-fn load_embedded_images(
+fn load_embedded_resources(
     context: &Context<'_>,
     resources: &mut Vec<SourceResource>,
     paths: &mut HashMap<ResourceKey, String>,
@@ -1308,12 +1324,28 @@ fn load_embedded_images(
     let records = context
         .image_records()?;
     let resource_start = records.start;
+    let mut font_bytes = 0usize;
+    let mut font_records = 0usize;
     for absolute_index in records {
         let record = context.pdb.record(absolute_index)?;
+        let id = absolute_index - resource_start + 1;
+        if record.starts_with(b"FONT") {
+            font_records += 1;
+            if font_records > 128 || font_bytes >= 32 * 1024 * 1024 { continue; }
+            if let Some(bytes) = crate::font_data::kindle(record)
+                && let Some((extension, media_type)) = crate::font_data::media_type(&bytes)
+            {
+                if font_bytes.saturating_add(bytes.len()) > 32 * 1024 * 1024 { continue; }
+                font_bytes += bytes.len();
+                let path = format!("Fonts/kindle-{id}.{extension}");
+                paths.insert(ResourceKey::Embed(id), path.clone());
+                resources.push(SourceResource { path, media_type: media_type.into(), bytes });
+            }
+            continue;
+        }
         let Some((extension, media_type)) = image_type(record) else {
             continue;
         };
-        let id = absolute_index - resource_start + 1;
         let path = format!("Images/kindle-{id}.{extension}");
         paths.insert(ResourceKey::Embed(id), path.clone());
         resources.push(SourceResource {
@@ -1876,7 +1908,7 @@ mod tests {
         assert_eq!(context.relative_record(1).unwrap(), b"kf8 text");
         let mut images = vec![];
         let mut paths = HashMap::new();
-        load_embedded_images(&context, &mut images, &mut paths).unwrap();
+        load_embedded_resources(&context, &mut images, &mut paths).unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(paths[&ResourceKey::Embed(1)], "Images/kindle-1.jpg");
     }

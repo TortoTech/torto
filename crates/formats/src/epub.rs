@@ -26,6 +26,12 @@ use crate::source::{TocHeadingHint, collect_toc_heading_hints, promote_toc_headi
 
 use crate::continuations;
 mod html_context;
+mod navigation;
+mod font_encryption;
+mod metadata;
+mod covers;
+#[cfg(test)]
+mod compatibility_tests;
 
 /// Resource budgets applied before and during decompression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +78,10 @@ struct EpubOpenOptions {
 /// Parsed EPUB backed by an immutable in-memory archive and lazy resource reads.
 #[derive(Debug)]
 pub(super) struct EpubPublication {
+    navigation: rebook_publication::NavigationMetadata,
+    cover_candidates: Vec<PublicationUrl>,
+    font_decoders: HashMap<String, crate::font_data::Decoder>,
+    toc_origin: rebook_publication::TableOfContentsOrigin,
     cover_page: Option<PublicationUrl>,
     book: Book,
     media_types: HashMap<String, String>,
@@ -84,15 +94,36 @@ pub(super) struct EpubPublication {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct ReadingIndex {
     pub book: Book,
+    #[serde(default)]
+    pub(super) navigation: rebook_publication::NavigationMetadata,
+    #[serde(default)]
+    toc_origin: rebook_publication::TableOfContentsOrigin,
+    #[serde(default)]
+    font_decoders: HashMap<String, crate::font_data::Decoder>,
+    #[serde(default)]
+    cover_candidates: Vec<PublicationUrl>,
     cover_page: Option<PublicationUrl>,
     media_types: HashMap<String, String>,
     navigation_documents: Vec<PublicationUrl>,
 }
 
+impl ReadingIndex {
+    pub(super) fn is_svg(&self, href: &PublicationUrl) -> bool {
+        self.media_types.get(href.path()).is_some_and(|t| t == "image/svg+xml")
+    }
+}
+
 impl EpubPublication {
+    fn is_svg(&self, href: &PublicationUrl) -> bool {
+        self.media_types.get(href.path()).map_or_else(|| guess_media_type(href.path()) == "image/svg+xml", |t| t == "image/svg+xml")
+    }
     pub(super) fn reading_index(&self) -> ReadingIndex {
         ReadingIndex {
             book: self.book.clone(),
+            navigation: self.navigation.clone(),
+            toc_origin: self.toc_origin,
+            font_decoders: self.font_decoders.clone(),
+            cover_candidates: self.cover_candidates.clone(),
             cover_page: self.cover_page.clone(),
             media_types: self.media_types.clone(),
             navigation_documents: self.html_context.navigation_documents.clone(),
@@ -107,6 +138,10 @@ impl EpubPublication {
         ensure_limit(bytes.len() as u64 <= limits.archive_bytes, "archive exceeds configured byte limit")?;
         let archive = EpubArchive::new(bytes, limits)?;
         Ok(Self {
+            navigation: index.navigation,
+            cover_candidates: index.cover_candidates,
+            font_decoders: index.font_decoders,
+            toc_origin: index.toc_origin,
             toc_heading_hints: collect_toc_heading_hints(&index.book.table_of_contents),
             html_context: crate::HtmlContext::new(&index.book.table_of_contents, index.navigation_documents),
             book: index.book,
@@ -154,10 +189,13 @@ impl EpubPublication {
         let container_url = PublicationUrl::parse("META-INF/container.xml")?;
         let container = archive.read_xml(&container_url)?;
         let rootfile_path = parse_container(&container)?;
-        let package_url = PublicationUrl::parse(&rootfile_path)?.resource_url();
+        let package_url = PublicationUrl::from_archive_path(&rootfile_path)?.resource_url();
         let package = archive.read_xml(&package_url)?;
         let package_model = parse_package(&package, &package_url)?;
+        let font_decoders = font_encryption::read(&archive, &package);
         let cover_page = discover_cover_page(&archive, &package_model, &package, &package_url);
+        let cover_candidates = covers::candidates(&archive, &package_model, &package, &package_url, cover_page.is_none());
+        let cover = cover_candidates.first().cloned().or_else(|| package_model.cover.clone());
 
         let mut media_types = HashMap::new();
         for item in package_model
@@ -168,9 +206,11 @@ impl EpubPublication {
             media_types.insert(item.href.path().to_owned(), item.media_type.clone());
         }
 
-        let mut reading_order = build_reading_order(&package_model)?;
-        let table_of_contents =
-            promote_single_toc_root(parse_navigation(&archive, &package_model)?);
+        let mut reading_order = build_reading_order(&package_model, &archive)?;
+        let (toc, toc_origin) = navigation::read(&archive, &package_model, &reading_order, &package_url);
+        let navigation = navigation::auxiliary(&archive, &package_model, &package, &package_url);
+        let table_of_contents = promote_single_toc_root(toc);
+        navigation::add_nonspine_targets(&table_of_contents, &package_model, &archive, &mut reading_order);
         let toc_heading_hints = collect_toc_heading_hints(&table_of_contents);
         let html_context =
             html_context::build(&package_model, &package, &package_url, &table_of_contents);
@@ -188,11 +228,15 @@ impl EpubPublication {
         };
 
         Ok(Self {
+            navigation,
+            cover_candidates,
+            font_decoders,
+            toc_origin,
             cover_page,
             book: Book {
                 id,
                 metadata: package_model.metadata,
-                cover: package_model.cover,
+                cover,
                 sections: reading_order,
                 table_of_contents,
             },
@@ -208,8 +252,23 @@ impl EpubPublication {
 use crate::html_context::collect_note_section_paths;
 
 impl BookSource for EpubPublication {
+    fn navigation_metadata(&self) -> Option<&rebook_publication::NavigationMetadata> { Some(&self.navigation) }
+    fn raster_resource(&self, href: &PublicationUrl) -> Result<Option<rebook_publication::RasterResource>, PublicationError> {
+        if self.is_svg(href) { crate::svg::raster(self, href) } else { Ok(None) }
+    }
+    fn raster_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
+        if self.is_svg(href) { self.html_context.svg_dimensions.get(self, href) } else { Ok(None) }
+    }
     fn book(&self) -> &Book {
         &self.book
+    }
+
+    fn table_of_contents_origin(&self) -> rebook_publication::TableOfContentsOrigin {
+        self.toc_origin
+    }
+
+    fn cover_candidates(&self) -> Vec<PublicationUrl> {
+        self.cover_candidates.clone()
     }
 
     fn cover_section(&self) -> Result<Option<Section>, PublicationError> {
@@ -261,8 +320,7 @@ impl BookSource for EpubPublication {
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
         let href = href.resource_url();
         let bytes = self
-            .archive
-            .read(&href)
+            .resource_bytes(&href)
             .map_err(EpubError::into_publication_error)?;
         let media_type = self
             .media_types
@@ -282,15 +340,11 @@ impl EpubPublication {
         let descriptor = self.book.sections.get(index).ok_or_else(|| {
             EpubError::InvalidArchive(format!("section index out of bounds: {index}"))
         })?;
-        if descriptor.media_type != "application/xhtml+xml" && descriptor.media_type != "text/html"
-        {
-            return Err(EpubError::Unsupported(format!(
-                "reflowable section media type: {}",
-                descriptor.media_type
-            )));
-        }
-
-        let xml = self.archive.read_content_xml(&descriptor.href)?;
+        let xml = match descriptor.media_type.as_str() {
+            "application/xhtml+xml" | "text/html" => self.archive.read_content_xml(&descriptor.href)?,
+            "image/svg+xml" => "<html><body><img src=\"#\"/></body></html>".into(),
+            _ => return Err(EpubError::Unsupported(format!("reflowable section media type: {}", descriptor.media_type))),
+        };
         let mut section = parse_section_with_resource_metadata(
             &xml,
             descriptor,
@@ -315,8 +369,17 @@ impl EpubPublication {
     fn font_traits(&self, href: &PublicationUrl) -> Option<rebook_html::FontTraits> {
         self.html_context.font_traits(href, || {
             (self.archive.entries.get(href.path())?.size <= crate::font_metadata::MAX_FONT_BYTES as u64)
-                .then(|| self.archive.read(href).ok()).flatten()
+                .then(|| self.resource_bytes(href).ok()).flatten()
         })
+    }
+
+    fn resource_bytes(&self, href: &PublicationUrl) -> Result<Vec<u8>, EpubError> {
+        let mut bytes = self.archive.read(href)?;
+        if let Some(decoder) = self.font_decoders.get(href.path()) {
+            ensure_limit(bytes.len() <= crate::font_metadata::MAX_FONT_BYTES, "embedded font exceeds byte limit")?;
+            decoder.apply(&mut bytes);
+        }
+        Ok(bytes)
     }
 }
 
@@ -431,7 +494,7 @@ impl EpubArchive {
                 )));
             }
 
-            let href = PublicationUrl::parse(&entry_name)?.resource_url();
+            let href = PublicationUrl::from_archive_path(&entry_name)?.resource_url();
             ensure_limit(
                 file.size() <= limits.entry_bytes,
                 format!(
@@ -771,7 +834,7 @@ fn recover_local_entry(
         return Ok(None);
     }
 
-    let href = PublicationUrl::parse(&file_name)?.resource_url();
+    let href = PublicationUrl::from_archive_path(&file_name)?.resource_url();
     ensure_limit(
         size <= limits.entry_bytes,
         format!(
@@ -1096,6 +1159,7 @@ struct ManifestItem {
     href: PublicationUrl,
     media_type: String,
     properties: Vec<String>,
+    fallback: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1149,8 +1213,7 @@ fn parse_package_metadata(package: Node<'_, '_>) -> (Metadata, Option<String>) {
     let title = metadata_node
         .and_then(|metadata| first_descendant_text(metadata, "title"))
         .unwrap_or_else(|| "Untitled publication".into());
-    let authors =
-        metadata_node.map_or_else(Vec::new, |metadata| descendant_texts(metadata, "creator"));
+    let (authors, details) = metadata::details(metadata_node);
     let languages =
         metadata_node.map_or_else(Vec::new, |metadata| descendant_texts(metadata, "language"));
     let layout = metadata_node
@@ -1183,6 +1246,7 @@ fn parse_package_metadata(package: Node<'_, '_>) -> (Metadata, Option<String>) {
             authors,
             languages,
             layout,
+            details,
         },
         epub2_cover_id,
     )
@@ -1215,7 +1279,8 @@ fn parse_package(xml: &str, package_url: &PublicationUrl) -> Result<PackageModel
     {
         let id = required_attribute(item, "id", package_url)?;
         let raw_href = required_attribute(item, "href", package_url)?;
-        let media_type = required_attribute(item, "media-type", package_url)?;
+        let media_type = required_attribute(item, "media-type", package_url)?
+            .split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
         let href = package_url.resolve(&raw_href)?.resource_url();
         let properties = token_attribute(item, "properties");
         let model = ManifestItem {
@@ -1223,6 +1288,7 @@ fn parse_package(xml: &str, package_url: &PublicationUrl) -> Result<PackageModel
             href,
             media_type,
             properties,
+            fallback: attribute_local(item, "fallback").map(str::to_owned),
         };
         if manifest.insert(id.clone(), model).is_some() {
             return Err(EpubError::InvalidXml {
@@ -1283,69 +1349,43 @@ fn parse_package(xml: &str, package_url: &PublicationUrl) -> Result<PackageModel
     })
 }
 
-fn build_reading_order(package: &PackageModel) -> Result<Vec<SpineItem>, EpubError> {
-    package
+fn build_reading_order(package: &PackageModel, archive: &EpubArchive) -> Result<Vec<SpineItem>, EpubError> {
+    let spine = package
         .spine
         .iter()
-        .map(|reference| {
-            let item = package.manifest.get(&reference.idref).ok_or_else(|| {
-                EpubError::InvalidArchive(format!(
-                    "spine references unknown manifest ID: {}",
-                    reference.idref
-                ))
-            })?;
+        .filter_map(|reference| {
+            let item = resolve_manifest_item(package, &reference.idref, archive)?;
             let mut properties = item.properties.clone();
             for property in &reference.properties {
                 if !properties.contains(property) {
                     properties.push(property.clone());
                 }
             }
-            Ok(SpineItem {
-                id: SpineItemId::new(item.id.clone())?,
+            Some(SpineItem {
+                id: SpineItemId::new(reference.idref.clone()).expect("validated manifest ID"),
                 href: item.href.clone(),
                 media_type: item.media_type.clone(),
                 linear: reference.linear,
                 properties,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if spine.is_empty() { return Err(EpubError::InvalidArchive("spine contains no available supported content".into())); }
+    Ok(spine)
 }
 
-fn parse_navigation(
-    archive: &EpubArchive,
-    package: &PackageModel,
-) -> Result<Vec<TocEntry>, EpubError> {
-    let nav_item = package
-        .manifest_order
-        .iter()
-        .filter_map(|id| package.manifest.get(id))
-        .find(|item| item.properties.iter().any(|property| property == "nav"));
-    if let Some(nav_item) = nav_item {
-        let xml = archive.read_xml(&nav_item.href)?;
-        let toc = parse_epub_navigation(&xml, &nav_item.href)?;
-        if !toc.is_empty() {
-            return Ok(toc);
+fn resolve_manifest_item<'a>(package: &'a PackageModel, id: &str, archive: &EpubArchive) -> Option<&'a ManifestItem> {
+    let mut item = package.manifest.get(id)?;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..64 {
+        if matches!(item.media_type.as_str(), "application/xhtml+xml" | "text/html" | "image/svg+xml")
+            && archive.entries.contains_key(item.href.path()) {
+            return Some(item);
         }
+        if !seen.insert(&item.id) { return None; }
+        item = package.manifest.get(item.fallback.as_ref()?)?;
     }
-
-    let ncx_item = package
-        .ncx_id
-        .as_ref()
-        .and_then(|id| package.manifest.get(id))
-        .or_else(|| {
-            package
-                .manifest_order
-                .iter()
-                .filter_map(|id| package.manifest.get(id))
-                .find(|item| item.media_type == "application/x-dtbncx+xml")
-        });
-    ncx_item.map_or_else(
-        || Ok(Vec::new()),
-        |item| {
-            let xml = archive.read_xml(&item.href)?;
-            parse_ncx(&xml, &item.href)
-        },
-    )
+    None
 }
 
 fn parse_epub_navigation(xml: &str, nav_url: &PublicationUrl) -> Result<Vec<TocEntry>, EpubError> {
@@ -1377,12 +1417,7 @@ fn parse_nav_list(
                 .unwrap_or_else(|| "Untitled section".into());
             let href = label_node
                 .and_then(|node| attribute_local(node, "href"))
-                .map(|value| nav_url.resolve(value))
-                .transpose()
-                .or_else(|error| match error {
-                    PublicationError::ExternalUrl(_) => Ok(None),
-                    other => Err(other),
-                })?;
+                .and_then(|value| nav_url.resolve(value).ok());
             let children = direct_child(item, "ol")
                 .map(|nested| parse_nav_list(nested, nav_url))
                 .transpose()?
@@ -1424,12 +1459,7 @@ fn parse_nav_points(
                 .children()
                 .find(|node| node.is_element() && node.tag_name().name() == "content")
                 .and_then(|node| attribute_local(node, "src"))
-                .map(|value| ncx_url.resolve(value))
-                .transpose()
-                .or_else(|error| match error {
-                    PublicationError::ExternalUrl(_) => Ok(None),
-                    other => Err(other),
-                })?;
+                .and_then(|value| ncx_url.resolve(value).ok());
             Ok(TocEntry {
                 label,
                 href,
@@ -1638,6 +1668,7 @@ fn required_attribute(
     resource: &PublicationUrl,
 ) -> Result<String, EpubError> {
     attribute_local(node, name)
+        .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
         .ok_or_else(|| EpubError::InvalidXml {
             resource: resource.to_string(),

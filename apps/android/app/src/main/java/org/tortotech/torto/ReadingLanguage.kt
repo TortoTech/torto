@@ -13,7 +13,7 @@ internal fun showReadingTranslation(bookLanguages:List<String>,system:Locale,tra
 }
 
 /** Compare language rather than region, including ISO 639 two- and three-letter codes. */
-private fun readingLanguage(locale:Locale):String? {
+internal fun readingLanguage(locale:Locale):String? {
     if(locale.language.isBlank()||locale.language in setOf("und","mul","zxx"))return null
     val language=try {locale.isO3Language} catch(_:MissingResourceException){return null}
     return when(language){

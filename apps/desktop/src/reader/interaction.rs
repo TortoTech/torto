@@ -58,72 +58,23 @@ impl DesktopReader {
         let unit = self.focus_units.get(index)?;
         self.highlights
             .iter()
-            .find(|highlight| focus_unit_matches_highlight_ranges(unit, &highlight.ranges))
-            .and_then(|highlight| highlight.note.clone())
+            .filter(|highlight| focus_unit_matches_highlight_ranges(unit, &highlight.ranges))
+            .find_map(|highlight| highlight.note.clone())
             .filter(|note| !note.trim().is_empty())
     }
 
     pub(in crate::reader) fn toggle_focus_highlight(&mut self) {
-        let Some((ranges, _)) = self.focus_annotation_payload() else {
-            return;
-        };
-        let existing = self
-            .highlights
-            .iter()
-            .find(|highlight| highlight.ranges == ranges)
-            .map(|highlight| highlight.id.clone());
-        if let Some(id) = existing {
-            self.remove_highlight(&id);
-        } else {
-            self.create_focus_highlight(None);
+        if let Some((ranges,text))=self.focus_annotation_payload(){
+            self.save_selection_annotation(ranges,text,None,rebook_app_core::highlights::selection::SelectionAction::Toggle,false);
+        }
+    }
+    pub(in crate::reader) fn create_focus_highlight(&mut self,note:Option<String>) {
+        if let Some((ranges,text))=self.focus_annotation_payload(){
+            self.save_selection_annotation(ranges,text,note,rebook_app_core::highlights::selection::SelectionAction::Add,false);
         }
     }
 
-    pub(in crate::reader) fn create_focus_highlight(&mut self, note: Option<String>) {
-        let Some((ranges, text)) = self.focus_annotation_payload() else {
-            return;
-        };
-        let note = note.and_then(|note| {
-            let note = note.trim().to_owned();
-            (!note.is_empty()).then_some(note)
-        });
-        if let Some(index) = self
-            .highlights
-            .iter()
-            .position(|highlight| highlight.ranges == ranges)
-        {
-            let Some(note) = note else {
-                return;
-            };
-            let mut highlight = self.highlights[index].clone();
-            highlight.note = Some(note);
-            match self.highlight_store.update(&highlight) {
-                Ok(true) => {
-                    self.highlights[index] = highlight;
-                    self.annotation_note_draft = None;
-                    self.bump_scene_revision();
-                    self.error = None;
-                }
-                Ok(false) => {
-                    self.error = Some("The annotation no longer exists".into());
-                }
-                Err(error) => self.error = Some(format!("Failed to save annotation: {error}")),
-            }
-            return;
-        }
-        let highlight = StoredHighlight::with_note(self.book_id.clone(), ranges, text, note);
-        match self.highlight_store.insert(&highlight) {
-            Ok(()) => {
-                self.highlights.insert(0, highlight);
-                self.annotation_note_draft = None;
-                self.bump_scene_revision();
-                self.error = None;
-            }
-            Err(error) => self.error = Some(format!("Failed to save highlight: {error}")),
-        }
-    }
-
-    fn focus_annotation_payload(&self) -> Option<(Vec<SourceRange>, String)> {
+    pub(super) fn focus_annotation_payload(&self) -> Option<(Vec<SourceRange>, String)> {
         let units = self
             .focus_action_units()
             .iter()
@@ -438,28 +389,9 @@ impl DesktopReader {
         }
     }
 
-    pub(in crate::reader) fn create_highlight(&mut self, note: Option<String>) {
-        let Some(selection) = self.selection.clone() else {
-            return;
-        };
-        let highlight = StoredHighlight::with_note(
-            self.book_id.clone(),
-            selection.ranges,
-            selection.text,
-            note,
-        );
-        match self.highlight_store.insert(&highlight) {
-            Ok(()) => {
-                self.highlights.insert(0, highlight);
-                self.selection_toolbar_visible = false;
-                self.annotation_note_draft = None;
-                self.selection_anchor = None;
-                self.selection = None;
-                self.selected_highlight_id = None;
-                self.bump_scene_revision();
-                self.error = None;
-            }
-            Err(error) => self.error = Some(format!("保存高亮失败：{error}")),
+    pub(in crate::reader) fn create_highlight(&mut self,note:Option<String>) {
+        if let Some(selection)=&self.selection {
+            self.save_selection_annotation(selection.ranges.clone(),selection.text.clone(),note,rebook_app_core::highlights::selection::SelectionAction::Add,true);
         }
     }
 

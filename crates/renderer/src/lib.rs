@@ -2628,15 +2628,26 @@ impl DisplayListCompiler {
                         sources: quote.sources.clone(),
                         continued_before: quote.continued_before,
                         continued_after: quote.continued_after,
-                        accent_x: quote.x + 6.0,
-                        accent_width: 4.0,
-                        accent: color(quote.accent),
+                        accent_x: if quote.fill.alpha > 0 { quote.x } else { quote.x + 6.0 },
+                        accent_width: if quote.fill.alpha > 0 { quote.width } else { 4.0 },
+                        accent: color(if quote.fill.alpha > 0 { quote.fill } else { quote.accent }),
                     });
                     if quote.fill.alpha > 0 {
                         commands.push(DisplayCommand::FillRoundedRect(FillRoundedRectCommand {
                             rect: RoundedRect::from_rect(bounds, 7.0),
                             color: color(quote.fill),
                         }));
+                        // Continuous-page joins have square edges; only the
+                        // actual quotation ends keep the card's rounded corners.
+                        for (continued, top, bottom) in [
+                            (quote.continued_before, bounds.y0, (bounds.y0 + 7.0).min(bounds.y1)),
+                            (quote.continued_after, (bounds.y1 - 7.0).max(bounds.y0), bounds.y1),
+                        ] {
+                            if continued { commands.push(DisplayCommand::FillRoundedRect(FillRoundedRectCommand {
+                                rect: RoundedRect::from_rect(Rect::new(bounds.x0, top, bounds.x1, bottom), 0.0),
+                                color: color(quote.fill),
+                            })); }
+                        }
                     }
                     let accent_inset = 8.0_f64.min(bounds.height() * 0.2);
                     let accent_top = if quote.continued_before {

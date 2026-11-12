@@ -124,11 +124,17 @@ private val symbolResources=mapOf(
     "stop" to R.drawable.ic_symbol_stop,
     "copy" to R.drawable.ic_symbol_copy,
     "highlight" to R.drawable.ic_symbol_highlight,
+    "underline" to R.drawable.ic_symbol_underline,
+    "remove-underline" to R.drawable.ic_symbol_remove_underline,
+    "thought" to R.drawable.ic_symbol_thought,
     "edit-note" to R.drawable.ic_symbol_edit_note,
     "edit" to R.drawable.ic_symbol_edit,
     "check" to R.drawable.ic_symbol_check,
     "undo" to R.drawable.ic_symbol_undo,
-    "expand" to R.drawable.ic_symbol_expand
+    "expand" to R.drawable.ic_symbol_expand,
+    "more" to R.drawable.ic_symbol_more,
+    "up" to R.drawable.ic_symbol_up,
+    "clear" to R.drawable.ic_symbol_clear
 )
 private val filledSymbolResources=mapOf(
     "library" to R.drawable.ic_symbol_library_filled,

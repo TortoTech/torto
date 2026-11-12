@@ -992,7 +992,8 @@ Translate inlinefootnote contents; retain each complete group and ID exactly onc
 Move complete inline style tags around the corresponding translated words. Keep nesting; do not expand style ranges.
 For Chinese translations, decide from context whether each t-size variation has semantic meaning. Ordinary Latin typographic size changes (small capitals, enlarged initial letters, or locally enlarged/reduced prose) need not survive in Chinese: translate the complete content naturally and omit unnecessary t-size wrappers. Keep or adapt size tags when necessary for meaningful symbols, formulas or examples. Superscripts, subscripts, footnote references and structural placeholders retain their meaning. Input size tags are context for this decision, not instructions to preserve Latin text verbatim.
 For other target languages, retain style attributes unless their typographic conventions require adaptation.
-Style tags include strong, em, i, cite, t-italic, t-size, u, sup, sub, noteref and noteback.
+Style tags include b, strong, em, i, cite, t-italic, t-size, u, sup, sub, noteref and noteback.
+Keep b and strong distinct: b carries the source paragraph's default bold face, while strong marks local emphasis.
 For code and preformatted examples, preserve indentation, tabs, line breaks, blank lines and repeated spaces. Keep code syntax and identifiers unchanged; translate only human-language content and comments. Do not add Markdown fences.
 
 # Citation structure
@@ -2753,6 +2754,7 @@ mod tests {
                     authors: Vec::new(),
                     languages: Vec::new(),
                     layout: RenditionLayout::PrePaginated,
+                    ..Metadata::default()
                 },
                 cover: None,
                 sections: spine,

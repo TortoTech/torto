@@ -10,6 +10,7 @@ Return the supplied Schema object. Omit uncertain results.
 Return only candidate IDs in `citations`, never citation text. Return `citations: []` when `targets.classify_citations` is empty.
 
 ## Headings
+Existing headings have already been recovered from authored structure and style heuristics; keep them unchanged and never reclassify them.
 Select numbered titles and standalone section numbers from `targets.classify_headings`.
 Read both adjacent paragraphs. Candidate eligibility does not prove that a paragraph is a heading.
 Use `style` as supporting evidence, not a requirement or proof.

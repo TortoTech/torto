@@ -419,7 +419,7 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
             ),
             (
                 ShortcutAction::FocusFootnotes,
-                language.text("脚注／公式备注开关", "Toggle footnotes / formula notes"),
+                language.text("预览注释", "Preview annotations"),
             ),
             (
                 ShortcutAction::FocusExtendSelectionPrevious,

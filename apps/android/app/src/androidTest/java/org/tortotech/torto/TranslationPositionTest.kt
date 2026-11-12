@@ -29,6 +29,8 @@ class TranslationPositionTest {
         val originalAi=core.aiOptions();val originalReading=core.readingOptions()
         val prefs=context.getSharedPreferences("reading",0);val originalFocus=prefs.getBoolean("focus",false)
         val originalSelection=prefs.getString("selection",null)
+        val originalFocusedSelection=prefs.getString("selectionFocus",null)
+        val originalClassicSelection=prefs.getString("selectionClassic",null)
         val existing=core.books().map {it.id}.toSet()
         val entered=CountDownLatch(1);val release=CountDownLatch(1)
         val stopped=AtomicBoolean();val failure=AtomicReference<Throwable?>()
@@ -77,7 +79,7 @@ class TranslationPositionTest {
         }
         fun hasProgress(node:AccessibilityNodeInfo?):Boolean=node!=null&&(node.className=="android.widget.ProgressBar"||(0 until node.childCount).any {hasProgress(node.getChild(it))})
         try {
-            check(prefs.edit().putBoolean("focus",true).remove("selection").commit())
+            check(prefs.edit().putBoolean("focus",true).remove("selection").remove("selectionFocus").remove("selectionClassic").commit())
             core.saveProvider(Provider("","custom","Translation position loopback","http://127.0.0.1:${server.localPort}/v1",listOf("test-model"),false),"inert-test-key",false)
             val provider=core.providers().single {it.name=="Translation position loopback"};providerId=provider.id
             core.saveReadingOptions(originalReading.copy(translated=false))
@@ -87,7 +89,7 @@ class TranslationPositionTest {
             instrumentation.runOnMainSync {model=ViewModelProvider(activity!!)[ReaderModel::class.java];model!!.open(book)}
             await("reader opens"){model!!.state.value.frame!=null&&!model!!.state.value.busy}
             assertFalse("New books start with translation off",model!!.state.value.translated)
-            assertEquals("Unconfigured selection defaults to free", "free", model!!.state.value.selectionMode)
+            assertEquals("Unconfigured focus selection defaults to paragraphs", "paragraph", model!!.state.value.selectionMode)
             instrumentation.runOnMainSync {model!!.selectionMode("sentence")}
             await("manual selection preference is remembered"){model!!.state.value.selectionMode=="sentence"}
             instrumentation.runOnMainSync {model!!.search("Paragraph 12:")}
@@ -128,6 +130,7 @@ class TranslationPositionTest {
             instrumentation.runOnMainSync {model?.back();activity?.finish()};instrumentation.removeMonitor(monitor)
             core.saveAiOptions(originalAi);core.saveReadingOptions(originalReading)
             check(prefs.edit().putBoolean("focus",originalFocus).apply {if(originalSelection==null)remove("selection")else putString("selection",originalSelection)}.commit())
+            check(prefs.edit().apply {if(originalFocusedSelection==null)remove("selectionFocus")else putString("selectionFocus",originalFocusedSelection);if(originalClassicSelection==null)remove("selectionClassic")else putString("selectionClassic",originalClassicSelection)}.commit())
             providerId?.let {core.deleteProvider(it)}
             if(book.id !in existing)core.removeBook(book.id)
             file.delete()

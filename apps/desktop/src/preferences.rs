@@ -87,8 +87,8 @@ pub(crate) enum ReadingMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum FocusStyle {
-    #[default]
     BackgroundHighlight,
+    #[default]
     SurroundingDim,
 }
 
@@ -761,13 +761,25 @@ mod tests {
         assert!(matches!(stored.spread, StoredSpreadMode::Single));
         assert!(matches!(stored.reading_mode, StoredReadingMode::Focus));
         assert!(!stored.hide_cursor_in_focus_mode);
-        assert_eq!(stored.focus_style, FocusStyle::BackgroundHighlight);
+        assert_eq!(stored.focus_style, FocusStyle::SurroundingDim);
         assert!(matches!(stored.theme, StoredAppTheme::System));
         assert!(matches!(
             stored.selection_granularity,
             StoredSelectionGranularity::Free
         ));
         assert_eq!(stored.shortcuts, ShortcutPreferences::default());
+    }
+
+    #[test]
+    fn explicit_focus_styles_survive_the_default_change() {
+        for (name, expected) in [
+            ("background-highlight", FocusStyle::BackgroundHighlight),
+            ("surrounding-dim", FocusStyle::SurroundingDim),
+        ] {
+            let json = format!(r#"{{"version":1,"focus_style":"{name}"}}"#);
+            let stored: StoredReaderPreferences = serde_json::from_str(&json).unwrap();
+            assert_eq!(stored.focus_style, expected);
+        }
     }
 
     #[test]

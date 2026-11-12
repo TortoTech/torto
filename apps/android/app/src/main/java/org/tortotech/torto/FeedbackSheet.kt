@@ -14,7 +14,9 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.semantics.*
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
@@ -26,7 +28,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable internal fun FeedbackSheet(state:FeedbackUiState,model:FeedbackModel){
+@Composable internal fun FeedbackSheet(state:FeedbackUiState,model:FeedbackModel,brightness:Float=-1f){
     val context=LocalContext.current
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(3)){model.addImages(context,it)}
     val waiting by produceState(false,state.retryUntil){
@@ -34,11 +36,14 @@ import org.json.JSONObject
         value=remaining>0;if(remaining>0){delay(remaining);value=false}
     }
     val disabled=state.loading||state.working||state.sending||state.locked
-    ModalBottomSheet(onDismissRequest=model::close,sheetState=rememberModalBottomSheetState(skipPartiallyExpanded=true),containerColor=MaterialTheme.colorScheme.surfaceContainerLow){
-        Column(Modifier.fillMaxWidth().fillMaxHeight(.94f).navigationBarsPadding().imePadding()){
-            Box(Modifier.fillMaxWidth().height(48.dp).padding(horizontal=8.dp)){
-                Text(tr("反馈问题","Report an issue"),Modifier.align(Alignment.Center),fontSize=16.sp,textAlign=TextAlign.Center)
-                ActionIcon("close",tr("关闭反馈","Close feedback"),modifier=Modifier.align(Alignment.CenterStart),onClick=model::close)
+    val title=tr("反馈问题","Report an issue")
+    val descriptionLabel=tr("反馈内容","Feedback description")
+    FullScreenInputDialog(model::close,brightness){dismiss->
+        val inputFocus=rememberInputFocus(!state.loading&&!state.locked&&state.status!="submitted")
+        Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).semantics {paneTitle=title}.statusBarsPadding().navigationBarsPadding().imePadding()){
+            Box(Modifier.fillMaxWidth().height(64.dp)){
+                Text(title,Modifier.align(Alignment.Center),fontSize=16.sp,textAlign=TextAlign.Center)
+                ActionIcon("expand",tr("关闭反馈","Close feedback"),modifier=Modifier.align(Alignment.CenterStart).padding(start=4.dp),onClick=dismiss)
             }
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal=16.dp),verticalArrangement=Arrangement.spacedBy(16.dp)){
                 if(state.loading)LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -50,7 +55,7 @@ import org.json.JSONObject
                         FilterChip(state.kind=="bug",{model.edit(kind="bug")},label={Text(tr("缺陷","Bug"))},enabled=!disabled)
                         FilterChip(state.kind=="feature",{model.edit(kind="feature")},label={Text(tr("功能","Feature"))},enabled=!disabled)
                     }
-                    OutlinedTextField(state.description,{if(it.length<=10000)model.edit(description=it)},Modifier.fillMaxWidth().heightIn(min=180.dp),enabled=!disabled,
+                    OutlinedTextField(state.description,{if(it.length<=10000)model.edit(description=it)},Modifier.fillMaxWidth().heightIn(min=180.dp).focusRequester(inputFocus).semantics {contentDescription=descriptionLabel},enabled=!disabled,
                         placeholder={Text(if(state.kind=="bug")tr("发生了什么？如何重现？你期望出现什么结果？","What happened? How can we reproduce it? What did you expect?")else tr("希望增加什么功能？它能解决什么问题？","What feature would help, and what problem would it solve?"))},
                         supportingText={Text(tr("至少 10 个非空白字符","At least 10 non-whitespace characters")+" · ${state.count}/5000",color=if(state.count>5000u)MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)})
                     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(12.dp)){
@@ -79,7 +84,7 @@ import org.json.JSONObject
                 if(state.status=="pending")Text(tr("暂时无法确认提交结果，内容已保留，请稍后重试","The result is not yet confirmed. Your report is preserved; retry later"),fontSize=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 state.error?.let {Text(feedbackError(it),fontSize=13.sp,color=MaterialTheme.colorScheme.error)}
                 if(waiting)Text(tr("请稍后重试","Please retry later"),fontSize=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                Button(onClick=if(state.status=="submitted")model::close else model::submit,
+                Button(onClick=if(state.status=="submitted")dismiss else model::submit,
                     enabled=state.status=="submitted"||!state.loading&&!state.working&&!state.sending&&!waiting&&state.valid,modifier=Modifier.fillMaxWidth()){
                     if(state.sending){CircularProgressIndicator(Modifier.size(18.dp),strokeWidth=2.dp,color=MaterialTheme.colorScheme.onPrimary);Spacer(Modifier.width(8.dp))}
                     Text(if(state.status=="submitted")tr("完成","Done")else if(state.sending)tr("提交中","Submitting")else if(state.locked)tr("重试","Retry")else tr("提交","Submit"))

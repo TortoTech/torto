@@ -15,6 +15,51 @@ fn parse(body: &str) -> Section {
 }
 
 #[test]
+fn compact_image_scope_preserves_caption_credit_description_and_source_nodes() {
+    let content = "<img id='image' src='x.png' style='width:60%'/><p id='caption' style='font-size:2em'><b>图4-1</b> 图表标题。</p><p id='description' style='text-indent:4em;font-size:2em'>图内补充说明。</p><p id='credit' style='margin-left:4em;font-weight:bold'>© Daniel Willingham</p>";
+    let grouped = parse(&format!("<div>{content}</div><p>外部正文。</p>"));
+    let baseline = parse(&format!("{content}<p>外部正文。</p>"));
+    let Block::Figure(figure) = &grouped.blocks[0] else {panic!("{:?}", grouped.blocks)};
+    assert_eq!(figure.images.len(),1);
+    assert_eq!(figure.captions.len(),3);
+    assert_eq!(figure.captions[0].kind,TextBlockKind::Caption);
+    assert_eq!(figure.captions[1].kind,TextBlockKind::QuoteAttribution);
+    assert_eq!(figure.captions[1].style.authored_alignment,Some(TextAlignment::Start));
+    assert_eq!(figure.captions[2].kind,TextBlockKind::QuoteAttribution);
+    assert!(figure.captions[2].content.iter().flat_map(Inline::text_runs).any(|r|r.style.bold),"Authored emphasis is retained for book style");
+    assert_eq!(grouped.anchors,baseline.anchors);
+    assert_eq!(grouped.blocks.iter().flat_map(Block::text_blocks).filter_map(|t|t.source.clone()).collect::<Vec<_>>(),
+        baseline.blocks.iter().flat_map(Block::text_blocks).filter_map(|t|t.source.clone()).collect::<Vec<_>>());
+    assert!(matches!(&grouped.blocks[1],Block::Text(t) if t.kind==TextBlockKind::Paragraph));
+    let explicit=parse(&format!("<figure>{content}</figure>"));
+    let Block::Figure(explicit)=&explicit.blocks[0] else {panic!("explicit figure")};
+    assert_eq!(explicit.images.len(),1);
+    assert_eq!(explicit.captions.iter().map(|t|t.kind).collect::<Vec<_>>(),figure.captions.iter().map(|t|t.kind).collect::<Vec<_>>());
+}
+
+#[test]
+fn media_inference_does_not_absorb_chapter_wrappers_or_multiple_figures() {
+    for body in [
+        "<div><h2>Topic</h2><img src='x.png'/><p>Figure 1. Caption</p><p>Following prose</p></div>".to_owned(),
+        format!("<div><img src='x.png'/><p>Figure 1. Caption</p><p>{}</p></div>", "Ordinary prose. ".repeat(50)),
+        "<div><img src='x.png'/><p>Figure 1. Caption</p><img src='y.png'/><p>Figure 2. Caption</p></div>".to_owned(),
+    ] {
+        let section=parse(&body);
+        assert!(section.blocks.len()>1,"must not combine the entire scope: {body}");
+    }
+}
+
+#[test]
+fn table_caption_return_links_are_not_footnotes_but_real_notes_stay_semantic() {
+    let section=parse("<figure><figcaption><p><a id='table' href='#mention' role='doc-backlink'>TABLE 2.1</a> Sources of Trading Ideas</p></figcaption><table><tr><td>Academic</td><td>Journal</td></tr></table></figure><p id='mention'>See <a href='#table'>Table 2.1</a>. Note<a id='ref' href='#note' role='doc-noteref'>1</a>.</p><aside id='note' role='doc-footnote'><p><a href='#ref' role='doc-backlink'>1</a> Real footnote.</p></aside>");
+    let Block::Figure(figure)=&section.blocks[0] else {panic!("figure")};
+    assert!(figure.body.iter().any(|b|matches!(b,Block::Table(_))));
+    assert!(!figure.body.iter().any(|b|matches!(b,Block::Note(_))));
+    assert!(figure.text_blocks().flat_map(|t|t.content.iter()).flat_map(Inline::text_runs).all(|r|r.style.link_role==LinkRole::Normal));
+    assert!(section.blocks.iter().any(Block::is_footnote_definition));
+}
+
+#[test]
 fn numbered_quote_caption_groups_with_preceding_image_without_renumbering_sources() {
     let body = "<p><img id='diagram' src='diagram.gif'/></p><div height='3%'/><p height='2%' width='0%'/><blockquote id='caption'><b>Figure 1.1: Animation of insertion sort</b></blockquote><p><img id='code' src='code.gif'/></p><p id='after'>After.</p>";
     let section = parse(body);

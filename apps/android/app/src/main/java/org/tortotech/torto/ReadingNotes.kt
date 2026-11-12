@@ -11,7 +11,6 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
@@ -67,11 +66,10 @@ import org.tortotech.torto.core.Annotation
     var query by rememberSaveable(state.active?.id){mutableStateOf("")}
     val term=query.trim()
     val results=remember(state.annotations,term){if(term.isEmpty())emptyList()else state.annotations.filter {it.quote.contains(term,true)||it.note.orEmpty().contains(term,true)}}
-    val focus=remember {FocusRequester()}
+    val focus=rememberInputFocus()
     val keyboard=LocalSoftwareKeyboardController.current
     val manager=LocalFocusManager.current
     val height=with(LocalDensity.current){maxOf(40.dp,24.sp.toDp()+8.dp)}
-    LaunchedEffect(Unit){withFrameNanos {};focus.requestFocus()}
     DisposableEffect(Unit){onDispose {manager.clearFocus();keyboard?.hide()}}
     Column(Modifier.fillMaxSize()){
         Box(Modifier.padding(horizontal=16.dp).fillMaxWidth().height(height+8.dp),contentAlignment=Alignment.Center){

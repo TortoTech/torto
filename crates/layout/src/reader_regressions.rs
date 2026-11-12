@@ -43,7 +43,7 @@ fn ordinary_paragraph_groups_do_not_share_note_numbers() {
 }
 
 #[test]
-fn unified_body_removes_uniform_styling_and_keeps_local_emphasis() {
+fn unified_body_preserves_unprofiled_bold_and_keeps_local_emphasis() {
     let style = ReaderStyle {
         typesetting: ReaderTypesetting::unified(),
         ..Default::default()
@@ -58,7 +58,7 @@ fn unified_body_removes_uniform_styling_and_keeps_local_emphasis() {
     let Inline::Text(run) = &resolved.content[0] else {
         panic!();
     };
-    assert!(!run.style.bold && !run.style.italic);
+    assert!(run.style.bold && !run.style.italic);
     assert_eq!(
         resolve_text_block(&paragraph, &ReaderStyle::default(), TextContext::Flow).as_ref(),
         &paragraph

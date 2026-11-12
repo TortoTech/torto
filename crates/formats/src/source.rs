@@ -492,6 +492,12 @@ impl DirectBookSource {
 }
 
 impl BookSource for DirectBookSource {
+    fn raster_resource(&self, href: &PublicationUrl) -> Result<Option<rebook_publication::RasterResource>, PublicationError> {
+        if self.resources.get(href.path()).is_some_and(|r| r.media_type == "image/svg+xml") { crate::svg::raster(self, href) } else { Ok(None) }
+    }
+    fn raster_resource_dimensions(&self, href: &PublicationUrl) -> Result<Option<[u32; 2]>, PublicationError> {
+        if self.resources.get(href.path()).is_some_and(|r| r.media_type == "image/svg+xml") { self.html_context.svg_dimensions.get(self, href) } else { Ok(None) }
+    }
     fn book(&self) -> &Book {
         &self.book
     }
@@ -808,6 +814,7 @@ mod tests {
                     authors: Vec::new(),
                     languages: Vec::new(),
                     layout: RenditionLayout::PrePaginated,
+                    ..Metadata::default()
                 },
                 sections: vec![SourceSection {
                     title: "Page 1".into(),
@@ -853,6 +860,7 @@ mod tests {
                     authors: Vec::new(),
                     languages: Vec::new(),
                     layout: RenditionLayout::Reflowable,
+                    ..Metadata::default()
                 },
                 sections: vec![SourceSection {
                     title: "Chapter".into(),
@@ -903,6 +911,7 @@ mod tests {
                     authors: Vec::new(),
                     languages: Vec::new(),
                     layout: RenditionLayout::Reflowable,
+                    ..Metadata::default()
                 },
                 sections: vec![SourceSection {
                     title: "Chapter".into(),
@@ -946,6 +955,7 @@ mod tests {
                     authors: Vec::new(),
                     languages: vec!["en".into()],
                     layout: RenditionLayout::Reflowable,
+                    ..Metadata::default()
                 },
                 sections: vec![SourceSection {
                     title: "Chapter".into(),
@@ -989,6 +999,7 @@ mod tests {
                     authors: Vec::new(),
                     languages: vec!["en".into()],
                     layout: RenditionLayout::Reflowable,
+                    ..Metadata::default()
                 },
                 sections: vec![SourceSection {
                     title: "Part".into(),
@@ -1031,6 +1042,7 @@ mod tests {
                     authors: Vec::new(),
                     languages: vec!["en".into()],
                     layout: RenditionLayout::Reflowable,
+                    ..Metadata::default()
                 },
                 sections: vec![SourceSection {
                     title: "Chapter".into(),
@@ -1073,6 +1085,7 @@ mod tests {
                     authors: Vec::new(),
                     languages: Vec::new(),
                     layout: RenditionLayout::PrePaginated,
+                    ..Metadata::default()
                 },
                 sections: vec![SourceSection {
                     title: "Page 1".into(),

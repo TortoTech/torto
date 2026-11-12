@@ -1048,7 +1048,7 @@ impl ShelfFeature {
                         left: SHELF_CONTENT_LEFT_MARGIN,
                         right: 16,
                         top: 12,
-                        bottom: 28,
+                        bottom: 0,
                     }),
             )
             .show(root_ui, |ui| {
@@ -1120,6 +1120,7 @@ impl ShelfFeature {
                             search_response.has_focus(),
                             interaction_blocked,
                         );
+                        ui.add_space(28.0);
                     });
                 }
             });

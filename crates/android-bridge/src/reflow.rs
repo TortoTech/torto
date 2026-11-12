@@ -5,7 +5,8 @@ use rebook_app_core::reading_text::source_range_contains_anchor;
 #[cfg(test)]
 pub(crate) mod tests;
 
-struct Anchor {
+#[derive(Clone)]
+pub(crate) struct Anchor {
     focus: SourceRange,
     source: SourceRange,
     screen_y: f32,
@@ -13,7 +14,7 @@ struct Anchor {
 }
 
 impl Anchor {
-    fn capture(s: &ReaderState) -> Option<Self> {
+    pub(crate) fn capture(s: &ReaderState) -> Option<Self> {
         if !s.focus {
             return None;
         }
@@ -83,7 +84,7 @@ impl Anchor {
         })
     }
 
-    fn restore(&self, s: &mut ReaderState) -> bool {
+    pub(crate) fn restore(&self, s: &mut ReaderState) -> bool {
         if s.session.go_to_source(&self.source.start).is_err() {
             return false;
         }
@@ -113,6 +114,7 @@ pub(crate) fn refresh(s: &mut ReaderState) -> Result<()> {
     let mut style = s.session.style();
     style.typesetting =
         rebook_app_core::reading::effective_typesetting(s.focus, &s.classic_typesetting);
+    apply_mobile_page_style(&mut style);
     s.session.refresh_source_with_style(style).map_err(error)?;
     scroll::invalidate(s);
     if let Some(anchor) = anchor {

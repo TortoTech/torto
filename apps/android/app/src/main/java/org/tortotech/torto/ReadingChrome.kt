@@ -30,6 +30,11 @@ import kotlinx.coroutines.delay
 
 internal val ReaderBarHeight=56.dp
 
+/** Match the native page while its first raster is still being prepared. */
+internal fun readerPaperColor(state:ScreenState)=state.frame?.info?.focusFadeColor?.let {
+    Color((it.toInt() and 0xFFFFFF) or 0xFF000000.toInt())
+} ?: if(state.dark)Color(0xFF181C1B)else Color(0xFFFAF8F3)
+
 /** Opening and uncached turns belong to the content plane; quick loads stay quiet. */
 @Composable internal fun ReaderOpeningIndicator(state:ScreenState){
     val visible=key(state.active?.id){loadingVisible(state.active!=null&&state.error==null&&(state.openingBook&&state.frame==null||state.readerContentLoading))}
@@ -66,7 +71,7 @@ internal val ReaderBarHeight=56.dp
                     val ink by animateColorAsState(if(active||pressed)brandControlColor() else defaultIconColor(),tween(100),label="home icon ink")
                     Box(Modifier.size(44.dp,IconSizes.Standard),contentAlignment=Alignment.Center){AppIcon(icon,tint=ink)}
                     Spacer(Modifier.height(2.dp))
-                    Text(label,fontSize=11.sp,lineHeight=14.sp,color=if(active)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(label,fontSize=11.sp,lineHeight=14.sp,color=ink)
                 }
             }
         }
@@ -76,7 +81,7 @@ internal val ReaderBarHeight=56.dp
 /** Overlay controls never participate in the native reading viewport's measurement. */
 @Composable internal fun BoxScope.ReadingChrome(
     state:ScreenState,blocked:Boolean,panel:String?,onBack:()->Unit,onPanel:(String)->Unit,
-    onTranslate:()->Unit,onTheme:()->Unit,onSplit:()->Unit={},onFeedback:()->Unit={},
+    onTranslate:()->Unit,onTheme:()->Unit,onFeedback:()->Unit={},
 ){
     val safe=readerSafePadding()
     val bottomPanel=readingBottomPanel(panel)
@@ -101,7 +106,7 @@ internal val ReaderBarHeight=56.dp
                 var selectionHint by remember {mutableStateOf(false)}
                 LaunchedEffect(selectionHint){if(selectionHint){delay(2000);selectionHint=false}}
                 Box {
-                    ActionIcon("select",tr("文字选择模式","Selection mode")){
+                    ActionIcon("select",tr("文字选择模式","Selection mode"),selected=panel=="selection"){
                         if(state.translated)selectionHint=true else onPanel("selection")
                     }
                     if(selectionHint){
@@ -113,17 +118,15 @@ internal val ReaderBarHeight=56.dp
                         }
                     }
                 }
+                ActionIcon("sun",tr("主题","Theme"),selected=panel=="theme",onClick=onTheme)
                 ActionIcon("type",tr("字体排版","Typography"),selected=readingPanelOwner(panel)=="typography"){onPanel("typography")}
-                ActionIcon(if(state.dark)"sun" else "moon",tr("切换明暗模式","Toggle light/dark"),!blocked,onClick=onTheme)
             }
         }
     }
     AnimatedVisibility(visible=state.chromeVisible&&panel==null&&state.interaction==null&&state.selected==null,enter=fadeIn(tween(180))+slideInVertically(tween(180)){it/5},exit=fadeOut(tween(180))+slideOutVertically(tween(180)){it/5},modifier=Modifier.align(Alignment.BottomEnd).padding(end=16.dp,bottom=safe.calculateBottomPadding()+ReaderBarHeight+16.dp)){
-        val split=state.frame?.info?.controls?.find {it.kind=="sentences"}
         val showTranslation=showReadingTranslation(state.bookLanguages,LocalConfiguration.current.locales[0],state.translated)
         Row(horizontalArrangement=Arrangement.spacedBy(10.dp)){
             ReadingFloatingAction("ai",tr("阅读助手","Reading assistant"),!blocked){onPanel("chat")}
-            ReadingFloatingAction("sentences",if(split?.active==true)tr("取消当前段落分句","Restore current paragraph")else tr("当前段落按句分段","Split current paragraph"),!blocked&&split!=null,split?.active==true,onSplit)
             if(showTranslation)ReadingFloatingAction("translate",if(state.translated)tr("关闭翻译","Turn translation off")else tr("开启翻译","Turn translation on"),!blocked,state.translated,onTranslate)
         }
     }

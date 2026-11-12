@@ -1,0 +1,4 @@
+<!-- Generated from assets/reader-icons/remove-underline.svg by scripts/sync-selection-icons.py. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:pathData="M6 17 L12 3 L18 17 M8 12 H16 M5 21 H19 M3 3 L21 21" android:fillColor="@android:color/transparent" android:strokeColor="@android:color/white" android:strokeWidth="1.5" android:strokeLineCap="round" android:strokeLineJoin="round" />
+</vector>

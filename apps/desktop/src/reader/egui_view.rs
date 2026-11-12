@@ -40,6 +40,7 @@ pub(super) const ASSISTANT_WIDTH: f32 = 340.0;
 const ASSISTANT_MIN_WIDTH: f32 = 300.0;
 const ASSISTANT_MAX_WIDTH: f32 = 560.0;
 const ASSISTANT_SIDE_PADDING: i8 = 14;
+const ASSISTANT_SLIDE_DISTANCE: f32 = 8.0;
 const ASSISTANT_SCROLLBAR_GUTTER: f32 = 14.0;
 const MIN_READER_CONTENT_WIDTH: f32 = 200.0;
 const FOCUS_MIN_TEXT_WIDTH: f32 = 400.0;
@@ -225,6 +226,21 @@ pub(super) fn shortcut_has_fresh_press(input: &egui::InputState, shortcut: &egui
                 && modifiers.matches_logically(shortcut.modifiers)
         )
     })
+}
+
+/// A paint-only overlay: the same viewport and source text continue under it.
+fn paint_reader_top_edge(painter: &egui::Painter, viewport: Rect, paper: Color32, opacity: f32) {
+    if opacity <= 0.001 || !viewport.is_positive() { return; }
+    let bottom = (viewport.top() + 16.0).min(viewport.bottom());
+    let mut mesh = egui::Mesh::default();
+    let top_color = paper.gamma_multiply(opacity.clamp(0.0, 1.0));
+    for (pos, color) in [
+        (viewport.left_top(), top_color), (viewport.right_top(), top_color),
+        (Pos2::new(viewport.right(), bottom), Color32::TRANSPARENT),
+        (Pos2::new(viewport.left(), bottom), Color32::TRANSPARENT),
+    ] { mesh.vertices.push(egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color }); }
+    mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+    painter.with_clip_rect(viewport).add(egui::Shape::mesh(mesh));
 }
 
 fn focus_edge_index(unit_count: usize, last: bool) -> Option<usize> {
@@ -658,6 +674,7 @@ impl DesktopReader {
         interaction_blocked: bool,
     ) -> ReaderFramePlan {
         let ctx = root_ui.ctx().clone();
+        self.poll_annotation_edits(&ctx);
         let now = Instant::now();
         if self.completion.is_none() {
             self.prepare_nearby_footnotes(&ctx);
@@ -754,7 +771,7 @@ impl DesktopReader {
                         self.toolbar(ui, background_ui)
                     });
                 }
-                let size = Vec2::new(ui.available_width(), (ui.available_height() - 3.0).max(1.0));
+                let size = Vec2::new(ui.available_width(), ui.available_height().max(1.0));
                 if self.is_scroll_mode() {
                     page_rect = ui
                         .scope(|ui| {
@@ -811,18 +828,8 @@ impl DesktopReader {
                 );
                 self.request_frame_repaint(ui.ctx());
 
-                let progress = unit_f32(self.progress());
-                let (track, _) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), 3.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter()
-                    .rect_filled(track, 0.0, Color32::from_black_alpha(18));
-                let filled = Rect::from_min_size(
-                    track.min,
-                    Vec2::new(track.width() * progress, track.height()),
-                );
-                ui.painter().rect_filled(filled, 0.0, palette().accent);
+                paint_reader_top_edge(ui.painter(), page_rect, background_ui,
+                    1.0 - chrome::header_opacity(self.ui.toolbar_motion.value));
             });
 
         let floating_sidebar_visible = !self.ui.sidebar_pinned && sidebar_progress > 0.001;
@@ -844,7 +851,6 @@ impl DesktopReader {
             self.focus_assistant_overlay(&ctx, page_rect);
         }
         self.pdf_zoom_controls(&ctx, page_rect, interaction_blocked);
-        self.table_chart_controls(&ctx, page_rect, interaction_blocked);
         self.focus_footnote_overlay(&ctx, page_rect);
         self.resize_side_panels(
             &ctx,
@@ -1226,39 +1232,36 @@ impl DesktopReader {
                 .show_separator_line(false)
                 .frame(
                     egui::Frame::new()
-                        .fill(palette().background)
                         .inner_margin(egui::Margin::symmetric(ASSISTANT_SIDE_PADDING, 0)),
                 )
                 .show(root_ui, |ui| {
-                    // Reserve the final reader width once. Animate only the panel's
-                    // paint and input bounds, so text is not repaginated each frame.
-                    let mut header_painter = ui.painter().clone();
-                    header_painter.set_opacity(assistant_progress);
-                    let clip = ui.max_rect();
-                    let rect = clip
-                        .translate(Vec2::new(assistant_width * (1.0 - assistant_progress), 0.0));
-                    ui.expand_to_include_rect(clip);
+                    // Keep pagination at its final width. Slide the whole visual
+                    // surface a short distance, so right-aligned actions stay in
+                    // view instead of waiting for a full-width slide to finish.
+                    let bounds = ui.max_rect();
+                    let offset = Vec2::new(ASSISTANT_SLIDE_DISTANCE * (1.0 - assistant_progress), 0.0);
+                    let panel = bounds.expand2(Vec2::new(f32::from(ASSISTANT_SIDE_PADDING), 0.0)).translate(offset);
+                    let rect = bounds.translate(offset);
+                    let clip = ui.clip_rect().intersect(panel);
+                    let opacity = ui.opacity() * assistant_progress;
+                    ui.expand_to_include_rect(bounds);
                     let mut content = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                     let ui = &mut content;
-                    ui.set_clip_rect(clip.intersect(ui.clip_rect()));
-                    ui.set_opacity(assistant_progress);
-                    if self.ui.assistant_motion.target < 0.5 {
+                    ui.set_clip_rect(clip);
+                    if self.ui.assistant_motion.target < 0.5 || assistant_progress <= 0.001 {
                         ui.disable();
                     }
+                    // Disabling closing controls must not add a second visual fade.
+                    ui.set_opacity(opacity);
+                    ui.painter().rect_filled(panel, 0.0, palette().background);
                     let header = Rect::from_min_size(
-                        Pos2::new(
-                            ui.max_rect().left() - f32::from(ASSISTANT_SIDE_PADDING),
-                            ui.max_rect().top(),
-                        ),
-                        Vec2::new(
-                            ui.max_rect().width() + 2.0 * f32::from(ASSISTANT_SIDE_PADDING),
-                            TOOLBAR_HEIGHT,
-                        ),
+                        panel.min,
+                        Vec2::new(panel.width(), TOOLBAR_HEIGHT),
                     );
                     // The header spans the panel frame, including both padding
-                    // strips; only transcript/input content uses the inset clip.
-                    header_painter.rect_filled(header, 0.0, color32(self.reader.style().background));
-                    if ui.rect_contains_pointer(ui.max_rect())
+                    // strips; only transcript/input content uses the inset layout.
+                    ui.painter().rect_filled(header, 0.0, color32(self.reader.style().background));
+                    if ui.is_enabled() && ui.rect_contains_pointer(ui.max_rect())
                         && ui.input(|input| input.pointer.any_pressed())
                     {
                         self.ui.assistant_keyboard_focus = true;
@@ -3560,10 +3563,11 @@ impl DesktopReader {
             "Chat",
             &ctx.format_shortcut(&self.shortcuts.focus_chat),
         );
+        let marked=self.focus_annotation_payload().is_some_and(|(ranges,_)|rebook_app_core::highlights::selection::contains_highlight(&self.highlights,&ranges));
         let highlight_hover = shortcut_tooltip(
             self.language,
-            "高亮",
-            "Highlight",
+            if marked {"删除划线"}else{"划线"},
+            if marked {"Remove highlight"}else{"Highlight"},
             &ctx.format_shortcut(&self.shortcuts.focus_highlight),
         );
         let note_hover = shortcut_tooltip(
@@ -3603,14 +3607,14 @@ impl DesktopReader {
                 } else {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
-                        chat = icon_button(ui, Icon::MessageCircle)
+                        chat = icon_button(ui, Icon::SelectionAi)
                             .on_hover_text(&chat_hover)
                             .clicked();
                         ui.add_enabled_ui(can_annotate, |ui| {
-                            highlight = icon_button(ui, Icon::Highlighter)
+                            highlight = icon_button(ui, if marked {Icon::SelectionRemoveHighlight}else{Icon::SelectionHighlight})
                                 .on_hover_text(&highlight_hover)
                                 .clicked();
-                            open_note = icon_button(ui, Icon::MessageSquarePlus)
+                            open_note = icon_button(ui, Icon::SelectionNote)
                                 .on_hover_text(&note_hover)
                                 .clicked();
                         });
@@ -3636,7 +3640,7 @@ impl DesktopReader {
             self.open_focus_assistant();
         } else if highlight {
             self.ui.focus_actions_visible = false;
-            self.create_focus_highlight(None);
+            self.toggle_focus_highlight();
         } else if open_note {
             self.annotation_note_draft = Some(AnnotationDraft {
                 note: self.current_focus_note().unwrap_or_default(),
@@ -4889,6 +4893,7 @@ impl DesktopReader {
         let Some(selection) = &self.selection else {
             return;
         };
+        let highlighted = self.selected_highlight_exists();
         let selection_text = selection.text.clone();
         let selection_rects = selection.rects.clone();
         let anchor = self.selection_action_anchor(&selection_rects);
@@ -4933,16 +4938,16 @@ impl DesktopReader {
                         }
                     } else {
                         ui.horizontal(|ui| {
-                            copy_selection = icon_button(ui, Icon::Copy)
+                            copy_selection = icon_button(ui, Icon::SelectionCopy)
                                 .on_hover_text(self.language.text("复制", "Copy"))
                                 .clicked();
-                            create_highlight = icon_button(ui, Icon::Highlighter)
-                                .on_hover_text(self.language.text("高亮", "Highlight"))
+                            create_highlight = icon_button(ui, if highlighted {Icon::SelectionRemoveHighlight}else{Icon::SelectionHighlight})
+                                .on_hover_text(if highlighted {self.language.text("删除划线", "Remove highlight")}else{self.language.text("划线", "Highlight")})
                                 .clicked();
-                            open_note = icon_button(ui, Icon::MessageSquarePlus)
+                            open_note = icon_button(ui, Icon::SelectionNote)
                                 .on_hover_text(self.language.text("添加批注", "Add note"))
                                 .clicked();
-                            explain = icon_button(ui, Icon::MessageCircleQuestion)
+                            explain = icon_button(ui, Icon::SelectionAi)
                                 .on_hover_text(self.language.text("解释", "Explain"))
                                 .clicked();
                         });
@@ -4960,7 +4965,7 @@ impl DesktopReader {
             );
             ctx.request_repaint_after(super::NOTICE_AUTO_DISMISS_DELAY);
         } else if create_highlight {
-            self.create_highlight(None);
+            self.toggle_selected_highlight();
         } else if open_note {
             self.annotation_note_draft = Some(AnnotationDraft {
                 focus_pending: true,
@@ -5597,93 +5602,6 @@ impl DesktopReader {
         let unit = self.focus_units.get(self.focus_unit_index)?;
         std::iter::once(&unit.range).chain(unit.paint_ranges.iter())
             .find_map(|range| self.semantic_source.chart_control(range))
-    }
-
-    fn table_chart_controls(&mut self, ctx: &egui::Context, page_rect: Rect, blocked: bool) {
-        if blocked
-            || self.is_focus_mode()
-            || self.preview_is_open()
-            || self.ui.overlay_visible()
-            || self.reader.style().typesetting.mode != rebook_layout::TypesettingMode::Unified
-        {
-            return;
-        }
-        let offset = self.preview_offset_x(page_rect.width());
-        let mut pages = Vec::new();
-        if let (Some(layout), Some(viewport)) = (&self.scroll_section, self.scroll_viewport) {
-            for (i, entry) in layout.pages.iter().enumerate() {
-                if layout.page_tops[i] + layout.page_heights[i] <= viewport.offset_y
-                    || layout.page_tops[i] >= viewport.offset_y + viewport.size.y
-                {
-                    continue;
-                }
-                let top = layout
-                    .content_y_for_position(entry.position, 0.0)
-                    .unwrap_or(0.0)
-                    + self.scroll_content_padding(viewport.size.y)
-                    - viewport.offset_y;
-                pages.push((entry.page.clone(), egui::vec2(offset, top)));
-            }
-        } else if let Ok(spread) = self.reader.current_spread() {
-            pages.push((spread.primary, egui::vec2(offset, 0.0)));
-            if let Some(page) = spread.secondary {
-                pages.push((page, egui::vec2(offset + spread.secondary_offset_x, 0.0)));
-            }
-        }
-        let mut controls = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for (page, offset) in pages {
-            for item in page.geometry_sources() {
-                let Some((source, active)) = self.semantic_source.chart_control(item) else {
-                    continue;
-                };
-                let bounds = page
-                    .source_table_bounds(std::slice::from_ref(item))
-                    .into_iter()
-                    .next()
-                    .or_else(|| {
-                        page.image_source_rects(std::slice::from_ref(item))
-                            .into_iter()
-                            .next()
-                    });
-                if let Some(bounds) = bounds {
-                    let y = bounds.y0 as f32;
-                    let right = bounds.x1 as f32;
-                    let position = egui::pos2(
-                        (page_rect.left() + offset.x + right - 32.0).clamp(
-                            page_rect.left() + 4.0,
-                            (page_rect.right() - 36.0).max(page_rect.left() + 4.0),
-                        ),
-                        page_rect.top() + offset.y + y - 36.0,
-                    );
-                    if position.y >= page_rect.top() - 1.0
-                        && position.y < page_rect.bottom() - 32.0
-                        && seen.insert((source.start.spine.clone(), source.start.node.clone()))
-                    {
-                        controls.push((source, active, position));
-                    }
-                }
-            }
-        }
-        for (source, active, position) in controls {
-            let mut change = false;
-            egui::Area::new(egui::Id::unique((
-                "table-chart",
-                &source.start.spine,
-                &source.start.node,
-            )))
-            .order(egui::Order::Foreground)
-            .fixed_pos(position)
-            .show(ctx, |ui| {
-                ui.set_clip_rect(page_rect);
-                change = table_chart_toggle_button(
-                    ui, self.language, active, None,
-                ).clicked();
-            });
-            if change {
-                self.toggle_table_chart(ctx, &source);
-            }
-        }
     }
 
     fn image_preview_overlay(&mut self, ctx: &egui::Context) {
@@ -8818,8 +8736,17 @@ mod reference_suggestion_label_tests {
             );
             output.textures_delta.clear();
         };
+        let settle=|reader:&mut DesktopReader|{
+            let deadline=Instant::now()+Duration::from_secs(5);
+            loop {
+                reader.poll_annotation_edits(&ctx);
+                if reader.annotation_edits.pending.is_none(){break;}
+                assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(1));
+            }
+        };
         let highlight = reader.shortcuts.focus_highlight;
         send(&mut reader, highlight, true);
+        settle(&mut reader);
         assert_eq!(reader.highlights.len(), 1);
         send(&mut reader, highlight, true);
         assert_eq!(
@@ -8829,6 +8756,7 @@ mod reference_suggestion_label_tests {
         );
         send(&mut reader, highlight, false);
         send(&mut reader, highlight, true);
+        settle(&mut reader);
         assert!(reader.highlights.is_empty());
         assert!(store.0.lock().unwrap().is_empty());
         send(&mut reader, highlight, false);
@@ -10925,7 +10853,7 @@ mod scroll_boundary_tests {
                         egui::CentralPanel::default().show(root, |ui| {
                             let size = Vec2::new(
                                 ui.available_width(),
-                                (ui.available_height() - 3.0).max(1.0),
+                                ui.available_height().max(1.0),
                             );
                             ui.scope(|ui| {
                                 egui::ScrollArea::vertical()
@@ -11119,5 +11047,28 @@ mod formula_note_shortcut_tests {
         .drop_without_applying_deltas();
         assert!(reader.image_preview.as_ref().unwrap().notes_open);
         assert!(reader.ui.focus_footnotes_visible);
+    }
+}
+
+#[cfg(test)]
+mod edge_gradient_tests {
+    use super::*;
+    #[test]
+    fn top_gradient_is_a_paint_only_overlay_and_hidden_when_toolbar_is_visible() {
+        let ctx=egui::Context::default();
+        for opacity in [0.0,1.0] {
+            let mut output=ctx.run_ui(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(400.,300.))),..Default::default()}, |ui| {
+                let rect=ui.max_rect();
+                paint_reader_top_edge(ui.painter(),rect,Color32::from_rgb(250,248,243),opacity);
+                assert_eq!(rect,ui.max_rect(),"The overlay must not reserve content space");
+            });
+            let meshes:Vec<_>=output.shapes.iter().filter_map(|s| if let egui::Shape::Mesh(m)=&s.shape{Some(m)}else{None}).collect();
+            if opacity==0. {assert!(meshes.is_empty());}else {
+                let mesh=meshes.iter().find(|m|m.vertices.len()==4).unwrap();
+                assert!(mesh.vertices[0].color.a()>0);assert_eq!(mesh.vertices[2].color.a(),0);
+                assert!((mesh.vertices[2].pos.y-mesh.vertices[0].pos.y-16.).abs()<0.01);
+            }
+            output.textures_delta.clear();
+        }
     }
 }

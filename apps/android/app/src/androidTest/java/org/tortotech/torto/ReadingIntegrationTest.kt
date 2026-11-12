@@ -128,7 +128,7 @@ class ReadingIntegrationTest {
             val context=instrumentation.targetContext
             val bitmap=Bitmap.createBitmap(720,1280,Bitmap.Config.ARGB_8888)
             val view=ReaderView(context);view.layout(0,0,720,1280)
-            view.present(ReaderFrame(bitmap,info.copy(scrollDistance=0.0)),SelectedText("selected",listOf(Rect(30f,50f,80f,20f))))
+            view.present(ReaderFrame(bitmap,info.copy(scrollDistance=0.0)),SelectedText("selected",listOf(Rect(30f,50f,80f,20f)),false))
             var handle:Boolean?=null;var moved=false;var ended=false;var scrolled=0f;var turns=0;var gestures=0
             view.onReadingGesture={gestures++};view.onHandleStart={handle=it};view.onHandleMove={_,_->moved=true};view.onHandleEnd={ended=true};view.onScroll={scrolled+=it};view.onTurn={turns++}
             val density=context.resources.displayMetrics.density;val start=android.os.SystemClock.uptimeMillis()
@@ -435,12 +435,11 @@ class ReadingIntegrationTest {
             val history=File(root,"chat/${book.id}.json");history.parentFile!!.mkdirs();history.writeText(messages.toString())
             core.openBook(book.id,Viewport(360u,640u,2f)).use {reopened->
                 try {
-                    assertEquals(2,reopened.chatHistory().size)
-                    assertEquals(attachment.id,reopened.chatHistory()[0].images.single().id)
-                    reopened.removeChatImage(attachment.id)
-                    reopened.chatImage(attachment.id).close()
+                    assertTrue("A new reading session never restores a transcript file",reopened.chatHistory().isEmpty())
+                    try{reopened.chatImage(attachment.id).close();fail("Closed reading sessions release their image cache")}catch(_:CoreException){}
                 }finally{reopened.shutdown()}
             }
+            history.delete()
         }
         fixture.delete();imageFile.delete()
         Unit

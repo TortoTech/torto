@@ -27,11 +27,13 @@ rebook-html = { path = "../html" }
 rebook-layout = { path = "../layout" }
 rebook-renderer = { path = "../renderer" }
 rebook-publication = { path = "../publication" }
+resvg.workspace = true
 roxmltree.workspace = true
 scraper.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sha1 = { version = "0.10.6", default-features = false }
 thiserror.workspace = true
 zip.workspace = true
 

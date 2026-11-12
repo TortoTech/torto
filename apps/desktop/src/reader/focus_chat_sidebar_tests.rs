@@ -426,6 +426,90 @@ fn sidebar_animation_reserves_width_once_and_releases_it_after_closing() {
 }
 
 #[test]
+fn assistant_sidebar_moves_and_fades_background_input_and_actions_together() {
+    #[derive(Debug)]
+    struct Sample { background: Rect, input: Rect, action: Rect }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for mode in [crate::preferences::ReadingMode::Focus, crate::preferences::ReadingMode::Classic] {
+        for (width, scale) in [(900.0, 1.0), (1441.0, 2.0)] {
+            let mut reader = reader();
+            reader.reading_mode = mode;
+            reader.language = crate::preferences::AppLanguage::English;
+            reader.toggle_assistant_panel(AssistantPanel::Chat);
+            let ctx = egui::Context::default();
+            crate::ui::configure(&ctx, &Default::default(), rebook_layout::default_monospace_font(),
+                crate::preferences::AppLanguage::English, runtime.handle());
+            ctx.set_pixels_per_point(scale);
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 901.0));
+            let mut sample = |progress: f32, closing: bool| {
+                reader.ui.assistant_motion.value = progress;
+                reader.ui.assistant_motion.target = if closing { 0.0 } else { 1.0 };
+                let mut result = None;
+                for pass in 0..2 {
+                    let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+                        |ui| { reader.show_side_panels(ui); });
+                    if pass == 1 {
+                        let mut background = None;
+                        let mut input = None;
+                        let mut action = None;
+                        let alpha = (255.0 * progress).round() as u8;
+                        for shape in &output.shapes {
+                            if let egui::Shape::Rect(rect) = &shape.shape {
+                                if rect.fill.a() > 0 && (rect.rect.height() - screen.height()).abs() < 1.0 {
+                                    assert_eq!(rect.fill.a(), alpha, "The panel background shares the content fade");
+                                    background = Some(rect.rect);
+                                }
+                                if rect.corner_radius.nw == 9 && rect.rect.top() > 500.0 {
+                                    assert_eq!(rect.fill.a(), alpha, "Closing must not add disabled dimming");
+                                    assert!(shape.clip_rect.contains_rect(rect.rect), "The input must not slide in through its own inset clip");
+                                    input = Some(rect.rect);
+                                }
+                                if rect.brush.is_some() && rect.rect.top() > TOOLBAR_HEIGHT && rect.rect.bottom() < TOOLBAR_HEIGHT + 60.0 {
+                                    assert_eq!(rect.fill.a(), alpha);
+                                    assert!(shape.clip_rect.contains_rect(rect.rect), "New conversation must be visible throughout the fade");
+                                    action = Some(rect.rect);
+                                }
+                            }
+                        }
+                        result = Some(Sample { background: background.expect("moving panel background"),
+                            input: input.expect("composer"), action: action.expect("new conversation cannot appear late") });
+                    }
+                    output.shapes.clear();
+                    output.textures_delta.clear();
+                }
+                result.unwrap()
+            };
+            let settled = sample(1.0, false);
+            for closing in [false, true] {
+                for progress in [0.1, 0.25, 0.5, 0.75, 0.9, 1.0, 0.75, 0.25] {
+                    let current = sample(progress, closing);
+                    let shift = current.background.left() - settled.background.left();
+                    if progress < 1.0 { assert!(shift > 0.0, "Keep the slide as well as the fade"); }
+                    assert!((current.input.left() - settled.input.left() - shift).abs() < 0.6, "{current:?}");
+                    assert!((current.action.left() - settled.action.left() - shift).abs() < 0.6, "{current:?}");
+                }
+            }
+            let point = sample(0.5, true).action.center();
+            drop(sample);
+            reader.chat.input = "Keep this draft while closing".into();
+            reader.ui.assistant_keyboard_focus = false;
+            let session = reader.chat.session_id;
+            for pressed in [true, false] {
+                let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerMoved(point), egui::Event::PointerButton {
+                        pos: point, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                    }], ..Default::default() }, |ui| { reader.show_side_panels(ui); });
+                output.shapes.clear();
+                output.textures_delta.clear();
+            }
+            assert_eq!(reader.chat.session_id, session, "Closing controls must remain non-interactive");
+            assert_eq!(reader.chat.input, "Keep this draft while closing");
+            assert!(!reader.ui.assistant_keyboard_focus);
+        }
+    }
+}
+
+#[test]
 fn directory_drawer_dims_assistant_divider_and_blocks_its_drag() {
     let mut reader = reader();
     reader.toggle_assistant_panel(AssistantPanel::Chat);

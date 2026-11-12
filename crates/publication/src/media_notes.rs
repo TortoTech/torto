@@ -1,6 +1,9 @@
 //! Shared, punctuation-delimited source/note labels for adjacent media.
 pub fn is_source(text: &str) -> bool {
-    prefix(
+    let text = text.trim_start();
+    text.strip_prefix('©').is_some_and(|tail| !tail.trim().is_empty())
+        || text.to_lowercase().starts_with("copyright ©")
+        || prefix(
         text,
         &[
             "source",
@@ -17,6 +20,8 @@ pub fn is_source(text: &str) -> bool {
             "資料來源",
             "数据来源",
             "數據來源",
+            "版权",
+            "版權",
         ],
     )
 }
@@ -59,6 +64,9 @@ mod tests {
             "资料来源: Authors",
             " Sources : Authors",
             "圖片來源：A",
+            "© Daniel Willingham",
+            "Copyright © Diagram author",
+            "版权：作者",
         ] {
             assert!(is_source(text), "{text}");
         }
@@ -69,6 +77,8 @@ mod tests {
             "Source material is discussed below",
             "数据来源的选择很重要",
             "注释是正文的一部分",
+            "Copyright law protects illustrations.",
+            "©",
         ] {
             assert!(!is_annotation(text), "{text}");
         }

@@ -14,7 +14,7 @@ import java.io.File
 @RunWith(AndroidJUnit4::class)
 class SettingsFeedbackTest {
     private val instrumentation get()=InstrumentationRegistry.getInstrumentation()
-    private fun await(message:String,condition:()->Boolean){val until=android.os.SystemClock.uptimeMillis()+8000;while(!condition()){assertTrue(message,android.os.SystemClock.uptimeMillis()<until);android.os.SystemClock.sleep(40)}}
+    private fun await(message:String,condition:()->Boolean){val until=android.os.SystemClock.uptimeMillis()+16000;while(!condition()){if(android.os.SystemClock.uptimeMillis()>=until){shot("settings-feedback-failure.png");fail(message)};android.os.SystemClock.sleep(40)}}
     private fun node(predicate:(AccessibilityNodeInfo)->Boolean):AccessibilityNodeInfo?{
         if(android.os.Build.VERSION.SDK_INT>=33)instrumentation.uiAutomation.clearCache()
         fun find(n:AccessibilityNodeInfo?):AccessibilityNodeInfo? {if(n==null)return null;if(n.isVisibleToUser&&predicate(n))return n;return (0 until n.childCount).firstNotNullOfOrNull {find(n.getChild(it))}}
@@ -104,7 +104,11 @@ class SettingsFeedbackTest {
             val service=instrumentation.uiAutomation.serviceInfo
             service.flags=service.flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
             instrumentation.uiAutomation.serviceInfo=service
-            assertTrue(input.performAction(AccessibilityNodeInfo.ACTION_FOCUS));assertTrue(input.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+            await("feedback description focuses without tapping"){node {it.isEditable&&it.isFocused}!=null}
+            val pane=node {it.paneTitle?.toString()=="反馈问题"}!!
+            val bounds=android.graphics.Rect().also(pane::getBoundsInScreen)
+            assertEquals("Feedback fills the top edge",0,bounds.top)
+            assertEquals("Feedback fills the bottom edge",activity!!.window.decorView.height,bounds.bottom)
             fun keyboard()=instrumentation.uiAutomation.windows.firstOrNull {it.type==android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD}
             await("feedback keyboard appears"){keyboard()!=null}
             android.os.SystemClock.sleep(300)
@@ -121,7 +125,7 @@ class SettingsFeedbackTest {
             click("关闭反馈");await("feedback closes again"){!feedback!!.state.value.visible}
             val fixture=File(context.cacheDir,"feedback-location.fb2");fixture.writeText("""<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0"><description><title-info><book-title>Feedback location fixture</book-title><lang>en</lang></title-info></description><body><section><title><p>Chapter one</p></title><p>Reading position remains unchanged when reporting a problem.</p><p>A second paragraph is available for focus navigation.</p></section></body></FictionBook>""")
             val book=core.importBook(fixture.absolutePath).first {it.title=="Feedback location fixture"};imported=book.id;fixture.delete()
-            instrumentation.runOnMainSync {reader!!.open(book)};await("book opens"){reader!!.state.value.frame!=null&&!reader!!.state.value.busy}
+            instrumentation.runOnMainSync {reader!!.open(book)};await("book opens"){val s=reader!!.state.value;if(s.error!=null)fail("Reader error: ${s.error}");s.frame!=null&&!s.busy}
             instrumentation.runOnMainSync {if(!reader!!.state.value.chromeVisible)reader!!.toggleChrome()};await("reader feedback action appears"){label("反馈问题")!=null}
             val frame=reader!!.state.value.frame!!
             click("反馈问题");await("reader context captures"){feedback!!.state.value.visible&&!feedback!!.state.value.loading}

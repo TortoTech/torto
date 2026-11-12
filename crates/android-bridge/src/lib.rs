@@ -104,6 +104,7 @@ pub struct TextRegion {
 pub struct SelectedText {
     pub text: String,
     pub bounds: Vec<Rect>,
+    pub highlighted: bool,
 }
 #[derive(Clone, uniffi::Record)]
 pub struct FocusTarget {
@@ -344,7 +345,9 @@ impl MobileCore {
                 .iter()
                 .find(|book| book.id == id)
                 .ok_or_else(|| error("Book not found"))?;
-            let publication = rebook_formats::open_file(&book.path).map_err(error)?;
+            let publication = rebook_formats::open_file_for_reading_cached(
+                &book.path, Some(&book.id), self.root.join("cache/source-ir"),
+            ).map_err(error)?;
             let canonical = mobile_source::for_reading(publication.source());
             let options = settings::load_reading(&self.root);
             let mut style = ReaderStyle::default();
@@ -355,7 +358,7 @@ impl MobileCore {
             style.typography.monospace_font = "monospace".into();
             style.typography.sans_serif_font = "sans-serif".into();
             settings::apply_typography(&mut style, &options);
-            apply_mobile_page_margins(&mut style);
+            apply_mobile_page_style(&mut style);
             let fonts =
                 rebook_app_core::fonts::store::load(&self.root.join("fonts"), Default::default());
             rebook_app_core::fonts::install(Arc::new(fonts.clone()));
@@ -399,8 +402,10 @@ impl MobileCore {
                 .record_reading_activity(&id, &session.current_locator())
                 .map_err(error)?;
             rebook_app_core::statistics::register_book(book);
-            let chat_path = self.root.join("chat").join(format!("{id}.json"));
-            let messages = chat::load_messages(&chat_path);
+            // Conversation belongs to this reader instance; only transient book
+            // image pixels use a session-scoped cache, never a transcript file.
+            let chat_path = self.root.join("cache/chat").join(uuid::Uuid::new_v4().to_string());
+            let messages = Vec::new();
             let session_typesetting = session.style().typesetting;
             Ok(Arc::new(MobileReader {
                 scheduler: Default::default(),
@@ -443,6 +448,7 @@ impl MobileCore {
                     focus: false,
                     focus_units: vec![],
                     focus_anchor: restored_anchor,
+                    focus_history: Default::default(),
                     history: vec![],
                 })),
             }))
@@ -485,6 +491,7 @@ struct ReaderState {
     classic_typesetting: rebook_layout::ReaderTypesetting,
     focus_units: Vec<interactions::FocusUnit>,
     focus_anchor: Option<SourceRange>,
+    focus_history: rebook_app_core::focus_navigation::UnitHistory<reflow::Anchor>,
     history: Vec<rebook_publication::LocatorV1>,
 }
 #[derive(uniffi::Object)]
@@ -530,6 +537,7 @@ impl MobileReader {
         self.stop_ai();
         work(move || {
             let state = self.state.lock().map_err(error)?.take();
+            if let Some(s)=&state {let _=std::fs::remove_dir_all(s.chat_path.with_extension("images"));}
             if let Some(s)=&state {let wake=s.store.wake();if wake.snapshot().active.as_deref()==Some(&s.book_id){wake.active(None);wake.changed(rebook_app_core::sync::SyncChange::Flush);}}
             drop(state);
             Ok(())
@@ -742,7 +750,7 @@ impl MobileReader {
                 let Some(a) = scroll::hit(s, x, y, false)? else {
                     return Ok(None);
                 };
-                let Some(b) = scroll::hit(s, end_x, end_y, true)? else {
+                let Some(b) = scroll::hit(s, end_x, end_y, false)? else {
                     return Ok(None);
                 };
                 if a.ordering_key() <= b.ordering_key() {
@@ -757,7 +765,7 @@ impl MobileReader {
                     .selection_between_with_granularity(&a, &b, s.selection_mode)
                     .map_err(error)?;
                 s.selected = selected.clone();
-                Ok(scroll::selected(s))
+                scroll::selected(s)
             })
         })
         .await
@@ -771,7 +779,7 @@ fn clear_selection_state(s: &mut ReaderState) {
 }
 fn apply_presentation_mode(s: &mut ReaderState, style: &mut ReaderStyle) -> Result<()> {
     style.typesetting = rebook_app_core::reading::effective_typesetting(s.focus, &s.classic_typesetting);
-    apply_mobile_page_margins(style);
+    apply_mobile_page_style(style);
     let settings = rebook_app_core::plugins::PluginSettings::load_default().map_err(error)?;
     s.pipeline.semantic.configure_presentation(
         &rebook_app_core::plugins::pdf_native::cache_identity(&s.book_id, s.pipeline.rewrite.as_ref(),
@@ -781,7 +789,13 @@ fn apply_presentation_mode(s: &mut ReaderState, style: &mut ReaderStyle) -> Resu
     );
     Ok(())
 }
-fn apply_mobile_page_margins(style: &mut ReaderStyle) {
+// Body reflows and reference previews share the same mobile presentation.
+fn apply_mobile_typesetting(typesetting: &mut rebook_layout::ReaderTypesetting) {
+    typesetting.quote_style = rebook_layout::QuoteStyle::Filled;
+    typesetting.fit_block_images = true;
+}
+fn apply_mobile_page_style(style: &mut ReaderStyle) {
+    apply_mobile_typesetting(&mut style.typesetting);
     // All mobile reading modes share the same app frame; authored block spacing
     // remains part of the book's own layout.
     style.horizontal_margin = 20.0;

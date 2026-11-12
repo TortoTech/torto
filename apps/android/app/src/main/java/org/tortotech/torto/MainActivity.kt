@@ -66,7 +66,7 @@ class MainActivity : ComponentActivity() {
     val feedbackState by feedback.state.collectAsStateWithLifecycle()
     val showBusy=loadingVisible(state.busy,state.quietUpdate)
     val choicePages=remember{ChoicePages()}
-    val selectionChoiceOwner=remember{Any()}
+    val assistantUi=rememberAssistantUiState(state.active?.id)
     LaunchedEffect(state.active?.id){choicePages.close()}
     var tab by rememberSaveable { mutableIntStateOf(0) }
     val routes=remember { mutableStateListOf<String>() }
@@ -89,6 +89,7 @@ class MainActivity : ComponentActivity() {
     val lifecycle=LocalLifecycleOwner.current.lifecycle
     val lifecycleState by lifecycle.currentStateFlow.collectAsState()
     val window=(context as? android.app.Activity)?.window
+    ReadingWindowBrightness(window,state.active!=null,state.readingBrightness)
     val systemBars=remember(window,view){window?.let {WindowCompat.getInsetsController(it,view)}}
     val darkBars=if(state.active!=null)state.dark else when(state.appTheme){"dark"->true;"light"->false;else->isSystemInDarkTheme()}
     DisposableEffect(systemBars){
@@ -110,7 +111,7 @@ class MainActivity : ComponentActivity() {
         else systemBars?.show(WindowInsetsCompat.Type.systemBars())
     }
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){it?.let(model::importBook)}
-    fun open(route:String){ if(route=="ai")editingProvider=null;routes.add(route);if(route in listOf("ai","translation","assistant","sync","layout"))model.loadServices();if(route=="statistics")model.loadStatistics() }
+    fun open(route:String){ if(route=="ai")editingProvider=null;routes.add(route);if(route in listOf("ai","translation","assistant","sync","layout"))model.loadServices() }
     fun editProvider(provider:Provider){editingProvider=provider;open("provider")}
     fun closeProvider(){if(routes.lastOrNull()=="provider"){routes.removeAt(routes.lastIndex);editingProvider=null}}
     fun reportIssue(){
@@ -124,7 +125,7 @@ class MainActivity : ComponentActivity() {
         panel=name
     }
     fun exitReading(){closePanel();routes.clear();tab=0;model.back()}
-    fun back(){when{choicePages.isOpen->choicePages.close();state.completionPage->exitReading();panel in listOf("layout-settings","translation-settings")->panel="typography";panel=="marks-search"->panel="marks";panel=="note"&&editing!=null->{editing=null;panel="marks"};panel!=null->closePanel();state.annotationPreviewId!=null->{model.loadAnnotations();panel="marks"};state.active!=null->exitReading();routes.lastOrNull()=="provider"->{if(!state.busy)closeProvider()};routes.isNotEmpty()->routes.removeAt(routes.lastIndex);tab!=0->tab=0}}
+    fun back(){when{choicePages.isOpen->choicePages.close();state.completionPage->exitReading();readingTypographyParent(panel)!=null->panel=readingTypographyParent(panel);panel=="marks-search"->panel="marks";panel=="note"&&editing!=null->{editing=null;panel="marks"};panel!=null->closePanel();state.annotationPreviewId!=null->{model.loadAnnotations();panel="marks"};state.active!=null->exitReading();routes.lastOrNull()=="provider"->{if(!state.busy)closeProvider()};routes.isNotEmpty()->routes.removeAt(routes.lastIndex);tab!=0->tab=0}}
     BackHandler(panel!=null||state.active!=null||routes.isNotEmpty()||tab!=0){back()}
     LaunchedEffect(state.interaction){
         state.interaction?.let {interaction->when(interaction.kind){
@@ -175,14 +176,6 @@ class MainActivity : ComponentActivity() {
         }
         val safe=readerSafePadding()
         val route=routes.lastOrNull()
-        val selectionTitle=tr("文字选择模式","Selection mode")
-        val selectionOptions=listOf("free" to tr("自由","Free"),"word" to tr("单词","Word"),"sentence" to tr("句子","Sentence"),"paragraph" to tr("段落","Paragraph"))
-        fun openReadingPanel(name:String){
-            if(name=="selection")choicePages.open(ChoiceRequest(selectionChoiceOwner,selectionTitle,
-                {if(model.state.value.translated)"paragraph"else model.state.value.selectionMode},{selectionOptions},
-                {!model.state.value.busy&&!model.state.value.translated},model::selectionMode))
-            else readerPanel(name)
-        }
         val title=when(route){
             "settings"->tr("设置","Settings");"typography"->tr("排版","Typesetting")
             "dark-mode"->tr("深色模式","Dark mode");"language"->tr("界面语言","Interface language")
@@ -191,11 +184,12 @@ class MainActivity : ComponentActivity() {
             "sync"->tr("云同步","Cloud sync");"about"->tr("关于","About");"statistics"->tr("阅读统计","Reading statistics");"book-statistics"->tr("阅读详情","Reading details")
             else->if(tab==0)tr("书架","Library") else tr("我","Me")
         }
+        ReaderEntryHost(state){state->
         Scaffold(
-            containerColor=if(route=="about")MaterialTheme.colorScheme.surfaceContainerLowest else MaterialTheme.colorScheme.background,
+            containerColor=if(state.active!=null)readerPaperColor(state)else if(route=="about")MaterialTheme.colorScheme.surfaceContainerLowest else MaterialTheme.colorScheme.background,
             contentWindowInsets=if(state.active!=null)WindowInsets(0,0,0,0)else ScaffoldDefaults.contentWindowInsets,
             snackbarHost={SnackbarHost(snackbar)},
-            topBar={if(state.active==null&&route in listOf("settings","dark-mode","language","typography","ai","provider","layout","translation","assistant","sync","about"))CenterAlignedTopAppBar(
+            topBar={if(state.active==null&&route in listOf("settings","dark-mode","language","typography","ai","provider","layout","translation","assistant","sync","about","statistics","book-statistics"))CenterAlignedTopAppBar(
                 title={Text(title,fontSize=16.sp)},
                 navigationIcon={ActionIcon("back",tr("返回","Back"),route!="provider"||!state.busy){back()}},
                 actions={if(route=="ai")ActionIcon("add",tr("添加提供商","Add provider"),!state.busy){editProvider(Provider("","custom","","",emptyList(),false))}},
@@ -208,7 +202,6 @@ class MainActivity : ComponentActivity() {
                 },
                 actions={
                     if(route==null&&tab==0){
-                        if(state.cloud?.enabled==true)ActionIcon("sync",tr("同步","Sync"),!state.busy&&!state.cloudStatus.running){model.synchronize()}
                         ActionIcon("add",tr("导入书籍","Import book"),!state.busy){picker.launch(arrayOf("*/*"))}
                     }else if(route==null&&tab==1){
                         ActionIcon("settings",tr("设置","Settings")){open("settings")}
@@ -220,7 +213,7 @@ class MainActivity : ComponentActivity() {
             Box(Modifier.fillMaxSize().padding(if(state.active==null)padding else PaddingValues(0.dp))) {
                 if(state.active!=null) Box(Modifier.fillMaxSize().padding(readerContentPadding(state.focus))) {
                     Box(Modifier.fillMaxSize()){
-                    AndroidView(factory={ReaderView(it).apply {onSize=model::measure;onMotion=model::readerMotion;onContentLoading=model::readerContentLoading;onReadingGesture=model::hideChrome;onTap=model::tap;onTurn=model::turn;onUnitTurn=model::turnUnit;onScroll=model::scroll;onHandleStart=model::beginHandle;onHandleMove=model::dragHandle;onHandleEnd=model::endHandle;onSelect={x,y,ex,ey->if(!model.state.value.chatWorking&&model.state.value.annotationPreviewId==null)model.select(x,y,ex,ey)}}},update={it.isEnabled=!state.chatWorking&&!feedbackState.visible&&panel==null&&!choicePages.isOpen&&!state.completionPage;it.importantForAccessibility=if(panel!=null||choicePages.isOpen||feedbackState.visible||state.completionPage)android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS else android.view.View.IMPORTANT_FOR_ACCESSIBILITY_AUTO;if(state.error!=null)it.cancelPendingNavigation();it.present(state.frame,state.selected,state.previousPage,state.nextPage,state.turnCompletion);it.presentReference(state.interaction?.indicator,org.tortotech.torto.core.referenceColor(state.dark))},modifier=Modifier.fillMaxSize())
+                    AndroidView(factory={ReaderView(it).apply {animateOpening=true;onSize=model::measure;onMotion=model::readerMotion;onContentLoading=model::readerContentLoading;onReadingGesture=model::hideChrome;onTap=model::tap;onTurn=model::turn;onUnitTurn=model::turnUnit;onScroll=model::scroll;onSentenceGesture=model::sentenceGesture;onHandleStart=model::beginHandle;onHandleMove=model::dragHandle;onHandleEnd=model::endHandle;onSelect={x,y,ex,ey->if(!model.state.value.chatWorking&&model.state.value.annotationPreviewId==null)model.select(x,y,ex,ey)}}},update={it.isEnabled=!state.chatWorking&&!feedbackState.visible&&panel==null&&!choicePages.isOpen&&!state.completionPage;it.importantForAccessibility=if(panel!=null||choicePages.isOpen||feedbackState.visible||state.completionPage)android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS else android.view.View.IMPORTANT_FOR_ACCESSIBILITY_AUTO;if(state.error!=null)it.cancelPendingNavigation();it.present(state.frame,state.selected,state.previousPage,state.nextPage,state.turnCompletion);it.presentReference(state.interaction?.indicator,org.tortotech.torto.core.referenceColor(state.dark))},modifier=Modifier.fillMaxSize())
                     ReaderOpeningIndicator(state)
                     }
                     state.frame?.info?.controls?.filter {it.kind!="sentences"&&state.annotationPreviewId==null&&!state.completionPage}?.takeIf {it.isNotEmpty()}?.let {controls->
@@ -235,9 +228,8 @@ class MainActivity : ComponentActivity() {
                         SelectionToolbar(selection,
                             onCopy={context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("",selection.text));model.clearSelection()},
                             onDismiss=model::clearSelection,
-                            onHighlight={model.saveAnnotation(null)},
-                            onNote={editing=null;panel="note"},
-                            onAsk={model.loadChat();panel="chat"})
+                            onHighlight=model::toggleSelectionHighlight,
+                            onNote={editing=null;panel="note"})
                     }
                 } else when(route){
                     "settings"->SettingsScreen(state,::open)
@@ -256,31 +248,39 @@ class MainActivity : ComponentActivity() {
                     ReadingPanelHost(state.active?.id,panel,::closePanel){name->
                         when(name){
                             "navigation"->ReadingNavigation(state,panel=="navigation",model,::closePanel)
-                            "typography"->TypographyPanel(state,model,openLayout={panel="layout-settings";model.loadServices()})
-                            "layout-settings"->ReadingPanelPage(tr("AI 排版设置","AI layout settings"),{panel="typography"}){ServiceSettingsPanel(state,model,"layout")}
+                            "typography"->ReadingTypographyPanel(state,model){next->panel=next;if(next=="layout-settings")model.loadServices()}
+                            "font-style"->ReadingFontStylePanel(state,model,{panel="typography"}){panel="font-choice-${it.name}"}
+                            "reading-mode"->ReadingModePanel(state,model){panel="typography"}
+                            "selection"->ReadingSelectionPanel(state,model,::closePanel)
+                            "theme"->ReadingThemePanel(state,model)
+                            "layout-settings"->ReadingPanelPage(tr("AI 排版设置","AI layout settings"),{panel="typography"},fill=false){ServiceSettingsPanel(state,model,"layout")}
                             "translation-settings"->ReadingPanelPage(tr("翻译设置","Translation settings"),{panel="typography"}){ServiceSettingsPanel(state,model,"translation")}
                             "marks"->AnnotationsPanel(state,model,{panel="marks-search"},::closePanel)
                             "marks-search"->NotesSearchPanel(state,model,{panel="marks"},::closePanel)
-                            "note"->NoteEditor(editing?.quote ?: state.selected?.text.orEmpty(),editing?.note){text->editing?.let {model.editAnnotation(it.id,text)} ?: model.saveAnnotation(text);closePanel()}
+                            else->if(name.startsWith("font-choice-"))ReadingFontSetting.entries.firstOrNull {it.name==name.removePrefix("font-choice-")}?.let {ReadingFontPicker(it,state,model){panel="font-style"}}
                         }
                     }
                     if(!state.completionPage&&state.annotationPreviewId!=null&&panel==null)NoteReadingChrome(state,
                         onList={model.loadAnnotations();panel="marks"},onClose=model::exitAnnotationPreview,
                         onPrevious={model.stepAnnotation(false)},onNext={model.stepAnnotation(true)})
-                    else if(!state.completionPage)ReadingChrome(state,showBusy||state.chatWorking,panel,::back,::openReadingPanel,
-                        onTranslate={model.translate(!state.translated)},onTheme={model.configure(state.fontSize,state.unified,!state.dark)},
-                        onSplit={state.frame?.info?.controls?.find {it.kind=="sentences"}?.let(model::toggleReadingControl)},onFeedback=::reportIssue)
+                    else if(!state.completionPage)ReadingChrome(state,showBusy||state.chatWorking,panel,::back,::readerPanel,
+                        onTranslate={model.translate(!state.translated)},onTheme={readerPanel("theme")},
+                        onFeedback=::reportIssue)
                 }
                 if(state.active!=null&&!state.completionPage&&state.interaction?.kind !in listOf("note","reference"))ReaderAiNotice(state,Modifier.align(Alignment.TopCenter).padding(top=safe.calculateTopPadding()+12.dp))
                 if(state.active!=null&&state.completionPage)ReadingCompletionPage(state,model::closeCompletionPage,::exitReading,model::loadCompletion,model::markCompletionFinished)
             }
         }
-        if(feedbackState.visible)FeedbackSheet(feedbackState,feedback)
+        }
+        if(feedbackState.visible)FeedbackSheet(feedbackState,feedback,if(state.active!=null)state.readingBrightness else -1f)
+        if(panel=="chat")ReadingAssistantDialog(state,model,::closePanel,assistantUi)
+        if(panel=="note")NoteComposerDialog(state,editing?.quote ?: state.selected?.text.orEmpty(),editing?.note,::closePanel){text,done->
+            editing?.let {model.editAnnotation(it.id,text,done)} ?: model.saveAnnotation(text,done)
+        }
         state.interaction?.let {interaction->
             if(interaction.kind in listOf("image","formula"))MediaPreview(interaction,model::dismissInteraction)
             else if(interaction.kind in listOf("note","reference"))ReadingReferenceSheet(interaction,state.fontSize,state.dark,model,state)
         }
-        if(panel=="chat")ModalBottomSheet(onDismissRequest={closePanel()},sheetState=rememberModalBottomSheetState(skipPartiallyExpanded=true)) {ChatPanel(state,model,::closePanel)}
         bookActions?.let {book->ModalBottomSheet(onDismissRequest={bookActions=null}){
             Text(book.title,Modifier.padding(20.dp),style=MaterialTheme.typography.titleLarge)
             ListItem(headlineContent={Text(tr("阅读","Read"))},leadingContent={AppIcon("book")},modifier=Modifier.clickable{model.open(book);bookActions=null})

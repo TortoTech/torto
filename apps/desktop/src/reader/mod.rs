@@ -90,6 +90,7 @@ mod footnotes;
 mod images;
 mod media_preview;
 mod media_links;
+mod annotation_edits;
 mod interaction;
 mod navigation;
 pub(super) mod render;
@@ -187,7 +188,7 @@ pub(crate) fn open_viewport(ui: &egui::Ui) -> LayoutViewport {
     LayoutViewport::new(
         logical_dimension(f64::from(rect.width())).max(1),
         logical_dimension(f64::from(
-            rect.height() - egui_view::TOOLBAR_HEIGHT - ui.spacing().item_spacing.y - 3.0,
+            rect.height() - egui_view::TOOLBAR_HEIGHT - ui.spacing().item_spacing.y,
         ))
         .max(1),
     )
@@ -909,6 +910,7 @@ pub(super) struct DesktopReader {
     pdf_metadata_missing: PdfMetadataMissing,
     highlight_store: HighlightStore,
     highlights: Vec<StoredHighlight>,
+    annotation_edits: annotation_edits::AnnotationEdits,
     progress_store: Option<SyncStore>,
     selection_anchor: Option<ReaderTextHit>,
     selection: Option<ReaderSelection>,
@@ -964,6 +966,7 @@ pub(super) struct DesktopReader {
     focus_selection_anchor: Option<usize>,
     focus_target_offset: Option<f32>,
     focus_reflow_anchor: Option<FocusReflowAnchor>,
+    focus_history: rebook_app_core::focus_navigation::UnitHistory<FocusUnitBookmark>,
     focus_anchor: Option<SourceAnchor>,
     focus_toc_override: Option<String>,
     pending_page_turn: Option<PageDirection>,
@@ -1965,6 +1968,7 @@ struct ScrollViewportState {
     size: egui::Vec2,
 }
 
+#[derive(Clone)]
 struct FocusReflowAnchor {
     viewport: ScrollViewportState,
     section_index: usize,
@@ -1978,6 +1982,12 @@ struct FocusReflowAnchor {
     #[cfg(debug_assertions)]
     previous_offset: f32,
     image_progress: Option<f32>,
+}
+
+#[derive(Clone)]
+struct FocusUnitBookmark {
+    focus: SourceAnchor,
+    viewport: Option<FocusReflowAnchor>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4342,6 +4352,7 @@ impl DesktopReader {
             pdf_metadata_missing,
             highlight_store,
             highlights,
+            annotation_edits: Default::default(),
             progress_store,
             selection_anchor: None,
             selection: None,
@@ -4434,6 +4445,7 @@ impl DesktopReader {
             focus_selection_anchor: None,
             focus_target_offset: None,
             focus_reflow_anchor: None,
+            focus_history: Default::default(),
             focus_anchor: restored_focus_anchor,
             focus_toc_override: None,
             pending_page_turn: None,

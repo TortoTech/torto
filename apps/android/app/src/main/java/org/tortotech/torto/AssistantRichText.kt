@@ -27,6 +27,20 @@ import org.tortotech.torto.core.renderChatFormula
 
 internal data class AssistantRun(val text:String,val style:Int,val link:String,val math:Boolean)
 internal data class AssistantBlock(val kind:String,val level:Int,val prefix:String,val runs:List<AssistantRun>,val rows:List<List<List<AssistantRun>>>)
+internal fun assistantCitationMarker(number:Int):String=when(number){
+    in 1..20->(0x2460+number-1).toChar().toString()
+    in 21..35->(0x3251+number-21).toChar().toString()
+    in 36..50->(0x32b1+number-36).toChar().toString()
+    else->"($number)"
+}
+/** Order matches Rust's citation list, including table cells and repeated links. */
+internal fun numberAssistantCitations(blocks:List<AssistantBlock>):List<AssistantBlock>{
+    val numbers=linkedMapOf<String,Int>()
+    fun runs(input:List<AssistantRun>)=input.map {run->
+        if(run.link.startsWith("link://j/"))run.copy(text=assistantCitationMarker(numbers.getOrPut(run.link){numbers.size+1}),math=false)else run
+    }
+    return blocks.map {block->block.copy(runs=runs(block.runs),rows=block.rows.map {row->row.map(::runs)})}
+}
 internal fun decodeAssistantMarkdown(json:String):List<AssistantBlock>{
     fun runs(array:JSONArray)=List(array.length()){i->array.getJSONObject(i).let {AssistantRun(it.getString("text"),it.getInt("style"),it.getString("link"),it.getBoolean("math"))}}
     val blocks=JSONArray(json)
@@ -65,7 +79,7 @@ private data class PreparedAssistant(val blocks:List<AssistantBlock>,val formula
         if(currentStreaming)delay(120)
         val source=currentText
         try {
-            val blocks=withContext(Dispatchers.Default){decodeAssistantMarkdown(chatMarkdown(source))}
+            val blocks=withContext(Dispatchers.Default){numberAssistantCitations(decodeAssistantMarkdown(chatMarkdown(source)))}
             val math=blocks.flatMap {b->b.runs+b.rows.flatten().flatten()}.filter {it.math}.map {it.text}.distinct().take(24)
             val images=mutableMapOf<String,Bitmap>()
             var budget=8*1024*1024

@@ -231,6 +231,7 @@ fn open_data(
                 authors,
                 languages: catalog.language.into_iter().collect(),
                 layout: RenditionLayout::PrePaginated,
+                ..Metadata::default()
             },
             sections,
             table_of_contents,

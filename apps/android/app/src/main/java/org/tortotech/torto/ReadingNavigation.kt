@@ -61,7 +61,7 @@ internal fun visibleContents(items:List<TocItem>,collapsed:Set<String>)=items.fi
     val visible=remember(state.toc,collapsed){visibleContents(state.toc,collapsed)}
     val keyboard=LocalSoftwareKeyboardController.current
     val focusManager=LocalFocusManager.current
-    val focus=remember {FocusRequester()}
+    val focus=rememberInputFocus(open&&search)
     val pillHeight=with(LocalDensity.current){maxOf(40.dp,24.sp.toDp()+8.dp)}
     LaunchedEffect(open,book,search,state.toc,current){
         if(open&&!search&&current!=null&&state.toc.isNotEmpty()){
@@ -73,8 +73,7 @@ internal fun visibleContents(items:List<TocItem>,collapsed:Set<String>)=items.fi
     }
     DisposableEffect(Unit){onDispose {focusManager.clearFocus();keyboard?.hide()}}
     LaunchedEffect(open,search){
-        if(open&&search){withFrameNanos {};focus.requestFocus()}
-        else {focusManager.clearFocus();keyboard?.hide()}
+        if(!open||!search){focusManager.clearFocus();keyboard?.hide()}
     }
     Column(Modifier.fillMaxSize()) {
         fun submit(){if(query.isNotBlank()&&!state.busy){submitted=true;focusManager.clearFocus();keyboard?.hide();model.search(query.trim())}}
@@ -118,12 +117,8 @@ internal fun visibleContents(items:List<TocItem>,collapsed:Set<String>)=items.fi
                     Row(Modifier.fillMaxWidth().heightIn(min=52.dp).padding(start=indent.dp,end=24.dp),verticalAlignment=Alignment.CenterVertically){
                         if(entry.hasChildren)ActionIcon(if(entry.id in collapsed)"next"else"expand",if(entry.id in collapsed)tr("展开章节","Expand chapter")else tr("收起章节","Collapse chapter")){collapsed=if(entry.id in collapsed)collapsed-entry.id else collapsed+entry.id}
                         else Spacer(Modifier.width(48.dp))
-                        Text(entry.title,Modifier.weight(1f).clickable(enabled=entry.href.isNotBlank()){keyboard?.hide();model.navigateToc(entry.id);onClose()}.padding(vertical=14.dp),
-                        style=MaterialTheme.typography.bodyLarge.copy(fontSize=16.sp),fontWeight=if(active)FontWeight.SemiBold else FontWeight.Normal,color=MaterialTheme.colorScheme.onSurface,maxLines=2,overflow=TextOverflow.Ellipsis)
-                    }
-                    if(active)Row(Modifier.fillMaxWidth().padding(start=(indent+64).dp,end=24.dp,top=8.dp,bottom=20.dp),verticalAlignment=Alignment.CenterVertically){
-                        AppIcon("book",size=IconSizes.Small,tint=MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(8.dp));Text(tr("当前读到","Reading here"),style=MaterialTheme.typography.labelLarge,color=MaterialTheme.colorScheme.primary)
+                        Text(entry.title,Modifier.weight(1f).semantics {selected=active}.clickable(enabled=entry.href.isNotBlank()){keyboard?.hide();model.navigateToc(entry.id);onClose()}.padding(vertical=14.dp),
+                        style=MaterialTheme.typography.bodyLarge.copy(fontSize=16.sp),fontWeight=if(active)FontWeight.SemiBold else FontWeight.Normal,color=if(active)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,maxLines=2,overflow=TextOverflow.Ellipsis)
                     }
                     HorizontalDivider(Modifier.padding(horizontal=20.dp),color=MaterialTheme.colorScheme.outlineVariant.copy(alpha=.35f),thickness=.5.dp)
                 }

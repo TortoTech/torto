@@ -27,6 +27,12 @@ pub(crate) enum Icon {
     ExternalLink,
     Globe,
     Highlighter,
+    SelectionCopy,
+    SelectionHighlight,
+    SelectionNote,
+    SelectionRemoveHighlight,
+    SelectionAi,
+
     Info,
     Keyboard,
     Languages,
@@ -62,7 +68,7 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 47] = [
+    const ALL: [Self; 52] = [
         Self::Chart,
         Self::Table,
         Self::AlertCircle,
@@ -79,6 +85,12 @@ impl Icon {
         Self::ExternalLink,
         Self::Globe,
         Self::Highlighter,
+        Self::SelectionCopy,
+        Self::SelectionHighlight,
+        Self::SelectionNote,
+        Self::SelectionRemoveHighlight,
+        Self::SelectionAi,
+
         Self::Info,
         Self::Keyboard,
         Self::Languages,
@@ -114,6 +126,12 @@ impl Icon {
 
     fn asset(self) -> (&'static str, &'static [u8]) {
         match self {
+            Self::SelectionCopy => ("selection-copy", include_bytes!("../../../../assets/reader-icons/copy.svg")),
+            Self::SelectionHighlight => ("selection-underline", include_bytes!("../../../../assets/reader-icons/underline.svg")),
+            Self::SelectionNote => ("selection-thought", include_bytes!("../../../../assets/reader-icons/thought.svg")),
+            Self::SelectionRemoveHighlight => ("selection-remove-underline", include_bytes!("../../../../assets/reader-icons/remove-underline.svg")),
+            Self::SelectionAi => ("selection-ai", include_bytes!("../../../../assets/reader-icons/ai.svg")),
+
             Self::AlertCircle => asset!("alert-circle"),
             Self::BookOpen => asset!("book-open"),
             Self::Bot => asset!("bot"),

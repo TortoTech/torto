@@ -196,6 +196,15 @@ mod tests {
         .blocks
     }
     #[test]
+    fn figure_table_return_link_does_not_remove_the_table_focus_step() {
+        let blocks=parse("<p>Before.</p><figure><figcaption><p><a href='#mention' role='doc-backlink'>TABLE 2.1</a> Sources</p></figcaption><table><tr><td>Academic</td><td>Journal</td></tr></table></figure><p id='mention'>After.</p>");
+        for unified in [false,true] {
+            assert_eq!(units(&blocks,unified).len(),3);
+            assert!(is_body(&blocks[1],unified));
+            assert!(units(&blocks,unified)[1].ranges.len()>=3,"Caption and table cells share the focus target");
+        }
+    }
+    #[test]
     fn headings_are_display_only_followers_of_each_semantic_body_kind() {
         for body in [
             "<p>Following prose.</p>",

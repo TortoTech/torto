@@ -334,7 +334,7 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..3 {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let mut socket = loop {
                 if let Ok((socket, _)) = listener.accept() { break socket; }
@@ -356,7 +356,7 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
             let headers_end = request.windows(4).position(|b| b == b"\r\n\r\n").unwrap() + 4;
             let payload: serde_json::Value = serde_json::from_slice(&request[headers_end..]).unwrap();
             assert!(payload.to_string().contains("data:image/png;base64,"));
-            let body = concat!("data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"共享阅读助手\"}}]}\n\n", "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n", "data: [DONE]\n\n");
+            let body = concat!("data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"第一\"}}]}\n\n","data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"第二\"}}]}\n\n","data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"共享阅读助手 [1](link://j/0)\"}}]}\n\n", "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n", "data: [DONE]\n\n");
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
             }
         });
@@ -384,13 +384,28 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
         reader.clone().go_back().await.unwrap();
         let reply = reader.clone().chat_with_images("summarize".into(), vec![attachment.clone()], chat::ChatRequest::new(), stream.clone()).await.unwrap();
         let followup = reader.clone().chat("describe the attached image again".into(), chat::ChatRequest::new(), stream.clone()).await.unwrap();
+        struct StopStream(Arc<chat::ChatRequest>);
+        impl chat::ChatListener for StopStream {fn update(&self,content:String,_:String,_:String){if !content.is_empty(){self.0.cancel();}}}
+        let request=chat::ChatRequest::new();
+        let stopped=reader.clone().chat("stop after some content".into(),request.clone(),Arc::new(StopStream(request))).await.unwrap();
         server.join().unwrap();
         assert_eq!(followup.messages.len(), 4);
         assert_eq!(reply.messages[0].images[0].id, attachment.id);
         assert_eq!(reply.messages.len(), 2);
-        assert_eq!(reply.messages[1].content, "共享阅读助手");
+        assert_eq!(reply.messages[1].content, "共享阅读助手 [1](link://j/0)");
+        assert_eq!(reply.messages[1].progress,vec!["第一第二"]);
+        assert_eq!(reply.messages[1].citations,vec!["link://j/0"]);
+        assert!(reply.messages[1].thinking_seconds.is_some());
+        assert!(stopped.messages.last().unwrap().stopped);
+        assert!(!stopped.messages.last().unwrap().content.is_empty());
+        assert_eq!(stopped.messages.len(),6);
+        let sources=reader.clone().chat_sources(vec!["link://j/0".into(),"link://j/999999".into(),"https://example.com".into(),"link://j/0".into()]).await.unwrap();
+        assert_eq!(sources.len(),1);assert!(!sources[0].excerpt.is_empty());
+        let deleted=reader.clone().delete_chat_turn(reply.messages[1].id.clone()).await.unwrap();
+        assert_eq!(deleted.len(),4);assert_eq!(deleted.last().unwrap().id,stopped.messages.last().unwrap().id);
+        assert_eq!(reader.clone().chat_history().await.unwrap()[0].id,followup.messages[2].id);
         assert!(stream.0.lock().unwrap().iter().any(|s| s.contains("共享阅读助手")));
-        reader.with(|s| { assert_eq!(chat::load_messages(&s.chat_path)[0].images[0].id, attachment.id); Ok(()) }).unwrap();
+        reader.with(|s| { assert!(s.messages.last().unwrap().stopped);assert!(!s.chat_path.exists());Ok(()) }).unwrap();
         reader.clone().clear_chat().await.unwrap();
         assert!(reader.clone().chat_history().await.unwrap().is_empty());
         assert!(reader.clone().chat_image(attachment.id).await.is_err());
@@ -496,6 +511,7 @@ fn imported_book_search_navigation_render_and_close_use_shared_core() {
         retained_focus_chapter_boundaries(&core,&root).await;
         statistics_cloud_and_diagnostics(&core, &root, &books[0].id).await;
         focus_membership_and_heading_masks_follow_desktop_across_pages_and_resizes(&core,&root).await;
+        documents::tests::image_reference_preview(&core,&root).await;
         drop(core);
         // The process-wide statistics worker can still own its SQLite handle
         // after MobileCore is dropped. Windows cannot unlink that open file;
@@ -568,6 +584,7 @@ async fn touch_and_focus(core: &Arc<MobileCore>, root: &std::path::Path) {
         )
         .await
         .unwrap();
+    reflow::tests::stable_mobile_image_presentation(&reader).await;
     let page = reader.clone().page().await.unwrap();
     assert!(page.info().focus_bounds.is_empty());
     let (x, y) = reader
@@ -848,6 +865,23 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
     assert!(visible.len() >= 2, "scroll window must contain nearby text");
     let a = &visible[0].bounds[0];
     let b = &visible[1].bounds[0];
+    let original_mode=reader.with(|s|Ok(s.selection_mode)).unwrap();
+    for mode in [SelectionGranularity::Free,SelectionGranularity::Word,SelectionGranularity::Sentence,SelectionGranularity::Paragraph] {
+        reader.with(|s|{s.selection_mode=mode;Ok(())}).unwrap();
+        let y=a.y+a.height/2.0;let end_y=b.y+b.height/2.0;
+        reader.with(|s|{assert!(scroll::hit(s,0.0,y,true)?.is_none(),"the fixture begins in a genuine margin");Ok(())}).unwrap();
+        if mode!=SelectionGranularity::Free {
+            assert!(reader.clone().select(0.0,y,0.0,y).await.unwrap().is_some(),"a stationary margin long press selects the nearest unit");
+        }
+        let forward=reader.clone().select(0.0,y,359.0,end_y).await.unwrap().expect("blank margins must select nearby text");
+        assert!(!forward.text.trim().is_empty());assert!(!forward.bounds.is_empty());
+        let reverse=reader.clone().select(359.0,end_y,0.0,y).await.unwrap().unwrap();
+        assert_eq!(forward.text,reverse.text,"both drag directions snap to the same boundaries");
+        reader.clone().begin_selection_handle(false).await.unwrap();
+        assert!(reader.clone().extend_selection(359.0,end_y).await.unwrap().is_some(),"a handle must keep tracking through margin space");
+        reader.clone().clear_selection().await.unwrap();
+    }
+    reader.with(|s|{s.selection_mode=original_mode;Ok(())}).unwrap();
     let selected = reader
         .clone()
         .select(
@@ -1489,8 +1523,15 @@ async fn retained_focus_chapter_boundaries(core: &Arc<MobileCore>, root: &std::p
     assert_ne!(next.scroll_context,from.scroll_context);
     assert!(next.regions.iter().any(|r|r.text.contains("C block 0:")));
     assert!(next.regions.iter().all(|r|!r.text.contains("A block")));
+    let margin=reader.clone().select(0.0,0.0,359.0,10.0).await.unwrap().unwrap();
+    assert!(!margin.text.contains("A block"),"blank padding must not select a neighbouring semantic unit from overscan");
+    reader.clone().clear_selection().await.unwrap();
     let back=reader.clone().turn_reading_unit(false).await.unwrap().info();
-    assert!(back.regions.iter().any(|r|r.text.contains("A block 9:")),"returning to a previous unit selects its final block");
+    assert_eq!(back.focus_index, from.focus_index, "returning restores the previously focused paragraph");
+    assert!(back.regions.iter().any(|r|r.text.contains("A block 3:")));
+    let before_bounds=from.regions.iter().find(|r|r.text.contains("A block 3:")).unwrap().bounds.clone();
+    let after_bounds=back.regions.iter().find(|r|r.text.contains("A block 3:")).unwrap().bounds.clone();
+    assert!((before_bounds[0].y-after_bounds[0].y).abs()<0.1,"returning must restore the source's screen coordinate");
     for (from,to,same_spine) in [("A","C",true),("C","B",false)] {
         let source=reader.clone().search(format!("{from} block 9:")).await.unwrap()[0].source.clone();
         let edge=reader.clone().go_to_source(source.clone()).await.unwrap().info();
@@ -1518,6 +1559,21 @@ async fn retained_focus_chapter_boundaries(core: &Arc<MobileCore>, root: &std::p
         reader.with(|s| {assert_eq!(s.session.current_reading_unit_anchor(),unit);Ok(())}).unwrap();
         assert!(back.regions.iter().any(|r|r.text.contains(&format!("{from} block 9:"))));
     }
+    // Retain independent positions across an actual spine boundary too. A
+    // speculative turn must read the saved destination without replacing it.
+    let source=reader.clone().search("C block 4:".into()).await.unwrap()[0].source.clone();
+    let c=reader.clone().go_to_source(source).await.unwrap().info();
+    reader.clone().turn_reading_unit(true).await.unwrap();
+    let source=reader.clone().search("B block 3:".into()).await.unwrap()[0].source.clone();
+    let b=reader.clone().go_to_source(source).await.unwrap().info();
+    let preview=reader.clone().preview_turn(false).await.unwrap().unwrap().info();
+    assert_eq!(preview.focus_index,c.focus_index);
+    let restored=reader.clone().turn_reading_unit(false).await.unwrap().info();
+    assert_eq!(restored.focus_index,c.focus_index);
+    assert!(restored.regions.iter().any(|r|r.text.contains("C block 4:")));
+    let restored=reader.clone().turn_reading_unit(true).await.unwrap().info();
+    assert_eq!(restored.focus_index,b.focus_index);
+    assert!(restored.regions.iter().any(|r|r.text.contains("B block 3:")));
     let saved=reader.with(|s| {
             Ok(s.store.load_progress(&s.book_id).map_err(error)?.unwrap().locator.source.unwrap())
         }).unwrap();
@@ -1555,14 +1611,19 @@ async fn native_document_pages(reader:&Arc<MobileReader>) {
     let first=reader.clone().note_page(markup.clone(),1,String::new(),String::new(),24.,0,viewport.clone(),0xff000000,0xfff8f5ee,
         ).await.unwrap();
     assert!(first.total>2,"long notes must remain scrollable");
+    assert!(first.content_height > viewport.height as f32);
     assert!(first.page.info().regions.iter().any(|r|r.text.contains("Paragraph 0")));
     let rect=first.page.info().regions.iter().flat_map(|r|&r.bounds).next().unwrap().clone();
     let selection=reader.clone().document_select(first.id.clone(),0,rect.x+2.0,rect.y+rect.height/2.0,rect.x+50.0,rect.y+rect.height/2.0,None,
         ).await.unwrap().unwrap();
     assert!(!selection.text.is_empty());assert!(!selection.bounds.is_empty());
+    let margin=reader.clone().document_select(first.id.clone(),0,0.0,rect.y+rect.height/2.0,299.0,rect.y+rect.height/2.0,None).await.unwrap().expect("reference selection accepts blank endpoints too");
+    assert!(!margin.text.is_empty());
+    assert!(reader.clone().document_select(first.id.clone(),0,0.0,rect.y+rect.height/2.0,299.0,rect.y+rect.height+4.0,Some(false)).await.unwrap().is_some());
     let last=reader.clone().note_page(markup,1,String::new(),String::new(),24.,first.total-1,viewport.clone(),0xff000000,0xfff8f5ee,
         ).await.unwrap();
     assert_eq!(last.id,first.id);
+    assert_eq!(last.content_height,first.content_height,"All slices report the same measured document height");
     assert!(last.page.info().regions.iter().any(|r|r.text.contains("44:")));
     assert_eq!(reader.clone().page().await.unwrap().info().progress,before.progress,"preview must not move book progress");
     reader.clone().close_document(first.id.clone()).await.unwrap();

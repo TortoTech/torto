@@ -16,6 +16,7 @@ use super::protocol::{
 };
 
 mod annotation_merge;
+mod selection_highlights;
 
 const DATABASE_FILE: &str = "sync-v1.sqlite3";
 const DATABASE_SCHEMA_VERSION: u32 = 2;
@@ -806,6 +807,10 @@ fn mark_annotation_changed(
 }
 
 impl HighlightRepository for SyncStore {
+    fn apply_selection_edit(&self, book: &str, expected: &[StoredHighlight], removed: &[String], replacement: Option<&StoredHighlight>) -> HighlightResult<bool> {
+        selection_highlights::apply(self, book, expected, removed, replacement)
+    }
+
     fn compact_conflicts(&self, book_id: &str) -> HighlightResult<usize> {
         self.compact_annotation_conflicts(book_id)
     }

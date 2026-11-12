@@ -193,6 +193,7 @@ fn build_publication(
                 authors: metadata.authors,
                 languages: Vec::new(),
                 layout: RenditionLayout::Reflowable,
+                ..Metadata::default()
             },
             cover: metadata.cover,
             sections,

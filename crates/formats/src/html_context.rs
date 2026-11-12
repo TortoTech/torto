@@ -24,6 +24,7 @@ pub(crate) fn image_dimensions(bytes: &[u8]) -> Option<[u32; 2]> {
 /// Container-independent navigation and note hints, computed once per book.
 #[derive(Debug, Default)]
 pub struct HtmlContext {
+    pub(crate) svg_dimensions: crate::svg::Dimensions,
     pub(crate) navigation_documents: Vec<PublicationUrl>,
     ancestors: HashMap<String, Vec<PublicationUrl>>,
     headings: HashMap<String, Vec<PublicationUrl>>,
