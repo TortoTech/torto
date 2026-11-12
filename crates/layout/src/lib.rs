@@ -1890,28 +1890,24 @@ impl LayoutEngine {
                     paginator.push_text(&prepared, &resolved)?;
                 }
                 Block::Quote(quote) => {
-                    let quote_horizontal_padding = if unified_reflow && reader_style.typesetting.quote_style == QuoteStyle::Filled {
-                        8.0
-                    } else if unified_reflow {
-                        // The accent occupies its own horizontal space even when
-                        // the reader or a containing figure disables prose indentation.
-                        (reader_style.typography.font_size
-                            * paragraph_indent_em(
-                                &reader_style.typesetting,
-                                reader_style.writing_system,
-                            ))
-                            .max(reader_style.typography.font_size)
-                            .max(QUOTE_MINIMUM_HORIZONTAL_PADDING)
-                    } else {
-                        0.0
-                    };
-                    let quote_width = if unified_reflow {
-                        (content_width - quote_horizontal_padding * 2.0).max(40.0)
-                    } else {
-                        content_width
+                    let quote_measure = |block: &TextBlock| {
+                        if !unified_reflow { return (0.0, content_width); }
+                        let padding = if reader_style.typesetting.quote_style == QuoteStyle::Filled {
+                            8.0
+                        } else {
+                            // Each original/translated paragraph owns its inset even
+                            // when both languages share one quotation decoration.
+                            (reader_style.typography.font_size
+                                * paragraph_indent_em(&reader_style.typesetting,
+                                    text_display_writing_system(block, reader_style.writing_system)))
+                                .max(reader_style.typography.font_size)
+                                .max(QUOTE_MINIMUM_HORIZONTAL_PADDING)
+                        };
+                        (padding, (content_width - padding * 2.0).max(40.0))
                     };
                     let mut prepared_body = Vec::with_capacity(quote.body.len());
                     for (index, body) in quote.body.iter().enumerate() {
+                        let (quote_horizontal_padding, quote_width) = quote_measure(body);
                         let mut resolved =
                             resolve_text_block(body, reader_style, TextContext::Flow);
                         if unified_reflow
@@ -1945,6 +1941,7 @@ impl LayoutEngine {
                     }
                     let prepared_attribution = if let Some(attribution) = quote.attribution.as_ref()
                     {
+                        let (quote_horizontal_padding, quote_width) = quote_measure(attribution);
                         let resolved =
                             resolve_text_block(attribution, reader_style, TextContext::Flow);
                         let mut prepared = self.shape_text_from_source(
@@ -4329,14 +4326,7 @@ fn resolve_text_block_with_caption_emphasis<'a>(
     let typography = &reader_style.typography;
     let profile = &reader_style.typesetting;
     let base_size = typography.font_size;
-    let display_system = block
-        .content
-        .iter()
-        .find_map(|inline| match inline {
-            Inline::Text(run) => run.style.display_writing_system,
-            _ => None,
-        })
-        .unwrap_or(reader_style.writing_system);
+    let display_system = text_display_writing_system(block, reader_style.writing_system);
     let body_line_height = unified_body_line_height(display_system);
     let (scale, line_height, margin_after) = match context {
         TextContext::Table => (profile.table_font_scale, profile.table_line_height, 0.0),
@@ -4429,15 +4419,11 @@ fn resolve_text_block_with_caption_emphasis<'a>(
             {
                 0.0
             }
-            TextBlockKind::Blockquote
-                if block
-                    .content
-                    .iter()
-                    .flat_map(Inline::text_runs)
-                    .any(|r| r.style.display_writing_system.is_some()) => {
+            // Translation keeps the authored decision to indent; only its
+            // magnitude follows the displayed language, like the quote inset.
+            TextBlockKind::Blockquote if block.style.indent > f32::EPSILON => {
                 base_size * paragraph_indent_em(profile, display_system)
             }
-            TextBlockKind::Blockquote if block.style.indent > f32::EPSILON => base_size * 2.0,
             TextBlockKind::Blockquote => 0.0,
             _ => 0.0,
         }
@@ -4866,6 +4852,13 @@ fn text_block_supports_space_justification(block: &TextBlock) -> bool {
         Inline::Ruby(_) => false,
         Inline::Math(_) | Inline::Image(_) | Inline::Break => true,
     })
+}
+
+fn text_display_writing_system(block: &TextBlock, fallback: WritingSystem) -> WritingSystem {
+    block.content.iter().find_map(|inline| match inline {
+        Inline::Text(run) => run.style.display_writing_system,
+        _ => None,
+    }).unwrap_or(fallback)
 }
 
 fn paragraph_indent_em(profile: &ReaderTypesetting, writing_system: WritingSystem) -> f32 {

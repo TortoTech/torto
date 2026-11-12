@@ -92,41 +92,88 @@ fn split_figure_caption_joins_per_language_and_preserves_both_source_nodes() {
 }
 
 #[test]
-fn translated_quote_indent_follows_display_language_and_respects_centering() {
+fn translated_quote_indent_preserves_authored_presence_and_follows_display_language() {
     let mut quote = text(TextBlockKind::Blockquote, "Quoted text.", "quote");
-    quote.style.indent = -32.;
-    let style = unified();
-    assert_eq!(
-        resolve_text_block(&quote, &style, TextContext::Flow)
-            .style
-            .indent,
-        0.
-    );
-    for (system, em) in [(WritingSystem::Cjk, 2.), (WritingSystem::Latin, 1.5)] {
-        let Inline::Text(run) = &mut quote.content[0] else {
-            panic!()
-        };
-        run.style.display_writing_system = Some(system);
-        assert_eq!(
-            resolve_text_block(&quote, &style, TextContext::Flow)
-                .style
-                .indent,
-            style.typography.font_size * em
-        );
+    for source_system in [WritingSystem::Latin, WritingSystem::Cjk] {
+        let mut style = unified();
+        style.writing_system = source_system;
+        for display in [None, Some(WritingSystem::Cjk), Some(WritingSystem::Latin)] {
+            let Inline::Text(run) = &mut quote.content[0] else { panic!() };
+            run.style.display_writing_system = display;
+            for source_indent in [-32., 0., 32.] {
+                quote.style.indent = source_indent;
+                for custom in [None, Some(0.75)] {
+                    style.typesetting.paragraph_indent_mode = if custom.is_some() {
+                        ParagraphIndentMode::Custom
+                    } else { ParagraphIndentMode::Auto };
+                    style.typesetting.paragraph_indent_em = custom.unwrap_or(2.);
+                    let em = custom.unwrap_or(if display.unwrap_or(source_system) == WritingSystem::Cjk { 2. } else { 1.5 });
+                    for alignment in [TextAlignment::Start, TextAlignment::Center, TextAlignment::End] {
+                        quote.style.semantic_alignment = Some(alignment);
+                        let expected = if source_indent > 0. && alignment == TextAlignment::Start {
+                            style.typography.font_size * em
+                        } else { 0. };
+                        assert_eq!(resolve_text_block(&quote, &style, TextContext::Flow).style.indent, expected);
+                        assert_eq!(resolve_text_block(&quote, &ReaderStyle::default(), TextContext::Flow).style.indent, source_indent);
+                    }
+                }
+            }
+        }
     }
-    quote.style.semantic_alignment = Some(TextAlignment::Center);
-    assert_eq!(
-        resolve_text_block(&quote, &style, TextContext::Flow)
-            .style
-            .indent,
-        0.
-    );
-    assert_eq!(
-        resolve_text_block(&quote, &ReaderStyle::default(), TextContext::Flow)
-            .style
-            .indent,
-        -32.
-    );
+}
+
+#[test]
+fn bilingual_quote_padding_and_wrapped_lines_follow_each_displayed_language() {
+    let source = EmptySource::new("bilingual-quote-insets");
+    let mut body = Vec::new();
+    for indent in [-32., 0., 32.] {
+        let mut original = text(TextBlockKind::Blockquote, &"Original quoted prose with several words. ".repeat(12), "quote");
+        original.style.indent = indent;
+        let mut translated = original.clone();
+        translated.content = vec![Inline::Text(TextRun {
+            text: "注意：引用正文保留原文是否首行缩进的区别，容器内边距按实际显示语言计算。".repeat(8),
+            style: TextStyle { display_writing_system: Some(WritingSystem::Cjk), ..Default::default() },
+            link: None,
+        })];
+        translated.source = None;
+        body.extend([original, translated]);
+    }
+    let mut attribution = text(TextBlockKind::QuoteAttribution, "中文引源", "credit");
+    let Inline::Text(run) = &mut attribution.content[0] else { panic!() };
+    run.style.display_writing_system = Some(WritingSystem::Cjk);
+    let block = Block::Quote(rebook_publication::QuoteBlock { body, attribution: Some(attribution), source: None });
+    let before = block.clone();
+    let mut engine = LayoutEngine::with_fonts([
+        ReaderFontBlob::new(Arc::new(include_bytes!("../../../assets/fonts/Literata-opsz-wght.ttf").as_slice())),
+        ReaderFontBlob::new(Arc::new(include_bytes!("../../../assets/fonts/LXGWWenKaiGBScreen.ttf").as_slice())),
+    ]);
+    for quote_style in [QuoteStyle::Accent, QuoteStyle::Filled] {
+        for width in [390, 900] {
+            let mut style = unified();
+            style.writing_system = WritingSystem::Latin;
+            style.typesetting.quote_style = quote_style;
+            style.spread = SpreadMode::Scroll;
+            let layout = engine.layout_blocks(&source, std::slice::from_ref(&block), LayoutViewport::new(width, 9000).unwrap(), &style).unwrap();
+            let left = reading_content_left(width as f32, &style);
+            let placed = layout.pages.iter().flat_map(|page| &page.items).filter_map(|item| match item {
+                PageItem::Text(text) if text.text.len() > 10 => Some(text), _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(placed.len(), 7);
+            for (index, text) in placed[..6].iter().enumerate() {
+                let em = if index % 2 == 0 { 1.5 } else { 2.0 };
+                let padding = if quote_style == QuoteStyle::Filled { 8.0 } else { style.typography.font_size * em };
+                let first_indent = if index >= 4 { style.typography.font_size * em } else { 0.0 };
+                assert!((text.origin_x - left - padding).abs() < 0.01);
+                let first = text.layout.get(text.lines.start).unwrap().metrics();
+                let continuation = text.layout.get(text.lines.start + 1).unwrap().metrics();
+                assert!((first.offset - first_indent).abs() < 0.01);
+                assert!(continuation.offset.abs() < 0.01);
+            }
+            let credit_padding = if quote_style == QuoteStyle::Filled { 8.0 } else { style.typography.font_size * 2.0 };
+            assert!((placed[6].origin_x - left - credit_padding).abs() < 0.01);
+        }
+    }
+    assert_eq!(block, before, "layout must not mutate source styles or anchors");
 }
 
 #[test]
