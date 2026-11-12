@@ -176,10 +176,9 @@ const fn native_window_theme(theme: AppTheme) -> Option<Theme> {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn native_shortcut_modifiers_match(
     modifiers: ModifiersState,
-    closing:bool,exit_requested:bool,
     shortcut: egui::KeyboardShortcut,
 ) -> bool {
     let modifiers = egui::Modifiers {
@@ -192,7 +191,7 @@ fn native_shortcut_modifiers_match(
     modifiers.matches_logically(shortcut.modifiers)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn native_open_settings_key_matches(
     key_code: KeyCode,
     repeat: bool,
@@ -352,6 +351,22 @@ impl Application {
                 });
             }
         });
+        if crate::smoke::enabled() {
+            let smoke_proxy = proxy.clone();
+            runtime.spawn(async move {
+                let mut ticks = tokio::time::interval(Duration::from_millis(100));
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Startup observation needs real frames after the UI becomes
+                // idle. A finite external wake also survives unrelated egui
+                // passes and native events that cancel a WaitUntil timer.
+                for _ in 0..=600 {
+                    ticks.tick().await;
+                    if smoke_proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         Self {
             app,
             egui_ctx,
@@ -536,11 +551,6 @@ impl ApplicationHandler<UserEvent> for Application {
     }
 
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-        if crate::smoke::enabled() && matches!(cause, StartCause::ResumeTimeReached { .. }) {
-            if let Some(window) = &self.window {
-                window.window.request_redraw();
-            }
-        }
         if matches!(cause, StartCause::ResumeTimeReached { .. }) {
             self.update_repaint_schedule(event_loop);
         }
@@ -881,10 +891,6 @@ impl ApplicationHandler<UserEvent> for Application {
                 }
                 Ok(false) => {}
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(100),
-            ));
-            return;
         }
         self.update_repaint_schedule(event_loop);
     }
@@ -964,7 +970,6 @@ mod tests {
         assert_eq!(native_window_theme(AppTheme::Dark), Some(Theme::Dark));
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn native_comma_shortcut_bypasses_ime_processed_logical_keys() {
         let shortcut = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Comma);
