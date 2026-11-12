@@ -941,12 +941,12 @@ fn reader_layout_settings(
                     settings_row_control_sized(ui, 300.0, |ui| {
                         for (style, label) in [
                             (
-                                FocusStyle::BackgroundHighlight,
-                                language.text("背景高亮", "Background highlight"),
-                            ),
-                            (
                                 FocusStyle::SurroundingDim,
                                 language.text("周边淡化", "Dim surroundings"),
+                            ),
+                            (
+                                FocusStyle::BackgroundHighlight,
+                                language.text("背景高亮", "Background highlight"),
                             ),
                         ] {
                             if choice_button(ui, label, *focus_style == style).clicked() {

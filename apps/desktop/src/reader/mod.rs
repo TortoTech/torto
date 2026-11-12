@@ -188,7 +188,7 @@ pub(crate) fn open_viewport(ui: &egui::Ui) -> LayoutViewport {
     LayoutViewport::new(
         logical_dimension(f64::from(rect.width())).max(1),
         logical_dimension(f64::from(
-            rect.height() - egui_view::TOOLBAR_HEIGHT - ui.spacing().item_spacing.y,
+            rect.height() - egui_view::TOOLBAR_HEIGHT + egui_view::HEADER_EDGE_FADE_HEIGHT,
         ))
         .max(1),
     )

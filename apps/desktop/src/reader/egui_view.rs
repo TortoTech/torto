@@ -61,6 +61,7 @@ const ASSISTANT_SELECTION_SCROLL_MIN_SPEED: f32 = 90.0;
 const ASSISTANT_SELECTION_SCROLL_MAX_SPEED: f32 = 640.0;
 const ASSISTANT_KEYBOARD_SCROLL_STEP: f32 = 64.0;
 pub(super) const TOOLBAR_HEIGHT: f32 = 44.0;
+pub(super) const HEADER_EDGE_FADE_HEIGHT: f32 = 16.0;
 pub(super) const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
 const TOOLBAR_TITLE_SIZE: f32 = 15.0;
 const TOC_ROW_HEIGHT: f32 = chrome::TOC_ROW_HEIGHT;
@@ -228,19 +229,27 @@ pub(super) fn shortcut_has_fresh_press(input: &egui::InputState, shortcut: &egui
     })
 }
 
-/// A paint-only overlay: the same viewport and source text continue under it.
-fn paint_reader_top_edge(painter: &egui::Painter, viewport: Rect, paper: Color32, opacity: f32) {
-    if opacity <= 0.001 || !viewport.is_positive() { return; }
-    let bottom = (viewport.top() + 16.0).min(viewport.bottom());
+/// The gradient occupies the bottom of the existing header, over the reading
+/// canvas. Revealing controls fills that same strip without reflowing the book.
+fn paint_reader_header(painter: &egui::Painter, header: Rect, paper: Color32, visibility: f32) {
+    if !header.is_positive() { return; }
+    let painter = painter.with_clip_rect(header);
+    let visibility = chrome::header_opacity(visibility);
+    if visibility >= 0.999 {
+        painter.rect_filled(header, 0.0, paper);
+        return;
+    }
+    let top = (header.bottom() - HEADER_EDGE_FADE_HEIGHT).max(header.top());
+    painter.rect_filled(Rect::from_min_max(header.min, Pos2::new(header.right(), top)), 0.0, paper);
     let mut mesh = egui::Mesh::default();
-    let top_color = paper.gamma_multiply(opacity.clamp(0.0, 1.0));
     for (pos, color) in [
-        (viewport.left_top(), top_color), (viewport.right_top(), top_color),
-        (Pos2::new(viewport.right(), bottom), Color32::TRANSPARENT),
-        (Pos2::new(viewport.left(), bottom), Color32::TRANSPARENT),
+        (Pos2::new(header.left(), top), paper),
+        (Pos2::new(header.right(), top), paper),
+        (header.right_bottom(), paper.gamma_multiply(visibility)),
+        (header.left_bottom(), paper.gamma_multiply(visibility)),
     ] { mesh.vertices.push(egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color }); }
     mesh.indices.extend([0, 1, 2, 0, 2, 3]);
-    painter.with_clip_rect(viewport).add(egui::Shape::mesh(mesh));
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 fn focus_edge_index(unit_count: usize, last: bool) -> Option<usize> {
@@ -744,92 +753,91 @@ impl DesktopReader {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(background_ui))
             .show(root_ui, |ui| {
-                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                {
-                    toolbar_rect = Rect::from_min_size(
-                        ui.next_widget_position(),
-                        Vec2::new(ui.available_width(), TOOLBAR_HEIGHT),
-                    );
-                    self.toolbar(ui, background_ui);
-                }
+                let (header_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), TOOLBAR_HEIGHT), egui::Sense::hover(),
+                );
+                toolbar_rect = header_rect;
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
                 {
-                    let (row, _) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), TOOLBAR_HEIGHT),
-                        egui::Sense::hover(),
-                    );
                     let right = (ctx.content_rect().right()
                         - crate::app::window_chrome::reserve_width(&ctx)
-                        - TOOLBAR_CONTROL_SIZE
-                        - 12.0)
-                        .min(row.right());
-                    toolbar_rect = Rect::from_min_max(
-                        row.min,
-                        Pos2::new(right.max(row.left() + 1.0), row.bottom()),
-                    );
-                    crate::app::window_chrome::bounded_ui(ui, toolbar_rect, |ui| {
-                        self.toolbar(ui, background_ui)
-                    });
+                        - TOOLBAR_CONTROL_SIZE - 12.0).min(header_rect.right());
+                    toolbar_rect.max.x = right.max(header_rect.left() + 1.0);
                 }
-                let size = Vec2::new(ui.available_width(), ui.available_height().max(1.0));
-                if self.is_scroll_mode() {
-                    page_rect = ui
-                        .scope(|ui| {
-                            if self.assistant_is_docked()
-                                && self.ui.assistant_panel.is_some()
-                                && assistant_progress > 0.001
-                            {
-                                // Inset the floating bar beyond the divider's drag
-                                // strip without taking width away from the text.
-                                ui.spacing_mut().scroll.bar_outer_margin =
-                                    PANEL_RESIZE_HANDLE_WIDTH / 2.0 + 4.0;
-                            }
-                            self.scroll_content(
-                                ui,
-                                size,
-                                page_texture,
-                                background_ui,
-                                interaction_blocked,
-                            )
-                        })
-                        .inner;
-                } else {
-                    let response = if let Some(texture) = page_texture {
-                        let (rect, response) =
-                            ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-                        let painter = ui.painter().with_clip_rect(rect);
-                        painter.rect_filled(rect, 0.0, background_ui);
-                        let texture_rect =
-                            texture.destination(rect, self.preview_content_left(rect.width()));
-                        painter.image(
-                            texture.id,
-                            texture_rect,
-                            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
-                        response
-                    } else {
-                        let (rect, response) =
-                            ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-                        ui.painter().rect_filled(rect, 0.0, background_ui);
-                        response
-                    };
-                    page_rect = response.rect;
-                    let pdf_captured = self.pdf_canvas_input(&response, interaction_blocked);
-                    if !self.preview_is_open() && !pdf_captured {
-                        self.pointer_interaction(&response);
-                        self.wheel_interaction(&response, interaction_blocked);
-                    }
-                }
-                self.resize_canvas(
-                    f64::from(page_rect.width()),
-                    f64::from(page_rect.height()),
-                    ui.ctx().pixels_per_point(),
+                let content_rect = Rect::from_min_max(
+                    Pos2::new(header_rect.left(), header_rect.bottom() - HEADER_EDGE_FADE_HEIGHT),
+                    ui.max_rect().right_bottom(),
                 );
-                self.request_frame_repaint(ui.ctx());
+                ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+                    ui.set_clip_rect(ui.clip_rect().intersect(content_rect));
+                    let size = Vec2::new(ui.available_width(), ui.available_height().max(1.0));
+                    if self.is_scroll_mode() {
+                        page_rect = ui
+                            .scope(|ui| {
+                                if self.assistant_is_docked()
+                                    && self.ui.assistant_panel.is_some()
+                                    && assistant_progress > 0.001
+                                {
+                                    // Inset the floating bar beyond the divider's drag
+                                    // strip without taking width away from the text.
+                                    ui.spacing_mut().scroll.bar_outer_margin =
+                                        PANEL_RESIZE_HANDLE_WIDTH / 2.0 + 4.0;
+                                }
+                                self.scroll_content(
+                                    ui,
+                                    size,
+                                    page_texture,
+                                    background_ui,
+                                    interaction_blocked,
+                                )
+                            })
+                            .inner;
+                    } else {
+                        let response = if let Some(texture) = page_texture {
+                            let (rect, response) =
+                                ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                            let painter = ui.painter().with_clip_rect(rect);
+                            painter.rect_filled(rect, 0.0, background_ui);
+                            let texture_rect =
+                                texture.destination(rect, self.preview_content_left(rect.width()));
+                            painter.image(
+                                texture.id,
+                                texture_rect,
+                                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                            response
+                        } else {
+                            let (rect, response) =
+                                ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                            ui.painter().rect_filled(rect, 0.0, background_ui);
+                            response
+                        };
+                        page_rect = response.rect;
+                        let pdf_captured = self.pdf_canvas_input(&response, interaction_blocked);
+                        if !self.preview_is_open() && !pdf_captured {
+                            self.pointer_interaction(&response);
+                            self.wheel_interaction(&response, interaction_blocked);
+                        }
+                    }
+                    self.resize_canvas(
+                        f64::from(page_rect.width()),
+                        f64::from(page_rect.height()),
+                        ui.ctx().pixels_per_point(),
+                    );
+                    self.request_frame_repaint(ui.ctx());
 
-                paint_reader_top_edge(ui.painter(), page_rect, background_ui,
-                    1.0 - chrome::header_opacity(self.ui.toolbar_motion.value));
+                });
+                let visibility = if self.ui.overlay == ReaderOverlay::Menu { 1.0 }
+                    else { self.ui.toolbar_motion.value };
+                paint_reader_header(ui.painter(), header_rect, background_ui, visibility);
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                crate::app::window_chrome::bounded_ui(ui, toolbar_rect, |ui| self.toolbar(ui));
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                ui.scope_builder(egui::UiBuilder::new().max_rect(toolbar_rect), |ui| {
+                    ui.set_clip_rect(ui.clip_rect().intersect(toolbar_rect));
+                    self.toolbar(ui);
+                });
             });
 
         let floating_sidebar_visible = !self.ui.sidebar_pinned && sidebar_progress > 0.001;
@@ -2508,7 +2516,7 @@ impl DesktopReader {
         }
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui, background: Color32) {
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
         let vertical_padding = ((TOOLBAR_HEIGHT - TOOLBAR_CONTROL_SIZE) / 2.0) as i8;
         let toolbar_width = ui.available_width();
         let hover_rect = Rect::from_min_size(
@@ -2521,7 +2529,6 @@ impl DesktopReader {
         let toolbar_actions_visible = self.ui.toolbar_motion.value.clamp(0.0, 1.0) > 0.02
             || self.ui.overlay == ReaderOverlay::Menu;
         egui::Frame::new()
-            .fill(background)
             .inner_margin(egui::Margin::symmetric(0, vertical_padding))
             .show(ui, |ui| {
                 ui.set_min_width(toolbar_width);
@@ -7842,8 +7849,8 @@ mod reference_suggestion_label_tests {
                         "pinned sidebar still consumes page width"
                     );
                     assert!(
-                        plan.rect.top() >= TOOLBAR_HEIGHT,
-                        "page starts below its column header"
+                        (plan.rect.top() - (TOOLBAR_HEIGHT - HEADER_EDGE_FADE_HEIGHT)).abs() < 0.1,
+                        "only the header’s internal fade overlaps the reading canvas"
                     );
                     window_chrome::paint_controls(&ctx);
                 },
@@ -8067,7 +8074,7 @@ mod reference_suggestion_label_tests {
             for progress in [0.0_f32, 0.25, 0.5, 0.75, 1.0, 0.75, 0.5, 0.25, 0.0] {
                 reader.ui.sidebar_motion = super::super::Motion::settled(progress);
                 let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))), ..Default::default() }, |root| {
-                    reader.toolbar(root, Color32::WHITE);
+                    reader.toolbar(root);
                 });
                 output.textures_delta.clear();
                 let alpha = output.shapes.iter().filter_map(|shape| match &shape.shape { egui::Shape::Rect(icon) if icon.brush.is_some() => Some(icon.fill.a()), _ => None }).max().unwrap_or(0);
@@ -8205,7 +8212,7 @@ mod reference_suggestion_label_tests {
                                 window_chrome::begin_frame(&ctx);
                                 let plan = reader.ui(root, None, false);
                                 assert!(plan.rect.left() > 100.0);
-                                assert!(plan.rect.top() >= TOOLBAR_HEIGHT);
+                                assert!((plan.rect.top() - (TOOLBAR_HEIGHT - HEADER_EDGE_FADE_HEIGHT)).abs() < 0.1);
                                 window_chrome::paint_controls(&ctx);
                             },
                         );
@@ -11053,22 +11060,68 @@ mod formula_note_shortcut_tests {
 #[cfg(test)]
 mod edge_gradient_tests {
     use super::*;
+
     #[test]
-    fn top_gradient_is_a_paint_only_overlay_and_hidden_when_toolbar_is_visible() {
-        let ctx=egui::Context::default();
-        for opacity in [0.0,1.0] {
-            let mut output=ctx.run_ui(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(400.,300.))),..Default::default()}, |ui| {
-                let rect=ui.max_rect();
-                paint_reader_top_edge(ui.painter(),rect,Color32::from_rgb(250,248,243),opacity);
-                assert_eq!(rect,ui.max_rect(),"The overlay must not reserve content space");
-            });
-            let meshes:Vec<_>=output.shapes.iter().filter_map(|s| if let egui::Shape::Mesh(m)=&s.shape{Some(m)}else{None}).collect();
-            if opacity==0. {assert!(meshes.is_empty());}else {
-                let mesh=meshes.iter().find(|m|m.vertices.len()==4).unwrap();
-                assert!(mesh.vertices[0].color.a()>0);assert_eq!(mesh.vertices[2].color.a(),0);
-                assert!((mesh.vertices[2].pos.y-mesh.vertices[0].pos.y-16.).abs()<0.01);
+    fn gradient_stays_inside_the_header_and_uses_the_existing_visibility_motion() {
+        let ctx = egui::Context::default();
+        let header = Rect::from_min_size(Pos2::new(12.0, 18.0), Vec2::new(320.0, TOOLBAR_HEIGHT));
+        for paper in [Color32::from_rgb(250, 248, 243), Color32::from_rgb(24, 26, 28)] {
+            for visibility in [0.0, 0.5, 1.0] {
+                let mut output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0))),
+                    ..Default::default()
+                }, |ui| {
+                    let before = ui.max_rect();
+                    paint_reader_header(ui.painter(), header, paper, visibility);
+                    assert_eq!(ui.max_rect(), before, "Painting must not reserve extra height");
+                });
+                let meshes = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                    egui::Shape::Mesh(mesh) => Some((shape.clip_rect, mesh)), _ => None,
+                }).collect::<Vec<_>>();
+                if visibility == 1.0 {
+                    assert!(meshes.is_empty());
+                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::Shape::Rect(rect) if rect.rect == header && rect.fill == paper)));
+                } else {
+                    let (clip, mesh) = meshes.iter().find(|(_, mesh)| mesh.vertices.len() == 4).unwrap();
+                    assert_eq!(*clip, header);
+                    assert_eq!(mesh.vertices[0].pos.y, header.bottom() - HEADER_EDGE_FADE_HEIGHT);
+                    assert_eq!(mesh.vertices[2].pos.y, header.bottom());
+                    assert!(mesh.vertices.iter().all(|v| header.contains(v.pos)));
+                    assert_eq!(mesh.vertices[0].color, paper);
+                    let bottom_alpha = mesh.vertices[2].color.a();
+                    if visibility == 0.0 { assert_eq!(bottom_alpha, 0); }
+                    else { assert!(bottom_alpha > 0 && bottom_alpha < paper.a()); }
+                }
+                output.textures_delta.clear();
             }
-            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn book_extends_under_the_internal_fade_without_moving_when_controls_appear() {
+        for mode in [crate::preferences::ReadingMode::Focus, crate::preferences::ReadingMode::Classic] {
+            let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+            reader.reading_mode = mode;
+            reader.ui.sidebar_open = false;
+            reader.ui.sidebar_pinned = false;
+            reader.ui.sidebar_motion = super::super::Motion::settled(0.0);
+            let ctx = egui::Context::default();
+            let mut previous = None;
+            for visibility in [0.0, 1.0, 0.5, 0.0] {
+                reader.ui.toolbar_motion = super::super::Motion::settled(visibility);
+                let mut output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                    ..Default::default()
+                }, |ui| {
+                    let plan = reader.ui(ui, None, false);
+                    assert_eq!(plan.rect.top(), TOOLBAR_HEIGHT - HEADER_EDGE_FADE_HEIGHT);
+                    assert_eq!(plan.rect.bottom(), 800.0);
+                    if let Some(before) = previous { assert_eq!(plan.rect, before); }
+                    previous = Some(plan.rect);
+                });
+                output.textures_delta.clear();
+            }
         }
     }
 }
